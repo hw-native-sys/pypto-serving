@@ -88,6 +88,8 @@ class ScheduledRequest:
     request: Request
     num_new_tokens: int
     is_prefill: bool
+    num_computed_tokens: int = 0
+    block_ids: list[int] = field(default_factory=list)
     resumed_from_preemption: bool = False
 
 
@@ -122,6 +124,8 @@ class Scheduler:
         self.requests: dict[str, Request] = {}
 
     def add_request(self, request: Request) -> None:
+        if len(request.prompt_token_ids) > self.config.max_seq_len:
+            request.prompt_token_ids = request.prompt_token_ids[: self.config.max_seq_len]
         request.block_hashes = self.block_pool.compute_block_hashes(request.prompt_token_ids)
         request.status = RequestStatus.WAITING
         self.waiting.append(request)
@@ -154,6 +158,8 @@ class Scheduler:
         token_budget = self.config.max_num_scheduled_tokens
 
         # Phase 1: schedule RUNNING requests (decode or resumed prefill)
+        scheduled_req_ids: set[str] = set()
+        num_scheduled_tokens: dict[str, int] = {}
         running_to_keep: list[Request] = []
         for request in self.running:
             num_new = request.num_new_tokens_needed
@@ -171,19 +177,31 @@ class Scheduler:
 
             num_blocks_needed = self._blocks_needed(request, num_new)
             if not self._try_allocate_blocks(request, num_blocks_needed):
-                preempted = self._preempt_lowest_priority(request)
+                preempted = self._preempt_lowest_priority(
+                    request, scheduled_req_ids, num_scheduled_tokens, output
+                )
                 if preempted is None:
                     running_to_keep.append(request)
                     continue
-                output.preempted_requests.append(preempted)
+                token_budget += preempted.get("returned_tokens", 0)
+                output.preempted_requests.append(preempted["request"])
                 if not self._try_allocate_blocks(request, num_blocks_needed):
                     running_to_keep.append(request)
                     continue
 
             is_prefill = request.is_prefill
+            all_block_ids = request.cached_block_ids + request.allocated_block_ids
             output.scheduled_requests.append(
-                ScheduledRequest(request=request, num_new_tokens=num_new, is_prefill=is_prefill)
+                ScheduledRequest(
+                    request=request,
+                    num_new_tokens=num_new,
+                    is_prefill=is_prefill,
+                    num_computed_tokens=request.num_computed_tokens,
+                    block_ids=list(all_block_ids),
+                )
             )
+            scheduled_req_ids.add(request.request_id)
+            num_scheduled_tokens[request.request_id] = num_new
             if is_prefill:
                 output.num_prefill_tokens += num_new
             else:
@@ -227,8 +245,15 @@ class Scheduler:
 
             request.status = RequestStatus.RUNNING
             self.running.append(request)
+            all_block_ids = request.cached_block_ids + request.allocated_block_ids
             output.scheduled_requests.append(
-                ScheduledRequest(request=request, num_new_tokens=num_new, is_prefill=True)
+                ScheduledRequest(
+                    request=request,
+                    num_new_tokens=num_new,
+                    is_prefill=True,
+                    num_computed_tokens=request.num_computed_tokens,
+                    block_ids=list(all_block_ids),
+                )
             )
             output.num_prefill_tokens += num_new
             token_budget -= num_new
@@ -319,13 +344,37 @@ class Scheduler:
             request.allocated_block_ids.append(block.block_id)
         return True
 
-    def _preempt_lowest_priority(self, exclude: Request) -> Request | None:
+    def _preempt_lowest_priority(
+        self,
+        exclude: Request,
+        scheduled_req_ids: set[str],
+        num_scheduled_tokens: dict[str, int],
+        output: SchedulerOutput,
+    ) -> dict | None:
+        """Preempt the lowest-priority running request to free blocks.
+
+        If the victim was already scheduled in this iteration, it is removed
+        from the scheduled output and its token budget is returned.
+        """
         if not self.running:
             return None
         candidates = [r for r in self.running if r.request_id != exclude.request_id]
         if not candidates:
             return None
         victim = max(candidates, key=lambda r: r.arrival_time)
+
+        returned_tokens = 0
+        if victim.request_id in scheduled_req_ids:
+            scheduled_req_ids.discard(victim.request_id)
+            returned_tokens = num_scheduled_tokens.pop(victim.request_id, 0)
+            output.scheduled_requests = [
+                s for s in output.scheduled_requests if s.request.request_id != victim.request_id
+            ]
+            if victim.is_prefill:
+                output.num_prefill_tokens -= returned_tokens
+            else:
+                output.num_decode_tokens -= returned_tokens
+
         self._free_request_blocks(victim)
         victim.status = RequestStatus.PREEMPTED
         victim.num_computed_tokens = 0
@@ -333,7 +382,7 @@ class Scheduler:
         victim.allocated_block_ids = []
         self.running = [r for r in self.running if r.request_id != victim.request_id]
         self.waiting.appendleft(victim)
-        return victim
+        return {"request": victim, "returned_tokens": returned_tokens}
 
     def _free_request_blocks(self, request: Request) -> None:
         for block_id in request.cached_block_ids:

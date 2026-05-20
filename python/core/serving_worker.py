@@ -157,32 +157,73 @@ class WorkerProcess:
         device = runtime_model.runtime.device
         batch_size = len(scheduled)
 
-        token_ids_list = []
+        chunk_tokens_list = []
+        positions_list = []
         seq_lens = []
         allocations = []
+        block_tables = []
+        slot_mappings = []
 
         for sr in scheduled:
             request = sr.request
-            prompt_tokens = request.prompt_token_ids
-            token_ids_list.append(prompt_tokens)
-            seq_lens.append(len(prompt_tokens))
-            alloc = self._get_or_create_allocation(request, len(prompt_tokens))
+            num_computed = sr.num_computed_tokens
+            num_new = sr.num_new_tokens
+
+            chunk_tokens = request.prompt_token_ids[num_computed:num_computed + num_new]
+            chunk_tokens_list.append(chunk_tokens)
+
+            positions = list(range(num_computed, num_computed + num_new))
+            positions_list.append(positions)
+
+            context_len = num_computed + num_new
+            seq_lens.append(num_new)
+
+            alloc = self._get_or_update_allocation(request, sr.block_ids, num_computed)
             allocations.append(alloc)
 
-        max_seq = max(seq_lens)
-        token_tensor = torch.zeros((batch_size, max_seq), dtype=torch.long, device=device)
+            block_tables.append(sr.block_ids)
+
+            page_size = self.kv_cache_manager._pool(self.config.model_id).page_size
+            chunk_slots = []
+            for token_idx in range(num_computed, num_computed + num_new):
+                page_idx = token_idx // page_size
+                offset = token_idx % page_size
+                slot = sr.block_ids[page_idx] * page_size + offset
+                chunk_slots.append(slot)
+            slot_mappings.append(chunk_slots)
+
+        max_chunk = max(len(t) for t in chunk_tokens_list)
+        token_tensor = torch.zeros((batch_size, max_chunk), dtype=torch.long, device=device)
         embeddings = torch.zeros(
-            (batch_size, max_seq, self.model_record.config.hidden_size),
+            (batch_size, max_chunk, self.model_record.config.hidden_size),
             dtype=runtime_model.embed_tokens.dtype,
             device=device,
         )
+        positions_tensor = torch.zeros((batch_size, max_chunk), dtype=torch.long, device=device)
 
-        for i, tokens in enumerate(token_ids_list):
+        for i, tokens in enumerate(chunk_tokens_list):
             row = torch.tensor(tokens, dtype=torch.long, device=device)
             token_tensor[i, : len(tokens)] = row
             embeddings[i, : len(tokens), :] = self.executor.lookup_embeddings(
                 runtime_model, row
             )
+            positions_tensor[i, : len(tokens)] = torch.tensor(
+                positions_list[i], dtype=torch.long, device=device
+            )
+
+        max_blocks = max(len(bt) for bt in block_tables)
+        block_table_tensor = torch.full(
+            (batch_size, max_blocks), -1, dtype=torch.int32, device=device
+        )
+        for i, bt in enumerate(block_tables):
+            block_table_tensor[i, : len(bt)] = torch.tensor(bt, dtype=torch.int32)
+
+        max_slots = max(len(sm) for sm in slot_mappings)
+        slot_mapping_tensor = torch.full(
+            (batch_size, max_slots), -1, dtype=torch.int32, device=device
+        )
+        for i, sm in enumerate(slot_mappings):
+            slot_mapping_tensor[i, : len(sm)] = torch.tensor(sm, dtype=torch.int32)
 
         prefill_result = self.executor.run_prefill(
             runtime_model,
@@ -192,12 +233,15 @@ class WorkerProcess:
                 input_embeddings=embeddings,
                 seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
                 kv_allocations=allocations,
+                positions=positions_tensor,
+                block_table=block_table_tensor,
+                slot_mapping=slot_mapping_tensor,
             ),
         )
 
         for i, sr in enumerate(scheduled):
             request = sr.request
-            will_be_computed = request.num_computed_tokens + sr.num_new_tokens
+            will_be_computed = sr.num_computed_tokens + sr.num_new_tokens
             if will_be_computed >= request.num_prompt_tokens:
                 logits = (
                     prefill_result.logits[i]
@@ -230,8 +274,9 @@ class WorkerProcess:
             )
             decode_tokens.append(last_token)
 
-            alloc = self._get_or_create_allocation(request, request.num_prompt_tokens)
-            self.kv_cache_manager.ensure_one_more_slot(alloc)
+            alloc = self._get_or_update_allocation(
+                request, sr.block_ids, sr.num_computed_tokens
+            )
             allocations.append(alloc)
             seq_lens.append(request.num_tokens)
 
@@ -280,11 +325,28 @@ class WorkerProcess:
         self._allocations[req_id] = alloc
         return alloc
 
+    def _get_or_update_allocation(
+        self, request, block_ids: list[int], num_computed_tokens: int
+    ) -> KvAllocation:
+        """Get or create allocation using scheduler-assigned block IDs."""
+        req_id = request.request_id
+        if req_id in self._allocations:
+            alloc = self._allocations[req_id]
+            alloc.page_ids = list(block_ids)
+            alloc.tokens_capacity = len(block_ids) * self.kv_cache_manager._pool(
+                self.config.model_id
+            ).page_size
+            alloc.tokens_used = num_computed_tokens
+            return alloc
+        alloc = self.kv_cache_manager.allocate_with_page_ids(
+            self.config.model_id, req_id, block_ids, tokens_used=num_computed_tokens
+        )
+        self._allocations[req_id] = alloc
+        return alloc
+
     def free_allocation(self, request_id: str) -> None:
-        """Free KV allocation when request finishes."""
-        alloc = self._allocations.pop(request_id, None)
-        if alloc is not None:
-            self.kv_cache_manager.free(alloc)
+        """Drop KV allocation reference. Block lifecycle is managed by the scheduler."""
+        self._allocations.pop(request_id, None)
 
 
 def _worker_entry(

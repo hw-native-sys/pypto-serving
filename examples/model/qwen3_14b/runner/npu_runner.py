@@ -955,6 +955,8 @@ class Qwen314BModelRunner(ModelRunner):
         hidden_size = model.config.hidden_size
         max_blocks = self._max_blocks_per_seq(model)
 
+        has_precomputed = batch.slot_mapping is not None and batch.block_table is not None
+
         hidden = torch.zeros((actual_batch, max_seq, hidden_size), dtype=torch.bfloat16)
         seq_lens = torch.empty((actual_batch,), dtype=torch.int32)
         block_table = torch.full((actual_batch * max_blocks,), -1, dtype=torch.int32)
@@ -970,13 +972,27 @@ class Qwen314BModelRunner(ModelRunner):
             hidden[batch_idx, :seq_len, :] = (
                 batch.input_embeddings[batch_idx, :seq_len, :].to(torch.bfloat16).cpu()
             )
-            self._write_block_table_row(block_table, batch_idx, max_blocks, alloc)
-            slot_row = self._kv_cache_manager.slot_mapping_for_positions(
-                alloc,
-                seq_len,
-                max_tokens=max_seq,
-            )
-            slot_mapping[batch_idx * max_seq : (batch_idx + 1) * max_seq] = slot_row
+
+            if has_precomputed:
+                bt_row = batch.block_table[batch_idx]
+                valid_blocks = (bt_row >= 0).sum().item()
+                block_table[
+                    batch_idx * max_blocks : batch_idx * max_blocks + valid_blocks
+                ] = bt_row[:valid_blocks].to(torch.int32).cpu()
+
+                sm_row = batch.slot_mapping[batch_idx]
+                valid_slots = (sm_row >= 0).sum().item()
+                slot_mapping[
+                    batch_idx * max_seq : batch_idx * max_seq + valid_slots
+                ] = sm_row[:valid_slots].to(torch.int32).cpu()
+            else:
+                self._write_block_table_row(block_table, batch_idx, max_blocks, alloc)
+                slot_row = self._kv_cache_manager.slot_mapping_for_positions(
+                    alloc,
+                    seq_len,
+                    max_tokens=max_seq,
+                )
+                slot_mapping[batch_idx * max_seq : (batch_idx + 1) * max_seq] = slot_row
 
         return _PrefillInputs(
             actual_batch=actual_batch,

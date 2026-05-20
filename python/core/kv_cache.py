@@ -81,6 +81,19 @@ class KvCacheManager:
             tokens_used=0,
         )
 
+    def allocate_with_page_ids(
+        self, model_id: str, request_id: str, page_ids: list[int], tokens_used: int = 0
+    ) -> KvAllocation:
+        """Create a KvAllocation using externally-assigned page IDs from the scheduler."""
+        pool = self._pool(model_id)
+        return KvAllocation(
+            request_id=request_id,
+            model_id=model_id,
+            page_ids=list(page_ids),
+            tokens_capacity=len(page_ids) * pool.page_size,
+            tokens_used=tokens_used,
+        )
+
     def ensure_one_more_slot(self, alloc: KvAllocation) -> int:
         """Ensure a request has capacity for one more token and return its slot."""
         pool = self._pool(alloc.model_id)

@@ -31,7 +31,8 @@ class ServingConfig:
     long_prefill_token_threshold: int = 2048
     max_seq_len: int = 4096
     engine_loop_interval: float = 0.001
-    block_size: int = 256
+    # Must equal RuntimeConfig.page_size for unified block/page management
+    block_size: int = 64
     num_blocks: int | None = None
 
 

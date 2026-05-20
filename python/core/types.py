@@ -182,6 +182,9 @@ class PrefillBatch:
     input_embeddings: torch.Tensor
     seq_lens: torch.Tensor
     kv_allocations: list[KvAllocation]
+    positions: torch.Tensor | None = None
+    block_table: torch.Tensor | None = None
+    slot_mapping: torch.Tensor | None = None
 
 
 @dataclass
