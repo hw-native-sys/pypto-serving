@@ -175,6 +175,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             device_id=self._device_id,
             save_kernels_dir=self._save_kernels_dir,
             l3_trace=self._l3_trace,
+            kv_cache_manager=self._kv_cache_manager,
         )
 
     def validate_generate_batch(
@@ -375,6 +376,90 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         final_rms = None
         lm_head = None
 
+        # KV quantization kernels (compiled only when kv_quant enabled).
+        # TQ fused kernels for prefill and decode.
+        kv_quant_config = getattr(model.runtime, "kv_quant_config", None)
+        prefill_tq: _L2Callable | None = None
+        decode_tq: _L2Callable | None = None
+        rot_matrices: torch.Tensor | None = None
+        tq_codebook: torch.Tensor | None = None
+        # QJL (Algorithm 2): per-layer orthogonal projection + K sign/norm caches.
+        qjl_matrices: torch.Tensor | None = None
+        quant_k_signs_cache: torch.Tensor | None = None
+        qjl_norms_cache: torch.Tensor | None = None
+        if kv_quant_config is not None and kv_quant_config.enabled:
+            # Prefill TQ kernel: @pl.jit multi-layer fused, writes directly to
+            # quantized KV cache (UINT8 + BF16 norms). Compiled via the same
+            # _compile_jit_fwd_callable path as regular prefill_fwd.
+            qwen3_prefill_tq = _load_pypto_lib_qwen14b_module("prefill_tq")
+            prefill_tq = self._compile_prefill_tq_callable(
+                qwen3_prefill_tq.prefill_fwd_tq,
+                batch=kernel_batch,
+                max_seq=model.runtime.max_seq_len,
+                block_table_stride=prefill_block_table_stride,
+                hidden_size=model.config.hidden_size,
+                intermediate_size=model.config.intermediate_size,
+                num_heads=model.config.num_attention_heads,
+                num_kv_heads=model.config.num_key_value_heads,
+                head_dim=model.config.head_dim,
+                num_layers=model.config.num_hidden_layers,
+                vocab_size=padded_vocab,
+            )
+            _mark("compile_prefill_tq")
+
+            # Decode TQ kernel: @pl.jit multi-layer fused with hybrid
+            # resident (BF16) + compressed (UINT8) block attention.
+            qwen3_decode_tq = _load_pypto_lib_qwen14b_module("decode_tq")
+            decode_tq = self._compile_decode_tq_callable(
+                qwen3_decode_tq.decode_fwd_tq,
+                batch=kernel_batch,
+                max_seq=model.runtime.max_seq_len,
+                hidden_size=model.config.hidden_size,
+                intermediate_size=model.config.intermediate_size,
+                num_heads=model.config.num_attention_heads,
+                num_kv_heads=model.config.num_key_value_heads,
+                head_dim=model.config.head_dim,
+                num_layers=model.config.num_hidden_layers,
+                vocab_size=padded_vocab,
+            )
+            _mark("compile_decode_tq")
+
+            # Generate per-layer rotation matrices matching the compressor seeds.
+            from python.core.turboquant.compressor import generate_rotation_matrix  # noqa: PLC0415
+            num_layers = model.config.num_hidden_layers
+            head_dim = model.config.head_dim
+            rot_mats = torch.stack([
+                generate_rotation_matrix(head_dim, seed=42 + l * 1000)
+                for l in range(num_layers)
+            ]).bfloat16().contiguous().cpu()
+            rot_matrices = self._shared_tensor(rot_mats.reshape(num_layers * head_dim, head_dim))
+
+            # TQ codebook (single row of Lloyd-Max centroids) — used by decode only.
+            n_levels = int(qwen3_prefill_tq.N_LEVELS)
+            from turboquant_kv import _lm_centroids  # noqa: PLC0415
+            _cb_row = _lm_centroids.float().unsqueeze(0)  # [1, N_LEVELS]
+            tq_codebook = _cb_row.clone().contiguous().share_memory_()  # [1, N_LEVELS]
+
+            # QJL (Algorithm 2): per-layer orthogonal projection matrices.
+            # Independent from rot_matrices (different seed).
+            qjl_mats = torch.stack([
+                generate_rotation_matrix(head_dim, seed=123 + l * 1000)
+                for l in range(num_layers)
+            ]).bfloat16().contiguous().cpu()
+            qjl_matrices = self._shared_tensor(qjl_mats.reshape(num_layers * head_dim, head_dim))
+
+            # QJL caches: K sign bits and residual norms.
+            # Same row layout as quant_k_cache: [num_layers * num_pages * num_kv_heads * page_size, ...]
+            runtime_cache_blocks = (model.runtime.max_seq_len + _QWEN14B_PAGE_SIZE - 1) // _QWEN14B_PAGE_SIZE
+            cmp_cache_rows = num_layers * kernel_batch * runtime_cache_blocks * model.config.num_key_value_heads * _QWEN14B_PAGE_SIZE
+            quant_k_signs_cache = torch.zeros(
+                cmp_cache_rows, head_dim, dtype=torch.uint8,
+            ).share_memory_()
+            qjl_norms_cache = torch.zeros(
+                cmp_cache_rows, 1, dtype=torch.float32,
+            ).share_memory_()
+        _mark("compile_kv_quant")
+
         rope_cos_raw, rope_sin_raw = rope_tables(
             model.runtime.max_seq_len,
             model.config.head_dim,
@@ -558,6 +643,13 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             l3_generate_platform=l3_generate_platform,
             l3_generate_runtime_name=l3_generate_runtime_name,
             l3_generate_param_infos=l3_generate_param_infos,
+            prefill_tq=prefill_tq,
+            decode_tq=decode_tq,
+            rot_matrices=rot_matrices,
+            tq_codebook=tq_codebook,
+            qjl_matrices=qjl_matrices,
+            quant_k_signs_cache=quant_k_signs_cache,
+            qjl_norms_cache=qjl_norms_cache,
         )
 
     def _compile_l2_callable(self, name: str, program: object) -> _L2Callable:
@@ -710,6 +802,130 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         ]
         return self._compile_jit_fwd_callable("decode_fwd", jit_fn, dummy_args)
 
+    def _compile_decode_tq_callable(
+        self,
+        jit_fn: object,
+        *,
+        batch: int,
+        max_seq: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        num_layers: int,
+        vocab_size: int,
+    ) -> _L2Callable:
+        """Compile the top-level ``@pl.jit`` decode_fwd_tq into an L2 callable."""
+        kv_hidden = num_kv_heads * head_dim
+        runtime_cache_blocks = (max_seq + _QWEN14B_PAGE_SIZE - 1) // _QWEN14B_PAGE_SIZE
+        cache_rows = batch * runtime_cache_blocks * num_layers * num_kv_heads * _QWEN14B_PAGE_SIZE
+        block_table_stride = int(max_seq + _QWEN14B_PAGE_SIZE - 1) // _QWEN14B_PAGE_SIZE
+        # TQ constants (must match qwen3_14b_decode_tq.py).
+        cmp_chunk = 32
+        n_levels = 16
+        dummy_args = [
+            torch.empty((batch, hidden_size), dtype=torch.bfloat16),               # hidden_states
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),            # input_rms_weight
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),     # wq
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),      # wk
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),      # wv
+            torch.empty((num_layers, head_dim), dtype=torch.float32),               # q_norm_weight
+            torch.empty((num_layers, head_dim), dtype=torch.float32),               # k_norm_weight
+            torch.empty((batch,), dtype=torch.int32),                               # seq_lens
+            torch.empty((batch * block_table_stride,), dtype=torch.int32),          # block_table
+            torch.empty((batch,), dtype=torch.int32),                               # slot_mapping
+            torch.empty((max_seq, head_dim), dtype=torch.float32),                  # rope_cos
+            torch.empty((max_seq, head_dim), dtype=torch.float32),                  # rope_sin
+            # TQ quantized KV cache.
+            torch.empty((cache_rows, head_dim), dtype=torch.uint8),                 # quant_k_cache
+            torch.empty((cache_rows, head_dim), dtype=torch.uint8),                 # quant_v_cache
+            torch.empty((cache_rows, 1), dtype=torch.float32),                      # quant_k_scales
+            torch.empty((cache_rows, 1), dtype=torch.float32),                      # quant_v_scales
+            # Compressed block tracking.
+            torch.empty((batch * block_table_stride,), dtype=torch.int32),          # cmp_block_table
+            torch.empty((batch,), dtype=torch.int32),                               # cmp_num_blocks
+            # Per-layer rotation matrices.
+            torch.empty((num_layers * head_dim, head_dim), dtype=torch.bfloat16),   # rot_matrices
+            # TQ codebook.
+            torch.empty((1, n_levels), dtype=torch.float32),                # tq_codebook
+            # QJL (Algorithm 2): projection matrices + K sign/norm caches.
+            torch.empty((num_layers * head_dim, head_dim), dtype=torch.bfloat16),   # qjl_matrices
+            torch.empty((cache_rows, head_dim), dtype=torch.uint8),                 # quant_k_signs_cache
+            torch.empty((cache_rows, 1), dtype=torch.float32),                      # qjl_norms_cache
+            # Standard layer weights.
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),     # wo
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),            # post_rms_weight
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),  # w_gate
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),  # w_up
+            torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),  # w_down
+            # Final norm + LM head.
+            torch.empty((1, hidden_size), dtype=torch.float32),                     # final_norm_weight
+            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),           # lm_head_weight
+            # Output (logits).
+            torch.empty((batch, vocab_size), dtype=torch.float32),                  # out (logits)
+        ]
+        return self._compile_jit_fwd_callable("decode_tq", jit_fn, dummy_args)
+
+    def _compile_prefill_tq_callable(
+        self,
+        jit_fn: object,
+        *,
+        batch: int,
+        max_seq: int,
+        block_table_stride: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        num_layers: int,
+        vocab_size: int,
+    ) -> _L2Callable:
+        """Compile the top-level ``@pl.jit`` prefill_fwd_tq into an L2 callable."""
+        kv_hidden = num_kv_heads * head_dim
+        total_tokens = batch * max_seq
+        runtime_cache_blocks = (max_seq + _QWEN14B_PAGE_SIZE - 1) // _QWEN14B_PAGE_SIZE
+        cache_rows = batch * runtime_cache_blocks * num_layers * num_kv_heads * _QWEN14B_PAGE_SIZE
+        # TQ constants (must match qwen3_14b_prefill_tq.py).
+        n_levels = 16    # int4 -> 16 levels
+        dummy_args = [
+            # Standard prefill inputs (same as regular prefill_fwd).
+            torch.empty((total_tokens, hidden_size), dtype=torch.bfloat16),       # hidden_states
+            torch.empty((batch,), dtype=torch.int32),                              # seq_lens
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),           # input_rms_weight
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),    # wq
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),     # wk
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),     # wv
+            torch.empty((num_layers, head_dim), dtype=torch.float32),              # q_norm_weight
+            torch.empty((num_layers, head_dim), dtype=torch.float32),              # k_norm_weight
+            torch.empty((max_seq, head_dim), dtype=torch.float32),                 # rope_cos
+            torch.empty((max_seq, head_dim), dtype=torch.float32),                 # rope_sin
+            torch.empty((batch * block_table_stride,), dtype=torch.int32),         # block_table
+            torch.empty((total_tokens,), dtype=torch.int32),                       # slot_mapping
+            # TQ quantized KV cache (replaces k_cache/v_cache).
+            torch.empty((cache_rows, head_dim), dtype=torch.uint8),                # quant_k_cache
+            torch.empty((cache_rows, head_dim), dtype=torch.uint8),                # quant_v_cache
+            torch.empty((cache_rows, 1), dtype=torch.float32),                     # quant_k_scales
+            torch.empty((cache_rows, 1), dtype=torch.float32),                     # quant_v_scales
+            # Per-layer rotation matrices [num_layers * head_dim, head_dim].
+            torch.empty((num_layers * head_dim, head_dim), dtype=torch.bfloat16),  # rot_matrices
+            # QJL (Algorithm 2): per-layer projection + K sign/norm caches.
+            torch.empty((num_layers * head_dim, head_dim), dtype=torch.bfloat16),  # qjl_matrices
+            torch.empty((cache_rows, head_dim), dtype=torch.uint8),                # quant_k_signs_cache
+            torch.empty((cache_rows, 1), dtype=torch.float32),                     # qjl_norms_cache
+            # Standard layer weights + final norm + lm_head.
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),    # wo
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),           # post_rms_weight
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),  # w_gate
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),  # w_up
+            torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),  # w_down
+            torch.empty((1, hidden_size), dtype=torch.float32),                    # final_norm_weight
+            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),          # lm_head_weight
+            torch.empty((batch, vocab_size), dtype=torch.float32),                 # out (logits)
+        ]
+        return self._compile_jit_fwd_callable("prefill_tq", jit_fn, dummy_args)
+
     def _compile_jit_fwd_callable(
         self,
         name: str,
@@ -758,6 +974,77 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             name=name,
             runtime_name=runtime_name,
             block_dim=int(runtime_config.get("block_dim", _QWEN14B_BLOCK_DIM)),
+            aicpu_thread_num=int(runtime_config.get("aicpu_thread_num", 4)),
+            param_infos=tuple(param_infos),
+        )
+
+    def _compile_l2_callable_from_jit(self, name: str, jit_fn, dummy_args: tuple) -> _L2Callable:
+        """Compile a ``@pl.jit`` function into a Simpler callable.
+
+        Uses the JIT compilation path (``fn._compile``) which supports
+        ``@pl.jit.inline`` helpers and scalar operations, unlike
+        ``compile_program()`` which requires ``@pl.program`` classes.
+        """
+        from pypto.jit.cache import make_cache_key  # noqa: PLC0415
+        from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
+        import pypto.language as pl_mod  # noqa: PLC0415
+
+        config = self._run_config(codegen_only=True)
+        work_dir = self._l2_work_dir(name)
+
+        # Bind dummy args to trigger JIT compilation.
+        param_names, _arguments, tensor_meta, scalar_values, scalar_dtypes, dynamic_dims = (
+            jit_fn._bind_args(dummy_args, {})
+        )
+        key = make_cache_key(
+            source_hash=jit_fn._get_source_hash(),
+            param_names=param_names,
+            tensor_shapes={n: m.shape for n, m in tensor_meta.items()},
+            tensor_dtypes={n: m.dtype for n, m in tensor_meta.items()},
+            dynamic_dims=dynamic_dims,
+            scalar_values=scalar_values,
+            platform=self._platform,
+        )
+        if key not in jit_fn._cache:
+            jit_fn._cache[key] = jit_fn._compile(
+                tensor_meta, scalar_values, scalar_dtypes, dynamic_dims, pl_mod,
+                platform=self._platform,
+            )
+        jit_output_dir = Path(jit_fn._cache[key].output_dir)
+
+        # Copy JIT output to our work_dir so compile_and_assemble finds it.
+        import shutil  # noqa: PLC0415
+        if work_dir.exists():
+            shutil.rmtree(work_dir)
+        shutil.copytree(jit_output_dir, work_dir)
+
+        chip_callable, runtime_name, runtime_config = compile_and_assemble(
+            work_dir,
+            self._platform,
+            pto_isa_commit=config.pto_isa_commit,
+        )
+        runtime_config = runtime_config or {}
+
+        # Build param_infos from bind_args metadata (JIT functions
+        # don't have a .functions dict that CompiledProgram expects).
+        class _ParamInfo:
+            __slots__ = ("name", "shape", "dtype")
+            def __init__(self, name, shape, dtype=None):
+                self.name = name
+                self.shape = shape
+                self.dtype = dtype
+
+        param_infos = []
+        for pname in param_names:
+            if pname in tensor_meta:
+                meta = tensor_meta[pname]
+                param_infos.append(_ParamInfo(pname, tuple(meta.shape), meta.dtype))
+            else:
+                param_infos.append(_ParamInfo(pname, None))
+        return _L2Callable(
+            chip_callable=chip_callable,
+            runtime_name=runtime_name,
+            block_dim=int(runtime_config.get("block_dim", 24)),
             aicpu_thread_num=int(runtime_config.get("aicpu_thread_num", 4)),
             param_infos=tuple(param_infos),
         )

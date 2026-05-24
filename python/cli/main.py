@@ -80,6 +80,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable chunked prefill (default: True). Use --no-enable-chunked-prefill to disable.",
     )
 
+    # KV cache quantization (TurboQuant)
+    parser.add_argument("--kv-quant", action="store_true", help="Enable TurboQuant KV cache compression.")
+    parser.add_argument("--kv-quant-key-bits", type=int, default=4, help="TurboQuant key bits (default: 4).")
+    parser.add_argument("--kv-quant-value-bits", type=int, default=2, help="TurboQuant value bits (default: 2).")
+    parser.add_argument("--kv-quant-residual-window", type=int, default=128, help="TurboQuant residual window (default: 128).")
+    parser.add_argument("--kv-quant-protected-layers", type=int, default=4, help="TurboQuant protected layers (default: 4).")
+    parser.add_argument("--kv-quant-protected-bits", type=int, default=8, help="TurboQuant protected bits (default: 8).")
+
     # Misc
     parser.add_argument(
         "--show-startup-logs",
@@ -122,6 +130,18 @@ def _build_runtime_config(args: argparse.Namespace):
     if kv_dtype == "auto":
         kv_dtype = args.dtype
 
+    kv_quant_config = None
+    if getattr(args, "kv_quant", False):
+        from python.core.types import KvQuantConfig
+        kv_quant_config = KvQuantConfig(
+            enabled=True,
+            key_bits=args.kv_quant_key_bits,
+            value_bits=args.kv_quant_value_bits,
+            residual_window=args.kv_quant_residual_window,
+            protected_layers=args.kv_quant_protected_layers,
+            protected_bits=args.kv_quant_protected_bits,
+        )
+
     return RuntimeConfig(
         page_size=args.block_size,
         max_batch_size=args.max_num_seqs,
@@ -130,6 +150,7 @@ def _build_runtime_config(args: argparse.Namespace):
         kv_dtype=kv_dtype,
         weight_dtype=args.dtype,
         max_new_tokens=args.max_new_tokens,
+        kv_quant_config=kv_quant_config,
     )
 
 

@@ -122,6 +122,17 @@ class _CompiledKernels:
     l3_generate_platform: str | None = None
     l3_generate_runtime_name: str | None = None
     l3_generate_param_infos: object | None = None
+    # TQ fused kernels for prefill and decode. None when kv-quant disabled.
+    prefill_tq: _L2Callable | None = None
+    decode_tq: _L2Callable | None = None
+    # Per-layer rotation matrices (stacked [num_layers * head_dim, head_dim] BF16).
+    rot_matrices: torch.Tensor | None = None
+    # Prefill TQ scratch buffers (allocated once, reused per prefill call).
+    tq_codebook: torch.Tensor | None = None
+    # QJL (Algorithm 2): per-layer orthogonal projection + K sign/norm caches.
+    qjl_matrices: torch.Tensor | None = None
+    quant_k_signs_cache: torch.Tensor | None = None
+    qjl_norms_cache: torch.Tensor | None = None
 
 
 @dataclass
@@ -168,6 +179,7 @@ class Qwen314BModelRunner(ModelRunner):
         device_id: int,
         save_kernels_dir: str | None,
         l3_trace: bool,
+        kv_cache_manager: object | None = None,
     ) -> None:
         super().__init__()
         self._model_id = model_id
@@ -176,9 +188,14 @@ class Qwen314BModelRunner(ModelRunner):
         self._device_id = device_id
         self._save_kernels_dir = save_kernels_dir
         self._l3_trace = l3_trace
+        self._kv_cache_manager = kv_cache_manager
         self._l2_workers: dict[str, LlmWorker] = {}
         self._l2_programs: dict[int, _L2ProgramHandle] = {}
         self._l2_child_allocs: dict[tuple[str, int], tuple[int, int]] = {}
+        self._l2_dirty_kv_models: set[str] = set()
+        # Logits dumping (set externally via runner._dump_logits_dir = Path(...)).
+        self._dump_logits_dir: Any | None = None  # pathlib.Path | None
+        self._decode_step: int = 0
 
     def _kv_cache_runtime_name(self) -> str:
         if self._compiled.prefill.runtime_name != self._compiled.decode.runtime_name:
@@ -229,49 +246,96 @@ class Qwen314BModelRunner(ModelRunner):
         compiled = self._compiled
         prefill_inputs = self._prepare_prefill_inputs(model, batch)
         dw = compiled.decode_weights
+        model_id = model.config.model_id
         t_prefill_start = time.perf_counter()
 
-        kv_cache = self._kv_caches.get(model.config.model_id)
-        if kv_cache is None:
-            raise RuntimeError(f"KV cache for model {model.config.model_id!r} is not initialized")
-        k_cache = kv_cache.key_pages
-        v_cache = kv_cache.value_pages
-        self._validate_kv_cache_bounds(model, prefill_inputs.block_table, prefill_inputs.slot_mapping, k_cache)
+        use_tq = (
+            compiled.prefill_tq is not None
+            and self._kv_cache_manager.is_quantization_enabled(model_id)
+        )
         logits_padded = torch.zeros(
             (prefill_inputs.actual_batch, compiled.padded_vocab),
             dtype=torch.float32,
         ).share_memory_()
 
-        self._run_l2_program(
-            compiled.prefill,
-            prefill_inputs.hidden,
-            prefill_inputs.seq_lens,
-            prefill_inputs.chunk_lens,
-            prefill_inputs.chunk_offsets,
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_input_rms_weight"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wq"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wk"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wv"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_q_norm_weight"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_k_norm_weight"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, compiled.rope_cos),
-            self._l2_child_tensor(compiled.prefill.runtime_name, compiled.rope_sin),
-            prefill_inputs.block_table,
-            prefill_inputs.slot_mapping,
-            k_cache,
-            v_cache,
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wo"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_post_rms_weight"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_w_gate"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_w_up"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_w_down"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, compiled.final_norm_weight),
-            self._l2_child_tensor(compiled.prefill.runtime_name, compiled.padded_lm_head_weight),
-            logits_padded,
-        )
+        if use_tq:
+            # TQ path: write directly to quantized KV cache, no BF16 needed.
+            # NOTE: TurboQuant prefill_tq assumes single-chunk (non-chunked)
+            # prefill; disable chunked prefill when kv-quant is enabled.
+            quant_k, quant_v, quant_k_norms, quant_v_norms = (
+                self._kv_cache_manager.materialize_full_layer_quant_cache(model_id)
+            )
+            self._run_l2_program(
+                compiled.prefill_tq,
+                prefill_inputs.hidden,
+                prefill_inputs.seq_lens,
+                self._l2_child_tensor(compiled.prefill_tq.runtime_name, dw["decode_input_rms_weight"]),
+                self._l2_child_tensor(compiled.prefill_tq.runtime_name, dw["decode_wq"]),
+                self._l2_child_tensor(compiled.prefill_tq.runtime_name, dw["decode_wk"]),
+                self._l2_child_tensor(compiled.prefill_tq.runtime_name, dw["decode_wv"]),
+                self._l2_child_tensor(compiled.prefill_tq.runtime_name, dw["decode_q_norm_weight"]),
+                self._l2_child_tensor(compiled.prefill_tq.runtime_name, dw["decode_k_norm_weight"]),
+                self._l2_child_tensor(compiled.prefill_tq.runtime_name, compiled.rope_cos),
+                self._l2_child_tensor(compiled.prefill_tq.runtime_name, compiled.rope_sin),
+                prefill_inputs.block_table,
+                prefill_inputs.slot_mapping,
+                quant_k,
+                quant_v,
+                quant_k_norms,
+                quant_v_norms,
+                self._l2_child_tensor(compiled.prefill_tq.runtime_name, compiled.rot_matrices),
+                self._l2_child_tensor(compiled.prefill_tq.runtime_name, compiled.qjl_matrices),
+                compiled.quant_k_signs_cache,
+                compiled.qjl_norms_cache,
+                self._l2_child_tensor(compiled.prefill_tq.runtime_name, dw["decode_wo"]),
+                self._l2_child_tensor(compiled.prefill_tq.runtime_name, dw["decode_post_rms_weight"]),
+                self._l2_child_tensor(compiled.prefill_tq.runtime_name, dw["decode_w_gate"]),
+                self._l2_child_tensor(compiled.prefill_tq.runtime_name, dw["decode_w_up"]),
+                self._l2_child_tensor(compiled.prefill_tq.runtime_name, dw["decode_w_down"]),
+                self._l2_child_tensor(compiled.prefill_tq.runtime_name, compiled.final_norm_weight),
+                self._l2_child_tensor(compiled.prefill_tq.runtime_name, compiled.padded_lm_head_weight),
+                logits_padded,
+            )
+        else:
+            # Standard BF16 path (device-resident paged cache).
+            kv_cache = self._kv_caches.get(model.config.model_id)
+            if kv_cache is None:
+                raise RuntimeError(f"KV cache for model {model.config.model_id!r} is not initialized")
+            k_cache = kv_cache.key_pages
+            v_cache = kv_cache.value_pages
+            self._validate_kv_cache_bounds(model, prefill_inputs.block_table, prefill_inputs.slot_mapping, k_cache)
+            self._run_l2_program(
+                compiled.prefill,
+                prefill_inputs.hidden,
+                prefill_inputs.seq_lens,
+                prefill_inputs.chunk_lens,
+                prefill_inputs.chunk_offsets,
+                self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_input_rms_weight"]),
+                self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wq"]),
+                self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wk"]),
+                self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wv"]),
+                self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_q_norm_weight"]),
+                self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_k_norm_weight"]),
+                self._l2_child_tensor(compiled.prefill.runtime_name, compiled.rope_cos),
+                self._l2_child_tensor(compiled.prefill.runtime_name, compiled.rope_sin),
+                prefill_inputs.block_table,
+                prefill_inputs.slot_mapping,
+                k_cache,
+                v_cache,
+                self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wo"]),
+                self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_post_rms_weight"]),
+                self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_w_gate"]),
+                self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_w_up"]),
+                self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_w_down"]),
+                self._l2_child_tensor(compiled.prefill.runtime_name, compiled.final_norm_weight),
+                self._l2_child_tensor(compiled.prefill.runtime_name, compiled.padded_lm_head_weight),
+                logits_padded,
+            )
+        self._l2_dirty_kv_models.add(model_id)
         if _TIMING_ENABLED:
+            label = "prefill_tq" if use_tq else "prefill"
             print(
-                f"[timing] prefill: fused {len(model.layers)} layers, "
+                f"[timing] {label}: fused {len(model.layers)} layers, "
                 f"{(time.perf_counter() - t_prefill_start) * 1000:.2f} ms",
                 flush=True,
             )
@@ -279,9 +343,15 @@ class Qwen314BModelRunner(ModelRunner):
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             seq_len = int(batch.seq_lens[batch_idx].item())
             alloc.tokens_used = max(alloc.tokens_used, seq_len)
+
+        final_logits = logits_padded[:, : model.config.vocab_size]
+        self._dump_kv_cache(model, batch, phase="prefill", step=0)
+        self._dump_logits(final_logits, phase="prefill", step=0)
+        self._decode_step = 0  # reset for new generation
+
         return PrefillResult(
             last_hidden=None,
-            logits=logits_padded[:, : model.config.vocab_size],
+            logits=final_logits,
         )
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
@@ -301,81 +371,233 @@ class Qwen314BModelRunner(ModelRunner):
         avoids padded rows clobbering an unrelated request's physical page.
         """
         compiled = self._compiled
+        dw = compiled.decode_weights
         model_id = model.config.model_id
+        use_tq = (
+            compiled.decode_tq is not None
+            and self._kv_cache_manager.is_quantization_enabled(model_id)
+        )
         decode_inputs = self._prepare_decode_inputs(model, batch)
         actual_batch = decode_inputs.actual_batch
-        dw = compiled.decode_weights
         rt = compiled.decode.runtime_name
         kernel_batch = model.runtime.max_batch_size
         max_blocks = self._max_blocks_per_seq(model)
-
-        kv_cache = self._kv_caches.get(model_id)
-        if kv_cache is None:
-            raise RuntimeError(f"KV cache for model {model_id!r} is not initialized")
-        k_cache = kv_cache.key_pages
-        v_cache = kv_cache.value_pages
 
         if kernel_batch > compiled.decode_logits_buffer.shape[0]:
             raise ValueError(
                 f"kernel batch {kernel_batch} exceeds logits buffer batch "
                 f"{compiled.decode_logits_buffer.shape[0]}"
             )
+        if use_tq:
+            # TQ decode path: hybrid resident (BF16) + compressed (UINT8) attention.
+            hidden = decode_inputs.hidden
+            quant_k, quant_v, quant_k_norms, quant_v_norms = (
+                self._kv_cache_manager.materialize_full_layer_quant_cache(model_id)
+            )
+            # Build compressed block tracking tensors.
+            cmp_block_table, cmp_num_blocks = self._kv_cache_manager.get_compressed_block_info(
+                model_id, batch,
+            )
 
-        # Pad active inputs up to the fixed kernel batch by replicating row 0.
-        def _pad_rows(active: torch.Tensor, rows_each: int) -> torch.Tensor:
-            view = active.reshape(actual_batch, rows_each)
-            padded = view[0:1].expand(kernel_batch - actual_batch, rows_each)
-            return torch.cat([view, padded], dim=0).reshape(-1).contiguous()
+            # decode_tq outputs logits directly (includes rms_lm_head).
+            decode_logits_out = compiled.decode_logits_buffer
 
-        hidden = torch.zeros((kernel_batch, model.config.hidden_size), dtype=torch.bfloat16)
-        hidden[:actual_batch] = decode_inputs.hidden
-        hidden[actual_batch:] = decode_inputs.hidden[0:1]
-        hidden = hidden.share_memory_()
-        seq_lens = _pad_rows(decode_inputs.seq_lens, 1).to(torch.int32).share_memory_()
-        block_table = _pad_rows(decode_inputs.block_table, max_blocks).to(torch.int32).share_memory_()
-        slot_mapping = _pad_rows(decode_inputs.slot_mapping, 1).to(torch.int32).share_memory_()
+            self._run_l2_program(
+                compiled.decode_tq,
+                hidden,
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, dw["decode_input_rms_weight"]),
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, dw["decode_wq"]),
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, dw["decode_wk"]),
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, dw["decode_wv"]),
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, dw["decode_q_norm_weight"]),
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, dw["decode_k_norm_weight"]),
+                decode_inputs.seq_lens,
+                decode_inputs.block_table,
+                decode_inputs.slot_mapping,
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, compiled.rope_cos),
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, compiled.rope_sin),
+                quant_k,
+                quant_v,
+                quant_k_norms,
+                quant_v_norms,
+                cmp_block_table,
+                cmp_num_blocks,
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, compiled.rot_matrices),
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, compiled.tq_codebook),
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, compiled.qjl_matrices),
+                compiled.quant_k_signs_cache,
+                compiled.qjl_norms_cache,
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, dw["decode_wo"]),
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, dw["decode_post_rms_weight"]),
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, dw["decode_w_gate"]),
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, dw["decode_w_up"]),
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, dw["decode_w_down"]),
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, compiled.final_norm_weight),
+                self._l2_child_tensor(compiled.decode_tq.runtime_name, compiled.padded_lm_head_weight),
+                decode_logits_out,
+            )
+            logits_padded = decode_logits_out
+        else:
+            # Standard BF16 decode path (device-resident, fixed-batch padded).
+            kv_cache = self._kv_caches.get(model_id)
+            if kv_cache is None:
+                raise RuntimeError(f"KV cache for model {model_id!r} is not initialized")
+            k_cache = kv_cache.key_pages
+            v_cache = kv_cache.value_pages
 
-        # Padded block_table / slot_mapping only ever reference row 0's
-        # already-valid pages, so bound-check exactly what the kernel will read.
-        self._validate_kv_cache_bounds(model, block_table, slot_mapping, k_cache)
+            # Pad active inputs up to the fixed kernel batch by replicating row 0.
+            def _pad_rows(active: torch.Tensor, rows_each: int) -> torch.Tensor:
+                view = active.reshape(actual_batch, rows_each)
+                padded = view[0:1].expand(kernel_batch - actual_batch, rows_each)
+                return torch.cat([view, padded], dim=0).reshape(-1).contiguous()
 
-        logits_padded = compiled.decode_logits_buffer  # full [kernel_batch, vocab]; trimmed below
-        # Argument order MUST match decode_layer.decode_fwd (PAGED):
-        #   hidden_states, input_rms_weight, wq, wk, wv, q_norm_weight,
-        #   k_norm_weight, seq_lens, block_table, slot_mapping, rope_cos, rope_sin,
-        #   k_cache, v_cache, wo, w_gate, w_up, w_down, post_rms_weight,
-        #   final_norm_weight, lm_head_weight, out.
-        self._run_l2_program(
-            compiled.decode,
-            hidden,
-            self._l2_child_tensor(rt, dw["decode_input_rms_weight"]),
-            self._l2_child_tensor(rt, dw["decode_wq"]),
-            self._l2_child_tensor(rt, dw["decode_wk"]),
-            self._l2_child_tensor(rt, dw["decode_wv"]),
-            self._l2_child_tensor(rt, dw["decode_q_norm_weight"]),
-            self._l2_child_tensor(rt, dw["decode_k_norm_weight"]),
-            seq_lens,
-            block_table,
-            slot_mapping,
-            self._l2_child_tensor(rt, compiled.rope_cos),
-            self._l2_child_tensor(rt, compiled.rope_sin),
-            k_cache,
-            v_cache,
-            self._l2_child_tensor(rt, dw["decode_wo"]),
-            self._l2_child_tensor(rt, dw["decode_w_gate"]),
-            self._l2_child_tensor(rt, dw["decode_w_up"]),
-            self._l2_child_tensor(rt, dw["decode_w_down"]),
-            self._l2_child_tensor(rt, dw["decode_post_rms_weight"]),
-            self._l2_child_tensor(rt, compiled.final_norm_weight),
-            self._l2_child_tensor(rt, compiled.padded_lm_head_weight),
-            logits_padded,
-        )
+            hidden = torch.zeros((kernel_batch, model.config.hidden_size), dtype=torch.bfloat16)
+            hidden[:actual_batch] = decode_inputs.hidden
+            hidden[actual_batch:] = decode_inputs.hidden[0:1]
+            hidden = hidden.share_memory_()
+            seq_lens = _pad_rows(decode_inputs.seq_lens, 1).to(torch.int32).share_memory_()
+            block_table = _pad_rows(decode_inputs.block_table, max_blocks).to(torch.int32).share_memory_()
+            slot_mapping = _pad_rows(decode_inputs.slot_mapping, 1).to(torch.int32).share_memory_()
+
+            # Padded block_table / slot_mapping only ever reference row 0's
+            # already-valid pages, so bound-check exactly what the kernel will read.
+            self._validate_kv_cache_bounds(model, block_table, slot_mapping, k_cache)
+
+            logits_padded = compiled.decode_logits_buffer  # full [kernel_batch, vocab]; trimmed below
+            self._run_l2_program(
+                compiled.decode,
+                hidden,
+                self._l2_child_tensor(rt, dw["decode_input_rms_weight"]),
+                self._l2_child_tensor(rt, dw["decode_wq"]),
+                self._l2_child_tensor(rt, dw["decode_wk"]),
+                self._l2_child_tensor(rt, dw["decode_wv"]),
+                self._l2_child_tensor(rt, dw["decode_q_norm_weight"]),
+                self._l2_child_tensor(rt, dw["decode_k_norm_weight"]),
+                seq_lens,
+                block_table,
+                slot_mapping,
+                self._l2_child_tensor(rt, compiled.rope_cos),
+                self._l2_child_tensor(rt, compiled.rope_sin),
+                k_cache,
+                v_cache,
+                self._l2_child_tensor(rt, dw["decode_wo"]),
+                self._l2_child_tensor(rt, dw["decode_w_gate"]),
+                self._l2_child_tensor(rt, dw["decode_w_up"]),
+                self._l2_child_tensor(rt, dw["decode_w_down"]),
+                self._l2_child_tensor(rt, dw["decode_post_rms_weight"]),
+                self._l2_child_tensor(rt, compiled.final_norm_weight),
+                self._l2_child_tensor(rt, compiled.padded_lm_head_weight),
+                logits_padded,
+            )
+        self._l2_dirty_kv_models.discard(model.config.model_id)
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
+
+        final_logits = logits_padded[:, : model.config.vocab_size]
+        self._dump_kv_cache(model, batch, phase="decode", step=self._decode_step)
+        self._dump_logits(final_logits, phase="decode", step=self._decode_step)
+        self._decode_step += 1
+
         return DecodeResult(
             hidden_states=decode_inputs.hidden.float(),
             logits=logits_padded[:actual_batch, : model.config.vocab_size].to(decode_inputs.hidden.device),
         )
+
+    def _dump_kv_cache(self, model: RuntimeModel, batch, *, phase: str, step: int) -> None:
+        """If dumping is enabled, save first block of KV cache (all layers) to .npy."""
+        if self._dump_logits_dir is None:
+            return
+        import numpy as np  # noqa: PLC0415
+
+        dump_dir = self._dump_logits_dir
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        model_id = model.config.model_id
+        pool = self._kv_cache_manager._pool(model_id)
+        use_tq = pool.quant_key_indices is not None
+
+        # First physical page of the first request.
+        alloc = batch.kv_allocations[0]
+        page_id = alloc.page_ids[0]
+
+        if use_tq:
+            # Save codebook and rotation matrices once (prefill step 0) for
+            # offline dequantization / comparison.
+            if phase == "prefill" and step == 0:
+                np.save(
+                    dump_dir / "codebook.npy",
+                    self._compiled.tq_codebook.cpu().float().numpy(),
+                )
+                num_layers = pool.num_layers
+                head_dim = pool.head_dim
+                rot_np = (
+                    self._compiled.rot_matrices.cpu()
+                    .reshape(num_layers, head_dim, head_dim)
+                    .float()
+                    .numpy()
+                )
+                np.save(dump_dir / "rot_matrices.npy", rot_np)
+
+            # TQ: quantized indices (uint8) + norms (float32).
+            # Shapes per file: [num_layers, num_kv_heads, page_size, head_dim]
+            np.save(
+                dump_dir / f"{phase}_step{step:04d}_quant_k.npy",
+                pool.quant_key_indices[:, page_id].cpu().numpy(),
+            )
+            np.save(
+                dump_dir / f"{phase}_step{step:04d}_quant_v.npy",
+                pool.quant_val_indices[:, page_id].cpu().numpy(),
+            )
+            np.save(
+                dump_dir / f"{phase}_step{step:04d}_quant_k_norm.npy",
+                pool.quant_key_norms[:, page_id].cpu().numpy(),
+            )
+            np.save(
+                dump_dir / f"{phase}_step{step:04d}_quant_v_norm.npy",
+                pool.quant_val_norms[:, page_id].cpu().numpy(),
+            )
+            print(
+                f"[kv-dump] {phase} step={step} TQ page={page_id} "
+                f"quant_k {pool.quant_key_indices[:, page_id].shape}",
+                flush=True,
+            )
+        else:
+            # FP path: KV cache is in self._kv_key_pages / self._kv_value_pages
+            # (the runner's own tensors, NOT pool.key_pages which belongs to
+            # KvCacheManager and is a separate allocation).  The kernel writes
+            # to the runner's tensors via child-memory, so we must sync from
+            # NPU before reading.
+            self._sync_all_kv_pages_from_npu(model_id, alloc)
+
+            key_pages = self._kv_key_pages[model_id]
+            value_pages = self._kv_value_pages[model_id]
+            np.save(
+                dump_dir / f"{phase}_step{step:04d}_k_cache.npy",
+                key_pages[:, page_id].cpu().float().numpy(),
+            )
+            np.save(
+                dump_dir / f"{phase}_step{step:04d}_v_cache.npy",
+                value_pages[:, page_id].cpu().float().numpy(),
+            )
+            print(
+                f"[kv-dump] {phase} step={step} FP page={page_id} "
+                f"k {key_pages[:, page_id].shape}",
+                flush=True,
+            )
+
+    def _dump_logits(self, logits: torch.Tensor, *, phase: str, step: int) -> None:
+        """If logits dumping is enabled, save full logits to .npy and print a summary."""
+        if self._dump_logits_dir is None:
+            return
+        import numpy as np  # noqa: PLC0415
+
+        dump_dir = self._dump_logits_dir
+        dump_dir.mkdir(parents=True, exist_ok=True)
+
+        logits_np = logits.detach().cpu().float().numpy()
+
+        # Save full logits to numpy file.
+        filepath = dump_dir / f"{phase}_step{step:04d}.npy"
+        np.save(filepath, logits_np)
 
     def _project_logits(self, model: RuntimeModel, hidden: torch.Tensor) -> torch.Tensor:
         """Run final RMSNorm and LM head kernels for a hidden-state batch."""
@@ -522,7 +744,8 @@ class Qwen314BModelRunner(ModelRunner):
 
         key = (runtime_name, storage_ptr)
         alloc = self._l2_child_allocs.get(key)
-        if alloc is None:
+        is_new = alloc is None
+        if is_new:
             worker = self._worker_for_runtime(runtime_name)
             dev_ptr = worker.malloc(storage_nbytes)
             if upload:
@@ -534,12 +757,101 @@ class Qwen314BModelRunner(ModelRunner):
             worker.copy_to(alloc[0], storage_ptr, storage_nbytes)
 
         dev_base, _ = alloc
+        # print(f"[DEBUG _l2_child_tensor] {'NEW' if is_new else 'REUSE'} "
+        #       f"runtime={runtime_name} "
+        #       f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+        #       f"storage_ptr={storage_ptr:#x} dev_ptr={dev_base:#x} "
+        #       f"refresh={refresh}", flush=True)
         shape = tuple(int(dim) for dim in tensor.shape)
         return WorkerTensor(
             data_ptr=dev_base + tensor_offset,
             shape=shape,
             dtype=torch_dtype_to_datatype(tensor.dtype),
         )
+
+    def _sync_all_kv_pages_from_npu(
+        self,
+        model_id: str,
+        alloc: KvAllocation,
+    ) -> None:
+        """Copy ALL written KV pages from NPU back to CPU.
+
+        The FP path writes KV cache via child-memory on the NPU.  The CPU-side
+        ``self._kv_key_pages`` / ``self._kv_value_pages`` tensors are stale
+        until we explicitly copy back.  This method syncs every physical page
+        that has been allocated for the request, across all layers.
+
+        NOTE: We must use the *runner's own* KV tensors (``self._kv_key_pages``)
+        rather than ``pool.key_pages`` from KvCacheManager — they are separate
+        allocations.  Only the runner's tensors were passed to ``_l2_child_tensor``
+        and thus have registered child-memory mappings.
+        """
+        key_pages = self._kv_key_pages.get(model_id)
+        value_pages = self._kv_value_pages.get(model_id)
+        if key_pages is None or key_pages.device.type != "cpu":
+            return
+
+        tokens_used = alloc.tokens_used
+        if tokens_used <= 0:
+            return
+
+        # All physical pages that have been written to.
+        page_size = self._kv_page_sizes[model_id]
+        max_page_idx = (tokens_used - 1) // page_size
+        physical_pages = alloc.page_ids[: max_page_idx + 1]
+        if not physical_pages:
+            return
+
+        num_kv_heads = key_pages.shape[2]
+        head_dim = key_pages.shape[4]
+        # Bytes per page per layer: H * S * D * element_size
+        page_bytes = num_kv_heads * page_size * head_dim * key_pages.element_size()
+
+        # Candidate runtime names: the child-memory allocation could have been
+        # registered by the prefill kernel OR the decode kernel.
+        candidate_runtime_names = []
+        compiled = self._compiled
+        if compiled.prefill is not None:
+            candidate_runtime_names.append(compiled.prefill.runtime_name)
+        if compiled.decode is not None and (
+            compiled.decode.runtime_name not in candidate_runtime_names
+        ):
+            candidate_runtime_names.append(compiled.decode.runtime_name)
+
+        for pages_tensor in (key_pages, value_pages):
+            storage = pages_tensor.untyped_storage()
+            storage_ptr = int(storage.data_ptr())
+
+            # Find the child alloc for this tensor across candidate runtimes.
+            child_alloc = None
+            found_runtime = None
+            for rn in candidate_runtime_names:
+                ca = self._l2_child_allocs.get((rn, storage_ptr))
+                if ca is not None:
+                    child_alloc = ca
+                    found_runtime = rn
+                    break
+            if child_alloc is None:
+                print(
+                    f"[sync-warn] No child alloc found for storage {storage_ptr:#x}, "
+                    f"KV page may be stale",
+                    flush=True,
+                )
+                continue
+
+            dev_ptr = child_alloc[0]
+            worker = self._worker_for_runtime(found_runtime)
+            num_pages_total = key_pages.shape[1]
+            layer_stride = num_pages_total * page_bytes
+
+            for physical_page in physical_pages:
+                for layer_idx in range(key_pages.shape[0]):
+                    offset = layer_idx * layer_stride + physical_page * page_bytes
+                    worker.copy_from(
+                        storage_ptr + offset,
+                        dev_ptr + offset,
+                        page_bytes,
+                    )
 
     @staticmethod
     def _share_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -574,18 +886,21 @@ class Qwen314BModelRunner(ModelRunner):
                 f"compiled program expects {len(param_infos)} arguments, got {len(args)}. Parameters: {names}"
             )
 
-        orch_args = ChipStorageTaskArgs()
+        # ChipStorageTaskArgs requires all tensors added before scalars.
+        # Collect them separately then add tensors first, scalars second.
+        tensor_entries = []
+        scalar_entries = []
         for info, arg in zip(param_infos, args, strict=True):
             if info.shape is None:
                 if not isinstance(arg, ctypes._SimpleCData):
                     raise TypeError(f"scalar parameter {info.name!r} must be passed as a ctypes scalar")
-                orch_args.add_scalar(scalar_to_uint64(arg))
+                scalar_entries.append(arg)
                 continue
             if isinstance(arg, WorkerTensor):
-                orch_args.add_tensor(arg.to_continuous_tensor())
+                tensor_entries.append(arg.to_continuous_tensor())
                 continue
             if isinstance(arg, ContinuousTensor):
-                orch_args.add_tensor(arg)
+                tensor_entries.append(arg)
                 continue
             if not isinstance(arg, torch.Tensor):
                 raise TypeError(f"tensor parameter {info.name!r} expects torch.Tensor, got {type(arg).__name__}")
@@ -595,7 +910,13 @@ class Qwen314BModelRunner(ModelRunner):
                 raise ValueError(f"tensor parameter {info.name!r} must be contiguous")
             if not arg.is_shared():
                 arg.share_memory_()
-            orch_args.add_tensor(make_tensor_arg(arg))
+            tensor_entries.append(make_tensor_arg(arg))
+
+        orch_args = ChipStorageTaskArgs()
+        for t in tensor_entries:
+            orch_args.add_tensor(t)
+        for s in scalar_entries:
+            orch_args.add_scalar(scalar_to_uint64(s))
         return orch_args
 
     # ── L3-wrapped generate: entire prefill + decode loop in one worker.run() ──

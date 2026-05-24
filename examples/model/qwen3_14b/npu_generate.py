@@ -43,7 +43,7 @@ from python.core import GenerateConfig, LLMEngine, RuntimeConfig
 from python.core.kv_cache import KvCacheManager
 from python.profile import get_profiler, merge_profile, profile_span
 from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
-from python.core.types import LoadedModel
+from python.core.types import KvQuantConfig, LoadedModel
 import dataclasses
 
 
@@ -416,6 +416,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="Implies --profile. Also dump per-layer prefill times and "
              "per-decode-step layer breakdowns.",
     )
+    # TurboQuant KV cache compression options
+    parser.add_argument(
+        "--kv-quant",
+        action="store_true",
+        help="Enable TurboQuant KV cache compression.",
+    )
+    parser.add_argument(
+        "--kv-quant-key-bits",
+        type=int,
+        default=4,
+        help="TurboQuant key quantization bits (default: 4).",
+    )
+    parser.add_argument(
+        "--kv-quant-value-bits",
+        type=int,
+        default=4,
+        help="TurboQuant value quantization bits (default: 4).",
+    )
+    parser.add_argument(
+        "--kv-quant-residual-window",
+        type=int,
+        default=128,
+        help="TurboQuant residual quantization window size (default: 128).",
+    )
+    parser.add_argument(
+        "--kv-quant-protected-layers",
+        type=int,
+        default=0,
+        help="Number of protected (unquantized) layers from the bottom (default: 0).",
+    )
+    parser.add_argument(
+        "--kv-quant-protected-bits",
+        type=int,
+        default=4,
+        help="Bit width for protected layers (default: 4).",
+    )
+    parser.add_argument(
+        "--dump-dir",
+        default=None,
+        help="Directory to save per-token logits and KV cache as .npy files "
+             "for FP vs quantized comparison. E.g. --dump-dir /tmp/dump_fp",
+    )
     return parser
 
 
@@ -448,6 +490,18 @@ def main() -> None:
 
     try:
         init_t0 = time.perf_counter()
+
+        kv_quant_config = None
+        if args.kv_quant:
+            kv_quant_config = KvQuantConfig(
+                enabled=True,
+                key_bits=args.kv_quant_key_bits,
+                value_bits=args.kv_quant_value_bits,
+                residual_window=args.kv_quant_residual_window,
+                protected_layers=args.kv_quant_protected_layers,
+                protected_bits=args.kv_quant_protected_bits,
+            )
+
         engine.init_model(
             model_id=args.model_id,
             model_dir=str(model_dir),
@@ -460,6 +514,7 @@ def main() -> None:
                 device="cpu",
                 kv_dtype="bfloat16",
                 weight_dtype="float32",
+                kv_quant_config=kv_quant_config,
             ),
         )
         if collector is not None:
@@ -467,6 +522,15 @@ def main() -> None:
             # Profiling must be installed AFTER init_model: register_model populates
             # executor._compiled[model_id] with the four kernel callables we wrap.
             InstallProfiling(engine, args.model_id, collector)
+
+        # Wire logits + KV cache dumping into the runner (must be after init_model
+        # so the runner has been created and stored in executor._runners).
+        if args.dump_dir:
+            from pathlib import Path as _Path  # noqa: PLC0415
+            _dump_dir = _Path(args.dump_dir)
+            _runner = executor._runners[args.model_id]  # type: ignore[attr-defined]
+            _runner._dump_logits_dir = _dump_dir
+            print(f"[dump] Saving logits + KV cache to {_dump_dir}", flush=True)
 
         config = GenerateConfig(
             max_new_tokens=args.max_new_tokens,

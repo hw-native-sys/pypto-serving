@@ -10,11 +10,29 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 
 import torch
 
 from .types import KvAllocation, ModelConfig, RuntimeConfig
+
+# Lazy import to avoid hard dependency when quantization is disabled.
+_KVCOMPRESSOR = None
+
+
+def _get_kv_compressor_cls():
+    global _KVCOMPRESSOR
+    if _KVCOMPRESSOR is None:
+        from .turboquant.compressor import KVCompressor
+        _KVCOMPRESSOR = KVCompressor
+    return _KVCOMPRESSOR
+
+
+@dataclass
+class _RequestQuantState:
+    """Per-request tracking for KV quantization."""
+    quant_page_count: int = 0  # how many compressed pages stored in quant_* buffers
 
 
 NONE_HASH = hash(("__none__",))
@@ -112,6 +130,14 @@ class _CachePool:
     max_blocks_per_seq: int
     key_pages: torch.Tensor
     value_pages: torch.Tensor
+    # TurboQuant KV cache quantization fields (None when quantization is disabled).
+    kv_compressor: object | None = None
+    kv_quant_config: KvQuantConfig | None = None
+    quant_key_indices: torch.Tensor | None = None
+    quant_key_norms: torch.Tensor | None = None
+    quant_val_indices: torch.Tensor | None = None
+    quant_val_norms: torch.Tensor | None = None
+    request_quant_states: dict = field(default_factory=dict)
 
 
 class KvCacheManager:
@@ -160,7 +186,32 @@ class KvCacheManager:
         if model_id in self._pools:
             return
         max_blocks_per_seq = math.ceil(runtime.max_seq_len / runtime.page_size)
+        # Determine number of bf16 pages.  When TurboQuant is enabled we only
+        # need a small pool: one resident segment per batch slot (for the
+        # residual window) plus enough workspace pages for one full-length
+        # sequence (used temporarily during decode to hold decompressed old
+        # tokens).
+        #
+        # NOTE: The workspace is shared across batch slots — it is only needed
+        # during the restore→kernel→compress cycle.  For batch=1 this formula
+        # is exact.  For batch>1, the caller must serialize the restore/compress
+        # per request so that workspace pages are reused across slots, or set
+        # total_kv_pages explicitly to cover simultaneous workspace demand.
+        kv_quant_config = runtime.kv_quant_config
         num_pages = runtime.total_kv_pages
+        if num_pages is None and kv_quant_config is not None and kv_quant_config.enabled:
+            # NOTE: The fused NPU decode kernel has the per-layer cache stride
+            # (num_pages * num_kv_heads * page_size) baked in at compile time.
+            # Reducing the page count would cause incorrect layer offsets and a
+            # device hang.  Keep the full page count; TurboQuant saves memory by
+            # compressing old tokens in-place (freeing bf16 pages back to the
+            # pool for reuse by *other* requests on the same model).
+            num_pages = runtime.max_batch_size * max_blocks_per_seq
+            print(
+                f"[KV-Quant] Using full bf16 pages ({num_pages}) to match "
+                f"compiled kernel stride. Compression frees pages for reuse.",
+                flush=True,
+            )
         if num_pages is None:
             num_pages = runtime.max_batch_size * max_blocks_per_seq
         self._init_blocks(num_pages, runtime.page_size)
@@ -175,6 +226,47 @@ class KvCacheManager:
             device=runtime.device,
         )
         value_pages = torch.zeros_like(key_pages)
+        # Initialize KV quantization if configured
+        kv_compressor = None
+        quant_key_indices = None
+        quant_key_norms = None
+        quant_val_indices = None
+        quant_val_norms = None
+        if kv_quant_config is not None and kv_quant_config.enabled:
+            print(f"[KV-Quant] Creating KVCompressor for model {model_id} ...", flush=True)
+            KVCompressor = _get_kv_compressor_cls()
+            kv_compressor = KVCompressor(
+                head_dim=config.head_dim,
+                num_layers=config.num_hidden_layers,
+                config=kv_quant_config,
+                device=runtime.device,
+            )
+            print(f"[KV-Quant] KVCompressor for model {model_id} created", flush=True)
+
+            # Compressed storage: non-packed uint8, one byte per element.
+            # For int4 (n_levels=16), each element stores values 0-15 in uint8.
+            # Shape: [num_layers, max_seq_pages, num_kv_heads, page_size, head_dim]
+            quant_key_indices = torch.zeros(
+                config.num_hidden_layers, max_blocks_per_seq,
+                config.num_key_value_heads, runtime.page_size, config.head_dim,
+                dtype=torch.uint8, device=runtime.device,
+            )
+            quant_key_norms = torch.zeros(
+                config.num_hidden_layers, max_blocks_per_seq,
+                config.num_key_value_heads, runtime.page_size, 1,
+                dtype=torch.float32, device=runtime.device,
+            )
+            quant_val_indices = torch.zeros(
+                config.num_hidden_layers, max_blocks_per_seq,
+                config.num_key_value_heads, runtime.page_size, config.head_dim,
+                dtype=torch.uint8, device=runtime.device,
+            )
+            quant_val_norms = torch.zeros(
+                config.num_hidden_layers, max_blocks_per_seq,
+                config.num_key_value_heads, runtime.page_size, 1,
+                dtype=torch.float32, device=runtime.device,
+            )
+
         self._pools[model_id] = _CachePool(
             page_size=runtime.page_size,
             num_layers=config.num_hidden_layers,
@@ -183,6 +275,12 @@ class KvCacheManager:
             max_blocks_per_seq=max_blocks_per_seq,
             key_pages=key_pages,
             value_pages=value_pages,
+            kv_compressor=kv_compressor,
+            kv_quant_config=kv_quant_config,
+            quant_key_indices=quant_key_indices,
+            quant_key_norms=quant_key_norms,
+            quant_val_indices=quant_val_indices,
+            quant_val_norms=quant_val_norms,
         )
 
     def allocate_for_prompt(self, model_id: str, request_id: str, prompt_len: int) -> KvAllocation:
@@ -401,12 +499,211 @@ class KvCacheManager:
             pool.value_pages[layer_idx].reshape(-1, pool.head_dim),
         )
 
+    def materialize_full_layer_cache(self, model_id: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return flattened K/V cache views stacked across every model layer.
+
+        Use this API for fused or L3 decode kernels that select layer i via
+        an arithmetic offset (layer_idx * cache_rows_per_layer) on a single
+        cache tensor. The pool is already laid out as
+        ``[num_layers, num_pages, num_kv_heads, page_size, head_dim]`` so the
+        flat view is zero-copy.
+
+        Returns:
+            (key_cache_all, value_cache_all) each shaped
+            [num_layers * num_pages * num_kv_heads * page_size, head_dim].
+        """
+        pool = self._pool(model_id)
+        return (
+            pool.key_pages.reshape(-1, pool.head_dim),
+            pool.value_pages.reshape(-1, pool.head_dim),
+        )
+
+    def materialize_single_layer_quant_cache(self, model_id: str, layer_idx: int):
+        """Return flattened quant K/V cache views for one layer.
+
+        Returns (quant_k, quant_v, quant_k_norms, quant_v_norms) each as 2D
+        tensors suitable for kernel arguments. Returns (None, None, None, None)
+        if quantization is not enabled.
+        """
+        pool = self._pool(model_id)
+        if pool.quant_key_indices is None:
+            return None, None, None, None
+        rows_per_layer = pool.max_blocks_per_seq * pool.num_kv_heads * pool.page_size
+        return (
+            pool.quant_key_indices[layer_idx].reshape(-1, pool.head_dim),
+            pool.quant_val_indices[layer_idx].reshape(-1, pool.head_dim),
+            pool.quant_key_norms[layer_idx].reshape(-1, 1),
+            pool.quant_val_norms[layer_idx].reshape(-1, 1),
+        )
+
+    def materialize_full_layer_quant_cache(self, model_id: str):
+        """Return flattened quant K/V cache views across all layers.
+
+        Returns (quant_k, quant_v, quant_k_norms, quant_v_norms) each as 2D
+        tensors. Returns (None, None, None, None) if quantization is not enabled.
+        """
+        pool = self._pool(model_id)
+        if pool.quant_key_indices is None:
+            return None, None, None, None
+        return (
+            pool.quant_key_indices.reshape(-1, pool.head_dim),
+            pool.quant_val_indices.reshape(-1, pool.head_dim),
+            pool.quant_key_norms.reshape(-1, 1),
+            pool.quant_val_norms.reshape(-1, 1),
+        )
+
     def free(self, alloc: KvAllocation) -> None:
         """Return an allocation's pages to the model pool."""
         self.release_request(alloc.request_id)
         alloc.page_ids.clear()
         alloc.tokens_capacity = 0
         alloc.tokens_used = 0
+        # Clean up per-request quantization state.
+        self._pool(alloc.model_id).request_quant_states.pop(alloc.request_id, None)
+
+    # ── KV cache quantization ──
+
+    def is_quantization_enabled(self, model_id: str) -> bool:
+        """Return whether KV cache quantization is enabled for a model."""
+        pool = self._pool(model_id)
+        return pool.kv_compressor is not None
+
+    def get_compressed_block_info(self, model_id: str, batch) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build cmp_block_table and cmp_num_blocks for the decode_tq kernel.
+
+        The TQ decode kernel reads ALL context blocks from the compressed
+        (quantized) cache.  cmp_block_table maps logical block positions to
+        physical page IDs in the quant cache (same layout as block_table).
+        cmp_num_blocks is the number of context blocks per request
+        (ceil(seq_len / page_size)).
+
+        Returns:
+            cmp_block_table: [batch * max_blocks_per_seq] INT32 — physical
+                block IDs of compressed pages for each request.
+            cmp_num_blocks: [batch] INT32 — number of compressed blocks per
+                request.
+        """
+        import torch
+        pool = self._pool(model_id)
+        max_blocks = pool.max_blocks_per_seq
+        actual_batch = len(batch.request_ids) if hasattr(batch, 'request_ids') else len(batch.kv_allocations)
+        cmp_block_table = torch.zeros(actual_batch * max_blocks, dtype=torch.int32)
+        cmp_num_blocks = torch.zeros(actual_batch, dtype=torch.int32)
+
+        for i, alloc in enumerate(batch.kv_allocations):
+            # All blocks written by prefill_tq are compressed.
+            # Physical page IDs come from the allocation's page_ids.
+            n_pages = len(alloc.page_ids)
+            ctx_blocks = min(n_pages, max_blocks)
+            cmp_num_blocks[i] = ctx_blocks
+            for j in range(ctx_blocks):
+                cmp_block_table[i * max_blocks + j] = alloc.page_ids[j]
+
+        return cmp_block_table.share_memory_(), cmp_num_blocks.share_memory_()
+
+    def get_quant_state(self, model_id: str, request_id: str) -> _RequestQuantState:
+        """Get or create per-request quantization state."""
+        pool = self._pool(model_id)
+        if request_id not in pool.request_quant_states:
+            pool.request_quant_states[request_id] = _RequestQuantState()
+        return pool.request_quant_states[request_id]
+
+    def _layer_key_bits(self, pool: _CachePool, layer_idx: int) -> int:
+        """Return the effective key bits for a layer (respects protected layers)."""
+        cfg = pool.kv_quant_config
+        protected = cfg.protected_layers
+        if layer_idx < protected or layer_idx >= pool.num_layers - protected:
+            return cfg.protected_bits
+        return cfg.key_bits
+
+    def _layer_val_bits(self, pool: _CachePool, layer_idx: int) -> int:
+        """Return the effective value bits for a layer (respects protected layers)."""
+        cfg = pool.kv_quant_config
+        protected = cfg.protected_layers
+        if layer_idx < protected or layer_idx >= pool.num_layers - protected:
+            return cfg.protected_bits
+        return cfg.value_bits
+
+    def compress_to_quant(self, model_id: str, alloc: KvAllocation, npu_runner=None) -> list[int]:
+        """Quantize ALL tokens into quant_* buffers and free their BF16 pages.
+
+        DEPRECATED: With prefill_tq writing directly to quant format, this method
+        is no longer needed for the prefill path. Kept for potential decode-time
+        residual window migration (not yet implemented).
+        """
+        pool = self._pool(model_id)
+        if pool.kv_compressor is None or pool.kv_quant_config is None:
+            return []
+        if pool.quant_key_indices is None:
+            return []
+        return []
+
+    def print_kv_cache_memory(self, model_id: str) -> None:
+        """Calculate and print KV cache memory usage for a model."""
+        pool = self._pool(model_id)
+
+        single_tensor_bytes = pool.key_pages.numel() * pool.key_pages.element_size()
+        total_kv_bytes = single_tensor_bytes * 2
+
+        dtype_size = pool.key_pages.element_size()
+        per_token_bytes = 2 * pool.num_layers * pool.num_kv_heads * pool.head_dim * dtype_size
+
+        total_pages = pool.key_pages.shape[1]
+        free_pages = self.num_free_blocks
+        used_pages = total_pages - free_pages
+        max_seq_len = pool.max_blocks_per_seq * pool.page_size
+
+        def _fmt(b: int) -> str:
+            if b >= 1024 ** 3:
+                return f"{b / 1024 ** 3:.2f} GiB"
+            return f"{b / 1024 ** 2:.2f} MiB"
+
+        print(f"[KV Cache] model_id = {model_id}", flush=True)
+        print(f"[KV Cache] dtype = {pool.key_pages.dtype}, element_size = {dtype_size} bytes", flush=True)
+        print(f"[KV Cache] shape per tensor = {list(pool.key_pages.shape)} "
+              f"[layers={pool.num_layers}, pages={total_pages}, "
+              f"kv_heads={pool.num_kv_heads}, page_size={pool.page_size}, head_dim={pool.head_dim}]", flush=True)
+        print(f"[KV Cache] key_pages   = {_fmt(single_tensor_bytes)}", flush=True)
+        print(f"[KV Cache] value_pages = {_fmt(single_tensor_bytes)}", flush=True)
+        print(f"[KV Cache] total KV cache memory = {_fmt(total_kv_bytes)}", flush=True)
+        print(f"[KV Cache] per-token memory = {per_token_bytes} bytes ({per_token_bytes / 1024:.2f} KiB)", flush=True)
+        print(f"[KV Cache] pages: total={total_pages}, free={free_pages}, used={used_pages}", flush=True)
+        print(f"[KV Cache] max_seq_len per request = {max_seq_len} tokens "
+              f"(max_blocks_per_seq={pool.max_blocks_per_seq}, page_size={pool.page_size})", flush=True)
+
+        if pool.kv_compressor is not None:
+            stats = self.quantization_stats(model_id)
+            quant_bytes = stats.get("quant_buffer_bytes", 0)
+            total_extra = quant_bytes
+            print(f"[KV Cache] quant buffers = {_fmt(quant_bytes)}", flush=True)
+            if total_kv_bytes > 0:
+                print(f"[KV Cache] total (bf16 + quant) = {_fmt(total_kv_bytes + total_extra)}", flush=True)
+            pages_per_seq_uncompressed = pool.max_blocks_per_seq
+            print(
+                f"[KV Cache] pages per request: pool={total_pages}, "
+                f"uncompressed would need={pages_per_seq_uncompressed} per request",
+                flush=True,
+            )
+
+    def quantization_stats(self, model_id: str) -> dict:
+        """Return memory usage stats for compressed KV cache."""
+        pool = self._pool(model_id)
+        if pool.kv_compressor is None:
+            return {"enabled": False}
+        quant_bytes = 0
+        if pool.quant_key_indices is not None:
+            quant_bytes += pool.quant_key_indices.numel() * pool.quant_key_indices.element_size()
+        if pool.quant_key_norms is not None:
+            quant_bytes += pool.quant_key_norms.numel() * pool.quant_key_norms.element_size()
+        if pool.quant_val_indices is not None:
+            quant_bytes += pool.quant_val_indices.numel() * pool.quant_val_indices.element_size()
+        if pool.quant_val_norms is not None:
+            quant_bytes += pool.quant_val_norms.numel() * pool.quant_val_norms.element_size()
+        return {
+            "enabled": True,
+            "quant_buffer_bytes": quant_bytes,
+            "quant_requests": len(pool.request_quant_states),
+        }
 
     def _pool(self, model_id: str) -> _CachePool:
         """Return the registered cache pool for a model."""
