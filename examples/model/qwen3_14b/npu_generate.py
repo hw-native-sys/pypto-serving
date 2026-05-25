@@ -376,7 +376,7 @@ def main() -> None:
         model_dir=str(model_dir),
         model_format="huggingface",
         runtime_config=RuntimeConfig(
-            page_size=256,
+            page_size=128,
             max_batch_size=16,
             max_seq_len=args.max_seq_len,
             max_new_tokens=args.max_new_tokens,

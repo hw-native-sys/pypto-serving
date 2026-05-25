@@ -92,6 +92,8 @@ class _CompiledKernels:
     padded_lm_head_weight: torch.Tensor
     layers: list[_KernelLayerWeights]
     decode_weights: dict[str, torch.Tensor]
+    decode_logits_buffer: torch.Tensor
+    decode_block_table_stride: int | None = None
     # L3-wrapped generate artifacts. Populated only when l3_mode=True.
     stacked_weights: dict[str, torch.Tensor] | None = None
     l3_generate_chip_callables: dict[str, object] | None = None
@@ -218,12 +220,7 @@ class Qwen314BModelRunner(ModelRunner):
         return PrefillResult(last_hidden=last_hidden, logits=logits)
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
-        """Run the fused all-layer decode kernel and project next-token logits."""
-        # The fused decode kernel (decode_full.py) processes all
-        # layers in one call: weights are pre-stacked into [num_layers * ...]
-        # tensors at compile time and the KV cache is the full multi-layer
-        # buffer. Argument order mirrors the kernel signature in
-        # build_qwen3_decode_program.qwen3_decode.
+        """Run the JIT all-layer decode kernel and return next-token logits."""
         compiled = self._compiled
         decode_inputs = self._prepare_decode_inputs(model, batch)
         hidden = decode_inputs.hidden
@@ -233,8 +230,13 @@ class Qwen314BModelRunner(ModelRunner):
             model.config.model_id,
         )
         refresh_kv_cache = model.config.model_id in self._l2_dirty_kv_models
-        out = torch.zeros_like(hidden)
 
+        if decode_inputs.actual_batch > compiled.decode_logits_buffer.shape[0]:
+            raise ValueError(
+                f"decode batch {decode_inputs.actual_batch} exceeds logits buffer batch "
+                f"{compiled.decode_logits_buffer.shape[0]}"
+            )
+        logits_padded = compiled.decode_logits_buffer[: decode_inputs.actual_batch]
         if isinstance(compiled.decode, _L2Callable):
             self._run_l2_program(
                 compiled.decode,
@@ -257,7 +259,9 @@ class Qwen314BModelRunner(ModelRunner):
                 self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_w_gate"]),
                 self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_w_up"]),
                 self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_w_down"]),
-                out,
+                self._l2_child_tensor(compiled.decode.runtime_name, compiled.final_norm_weight),
+                self._l2_child_tensor(compiled.decode.runtime_name, compiled.padded_lm_head_weight),
+                logits_padded,
             )
         else:
             compiled.decode(
@@ -280,17 +284,18 @@ class Qwen314BModelRunner(ModelRunner):
                 dw["decode_w_gate"],
                 dw["decode_w_up"],
                 dw["decode_w_down"],
-                out,
+                compiled.final_norm_weight,
+                compiled.padded_lm_head_weight,
+                logits_padded,
                 config=None,
             )
         self._l2_dirty_kv_models.discard(model.config.model_id)
-
-        final_hidden = out.float()
-
-        logits = self._project_logits(model, final_hidden)
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
-        return DecodeResult(hidden_states=final_hidden, logits=logits)
+        return DecodeResult(
+            hidden_states=hidden.float(),
+            logits=logits_padded[:, : model.config.vocab_size].to(hidden.device),
+        )
 
     def _project_logits(self, model: RuntimeModel, hidden: torch.Tensor) -> torch.Tensor:
         """Run final RMSNorm and LM head kernels for a hidden-state batch."""
@@ -1010,7 +1015,7 @@ class Qwen314BModelRunner(ModelRunner):
         """Pack active decode requests into fused decode-kernel inputs."""
         actual_batch = self._validate_batch_size(model, len(batch.kv_allocations))
         hidden_size = model.config.hidden_size
-        max_blocks = self._max_blocks_per_seq(model)
+        max_blocks = self._compiled.decode_block_table_stride or self._max_blocks_per_seq(model)
 
         hidden = torch.zeros((actual_batch, hidden_size), dtype=torch.bfloat16)
         seq_lens = torch.empty((actual_batch,), dtype=torch.int32)
