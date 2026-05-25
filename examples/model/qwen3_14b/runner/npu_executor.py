@@ -100,34 +100,6 @@ def _load_pypto_lib_qwen14b_module(module_name: str) -> object:
     return module
 
 
-def _patch_orch_make_tensor_arg(module: object) -> None:
-    """Allow ``make_tensor_arg`` in a generated orchestration module to pass
-    ``ContinuousTensor`` objects through unchanged.
-
-    The generated ``host_orch.py`` always calls ``make_tensor_arg(t)`` for
-    every entry in the ``tensors`` dict.  When we pre-upload static weights
-    and replace them with ``ContinuousTensor(child_memory=True)`` objects,
-    the default ``make_tensor_arg`` (which expects a ``torch.Tensor``) would
-    crash.  Patching it here lets child_memory tensors pass through as-is
-    so the runtime skips H2D/D2H for those buffers.
-    """
-    try:
-        from simpler.task_interface import ContinuousTensor  # noqa: PLC0415
-    except ImportError:
-        return
-    _orig = getattr(module, "make_tensor_arg", None)
-    if _orig is None or getattr(_orig, "_child_memory_patched", False):
-        return
-
-    def _patched(tensor: object) -> object:
-        if isinstance(tensor, ContinuousTensor):
-            return tensor
-        return _orig(tensor)  # type: ignore[misc]
-
-    _patched._child_memory_patched = True  # type: ignore[attr-defined]
-    module.make_tensor_arg = _patched  # type: ignore[attr-defined]
-
-
 class _StackedLayerView:
     """Adapter exposing HF-format LayerWeights in kernel orientation.
 
@@ -410,7 +382,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 profiling=_rc.compile_profiling,
                 distributed_config=DistributedConfig(
                     device_ids=[self._device_id],
-                    block_dim=3,
+                    block_dim=24,
                     num_sub_workers=0,
                     aicpu_thread_num=4,
                 ),
@@ -428,73 +400,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 head_dim=model.config.head_dim,
             )
             _mark("stack_layer_weights")
-
-        # L3-wrapped generate: pre-extract l3_generate setup artifacts
-        # (expensive compile_and_assemble + module loading done once,
-        # reused per generate call).
-        l3_generate_chip_callables: dict[str, object] | None = None
-        l3_generate_entry_fn: object | None = None
-        l3_generate_sub_worker_fns: dict[str, object] | None = None
-        l3_generate_dc: object | None = None
-        l3_generate_platform: str | None = None
-        l3_generate_runtime_name: str | None = None
-        l3_generate_param_infos: object | None = None
-        if self._l3_mode:
-            from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
-            from pypto.runtime.distributed_runner import _load_generated_module  # noqa: PLC0415
-            from pypto.pypto_core.ir import FunctionType  # noqa: PLC0415
-
-            # Pre-extract l3_generate setup artifacts.
-            lg_dc = l3_generate._distributed_config
-            lg_output_dir = l3_generate.output_dir
-            lg_chip_callables: dict[str, object] = {}
-            lg_runtime_name = "tensormap_and_ringbuffer"
-            lg_next_levels_dir = lg_output_dir / "next_levels"
-            for func in l3_generate._program.functions.values():
-                if func.func_type in (FunctionType.Orchestration, FunctionType.Opaque):
-                    chip_dir = lg_next_levels_dir / func.name
-                    if chip_dir.exists():
-                        cc, lg_runtime_name, _ = compile_and_assemble(
-                            chip_dir, l3_generate.platform,
-                        )
-                        lg_chip_callables[func.name] = cc
-            lg_orch_path = lg_output_dir / "orchestration" / "host_orch.py"
-            lg_orch_module = _load_generated_module(lg_orch_path)
-            # Patch make_tensor_arg so pre-uploaded ContinuousTensor objects
-            # (child_memory=True) are passed through unchanged instead of
-            # triggering a crash when the generated code calls make_tensor_arg
-            # on a non-torch.Tensor value.
-            _patch_orch_make_tensor_arg(lg_orch_module)
-            lg_entry_fn = None
-            for attr_name in ("entry", "host_orch"):
-                lg_entry_fn = getattr(lg_orch_module, attr_name, None)
-                if lg_entry_fn is not None:
-                    break
-            if lg_entry_fn is None:
-                for name in dir(lg_orch_module):
-                    obj = getattr(lg_orch_module, name)
-                    if callable(obj) and not name.startswith("_"):
-                        lg_entry_fn = obj
-                        break
-            lg_sub_worker_fns: dict[str, object] = {}
-            lg_sub_workers_dir = lg_output_dir / "sub_workers"
-            if lg_sub_workers_dir.exists():
-                for py_file in sorted(lg_sub_workers_dir.glob("*.py")):
-                    mod = _load_generated_module(py_file)
-                    fn_name = py_file.stem
-                    fn = getattr(mod, fn_name, None)
-                    if fn is not None:
-                        lg_sub_worker_fns[fn_name] = fn
-            lg_param_infos, _, _ = l3_generate._get_metadata()
-
-            l3_generate_chip_callables = lg_chip_callables
-            l3_generate_entry_fn = lg_entry_fn
-            l3_generate_sub_worker_fns = lg_sub_worker_fns
-            l3_generate_dc = lg_dc
-            l3_generate_platform = l3_generate.platform
-            l3_generate_runtime_name = lg_runtime_name
-            l3_generate_param_infos = lg_param_infos
-            _mark("l3_extract_artifacts")
 
         lm_head_weight = model.lm_head
         if padded_vocab != lm_head_weight.shape[0]:
@@ -535,13 +440,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             layers=layers,
             decode_weights=decode_weights,
             stacked_weights=stacked_weights,
-            l3_generate_chip_callables=l3_generate_chip_callables,
-            l3_generate_entry_fn=l3_generate_entry_fn,
-            l3_generate_sub_worker_fns=l3_generate_sub_worker_fns,
-            l3_generate_dc=l3_generate_dc,
-            l3_generate_platform=l3_generate_platform,
-            l3_generate_runtime_name=l3_generate_runtime_name,
-            l3_generate_param_infos=l3_generate_param_infos,
+            l3_generate_program=l3_generate,
         )
 
     def _compile_l2_callable(self, name: str, program: object) -> _L2Callable:

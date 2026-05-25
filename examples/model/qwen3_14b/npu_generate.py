@@ -367,13 +367,21 @@ def main() -> None:
         executor=executor,
     )
 
+    try:
+        _run(engine, args, collector)
+    finally:
+        # Release forked workers + device-resident weights/KV before exit.
+        engine.close()
+
+
+def _run(engine: LLMEngine, args: argparse.Namespace, collector: "_TimingCollector | None") -> None:
     if args.num_layers_override is not None:
         _install_num_layers_override(engine, args.num_layers_override)
 
     init_t0 = time.perf_counter()
     engine.init_model(
         model_id=args.model_id,
-        model_dir=str(model_dir),
+        model_dir=str(Path(args.model_dir).resolve()),
         model_format="huggingface",
         runtime_config=RuntimeConfig(
             page_size=256,

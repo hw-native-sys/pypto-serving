@@ -90,3 +90,10 @@ class ModelExecutor(ABC):
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
         """Run one decode step for active requests and return next-token logits."""
         raise NotImplementedError
+
+    def close(self) -> None:
+        """Release any backend resources held by this executor.
+
+        Default is a no-op; backends holding device/worker state override this.
+        Idempotent: callers may invoke it more than once.
+        """

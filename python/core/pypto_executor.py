@@ -47,9 +47,31 @@ class PyptoExecutor(ModelExecutor, ABC):
 
     def register_model(self, model_id: str, record: ModelRecord) -> None:
         """Compile kernels for ``record`` and attach a runner to ``model_id``."""
+        # Releasing an existing runner before overwrite prevents leaking its
+        # forked worker(s) and device-resident buffers on re-registration.
+        existing = self._runners.pop(model_id, None)
+        if existing is not None:
+            existing.close()
         compiled = self._compile_model(record.runtime_model)
         self._compiled[model_id] = compiled
         self._runners[model_id] = self._create_runner(model_id, compiled)
+
+    def close(self) -> None:
+        """Close every registered runner and drop compiled artifacts.
+
+        Idempotent. Each runner is closed independently so one failure does not
+        strand the rest; the registries are cleared regardless.
+        """
+        errors: list[Exception] = []
+        for runner in self._runners.values():
+            try:
+                runner.close()
+            except Exception as exc:  # noqa: BLE001 - surface after closing the rest
+                errors.append(exc)
+        self._runners.clear()
+        self._compiled.clear()
+        if errors:
+            raise errors[0]
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         """Delegate prefill execution to the registered model runner."""

@@ -26,3 +26,10 @@ class ModelRunner(ABC):
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
         """Run the compiled decode path for one batch."""
         raise NotImplementedError
+
+    def close(self) -> None:
+        """Release any device/worker resources held by this runner.
+
+        Default is a no-op so runners without resident state need no override.
+        Idempotent: callers may invoke it more than once.
+        """

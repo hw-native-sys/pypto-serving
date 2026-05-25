@@ -94,13 +94,11 @@ class _CompiledKernels:
     decode_weights: dict[str, torch.Tensor]
     # L3-wrapped generate artifacts. Populated only when l3_mode=True.
     stacked_weights: dict[str, torch.Tensor] | None = None
-    l3_generate_chip_callables: dict[str, object] | None = None
-    l3_generate_entry_fn: object | None = None
-    l3_generate_sub_worker_fns: dict[str, object] | None = None
-    l3_generate_dc: object | None = None  # DistributedConfig
-    l3_generate_platform: str | None = None
-    l3_generate_runtime_name: str | None = None
-    l3_generate_param_infos: object | None = None
+    # Compiled L3 generate program (pypto DistributedCompiledProgram). The
+    # runner calls .prepare(sub_worker_overrides=...) on it once to obtain a
+    # reusable DistributedRuntime; setup (assemble + Worker fork) happens once
+    # and every generate request dispatches on the held Worker.
+    l3_generate_program: object | None = None
 
 
 @dataclass
@@ -133,6 +131,44 @@ class _L2ProgramHandle:
     runtime_name: str
 
 
+@dataclass
+class _L3Runtime:
+    """Reusable L3 generate handle: prepared once, dispatched per request.
+
+    Holds the pypto ``DistributedRuntime`` (assembled + forked once via
+    ``prepare()``) plus all fixed-size shared-memory IO buffers and the
+    worker-resident weight/KV ``DeviceTensor`` handles. ``args`` is the
+    positional argument tuple for ``rt(*args)`` in kernel-parameter order;
+    its host buffers are reused in place across requests and the weight
+    ``DeviceTensor`` objects stay device-resident.
+    """
+
+    rt: Any  # pypto DistributedRuntime
+    args: tuple[Any, ...]
+    # Per-request host buffers (filled in place before each dispatch).
+    prefill_hidden: torch.Tensor
+    prefill_seq_lens: torch.Tensor
+    prefill_slot_mapping: torch.Tensor
+    block_table: torch.Tensor
+    decode_hidden_buf: torch.Tensor
+    decode_seq_lens: torch.Tensor
+    decode_slot_mapping_buf: torch.Tensor
+    decode_out_storage: torch.Tensor  # rms_x; decode_out is the [:batch] view
+    # Sub-worker shared state (read in the forked child, reset per request).
+    done_flag: torch.Tensor
+    generated_ids: torch.Tensor
+    token_count: torch.Tensor
+    eos_id_buf: torch.Tensor
+    max_new_tokens_buf: torch.Tensor
+    page_ids_buf: torch.Tensor
+    num_pages_buf: torch.Tensor
+    # KV cache: device-resident buffers + persistent host pool views for sync.
+    kv_k: Any  # DeviceTensor
+    kv_v: Any  # DeviceTensor
+    kv_k_host: torch.Tensor
+    kv_v_host: torch.Tensor
+
+
 class Qwen314BModelRunner(ModelRunner):
     """Runtime wrapper for one Qwen3-14B model's compiled PyPTO kernels."""
 
@@ -158,6 +194,9 @@ class Qwen314BModelRunner(ModelRunner):
         self._l2_programs: dict[int, _L2ProgramHandle] = {}
         self._l2_child_allocs: dict[tuple[str, int], tuple[int, int]] = {}
         self._l2_dirty_kv_models: set[str] = set()
+        # One reusable L3 generate handle per model (prepared lazily on first
+        # run_generate_l3 call, dispatched per request).
+        self._l3_runtimes: dict[str, _L3Runtime] = {}
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         """Run layer-by-layer prompt prefill and project next-token logits."""
@@ -447,7 +486,12 @@ class Qwen314BModelRunner(ModelRunner):
         return tensor
 
     def close(self) -> None:
-        """Release non-L3 child-memory allocations and L2 workers."""
+        """Release L3 runtimes, non-L3 child-memory allocations, and L2 workers."""
+        # Close reusable L3 generate handles (releases the held Worker + its
+        # device-resident weight/KV buffers).
+        for lr in self._l3_runtimes.values():
+            lr.rt.close()
+        self._l3_runtimes.clear()
         for (runtime_name, _), (dev_ptr, _nbytes) in list(self._l2_child_allocs.items()):
             worker = self._l2_workers.get(runtime_name)
             if worker is not None and worker.initialized:
@@ -496,7 +540,11 @@ class Qwen314BModelRunner(ModelRunner):
             orch_args.add_tensor(make_tensor_arg(arg))
         return orch_args
 
-    # ── L3-wrapped generate: entire prefill + decode loop in one worker.run() ──
+    # ── L3-wrapped generate: entire prefill + decode loop in one dispatch ──
+    #
+    # Setup (assemble + Worker fork + static-weight upload) happens once per
+    # model via DistributedCompiledProgram.prepare(); each request fills the
+    # fixed shared buffers in place and dispatches on the held DistributedRuntime.
 
     def run_generate_l3(
         self,
@@ -505,20 +553,27 @@ class Qwen314BModelRunner(ModelRunner):
         max_new_tokens: int,
         eos_token_id: int | None,
     ) -> tuple[list[int], torch.Tensor]:
-        """Run the full generate loop inside a single Worker(level=3).
+        """Run the full generate loop on a reusable L3 DistributedRuntime.
 
-        Dispatches prefill chunks + final_rms + lm_head + decode loop entirely
-        within one worker.run() call, using sub_worker for CPU-side sampling
-        and embedding lookup between device dispatches.
+        host_orch drives prefill + final_rms + lm_head + the unrolled decode
+        loop in a single dispatch; the sample_and_prepare sub-worker performs
+        CPU-side sampling and embedding lookup between decode steps. The worker
+        and resident weights are prepared once (see _ensure_l3_runtime) and
+        reused; this call only refreshes per-request buffers and dispatches.
 
         Returns (generated_token_ids, final_hidden).
         """
-        from simpler.task_interface import CallConfig  # noqa: PLC0415
-        from simpler.worker import Worker  # noqa: PLC0415
+        compiled = self._compiled
+        if compiled.l3_generate_program is None:
+            raise RuntimeError("L3 generate program not compiled.")
+        if max_new_tokens > model.runtime.max_new_tokens:
+            raise ValueError(
+                f"max_new_tokens={max_new_tokens} exceeds compiled L3 limit "
+                f"{model.runtime.max_new_tokens}"
+            )
 
-        _verbose = self._l3_trace
         timer = StageTimer(
-            enabled=_verbose,
+            enabled=self._l3_trace,
             prefix="L3-breakdown",
             title="run_generate_l3 stage timings",
         )
@@ -526,423 +581,242 @@ class Qwen314BModelRunner(ModelRunner):
         def _mark(label: str) -> None:
             timer.mark(label)
 
-        compiled = self._compiled
-        if compiled.l3_generate_chip_callables is None:
-            raise RuntimeError("L3 generate artifacts not compiled.")
-        if max_new_tokens > model.runtime.max_new_tokens:
-            raise ValueError(
-                f"max_new_tokens={max_new_tokens} exceeds compiled L3 limit "
-                f"{model.runtime.max_new_tokens}"
-            )
+        lr = self._ensure_l3_runtime(model)
+        _mark("ensure_l3_runtime")
 
-        _mark("entry_validate")
         prefill_inputs = self._prepare_prefill_inputs(model, prefill_batch)
-        _mark("prepare_prefill_inputs")
         actual_batch = prefill_inputs.actual_batch
         if actual_batch != 1:
             raise ValueError(
                 "run_generate_l3 currently supports batch_size=1 only; "
                 f"got {actual_batch} requests."
             )
-        hidden_size = model.config.hidden_size
-        max_seq = model.runtime.max_seq_len
-        vocab_size = model.config.vocab_size
-        padded_vocab = compiled.padded_vocab
+        _mark("prepare_prefill_inputs")
 
-        k_cache_all, v_cache_all = self._kv_cache_manager.materialize_full_layer_cache(
-            model.config.model_id,
-        )
-        _mark("kv_cache_materialize")
+        # Fill the fixed shared buffers in place (allocated once before fork).
+        lr.prefill_hidden.copy_(prefill_inputs.hidden)
+        lr.prefill_seq_lens.copy_(prefill_inputs.seq_lens)
+        lr.prefill_slot_mapping.copy_(prefill_inputs.slot_mapping)
+        lr.block_table.copy_(prefill_inputs.block_table)
 
-        # Build initial decode hidden: last prompt token embedding per batch.
-        decode_hidden = torch.zeros((actual_batch, hidden_size), dtype=torch.bfloat16)
-        decode_slot_mapping = torch.zeros((actual_batch,), dtype=torch.int32)
-        for b in range(actual_batch):
-            seq_len_b = int(prefill_inputs.seq_lens[b].item())
-            decode_hidden[b] = prefill_inputs.hidden[b, seq_len_b - 1, :]
-            decode_slot_mapping[b] = int(
-                prefill_inputs.slot_mapping[b * max_seq + seq_len_b - 1].item()
-            )
-
-        # Pre-allocate all shared-memory tensors for the full generate loop.
-        prefill_out = torch.zeros_like(prefill_inputs.hidden).share_memory_()
-        # decode_out and rms_x share one padded buffer so no CPU copy is needed
-        # between them.  l3_generate writes to decode_out (the first actual_batch
-        # rows); final_rms reads rms_x (all _LOGITS_BATCH_TILE rows).  The padding
-        # rows stay zero throughout, satisfying the zero-pad contract of final_rms.
-        _decode_out_storage = torch.zeros(
-            (_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16
-        ).share_memory_()
-        decode_out = _decode_out_storage[:actual_batch, :]   # [actual_batch, hidden_size]
-        rms_x = _decode_out_storage                          # [_LOGITS_BATCH_TILE, hidden_size]
-        # final_rms / lm_head intermediates.
-        rms_gamma = model.final_norm_weight.view(1, hidden_size).float().cpu().share_memory_()
-        rms_normed = torch.zeros((_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16).share_memory_()
-        lm_head_weight = compiled.padded_lm_head_weight.share_memory_()
-        logits_padded = torch.zeros((_LOGITS_BATCH_TILE, padded_vocab), dtype=torch.float32).share_memory_()
-        _mark("alloc_io_buffers")
-        # Sub-worker communication tensors.
-        embed_tokens = model.embed_tokens.to(torch.bfloat16).cpu().share_memory_()
-        _mark("embed_tokens_to_shm")
-        done_flag = torch.zeros((1,), dtype=torch.int32).share_memory_()
-        generated_ids = torch.full((max_new_tokens,), -1, dtype=torch.int64).share_memory_()
-        token_count = torch.zeros((1,), dtype=torch.int32).share_memory_()
-        # Mutable decode inputs (updated by sub_worker between steps).
-        decode_hidden_buf = decode_hidden.clone().share_memory_()
-        decode_seq_lens = prefill_inputs.seq_lens.clone().share_memory_()
-        decode_slot_mapping_buf = decode_slot_mapping.clone().share_memory_()
-
-        # Ensure all prefill inputs are in shared memory.
-        prefill_hidden = prefill_inputs.hidden.share_memory_()
-        prefill_seq_lens = prefill_inputs.seq_lens.share_memory_()
-        prefill_slot_mapping = prefill_inputs.slot_mapping.share_memory_()
-        block_table = prefill_inputs.block_table.share_memory_()
-        rope_cos = compiled.rope_cos.share_memory_()
-        rope_sin = compiled.rope_sin.share_memory_()
-        k_cache_all = k_cache_all.share_memory_()
-        v_cache_all = v_cache_all.share_memory_()
-        _mark("kv_and_prefill_to_shm")
-
-        # Ensure stacked weights are in shared memory.
-        sm_sw = {}
-        for k, v in compiled.stacked_weights.items():
-            sm_sw[k] = v.share_memory_() if not v.is_shared() else v
-        _mark("stacked_weights_to_shm")
-
-        # SSA-name substrings that identify static weight parameters in the
-        # tensors_dict built by _build_full_tensors().  Used in
-        # generate_orch_fn to pre-upload these tensors once per generate call
-        # (child_memory=True) so all decode dispatches skip H2D re-upload.
-        _sw_substrings: frozenset[str] = frozenset(sm_sw.keys()) | {
-            "rope_cos", "rope_sin", "final_norm_weight", "lm_head_weight",
-        }
-
-        # ── Sub-worker callable ──
-        # Runs in a forked child process. Reads logits → argmax → embedding lookup
-        # → writes decode_hidden_buf / decode_seq_lens / decode_slot_mapping_buf.
-        _eos_id = eos_token_id
-        _vocab = vocab_size
-        _actual_batch = actual_batch
-        _page_size = model.runtime.page_size
-
-        # Pre-capture references for the sub_worker closure.
-        # These are shared-memory tensors visible in the forked child.
-        _embed_tokens = embed_tokens
-        _done_flag = done_flag
-        _generated_ids = generated_ids
-        _token_count = token_count
-        _decode_hidden_buf = decode_hidden_buf
-        _decode_seq_lens = decode_seq_lens
-        _decode_slot_mapping_buf = decode_slot_mapping_buf
-        _logits_padded = logits_padded
-        _prefill_batch = prefill_batch
-
-        # L3 tracing: enabled by the executor's l3_trace flag (typically wired
-        # to --profile-verbose). When disabled, all per-stage timestamp prints
-        # are suppressed.
-        _l3_trace_enabled = self._l3_trace
-
-        # Shared-memory anchors so forked sub-worker callbacks can print times
-        # relative to a common start (set at prefill submit_start in the parent).
-        # Slot 0: start anchor (perf_counter seconds).
-        # Slot 1: timestamp of the previous printed event (for Δprev).
-        _t_anchors = torch.zeros(2, dtype=torch.float64).share_memory_()
-
-        def _fmt_rel(t_now: float) -> str:
-            t0 = float(_t_anchors[0].item())
-            t_prev = float(_t_anchors[1].item())
-            if t0 <= 0.0:
-                return "t=+0.000ms (Δ+0.000ms)"
-            rel_ms = (t_now - t0) * 1000.0
-            d_ms = (t_now - t_prev) * 1000.0 if t_prev > 0.0 else 0.0
-            _t_anchors[1] = t_now
-            return f"t=+{rel_ms:.2f}ms (Δ+{d_ms:.2f}ms)"
-
-        # Track when each sample_and_prepare finishes so we can split
-        # chip-task time vs sub-worker IPC + work time.
-        _sample_done_ts = [0.0]  # timestamp of last sample_and_prepare return
-
-        def sample_and_prepare_fn(task_args):
-            """Sub-worker: sample token from logits, prepare next decode inputs."""
-            _t_enter = time.perf_counter()
-            if _done_flag[0].item():
-                return  # EOS already hit, no-op.
-
-            # Read logits (written by lm_head chip task into logits_padded).
-            logits = _logits_padded[0, :_vocab]
-            token_id = int(logits.argmax().item())
-
-            step = int(_token_count[0].item())
-            if _l3_trace_enabled:
-                _prev_done = _sample_done_ts[0]
-                chip_ms = (_t_enter - _prev_done) * 1000.0 if _prev_done > 0.0 else 0.0
-                print(
-                    f"[L3-step] step={step:02d} sample_enter {_fmt_rel(_t_enter)}"
-                    f"  chip_tasks={chip_ms:.1f}ms",
-                    flush=True,
-                )
-            _generated_ids[step] = token_id
-            _token_count[0] = step + 1
-
-            if _eos_id is not None and token_id == _eos_id:
-                _done_flag[0] = 1
-                _t_exit = time.perf_counter()
-                _sample_done_ts[0] = _t_exit
-                if _l3_trace_enabled:
-                    work_ms = (_t_exit - _t_enter) * 1000.0
-                    print(
-                        f"[L3-step] step={step:02d} sample_exit  {_fmt_rel(_t_exit)}"
-                        f"  sample_work={work_ms:.1f}ms",
-                        flush=True,
-                    )
-                return
-
-            if step + 1 >= max_new_tokens:
-                _done_flag[0] = 1
-                _t_exit = time.perf_counter()
-                _sample_done_ts[0] = _t_exit
-                if _l3_trace_enabled:
-                    work_ms = (_t_exit - _t_enter) * 1000.0
-                    print(
-                        f"[L3-step] step={step:02d} sample_exit  {_fmt_rel(_t_exit)}"
-                        f"  sample_work={work_ms:.1f}ms",
-                        flush=True,
-                    )
-                return
-
-            # Embedding lookup.
-            _decode_hidden_buf[0, :] = _embed_tokens[token_id]
-
-            # Update seq_lens.
-            for b in range(_actual_batch):
-                new_seq_len = int(_decode_seq_lens[b].item()) + 1
-                _decode_seq_lens[b] = new_seq_len
-                # Update slot_mapping for next position.
-                alloc = _prefill_batch.kv_allocations[b]
-                page_idx = (new_seq_len - 1) // _page_size
-                slot_in_page = (new_seq_len - 1) % _page_size
-                if page_idx < len(alloc.page_ids):
-                    _decode_slot_mapping_buf[b] = alloc.page_ids[page_idx] * _page_size + slot_in_page
-
-            _t_exit = time.perf_counter()
-            _sample_done_ts[0] = _t_exit
-            if _l3_trace_enabled:
-                work_ms = (_t_exit - _t_enter) * 1000.0
-                print(
-                    f"[L3-step] step={step:02d} sample_exit  {_fmt_rel(_t_exit)}"
-                    f"  sample_work={work_ms:.1f}ms",
-                    flush=True,
-                )
-
-        # ── Build the orchestrator function ──
-
-        lg_entry_fn = compiled.l3_generate_entry_fn
-        lg_chip_callables = compiled.l3_generate_chip_callables
-        lg_dc = compiled.l3_generate_dc
-        lg_param_infos = compiled.l3_generate_param_infos
-
-        def _submit_l3_generate(orch, config, tensors_dict, _keep):
-            """Submit one l3_generate entry_fn call (dispatches all-layers L2 tasks)."""
-            lg_entry_fn(
-                orch, None, config,
-                tensors=tensors_dict,
-                callables=lg_callable_ids,
-                sub_ids=sub_ids,
-                _keep=_keep,
-                contexts=worker.chip_contexts,
-            )
-
-        _has_prefill_tensor = torch.tensor(True, dtype=torch.bool).share_memory_()
-
-        def _build_full_tensors():
-            """Build the tensor dict for the single l3_generate dispatch.
-
-            host_orch now owns the full generation loop (prefill step 0 +
-            pl.unroll(max_new_tokens) decode steps), so this is called once.
-            has_prefill is always True: step 0 inside host_orch runs prefill_all
-            then the first decode; subsequent iterations run decode-only.
-            """
-            td = {}
-            for info, val in zip(lg_param_infos, [
-                prefill_hidden,           # prefill_hidden
-                prefill_seq_lens,         # prefill_seq_lens
-                prefill_slot_mapping,     # prefill_slot_mapping
-                decode_hidden_buf,        # decode_hidden
-                decode_seq_lens,          # decode_seq_lens (mutated by sample_and_prepare sub-worker)
-                decode_slot_mapping_buf,  # decode_slot_mapping
-                sm_sw["input_rms_weight"],
-                sm_sw["wq"],
-                sm_sw["wk"],
-                sm_sw["wv"],
-                sm_sw["q_norm_weight"],
-                sm_sw["k_norm_weight"],
-                rope_cos,
-                rope_sin,
-                block_table,
-                k_cache_all,
-                v_cache_all,
-                sm_sw["wo"],
-                sm_sw["post_rms_weight"],
-                sm_sw["w_gate"],
-                sm_sw["w_up"],
-                sm_sw["w_down"],
-                _has_prefill_tensor,      # has_prefill = True
-                prefill_out,              # prefill_out
-                decode_out,               # decode_out
-                rms_x,                    # rms_x  (shares storage with decode_out)
-                rms_gamma,                # final_norm_weight
-                rms_normed,               # rms_normed
-                lm_head_weight,           # lm_head_weight_t
-                logits_padded,            # logits_padded
-            ], strict=True):
-                if not val.is_shared():
-                    val = val.share_memory_()
-                td[info.name] = val
-            return td
-
-        # KV cache device pointers collected inside generate_orch_fn so the
-        # post-run sync-back step can copy updated K/V values back to host.
-        # Format: list of (host_ptr: int, dev_ptr: int, nbytes: int).
-        _kv_dev_ptrs: list[tuple[int, int, int]] = []
-
-        def generate_orch_fn(orch, _args, _cfg):
-            _keep: list = []
-            call_config = CallConfig()
-            call_config.block_dim = lg_dc.block_dim
-            call_config.aicpu_thread_num = lg_dc.aicpu_thread_num
-
-            _t_pf = time.perf_counter()
-            _t_anchors[0] = _t_pf
-            _t_anchors[1] = _t_pf
-            _sample_done_ts[0] = _t_pf  # baseline for step 0 chip_tasks measurement
-            if _l3_trace_enabled:
-                print(f"[L3-step] host_orch submit_start {_fmt_rel(_t_pf)}", flush=True)
-
-            # Single dispatch: host_orch drives prefill + all decode steps
-            # (pl.unroll(max_new_tokens) inside host_orch).
-            td = _build_full_tensors()
-
-            from simpler.task_interface import ContinuousTensor as _CT  # noqa: PLC0415
-            from simpler_setup.torch_interop import (  # noqa: PLC0415
-                torch_dtype_to_datatype as _td2dt,
-            )
-
-            # Pre-upload static weight tensors once per generate call.
-            # child_memory=True → runtime skips H2D + D2H on every dispatch.
-            # ~3 400 ms of init_runtime per step reduced to ~11 ms.
-            for _pname, _t in list(td.items()):
-                if not isinstance(_t, torch.Tensor):
-                    continue
-                if not any(_sub in _pname for _sub in _sw_substrings):
-                    continue
-                _nbytes = int(_t.nbytes)
-                _dev_ptr = orch.malloc(worker_id=0, size=_nbytes)
-                orch.copy_to(worker_id=0, dst=_dev_ptr, src=_t.data_ptr(), size=_nbytes)
-                _shapes = tuple(int(s) for s in _t.shape)
-                _dt = _td2dt(_t.dtype)
-                td[_pname] = _CT.make(_dev_ptr, _shapes, _dt, child_memory=True)
-
-            # Pre-upload KV cache (k_cache_all / v_cache_all) once per
-            # generate call.  The kernel writes updated K/V values in-place on
-            # device; child_memory=True skips H2D and D2H on every decode step,
-            # saving ~280 ms H2D + ~360 ms D2H per step (~640 ms × 16 steps).
-            # After worker.run() drains (all tasks done), a second worker.run()
-            # call copies the final device state back to the host KV cache via
-            # orch.copy_from so subsequent generate calls see updated values.
-            for _pname, _t in list(td.items()):
-                if not isinstance(_t, torch.Tensor):
-                    continue
-                if "k_cache_all" not in _pname and "v_cache_all" not in _pname:
-                    continue
-                _nbytes = int(_t.nbytes)
-                _dev_ptr = orch.malloc(worker_id=0, size=_nbytes)
-                orch.copy_to(worker_id=0, dst=_dev_ptr, src=_t.data_ptr(), size=_nbytes)
-                _shapes = tuple(int(s) for s in _t.shape)
-                _dt = _td2dt(_t.dtype)
-                _kv_dev_ptrs.append((_t.data_ptr(), _dev_ptr, _nbytes))
-                td[_pname] = _CT.make(_dev_ptr, _shapes, _dt, child_memory=True)
-
-            _submit_l3_generate(orch, call_config, td, _keep)
-
-            if _l3_trace_enabled:
-                print(f"[L3-step] all submits done {_fmt_rel(time.perf_counter())}", flush=True)
-
-        # ── Create Worker and execute ──
-
-        lg_sub_fns = dict(compiled.l3_generate_sub_worker_fns or {})
-        # Override the placeholder sample_and_prepare sub-worker emitted by the
-        # l3_generate compiler with the real closure that reads shared-memory
-        # tensors and performs argmax → embedding lookup → slot-map update.
-        lg_sub_fns["sample_and_prepare"] = sample_and_prepare_fn
-
-        num_sub = max(lg_dc.num_sub_workers, len(lg_sub_fns))
-
-        _mark("setup_closures_and_buffers")
-
-        worker = Worker(
-            level=3,
-            device_ids=[self._device_id],
-            num_sub_workers=num_sub,
-            platform=compiled.l3_generate_platform,
-            runtime=compiled.l3_generate_runtime_name,
+        # Initial decode input: last prompt token's embedding + its KV slot.
+        seq_len0 = int(prefill_inputs.seq_lens[0].item())
+        lr.decode_hidden_buf[0] = prefill_inputs.hidden[0, seq_len0 - 1, :]
+        lr.decode_seq_lens.copy_(prefill_inputs.seq_lens)
+        lr.decode_slot_mapping_buf[0] = int(
+            prefill_inputs.slot_mapping[seq_len0 - 1].item()
         )
 
-        _mark("Worker_ctor")
+        # Reset sub-worker control state for this request.
+        lr.done_flag.zero_()
+        lr.token_count.zero_()
+        lr.generated_ids.fill_(-1)
+        lr.eos_id_buf[0] = -1 if eos_token_id is None else int(eos_token_id)
+        lr.max_new_tokens_buf[0] = int(max_new_tokens)
 
-        # Register chip callables and sub-worker callables before worker.init().
-        lg_callable_ids: dict[str, int] = {}
-        for name, callable_obj in lg_chip_callables.items():
-            lg_callable_ids[name] = worker.register(callable_obj)
+        # Per-request KV page table used by sample_and_prepare for slot mapping.
+        alloc = prefill_batch.kv_allocations[0]
+        n_pages = len(alloc.page_ids)
+        lr.num_pages_buf[0] = n_pages
+        if n_pages > 0:
+            lr.page_ids_buf[:n_pages] = torch.tensor(alloc.page_ids, dtype=torch.int32)
+        _mark("fill_buffers")
 
-        sub_ids: dict[str, int] = {}
-        for name, fn in lg_sub_fns.items():
-            sub_ids[name] = worker.register(fn)
+        # Refresh device KV from the host pool, dispatch, then sync back.
+        lr.rt.copy_to(lr.kv_k.data_ptr, lr.kv_k_host.data_ptr(), lr.kv_k.nbytes)
+        lr.rt.copy_to(lr.kv_v.data_ptr, lr.kv_v_host.data_ptr(), lr.kv_v.nbytes)
+        _mark("kv_upload")
 
-        _mark("worker_register")
+        lr.rt(*lr.args)
+        _mark("dispatch")
 
-        worker.init()
-        _mark("worker_init")
-        try:
-            _t_run_start = time.perf_counter()
-            worker.run(generate_orch_fn)
-            _mark("worker_run_generate")
+        lr.rt.copy_from(lr.kv_k_host.data_ptr(), lr.kv_k.data_ptr, lr.kv_k.nbytes)
+        lr.rt.copy_from(lr.kv_v_host.data_ptr(), lr.kv_v.data_ptr, lr.kv_v.nbytes)
+        _mark("kv_sync_back")
 
-            # Sync KV cache back to host.  worker.run() above calls _drain()
-            # internally, so all chip tasks (including the last decode step)
-            # have completed by the time we reach here.  The child_memory
-            # buffers are still live (worker.close() not yet called), so a
-            # second worker.run() can copy them back to the host tensors.
-            if _kv_dev_ptrs:
-                def _kv_sync_orch_fn(orch, _args, _cfg):  # noqa: E306
-                    for _host_ptr, _dev_ptr, _nbytes in _kv_dev_ptrs:
-                        orch.copy_from(
-                            worker_id=0, dst=_host_ptr, src=_dev_ptr, size=_nbytes,
-                        )
-                worker.run(_kv_sync_orch_fn)
-            _mark("worker_run_kv_sync")
+        # Update KV allocation usage.
+        final_token_count = int(lr.token_count[0].item())
+        base_seq = int(prefill_inputs.seq_lens[0].item())
+        alloc.tokens_used = max(alloc.tokens_used, base_seq + final_token_count)
 
-            _t_run_end = time.perf_counter()
-            print(
-                f"[L3-timer] worker.run total wall-clock: "
-                f"{(_t_run_end-_t_run_start)*1000:.1f}ms",
-                flush=True,
-            )
-        finally:
-            worker.close()
-            _mark("worker_close")
-
-        # Update KV allocations.
-        final_token_count = int(token_count[0].item())
-        for batch_idx, alloc in enumerate(prefill_batch.kv_allocations):
-            base_seq = int(prefill_inputs.seq_lens[batch_idx].item())
-            alloc.tokens_used = max(alloc.tokens_used, base_seq + final_token_count)
-
-        ids = generated_ids[:final_token_count].tolist()
-        ret_val = ids, decode_out[:actual_batch].float()
+        ids = lr.generated_ids[:final_token_count].tolist()
+        ret_val = ids, lr.decode_out_storage[:actual_batch].float()
         _mark("post_process")
 
         timer.report()
         return ret_val
+
+    def _ensure_l3_runtime(self, model: RuntimeModel) -> _L3Runtime:
+        """Prepare (once per model) the reusable L3 generate runtime.
+
+        Allocates all fixed-size shared-memory buffers BEFORE the worker fork,
+        defines the sample_and_prepare sub-worker closure (which reads only
+        shared memory so it serves every request), calls
+        DistributedCompiledProgram.prepare() to assemble + fork the worker
+        once, and uploads the static weights and KV cache to worker-resident
+        DeviceTensor buffers. The result is cached and reused per request.
+        """
+        model_id = model.config.model_id
+        cached = self._l3_runtimes.get(model_id)
+        if cached is not None:
+            return cached
+
+        compiled = self._compiled
+        if compiled.l3_generate_program is None:
+            raise RuntimeError("L3 generate program not compiled.")
+        hidden_size = model.config.hidden_size
+        max_seq = model.runtime.max_seq_len
+        vocab_size = model.config.vocab_size
+        padded_vocab = compiled.padded_vocab
+        page_size = model.runtime.page_size
+        mnt_limit = model.runtime.max_new_tokens
+        max_blocks = self._max_blocks_per_seq(model)
+        batch = 1  # L3 generate fast path is batch_size=1 (see validate_generate_batch)
+
+        # ── Fixed-size shared host buffers. They must exist before the worker
+        # fork so the forked sub-worker inherits their shared-memory mappings. ──
+        def _shm(*shape: int, dtype: torch.dtype, fill: int | None = None) -> torch.Tensor:
+            t = torch.zeros(shape, dtype=dtype) if not fill else torch.full(shape, fill, dtype=dtype)
+            return t.share_memory_()
+
+        prefill_hidden = _shm(batch, max_seq, hidden_size, dtype=torch.bfloat16)
+        prefill_seq_lens = _shm(batch, dtype=torch.int32)
+        prefill_slot_mapping = _shm(batch * max_seq, dtype=torch.int32, fill=-1)
+        block_table = _shm(batch * max_blocks, dtype=torch.int32, fill=-1)
+        decode_hidden_buf = _shm(batch, hidden_size, dtype=torch.bfloat16)
+        decode_seq_lens = _shm(batch, dtype=torch.int32)
+        decode_slot_mapping_buf = _shm(batch, dtype=torch.int32)
+        # has_prefill is always True: step 0 inside host_orch runs prefill_all
+        # then the first decode; subsequent unrolled iterations are decode-only.
+        has_prefill = torch.tensor(True, dtype=torch.bool).share_memory_()
+        prefill_out = _shm(batch, max_seq, hidden_size, dtype=torch.bfloat16)
+        # decode_out and rms_x share one padded buffer (no CPU copy between
+        # them). host_orch writes decode_out (first `batch` rows); final_rms
+        # reads rms_x (all _LOGITS_BATCH_TILE rows). Padding rows stay zero —
+        # the kernel only writes the first `batch` rows — satisfying final_rms.
+        decode_out_storage = _shm(_LOGITS_BATCH_TILE, hidden_size, dtype=torch.bfloat16)
+        decode_out = decode_out_storage[:batch, :]
+        rms_x = decode_out_storage
+        rms_normed = _shm(_LOGITS_BATCH_TILE, hidden_size, dtype=torch.bfloat16)
+        logits_padded = _shm(_LOGITS_BATCH_TILE, padded_vocab, dtype=torch.float32)
+
+        # Sub-worker shared state (reset per request in run_generate_l3).
+        done_flag = _shm(1, dtype=torch.int32)
+        generated_ids = _shm(mnt_limit, dtype=torch.int64, fill=-1)
+        token_count = _shm(1, dtype=torch.int32)
+        eos_id_buf = _shm(1, dtype=torch.int64, fill=-1)
+        max_new_tokens_buf = _shm(1, dtype=torch.int64)
+        page_ids_buf = _shm(max_blocks, dtype=torch.int32)
+        num_pages_buf = _shm(1, dtype=torch.int32)
+
+        # Static model tensors. Each must be a CPU, contiguous, shared-memory
+        # tensor allocated BEFORE prepare()'s fork so the upload (which runs in
+        # the forked chip worker) reads the right bytes; alloc_tensor enforces
+        # this. _static_src guarantees contiguity (alloc_tensor asserts it).
+        def _static_src(t: torch.Tensor) -> torch.Tensor:
+            if t.device.type != "cpu":
+                t = t.cpu()
+            if not t.is_contiguous():
+                t = t.contiguous()
+            return t if t.is_shared() else t.share_memory_()
+
+        embed_tokens = _static_src(model.embed_tokens.to(torch.bfloat16))
+        rms_gamma = _static_src(model.final_norm_weight.view(1, hidden_size).float())
+        lm_head_weight = _static_src(compiled.padded_lm_head_weight)
+        rope_cos = _static_src(compiled.rope_cos)
+        rope_sin = _static_src(compiled.rope_sin)
+        sm_sw = {k: _static_src(v) for k, v in compiled.stacked_weights.items()}
+
+        # Persistent KV pool views (same backing storage across requests).
+        kv_k_host, kv_v_host = self._kv_cache_manager.materialize_full_layer_cache(model_id)
+        kv_k_host = self._share_cpu_tensor(kv_k_host)
+        kv_v_host = self._share_cpu_tensor(kv_v_host)
+
+        # ── sample_and_prepare sub-worker (runs in the forked child). Reads
+        # logits → argmax → writes the next decode inputs. It reads only shared
+        # memory, so one closure serves every request. ──
+        def sample_and_prepare_fn(task_args):  # noqa: ANN001, ARG001
+            if done_flag[0].item():
+                return  # request already finished (EOS / length)
+            token_id = int(logits_padded[0, :vocab_size].argmax().item())
+            step = int(token_count[0].item())
+            generated_ids[step] = token_id
+            token_count[0] = step + 1
+            eos = int(eos_id_buf[0].item())
+            if eos >= 0 and token_id == eos:
+                done_flag[0] = 1
+                return
+            if step + 1 >= int(max_new_tokens_buf[0].item()):
+                done_flag[0] = 1
+                return
+            # Embedding lookup for the next decode step.
+            decode_hidden_buf[0, :] = embed_tokens[token_id]
+            new_seq_len = int(decode_seq_lens[0].item()) + 1
+            decode_seq_lens[0] = new_seq_len
+            page_idx = (new_seq_len - 1) // page_size
+            slot_in_page = (new_seq_len - 1) % page_size
+            if page_idx < int(num_pages_buf[0].item()):
+                decode_slot_mapping_buf[0] = (
+                    int(page_ids_buf[page_idx].item()) * page_size + slot_in_page
+                )
+
+        # ── Prepare the worker once (assemble + fork + register override). ──
+        rt = compiled.l3_generate_program.prepare(
+            sub_worker_overrides={"sample_and_prepare": sample_and_prepare_fn},
+        )
+
+        # Upload static weights + KV to worker-resident DeviceTensors (once).
+        def _dev(host: torch.Tensor) -> Any:
+            return rt.alloc_tensor(tuple(int(s) for s in host.shape), host.dtype, init=host)
+
+        w = {k: _dev(v) for k, v in sm_sw.items()}
+        rope_cos_dt = _dev(rope_cos)
+        rope_sin_dt = _dev(rope_sin)
+        final_norm_dt = _dev(rms_gamma)
+        lm_head_dt = _dev(lm_head_weight)
+        kv_k = _dev(kv_k_host)
+        kv_v = _dev(kv_v_host)
+
+        # Fixed positional args in kernel-parameter order. Host buffers are
+        # reused in place; weight/KV DeviceTensors stay device-resident. Order
+        # mirrors build_qwen3_14b_l3_generate_program's host_orch signature.
+        args = (
+            prefill_hidden, prefill_seq_lens, prefill_slot_mapping,
+            decode_hidden_buf, decode_seq_lens, decode_slot_mapping_buf,
+            w["input_rms_weight"], w["wq"], w["wk"], w["wv"],
+            w["q_norm_weight"], w["k_norm_weight"],
+            rope_cos_dt, rope_sin_dt,
+            block_table, kv_k, kv_v,
+            w["wo"], w["post_rms_weight"], w["w_gate"], w["w_up"], w["w_down"],
+            has_prefill, prefill_out, decode_out, rms_x,
+            final_norm_dt, rms_normed, lm_head_dt, logits_padded,
+        )
+
+        lr = _L3Runtime(
+            rt=rt,
+            args=args,
+            prefill_hidden=prefill_hidden,
+            prefill_seq_lens=prefill_seq_lens,
+            prefill_slot_mapping=prefill_slot_mapping,
+            block_table=block_table,
+            decode_hidden_buf=decode_hidden_buf,
+            decode_seq_lens=decode_seq_lens,
+            decode_slot_mapping_buf=decode_slot_mapping_buf,
+            decode_out_storage=decode_out_storage,
+            done_flag=done_flag,
+            generated_ids=generated_ids,
+            token_count=token_count,
+            eos_id_buf=eos_id_buf,
+            max_new_tokens_buf=max_new_tokens_buf,
+            page_ids_buf=page_ids_buf,
+            num_pages_buf=num_pages_buf,
+            kv_k=kv_k,
+            kv_v=kv_v,
+            kv_k_host=kv_k_host,
+            kv_v_host=kv_v_host,
+        )
+        self._l3_runtimes[model_id] = lr
+        return lr
 
     def _prepare_prefill_inputs(
         self,

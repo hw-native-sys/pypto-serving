@@ -50,6 +50,21 @@ class LLMEngine:
         self._models: dict[str, ModelRecord] = {}
         self._request_counter = itertools.count()
 
+    def close(self) -> None:
+        """Release executor-held resources (forked workers, device memory).
+
+        Idempotent. Without this, an executor that forks workers and holds
+        device-resident buffers only frees them at process exit.
+        """
+        self._executor.close()
+        self._models.clear()
+
+    def __enter__(self) -> LLMEngine:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
     def init_model(
         self,
         model_id: str,
