@@ -133,6 +133,26 @@ class _L2ProgramHandle:
     runtime_name: str
 
 
+@dataclass(frozen=True)
+class _DeferredChildTensor:
+    """CPU tensor that should be materialized as child memory inside an L3 run."""
+
+    runtime_name: str
+    tensor: torch.Tensor
+    upload: bool = True
+    refresh: bool = False
+    require_existing: bool = False
+
+
+@dataclass(frozen=True)
+class _PostSubmitCopy:
+    """Device-to-host copy to enqueue after an L3 child task has drained."""
+
+    dst: int
+    src: int
+    nbytes: int
+
+
 class Qwen314BModelRunner(ModelRunner):
     """Runtime wrapper for one Qwen3-14B model's compiled PyPTO kernels."""
 
@@ -227,7 +247,6 @@ class Qwen314BModelRunner(ModelRunner):
         k_cache, v_cache = self.materialize_full_layer_cache(
             model.config.model_id,
         )
-        refresh_kv_cache = model.config.model_id in self._l2_dirty_kv_models
 
         if decode_inputs.actual_batch > compiled.decode_logits_buffer.shape[0]:
             raise ValueError(
@@ -249,8 +268,8 @@ class Qwen314BModelRunner(ModelRunner):
             decode_inputs.slot_mapping,
             self._l2_child_tensor(compiled.decode.runtime_name, compiled.rope_cos),
             self._l2_child_tensor(compiled.decode.runtime_name, compiled.rope_sin),
-            self._l2_child_tensor(compiled.decode.runtime_name, k_cache, refresh=refresh_kv_cache),
-            self._l2_child_tensor(compiled.decode.runtime_name, v_cache, refresh=refresh_kv_cache),
+            k_cache,
+            v_cache,
             self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_wo"]),
             self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_post_rms_weight"]),
             self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_w_gate"]),
@@ -293,67 +312,97 @@ class Qwen314BModelRunner(ModelRunner):
             compiled.lm_head(normed, compiled.padded_lm_head_weight, logits_padded, config=None)
             return logits_padded[:actual_batch, :vocab_size].to(hidden.device)
 
-        normed: torch.Tensor | WorkerTensor
-        x_arg: torch.Tensor | WorkerTensor = x
-        worker: LlmWorker | None = None
+        normed = torch.zeros((_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16).share_memory_()
+        normed_arg: torch.Tensor | _DeferredChildTensor = normed
         if compiled.final_rms.runtime_name == compiled.lm_head.runtime_name:
-            worker = self._worker_for_runtime(compiled.final_rms.runtime_name)
-            x_arg = worker.alloc_tensor(x.shape, x.dtype, init=x)
-            normed = worker.alloc_tensor(x.shape, x.dtype)
-        else:
-            normed = torch.zeros((_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16).share_memory_()
+            normed_arg = self._l2_child_tensor(compiled.final_rms.runtime_name, normed, upload=False)
 
-        try:
-            self._run_l2_program(
-                compiled.final_rms,
-                x_arg,
-                self._l2_child_tensor(compiled.final_rms.runtime_name, compiled.final_norm_weight),
+        self._run_l2_program(
+            compiled.final_rms,
+            x,
+            self._l2_child_tensor(compiled.final_rms.runtime_name, compiled.final_norm_weight),
+            normed_arg,
+        )
+
+        lm_head_input: torch.Tensor | _DeferredChildTensor = normed
+        if isinstance(normed_arg, _DeferredChildTensor):
+            lm_head_input = self._l2_child_tensor(
+                compiled.lm_head.runtime_name,
                 normed,
+                upload=False,
+                require_existing=True,
             )
 
-            logits_padded = torch.zeros((_LOGITS_BATCH_TILE, padded_vocab), dtype=torch.float32).share_memory_()
-            self._run_l2_program(
-                compiled.lm_head,
-                normed,
-                self._l2_child_tensor(compiled.lm_head.runtime_name, compiled.padded_lm_head_weight),
-                logits_padded,
-            )
-        finally:
-            if isinstance(x_arg, WorkerTensor):
-                if worker is None:
-                    raise RuntimeError("missing L2 worker for child-memory logits projection")
-                worker.free_tensor(x_arg)
-            if isinstance(normed, WorkerTensor):
-                if worker is None:
-                    raise RuntimeError("missing L2 worker for child-memory logits projection")
-                worker.free_tensor(normed)
+        logits_padded = torch.zeros((_LOGITS_BATCH_TILE, padded_vocab), dtype=torch.float32).share_memory_()
+        self._run_l2_program(
+            compiled.lm_head,
+            lm_head_input,
+            self._l2_child_tensor(compiled.lm_head.runtime_name, compiled.padded_lm_head_weight),
+            logits_padded,
+        )
         return logits_padded[:actual_batch, :vocab_size].to(hidden.device)
 
     def _run_l2_program(self, callable_spec: _L2Callable, *args: Any) -> None:
-        """Run a compiled non-L3 program through the LLM Simpler worker."""
+        """Run one compiled chip program through a wrapped L3 worker."""
         from simpler.task_interface import CallConfig  # noqa: PLC0415
 
+        self._share_l2_host_args(args)
         handle = self._ensure_l2_program(callable_spec)
-        orch_args = self._build_l2_orch_args(callable_spec, args)
 
         cfg = CallConfig()
         cfg.block_dim = callable_spec.block_dim
         cfg.aicpu_thread_num = callable_spec.aicpu_thread_num
 
         worker = self._l2_workers[handle.runtime_name]
-        worker.run(handle.callable_id, orch_args, cfg)
+        post_submit_copies: list[_PostSubmitCopy] = []
+
+        def _orch_fn(orchestrator: Any, _args: Any, _config: Any) -> None:
+            orch_args, copies = self._build_l2_orch_args(
+                callable_spec,
+                args,
+                worker=worker,
+                orchestrator=orchestrator,
+            )
+            post_submit_copies.extend(copies)
+            worker.submit_next_level(
+                handle.callable_id,
+                orch_args,
+                cfg,
+                worker_id=0,
+                orchestrator=orchestrator,
+            )
+
+        try:
+            worker.run(_orch_fn)
+            if post_submit_copies:
+                def _copy_back_orch_fn(orchestrator: Any, _args: Any, _config: Any) -> None:
+                    for copy in post_submit_copies:
+                        worker.copy_from(
+                            copy.dst,
+                            copy.src,
+                            copy.nbytes,
+                            worker_id=0,
+                            orchestrator=orchestrator,
+                        )
+
+                worker.run(_copy_back_orch_fn)
+        finally:
+            self._discard_l2_worker(handle.runtime_name)
 
     def _worker_for_runtime(self, runtime_name: str) -> LlmWorker:
-        """Return an initialized worker for ``runtime_name``."""
+        """Return a wrapped L3 worker for ``runtime_name``."""
         worker = self._l2_workers.get(runtime_name)
         if worker is not None:
             return worker
+        for active_runtime_name in list(self._l2_workers):
+            if active_runtime_name != runtime_name:
+                self._close_l2_worker(active_runtime_name)
         worker = LlmWorker(
-            level=2,
+            level=3,
             platform=self._platform,
             runtime=runtime_name,
-            device_id=self._device_id,
-            auto_init=True,
+            device_ids=[self._device_id],
+            num_sub_workers=0,
         )
         self._l2_workers[runtime_name] = worker
         return worker
@@ -366,13 +415,40 @@ class Qwen314BModelRunner(ModelRunner):
             return cached
 
         worker = self._worker_for_runtime(callable_spec.runtime_name)
+        if not worker.initialized:
+            handle = self._register_l2_program(callable_spec, worker)
+            self._register_known_l2_programs_for_runtime(callable_spec.runtime_name, worker)
+            worker.init()
+            return handle
 
+        return self._register_l2_program(callable_spec, worker)
+
+    def _register_l2_program(self, callable_spec: _L2Callable, worker: LlmWorker) -> _L2ProgramHandle:
+        """Register ``callable_spec`` on ``worker`` once and cache the callable id."""
+        key = id(callable_spec)
+        cached = self._l2_programs.get(key)
+        if cached is not None:
+            return cached
         handle = _L2ProgramHandle(
             callable_id=worker.register(callable_spec.chip_callable),
             runtime_name=callable_spec.runtime_name,
         )
         self._l2_programs[key] = handle
         return handle
+
+    def _register_known_l2_programs_for_runtime(self, runtime_name: str, worker: LlmWorker) -> None:
+        """Pre-register known callables for a runtime before the L3 worker starts."""
+        compiled = self._compiled
+        if not isinstance(compiled, _CompiledKernels):
+            return
+        for callable_spec in (
+            compiled.prefill,
+            compiled.decode,
+            compiled.final_rms,
+            compiled.lm_head,
+        ):
+            if isinstance(callable_spec, _L2Callable) and callable_spec.runtime_name == runtime_name:
+                self._register_l2_program(callable_spec, worker)
 
     def _l2_child_tensor(
         self,
@@ -381,15 +457,32 @@ class Qwen314BModelRunner(ModelRunner):
         *,
         upload: bool = True,
         refresh: bool = False,
-    ) -> WorkerTensor:
-        """Return a worker-resident view for a CPU tensor's backing storage."""
-        from simpler_setup.torch_interop import torch_dtype_to_datatype  # noqa: PLC0415
-
+        require_existing: bool = False,
+    ) -> _DeferredChildTensor:
+        """Return a deferred worker-resident view for a CPU tensor backing storage."""
         if tensor.device.type != "cpu":
             raise ValueError("child-memory tensor must be on CPU")
         if not tensor.is_contiguous():
             raise ValueError("child-memory tensor must be contiguous")
-        tensor = self._share_cpu_tensor(tensor)
+        return _DeferredChildTensor(
+            runtime_name=runtime_name,
+            tensor=self._share_cpu_tensor(tensor),
+            upload=upload,
+            refresh=refresh,
+            require_existing=require_existing,
+        )
+
+    def _resolve_l3_child_tensor(
+        self,
+        deferred: _DeferredChildTensor,
+        *,
+        worker: LlmWorker,
+        orchestrator: Any,
+    ) -> tuple[WorkerTensor, _PostSubmitCopy | None]:
+        """Allocate or reuse a child-memory tensor inside an L3 orchestration scope."""
+        from simpler_setup.torch_interop import torch_dtype_to_datatype  # noqa: PLC0415
+
+        tensor = deferred.tensor
         storage = tensor.untyped_storage()
         storage_ptr = int(storage.data_ptr())
         storage_nbytes = int(storage.nbytes())
@@ -397,26 +490,27 @@ class Qwen314BModelRunner(ModelRunner):
         if tensor_offset < 0 or tensor_offset + int(tensor.nbytes) > storage_nbytes:
             raise ValueError("tensor view is outside its backing storage")
 
-        key = (runtime_name, storage_ptr)
+        key = (deferred.runtime_name, storage_ptr)
         alloc = self._l2_child_allocs.get(key)
         if alloc is None:
-            worker = self._worker_for_runtime(runtime_name)
-            dev_ptr = worker.malloc(storage_nbytes)
-            if upload:
-                worker.copy_to(dev_ptr, storage_ptr, storage_nbytes)
+            if deferred.require_existing:
+                raise RuntimeError("missing worker-resident tensor allocation")
+            dev_ptr = worker.malloc(storage_nbytes, worker_id=0, orchestrator=orchestrator)
+            if deferred.upload:
+                worker.copy_to(dev_ptr, storage_ptr, storage_nbytes, worker_id=0, orchestrator=orchestrator)
             alloc = (dev_ptr, storage_nbytes)
             self._l2_child_allocs[key] = alloc
-        elif upload and refresh:
-            worker = self._worker_for_runtime(runtime_name)
-            worker.copy_to(alloc[0], storage_ptr, storage_nbytes)
+        elif deferred.upload and deferred.refresh:
+            worker.copy_to(alloc[0], storage_ptr, storage_nbytes, worker_id=0, orchestrator=orchestrator)
 
         dev_base, _ = alloc
         shape = tuple(int(dim) for dim in tensor.shape)
-        return WorkerTensor(
+        worker_tensor = WorkerTensor(
             data_ptr=dev_base + tensor_offset,
             shape=shape,
             dtype=torch_dtype_to_datatype(tensor.dtype),
         )
+        return worker_tensor, _PostSubmitCopy(storage_ptr, dev_base, storage_nbytes)
 
     @staticmethod
     def _share_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -425,23 +519,65 @@ class Qwen314BModelRunner(ModelRunner):
             return tensor.share_memory_()
         return tensor
 
+    @classmethod
+    def _share_l2_host_args(cls, args: tuple[Any, ...]) -> None:
+        """Share host tensor mappings before L3 child workers are initialized."""
+        for arg in args:
+            if isinstance(arg, _DeferredChildTensor):
+                cls._share_cpu_tensor(arg.tensor)
+            elif isinstance(arg, torch.Tensor):
+                cls._share_cpu_tensor(arg)
+
     def close(self) -> None:
         """Release non-L3 child-memory allocations and L2 workers."""
-        for (runtime_name, _), (dev_ptr, _nbytes) in list(self._l2_child_allocs.items()):
-            worker = self._l2_workers.get(runtime_name)
-            if worker is not None and worker.initialized:
-                worker.free(dev_ptr)
-        self._l2_child_allocs.clear()
-        self._l2_programs.clear()
+        for runtime_name in list(self._l2_workers):
+            self._close_l2_worker(runtime_name)
         self._l2_dirty_kv_models.clear()
-        for worker in self._l2_workers.values():
-            worker.close()
-        self._l2_workers.clear()
 
-    @staticmethod
-    def _build_l2_orch_args(callable_spec: _L2Callable, args: tuple[Any, ...]):
-        """Build ``ChipStorageTaskArgs`` for a compiled L2 program call."""
-        from simpler.task_interface import ChipStorageTaskArgs, ContinuousTensor, scalar_to_uint64  # noqa: PLC0415
+    def _close_l2_worker(self, runtime_name: str) -> None:
+        """Close one wrapped L3 worker and forget runtime-local child state."""
+        worker = self._l2_workers.pop(runtime_name, None)
+        for key, (dev_ptr, _nbytes) in list(self._l2_child_allocs.items()):
+            alloc_runtime_name, _storage_ptr = key
+            if alloc_runtime_name != runtime_name:
+                continue
+            self._l2_child_allocs.pop(key, None)
+            if worker is not None and worker.initialized and worker.level < 3:
+                worker.free(dev_ptr)
+        for key, handle in list(self._l2_programs.items()):
+            if handle.runtime_name == runtime_name:
+                self._l2_programs.pop(key, None)
+        if worker is not None:
+            worker.close()
+
+    def _discard_l2_worker(self, runtime_name: str) -> None:
+        """Discard one-shot L3 worker state after a submitted chip task."""
+        worker = self._l2_workers.pop(runtime_name, None)
+        for key in list(self._l2_child_allocs):
+            alloc_runtime_name, _storage_ptr = key
+            if alloc_runtime_name == runtime_name:
+                self._l2_child_allocs.pop(key, None)
+        for key, handle in list(self._l2_programs.items()):
+            if handle.runtime_name == runtime_name:
+                self._l2_programs.pop(key, None)
+        if worker is not None:
+            worker.discard_l3_children()
+
+    def _build_l2_orch_args(
+        self,
+        callable_spec: _L2Callable,
+        args: tuple[Any, ...],
+        *,
+        worker: LlmWorker | None = None,
+        orchestrator: Any = None,
+    ):
+        """Build ``TaskArgs`` for submitting a compiled child chip program."""
+        from simpler.task_interface import (  # noqa: PLC0415
+            ContinuousTensor,
+            TaskArgs,
+            TensorArgType,
+            scalar_to_uint64,
+        )
         from simpler_setup.torch_interop import make_tensor_arg  # noqa: PLC0415
 
         param_infos = callable_spec.param_infos
@@ -451,18 +587,30 @@ class Qwen314BModelRunner(ModelRunner):
                 f"compiled program expects {len(param_infos)} arguments, got {len(args)}. Parameters: {names}"
             )
 
-        orch_args = ChipStorageTaskArgs()
-        for info, arg in zip(param_infos, args, strict=True):
+        orch_args = TaskArgs()
+        post_submit_copies: list[_PostSubmitCopy] = []
+        for arg_index, (info, arg) in enumerate(zip(param_infos, args, strict=True)):
             if info.shape is None:
                 if not isinstance(arg, ctypes._SimpleCData):
                     raise TypeError(f"scalar parameter {info.name!r} must be passed as a ctypes scalar")
                 orch_args.add_scalar(scalar_to_uint64(arg))
                 continue
+            tag = self._l2_tensor_arg_type(info, arg, arg_index, len(args), TensorArgType)
+            if isinstance(arg, _DeferredChildTensor):
+                if worker is None or orchestrator is None:
+                    raise RuntimeError("deferred child tensor requires L3 worker and orchestrator")
+                arg, copy = self._resolve_l3_child_tensor(
+                    arg,
+                    worker=worker,
+                    orchestrator=orchestrator,
+                )
+                if tag == TensorArgType.INOUT and copy is not None:
+                    post_submit_copies.append(copy)
             if isinstance(arg, WorkerTensor):
-                orch_args.add_tensor(arg.to_continuous_tensor())
+                orch_args.add_tensor(arg.to_continuous_tensor(), tag)
                 continue
             if isinstance(arg, ContinuousTensor):
-                orch_args.add_tensor(arg)
+                orch_args.add_tensor(arg, tag)
                 continue
             if not isinstance(arg, torch.Tensor):
                 raise TypeError(f"tensor parameter {info.name!r} expects torch.Tensor, got {type(arg).__name__}")
@@ -472,8 +620,36 @@ class Qwen314BModelRunner(ModelRunner):
                 raise ValueError(f"tensor parameter {info.name!r} must be contiguous")
             if not arg.is_shared():
                 arg.share_memory_()
-            orch_args.add_tensor(make_tensor_arg(arg))
-        return orch_args
+            orch_args.add_tensor(make_tensor_arg(arg), tag)
+        return orch_args, post_submit_copies
+
+    @staticmethod
+    def _l2_tensor_arg_type(
+        info: object,
+        arg: object,
+        arg_index: int,
+        arg_count: int,
+        tensor_arg_type: object,
+    ) -> object:
+        """Translate PyPTO parameter metadata into a Simpler tensor argument tag."""
+        name = getattr(info, "name", "")
+        if name in {"k_cache", "v_cache"}:
+            return tensor_arg_type.INOUT
+
+        direction = getattr(info, "direction", None)
+        direction_name = getattr(direction, "name", None)
+        if direction_name is None and direction is not None:
+            direction_name = str(direction).rsplit(".", maxsplit=1)[-1]
+        if direction_name == "InOut":
+            return tensor_arg_type.INOUT
+        if direction_name == "Out":
+            return tensor_arg_type.OUTPUT_EXISTING
+
+        if name in {"out", "output"}:
+            return tensor_arg_type.OUTPUT_EXISTING
+        if isinstance(arg, torch.Tensor) and arg_index == arg_count - 1:
+            return tensor_arg_type.OUTPUT_EXISTING
+        return tensor_arg_type.INPUT
 
     # ── L3-wrapped generate: entire prefill + decode loop in one worker.run() ──
 
