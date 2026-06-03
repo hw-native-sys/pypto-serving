@@ -18,6 +18,7 @@ that can be submitted as ``child_memory`` inputs.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -198,6 +199,11 @@ class Worker:
         """Whether the wrapped Simpler worker has been initialized."""
         return self._initialized
 
+    @property
+    def chip_contexts(self) -> Any:
+        """Return L3 child chip contexts when exposed by the wrapped worker."""
+        return getattr(self._worker, "chip_contexts", None)
+
     def init(self) -> None:
         """Initialize runtime resources if they are not already live."""
         if self._initialized:
@@ -210,6 +216,68 @@ class Worker:
         if not self._initialized:
             return
         self._worker.close()
+        self._initialized = False
+
+    def discard_l3_children(self) -> None:
+        """Best-effort cleanup for one-shot L3 workers whose chip child has exited."""
+        if self.level < 3:
+            self.close()
+            return
+        if not self._initialized:
+            return
+
+        from simpler.worker import (  # noqa: PLC0415
+            _OFF_STATE,
+            _SHUTDOWN,
+            _buffer_field_addr,
+            _mailbox_store_i32,
+        )
+
+        impl = self._worker
+        for shm in list(getattr(impl, "_sub_shms", [])) + list(getattr(impl, "_chip_shms", [])) + list(
+            getattr(impl, "_next_level_shms", [])
+        ):
+            try:
+                buf = shm.buf
+                if buf is not None:
+                    _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _SHUTDOWN)
+            except Exception:  # noqa: BLE001
+                pass
+
+        for pid in list(getattr(impl, "_sub_pids", [])) + list(getattr(impl, "_chip_pids", [])) + list(
+            getattr(impl, "_next_level_pids", [])
+        ):
+            try:
+                os.waitpid(int(pid), 0)
+            except ChildProcessError:
+                pass
+            except OSError:
+                pass
+
+        for shm in list(getattr(impl, "_sub_shms", [])) + list(getattr(impl, "_chip_shms", [])) + list(
+            getattr(impl, "_next_level_shms", [])
+        ):
+            try:
+                shm.close()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:  # noqa: BLE001
+                pass
+
+        for attr in ("_sub_pids", "_chip_pids", "_next_level_pids"):
+            getattr(impl, attr, []).clear()
+        for attr in ("_sub_shms", "_chip_shms", "_next_level_shms", "_next_level_workers"):
+            getattr(impl, attr, []).clear()
+        if hasattr(impl, "_worker"):
+            impl._worker = None  # noqa: SLF001
+        if hasattr(impl, "_orch"):
+            impl._orch = None  # noqa: SLF001
+        if hasattr(impl, "_hierarchical_started"):
+            impl._hierarchical_started = False  # noqa: SLF001
         self._initialized = False
 
     def _require_initialized(self, op: str) -> None:
@@ -230,36 +298,91 @@ class Worker:
         self._require_initialized("prepare_callable")
         self._worker.prepare_callable(int(callable_id), callable_obj)
 
-    def run(self, callable_obj: Any, args: Any = None, config: Any = None) -> None:
+    def run(self, callable_obj: Any, args: Any = None, config: Any = None) -> Any:
         """Run one L2 callable id or one L3 orchestration function."""
         self._require_initialized("run")
-        self._worker.run(callable_obj, args=args, config=config)
+        return self._worker.run(callable_obj, args=args, config=config)
+
+    def submit_next_level(
+        self,
+        callable_id: int,
+        args: Any,
+        config: Any = None,
+        *,
+        worker_id: int = 0,
+        orchestrator: Any,
+    ) -> Any:
+        """Submit a child chip callable from inside an L3 orchestration callback."""
+        if self.level < 3:
+            raise RuntimeError("Worker.submit_next_level requires a level 3 worker")
+        return orchestrator.submit_next_level(
+            int(callable_id),
+            args,
+            config,
+            worker=int(worker_id),
+        )
+
+    def run_next_level(
+        self,
+        callable_id: int,
+        args: Any,
+        config: Any = None,
+        *,
+        worker_id: int = 0,
+    ) -> Any:
+        """Run one chip callable through an L3 orchestration scope."""
+        if self.level < 3:
+            return self.run(int(callable_id), args=args, config=config)
+
+        def _orch_fn(orchestrator: Any, _args: Any, _config: Any) -> None:
+            self.submit_next_level(
+                int(callable_id),
+                args,
+                config,
+                worker_id=worker_id,
+                orchestrator=orchestrator,
+            )
+
+        return self.run(_orch_fn)
 
     def run_prepared(self, callable_id: int, args: Any = None, config: Any = None) -> None:
         """Run a callable previously staged with :meth:`prepare_callable`."""
         self._require_initialized("run_prepared")
         self._worker.run_prepared(int(callable_id), args=args, config=config)
 
-    def malloc(self, nbytes: int, *, worker_id: int = 0) -> int:
+    def malloc(self, nbytes: int, *, worker_id: int = 0, orchestrator: Any = None) -> int:
         """Allocate bytes on a worker child and return the device pointer."""
         self._require_initialized("malloc")
         nbytes = _validate_positive_int("nbytes", nbytes)
+        if orchestrator is not None:
+            return int(orchestrator.malloc(worker_id=int(worker_id), size=nbytes))
         return self._worker.malloc(nbytes, worker_id=int(worker_id))
 
-    def free(self, ptr: int, *, worker_id: int = 0) -> None:
+    def free(self, ptr: int, *, worker_id: int = 0, orchestrator: Any = None) -> None:
         """Free a pointer previously returned by :meth:`malloc`."""
         self._require_initialized("free")
+        if orchestrator is not None:
+            orchestrator.free(worker_id=int(worker_id), ptr=int(ptr))
+            return
         self._worker.free(int(ptr), worker_id=int(worker_id))
 
-    def copy_to(self, dst: int, src: int, nbytes: int, *, worker_id: int = 0) -> None:
+    def copy_to(self, dst: int, src: int, nbytes: int, *, worker_id: int = 0, orchestrator: Any = None) -> None:
         """Copy ``nbytes`` from a host pointer to worker device memory."""
         self._require_initialized("copy_to")
-        self._worker.copy_to(int(dst), int(src), _validate_positive_int("nbytes", nbytes), worker_id=int(worker_id))
+        nbytes = _validate_positive_int("nbytes", nbytes)
+        if orchestrator is not None:
+            orchestrator.copy_to(worker_id=int(worker_id), dst=int(dst), src=int(src), size=nbytes)
+            return
+        self._worker.copy_to(int(dst), int(src), nbytes, worker_id=int(worker_id))
 
-    def copy_from(self, dst: int, src: int, nbytes: int, *, worker_id: int = 0) -> None:
+    def copy_from(self, dst: int, src: int, nbytes: int, *, worker_id: int = 0, orchestrator: Any = None) -> None:
         """Copy ``nbytes`` from worker device memory to a host pointer."""
         self._require_initialized("copy_from")
-        self._worker.copy_from(int(dst), int(src), _validate_positive_int("nbytes", nbytes), worker_id=int(worker_id))
+        nbytes = _validate_positive_int("nbytes", nbytes)
+        if orchestrator is not None:
+            orchestrator.copy_from(worker_id=int(worker_id), dst=int(dst), src=int(src), size=nbytes)
+            return
+        self._worker.copy_from(int(dst), int(src), nbytes, worker_id=int(worker_id))
 
     def alloc_tensor(
         self,
