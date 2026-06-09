@@ -451,25 +451,38 @@ class Scheduler:
             resident_block_ids = [
                 block_id for block_id in victim.cached_block_ids + victim.allocated_block_ids
                 if self.kv_cache_manager.blocks[block_id].location == KVBlockLocation.NPU
+                and self.kv_cache_manager.blocks[block_id].physical_page_id is not None
+                and self.kv_cache_manager.blocks[block_id].pending_job_id is None
+                and self.kv_cache_manager.blocks[block_id].ref_cnt == 1
             ]
-            if not resident_block_ids:
-                return None
-            job = self.kv_cache_manager.build_cpu_store_job(
-                resident_block_ids,
-                request_id=victim.request_id,
-            )
-            output.transfer_jobs.append(job)
-            output.jobs_to_flush.add(job.job_id)
-            self.num_cpu_store_jobs += 1
-            self.num_cpu_store_blocks += len(resident_block_ids)
+            if resident_block_ids:
+                try:
+                    job = self.kv_cache_manager.build_cpu_store_job(
+                        resident_block_ids,
+                        request_id=victim.request_id,
+                    )
+                except RuntimeError:
+                    job = None
+                if job is not None:
+                    output.transfer_jobs.append(job)
+                    output.jobs_to_flush.add(job.job_id)
+                    self.num_cpu_store_jobs += 1
+                    self.num_cpu_store_blocks += len(resident_block_ids)
+                else:
+                    self._reset_preempted_request_to_recompute(victim)
+            else:
+                self._reset_preempted_request_to_recompute(victim)
         else:
-            self._free_request_blocks(victim)
-            victim.num_computed_tokens = 0
-            victim.cached_block_ids = []
-            victim.allocated_block_ids = []
+            self._reset_preempted_request_to_recompute(victim)
         victim.status = RequestStatus.PREEMPTED
         self.waiting.appendleft(victim)
         return {"request": victim, "returned_tokens": returned_tokens}
+
+    def _reset_preempted_request_to_recompute(self, request: Request) -> None:
+        self._free_request_blocks(request)
+        request.num_computed_tokens = 0
+        request.cached_block_ids = []
+        request.allocated_block_ids = []
 
     def _free_request_blocks(self, request: Request) -> None:
         self.kv_cache_manager.release_blocks_by_ids(

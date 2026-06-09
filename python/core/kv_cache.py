@@ -239,7 +239,7 @@ class KvCacheManager:
         if blocks is None:
             raise RuntimeError("Insufficient KV cache blocks.")
         self.request_blocks[request_id] = blocks
-        page_ids = [block.block_id for block in blocks]
+        page_ids = [self._resident_physical_page_id(block) for block in blocks]
         return KvAllocation(
             request_id=request_id,
             model_id=model_id,
@@ -497,12 +497,16 @@ class KvCacheManager:
         """Mark SSD blocks as being loaded back to NPU pages."""
         if len(block_ids) != len(physical_page_ids):
             raise ValueError("block_ids and physical_page_ids must have the same length")
-        for idx, block_id in enumerate(block_ids):
+        for block_id in block_ids:
             block = self.blocks[block_id]
             if block.location != KVBlockLocation.SSD:
                 raise RuntimeError(f"KV block {block_id} is not stored on SSD")
             if block.pending_job_id is not None:
                 raise RuntimeError(f"KV block {block_id} already has pending job {block.pending_job_id}")
+        for idx, block_id in enumerate(block_ids):
+            block = self.blocks[block_id]
+            if block.ref_cnt == 0:
+                self.free_queue.remove(block)
             self._reserve_physical_page_id(physical_page_ids[idx])
             block.location = KVBlockLocation.MOVING_TO_NPU
             block.physical_page_id = physical_page_ids[idx]
@@ -518,12 +522,16 @@ class KvCacheManager:
         """Mark CPU-resident blocks as being loaded back to NPU pages."""
         if len(block_ids) != len(physical_page_ids):
             raise ValueError("block_ids and physical_page_ids must have the same length")
-        for idx, block_id in enumerate(block_ids):
+        for block_id in block_ids:
             block = self.blocks[block_id]
             if block.location != KVBlockLocation.CPU:
                 raise RuntimeError(f"KV block {block_id} is not stored on CPU")
             if block.pending_job_id is not None:
                 raise RuntimeError(f"KV block {block_id} already has pending job {block.pending_job_id}")
+        for idx, block_id in enumerate(block_ids):
+            block = self.blocks[block_id]
+            if block.ref_cnt == 0:
+                self.free_queue.remove(block)
             self._reserve_physical_page_id(physical_page_ids[idx])
             block.location = KVBlockLocation.MOVING_TO_NPU
             block.physical_page_id = physical_page_ids[idx]
@@ -598,20 +606,27 @@ class KvCacheManager:
         request_id: str | None = None,
     ) -> TransferJob:
         """Create and mark one CPU-to-NPU transfer job for logical blocks."""
-        if physical_page_ids is None:
-            physical_page_ids = self._allocate_physical_page_ids(len(block_ids))
-            if physical_page_ids is None:
-                raise RuntimeError("Insufficient free NPU pages for CPU KV load")
-        if len(block_ids) != len(physical_page_ids):
-            raise ValueError("block_ids and physical_page_ids must have the same length")
         cpu_slot_ids: list[int] = []
         for block_id in block_ids:
             block = self.blocks[block_id]
             if block.location != KVBlockLocation.CPU or block.cpu_slot_id is None:
                 raise RuntimeError(f"KV block {block_id} is not stored on CPU")
             cpu_slot_ids.append(block.cpu_slot_id)
+        allocated_physical_pages = physical_page_ids is None
+        if physical_page_ids is None:
+            physical_page_ids = self._allocate_physical_page_ids(len(block_ids))
+            if physical_page_ids is None:
+                raise RuntimeError("Insufficient free NPU pages for CPU KV load")
+        if len(block_ids) != len(physical_page_ids):
+            raise ValueError("block_ids and physical_page_ids must have the same length")
         job_id = self._next_job_id()
-        self.mark_cpu_blocks_moving_to_npu(block_ids, physical_page_ids, job_id)
+        try:
+            self.mark_cpu_blocks_moving_to_npu(block_ids, physical_page_ids, job_id)
+        except Exception:
+            if allocated_physical_pages:
+                for page_id in physical_page_ids:
+                    self._release_physical_page_id(page_id)
+            raise
         return TransferJob(
             job_id=job_id,
             request_id=request_id,
@@ -658,20 +673,27 @@ class KvCacheManager:
         request_id: str | None = None,
     ) -> TransferJob:
         """Create and mark one SSD-to-NPU transfer job for logical blocks."""
-        if physical_page_ids is None:
-            physical_page_ids = self._allocate_physical_page_ids(len(block_ids))
-            if physical_page_ids is None:
-                raise RuntimeError("Insufficient free NPU pages for SSD KV load")
-        if len(block_ids) != len(physical_page_ids):
-            raise ValueError("block_ids and physical_page_ids must have the same length")
         ssd_slot_ids: list[int] = []
         for block_id in block_ids:
             block = self.blocks[block_id]
             if block.location != KVBlockLocation.SSD or block.ssd_slot_id is None:
                 raise RuntimeError(f"KV block {block_id} is not stored on SSD")
             ssd_slot_ids.append(block.ssd_slot_id)
+        allocated_physical_pages = physical_page_ids is None
+        if physical_page_ids is None:
+            physical_page_ids = self._allocate_physical_page_ids(len(block_ids))
+            if physical_page_ids is None:
+                raise RuntimeError("Insufficient free NPU pages for SSD KV load")
+        if len(block_ids) != len(physical_page_ids):
+            raise ValueError("block_ids and physical_page_ids must have the same length")
         job_id = self._next_job_id()
-        self.mark_blocks_moving_to_npu(block_ids, physical_page_ids, job_id)
+        try:
+            self.mark_blocks_moving_to_npu(block_ids, physical_page_ids, job_id)
+        except Exception:
+            if allocated_physical_pages:
+                for page_id in physical_page_ids:
+                    self._release_physical_page_id(page_id)
+            raise
         return TransferJob(
             job_id=job_id,
             request_id=request_id,
@@ -738,7 +760,7 @@ class KvCacheManager:
             if blocks is None:
                 raise RuntimeError("Insufficient KV cache blocks.")
             self.request_blocks.setdefault(alloc.request_id, []).extend(blocks)
-            alloc.page_ids.extend(block.block_id for block in blocks)
+            alloc.page_ids.extend(self._resident_physical_page_id(block) for block in blocks)
             alloc.tokens_capacity = len(alloc.page_ids) * pool.page_size
         return self.slot_mapping_for_request(alloc, alloc.tokens_used)
 
@@ -857,6 +879,11 @@ class KvCacheManager:
         block = KVCacheBlock(block_id=len(self.blocks), physical_page_id=None)
         self.blocks.append(block)
         return block
+
+    def _resident_physical_page_id(self, block: KVCacheBlock) -> int:
+        if block.location != KVBlockLocation.NPU or block.physical_page_id is None:
+            raise RuntimeError(f"KV block {block.block_id} is not resident on NPU")
+        return block.physical_page_id
 
     def _allocate_physical_page_id(self) -> int | None:
         if not self._free_physical_page_ids:
