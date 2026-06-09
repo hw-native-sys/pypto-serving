@@ -47,6 +47,7 @@ def test_build_serving_engine_config_uses_cli_args(tmp_path, monkeypatch):
         "--long-prefill-token-threshold", "64",
         "--no-enable-prefix-caching",
         "--no-enable-chunked-prefill",
+        "--max-cpu-offload-blocks", "12",
     ])
 
     config = cli.build_serving_engine_config(args)
@@ -71,6 +72,7 @@ def test_build_serving_engine_config_uses_cli_args(tmp_path, monkeypatch):
     assert config.long_prefill_token_threshold == 64
     assert config.enable_prefix_cache is False
     assert config.enable_chunk_prefill is False
+    assert config.max_cpu_offload_blocks == 12
 
 
 def test_parser_rejects_invalid_backend(tmp_path):
@@ -87,6 +89,14 @@ def test_parser_rejects_removed_prompt_mode(tmp_path):
 
     with pytest.raises(SystemExit):
         _parse_args(["--model", str(model_dir), "--backend", "npu", "--prompt", "hello"])
+
+
+def test_parser_rejects_negative_cpu_offload_blocks(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+
+    with pytest.raises(SystemExit):
+        _parse_args(["--model", str(model_dir), "--max-cpu-offload-blocks", "-1"])
 
 
 def test_main_starts_serving(tmp_path, monkeypatch):

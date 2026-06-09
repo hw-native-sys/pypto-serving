@@ -73,6 +73,14 @@ class PyptoExecutor(ModelExecutor, ABC):
         ):
             return self._runners[model.config.model_id].run_decode(model, batch)
 
+    def materialize_kv_page_view(self, model_id: str):
+        """Return a worker-side canonical KV page view for offload backends."""
+        runner = self._runners[model_id]
+        materialize = getattr(runner, "materialize_kv_page_view", None)
+        if not callable(materialize):
+            raise RuntimeError(f"Runner for model {model_id!r} does not expose a KV page view")
+        return materialize(model_id)
+
     @contextlib.contextmanager
     def session(self):
         """Provide a generation lifecycle hook for PyPTO runtimes."""

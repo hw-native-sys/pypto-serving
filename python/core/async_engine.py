@@ -49,6 +49,7 @@ class EngineConfig:
     # Feature flags
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
+    max_cpu_offload_blocks: int = 0
 
 
 @dataclass
@@ -93,6 +94,7 @@ class AsyncLLMEngine:
             num_blocks=num_blocks,
             block_size=block_size,
             enable_prefix_cache=self.config.enable_prefix_cache,
+            max_cpu_offload_blocks=self.config.max_cpu_offload_blocks,
         )
 
         scheduler_config = SchedulerConfig(
@@ -102,6 +104,7 @@ class AsyncLLMEngine:
             max_seq_len=runtime.max_seq_len,
             enable_prefix_cache=self.config.enable_prefix_cache,
             enable_chunk_prefill=self.config.enable_chunk_prefill,
+            max_cpu_offload_blocks=self.config.max_cpu_offload_blocks,
         )
         self.scheduler = Scheduler(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)
 
@@ -258,6 +261,7 @@ class AsyncLLMEngine:
                 self._handle_step_error(scheduler_output)
                 continue
 
+            self._process_transfer_outputs(step_output)
             with profile_span(
                 "scheduler.process_step_output",
                 cat="scheduler",
@@ -304,6 +308,24 @@ class AsyncLLMEngine:
                 finish_reason=req_output.finish_reason,
             )
             ctx.queue.put_nowait(token_output)
+
+    def _process_transfer_outputs(self, step_output: StepOutput) -> None:
+        """Apply completed worker-side KV transfers to scheduler metadata."""
+        if not step_output.completed_transfer_jobs:
+            return
+        with profile_span(
+            "scheduler.process_kv_transfer_output",
+            cat="scheduler",
+            args={"jobs": len(step_output.completed_transfer_jobs)},
+        ):
+            for result in step_output.completed_transfer_jobs:
+                if not result.success:
+                    logger.error(
+                        "KV transfer job %s failed: %s",
+                        result.job_id,
+                        result.error or "unknown error",
+                    )
+                self.kv_cache_manager.complete_transfer_result(result)
 
     def _handle_step_error(self, scheduler_output: SchedulerOutput) -> None:
         """On worker error, abort all requests in the failed batch."""

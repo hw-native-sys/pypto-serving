@@ -14,6 +14,7 @@ from typing import Literal
 
 import torch
 
+from .kv_offload import TransferResult
 from .tokenizer import TokenizerAdapter
 
 
@@ -235,4 +236,5 @@ class WorkerCommand:
 class StepOutput:
     """Result returned from worker process after executing a batch step."""
     new_tokens: dict  # {request_id: int}
+    completed_transfer_jobs: list[TransferResult] = field(default_factory=list)
     error: str | None = None
