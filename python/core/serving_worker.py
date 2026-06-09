@@ -16,6 +16,15 @@ import torch
 
 from typing import TYPE_CHECKING
 
+from .kv_offload import (
+    CPUKvOffloadBackend,
+    CPULoadStoreSpec,
+    KvOffloadBackend,
+    SSDLoadStoreSpec,
+    TransferJob,
+    TransferResult,
+    UnavailableKvOffloadBackend,
+)
 from python.profile import get_profiler, profile_span
 from .types import (
     DecodeBatch,
@@ -52,6 +61,8 @@ class WorkerProcess:
         self.sampler = None
         self.model_record = None
         self._page_size: int = 64
+        self._cpu_kv_offload_backend: CPUKvOffloadBackend | None = None
+        self._ssd_kv_offload_backend: KvOffloadBackend | None = None
 
     def init_device_and_model(self) -> None:
         from .model_loader import ModelLoader
@@ -138,6 +149,7 @@ class WorkerProcess:
         """Execute one batch step (may contain prefill + decode requests)."""
         runtime_model = self.model_record.runtime_model
         new_tokens: dict[str, int] = {}
+        completed_transfer_jobs = self._execute_kv_transfer_jobs(scheduler_output)
 
         prefill_requests = [
             sr for sr in scheduler_output.scheduled_requests if sr.is_prefill
@@ -157,7 +169,92 @@ class WorkerProcess:
                 if decode_requests:
                     self._batch_decode(decode_requests, runtime_model, new_tokens)
 
-        return StepOutput(new_tokens=new_tokens)
+        return StepOutput(new_tokens=new_tokens, completed_transfer_jobs=completed_transfer_jobs)
+
+    def _execute_kv_transfer_jobs(self, scheduler_output) -> list[TransferResult]:
+        """Execute worker-side KV transfer jobs carried by scheduler output."""
+        transfer_jobs: list[TransferJob] = list(getattr(scheduler_output, "transfer_jobs", []) or [])
+        jobs_to_flush: set[int] = set(getattr(scheduler_output, "jobs_to_flush", set()) or set())
+        if not transfer_jobs and not jobs_to_flush:
+            return []
+
+        completed: list[TransferResult] = []
+        with profile_span(
+            "WorkerProcess.kv_transfer_jobs",
+            cat="worker",
+            args={"jobs": len(transfer_jobs), "flush": len(jobs_to_flush)},
+        ):
+            for job in transfer_jobs:
+                try:
+                    backend = self._ensure_kv_offload_backend(job)
+                    backend.submit(job)
+                except Exception as exc:
+                    completed.append(TransferResult(job_id=job.job_id, success=False, error=str(exc)))
+
+            if self._cpu_kv_offload_backend is not None and jobs_to_flush:
+                completed.extend(self._cpu_kv_offload_backend.wait(jobs_to_flush))
+            if self._ssd_kv_offload_backend is not None and jobs_to_flush:
+                completed.extend(self._ssd_kv_offload_backend.wait(jobs_to_flush))
+
+            if self._cpu_kv_offload_backend is not None:
+                completed.extend(self._cpu_kv_offload_backend.poll())
+            if self._ssd_kv_offload_backend is not None:
+                completed.extend(self._ssd_kv_offload_backend.poll())
+
+        return completed
+
+    def _ensure_kv_offload_backend(self, job: TransferJob) -> KvOffloadBackend:
+        """Return the worker backend responsible for one KV transfer job."""
+        if self._max_cpu_slot_id(job) is not None:
+            return self._ensure_cpu_kv_offload_backend(job)
+        if self._uses_ssd(job):
+            return self._ensure_ssd_kv_offload_backend()
+        raise ValueError(f"unsupported KV transfer direction: {job.direction}")
+
+    def _ensure_cpu_kv_offload_backend(self, job: TransferJob) -> CPUKvOffloadBackend:
+        """Create or grow the CPU KV offload backend required by one job."""
+        max_slot_id = self._max_cpu_slot_id(job)
+        if max_slot_id is None:
+            raise ValueError(f"unsupported KV transfer direction: {job.direction}")
+        required_slots = max_slot_id + 1
+        if self._cpu_kv_offload_backend is None:
+            materialize = getattr(self.executor, "materialize_kv_page_view", None)
+            if not callable(materialize):
+                raise RuntimeError("executor does not expose a worker KV page view")
+            page_view = materialize(self.config.model_id)
+            self._cpu_kv_offload_backend = CPUKvOffloadBackend(page_view, num_cpu_slots=required_slots)
+        else:
+            self._cpu_kv_offload_backend.ensure_num_cpu_slots(required_slots)
+        return self._cpu_kv_offload_backend
+
+    def _ensure_ssd_kv_offload_backend(self) -> KvOffloadBackend:
+        """Return the SSD KV backend placeholder until the real NPU-SSD API is wired."""
+        if self._ssd_kv_offload_backend is None:
+            self._ssd_kv_offload_backend = UnavailableKvOffloadBackend(
+                "SSD",
+                reason="NPU-attached SSD KV transfer API is not configured",
+            )
+        return self._ssd_kv_offload_backend
+
+    @staticmethod
+    def _max_cpu_slot_id(job: TransferJob) -> int | None:
+        cpu_specs = [
+            spec for spec in (job.src, job.dst)
+            if isinstance(spec, CPULoadStoreSpec)
+        ]
+        if not cpu_specs:
+            return None
+        max_slot_id = -1
+        for spec in cpu_specs:
+            if spec.block_ids:
+                max_slot_id = max(max_slot_id, max(spec.block_ids))
+        if max_slot_id < 0:
+            raise ValueError("CPU transfer specs must include at least one slot")
+        return max_slot_id
+
+    @staticmethod
+    def _uses_ssd(job: TransferJob) -> bool:
+        return isinstance(job.src, SSDLoadStoreSpec) or isinstance(job.dst, SSDLoadStoreSpec)
 
     def _batch_prefill(
         self, scheduled: list, runtime_model, new_tokens: dict[str, int]

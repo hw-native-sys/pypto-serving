@@ -199,6 +199,11 @@ class Qwen314BModelRunner(ModelRunner):
         if worker is not None and worker.initialized:
             worker.free_tensor(tensor)
 
+    def materialize_kv_page_view(self, model_id: str):
+        """Return a page-contiguous view over runner-owned NPU KV cache."""
+        worker = self._worker_for_runtime(self._kv_cache_runtime_name())
+        return self.materialize_worker_page_view(model_id, worker)
+
     @staticmethod
     def _validate_kv_cache_bounds(
         model: RuntimeModel,

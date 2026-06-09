@@ -79,6 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Enable chunked prefill (default: True). Use --no-enable-chunked-prefill to disable.",
     )
+    parser.add_argument(
+        "--max-cpu-offload-blocks",
+        type=_non_negative_int,
+        default=0,
+        help="Maximum number of KV blocks that can be offloaded to CPU. Use 0 to disable CPU offload.",
+    )
 
     # Misc
     parser.add_argument(
@@ -114,6 +120,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         long_prefill_token_threshold=args.long_prefill_token_threshold,
         enable_prefix_cache=args.enable_prefix_caching,
         enable_chunk_prefill=args.enable_chunked_prefill,
+        max_cpu_offload_blocks=args.max_cpu_offload_blocks,
     )
 
 
@@ -142,6 +149,13 @@ def _build_executor_kwargs() -> dict[str, object]:
     if save_kernels_dir:
         executor_kwargs["save_kernels_dir"] = save_kernels_dir
     return executor_kwargs
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
 
 
 def run_serve(
@@ -189,6 +203,7 @@ def run_serve(
     print(f"  Chunked prefill threshold: {config.long_prefill_token_threshold}")
     print(f"  Prefix cache: {'enabled' if config.enable_prefix_cache else 'disabled'}")
     print(f"  Chunk prefill: {'enabled' if config.enable_chunk_prefill else 'disabled'}")
+    print(f"  CPU KV offload blocks: {config.max_cpu_offload_blocks}")
     print("  Endpoints: /v1/completions, /v1/chat/completions, /v1/models, /health")
 
     uvicorn.run(app, host=host, port=port, log_level="info")

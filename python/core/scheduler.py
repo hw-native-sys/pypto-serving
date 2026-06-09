@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from .kv_cache import KvCacheManager
+from .kv_offload import KVBlockLocation, TransferJob
 
 
 class RequestStatus(Enum):
@@ -45,6 +46,7 @@ class SchedulerConfig:
     # Feature flags
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
+    max_cpu_offload_blocks: int = 0
 
 
 @dataclass
@@ -100,12 +102,18 @@ class ScheduledRequest:
 class SchedulerOutput:
     scheduled_requests: list[ScheduledRequest] = field(default_factory=list)
     preempted_requests: list[Request] = field(default_factory=list)
+    transfer_jobs: list[TransferJob] = field(default_factory=list)
+    jobs_to_flush: set[int] = field(default_factory=set)
     num_prefill_tokens: int = 0
     num_decode_tokens: int = 0
 
     @property
     def is_empty(self) -> bool:
-        return len(self.scheduled_requests) == 0
+        return (
+            len(self.scheduled_requests) == 0
+            and len(self.transfer_jobs) == 0
+            and len(self.jobs_to_flush) == 0
+        )
 
 
 @dataclass
@@ -125,6 +133,10 @@ class Scheduler:
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
         self.requests: dict[str, Request] = {}
+        self.num_cpu_store_jobs: int = 0
+        self.num_cpu_load_jobs: int = 0
+        self.num_cpu_store_blocks: int = 0
+        self.num_cpu_load_blocks: int = 0
 
     def add_request(self, request: Request) -> None:
         if len(request.prompt_token_ids) > self.config.max_seq_len:
@@ -164,11 +176,12 @@ class Scheduler:
         # Phase 1: schedule RUNNING requests (decode or resumed prefill)
         scheduled_req_ids: set[str] = set()
         num_scheduled_tokens: dict[str, int] = {}
-        running_to_keep: list[Request] = []
-        for request in self.running:
+        req_index = 0
+        while req_index < len(self.running) and token_budget > 0:
+            request = self.running[req_index]
             num_new = request.num_new_tokens_needed
             if num_new <= 0:
-                running_to_keep.append(request)
+                req_index += 1
                 continue
 
             if self.config.enable_chunk_prefill and self.config.long_prefill_token_threshold > 0:
@@ -176,32 +189,39 @@ class Scheduler:
             num_new = min(num_new, token_budget)
 
             if num_new <= 0:
-                running_to_keep.append(request)
+                req_index += 1
                 continue
 
             num_blocks_needed = self._blocks_needed(request, num_new)
             if not self._try_allocate_blocks(request, num_blocks_needed):
+                preempted_request = self._pop_lowest_priority_running_request(request)
+                if preempted_request is None:
+                    req_index += 1
+                    continue
                 preempted = self._preempt_lowest_priority(
-                    request, scheduled_req_ids, num_scheduled_tokens, output
+                    preempted_request,
+                    scheduled_req_ids,
+                    num_scheduled_tokens,
+                    output,
                 )
                 if preempted is None:
-                    running_to_keep.append(request)
+                    self.running.insert(req_index, preempted_request)
+                    req_index += 1
                     continue
                 token_budget += preempted.get("returned_tokens", 0)
                 output.preempted_requests.append(preempted["request"])
-                if not self._try_allocate_blocks(request, num_blocks_needed):
-                    running_to_keep.append(request)
-                    continue
+                break
 
             is_prefill = request.is_prefill
             all_block_ids = request.cached_block_ids + request.allocated_block_ids
+            physical_block_ids = self.kv_cache_manager.resident_block_ids(all_block_ids)
             output.scheduled_requests.append(
                 ScheduledRequest(
                     request=request,
                     num_new_tokens=num_new,
                     is_prefill=is_prefill,
                     num_computed_tokens=request.num_computed_tokens,
-                    block_ids=list(all_block_ids),
+                    block_ids=physical_block_ids,
                 )
             )
             scheduled_req_ids.add(request.request_id)
@@ -211,58 +231,71 @@ class Scheduler:
             else:
                 output.num_decode_tokens += num_new
             token_budget -= num_new
-            running_to_keep.append(request)
+            req_index += 1
 
-        self.running = running_to_keep
-
-        # Phase 2: schedule WAITING requests (new prefill)
         remaining_waiting: deque[Request] = deque()
-        while self.waiting and token_budget > 0:
-            if len(self.running) >= self.config.max_num_running_reqs:
-                break
+        # Phase 2: schedule WAITING requests (new prefill or resumed preemption).
+        if not output.preempted_requests:
+            while self.waiting and token_budget > 0:
+                if len(self.running) >= self.config.max_num_running_reqs:
+                    break
 
-            request = self.waiting.popleft()
+                request = self.waiting.popleft()
 
-            # Prefix cache lookup
-            if self.config.enable_prefix_cache:
-                cached_blocks = self.kv_cache_manager.get_computed_blocks(request.prompt_token_ids)
-                if cached_blocks:
-                    request.cached_block_ids = [b.block_id for b in cached_blocks]
-                    request.num_computed_tokens = len(cached_blocks) * self.kv_cache_manager.block_size
-            else:
-                cached_blocks = []
+                # Prefix cache lookup
+                existing_block_ids = request.cached_block_ids + request.allocated_block_ids
+                if self.config.enable_prefix_cache and not existing_block_ids:
+                    cached_blocks = self.kv_cache_manager.get_computed_blocks(request.prompt_token_ids)
+                    if cached_blocks:
+                        request.cached_block_ids = [b.block_id for b in cached_blocks]
+                        request.num_computed_tokens = len(cached_blocks) * self.kv_cache_manager.block_size
+                else:
+                    cached_blocks = []
 
-            num_new = request.num_new_tokens_needed
-            if self.config.enable_chunk_prefill and self.config.long_prefill_token_threshold > 0:
-                num_new = min(num_new, self.config.long_prefill_token_threshold)
-            num_new = min(num_new, token_budget)
+                num_new = request.num_new_tokens_needed
+                if self.config.enable_chunk_prefill and self.config.long_prefill_token_threshold > 0:
+                    num_new = min(num_new, self.config.long_prefill_token_threshold)
+                num_new = min(num_new, token_budget)
 
-            if num_new <= 0:
-                remaining_waiting.append(request)
-                continue
+                if num_new <= 0:
+                    remaining_waiting.append(request)
+                    continue
 
-            num_blocks_needed = self._blocks_needed(request, num_new)
-            if not self._try_allocate_blocks(request, num_blocks_needed):
-                self.kv_cache_manager.release_cached_blocks(cached_blocks)
-                request.cached_block_ids = []
-                request.num_computed_tokens = 0
-                remaining_waiting.append(request)
-                break
+                all_block_ids = request.cached_block_ids + request.allocated_block_ids
+                missing_block_ids = self.kv_cache_manager.non_resident_block_ids(all_block_ids)
+                num_blocks_needed = self._blocks_needed(request, num_new)
+                if self.kv_cache_manager.num_free_blocks < len(missing_block_ids) + num_blocks_needed:
+                    self.kv_cache_manager.release_cached_blocks(cached_blocks)
+                    request.cached_block_ids = []
+                    request.num_computed_tokens = 0
+                    remaining_waiting.append(request)
+                    break
+                if not self._ensure_blocks_resident(request, all_block_ids, output):
+                    remaining_waiting.append(request)
+                    continue
 
-            request.status = RequestStatus.RUNNING
-            self.running.append(request)
-            all_block_ids = request.cached_block_ids + request.allocated_block_ids
-            output.scheduled_requests.append(
-                ScheduledRequest(
-                    request=request,
-                    num_new_tokens=num_new,
-                    is_prefill=True,
-                    num_computed_tokens=request.num_computed_tokens,
-                    block_ids=list(all_block_ids),
+                if not self._try_allocate_blocks(request, num_blocks_needed):
+                    self.kv_cache_manager.release_cached_blocks(cached_blocks)
+                    request.cached_block_ids = []
+                    request.num_computed_tokens = 0
+                    remaining_waiting.append(request)
+                    break
+
+                request.status = RequestStatus.RUNNING
+                self.running.append(request)
+                all_block_ids = request.cached_block_ids + request.allocated_block_ids
+                physical_block_ids = self.kv_cache_manager.resident_block_ids(all_block_ids)
+                output.scheduled_requests.append(
+                    ScheduledRequest(
+                        request=request,
+                        num_new_tokens=num_new,
+                        is_prefill=True,
+                        num_computed_tokens=request.num_computed_tokens,
+                        block_ids=physical_block_ids,
+                    )
                 )
-            )
-            output.num_prefill_tokens += num_new
-            token_budget -= num_new
+                output.num_prefill_tokens += num_new
+                token_budget -= num_new
 
         remaining_waiting.extend(self.waiting)
         self.waiting = remaining_waiting
@@ -350,25 +383,58 @@ class Scheduler:
         request.allocated_block_ids.extend(block_ids)
         return True
 
+    def _ensure_blocks_resident(
+        self,
+        request: Request,
+        block_ids: list[int],
+        output: SchedulerOutput,
+    ) -> bool:
+        if any(self.kv_cache_manager.blocks[block_id].pending_job_id is not None for block_id in block_ids):
+            return False
+        missing_block_ids = self.kv_cache_manager.non_resident_block_ids(block_ids)
+        if not missing_block_ids:
+            return True
+        if self.config.max_cpu_offload_blocks <= 0:
+            return False
+        try:
+            job = self.kv_cache_manager.build_cpu_load_job(
+                missing_block_ids,
+                request_id=request.request_id,
+            )
+        except RuntimeError:
+            return False
+        output.transfer_jobs.append(job)
+        output.jobs_to_flush.add(job.job_id)
+        self.num_cpu_load_jobs += 1
+        self.num_cpu_load_blocks += len(missing_block_ids)
+        return False
+
+    def _pop_lowest_priority_running_request(self, exclude: Request) -> Request | None:
+        """Remove and return the lowest-priority running request."""
+        if not self.running:
+            return None
+        candidates = [r for r in self.running if r.request_id != exclude.request_id]
+        if candidates:
+            victim = max(candidates, key=lambda r: r.arrival_time)
+            self.running.remove(victim)
+            return victim
+        if exclude in self.running:
+            self.running.remove(exclude)
+            return exclude
+        return None
+
     def _preempt_lowest_priority(
         self,
-        exclude: Request,
+        victim: Request,
         scheduled_req_ids: set[str],
         num_scheduled_tokens: dict[str, int],
         output: SchedulerOutput,
     ) -> dict | None:
-        """Preempt the lowest-priority running request to free blocks.
+        """Preempt a request that has already been removed from the running queue.
 
         If the victim was already scheduled in this iteration, it is removed
         from the scheduled output and its token budget is returned.
         """
-        if not self.running:
-            return None
-        candidates = [r for r in self.running if r.request_id != exclude.request_id]
-        if not candidates:
-            return None
-        victim = max(candidates, key=lambda r: r.arrival_time)
-
         returned_tokens = 0
         if victim.request_id in scheduled_req_ids:
             scheduled_req_ids.discard(victim.request_id)
@@ -381,12 +447,27 @@ class Scheduler:
             else:
                 output.num_decode_tokens -= returned_tokens
 
-        self._free_request_blocks(victim)
+        if self.config.max_cpu_offload_blocks > 0:
+            resident_block_ids = [
+                block_id for block_id in victim.cached_block_ids + victim.allocated_block_ids
+                if self.kv_cache_manager.blocks[block_id].location == KVBlockLocation.NPU
+            ]
+            if not resident_block_ids:
+                return None
+            job = self.kv_cache_manager.build_cpu_store_job(
+                resident_block_ids,
+                request_id=victim.request_id,
+            )
+            output.transfer_jobs.append(job)
+            output.jobs_to_flush.add(job.job_id)
+            self.num_cpu_store_jobs += 1
+            self.num_cpu_store_blocks += len(resident_block_ids)
+        else:
+            self._free_request_blocks(victim)
+            victim.num_computed_tokens = 0
+            victim.cached_block_ids = []
+            victim.allocated_block_ids = []
         victim.status = RequestStatus.PREEMPTED
-        victim.num_computed_tokens = 0
-        victim.cached_block_ids = []
-        victim.allocated_block_ids = []
-        self.running = [r for r in self.running if r.request_id != victim.request_id]
         self.waiting.appendleft(victim)
         return {"request": victim, "returned_tokens": returned_tokens}
 
