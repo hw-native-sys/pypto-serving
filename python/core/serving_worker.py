@@ -16,6 +16,7 @@ import torch
 
 from typing import TYPE_CHECKING
 
+from .kv_offload import CPUKvOffloadBackend, TransferJob, TransferResult
 from python.profile import get_profiler, profile_span
 from .types import (
     DecodeBatch,
@@ -52,6 +53,8 @@ class WorkerProcess:
         self.sampler = None
         self.model_record = None
         self._page_size: int = 64
+        self._kv_offload_backend: CPUKvOffloadBackend | None = None
+        self._kv_offload_cpu_slots: torch.Tensor | None = None
 
     def init_device_and_model(self) -> None:
         from .model_loader import ModelLoader
@@ -94,6 +97,10 @@ class WorkerProcess:
             )
 
             self._page_size = loaded.runtime_model.runtime.page_size
+            self._preallocate_kv_offload_cpu_slots(
+                loaded.config,
+                loaded.runtime_model.runtime,
+            )
 
             register_model = getattr(self.executor, "register_model", None)
             if callable(register_model):
@@ -124,17 +131,29 @@ class WorkerProcess:
                     pass  # No allocation cleanup needed
 
                 try:
-                    result = self._execute_step(cmd.scheduler_output)
+                    result = self._execute_step(
+                        cmd.scheduler_output,
+                    )
                     self.output_queue.put(result)
                 except Exception as e:
                     logger.error(f"Worker step failed: {e}", exc_info=True)
+                    self.output_queue.put(StepOutput(new_tokens={}, error=str(e)))
+            elif cmd.type == "kv_transfer":
+                try:
+                    result = self._execute_kv_transfer_step(cmd.kv_transfer_jobs or [])
+                    self.output_queue.put(result)
+                except Exception as e:
+                    logger.error(f"Worker KV transfer failed: {e}", exc_info=True)
                     self.output_queue.put(StepOutput(new_tokens={}, error=str(e)))
             else:
                 logger.warning(f"Worker received unknown command: {cmd.type}")
 
         logger.info("Worker exiting")
 
-    def _execute_step(self, scheduler_output) -> StepOutput:
+    def _execute_step(
+        self,
+        scheduler_output,
+    ) -> StepOutput:
         """Execute one batch step (may contain prefill + decode requests)."""
         runtime_model = self.model_record.runtime_model
         new_tokens: dict[str, int] = {}
@@ -158,6 +177,80 @@ class WorkerProcess:
                     self._batch_decode(decode_requests, runtime_model, new_tokens)
 
         return StepOutput(new_tokens=new_tokens)
+
+    def _execute_kv_transfer_step(self, kv_transfer_jobs: list[TransferJob]) -> StepOutput:
+        """Execute a transfer-only worker command without running model kernels."""
+        transfer_results: list[TransferResult] = []
+        with profile_span(
+            "WorkerProcess.execute_kv_transfer_step",
+            cat="worker",
+            args={"jobs": len(kv_transfer_jobs)},
+        ):
+            if kv_transfer_jobs:
+                transfer_results.extend(self._execute_kv_transfer_jobs(kv_transfer_jobs))
+        failed_transfer = next((result for result in transfer_results if not result.success), None)
+        if failed_transfer is not None:
+            return StepOutput(
+                new_tokens={},
+                kv_transfer_results=transfer_results,
+                error=failed_transfer.error or "KV offload transfer failed",
+            )
+        return StepOutput(new_tokens={}, kv_transfer_results=transfer_results)
+
+    def _preallocate_kv_offload_cpu_slots(self, model_config, runtime_config) -> None:
+        """Create CPU offload slots before the L3 worker forks chip children."""
+        max_cpu_slots = int(getattr(self.config, "max_cpu_offload_blocks", 0))
+        if max_cpu_slots <= 0:
+            return
+        kv_dtype = getattr(torch, runtime_config.kv_dtype)
+        element_size = torch.empty((), dtype=kv_dtype).element_size()
+        page_size_bytes = (
+            2
+            * int(model_config.num_hidden_layers)
+            * int(model_config.num_key_value_heads)
+            * int(runtime_config.page_size)
+            * int(model_config.head_dim)
+            * element_size
+        )
+        self._kv_offload_cpu_slots = torch.empty(
+            (max_cpu_slots, page_size_bytes),
+            dtype=torch.uint8,
+            device="cpu",
+        ).share_memory_()
+
+    def _execute_kv_transfer_jobs(self, jobs: list[TransferJob]) -> list[TransferResult]:
+        """Run CPU KV offload transfers before model execution."""
+        backend = self._get_kv_offload_backend(jobs)
+        results: list[TransferResult] = []
+        for job in jobs:
+            backend.submit(job)
+            results.extend(backend.wait({job.job_id}))
+        return results
+
+    def _get_kv_offload_backend(self, jobs: list[TransferJob]) -> CPUKvOffloadBackend:
+        if self._kv_offload_backend is not None:
+            return self._kv_offload_backend
+        max_slot_id = -1
+        for job in jobs:
+            for endpoint in (job.src, job.dst):
+                slot_ids = getattr(endpoint, "slot_ids", None)
+                if slot_ids:
+                    max_slot_id = max(max_slot_id, max(slot_ids))
+        configured_slots = int(getattr(self.config, "max_cpu_offload_blocks", 0))
+        num_cpu_slots = max(configured_slots, max_slot_id + 1, 1)
+        page_view = self.executor.materialize_kv_page_view(self.config.model_id)
+        cpu_slots = self._kv_offload_cpu_slots
+        if cpu_slots is not None and cpu_slots.shape[0] < num_cpu_slots:
+            raise RuntimeError(
+                "Preallocated CPU KV slots are smaller than requested transfer slots: "
+                f"preallocated={cpu_slots.shape[0]}, requested={num_cpu_slots}"
+            )
+        self._kv_offload_backend = CPUKvOffloadBackend(
+            page_view,
+            num_cpu_slots=num_cpu_slots,
+            cpu_slots=cpu_slots,
+        )
+        return self._kv_offload_backend
 
     def _batch_prefill(
         self, scheduled: list, runtime_model, new_tokens: dict[str, int]

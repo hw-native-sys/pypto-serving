@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from .kv_cache import KvCacheManager
+from .kv_offload import KVBlockLocation, TransferJob, TransferResult
 
 
 class RequestStatus(Enum):
@@ -45,6 +46,7 @@ class SchedulerConfig:
     # Feature flags
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
+    enable_kv_cpu_offload: bool = False
 
 
 @dataclass
@@ -100,12 +102,13 @@ class ScheduledRequest:
 class SchedulerOutput:
     scheduled_requests: list[ScheduledRequest] = field(default_factory=list)
     preempted_requests: list[Request] = field(default_factory=list)
+    kv_transfer_jobs: list[TransferJob] = field(default_factory=list)
     num_prefill_tokens: int = 0
     num_decode_tokens: int = 0
 
     @property
     def is_empty(self) -> bool:
-        return len(self.scheduled_requests) == 0
+        return len(self.scheduled_requests) == 0 and len(self.kv_transfer_jobs) == 0
 
 
 @dataclass
@@ -125,6 +128,7 @@ class Scheduler:
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
         self.requests: dict[str, Request] = {}
+        self._pending_store_kv_transfer_jobs: list[TransferJob] = []
 
     def add_request(self, request: Request) -> None:
         if len(request.prompt_token_ids) > self.config.max_seq_len:
@@ -151,14 +155,24 @@ class Scheduler:
         if request is None:
             return
         request.status = status
+        release_block_ids = request.cached_block_ids + request.allocated_block_ids
         self._free_request_blocks(request)
+        self._queue_cpu_store_jobs(release_block_ids, request.request_id)
         self.running = [r for r in self.running if r.request_id != request_id]
 
     def has_work(self) -> bool:
-        return len(self.running) > 0 or len(self.waiting) > 0
+        return (
+            len(self.running) > 0
+            or len(self.waiting) > 0
+            or len(self._pending_store_kv_transfer_jobs) > 0
+        )
 
     def schedule(self) -> SchedulerOutput:
         output = SchedulerOutput()
+        if self._pending_store_kv_transfer_jobs:
+            output.kv_transfer_jobs.extend(self._pending_store_kv_transfer_jobs)
+            self._pending_store_kv_transfer_jobs = []
+            return output
         token_budget = self.config.max_num_scheduled_tokens
 
         # Phase 1: schedule RUNNING requests (decode or resumed prefill)
@@ -229,6 +243,19 @@ class Scheduler:
                 if cached_blocks:
                     request.cached_block_ids = [b.block_id for b in cached_blocks]
                     request.num_computed_tokens = len(cached_blocks) * self.kv_cache_manager.block_size
+                    if self.config.enable_kv_cpu_offload:
+                        cpu_block_ids = [
+                            block.block_id
+                            for block in cached_blocks
+                            if block.location == KVBlockLocation.CPU
+                        ]
+                        if cpu_block_ids:
+                            output.kv_transfer_jobs.append(
+                                self.kv_cache_manager.build_cpu_load_job(
+                                    cpu_block_ids,
+                                    request_id=request.request_id,
+                                )
+                            )
             else:
                 cached_blocks = []
 
@@ -268,6 +295,17 @@ class Scheduler:
         self.waiting = remaining_waiting
 
         return output
+
+    def complete_transfer_results(self, results: list[TransferResult]) -> None:
+        """Apply KV transfer completions produced by the worker process."""
+        for result in results:
+            self.kv_cache_manager.complete_transfer_result(result)
+
+    def pop_store_kv_transfer_jobs(self) -> list[TransferJob]:
+        """Return and clear NPU->CPU stores queued after request completion."""
+        jobs = self._pending_store_kv_transfer_jobs
+        self._pending_store_kv_transfer_jobs = []
+        return jobs
 
     def update_from_output(
         self, scheduler_output: SchedulerOutput, new_token_ids: dict[str, int]
@@ -317,7 +355,9 @@ class Scheduler:
         for req_id in finished_ids:
             request = self.requests.get(req_id)
             if request is not None:
+                release_block_ids = request.cached_block_ids + request.allocated_block_ids
                 self._free_request_blocks(request)
+                self._queue_cpu_store_jobs(release_block_ids, request.request_id)
             self.running = [r for r in self.running if r.request_id != req_id]
 
         return outputs
@@ -344,7 +384,15 @@ class Scheduler:
             return True
         if self.kv_cache_manager.num_free_blocks < num_blocks:
             return False
-        block_ids = self.kv_cache_manager.allocate_block_ids(num_blocks)
+        current_block_ids = request.cached_block_ids + request.allocated_block_ids
+        preferred_block_ids: list[int] = []
+        if current_block_ids:
+            start = current_block_ids[-1] + 1
+            preferred_block_ids = list(range(start, start + num_blocks))
+        block_ids = self.kv_cache_manager.allocate_preferred_block_ids(
+            num_blocks,
+            preferred_block_ids,
+        )
         if block_ids is None:
             return False
         request.allocated_block_ids.extend(block_ids)
@@ -411,3 +459,23 @@ class Scheduler:
             already_cached,
             total_blocks_computed,
         )
+
+    def _queue_cpu_store_jobs(self, block_ids: list[int], request_id: str) -> None:
+        """Queue CPU stores for completed cached blocks that are no longer referenced."""
+        if not self.config.enable_kv_cpu_offload:
+            return
+        store_block_ids: list[int] = []
+        for block_id in block_ids:
+            block = self.kv_cache_manager.blocks[block_id]
+            if block.block_hash is None:
+                continue
+            if block.location != KVBlockLocation.NPU or block.ref_cnt != 0:
+                continue
+            store_block_ids.append(block_id)
+
+        for block_id in store_block_ids:
+            try:
+                job = self.kv_cache_manager.build_cpu_store_job([block_id], request_id=request_id)
+            except RuntimeError:
+                break
+            self._pending_store_kv_transfer_jobs.append(job)
