@@ -28,6 +28,13 @@ RuntimeConfig = None
 _VALID_BACKENDS = {"npu"}
 
 
+def _supported_block_size(value: str) -> int:
+    parsed = int(value)
+    if parsed != 128:
+        raise argparse.ArgumentTypeError("only block size 128 is currently supported")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pypto-serving",
@@ -48,7 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Runtime
     parser.add_argument("--max-model-len", type=int, default=512, help="Maximum sequence length (default: 512).")
-    parser.add_argument("--block-size", type=int, default=128, help="KV cache block size (default: 128).")
+    parser.add_argument(
+        "--block-size",
+        type=_supported_block_size,
+        default=128,
+        help="KV cache block size. Currently only 128 is supported (default: 128).",
+    )
 
     # Generation
     parser.add_argument("--max-new-tokens", type=int, default=32, help="Maximum new tokens to generate (default: 32).")
@@ -64,8 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--long-prefill-token-threshold",
         type=int,
-        default=2048,
-        help="Chunked prefill threshold in serving mode (default: 2048).",
+        default=64,
+        help="Chunked prefill threshold in serving mode (default: 64).",
     )
     parser.add_argument(
         "--enable-prefix-caching",
@@ -78,6 +90,12 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable chunked prefill (default: True). Use --no-enable-chunked-prefill to disable.",
+    )
+    parser.add_argument(
+        "--max-cpu-offload-blocks",
+        type=int,
+        default=0,
+        help="Maximum number of KV blocks to keep in CPU offload storage. 0 disables CPU offload (default: 0).",
     )
 
     # Misc
@@ -114,6 +132,8 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         long_prefill_token_threshold=args.long_prefill_token_threshold,
         enable_prefix_cache=args.enable_prefix_caching,
         enable_chunk_prefill=args.enable_chunked_prefill,
+        enable_kv_cpu_offload=args.max_cpu_offload_blocks > 0,
+        max_cpu_offload_blocks=args.max_cpu_offload_blocks,
     )
 
 
@@ -189,6 +209,9 @@ def run_serve(
     print(f"  Chunked prefill threshold: {config.long_prefill_token_threshold}")
     print(f"  Prefix cache: {'enabled' if config.enable_prefix_cache else 'disabled'}")
     print(f"  Chunk prefill: {'enabled' if config.enable_chunk_prefill else 'disabled'}")
+    print(f"  KV CPU offload: {'enabled' if config.enable_kv_cpu_offload else 'disabled'}")
+    if config.enable_kv_cpu_offload:
+        print(f"  Max CPU offload blocks: {config.max_cpu_offload_blocks}")
     print("  Endpoints: /v1/completions, /v1/chat/completions, /v1/models, /health")
 
     uvicorn.run(app, host=host, port=port, log_level="info")

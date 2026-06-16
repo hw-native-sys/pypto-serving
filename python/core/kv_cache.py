@@ -14,6 +14,13 @@ from dataclasses import dataclass, field
 
 import torch
 
+from .kv_offload import (
+    CPULoadStoreSpec,
+    KVBlockLocation,
+    NPULoadStoreSpec,
+    TransferJob,
+    TransferResult,
+)
 from .types import KvAllocation, ModelConfig, RuntimeConfig
 
 
@@ -32,6 +39,10 @@ class KVCacheBlock:
     block_id: int
     ref_cnt: int = 0
     block_hash: int | None = None
+    location: KVBlockLocation = KVBlockLocation.NPU
+    physical_page_id: int | None = None
+    cpu_slot_id: int | None = None
+    cpu_last_access: int = 0
     prev_free: "KVCacheBlock | None" = field(default=None, repr=False)
     next_free: "KVCacheBlock | None" = field(default=None, repr=False)
 
@@ -123,6 +134,7 @@ class KvCacheManager:
         num_blocks: int | None = None,
         block_size: int = 64,
         enable_prefix_cache: bool = True,
+        max_cpu_offload_blocks: int = 0,
     ) -> None:
         """Create an empty registry of model-specific KV pools."""
         self._pools: dict[str, _CachePool] = {}
@@ -132,6 +144,11 @@ class KvCacheManager:
         self.free_queue = FreeKVCacheBlockQueue()
         self.hash_to_block: dict[int, KVCacheBlock] = {}
         self.request_blocks: dict[str, list[KVCacheBlock]] = {}
+        self.max_cpu_offload_blocks = int(max_cpu_offload_blocks)
+        self._next_transfer_job_id = 0
+        self._cpu_access_clock = 0
+        self._free_cpu_slots: list[int] = list(range(self.max_cpu_offload_blocks))
+        self._pending_transfer_blocks: dict[int, list[int]] = {}
         if num_blocks is not None:
             self._init_blocks(num_blocks, block_size)
 
@@ -145,13 +162,21 @@ class KvCacheManager:
         """Return the total number of physical KV blocks."""
         return len(self.blocks)
 
+    @property
+    def num_free_cpu_slots(self) -> int:
+        """Return the number of CPU offload slots available for new stores."""
+        return len(self._free_cpu_slots)
+
     def _init_blocks(self, num_blocks: int, block_size: int) -> None:
         if self.blocks:
             if len(self.blocks) != num_blocks or self.block_size != block_size:
                 raise ValueError("KV block pool is already initialized with different dimensions")
             return
         self.block_size = block_size
-        self.blocks = [KVCacheBlock(block_id=i) for i in range(num_blocks)]
+        self.blocks = [
+            KVCacheBlock(block_id=i, physical_page_id=i)
+            for i in range(num_blocks)
+        ]
         for block in self.blocks:
             self.free_queue.append(block)
 
@@ -206,25 +231,59 @@ class KvCacheManager:
         """Allocate physical KV blocks, evicting stale prefix hashes as needed."""
         if num_blocks <= 0:
             return []
+        return self.allocate_preferred_blocks(num_blocks, [])
+
+    def allocate_preferred_blocks(
+        self,
+        num_blocks: int,
+        preferred_block_ids: list[int],
+    ) -> list[KVCacheBlock] | None:
+        """Allocate blocks, trying specific free block IDs before FIFO fallback."""
+        if num_blocks <= 0:
+            return []
         if self.num_free_blocks < num_blocks:
             return None
         blocks: list[KVCacheBlock] = []
+        used_preferred: set[int] = set()
+        for block_id in preferred_block_ids:
+            if len(blocks) >= num_blocks:
+                break
+            if block_id in used_preferred or block_id < 0 or block_id >= len(self.blocks):
+                continue
+            block = self.blocks[block_id]
+            if not self._is_free(block):
+                continue
+            self.free_queue.remove(block)
+            self._prepare_allocated_block(block)
+            blocks.append(block)
+            used_preferred.add(block_id)
+
         for _ in range(num_blocks):
+            if len(blocks) >= num_blocks:
+                break
             block = self.free_queue.popleft()
             if block is None:
                 for allocated in blocks:
                     self.release(allocated)
                 return None
-            if block.block_hash is not None:
-                self.hash_to_block.pop(block.block_hash, None)
-                block.block_hash = None
-            block.ref_cnt = 1
+            self._prepare_allocated_block(block)
             blocks.append(block)
         return blocks
 
     def allocate_block_ids(self, num_blocks: int) -> list[int] | None:
         """Allocate physical KV blocks and return their IDs."""
         blocks = self.allocate_blocks(num_blocks)
+        if blocks is None:
+            return None
+        return [block.block_id for block in blocks]
+
+    def allocate_preferred_block_ids(
+        self,
+        num_blocks: int,
+        preferred_block_ids: list[int],
+    ) -> list[int] | None:
+        """Allocate physical KV blocks and return their IDs, preferring given IDs."""
+        blocks = self.allocate_preferred_blocks(num_blocks, preferred_block_ids)
         if blocks is None:
             return None
         return [block.block_id for block in blocks]
@@ -256,6 +315,8 @@ class KvCacheManager:
         if block.ref_cnt == 0:
             self.free_queue.remove(block)
         block.ref_cnt += 1
+        if block.location == KVBlockLocation.CPU:
+            self._touch_cpu_block(block)
         return block
 
     def cache_block(self, block: KVCacheBlock, block_hash: int) -> None:
@@ -276,6 +337,108 @@ class KvCacheManager:
                 break
             self.cache_block(self.blocks[block_ids[idx]], block_hashes[idx])
 
+    def build_cpu_store_job(self, block_ids: list[int], request_id: str | None = None) -> TransferJob:
+        """Build a transfer job that stores resident NPU blocks into CPU slots."""
+        blocks = [self.blocks[block_id] for block_id in block_ids]
+        for block in blocks:
+            if block.ref_cnt != 0:
+                raise RuntimeError(f"Cannot offload KV block {block.block_id} with active references.")
+        if len(blocks) > self.max_cpu_offload_blocks:
+            raise RuntimeError("Insufficient CPU KV offload slots.")
+        while len(self._free_cpu_slots) < len(blocks):
+            if self._evict_lru_cpu_block() is None:
+                raise RuntimeError("Insufficient CPU KV offload slots.")
+
+        page_ids: list[int] = []
+        slot_ids: list[int] = []
+        for block in blocks:
+            if block.location != KVBlockLocation.NPU or block.physical_page_id is None:
+                raise RuntimeError(f"KV block {block.block_id} is not resident on NPU.")
+            if block.ref_cnt == 0:
+                self.free_queue.remove(block)
+            slot_id = self._free_cpu_slots.pop(0)
+            block.location = KVBlockLocation.TRANSFERRING
+            block.cpu_slot_id = slot_id
+            block.cpu_last_access = 0
+            page_ids.append(block.physical_page_id)
+            slot_ids.append(slot_id)
+
+        job = TransferJob(
+            self._next_job_id(),
+            request_id,
+            NPULoadStoreSpec(page_ids),
+            CPULoadStoreSpec(slot_ids),
+        )
+        self._pending_transfer_blocks[job.job_id] = [block.block_id for block in blocks]
+        return job
+
+    def build_cpu_load_job(self, block_ids: list[int], request_id: str | None = None) -> TransferJob:
+        """Build a transfer job that loads CPU-offloaded blocks back to NPU pages."""
+        blocks = [self.blocks[block_id] for block_id in block_ids]
+        page_ids: list[int] = []
+        slot_ids: list[int] = []
+        for block in blocks:
+            if block.location != KVBlockLocation.CPU or block.cpu_slot_id is None:
+                raise RuntimeError(f"KV block {block.block_id} is not resident on CPU.")
+            block.location = KVBlockLocation.TRANSFERRING
+            block.physical_page_id = block.block_id
+            block.cpu_last_access = 0
+            page_ids.append(block.physical_page_id)
+            slot_ids.append(block.cpu_slot_id)
+
+        job = TransferJob(
+            self._next_job_id(),
+            request_id,
+            CPULoadStoreSpec(slot_ids),
+            NPULoadStoreSpec(page_ids),
+        )
+        self._pending_transfer_blocks[job.job_id] = [block.block_id for block in blocks]
+        return job
+
+    def complete_transfer_result(self, result: TransferResult) -> None:
+        """Apply a completed CPU offload transfer to block residency metadata."""
+        block_ids = self._pending_transfer_blocks.pop(result.job_id, [])
+        if not block_ids:
+            return
+        blocks = [self.blocks[block_id] for block_id in block_ids]
+        if not result.success:
+            if isinstance(result.src, NPULoadStoreSpec) and isinstance(result.dst, CPULoadStoreSpec):
+                for block in blocks:
+                    block.location = KVBlockLocation.NPU
+                    if block.cpu_slot_id is not None:
+                        self._free_cpu_slots.append(block.cpu_slot_id)
+                        block.cpu_slot_id = None
+                    block.cpu_last_access = 0
+                    if block.ref_cnt == 0:
+                        self.free_queue.append(block)
+            elif isinstance(result.src, CPULoadStoreSpec) and isinstance(result.dst, NPULoadStoreSpec):
+                for block in blocks:
+                    block.location = KVBlockLocation.CPU
+                    block.physical_page_id = None
+                    block.cpu_last_access = 0
+            else:
+                raise TypeError("Unsupported KV offload transfer result")
+            raise RuntimeError(result.error or "KV offload transfer failed")
+
+        if isinstance(result.src, NPULoadStoreSpec) and isinstance(result.dst, CPULoadStoreSpec):
+            for block, slot_id in zip(blocks, result.dst.slot_ids, strict=True):
+                block.location = KVBlockLocation.CPU
+                block.physical_page_id = None
+                block.cpu_slot_id = slot_id
+                self._touch_cpu_block(block)
+                if block.ref_cnt == 0:
+                    self.free_queue.append(block)
+        elif isinstance(result.src, CPULoadStoreSpec) and isinstance(result.dst, NPULoadStoreSpec):
+            for block, page_id in zip(blocks, result.dst.page_ids, strict=True):
+                block.location = KVBlockLocation.NPU
+                block.physical_page_id = page_id
+                if block.cpu_slot_id is not None:
+                    self._free_cpu_slots.append(block.cpu_slot_id)
+                    block.cpu_slot_id = None
+                    block.cpu_last_access = 0
+        else:
+            raise TypeError("Unsupported KV offload transfer result")
+
     def release(self, block: KVCacheBlock) -> None:
         """Release one request reference to a block."""
         if block.ref_cnt <= 0:
@@ -283,6 +446,59 @@ class KvCacheManager:
         block.ref_cnt -= 1
         if block.ref_cnt == 0:
             self.free_queue.append(block)
+
+    def _next_job_id(self) -> int:
+        job_id = self._next_transfer_job_id
+        self._next_transfer_job_id += 1
+        return job_id
+
+    def _is_free(self, block: KVCacheBlock) -> bool:
+        return (
+            block.ref_cnt == 0
+            and (
+                block == self.free_queue.head
+                or block == self.free_queue.tail
+                or block.prev_free is not None
+                or block.next_free is not None
+            )
+        )
+
+    def _prepare_allocated_block(self, block: KVCacheBlock) -> None:
+        if block.block_hash is not None:
+            self.hash_to_block.pop(block.block_hash, None)
+            block.block_hash = None
+        if block.cpu_slot_id is not None:
+            self._free_cpu_slots.append(block.cpu_slot_id)
+        block.location = KVBlockLocation.NPU
+        block.physical_page_id = block.block_id
+        block.cpu_slot_id = None
+        block.cpu_last_access = 0
+        block.ref_cnt = 1
+
+    def _touch_cpu_block(self, block: KVCacheBlock) -> None:
+        self._cpu_access_clock += 1
+        block.cpu_last_access = self._cpu_access_clock
+
+    def _evict_lru_cpu_block(self) -> KVCacheBlock | None:
+        candidates = [
+            block
+            for block in self.blocks
+            if block.location == KVBlockLocation.CPU
+            and block.ref_cnt == 0
+            and block.cpu_slot_id is not None
+        ]
+        if not candidates:
+            return None
+        victim = min(candidates, key=lambda block: block.cpu_last_access)
+        if victim.block_hash is not None:
+            self.hash_to_block.pop(victim.block_hash, None)
+            victim.block_hash = None
+        self._free_cpu_slots.append(victim.cpu_slot_id)
+        victim.cpu_slot_id = None
+        victim.cpu_last_access = 0
+        victim.location = KVBlockLocation.NPU
+        victim.physical_page_id = victim.block_id
+        return victim
 
     def _iter_block_hashes(self, token_ids: list[int]):
         """Yield (block_index, block_hash) for each full block in the token sequence."""

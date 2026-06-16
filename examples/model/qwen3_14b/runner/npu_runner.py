@@ -15,6 +15,7 @@ from typing import Any
 import torch
 from pypto.runtime import DeviceTensor
 
+from python.core.kv_offload import WorkerKVPageView
 from python.core.model_runner import ModelRunner
 from python.core.types import (
     DecodeBatch,
@@ -200,6 +201,26 @@ class Qwen314BModelRunner(ModelRunner):
             self._pending_kv_cache_specs[model.config.model_id] = spec
         ModelRunner.init_kv_cache(self, model.config.model_id, spec[0], spec[1])
         return self._kv_caches[model.config.model_id]
+
+    def materialize_kv_page_view(self, model_id: str) -> WorkerKVPageView:
+        """Return a byte-level transfer view over this model's runner-owned KV pages."""
+        kv_cache = self._kv_caches.get(model_id)
+        if kv_cache is None:
+            spec = self._pending_kv_cache_specs.get(model_id)
+            if spec is None:
+                raise RuntimeError(f"KV cache for model {model_id!r} is not initialized")
+            ModelRunner.init_kv_cache(self, model_id, spec[0], spec[1])
+            kv_cache = self._kv_caches[model_id]
+        return WorkerKVPageView(
+            worker=self._shared_l3_worker(),
+            key_pages=kv_cache.key_pages,
+            value_pages=kv_cache.value_pages,
+            num_layers=kv_cache.num_layers,
+            num_pages=kv_cache.num_pages,
+            num_kv_heads=kv_cache.num_kv_heads,
+            page_size=kv_cache.page_size,
+            head_dim=kv_cache.head_dim,
+        )
 
     @staticmethod
     def _validate_kv_cache_bounds(

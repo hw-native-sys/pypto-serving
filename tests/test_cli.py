@@ -38,7 +38,7 @@ def test_build_serving_engine_config_uses_cli_args(tmp_path, monkeypatch):
         "--platform", "a5",
         "--device", "2",
         "--max-model-len", "1024",
-        "--block-size", "64",
+        "--block-size", "128",
         "--dtype", "bfloat16",
         "--kv-cache-dtype", "auto",
         "--max-new-tokens", "8",
@@ -47,6 +47,7 @@ def test_build_serving_engine_config_uses_cli_args(tmp_path, monkeypatch):
         "--long-prefill-token-threshold", "64",
         "--no-enable-prefix-caching",
         "--no-enable-chunked-prefill",
+        "--max-cpu-offload-blocks", "3",
     ])
 
     config = cli.build_serving_engine_config(args)
@@ -60,7 +61,7 @@ def test_build_serving_engine_config_uses_cli_args(tmp_path, monkeypatch):
         "pypto_root": "/tmp/pypto",
         "save_kernels_dir": "/tmp/kernels",
     }
-    assert config.runtime_config.page_size == 64
+    assert config.runtime_config.page_size == 128
     assert config.runtime_config.max_batch_size == 4
     assert config.runtime_config.max_seq_len == 1024
     assert config.runtime_config.kv_dtype == "bfloat16"
@@ -71,6 +72,8 @@ def test_build_serving_engine_config_uses_cli_args(tmp_path, monkeypatch):
     assert config.long_prefill_token_threshold == 64
     assert config.enable_prefix_cache is False
     assert config.enable_chunk_prefill is False
+    assert config.enable_kv_cpu_offload is True
+    assert config.max_cpu_offload_blocks == 3
 
 
 def test_parser_rejects_invalid_backend(tmp_path):
@@ -79,6 +82,25 @@ def test_parser_rejects_invalid_backend(tmp_path):
 
     with pytest.raises(SystemExit):
         _parse_args(["--model", str(model_dir), "--backend", "cpu"])
+
+
+def test_parser_rejects_unsupported_block_size(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+
+    with pytest.raises(SystemExit):
+        _parse_args(["--model", str(model_dir), "--block-size", "64"])
+
+
+def test_cpu_offload_defaults_to_disabled(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    args = _parse_args(["--model", str(model_dir)])
+
+    config = cli.build_serving_engine_config(args)
+
+    assert config.enable_kv_cpu_offload is False
+    assert config.max_cpu_offload_blocks == 0
 
 
 def test_parser_rejects_removed_prompt_mode(tmp_path):

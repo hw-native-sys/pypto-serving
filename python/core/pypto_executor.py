@@ -15,6 +15,7 @@ from abc import ABC, abstractmethod
 
 from .executor import ModelExecutor
 from .kv_cache import KvCacheManager
+from .kv_offload import WorkerKVPageView
 from .model_runner import ModelRunner
 from python.profile import profile_span
 from .types import (
@@ -76,6 +77,10 @@ class PyptoExecutor(ModelExecutor, ABC):
             args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)},
         ):
             return self._runners[model.config.model_id].run_decode(model, batch)
+
+    def materialize_kv_page_view(self, model_id: str) -> WorkerKVPageView:
+        """Return a byte-level transfer view for one model's runner-owned KV cache."""
+        return self._runners[model_id].materialize_kv_page_view(model_id)
 
     @contextlib.contextmanager
     def session(self):

@@ -49,6 +49,8 @@ class EngineConfig:
     # Feature flags
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
+    enable_kv_cpu_offload: bool = False
+    max_cpu_offload_blocks: int = 0
 
 
 @dataclass
@@ -93,6 +95,7 @@ class AsyncLLMEngine:
             num_blocks=num_blocks,
             block_size=block_size,
             enable_prefix_cache=self.config.enable_prefix_cache,
+            max_cpu_offload_blocks=self.config.max_cpu_offload_blocks,
         )
 
         scheduler_config = SchedulerConfig(
@@ -102,6 +105,7 @@ class AsyncLLMEngine:
             max_seq_len=runtime.max_seq_len,
             enable_prefix_cache=self.config.enable_prefix_cache,
             enable_chunk_prefill=self.config.enable_chunk_prefill,
+            enable_kv_cpu_offload=self.config.enable_kv_cpu_offload,
         )
         self.scheduler = Scheduler(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)
 
@@ -228,6 +232,20 @@ class AsyncLLMEngine:
                 await asyncio.sleep(self.config.engine_loop_interval)
                 continue
 
+            if scheduler_output.kv_transfer_jobs:
+                transfer_ok = await self._execute_kv_transfer_jobs(
+                    scheduler_output.kv_transfer_jobs,
+                    profile_name="scheduler.load_kv_transfer",
+                    timeout_message="Worker response timed out during load KV transfer (300s)",
+                    error_prefix="Worker returned load KV transfer error",
+                )
+                if not transfer_ok:
+                    self._handle_step_error(scheduler_output)
+                    continue
+
+            if not scheduler_output.scheduled_requests:
+                continue
+
             finished_ids = self._pending_free_ids.copy()
             self._pending_free_ids.clear()
             with profile_span(
@@ -264,13 +282,73 @@ class AsyncLLMEngine:
                 args={"new_tokens": len(step_output.new_tokens)},
             ):
                 self._process_step_output(scheduler_output, step_output)
+            await self._drain_store_kv_transfer_jobs()
 
         logger.info("Engine loop stopped")
+
+    async def _drain_store_kv_transfer_jobs(self) -> None:
+        """Execute NPU->CPU stores queued by requests that just finished."""
+        jobs = self.scheduler.pop_store_kv_transfer_jobs()
+        if not jobs:
+            return
+        await self._execute_kv_transfer_jobs(
+            jobs,
+            profile_name="scheduler.store_kv_transfer",
+            timeout_message="Worker response timed out during store KV transfer (300s)",
+            error_prefix="Worker returned store KV transfer error",
+        )
+
+    async def _execute_kv_transfer_jobs(
+        self,
+        jobs,
+        *,
+        profile_name: str,
+        timeout_message: str,
+        error_prefix: str,
+    ) -> bool:
+        """Send KV transfer jobs to the worker and apply their completions."""
+        with profile_span(
+            f"{profile_name}.queue",
+            cat="scheduler",
+            args={"jobs": len(jobs)},
+        ):
+            self._input_queue.put(
+                WorkerCommand(
+                    type="kv_transfer",
+                    kv_transfer_jobs=jobs,
+                )
+            )
+
+        try:
+            with profile_span(f"{profile_name}.wait", cat="scheduler"):
+                step_output: StepOutput = await asyncio.to_thread(
+                    self._output_queue.get, timeout=300
+                )
+        except queue.Empty:
+            logger.error(timeout_message)
+            return False
+
+        if step_output.error:
+            logger.error(f"{error_prefix}: {step_output.error}")
+            return False
+
+        try:
+            self.scheduler.complete_transfer_results(step_output.kv_transfer_results)
+        except RuntimeError as exc:
+            logger.error(f"KV transfer completion failed: {exc}")
+            return False
+        return True
 
     def _process_step_output(
         self, scheduler_output: SchedulerOutput, step_output: StepOutput
     ) -> None:
         """Process worker results: update scheduler state, push tokens to request queues."""
+        try:
+            self.scheduler.complete_transfer_results(step_output.kv_transfer_results)
+        except RuntimeError as exc:
+            logger.error(f"KV transfer completion failed: {exc}")
+            self._handle_step_error(scheduler_output)
+            return
         request_outputs = self.scheduler.update_from_output(
             scheduler_output, step_output.new_tokens
         )

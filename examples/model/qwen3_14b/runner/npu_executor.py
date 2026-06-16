@@ -31,7 +31,6 @@ from python.core.utils import rope_tables, round_up
 
 
 _VOCAB_PAD_MULTIPLE = 512  # must be a multiple of lm_head.VOCAB_CHUNK (64)
-_QWEN14B_PAGE_SIZE = 128
 _QWEN14B_BLOCK_DIM = 24
 
 
@@ -576,9 +575,4 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             mismatch = ", ".join(f"{k}={actual[k]} (expected {v})" for k, v in expected.items() if actual[k] != v)
             raise ValueError(
                 "Bundled kernels under model/ currently support Qwen3-14B layer shapes only: " + mismatch
-            )
-        if model.runtime.page_size != _QWEN14B_PAGE_SIZE:
-            raise ValueError(
-                "PyPTO Qwen3-14B kernels require runtime page_size "
-                f"{_QWEN14B_PAGE_SIZE}, got {model.runtime.page_size}."
             )

@@ -17,6 +17,7 @@ import torch
 
 from pypto.runtime import DeviceTensor
 
+from .kv_offload import WorkerKVPageView
 from .types import (
     DecodeBatch,
     DecodeResult,
@@ -34,6 +35,11 @@ class _KvCachePool:
 
     key_pages: DeviceTensor
     value_pages: DeviceTensor
+    num_layers: int
+    num_pages: int
+    num_kv_heads: int
+    page_size: int
+    head_dim: int
 
 
 class ModelRunner(ABC):
@@ -67,6 +73,11 @@ class ModelRunner(ABC):
         self._kv_caches[model_id] = _KvCachePool(
             key_pages=key_pages,
             value_pages=value_pages,
+            num_layers=config.num_hidden_layers,
+            num_pages=num_pages,
+            num_kv_heads=config.num_key_value_heads,
+            page_size=runtime.page_size,
+            head_dim=config.head_dim,
         )
 
     def close_kv_cache(self) -> None:
@@ -75,6 +86,10 @@ class ModelRunner(ABC):
             self._free_kv_cache_tensor(pool.key_pages)
             self._free_kv_cache_tensor(pool.value_pages)
         self._kv_caches.clear()
+
+    def materialize_kv_page_view(self, model_id: str) -> WorkerKVPageView:
+        """Return a byte-level view over runner-owned KV pages."""
+        raise NotImplementedError("This runner does not expose KV page transfers.")
 
     @abstractmethod
     def _alloc_kv_cache_tensor(self, shape: tuple[int, ...], dtype: torch.dtype) -> DeviceTensor:

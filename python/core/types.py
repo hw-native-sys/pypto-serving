@@ -14,6 +14,7 @@ from typing import Literal
 
 import torch
 
+from .kv_offload import TransferJob, TransferResult
 from .tokenizer import TokenizerAdapter
 
 
@@ -223,13 +224,15 @@ class GenerateResult:
 @dataclass
 class WorkerCommand:
     """Command sent from main process to worker process."""
-    type: str  # "step" | "shutdown"
+    type: str  # "step" | "kv_transfer" | "shutdown"
     scheduler_output: object | None = None
     finished_request_ids: list | None = None
+    kv_transfer_jobs: list[TransferJob] | None = None
 
 
 @dataclass
 class StepOutput:
     """Result returned from worker process after executing a batch step."""
     new_tokens: dict  # {request_id: int}
+    kv_transfer_results: list[TransferResult] = field(default_factory=list)
     error: str | None = None
