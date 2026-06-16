@@ -51,6 +51,16 @@ class ModelConfig:
     torch_dtype: str
 
 
+@dataclass
+class KvQuantConfig:
+    enabled: bool = False
+    key_bits: int = 4
+    value_bits: int = 4
+    residual_window: int = 128
+    protected_layers: int = 0
+    protected_bits: int = 4
+
+
 @dataclass(frozen=True)
 class RuntimeConfig:
     """Runtime limits and device placement for one loaded model."""
@@ -62,7 +72,11 @@ class RuntimeConfig:
     kv_dtype: str = "float32"
     weight_dtype: str = "float32"
     total_kv_pages: int | None = None
-    # Compile-time generation limit used by model-specific runners.
+    kv_quant_config: KvQuantConfig | None = None
+    # Compile-time decode loop length for the host_orch pl.unroll in l3_generate.
+    # All generate() calls must use max_new_tokens <= this value; the loop always
+    # runs this many decode steps (sample_and_prepare no-ops after EOS or when
+    # the per-call max_new_tokens cap is reached).
     max_new_tokens: int = 256
 
 

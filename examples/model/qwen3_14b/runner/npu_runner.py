@@ -93,6 +93,10 @@ class _CompiledKernels:
     decode_block_table_buffer: torch.Tensor
     decode_slot_mapping_buffer: torch.Tensor
     decode_logits_buffer: torch.Tensor
+    # TurboQuant (TQ) artifacts. Populated only when tq_mode=True.
+    tq_mode: bool = False
+    rot_matrices: torch.Tensor | None = None  # [num_layers*head_dim, head_dim] BF16
+    tq_codebook: torch.Tensor | None = None   # [1, 16] FP32 Lloyd-Max centroids
 
 
 @dataclass
@@ -147,6 +151,9 @@ class _StaticKernelArgs:
     rope_sin: _StaticDeviceTensor
     padded_lm_head_weight: _StaticDeviceTensor
     decode_weights: dict[str, _StaticDeviceTensor]
+    # TurboQuant static artifacts (None unless tq_mode).
+    rot_matrices: _StaticDeviceTensor | None = None
+    tq_codebook: _StaticDeviceTensor | None = None
 
 
 class Qwen314BModelRunner(ModelRunner):
@@ -156,9 +163,11 @@ class Qwen314BModelRunner(ModelRunner):
         self,
         *,
         compiled: _CompiledKernels,
+        tq_mode: bool = False,
     ) -> None:
         super().__init__()
         self._compiled = compiled
+        self._tq_mode = tq_mode
         self._l3_worker: Any | None = None
         self._l3_static_tensors: dict[tuple[int, tuple[int, ...], torch.dtype], object] = {}
         self._static_args: _StaticKernelArgs | None = None
@@ -234,7 +243,7 @@ class Qwen314BModelRunner(ModelRunner):
     def _iter_static_host_tensors(self) -> tuple[torch.Tensor, ...]:
         """Return host tensors that must be shared before the worker forks."""
         compiled = self._compiled
-        return (
+        tensors: tuple[torch.Tensor, ...] = (
             compiled.final_norm_weight,
             compiled.rope_cos,
             compiled.rope_sin,
@@ -253,6 +262,12 @@ class Qwen314BModelRunner(ModelRunner):
             compiled.decode_slot_mapping_buffer,
             compiled.decode_logits_buffer,
         )
+        # TurboQuant rotation matrices + codebook are also static kernel inputs.
+        if compiled.rot_matrices is not None:
+            tensors += (compiled.rot_matrices,)
+        if compiled.tq_codebook is not None:
+            tensors += (compiled.tq_codebook,)
+        return tensors
 
     def _build_static_kernel_args(self) -> _StaticKernelArgs:
         """Create static device-upload markers once per runner."""
@@ -266,6 +281,16 @@ class Qwen314BModelRunner(ModelRunner):
                 name: self._static_device_tensor(tensor)
                 for name, tensor in compiled.decode_weights.items()
             },
+            rot_matrices=(
+                self._static_device_tensor(compiled.rot_matrices)
+                if compiled.rot_matrices is not None
+                else None
+            ),
+            tq_codebook=(
+                self._static_device_tensor(compiled.tq_codebook)
+                if compiled.tq_codebook is not None
+                else None
+            ),
         )
 
     def _require_static_args(self) -> _StaticKernelArgs:
@@ -282,14 +307,32 @@ class Qwen314BModelRunner(ModelRunner):
         logits_padded = compiled.prefill_logits_buffer
 
         kv_cache = self._materialize_kv_cache(model)
-        k_cache = kv_cache.key_pages
-        v_cache = kv_cache.value_pages
-        self._validate_kv_cache_bounds(model, prefill_inputs.block_table, prefill_inputs.slot_mapping, k_cache)
-
-        self._run_distributed_program(
-            compiled.prefill,
-            *self._prefill_kernel_args(prefill_inputs, k_cache, v_cache, logits_padded),
-        )
+        if self._tq_mode:
+            quant_k = kv_cache.quant_k_pages
+            quant_v = kv_cache.quant_v_pages
+            k_scales = kv_cache.k_scales_pages
+            v_scales = kv_cache.v_scales_pages
+            if quant_k is None or quant_v is None or k_scales is None or v_scales is None:
+                raise RuntimeError("TurboQuant KV caches are not initialized")
+            self._validate_kv_cache_bounds(
+                model, prefill_inputs.block_table, prefill_inputs.slot_mapping, quant_k
+            )
+            self._run_distributed_program(
+                compiled.prefill,
+                *self._prefill_tq_kernel_args(
+                    prefill_inputs, quant_k, quant_v, k_scales, v_scales, logits_padded
+                ),
+            )
+        else:
+            k_cache = kv_cache.key_pages
+            v_cache = kv_cache.value_pages
+            self._validate_kv_cache_bounds(
+                model, prefill_inputs.block_table, prefill_inputs.slot_mapping, k_cache
+            )
+            self._run_distributed_program(
+                compiled.prefill,
+                *self._prefill_kernel_args(prefill_inputs, k_cache, v_cache, logits_padded),
+            )
 
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             seq_len = int(batch.seq_lens[batch_idx].item())
@@ -322,19 +365,37 @@ class Qwen314BModelRunner(ModelRunner):
         kv_cache = self._kv_caches.get(model_id)
         if kv_cache is None:
             raise RuntimeError(f"KV cache for model {model_id!r} is not initialized")
-        k_cache = kv_cache.key_pages
-        v_cache = kv_cache.value_pages
 
         kernel_inputs = self._pad_decode_inputs(model, decode_inputs)
 
-        # Padded block_table / slot_mapping only ever reference row 0's
-        # already-valid pages, so bound-check exactly what the kernel will read.
-        self._validate_kv_cache_bounds(model, kernel_inputs.block_table, kernel_inputs.slot_mapping, k_cache)
-
-        self._run_distributed_program(
-            compiled.decode,
-            *self._decode_kernel_args(kernel_inputs, k_cache, v_cache),
-        )
+        if self._tq_mode:
+            quant_k = kv_cache.quant_k_pages
+            quant_v = kv_cache.quant_v_pages
+            k_scales = kv_cache.k_scales_pages
+            v_scales = kv_cache.v_scales_pages
+            if quant_k is None or quant_v is None or k_scales is None or v_scales is None:
+                raise RuntimeError("TurboQuant KV caches are not initialized")
+            # Padded block_table / slot_mapping only ever reference row 0's
+            # already-valid pages, so bound-check exactly what the kernel will read.
+            self._validate_kv_cache_bounds(
+                model, kernel_inputs.block_table, kernel_inputs.slot_mapping, quant_k
+            )
+            self._run_distributed_program(
+                compiled.decode,
+                *self._decode_tq_kernel_args(kernel_inputs, quant_k, quant_v, k_scales, v_scales),
+            )
+        else:
+            k_cache = kv_cache.key_pages
+            v_cache = kv_cache.value_pages
+            # Padded block_table / slot_mapping only ever reference row 0's
+            # already-valid pages, so bound-check exactly what the kernel will read.
+            self._validate_kv_cache_bounds(
+                model, kernel_inputs.block_table, kernel_inputs.slot_mapping, k_cache
+            )
+            self._run_distributed_program(
+                compiled.decode,
+                *self._decode_kernel_args(kernel_inputs, k_cache, v_cache),
+            )
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
         return DecodeResult(
@@ -410,6 +471,99 @@ class Qwen314BModelRunner(ModelRunner):
             weights["decode_w_up"],
             weights["decode_w_down"],
             weights["decode_post_rms_weight"],
+            static.final_norm_weight,
+            static.padded_lm_head_weight,
+            inputs.logits,
+        )
+
+    def _prefill_tq_kernel_args(
+        self,
+        inputs: _PrefillInputs,
+        quant_k: DeviceTensor,
+        quant_v: DeviceTensor,
+        k_scales: DeviceTensor,
+        v_scales: DeviceTensor,
+        logits: torch.Tensor,
+    ) -> tuple[Any, ...]:
+        """Return arguments in ``qwen3_prefill_tq_host`` signature order.
+
+        TQ prefill drops chunk_lens/chunk_offsets and replaces the BF16 k/v cache
+        with UINT8 quantized caches + FP32 scales + rotation matrices + codebook.
+        """
+        static = self._require_static_args()
+        if static.rot_matrices is None or static.tq_codebook is None:
+            raise RuntimeError("TurboQuant rotation matrices / codebook are not compiled")
+        weights = static.decode_weights
+        return (
+            inputs.hidden,
+            inputs.seq_lens,
+            weights["decode_input_rms_weight"],
+            weights["decode_wq"],
+            weights["decode_wk"],
+            weights["decode_wv"],
+            weights["decode_q_norm_weight"],
+            weights["decode_k_norm_weight"],
+            static.rope_cos,
+            static.rope_sin,
+            inputs.block_table,
+            inputs.slot_mapping,
+            quant_k,
+            quant_v,
+            k_scales,
+            v_scales,
+            static.rot_matrices,
+            static.tq_codebook,
+            weights["decode_wo"],
+            weights["decode_post_rms_weight"],
+            weights["decode_w_gate"],
+            weights["decode_w_up"],
+            weights["decode_w_down"],
+            static.final_norm_weight,
+            static.padded_lm_head_weight,
+            logits,
+        )
+
+    def _decode_tq_kernel_args(
+        self,
+        inputs: _DecodeKernelInputs,
+        quant_k: DeviceTensor,
+        quant_v: DeviceTensor,
+        k_scales: DeviceTensor,
+        v_scales: DeviceTensor,
+    ) -> tuple[Any, ...]:
+        """Return arguments in ``qwen3_decode_tq_host`` signature order.
+
+        TQ decode replaces the BF16 k/v cache with the six TQ tensors. Weight
+        order is wo, post_rms, w_gate, w_up, w_down (differs from non-TQ decode).
+        """
+        static = self._require_static_args()
+        if static.rot_matrices is None or static.tq_codebook is None:
+            raise RuntimeError("TurboQuant rotation matrices / codebook are not compiled")
+        weights = static.decode_weights
+        return (
+            inputs.hidden,
+            weights["decode_input_rms_weight"],
+            weights["decode_wq"],
+            weights["decode_wk"],
+            weights["decode_wv"],
+            weights["decode_q_norm_weight"],
+            weights["decode_k_norm_weight"],
+            inputs.seq_lens,
+            inputs.block_table,
+            inputs.slot_mapping,
+            static.rope_cos,
+            static.rope_sin,
+            quant_k,
+            quant_v,
+            k_scales,
+            v_scales,
+            static.rot_matrices,
+            static.tq_codebook,
+            weights["decode_wo"],
+            weights["decode_post_rms_weight"],
+            weights["decode_w_gate"],
+            weights["decode_w_up"],
+            weights["decode_w_down"],
             static.final_norm_weight,
             static.padded_lm_head_weight,
             inputs.logits,
@@ -527,6 +681,11 @@ class Qwen314BModelRunner(ModelRunner):
             *static.decode_weights.values(),
         ):
             self._coerce_l3_arg(worker, arg)
+        # TurboQuant rotation matrices + codebook are also uploaded once.
+        if static.rot_matrices is not None:
+            self._coerce_l3_arg(worker, static.rot_matrices)
+        if static.tq_codebook is not None:
+            self._coerce_l3_arg(worker, static.tq_codebook)
 
     @staticmethod
     def _copy_replicated_rows(

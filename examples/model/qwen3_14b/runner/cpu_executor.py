@@ -40,8 +40,9 @@ except ImportError:
 class CpuModelExecutor(ModelExecutor):
     """Reference CPU executor for functional generation and small tests."""
 
-    def __init__(self, kv_cache_manager: KvCacheManager) -> None:
+    def __init__(self, kv_cache_manager: KvCacheManager, *, num_layers_override: int | None = None) -> None:
         super().__init__(kv_cache_manager)
+        self._num_layers_override = num_layers_override
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         """Run each prompt through all transformer layers on CPU."""
@@ -54,6 +55,8 @@ class CpuModelExecutor(ModelExecutor):
             positions = torch.arange(seq_len, device=model.runtime.device, dtype=torch.long)
 
             for layer_idx, layer in enumerate(model.layers):
+                if self._num_layers_override is not None and layer_idx >= self._num_layers_override:
+                    break
                 hidden = self._layer_prefill(
                     model=model,
                     layer_idx=layer_idx,
@@ -77,6 +80,8 @@ class CpuModelExecutor(ModelExecutor):
             position = int(batch.seq_lens[batch_idx].item()) - 1
 
             for layer_idx, layer in enumerate(model.layers):
+                if self._num_layers_override is not None and layer_idx >= self._num_layers_override:
+                    break
                 hidden = self._layer_decode(
                     model=model,
                     layer_idx=layer_idx,
@@ -231,3 +236,215 @@ class CpuModelExecutor(ModelExecutor):
         scores = torch.matmul(q_heads, k_rep.transpose(-1, -2)).squeeze(1) / math.sqrt(q.shape[-1])
         attn = torch.softmax(scores, dim=-1)
         return torch.matmul(attn.unsqueeze(1), v_rep).squeeze(1)
+
+# ---------------------------------------------------------------------------
+# TurboQuant variant
+# ---------------------------------------------------------------------------
+
+try:
+    from python.core.turboquant.compressor import generate_rotation_matrix
+    from python.core.turboquant.lloyd_max import LloydMaxCodebook
+except ImportError:
+    from python.core.turboquant.compressor import generate_rotation_matrix
+    from python.core.turboquant.lloyd_max import LloydMaxCodebook
+
+
+HEAD_DIM_TQ = 128
+EPS_TQ = 1e-6
+
+
+class CpuTqModelExecutor(CpuModelExecutor):
+    """CPU executor with TurboQuant KV cache compression (no dumps)."""
+
+    def __init__(self, kv_cache_manager, *, num_layers_override=None):
+        super().__init__(kv_cache_manager, num_layers_override=num_layers_override)
+        self._codebook = None
+        self._rot_matrices = []
+
+    def _ensure_codebook(self, head_dim):
+        if self._codebook is None:
+            self._codebook = LloydMaxCodebook(head_dim, bits=4)
+
+    def _ensure_rot_matrices(self, num_layers, head_dim):
+        if len(self._rot_matrices) == num_layers:
+            return
+        self._rot_matrices = [
+            generate_rotation_matrix(head_dim, seed=42 + l * 1000).bfloat16()
+            for l in range(num_layers)
+        ]
+
+    def _tq_quantize(self, x, rot_matrix):
+        cb = self._codebook.centroids
+        bnd = self._codebook.boundaries
+        l2 = torch.sqrt(x.float().pow(2).sum(dim=-1, keepdim=True) + EPS_TQ)
+        xr = torch.matmul((x.float() / l2).bfloat16(), rot_matrix).float()
+        idx = torch.searchsorted(bnd, xr).to(torch.int32).to(torch.float16).to(torch.uint8)
+        return idx, l2.float()
+
+    def _tq_dequantize(self, qi, sc, rm):
+        cb = self._codebook.centroids
+        yh = cb[qi.to(torch.float16).to(torch.int32).long()]
+        yh = yh.float() / torch.sqrt(yh.float().pow(2).sum(dim=-1, keepdim=True) + EPS_TQ)
+        return torch.matmul(yh, rm.float().T) * sc
+
+    def run_prefill(self, model, batch):
+        cfg = model.config
+        self._ensure_codebook(cfg.head_dim)
+        self._ensure_rot_matrices(cfg.num_hidden_layers, cfg.head_dim)
+        last_hidden_rows, logits_rows = [], []
+        for bi, alloc in enumerate(batch.kv_allocations):
+            h = batch.input_embeddings[bi].to(model.runtime.device).float()
+            seq_len = int(batch.seq_lens[bi].item())
+            h = h[:seq_len]
+            pos = torch.arange(seq_len, device=model.runtime.device, dtype=torch.long)
+            for li, layer in enumerate(model.layers):
+                if self._num_layers_override is not None and li >= self._num_layers_override:
+                    break
+                h = self._layer_prefill_tq(model, li, layer, h, pos, alloc)
+            last_hidden_rows.append(h[-1])
+            logits_rows.append(self._project_logits(model, h[-1]))
+        return PrefillResult(last_hidden=torch.stack(last_hidden_rows), logits=torch.stack(logits_rows))
+
+    def run_decode(self, model, batch):
+        hidden_rows, logits_rows = [], []
+        for bi, alloc in enumerate(batch.kv_allocations):
+            h = batch.hidden_states[bi].to(model.runtime.device).float()
+            pos = int(batch.seq_lens[bi].item()) - 1
+            for li, layer in enumerate(model.layers):
+                if self._num_layers_override is not None and li >= self._num_layers_override:
+                    break
+                h = self._layer_decode_tq(model, li, layer, h, pos, alloc)
+            hidden_rows.append(h)
+            logits_rows.append(self._project_logits(model, h))
+        return DecodeResult(hidden_states=torch.stack(hidden_rows), logits=torch.stack(logits_rows))
+
+    def _layer_prefill_tq(self, model, layer_idx, layer, hidden_states, positions, alloc):
+        cfg = model.config
+        nkh, nh, hd = cfg.num_key_value_heads, cfg.num_attention_heads, cfg.head_dim
+        rm = self._rot_matrices[layer_idx]
+        sl = hidden_states.shape[0]
+        normed = self._rms_norm(hidden_states, layer.input_rms_weight, cfg.rms_norm_eps)
+        q = self._linear(normed, layer.wq).view(-1, nh, hd)
+        k = self._linear(normed, layer.wk).view(-1, nkh, hd)
+        v = self._linear(normed, layer.wv).view(-1, nkh, hd)
+        q = self._per_head_rms_norm(q, layer.q_norm_weight, cfg.rms_norm_eps)
+        k = self._per_head_rms_norm(k, layer.k_norm_weight, cfg.rms_norm_eps)
+        q = self._apply_rope(q, positions, cfg.rope_theta)
+        k = self._apply_rope(k, positions, cfg.rope_theta)
+        qk_all = torch.zeros(sl, nkh, hd, dtype=torch.uint8)
+        qv_all = torch.zeros(sl, nkh, hd, dtype=torch.uint8)
+        ks_all = torch.zeros(sl, nkh, 1)
+        vs_all = torch.zeros(sl, nkh, 1)
+        for hx in range(nkh):
+            qi, ks = self._tq_quantize(k[:, hx, :].reshape(-1, hd), rm)
+            qk_all[:, hx, :] = qi; ks_all[:, hx, :] = ks
+            qi, vs = self._tq_quantize(v[:, hx, :].reshape(-1, hd), rm)
+            qv_all[:, hx, :] = qi; vs_all[:, hx, :] = vs
+        pool = self._kv_cache_manager._pool(model.config.model_id)
+        if pool.quant_key_indices is not None:
+            self._write_quant_cache(pool, layer_idx, alloc, 0, qk_all, qv_all, ks_all, vs_all)
+        ao = self._attention_prefill_tq(q, qk_all, qv_all, ks_all, vs_all, nh, nkh, rm)
+        ar = hidden_states + self._linear(ao.reshape(sl, -1), layer.wo)
+        mn = self._rms_norm(ar, layer.post_rms_weight, cfg.rms_norm_eps)
+        g, u = self._linear(mn, layer.w_gate), self._linear(mn, layer.w_up)
+        return ar + self._linear(torch.nn.functional.silu(g) * u, layer.w_down)
+
+    def _layer_decode_tq(self, model, layer_idx, layer, hidden_state, position, alloc):
+        cfg = model.config
+        nkh, nh, hd = cfg.num_key_value_heads, cfg.num_attention_heads, cfg.head_dim
+        rm = self._rot_matrices[layer_idx]
+        normed = self._rms_norm(hidden_state.unsqueeze(0), layer.input_rms_weight, cfg.rms_norm_eps)
+        q = self._linear(normed, layer.wq).view(nh, hd)
+        k = self._linear(normed, layer.wk).view(nkh, hd)
+        v = self._linear(normed, layer.wv).view(nkh, hd)
+        q = self._per_head_rms_norm(q.unsqueeze(0), layer.q_norm_weight, cfg.rms_norm_eps).squeeze(0)
+        k = self._per_head_rms_norm(k.unsqueeze(0), layer.k_norm_weight, cfg.rms_norm_eps).squeeze(0)
+        pt = torch.tensor([position], dtype=torch.long)
+        q = self._apply_rope(q.unsqueeze(0), pt, cfg.rope_theta).squeeze(0)
+        k = self._apply_rope(k.unsqueeze(0), pt, cfg.rope_theta).squeeze(0)
+        nqk, nqv = torch.zeros(nkh, hd, dtype=torch.uint8), torch.zeros(nkh, hd, dtype=torch.uint8)
+        nks, nvs = torch.zeros(nkh, 1), torch.zeros(nkh, 1)
+        for hx in range(nkh):
+            qi, ks = self._tq_quantize(k[hx:hx+1], rm); nqk[hx]=qi[0]; nks[hx]=ks[0]
+            qi, vs = self._tq_quantize(v[hx:hx+1], rm); nqv[hx]=qi[0]; nvs[hx]=vs[0]
+        pool = self._kv_cache_manager._pool(model.config.model_id)
+        if pool.quant_key_indices is not None:
+            self._write_quant_cache_single(pool, layer_idx, alloc, position, nqk, nqv, nks, nvs)
+        qkf, qvf, ksf, vsf = self._read_full_quant_cache(pool, layer_idx, alloc, nkh, hd)
+        ao = self._attention_decode_tq(q, qkf, qvf, ksf, vsf, nh, nkh, rm)
+        ar = hidden_state + self._linear(ao.reshape(1, -1), layer.wo).squeeze(0)
+        mn = self._rms_norm(ar.unsqueeze(0), layer.post_rms_weight, cfg.rms_norm_eps)
+        g, u = self._linear(mn, layer.w_gate), self._linear(mn, layer.w_up)
+        return ar + self._linear(torch.nn.functional.silu(g) * u, layer.w_down).squeeze(0)
+
+    def _attention_prefill_tq(self, q, qk, qv, ks, vs, nh, nkh, rm):
+        sl, qpk = q.shape[0], nh // nkh
+        ctx = torch.zeros(sl, nh, HEAD_DIM_TQ, dtype=torch.float32)
+        for kvh in range(nkh):
+            kd = self._tq_dequantize(qk[:, kvh, :], ks[:, kvh, :], rm)
+            vd = self._tq_dequantize(qv[:, kvh, :], vs[:, kvh, :], rm)
+            qs = kvh * qpk
+            qh = q[:, qs:qs + qpk, :]
+            for i in range(sl):
+                sc = torch.matmul(qh[i], kd[:i+1].T) / (HEAD_DIM_TQ ** 0.5)
+                ctx[i, qs:qs+qpk, :] = torch.matmul(torch.softmax(sc, dim=-1), vd[:i+1])
+        return ctx
+
+    def _attention_decode_tq(self, q, qk, qv, ks, vs, nh, nkh, rm):
+        qpk = nh // nkh
+        parts = []
+        for kvh in range(nkh):
+            kd = self._tq_dequantize(qk[:, kvh, :], ks[:, kvh, :], rm)
+            vd = self._tq_dequantize(qv[:, kvh, :], vs[:, kvh, :], rm)
+            qh = q[kvh * qpk:(kvh + 1) * qpk]
+            sc = torch.matmul(qh, kd.T) / (HEAD_DIM_TQ ** 0.5)
+            parts.append(torch.matmul(torch.softmax(sc, dim=-1), vd))
+        return torch.cat(parts, dim=0)
+
+    @staticmethod
+    def _write_quant_cache(pool, layer_idx, alloc, start_token, qk, qv, ks, vs):
+        sl, nkh, hd = qk.shape
+        ps = pool.page_size
+        for to in range(sl):
+            ti = start_token + to
+            pg = ti // ps; off = ti % ps
+            if pg >= len(alloc.page_ids): break
+            pp = alloc.page_ids[pg]
+            for hx in range(nkh):
+                pool.quant_key_indices[layer_idx, pp, hx, off, :] = qk[to, hx, :]
+                pool.quant_val_indices[layer_idx, pp, hx, off, :] = qv[to, hx, :]
+                pool.quant_key_norms[layer_idx, pp, hx, off, 0] = ks[to, hx, 0].to(torch.bfloat16)
+                pool.quant_val_norms[layer_idx, pp, hx, off, 0] = vs[to, hx, 0].to(torch.bfloat16)
+        alloc.tokens_used = max(alloc.tokens_used, start_token + sl)
+
+    @staticmethod
+    def _write_quant_cache_single(pool, layer_idx, alloc, pos, qk, qv, ks, vs):
+        nkh, hd = qk.shape
+        ps = pool.page_size
+        pg, off = pos // ps, pos % ps
+        if pg >= len(alloc.page_ids): return
+        pp = alloc.page_ids[pg]
+        for hx in range(nkh):
+            pool.quant_key_indices[layer_idx, pp, hx, off, :] = qk[hx]
+            pool.quant_val_indices[layer_idx, pp, hx, off, :] = qv[hx]
+            pool.quant_key_norms[layer_idx, pp, hx, off, 0] = ks[hx, 0].to(torch.bfloat16)
+            pool.quant_val_norms[layer_idx, pp, hx, off, 0] = vs[hx, 0].to(torch.bfloat16)
+        alloc.tokens_used = max(alloc.tokens_used, pos + 1)
+
+    @staticmethod
+    def _read_full_quant_cache(pool, layer_idx, alloc, nkh, hd):
+        tu, ps = alloc.tokens_used, pool.page_size
+        qk = torch.zeros(tu, nkh, hd, dtype=torch.uint8)
+        qv = torch.zeros(tu, nkh, hd, dtype=torch.uint8)
+        ks = torch.zeros(tu, nkh, 1)
+        vs = torch.zeros(tu, nkh, 1)
+        for tok in range(tu):
+            pg, off = tok // ps, tok % ps
+            if pg >= len(alloc.page_ids): break
+            pp = alloc.page_ids[pg]
+            for hx in range(nkh):
+                qk[tok, hx, :] = pool.quant_key_indices[layer_idx, pp, hx, off, :]
+                qv[tok, hx, :] = pool.quant_val_indices[layer_idx, pp, hx, off, :]
+                ks[tok, hx, 0] = pool.quant_key_norms[layer_idx, pp, hx, off, 0].float()
+                vs[tok, hx, 0] = pool.quant_val_norms[layer_idx, pp, hx, off, 0].float()
+        return qk, qv, ks, vs

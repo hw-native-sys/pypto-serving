@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from simpler.task_interface import ContinuousTensor, DataType
+from simpler.task_interface import DataType, Tensor
 from simpler.worker import Worker as SimplerWorker
 
 
@@ -119,9 +119,9 @@ class WorkerTensor:
         """Return the corresponding ``torch.dtype``."""
         return _to_torch_dtype(self.dtype)
 
-    def to_continuous_tensor(self) -> ContinuousTensor:
+    def to_continuous_tensor(self) -> Tensor:
         """Return a Simpler tensor view that skips runtime malloc/free."""
-        return ContinuousTensor.make(self.data_ptr, self.shape, self.dtype, child_memory=True)
+        return Tensor.make(self.data_ptr, self.shape, self.dtype, True)
 
 
 class Worker:
@@ -133,7 +133,7 @@ class Worker:
     optional Python sub-workers.  The wrapper is intentionally small: it adds
     LLM-oriented validation and ``WorkerTensor`` helpers, but preserves Simpler
     concepts such as callables, worker ids, ``CallConfig``, and
-    ``ContinuousTensor``.
+    ``Tensor`` (child-memory views).
     """
 
     def __init__(

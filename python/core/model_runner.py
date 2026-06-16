@@ -30,10 +30,19 @@ from .types import (
 
 @dataclass
 class _KvCachePool:
-    """Worker-resident flat all-layer KV cache for one model."""
+    """Worker-resident flat all-layer KV cache for one model.
 
-    key_pages: DeviceTensor
-    value_pages: DeviceTensor
+    For TurboQuant (TQ) mode the quantized caches and scales are populated
+    instead of (or in addition to) the BF16 key_pages / value_pages.
+    """
+
+    key_pages: DeviceTensor | None = None
+    value_pages: DeviceTensor | None = None
+    # TurboQuant compressed caches.
+    quant_k_pages: DeviceTensor | None = None
+    quant_v_pages: DeviceTensor | None = None
+    k_scales_pages: DeviceTensor | None = None
+    v_scales_pages: DeviceTensor | None = None
 
 
 class ModelRunner(ABC):
@@ -52,12 +61,45 @@ class ModelRunner(ABC):
         num_pages = runtime.total_kv_pages
         if num_pages is None:
             num_pages = runtime.max_batch_size * max_blocks_per_seq
-        kv_dtype = getattr(torch, runtime.kv_dtype)
         cache_rows = config.num_hidden_layers * num_pages * config.num_key_value_heads * runtime.page_size
         cache_shape = (
             cache_rows,
             config.head_dim,
         )
+
+        qcfg = runtime.kv_quant_config
+        if qcfg is not None and qcfg.enabled:
+            # TurboQuant: UINT8 quantized K/V caches + FP32 per-row scales,
+            # allocated in place of the BF16 key/value pages.
+            scales_shape = (cache_rows, 1)
+            quant_k = self._alloc_kv_cache_tensor(cache_shape, torch.uint8)
+            try:
+                quant_v = self._alloc_kv_cache_tensor(cache_shape, torch.uint8)
+            except Exception:
+                self._free_kv_cache_tensor(quant_k)
+                raise
+            try:
+                k_scales = self._alloc_kv_cache_tensor(scales_shape, torch.float32)
+            except Exception:
+                self._free_kv_cache_tensor(quant_k)
+                self._free_kv_cache_tensor(quant_v)
+                raise
+            try:
+                v_scales = self._alloc_kv_cache_tensor(scales_shape, torch.float32)
+            except Exception:
+                self._free_kv_cache_tensor(quant_k)
+                self._free_kv_cache_tensor(quant_v)
+                self._free_kv_cache_tensor(k_scales)
+                raise
+            self._kv_caches[model_id] = _KvCachePool(
+                quant_k_pages=quant_k,
+                quant_v_pages=quant_v,
+                k_scales_pages=k_scales,
+                v_scales_pages=v_scales,
+            )
+            return
+
+        kv_dtype = getattr(torch, runtime.kv_dtype)
         key_pages = self._alloc_kv_cache_tensor(cache_shape, kv_dtype)
         try:
             value_pages = self._alloc_kv_cache_tensor(cache_shape, kv_dtype)
@@ -72,8 +114,18 @@ class ModelRunner(ABC):
     def close_kv_cache(self) -> None:
         """Release all runner-owned KV cache tensors."""
         for pool in list(self._kv_caches.values()):
-            self._free_kv_cache_tensor(pool.key_pages)
-            self._free_kv_cache_tensor(pool.value_pages)
+            if pool.key_pages is not None:
+                self._free_kv_cache_tensor(pool.key_pages)
+            if pool.value_pages is not None:
+                self._free_kv_cache_tensor(pool.value_pages)
+            if pool.quant_k_pages is not None:
+                self._free_kv_cache_tensor(pool.quant_k_pages)
+            if pool.quant_v_pages is not None:
+                self._free_kv_cache_tensor(pool.quant_v_pages)
+            if pool.k_scales_pages is not None:
+                self._free_kv_cache_tensor(pool.k_scales_pages)
+            if pool.v_scales_pages is not None:
+                self._free_kv_cache_tensor(pool.v_scales_pages)
         self._kv_caches.clear()
 
     @abstractmethod

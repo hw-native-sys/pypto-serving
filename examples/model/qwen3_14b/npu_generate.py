@@ -35,7 +35,7 @@ from python.core import GenerateConfig, LLMEngine, RuntimeConfig
 from python.core.kv_cache import KvCacheManager
 from python.profile import get_profiler, merge_profile, profile_span
 from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
-from python.core.types import LoadedModel
+from python.core.types import KvQuantConfig, LoadedModel
 import dataclasses
 
 
@@ -372,6 +372,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Implies --profile. Also dump per-layer prefill times and "
              "per-decode-step layer breakdowns.",
     )
+    parser.add_argument(
+        "--tq",
+        action="store_true",
+        dest="tq_mode",
+        help="Enable TurboQuant KV cache compression (4-bit quantized K/V cache).",
+    )
     return parser
 
 
@@ -392,6 +398,7 @@ def main() -> None:
         device_id=args.device_id,
         save_kernels_dir=args.save_kernels_dir,
         l3_trace=args.profile_verbose,
+        tq_mode=args.tq_mode,
     )
     engine = LLMEngine(
         kv_cache_manager=kv_cache_manager,
@@ -414,7 +421,8 @@ def main() -> None:
                 max_new_tokens=args.max_new_tokens,
                 device="cpu",
                 kv_dtype="bfloat16",
-                weight_dtype="float32",
+                weight_dtype="bfloat16",
+                kv_quant_config=KvQuantConfig(enabled=True) if args.tq_mode else None,
             ),
         )
         if collector is not None:

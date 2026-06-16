@@ -86,6 +86,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show model loading and kernel compilation logs. Startup logs are suppressed by default.",
     )
+    # TurboQuant
+    parser.add_argument(
+        "--tq",
+        action="store_true",
+        dest="tq_mode",
+        help="Enable TurboQuant KV cache compression (4-bit quantized K/V cache).",
+    )
     return parser
 
 
@@ -99,7 +106,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         from python.core.async_engine import EngineConfig
 
     model_dir = str(Path(args.model).resolve())
-    executor_kwargs = _build_executor_kwargs()
+    executor_kwargs = _build_executor_kwargs(args)
 
     return EngineConfig(
         model_id=args.served_model_name or Path(args.model).name,
@@ -122,6 +129,14 @@ def _build_runtime_config(args: argparse.Namespace):
     if kv_dtype == "auto":
         kv_dtype = args.dtype
 
+    kv_quant_config = None
+    if getattr(args, "tq_mode", False):
+        try:
+            from ..core.types import KvQuantConfig
+        except ImportError:
+            from python.core.types import KvQuantConfig
+        kv_quant_config = KvQuantConfig(enabled=True)
+
     return RuntimeConfig(
         page_size=args.block_size,
         max_batch_size=args.max_num_seqs,
@@ -130,10 +145,11 @@ def _build_runtime_config(args: argparse.Namespace):
         kv_dtype=kv_dtype,
         weight_dtype=args.dtype,
         max_new_tokens=args.max_new_tokens,
+        kv_quant_config=kv_quant_config,
     )
 
 
-def _build_executor_kwargs() -> dict[str, object]:
+def _build_executor_kwargs(args: argparse.Namespace) -> dict[str, object]:
     executor_kwargs: dict[str, object] = {}
     pypto_root = os.environ.get("PYPTO_ROOT")
     save_kernels_dir = os.environ.get("PYPTO_SAVE_KERNELS_DIR")
@@ -141,6 +157,8 @@ def _build_executor_kwargs() -> dict[str, object]:
         executor_kwargs["pypto_root"] = pypto_root
     if save_kernels_dir:
         executor_kwargs["save_kernels_dir"] = save_kernels_dir
+    if getattr(args, "tq_mode", False):
+        executor_kwargs["tq_mode"] = True
     return executor_kwargs
 
 
