@@ -55,6 +55,9 @@ def test_build_serving_engine_config_uses_cli_args(tmp_path, monkeypatch):
     assert config.model_dir == str(model_dir.resolve())
     assert config.platform == "a5"
     assert config.device_id == 2
+    assert config.device_ids == (2,)
+    assert config.parallel_config.devices == (2,)
+    assert config.parallel_config.replica_device_groups == ((2,),)
     assert config.executor_cls == "PyptoQwen14BExecutor"
     assert config.executor_kwargs == {
         "pypto_root": "/tmp/pypto",
@@ -71,6 +74,39 @@ def test_build_serving_engine_config_uses_cli_args(tmp_path, monkeypatch):
     assert config.long_prefill_token_threshold == 64
     assert config.enable_prefix_cache is False
     assert config.enable_chunk_prefill is False
+
+
+def test_build_serving_engine_config_accepts_parallel_topology(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    args = _parse_args([
+        "--model", str(model_dir),
+        "--devices", "0,1,2,3",
+        "--dp", "2",
+        "--tp", "2",
+    ])
+
+    config = cli.build_serving_engine_config(args)
+
+    assert config.device_id == 0
+    assert config.device_ids == (0, 1, 2, 3)
+    assert config.parallel_config.data_parallel_size == 2
+    assert config.parallel_config.tensor_parallel_size == 2
+    assert config.parallel_config.replica_device_groups == ((0, 1), (2, 3))
+
+
+def test_build_serving_engine_config_rejects_invalid_parallel_topology(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    args = _parse_args([
+        "--model", str(model_dir),
+        "--devices", "0,1,2",
+        "--dp", "2",
+        "--tp", "2",
+    ])
+
+    with pytest.raises(ValueError, match="number of devices"):
+        cli.build_serving_engine_config(args)
 
 
 def test_parser_rejects_invalid_backend(tmp_path):
