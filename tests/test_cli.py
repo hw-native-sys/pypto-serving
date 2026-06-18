@@ -46,6 +46,7 @@ def test_build_serving_engine_config_uses_cli_args(tmp_path, monkeypatch):
         "--max-num-batched-tokens", "256",
         "--long-prefill-token-threshold", "64",
         "--no-enable-prefix-caching",
+        "--prefix-cache-backend", "radix",
         "--no-enable-chunked-prefill",
     ])
 
@@ -70,7 +71,20 @@ def test_build_serving_engine_config_uses_cli_args(tmp_path, monkeypatch):
     assert config.max_num_scheduled_tokens == 256
     assert config.long_prefill_token_threshold == 64
     assert config.enable_prefix_cache is False
+    assert config.prefix_cache_backend == "radix"
     assert config.enable_chunk_prefill is False
+
+
+def test_prefix_cache_backend_defaults_to_hash_even_with_env(tmp_path, monkeypatch):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    monkeypatch.setenv("PYPTO_PREFIX_CACHE_BACKEND", "radix")
+
+    args = _parse_args(["--model", str(model_dir), "--backend", "npu"])
+    config = cli.build_serving_engine_config(args)
+
+    assert args.prefix_cache_backend == "hash"
+    assert config.prefix_cache_backend == "hash"
 
 
 def test_parser_rejects_invalid_backend(tmp_path):

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -45,6 +46,7 @@ class SchedulerConfig:
     # Feature flags
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
+    prefix_cache_backend: str = "hash"
 
 
 @dataclass
@@ -52,6 +54,7 @@ class Request:
     request_id: str
     prompt_token_ids: list[int]
     max_new_tokens: int
+    model_id: str = ""
     arrival_time: float = field(default_factory=time.time)
     status: RequestStatus = RequestStatus.WAITING
     num_computed_tokens: int = 0
@@ -121,15 +124,22 @@ class Scheduler:
 
     def __init__(self, config: SchedulerConfig, kv_cache_manager: KvCacheManager) -> None:
         self.config = config
+        if self.config.prefix_cache_backend not in {"hash", "radix"}:
+            raise ValueError(
+                "prefix_cache_backend must be either 'hash' or 'radix', "
+                f"got {self.config.prefix_cache_backend!r}"
+            )
         self.kv_cache_manager = kv_cache_manager
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
         self.requests: dict[str, Request] = {}
+        self._radix_nodes: dict[str, object] = {}
+        self._radix_debug = os.environ.get("PYPTO_RADIX_DEBUG", "").lower() not in {"", "0", "false", "no"}
 
     def add_request(self, request: Request) -> None:
         if len(request.prompt_token_ids) > self.config.max_seq_len:
             request.prompt_token_ids = request.prompt_token_ids[: self.config.max_seq_len]
-        if self.config.enable_prefix_cache:
+        if self.config.enable_prefix_cache and self.config.prefix_cache_backend == "hash":
             request.block_hashes = self.kv_cache_manager.compute_block_hashes(request.prompt_token_ids)
         request.status = RequestStatus.WAITING
         self.waiting.append(request)
@@ -224,7 +234,10 @@ class Scheduler:
             request = self.waiting.popleft()
 
             # Prefix cache lookup
-            if self.config.enable_prefix_cache:
+            if self.config.enable_prefix_cache and self.config.prefix_cache_backend == "radix":
+                self._match_radix_prefix(request)
+                cached_blocks = []
+            elif self.config.enable_prefix_cache:
                 cached_blocks = self.kv_cache_manager.get_computed_blocks(request.prompt_token_ids)
                 if cached_blocks:
                     request.cached_block_ids = [b.block_id for b in cached_blocks]
@@ -238,12 +251,18 @@ class Scheduler:
             num_new = min(num_new, token_budget)
 
             if num_new <= 0:
+                if self.config.prefix_cache_backend == "radix":
+                    self.kv_cache_manager.release_pages_from_request(request.cached_block_ids)
+                    self._release_radix_prefix(request)
                 remaining_waiting.append(request)
                 continue
 
             num_blocks_needed = self._blocks_needed(request, num_new)
             if not self._try_allocate_blocks(request, num_blocks_needed):
                 self.kv_cache_manager.release_cached_blocks(cached_blocks)
+                if self.config.prefix_cache_backend == "radix":
+                    self.kv_cache_manager.release_pages_from_request(request.cached_block_ids)
+                self._release_radix_prefix(request)
                 request.cached_block_ids = []
                 request.num_computed_tokens = 0
                 remaining_waiting.append(request)
@@ -260,6 +279,14 @@ class Scheduler:
                     num_computed_tokens=request.num_computed_tokens,
                     block_ids=list(all_block_ids),
                 )
+            )
+            self._debug_radix(
+                "schedule",
+                request,
+                scheduled_prefill_tokens=num_new,
+                computed_tokens=request.num_computed_tokens,
+                cached_pages=len(request.cached_block_ids),
+                allocated_pages=len(request.allocated_block_ids),
             )
             output.num_prefill_tokens += num_new
             token_budget -= num_new
@@ -342,8 +369,6 @@ class Scheduler:
     def _try_allocate_blocks(self, request: Request, num_blocks: int) -> bool:
         if num_blocks <= 0:
             return True
-        if self.kv_cache_manager.num_free_blocks < num_blocks:
-            return False
         block_ids = self.kv_cache_manager.allocate_block_ids(num_blocks)
         if block_ids is None:
             return False
@@ -395,12 +420,33 @@ class Scheduler:
             request.cached_block_ids,
             request.allocated_block_ids,
         )
+        self._release_radix_prefix(request)
         request.cached_block_ids = []
         request.allocated_block_ids = []
 
     def _cache_completed_blocks(self, request: Request) -> None:
         """Register completed blocks in the prefix cache."""
         if not self.config.enable_prefix_cache:
+            return
+        if self.config.prefix_cache_backend == "radix":
+            all_block_ids = request.cached_block_ids + request.allocated_block_ids
+            completed_len = min(request.num_computed_tokens, len(request.all_token_ids))
+            completed_pages = min(
+                completed_len // self.kv_cache_manager.block_size,
+                len(all_block_ids),
+            )
+            completed_len = completed_pages * self.kv_cache_manager.block_size
+            self.kv_cache_manager.insert_radix_prefix(
+                request.model_id,
+                request.all_token_ids[:completed_len],
+                all_block_ids[:completed_pages],
+            )
+            self._debug_radix(
+                "insert",
+                request,
+                total_tokens=completed_len,
+                pages=completed_pages,
+            )
             return
         total_blocks_computed = request.num_computed_tokens // self.kv_cache_manager.block_size
         already_cached = len(request.cached_block_ids)
@@ -411,3 +457,37 @@ class Scheduler:
             already_cached,
             total_blocks_computed,
         )
+
+    def _match_radix_prefix(self, request: Request) -> None:
+        """Attach a radix prefix hit to a waiting request."""
+        max_match_len = max(0, request.num_prompt_tokens - 1)
+        match_tokens = request.prompt_token_ids[:max_match_len]
+        match = self.kv_cache_manager.match_radix_prefix(request.model_id, match_tokens)
+        self._debug_radix(
+            "match",
+            request,
+            prompt_tokens=request.num_prompt_tokens,
+            max_match_len=max_match_len,
+            matched_tokens=match.prefix_len,
+            matched_pages=len(match.page_ids),
+        )
+        if match.prefix_len <= 0:
+            return
+        request.cached_block_ids = list(match.page_ids)
+        request.num_computed_tokens = match.prefix_len
+        self.kv_cache_manager.retain_pages_for_request(request.cached_block_ids)
+        self._radix_nodes[request.request_id] = match.last_node
+
+    def _debug_radix(self, event: str, request: Request, **fields: object) -> None:
+        if not self._radix_debug or self.config.prefix_cache_backend != "radix":
+            return
+        details = " ".join(f"{key}={value}" for key, value in fields.items())
+        print(
+            f"[radix] {event} request={request.request_id} model={request.model_id} {details}",
+            flush=True,
+        )
+
+    def _release_radix_prefix(self, request: Request) -> None:
+        node = self._radix_nodes.pop(request.request_id, None)
+        if node is not None:
+            self.kv_cache_manager.radix_cache.dec_lock_ref(node)

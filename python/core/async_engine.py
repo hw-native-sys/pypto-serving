@@ -49,6 +49,7 @@ class EngineConfig:
     # Feature flags
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
+    prefix_cache_backend: str = "hash"
 
 
 @dataclass
@@ -102,6 +103,7 @@ class AsyncLLMEngine:
             max_seq_len=runtime.max_seq_len,
             enable_prefix_cache=self.config.enable_prefix_cache,
             enable_chunk_prefill=self.config.enable_chunk_prefill,
+            prefix_cache_backend=self.config.prefix_cache_backend,
         )
         self.scheduler = Scheduler(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)
 
@@ -178,6 +180,7 @@ class AsyncLLMEngine:
                 request_id=request_id,
                 prompt_token_ids=prompt_token_ids,
                 max_new_tokens=config.max_new_tokens,
+                model_id=self.config.model_id,
                 arrival_time=time.time(),
                 stop_strings=tuple(config.stop) if config.stop else (),
                 eos_token_id=self.eos_token_id,

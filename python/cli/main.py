@@ -74,6 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable prefix caching (default: True). Use --no-enable-prefix-caching to disable.",
     )
     parser.add_argument(
+        "--prefix-cache-backend",
+        default="hash",
+        choices=("hash", "radix"),
+        help="Prefix cache backend: hash or radix (default: hash).",
+    )
+    parser.add_argument(
         "--enable-chunked-prefill",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -114,6 +120,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         long_prefill_token_threshold=args.long_prefill_token_threshold,
         enable_prefix_cache=args.enable_prefix_caching,
         enable_chunk_prefill=args.enable_chunked_prefill,
+        prefix_cache_backend=args.prefix_cache_backend,
     )
 
 
@@ -188,6 +195,7 @@ def run_serve(
     print(f"  Max scheduled tokens/iter: {config.max_num_scheduled_tokens}")
     print(f"  Chunked prefill threshold: {config.long_prefill_token_threshold}")
     print(f"  Prefix cache: {'enabled' if config.enable_prefix_cache else 'disabled'}")
+    print(f"  Prefix cache backend: {config.prefix_cache_backend}")
     print(f"  Chunk prefill: {'enabled' if config.enable_chunk_prefill else 'disabled'}")
     print("  Endpoints: /v1/completions, /v1/chat/completions, /v1/models, /health")
 

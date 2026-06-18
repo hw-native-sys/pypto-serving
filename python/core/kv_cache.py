@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from .radix_cache import RadixKey, RadixMatch, RadixPrefixCache
 from .types import KvAllocation, ModelConfig, RuntimeConfig
 
 
@@ -132,6 +133,7 @@ class KvCacheManager:
         self.free_queue = FreeKVCacheBlockQueue()
         self.hash_to_block: dict[int, KVCacheBlock] = {}
         self.request_blocks: dict[str, list[KVCacheBlock]] = {}
+        self.radix_cache = self._new_radix_cache()
         if num_blocks is not None:
             self._init_blocks(num_blocks, block_size)
 
@@ -154,6 +156,7 @@ class KvCacheManager:
         self.blocks = [KVCacheBlock(block_id=i) for i in range(num_blocks)]
         for block in self.blocks:
             self.free_queue.append(block)
+        self.radix_cache = self._new_radix_cache()
 
     def register_model(self, model_id: str, config: ModelConfig, runtime: RuntimeConfig) -> None:
         """Create the KV page pool for a model if it is not already registered."""
@@ -207,6 +210,8 @@ class KvCacheManager:
         if num_blocks <= 0:
             return []
         if self.num_free_blocks < num_blocks:
+            self.radix_cache.evict_pages(num_blocks - self.num_free_blocks)
+        if self.num_free_blocks < num_blocks:
             return None
         blocks: list[KVCacheBlock] = []
         for _ in range(num_blocks):
@@ -232,8 +237,27 @@ class KvCacheManager:
     def release_blocks_by_ids(self, *block_id_groups: list[int]) -> None:
         """Release request references for one or more groups of physical block IDs."""
         for block_ids in block_id_groups:
-            for block_id in block_ids:
-                self.release(self.blocks[block_id])
+            self.release_pages_from_request(block_ids)
+
+    def retain_pages_for_request(self, page_ids: list[int]) -> None:
+        """Take one active-request reference on each physical KV page."""
+        for page_id in page_ids:
+            self.retain(self.blocks[page_id])
+
+    def release_pages_from_request(self, page_ids: list[int]) -> None:
+        """Release one active-request reference from each physical KV page."""
+        for page_id in page_ids:
+            self.release(self.blocks[page_id])
+
+    def retain_pages_for_cache(self, page_ids: list[int]) -> None:
+        """Take one prefix-cache reference on each physical KV page."""
+        for page_id in page_ids:
+            self.retain(self.blocks[page_id])
+
+    def release_pages_from_cache(self, page_ids: list[int]) -> None:
+        """Release one prefix-cache reference from each physical KV page."""
+        for page_id in page_ids:
+            self.release(self.blocks[page_id])
 
     def release_cached_blocks(self, blocks: list[KVCacheBlock]) -> None:
         """Release cached block objects returned by ``get_computed_blocks``."""
@@ -284,6 +308,12 @@ class KvCacheManager:
         if block.ref_cnt == 0:
             self.free_queue.append(block)
 
+    def retain(self, block: KVCacheBlock) -> None:
+        """Retain one reference to a physical KV block."""
+        if block.ref_cnt == 0:
+            self.free_queue.remove(block)
+        block.ref_cnt += 1
+
     def _iter_block_hashes(self, token_ids: list[int]):
         """Yield (block_index, block_hash) for each full block in the token sequence."""
         parent_hash = NONE_HASH
@@ -309,6 +339,18 @@ class KvCacheManager:
     def compute_block_hashes(self, token_ids: list[int]) -> list[int]:
         """Compute chained hashes for all full blocks in the token sequence."""
         return [block_hash for _, block_hash in self._iter_block_hashes(token_ids)]
+
+    def match_radix_prefix(self, model_id: str, token_ids: list[int]) -> RadixMatch:
+        """Find and lock the longest page-aligned radix prefix for one model."""
+        if not self.enable_prefix_cache:
+            return self.radix_cache.match(RadixKey.from_tokens([], extra_key=(model_id,)))
+        return self.radix_cache.match(RadixKey.from_tokens(token_ids, extra_key=(model_id,)))
+
+    def insert_radix_prefix(self, model_id: str, token_ids: list[int], page_ids: list[int]) -> None:
+        """Publish a page-aligned request prefix to the radix cache."""
+        if not self.enable_prefix_cache:
+            return
+        self.radix_cache.insert(RadixKey.from_tokens(token_ids, extra_key=(model_id,)), page_ids)
 
     def ensure_one_more_slot(self, alloc: KvAllocation) -> int:
         """Ensure a request has capacity for one more token and return its slot."""
@@ -413,3 +455,10 @@ class KvCacheManager:
         if model_id not in self._pools:
             raise KeyError(f"Model {model_id} is not registered with the KV cache manager.")
         return self._pools[model_id]
+
+    def _new_radix_cache(self) -> RadixPrefixCache:
+        return RadixPrefixCache(
+            self.block_size,
+            retain_pages=self.retain_pages_for_cache,
+            release_pages=self.release_pages_from_cache,
+        )
