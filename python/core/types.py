@@ -105,6 +105,7 @@ class RuntimeModel:
     final_norm_weight: torch.Tensor
     lm_head: torch.Tensor
     layers: list[LayerWeights]
+    extra: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
