@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import queue
 import time
 from collections.abc import AsyncGenerator
@@ -25,6 +26,29 @@ from .types import RuntimeConfig, StepOutput, WorkerCommand
 from .serving_worker import spawn_worker
 
 logger = logging.getLogger(__name__)
+_DEFAULT_WORKER_INIT_TIMEOUT_SECONDS = 600.0
+_DEFAULT_WORKER_STEP_TIMEOUT_SECONDS = 300.0
+
+
+def _positive_env_timeout_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        timeout = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive number of seconds") from exc
+    if timeout <= 0:
+        raise ValueError(f"{name} must be a positive number of seconds")
+    return timeout
+
+
+def _worker_init_timeout_seconds() -> float:
+    return _positive_env_timeout_seconds("PYPTO_WORKER_INIT_TIMEOUT", _DEFAULT_WORKER_INIT_TIMEOUT_SECONDS)
+
+
+def _worker_step_timeout_seconds() -> float:
+    return _positive_env_timeout_seconds("PYPTO_WORKER_STEP_TIMEOUT", _DEFAULT_WORKER_STEP_TIMEOUT_SECONDS)
 
 
 @dataclass
@@ -139,9 +163,10 @@ class DPEngineCore:
                 self._output_queue = output_q
 
                 logger.info("Waiting for worker to initialize model...")
-                await asyncio.to_thread(ready_event.wait, timeout=600)
+                init_timeout = _worker_init_timeout_seconds()
+                await asyncio.to_thread(ready_event.wait, timeout=init_timeout)
                 if not ready_event.is_set():
-                    raise RuntimeError("Worker failed to initialize within timeout")
+                    raise RuntimeError(f"Worker failed to initialize within {init_timeout:g}s")
                 logger.info("Worker ready")
 
             self._running = True
@@ -278,11 +303,12 @@ class DPEngineCore:
 
             try:
                 with profile_span("scheduler.wait_worker_output", cat="scheduler"):
+                    step_timeout = _worker_step_timeout_seconds()
                     step_output: StepOutput = await asyncio.to_thread(
-                        self._output_queue.get, timeout=300
+                        self._output_queue.get, timeout=step_timeout
                     )
             except queue.Empty:
-                logger.error("Worker response timed out (300s)")
+                logger.error(f"Worker response timed out ({step_timeout:g}s)")
                 self._handle_step_error(scheduler_output)
                 continue
 

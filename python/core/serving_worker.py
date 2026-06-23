@@ -113,6 +113,9 @@ class WorkerProcess:
         if self.config.executor_cls == "PyptoQwen14BExecutor":
             from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor
             return Qwen314BPyptoExecutor
+        if self.config.executor_cls == "PyptoDeepSeekV4Executor":
+            from examples.model.deepseek_v4.runner.npu_executor import DeepSeekV4PyptoExecutor
+            return DeepSeekV4PyptoExecutor
         from .executor import ModelExecutor
         return ModelExecutor
 
@@ -129,7 +132,9 @@ class WorkerProcess:
                 break
             elif cmd.type == "step":
                 if cmd.finished_request_ids:
-                    pass  # No allocation cleanup needed
+                    release_finished = getattr(self.executor, "release_finished_requests", None)
+                    if callable(release_finished):
+                        release_finished(cmd.finished_request_ids)
 
                 try:
                     result = self._execute_step(cmd.scheduler_output)
