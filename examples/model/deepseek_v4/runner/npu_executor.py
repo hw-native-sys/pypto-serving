@@ -36,6 +36,7 @@ from examples.model.deepseek_v4.runner.npu_runner import (
     DeepSeekV4ModelRunner,
     _DECODE_TENSOR_ORDER,
     _PREFILL_TENSOR_ORDER,
+    build_deepseek_v4_cache_group_specs,
     build_deepseek_v4_layer_plan,
 )
 from examples.model.deepseek_v4.runner.weight_loader import deepseek_v4_lm_head_layout

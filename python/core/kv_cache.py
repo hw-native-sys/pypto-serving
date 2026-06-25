@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from .types import KvAllocation, ModelConfig, RuntimeConfig
+from .types import KvAllocation, KVCacheGroupSpec, ModelConfig, RuntimeConfig
 
 
 NONE_HASH = hash(("__none__",))
@@ -114,6 +114,25 @@ class _CachePool:
     value_pages: torch.Tensor
 
 
+@dataclass
+class _GroupBlockPool:
+    """Per-group block pool with independent free queue and capacity."""
+
+    name: str
+    spec: KVCacheGroupSpec
+    blocks: list[KVCacheBlock]
+    free_queue: FreeKVCacheBlockQueue
+    request_blocks: dict[str, list[KVCacheBlock]]
+
+    @property
+    def num_free_blocks(self) -> int:
+        return self.free_queue.count
+
+    @property
+    def num_blocks(self) -> int:
+        return len(self.blocks)
+
+
 class KvCacheManager:
     """Unified KV block metadata and paged KV tensor storage manager."""
 
@@ -132,6 +151,7 @@ class KvCacheManager:
         self.free_queue = FreeKVCacheBlockQueue()
         self.hash_to_block: dict[int, KVCacheBlock] = {}
         self.request_blocks: dict[str, list[KVCacheBlock]] = {}
+        self._group_pools: dict[str, _GroupBlockPool] = {}
         if num_blocks is not None:
             self._init_blocks(num_blocks, block_size)
 
@@ -407,6 +427,152 @@ class KvCacheManager:
         alloc.page_ids.clear()
         alloc.tokens_capacity = 0
         alloc.tokens_used = 0
+
+    # ------------------------------------------------------------------
+    # Multi-group KV cache support (for models like DeepSeekV4 with
+    # multiple cache families: ori, cmp, idx, states, etc.)
+    # ------------------------------------------------------------------
+
+    @property
+    def has_groups(self) -> bool:
+        """True when multi-group cache pools have been initialized."""
+        return len(self._group_pools) > 0
+
+    @property
+    def group_names(self) -> list[str]:
+        """Return registered group names."""
+        return list(self._group_pools.keys())
+
+    def init_groups(self, group_specs: tuple[KVCacheGroupSpec, ...]) -> None:
+        """Initialize per-group block pools from group specifications.
+
+        Each group gets its own independent block pool. Groups are used by
+        models like DeepSeekV4 that have multiple cache families with
+        different block sizes and compression ratios.
+        """
+        if self._group_pools:
+            existing = set(self._group_pools.keys())
+            incoming = {gs.name for gs in group_specs}
+            if existing != incoming:
+                raise ValueError(
+                    f"Group pools already initialized with {existing}, got {incoming}"
+                )
+            return
+        for gs in group_specs:
+            num_blocks = gs.max_blocks_per_seq * (
+                self._max_batch_size_from_default_pool() or 32
+            )
+            blocks = [KVCacheBlock(block_id=i) for i in range(num_blocks)]
+            free_queue = FreeKVCacheBlockQueue()
+            for block in blocks:
+                free_queue.append(block)
+            self._group_pools[gs.name] = _GroupBlockPool(
+                name=gs.name,
+                spec=gs,
+                blocks=blocks,
+                free_queue=free_queue,
+                request_blocks={},
+            )
+
+    def _max_batch_size_from_default_pool(self) -> int | None:
+        """Infer max batch from the default pool if available."""
+        if self.blocks:
+            return max(1, len(self.blocks) // max(1, self.block_size))
+        return None
+
+    def allocate_group_blocks(
+        self, group_name: str, num_blocks: int
+    ) -> list[int] | None:
+        """Allocate blocks from a named group pool. Returns block IDs or None."""
+        pool = self._group_pool(group_name)
+        if num_blocks <= 0:
+            return []
+        if pool.num_free_blocks < num_blocks:
+            return None
+        allocated: list[int] = []
+        for _ in range(num_blocks):
+            block = pool.free_queue.popleft()
+            if block is None:
+                for bid in allocated:
+                    self._release_group_block(pool, pool.blocks[bid])
+                return None
+            block.ref_cnt = 1
+            allocated.append(block.block_id)
+        return allocated
+
+    def allocate_for_groups(
+        self,
+        request_id: str,
+        token_count: int,
+    ) -> dict[str, list[int]]:
+        """Allocate blocks across all groups for one request.
+
+        Returns a dict mapping group_name -> list of block IDs.
+        Raises RuntimeError if any group cannot satisfy the allocation.
+        """
+        result: dict[str, list[int]] = {}
+        allocated_groups: list[str] = []
+        try:
+            for name, pool in self._group_pools.items():
+                spec = pool.spec
+                num_blocks_needed = math.ceil(
+                    token_count / (spec.spec.block_size // max(1, spec.spec.compress_ratio))
+                )
+                num_blocks_needed = min(num_blocks_needed, spec.max_blocks_per_seq)
+                block_ids = self.allocate_group_blocks(name, num_blocks_needed)
+                if block_ids is None:
+                    raise RuntimeError(
+                        f"Insufficient blocks in group {name!r}: "
+                        f"need {num_blocks_needed}, have {pool.num_free_blocks}"
+                    )
+                result[name] = block_ids
+                pool.request_blocks.setdefault(request_id, []).extend(
+                    pool.blocks[bid] for bid in block_ids
+                )
+                allocated_groups.append(name)
+        except RuntimeError:
+            for gname in allocated_groups:
+                self.release_group_request(gname, request_id)
+            raise
+        return result
+
+    def release_group_request(self, group_name: str, request_id: str) -> None:
+        """Release all blocks held by a request in one group."""
+        pool = self._group_pool(group_name)
+        blocks = pool.request_blocks.pop(request_id, [])
+        for block in blocks:
+            self._release_group_block(pool, block)
+
+    def release_all_group_requests(self, request_id: str) -> None:
+        """Release blocks held by a request across all groups."""
+        for pool in self._group_pools.values():
+            blocks = pool.request_blocks.pop(request_id, [])
+            for block in blocks:
+                self._release_group_block(pool, block)
+
+    def release_group_blocks_by_ids(
+        self, group_name: str, block_ids: list[int]
+    ) -> None:
+        """Release specific block IDs in a named group."""
+        pool = self._group_pool(group_name)
+        for bid in block_ids:
+            self._release_group_block(pool, pool.blocks[bid])
+
+    def group_free_count(self, group_name: str) -> int:
+        """Return free block count for a named group."""
+        return self._group_pool(group_name).num_free_blocks
+
+    def _release_group_block(self, pool: _GroupBlockPool, block: KVCacheBlock) -> None:
+        if block.ref_cnt <= 0:
+            return
+        block.ref_cnt -= 1
+        if block.ref_cnt == 0:
+            pool.free_queue.append(block)
+
+    def _group_pool(self, group_name: str) -> _GroupBlockPool:
+        if group_name not in self._group_pools:
+            raise KeyError(f"Group {group_name!r} is not registered")
+        return self._group_pools[group_name]
 
     def _pool(self, model_id: str) -> _CachePool:
         """Return the registered cache pool for a model."""

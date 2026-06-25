@@ -132,6 +132,8 @@ class DPEngineCore:
             block_size=block_size,
             enable_prefix_cache=self.config.enable_prefix_cache,
         )
+        if runtime.kv_cache_groups:
+            self.kv_cache_manager.init_groups(runtime.kv_cache_groups)
 
         scheduler_config = SchedulerConfig(
             max_num_running_reqs=self.config.max_num_running_reqs,

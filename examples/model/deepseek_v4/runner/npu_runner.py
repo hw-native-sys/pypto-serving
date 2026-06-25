@@ -24,6 +24,8 @@ from python.core.model_runner import ModelRunner
 from python.core.types import (
     DecodeBatch,
     DecodeResult,
+    KVCacheGroupSpec,
+    KVCacheSpec,
     ModelConfig,
     PrefillBatch,
     PrefillResult,
@@ -65,6 +67,66 @@ DEEPSEEK_V4_CSA_STATE_DIM = 2 * DEEPSEEK_V4_CSA_MAIN_OUT_DIM
 DEEPSEEK_V4_CSA_INNER_STATE_DIM = 2 * DEEPSEEK_V4_CSA_INNER_OUT_DIM
 DEEPSEEK_V4_RMS_NORM_EPS = 1e-6
 DEEPSEEK_V4_HC_EPS = 1e-6
+
+
+def build_deepseek_v4_cache_group_specs(
+    num_hidden_layers: int,
+) -> tuple[KVCacheGroupSpec, ...]:
+    """Build KVCacheGroupSpecs for all 6 DeepSeekV4 cache families."""
+    all_layers = tuple(range(num_hidden_layers))
+    block_size = DEEPSEEK_V4_BLOCK_SIZE
+    head_dim = DEEPSEEK_V4_HEAD_DIM
+    idx_head_dim = DEEPSEEK_V4_IDX_HEAD_DIM
+    return (
+        KVCacheGroupSpec(
+            name="ori",
+            layer_indices=all_layers,
+            spec=KVCacheSpec(block_size=block_size, page_size_bytes=block_size * head_dim * 2),
+            max_blocks_per_seq=DEEPSEEK_V4_ORI_MAX_BLOCKS,
+        ),
+        KVCacheGroupSpec(
+            name="cmp",
+            layer_indices=all_layers,
+            spec=KVCacheSpec(block_size=block_size, page_size_bytes=block_size * head_dim * 2),
+            max_blocks_per_seq=DEEPSEEK_V4_CMP_MAX_BLOCKS,
+        ),
+        KVCacheGroupSpec(
+            name="idx",
+            layer_indices=all_layers,
+            spec=KVCacheSpec(block_size=block_size, page_size_bytes=block_size * idx_head_dim * 2),
+            max_blocks_per_seq=DEEPSEEK_V4_IDX_MAX_BLOCKS,
+        ),
+        KVCacheGroupSpec(
+            name="hca_state",
+            layer_indices=all_layers,
+            spec=KVCacheSpec(
+                block_size=DEEPSEEK_V4_C128_STATE_BLOCK_SIZE,
+                page_size_bytes=DEEPSEEK_V4_C128_STATE_BLOCK_SIZE * DEEPSEEK_V4_HCA_STATE_DIM * 2,
+                compress_ratio=1,
+            ),
+            max_blocks_per_seq=DEEPSEEK_V4_HCA_STATE_MAX_BLOCKS,
+        ),
+        KVCacheGroupSpec(
+            name="csa_state",
+            layer_indices=all_layers,
+            spec=KVCacheSpec(
+                block_size=DEEPSEEK_V4_C4_STATE_BLOCK_SIZE,
+                page_size_bytes=DEEPSEEK_V4_C4_STATE_BLOCK_SIZE * DEEPSEEK_V4_CSA_STATE_DIM * 2,
+                compress_ratio=1,
+            ),
+            max_blocks_per_seq=DEEPSEEK_V4_CSA_STATE_MAX_BLOCKS,
+        ),
+        KVCacheGroupSpec(
+            name="csa_inner_state",
+            layer_indices=all_layers,
+            spec=KVCacheSpec(
+                block_size=DEEPSEEK_V4_C4_STATE_BLOCK_SIZE,
+                page_size_bytes=DEEPSEEK_V4_C4_STATE_BLOCK_SIZE * DEEPSEEK_V4_CSA_INNER_STATE_DIM * 2,
+                compress_ratio=1,
+            ),
+            max_blocks_per_seq=DEEPSEEK_V4_CSA_INNER_STATE_MAX_BLOCKS,
+        ),
+    )
 
 
 _PREFILL_TENSOR_ORDER = (
@@ -381,11 +443,28 @@ class DeepSeekV4CacheManager:
         return slots
 
     def block_table(self, slots: Sequence[int], *, max_blocks: int) -> torch.Tensor:
-        """Build a row-major block table for request-owned physical block ranges."""
+        """Build a row-major block table for request-owned physical block ranges.
+
+        When no external block IDs are provided, falls back to contiguous
+        slot-based addressing for backwards compatibility.
+        """
         table = torch.empty((len(slots), max_blocks), dtype=torch.int32)
         for row, slot in enumerate(slots):
             start = int(slot) * max_blocks
             table[row].copy_(torch.arange(start, start + max_blocks, dtype=torch.int32))
+        return table
+
+    def block_table_from_ids(
+        self,
+        per_request_block_ids: Sequence[list[int]],
+        *,
+        max_blocks: int,
+    ) -> torch.Tensor:
+        """Build a block table from scheduler-allocated block IDs."""
+        table = torch.zeros((len(per_request_block_ids), max_blocks), dtype=torch.int32)
+        for row, block_ids in enumerate(per_request_block_ids):
+            n = min(len(block_ids), max_blocks)
+            table[row, :n] = torch.tensor(block_ids[:n], dtype=torch.int32)
         return table
 
     def slot_mapping(
@@ -416,6 +495,120 @@ class DeepSeekV4CacheManager:
                 mapping[row, col] = base + logical
         return mapping
 
+    def slot_mapping_from_ids(
+        self,
+        per_request_block_ids: Sequence[list[int]],
+        positions: Sequence[Sequence[int]],
+        *,
+        block_size: int | None = None,
+        compress_ratio: int = 1,
+    ) -> torch.Tensor:
+        """Map token positions to physical slots using scheduler block IDs."""
+        block_size = self.layout.block_size if block_size is None else int(block_size)
+        max_tokens = max((len(row) for row in positions), default=0)
+        mapping = torch.full((len(per_request_block_ids), max_tokens), -1, dtype=torch.int64)
+        for row, (block_ids, row_positions) in enumerate(
+            zip(per_request_block_ids, positions, strict=True)
+        ):
+            for col, position in enumerate(row_positions):
+                logical = int(position) // compress_ratio
+                block_idx = logical // block_size
+                offset = logical % block_size
+                if block_idx < len(block_ids):
+                    mapping[row, col] = block_ids[block_idx] * block_size + offset
+        return mapping
+
+    def sliding_window_slot_mapping_from_ids(
+        self,
+        per_request_block_ids: Sequence[list[int]],
+        positions: Sequence[Sequence[int]],
+        *,
+        kernel_rows: int,
+    ) -> torch.Tensor:
+        """Map positions into sliding-window cache using scheduler block IDs."""
+        active = list(zip(per_request_block_ids, positions, strict=True))
+        if not active:
+            raise ValueError("block_ids must not be empty")
+        while len(active) < kernel_rows:
+            active.append(active[0])
+        mapping = torch.full(
+            (kernel_rows, max((len(pos) for _, pos in active), default=0)),
+            -1, dtype=torch.int64,
+        )
+        for row_idx, (block_ids, row_positions) in enumerate(active):
+            for col, position in enumerate(row_positions):
+                window_slot = int(position) % self.layout.block_size
+                block_idx = window_slot // self.layout.block_size
+                offset = window_slot % self.layout.block_size
+                if block_idx < len(block_ids):
+                    mapping[row_idx, col] = block_ids[block_idx] * self.layout.block_size + offset
+                elif block_ids:
+                    mapping[row_idx, col] = block_ids[0] * self.layout.block_size + window_slot
+        return mapping
+
+    def compressed_slot_mapping_from_ids(
+        self,
+        per_request_block_ids: Sequence[list[int]],
+        positions: Sequence[Sequence[int]],
+        *,
+        compress_ratio: int,
+        block_size: int | None = None,
+        kernel_rows: int,
+    ) -> torch.Tensor:
+        """Map compression-boundary positions using scheduler block IDs."""
+        block_size = self.layout.block_size if block_size is None else int(block_size)
+        active: list[tuple[list[int], Sequence[int]]] = list(
+            zip(per_request_block_ids, positions, strict=True)
+        )
+        if not active:
+            raise ValueError("block_ids must not be empty")
+        while len(active) < kernel_rows:
+            active.append(active[0])
+        mapping = torch.full(
+            (kernel_rows, max((len(pos) for _, pos in active), default=0)),
+            -1, dtype=torch.int64,
+        )
+        for row_idx, (block_ids, row_positions) in enumerate(active):
+            for col, position in enumerate(row_positions):
+                position = int(position)
+                if (position + 1) % compress_ratio != 0:
+                    continue
+                logical = position // compress_ratio
+                block_idx = logical // block_size
+                offset = logical % block_size
+                if block_idx < len(block_ids):
+                    mapping[row_idx, col] = block_ids[block_idx] * block_size + offset
+        return mapping
+
+    def state_slot_mapping_from_ids(
+        self,
+        per_request_block_ids: Sequence[list[int]],
+        positions: Sequence[Sequence[int]],
+        *,
+        state_block_size: int,
+        kernel_rows: int,
+    ) -> torch.Tensor:
+        """Map positions into compressor-state cache using scheduler block IDs."""
+        active: list[tuple[list[int], Sequence[int]]] = list(
+            zip(per_request_block_ids, positions, strict=True)
+        )
+        if not active:
+            raise ValueError("block_ids must not be empty")
+        while len(active) < kernel_rows:
+            active.append(active[0])
+        mapping = torch.full(
+            (kernel_rows, max((len(pos) for _, pos in active), default=0)),
+            -1, dtype=torch.int64,
+        )
+        for row_idx, (block_ids, row_positions) in enumerate(active):
+            for col, position in enumerate(row_positions):
+                position = int(position)
+                block_idx = position // state_block_size
+                offset = position % state_block_size
+                if block_idx < len(block_ids):
+                    mapping[row_idx, col] = block_ids[block_idx] * state_block_size + offset
+        return mapping
+
     def block_table_for_kernel_rows(
         self,
         slots: Sequence[int],
@@ -428,6 +621,21 @@ class DeepSeekV4CacheManager:
             raise ValueError("slots must not be empty")
         active = self.block_table(slots, max_blocks=max_blocks)
         return self.replicate_first_row(active, actual_rows=len(slots), kernel_rows=kernel_rows)
+
+    def block_table_for_kernel_rows_from_ids(
+        self,
+        per_request_block_ids: Sequence[list[int]],
+        *,
+        max_blocks: int,
+        kernel_rows: int,
+    ) -> torch.Tensor:
+        """Build a fixed-row block table from scheduler block IDs."""
+        if not per_request_block_ids:
+            raise ValueError("block_ids must not be empty")
+        active = self.block_table_from_ids(per_request_block_ids, max_blocks=max_blocks)
+        return self.replicate_first_row(
+            active, actual_rows=len(per_request_block_ids), kernel_rows=kernel_rows
+        )
 
     def sliding_window_slot_mapping(
         self,
@@ -862,6 +1070,18 @@ class DeepSeekV4ModelRunner(ModelRunner):
             include_gate_bias=layer.include_gate_bias,
         )
 
+    def _has_group_block_ids(self, batch_group_ids: list[dict[str, list[int]]]) -> bool:
+        """Check if scheduler-provided group block IDs are available."""
+        return bool(batch_group_ids) and any(g for g in batch_group_ids)
+
+    def _get_group_ids(
+        self, batch_group_ids: list[dict[str, list[int]]], group_name: str, request_idx: int
+    ) -> list[int]:
+        """Extract block IDs for a specific group and request from batch group IDs."""
+        if request_idx < len(batch_group_ids) and batch_group_ids[request_idx]:
+            return batch_group_ids[request_idx].get(group_name, [])
+        return []
+
     def prepare_prefill_inputs(self, model: RuntimeModel, batch: PrefillBatch) -> DeepSeekV4PreparedPrefillInputs:
         """Build DeepSeekV4 prefill host inputs for the current scheduler chunk."""
         builder = self._require_input_builder()
@@ -886,6 +1106,107 @@ class DeepSeekV4ModelRunner(ModelRunner):
         token_ids = batch.token_ids[0, :actual_tokens].detach().cpu().to(torch.long)
         sparse_by_ratio = self._prefill_sparse_by_ratio(positions, actual_tokens)
 
+        use_group_ids = self._has_group_block_ids(batch.block_ids_by_group)
+
+        if use_group_ids:
+            ori_ids = [self._get_group_ids(batch.block_ids_by_group, "ori", 0)]
+            cmp_ids = [self._get_group_ids(batch.block_ids_by_group, "cmp", 0)]
+            idx_ids = [self._get_group_ids(batch.block_ids_by_group, "idx", 0)]
+            hca_state_ids = [self._get_group_ids(batch.block_ids_by_group, "hca_state", 0)]
+            csa_state_ids = [self._get_group_ids(batch.block_ids_by_group, "csa_state", 0)]
+            csa_inner_ids = [self._get_group_ids(batch.block_ids_by_group, "csa_inner_state", 0)]
+
+            ori_block_table = self.cache_manager.block_table_from_ids(
+                ori_ids, max_blocks=layout.ori_max_blocks
+            )[0]
+            ori_slot_mapping = self.cache_manager.sliding_window_slot_mapping_from_ids(
+                ori_ids, [positions], kernel_rows=layout.prefill_batch
+            )[0]
+            cmp_block_table = self.cache_manager.block_table_from_ids(
+                cmp_ids, max_blocks=layout.prefill_cmp_max_blocks
+            )[0]
+            idx_block_table = self.cache_manager.block_table_from_ids(
+                idx_ids, max_blocks=layout.prefill_idx_max_blocks
+            )[0]
+            hca_state_bt = self.cache_manager.block_table_from_ids(
+                hca_state_ids, max_blocks=layout.prefill_hca_state_max_blocks
+            )[0]
+            csa_state_bt = self.cache_manager.block_table_from_ids(
+                csa_state_ids, max_blocks=layout.prefill_csa_state_max_blocks
+            )[0]
+            csa_inner_bt = self.cache_manager.block_table_from_ids(
+                csa_inner_ids, max_blocks=layout.prefill_csa_inner_state_max_blocks
+            )[0]
+
+            hca_cmp_sm = self.cache_manager.compressed_slot_mapping_from_ids(
+                cmp_ids, [positions], compress_ratio=128, kernel_rows=layout.prefill_batch
+            )[0]
+            hca_state_sm = self.cache_manager.state_slot_mapping_from_ids(
+                hca_state_ids, [positions],
+                state_block_size=layout.c128_state_block_size, kernel_rows=layout.prefill_batch
+            )[0]
+            csa_cmp_sm = self.cache_manager.compressed_slot_mapping_from_ids(
+                cmp_ids, [positions], compress_ratio=4, kernel_rows=layout.prefill_batch
+            )[0]
+            csa_idx_sm = self.cache_manager.compressed_slot_mapping_from_ids(
+                idx_ids, [positions], compress_ratio=4, kernel_rows=layout.prefill_batch
+            )[0]
+            csa_state_sm = self.cache_manager.state_slot_mapping_from_ids(
+                csa_state_ids, [positions],
+                state_block_size=layout.c4_state_block_size, kernel_rows=layout.prefill_batch
+            )[0]
+            csa_inner_sm = self.cache_manager.state_slot_mapping_from_ids(
+                csa_inner_ids, [positions],
+                state_block_size=layout.c4_state_block_size, kernel_rows=layout.prefill_batch
+            )[0]
+        else:
+            ori_block_table = self.cache_manager.block_table(
+                [slot], max_blocks=layout.ori_max_blocks
+            )[0]
+            ori_slot_mapping = self.cache_manager.sliding_window_slot_mapping(
+                [slot], [positions], kernel_rows=layout.prefill_batch
+            )[0]
+            cmp_block_table = self.cache_manager.block_table(
+                [slot], max_blocks=layout.prefill_cmp_max_blocks
+            )[0]
+            idx_block_table = self.cache_manager.block_table(
+                [slot], max_blocks=layout.prefill_idx_max_blocks
+            )[0]
+            hca_state_bt = self.cache_manager.block_table(
+                [slot], max_blocks=layout.prefill_hca_state_max_blocks
+            )[0]
+            csa_state_bt = self.cache_manager.block_table(
+                [slot], max_blocks=layout.prefill_csa_state_max_blocks
+            )[0]
+            csa_inner_bt = self.cache_manager.block_table(
+                [slot], max_blocks=layout.prefill_csa_inner_state_max_blocks
+            )[0]
+
+            hca_cmp_sm = self.cache_manager.compressed_slot_mapping(
+                [slot], [positions], max_blocks=layout.prefill_cmp_max_blocks,
+                compress_ratio=128, kernel_rows=layout.prefill_batch
+            )[0]
+            hca_state_sm = self.cache_manager.state_slot_mapping(
+                [slot], [positions], max_blocks=layout.prefill_hca_state_max_blocks,
+                state_block_size=layout.c128_state_block_size, kernel_rows=layout.prefill_batch
+            )[0]
+            csa_cmp_sm = self.cache_manager.compressed_slot_mapping(
+                [slot], [positions], max_blocks=layout.prefill_cmp_max_blocks,
+                compress_ratio=4, kernel_rows=layout.prefill_batch
+            )[0]
+            csa_idx_sm = self.cache_manager.compressed_slot_mapping(
+                [slot], [positions], max_blocks=layout.prefill_idx_max_blocks,
+                compress_ratio=4, kernel_rows=layout.prefill_batch
+            )[0]
+            csa_state_sm = self.cache_manager.state_slot_mapping(
+                [slot], [positions], max_blocks=layout.prefill_csa_state_max_blocks,
+                state_block_size=layout.c4_state_block_size, kernel_rows=layout.prefill_batch
+            )[0]
+            csa_inner_sm = self.cache_manager.state_slot_mapping(
+                [slot], [positions], max_blocks=layout.prefill_csa_inner_state_max_blocks,
+                state_block_size=layout.c4_state_block_size, kernel_rows=layout.prefill_batch
+            )[0]
+
         return DeepSeekV4PreparedPrefillInputs(
             request_id=request_id,
             slot=slot,
@@ -893,105 +1214,32 @@ class DeepSeekV4ModelRunner(ModelRunner):
             x_hc=builder.prefill_x_hc(embeddings, actual_tokens=actual_tokens),
             input_ids=self._rank_stack(self._padded_vector(token_ids, layout.prefill_seq, dtype=torch.long)),
             position_ids=self._rank_stack(self._prefill_position_ids(positions, layout.prefill_seq)),
-            ori_block_table=self._rank_stack(
-                self.cache_manager.block_table([slot], max_blocks=layout.ori_max_blocks)[0]
-            ),
+            ori_block_table=self._rank_stack(ori_block_table),
             ori_slot_mapping=self._rank_stack(
-                self._pad_prefill_mapping(
-                    self.cache_manager.sliding_window_slot_mapping(
-                        [slot],
-                        [positions],
-                        kernel_rows=layout.prefill_batch,
-                    )[0],
-                    layout.prefill_seq,
-                )
+                self._pad_prefill_mapping(ori_slot_mapping, layout.prefill_seq)
             ),
-            cmp_block_table=self._rank_stack(
-                self.cache_manager.block_table([slot], max_blocks=layout.prefill_cmp_max_blocks)[0]
-            ),
-            idx_block_table=self._rank_stack(
-                self.cache_manager.block_table([slot], max_blocks=layout.prefill_idx_max_blocks)[0]
-            ),
-            hca_compress_state_block_table=self._rank_stack(
-                self.cache_manager.block_table([slot], max_blocks=layout.prefill_hca_state_max_blocks)[0]
-            ),
-            csa_compress_state_block_table=self._rank_stack(
-                self.cache_manager.block_table([slot], max_blocks=layout.prefill_csa_state_max_blocks)[0]
-            ),
-            csa_inner_compress_state_block_table=self._rank_stack(
-                self.cache_manager.block_table([slot], max_blocks=layout.prefill_csa_inner_state_max_blocks)[0]
-            ),
+            cmp_block_table=self._rank_stack(cmp_block_table),
+            idx_block_table=self._rank_stack(idx_block_table),
+            hca_compress_state_block_table=self._rank_stack(hca_state_bt),
+            csa_compress_state_block_table=self._rank_stack(csa_state_bt),
+            csa_inner_compress_state_block_table=self._rank_stack(csa_inner_bt),
             hca_cmp_slot_mapping=self._rank_stack(
-                self._pad_prefill_mapping(
-                    self.cache_manager.compressed_slot_mapping(
-                        [slot],
-                        [positions],
-                        max_blocks=layout.prefill_cmp_max_blocks,
-                        compress_ratio=128,
-                        kernel_rows=layout.prefill_batch,
-                    )[0],
-                    layout.prefill_seq,
-                )
+                self._pad_prefill_mapping(hca_cmp_sm, layout.prefill_seq)
             ),
             hca_state_slot_mapping=self._rank_stack(
-                self._pad_prefill_mapping(
-                    self.cache_manager.state_slot_mapping(
-                        [slot],
-                        [positions],
-                        max_blocks=layout.prefill_hca_state_max_blocks,
-                        state_block_size=layout.c128_state_block_size,
-                        kernel_rows=layout.prefill_batch,
-                    )[0],
-                    layout.prefill_seq,
-                )
+                self._pad_prefill_mapping(hca_state_sm, layout.prefill_seq)
             ),
             csa_cmp_slot_mapping=self._rank_stack(
-                self._pad_prefill_mapping(
-                    self.cache_manager.compressed_slot_mapping(
-                        [slot],
-                        [positions],
-                        max_blocks=layout.prefill_cmp_max_blocks,
-                        compress_ratio=4,
-                        kernel_rows=layout.prefill_batch,
-                    )[0],
-                    layout.prefill_seq,
-                )
+                self._pad_prefill_mapping(csa_cmp_sm, layout.prefill_seq)
             ),
             csa_idx_slot_mapping=self._rank_stack(
-                self._pad_prefill_mapping(
-                    self.cache_manager.compressed_slot_mapping(
-                        [slot],
-                        [positions],
-                        max_blocks=layout.prefill_idx_max_blocks,
-                        compress_ratio=4,
-                        kernel_rows=layout.prefill_batch,
-                    )[0],
-                    layout.prefill_seq,
-                )
+                self._pad_prefill_mapping(csa_idx_sm, layout.prefill_seq)
             ),
             csa_state_slot_mapping=self._rank_stack(
-                self._pad_prefill_mapping(
-                    self.cache_manager.state_slot_mapping(
-                        [slot],
-                        [positions],
-                        max_blocks=layout.prefill_csa_state_max_blocks,
-                        state_block_size=layout.c4_state_block_size,
-                        kernel_rows=layout.prefill_batch,
-                    )[0],
-                    layout.prefill_seq,
-                )
+                self._pad_prefill_mapping(csa_state_sm, layout.prefill_seq)
             ),
             csa_inner_state_slot_mapping=self._rank_stack(
-                self._pad_prefill_mapping(
-                    self.cache_manager.state_slot_mapping(
-                        [slot],
-                        [positions],
-                        max_blocks=layout.prefill_csa_inner_state_max_blocks,
-                        state_block_size=layout.c4_state_block_size,
-                        kernel_rows=layout.prefill_batch,
-                    )[0],
-                    layout.prefill_seq,
-                )
+                self._pad_prefill_mapping(csa_inner_sm, layout.prefill_seq)
             ),
             cmp_sparse_indices_by_ratio={
                 ratio: self._rank_stack(indices)
@@ -1026,74 +1274,157 @@ class DeepSeekV4ModelRunner(ModelRunner):
         x_hc = builder.decode_x_hc(batch.hidden_states.to(torch.bfloat16).cpu(), actual_batch=actual_batch)
         decode_slots = (*slots, *((slots[0],) * (layout.decode_batch - actual_batch)))
         decode_positions = (*positions, *((positions[0],) * (layout.decode_batch - actual_batch)))
-        ori_slot_mapping = self._mask_inactive_decode_slots(
-            self.cache_manager.sliding_window_slot_mapping(
-                slots,
-                positions,
-                kernel_rows=layout.decode_batch,
-            ),
-            actual_batch,
-        )
-        hca_cmp_slot_mapping = self._mask_inactive_decode_slots(
-            self.cache_manager.compressed_slot_mapping(
-                slots,
-                positions,
-                max_blocks=layout.cmp_max_blocks,
-                compress_ratio=128,
-                kernel_rows=layout.decode_batch,
-            ),
-            actual_batch,
-        )
-        hca_state_slot_mapping = self._mask_inactive_decode_slots(
-            self.cache_manager.state_slot_mapping(
-                slots,
-                positions,
-                max_blocks=layout.hca_state_max_blocks,
-                state_block_size=layout.c128_state_block_size,
-                kernel_rows=layout.decode_batch,
-            ),
-            actual_batch,
-        )
-        csa_cmp_slot_mapping = self._mask_inactive_decode_slots(
-            self.cache_manager.compressed_slot_mapping(
-                slots,
-                positions,
-                max_blocks=layout.cmp_max_blocks,
-                compress_ratio=4,
-                kernel_rows=layout.decode_batch,
-            ),
-            actual_batch,
-        )
-        csa_idx_slot_mapping = self._mask_inactive_decode_slots(
-            self.cache_manager.compressed_slot_mapping(
-                slots,
-                positions,
-                max_blocks=layout.idx_max_blocks,
-                compress_ratio=4,
-                kernel_rows=layout.decode_batch,
-            ),
-            actual_batch,
-        )
-        csa_state_slot_mapping = self._mask_inactive_decode_slots(
-            self.cache_manager.state_slot_mapping(
-                slots,
-                positions,
-                max_blocks=layout.csa_state_max_blocks,
-                state_block_size=layout.c4_state_block_size,
-                kernel_rows=layout.decode_batch,
-            ),
-            actual_batch,
-        )
-        csa_inner_state_slot_mapping = self._mask_inactive_decode_slots(
-            self.cache_manager.state_slot_mapping(
-                slots,
-                positions,
-                max_blocks=layout.csa_inner_state_max_blocks,
-                state_block_size=layout.c4_state_block_size,
-                kernel_rows=layout.decode_batch,
-            ),
-            actual_batch,
-        )
+
+        use_group_ids = self._has_group_block_ids(batch.block_ids_by_group)
+
+        if use_group_ids:
+            ori_ids = [self._get_group_ids(batch.block_ids_by_group, "ori", i) for i in range(actual_batch)]
+            cmp_ids = [self._get_group_ids(batch.block_ids_by_group, "cmp", i) for i in range(actual_batch)]
+            idx_ids = [self._get_group_ids(batch.block_ids_by_group, "idx", i) for i in range(actual_batch)]
+            hca_state_ids = [self._get_group_ids(batch.block_ids_by_group, "hca_state", i) for i in range(actual_batch)]
+            csa_state_ids = [self._get_group_ids(batch.block_ids_by_group, "csa_state", i) for i in range(actual_batch)]
+            csa_inner_ids = [self._get_group_ids(batch.block_ids_by_group, "csa_inner_state", i) for i in range(actual_batch)]
+
+            ori_slot_mapping = self._mask_inactive_decode_slots(
+                self.cache_manager.sliding_window_slot_mapping_from_ids(
+                    ori_ids, positions, kernel_rows=layout.decode_batch,
+                ), actual_batch,
+            )
+            hca_cmp_slot_mapping = self._mask_inactive_decode_slots(
+                self.cache_manager.compressed_slot_mapping_from_ids(
+                    cmp_ids, positions, compress_ratio=128, kernel_rows=layout.decode_batch,
+                ), actual_batch,
+            )
+            hca_state_slot_mapping = self._mask_inactive_decode_slots(
+                self.cache_manager.state_slot_mapping_from_ids(
+                    hca_state_ids, positions,
+                    state_block_size=layout.c128_state_block_size, kernel_rows=layout.decode_batch,
+                ), actual_batch,
+            )
+            csa_cmp_slot_mapping = self._mask_inactive_decode_slots(
+                self.cache_manager.compressed_slot_mapping_from_ids(
+                    cmp_ids, positions, compress_ratio=4, kernel_rows=layout.decode_batch,
+                ), actual_batch,
+            )
+            csa_idx_slot_mapping = self._mask_inactive_decode_slots(
+                self.cache_manager.compressed_slot_mapping_from_ids(
+                    idx_ids, positions, compress_ratio=4, kernel_rows=layout.decode_batch,
+                ), actual_batch,
+            )
+            csa_state_slot_mapping = self._mask_inactive_decode_slots(
+                self.cache_manager.state_slot_mapping_from_ids(
+                    csa_state_ids, positions,
+                    state_block_size=layout.c4_state_block_size, kernel_rows=layout.decode_batch,
+                ), actual_batch,
+            )
+            csa_inner_state_slot_mapping = self._mask_inactive_decode_slots(
+                self.cache_manager.state_slot_mapping_from_ids(
+                    csa_inner_ids, positions,
+                    state_block_size=layout.c4_state_block_size, kernel_rows=layout.decode_batch,
+                ), actual_batch,
+            )
+            block_table = self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows_from_ids(
+                    ori_ids, max_blocks=layout.ori_max_blocks, kernel_rows=layout.decode_batch,
+                )
+            )
+            cmp_block_table = self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows_from_ids(
+                    cmp_ids, max_blocks=layout.cmp_max_blocks, kernel_rows=layout.decode_batch,
+                )
+            )
+            idx_block_table = self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows_from_ids(
+                    idx_ids, max_blocks=layout.idx_max_blocks, kernel_rows=layout.decode_batch,
+                )
+            )
+            hca_state_block_table = self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows_from_ids(
+                    hca_state_ids, max_blocks=layout.hca_state_max_blocks, kernel_rows=layout.decode_batch,
+                )
+            )
+            csa_state_block_table = self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows_from_ids(
+                    csa_state_ids, max_blocks=layout.csa_state_max_blocks, kernel_rows=layout.decode_batch,
+                )
+            )
+            csa_inner_block_table = self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows_from_ids(
+                    csa_inner_ids, max_blocks=layout.csa_inner_state_max_blocks, kernel_rows=layout.decode_batch,
+                )
+            )
+        else:
+            ori_slot_mapping = self._mask_inactive_decode_slots(
+                self.cache_manager.sliding_window_slot_mapping(
+                    slots, positions, kernel_rows=layout.decode_batch,
+                ), actual_batch,
+            )
+            hca_cmp_slot_mapping = self._mask_inactive_decode_slots(
+                self.cache_manager.compressed_slot_mapping(
+                    slots, positions, max_blocks=layout.cmp_max_blocks,
+                    compress_ratio=128, kernel_rows=layout.decode_batch,
+                ), actual_batch,
+            )
+            hca_state_slot_mapping = self._mask_inactive_decode_slots(
+                self.cache_manager.state_slot_mapping(
+                    slots, positions, max_blocks=layout.hca_state_max_blocks,
+                    state_block_size=layout.c128_state_block_size, kernel_rows=layout.decode_batch,
+                ), actual_batch,
+            )
+            csa_cmp_slot_mapping = self._mask_inactive_decode_slots(
+                self.cache_manager.compressed_slot_mapping(
+                    slots, positions, max_blocks=layout.cmp_max_blocks,
+                    compress_ratio=4, kernel_rows=layout.decode_batch,
+                ), actual_batch,
+            )
+            csa_idx_slot_mapping = self._mask_inactive_decode_slots(
+                self.cache_manager.compressed_slot_mapping(
+                    slots, positions, max_blocks=layout.idx_max_blocks,
+                    compress_ratio=4, kernel_rows=layout.decode_batch,
+                ), actual_batch,
+            )
+            csa_state_slot_mapping = self._mask_inactive_decode_slots(
+                self.cache_manager.state_slot_mapping(
+                    slots, positions, max_blocks=layout.csa_state_max_blocks,
+                    state_block_size=layout.c4_state_block_size, kernel_rows=layout.decode_batch,
+                ), actual_batch,
+            )
+            csa_inner_state_slot_mapping = self._mask_inactive_decode_slots(
+                self.cache_manager.state_slot_mapping(
+                    slots, positions, max_blocks=layout.csa_inner_state_max_blocks,
+                    state_block_size=layout.c4_state_block_size, kernel_rows=layout.decode_batch,
+                ), actual_batch,
+            )
+            block_table = self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows(
+                    slots, max_blocks=layout.ori_max_blocks, kernel_rows=layout.decode_batch,
+                )
+            )
+            cmp_block_table = self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows(
+                    slots, max_blocks=layout.cmp_max_blocks, kernel_rows=layout.decode_batch,
+                )
+            )
+            idx_block_table = self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows(
+                    slots, max_blocks=layout.idx_max_blocks, kernel_rows=layout.decode_batch,
+                )
+            )
+            hca_state_block_table = self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows(
+                    slots, max_blocks=layout.hca_state_max_blocks, kernel_rows=layout.decode_batch,
+                )
+            )
+            csa_state_block_table = self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows(
+                    slots, max_blocks=layout.csa_state_max_blocks, kernel_rows=layout.decode_batch,
+                )
+            )
+            csa_inner_block_table = self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows(
+                    slots, max_blocks=layout.csa_inner_state_max_blocks, kernel_rows=layout.decode_batch,
+                )
+            )
 
         return DeepSeekV4PreparedDecodeInputs(
             request_ids=tuple(batch.request_ids),
@@ -1103,49 +1434,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
             input_ids=self._rank_stack(token_ids),
             position_ids=self._rank_stack(torch.tensor(decode_positions, dtype=torch.int32).reshape(-1)),
             kv_seq_lens=self._rank_stack(self._decode_kv_seq_lens(batch.seq_lens, actual_batch)),
-            block_table=self._rank_stack(
-                self.cache_manager.block_table_for_kernel_rows(
-                    slots,
-                    max_blocks=layout.ori_max_blocks,
-                    kernel_rows=layout.decode_batch,
-                )
-            ),
+            block_table=block_table,
             ori_slot_mapping=self._rank_stack(ori_slot_mapping.reshape(-1)),
-            cmp_block_table=self._rank_stack(
-                self.cache_manager.block_table_for_kernel_rows(
-                    slots,
-                    max_blocks=layout.cmp_max_blocks,
-                    kernel_rows=layout.decode_batch,
-                )
-            ),
-            idx_block_table=self._rank_stack(
-                self.cache_manager.block_table_for_kernel_rows(
-                    slots,
-                    max_blocks=layout.idx_max_blocks,
-                    kernel_rows=layout.decode_batch,
-                )
-            ),
-            hca_compress_state_block_table=self._rank_stack(
-                self.cache_manager.block_table_for_kernel_rows(
-                    slots,
-                    max_blocks=layout.hca_state_max_blocks,
-                    kernel_rows=layout.decode_batch,
-                )
-            ),
-            csa_compress_state_block_table=self._rank_stack(
-                self.cache_manager.block_table_for_kernel_rows(
-                    slots,
-                    max_blocks=layout.csa_state_max_blocks,
-                    kernel_rows=layout.decode_batch,
-                )
-            ),
-            csa_inner_compress_state_block_table=self._rank_stack(
-                self.cache_manager.block_table_for_kernel_rows(
-                    slots,
-                    max_blocks=layout.csa_inner_state_max_blocks,
-                    kernel_rows=layout.decode_batch,
-                )
-            ),
+            cmp_block_table=cmp_block_table,
+            idx_block_table=idx_block_table,
+            hca_compress_state_block_table=hca_state_block_table,
+            csa_compress_state_block_table=csa_state_block_table,
+            csa_inner_compress_state_block_table=csa_inner_block_table,
             hca_cmp_slot_mapping=self._rank_stack(hca_cmp_slot_mapping.reshape(-1)),
             hca_state_slot_mapping=self._rank_stack(hca_state_slot_mapping.reshape(-1)),
             csa_cmp_slot_mapping=self._rank_stack(csa_cmp_slot_mapping.reshape(-1)),

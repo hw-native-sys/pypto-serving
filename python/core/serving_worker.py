@@ -224,6 +224,7 @@ class WorkerProcess:
                     list(positions_list[i]), dtype=torch.long, device=device
                 )
 
+            group_block_ids_list = [sr.block_ids_by_group for sr in scheduled]
             prefill_result = self.executor.run_prefill(
                 runtime_model,
                 PrefillBatch(
@@ -233,6 +234,7 @@ class WorkerProcess:
                     seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
                     positions=positions_tensor,
                     block_ids=block_ids_list,
+                    block_ids_by_group=group_block_ids_list,
                 ),
             )
 
@@ -284,6 +286,7 @@ class WorkerProcess:
             decode_token_tensor = torch.tensor(decode_tokens, dtype=torch.long, device=device)
             decode_embeddings = self.executor.lookup_embeddings(runtime_model, decode_token_tensor)
 
+            group_block_ids_list = [sr.block_ids_by_group for sr in scheduled]
             decode_result = self.executor.run_decode(
                 runtime_model,
                 DecodeBatch(
@@ -292,6 +295,7 @@ class WorkerProcess:
                     hidden_states=decode_embeddings,
                     seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
                     block_ids=block_ids_list,
+                    block_ids_by_group=group_block_ids_list,
                 ),
             )
 
