@@ -14,7 +14,7 @@ import logging
 import time
 import uuid
 
-from .async_engine import AsyncLLMEngine
+from .async_engine import AsyncLLMEngineClient, DPEngineCore
 from python.profile import profile_instant, profile_span
 from .types import GenerateConfig
 
@@ -91,7 +91,7 @@ class ChatCompletionResponse(BaseModel):
 # --- Server ---
 
 class ServingServer:
-    def __init__(self, async_engine: AsyncLLMEngine, model_id: str) -> None:
+    def __init__(self, async_engine: AsyncLLMEngineClient | DPEngineCore, model_id: str) -> None:
         self.engine = async_engine
         self.model_id = model_id
         self.app = FastAPI(title="PyPTO Serving")
@@ -275,6 +275,6 @@ class ServingServer:
         return mapping.get(reason, "stop")
 
 
-def create_serving_app(async_engine: AsyncLLMEngine, model_id: str) -> FastAPI:
+def create_serving_app(async_engine: AsyncLLMEngineClient | DPEngineCore, model_id: str) -> FastAPI:
     server = ServingServer(async_engine, model_id)
     return server.app

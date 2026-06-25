@@ -64,6 +64,7 @@ class Request:
     cached_block_ids: list[int] = field(default_factory=list)
     allocated_block_ids: list[int] = field(default_factory=list)
     block_hashes: list[int] = field(default_factory=list)
+    allocated_group_block_ids: dict[str, list[int]] = field(default_factory=dict)
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -93,6 +94,7 @@ class ScheduledRequest:
     is_prefill: bool
     num_computed_tokens: int = 0
     block_ids: list[int] = field(default_factory=list)
+    block_ids_by_group: dict[str, list[int]] = field(default_factory=dict)
     resumed_from_preemption: bool = False
 
 
@@ -195,6 +197,7 @@ class Scheduler:
 
             is_prefill = request.is_prefill
             all_block_ids = request.cached_block_ids + request.allocated_block_ids
+            self._try_allocate_group_blocks(request, request.num_computed_tokens + num_new)
             output.scheduled_requests.append(
                 ScheduledRequest(
                     request=request,
@@ -202,6 +205,7 @@ class Scheduler:
                     is_prefill=is_prefill,
                     num_computed_tokens=request.num_computed_tokens,
                     block_ids=list(all_block_ids),
+                    block_ids_by_group=dict(request.allocated_group_block_ids),
                 )
             )
             scheduled_req_ids.add(request.request_id)
@@ -252,6 +256,7 @@ class Scheduler:
             request.status = RequestStatus.RUNNING
             self.running.append(request)
             all_block_ids = request.cached_block_ids + request.allocated_block_ids
+            self._try_allocate_group_blocks(request, request.num_computed_tokens + num_new)
             output.scheduled_requests.append(
                 ScheduledRequest(
                     request=request,
@@ -259,6 +264,7 @@ class Scheduler:
                     is_prefill=True,
                     num_computed_tokens=request.num_computed_tokens,
                     block_ids=list(all_block_ids),
+                    block_ids_by_group=dict(request.allocated_group_block_ids),
                 )
             )
             output.num_prefill_tokens += num_new
@@ -386,6 +392,7 @@ class Scheduler:
         victim.num_computed_tokens = 0
         victim.cached_block_ids = []
         victim.allocated_block_ids = []
+        victim.allocated_group_block_ids = {}
         self.running = [r for r in self.running if r.request_id != victim.request_id]
         self.waiting.appendleft(victim)
         return {"request": victim, "returned_tokens": returned_tokens}
@@ -397,6 +404,22 @@ class Scheduler:
         )
         request.cached_block_ids = []
         request.allocated_block_ids = []
+        if request.allocated_group_block_ids:
+            self.kv_cache_manager.release_all_group_requests(request.request_id)
+            request.allocated_group_block_ids = {}
+
+    def _try_allocate_group_blocks(self, request: Request, total_tokens: int) -> None:
+        """Allocate multi-group blocks if groups are configured."""
+        if not self.kv_cache_manager.has_groups:
+            return
+        if request.allocated_group_block_ids:
+            return
+        try:
+            request.allocated_group_block_ids = self.kv_cache_manager.allocate_for_groups(
+                request.request_id, total_tokens
+            )
+        except RuntimeError:
+            request.allocated_group_block_ids = {}
 
     def _cache_completed_blocks(self, request: Request) -> None:
         """Register completed blocks in the prefix cache."""

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import sys
 from collections.abc import Iterator, Sequence
@@ -23,6 +24,8 @@ if TYPE_CHECKING:
 from python.profile import get_profiler, merge_profile
 
 RuntimeConfig = None
+ParallelConfig = None
+parse_device_ids = None
 
 
 _VALID_BACKENDS = {"npu"}
@@ -42,6 +45,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend", default="npu", choices=sorted(_VALID_BACKENDS), help="Inference backend (default: npu).")
     parser.add_argument("--platform", default="a2a3", help="NPU platform (default: a2a3).")
     parser.add_argument("--device", type=int, default=0, help="NPU device ID (default: 0).")
+    parser.add_argument(
+        "--devices",
+        default=None,
+        help="Comma-separated NPU device ids for DP x TP placement, for example 0,1,2,3.",
+    )
+    parser.add_argument("--dp", "--data-parallel-size", dest="data_parallel_size", type=int, default=1, help="Data-parallel replica count.")
+    parser.add_argument("--tp", "--tensor-parallel-size", dest="tensor_parallel_size", type=int, default=1, help="Tensor-parallel group size.")
+    parser.add_argument("--pp", "--pipeline-parallel-size", dest="pipeline_parallel_size", type=int, default=1, help="Pipeline parallel size.")
+    parser.add_argument(
+        "--ep",
+        "--enable-expert-parallel",
+        dest="enable_expert_parallel",
+        action="store_true",
+        help="Enable expert parallelism. Not supported yet; accepted for config compatibility.",
+    )
+    parser.add_argument("--expert-placement-strategy", default="linear", help="Expert placement policy placeholder.")
+    parser.add_argument("--all2all-backend", default="none", help="Expert-parallel all2all backend placeholder.")
+    parser.add_argument(
+        "--data-parallel-routing",
+        default="least_pending_tokens",
+        choices=["least_pending_tokens"],
+        help="Data-parallel request routing policy.",
+    )
     # Dtype
     parser.add_argument("--dtype", default="float32", help="Weight data type (default: float32).")
     parser.add_argument("--kv-cache-dtype", default="bfloat16", help="KV cache data type. 'auto' follows --dtype (default: bfloat16).")
@@ -100,19 +126,42 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
 
     model_dir = str(Path(args.model).resolve())
     executor_kwargs = _build_executor_kwargs()
+    devices = parse_device_ids(args.devices, default_device=args.device)
+    model_family = _detect_model_family(Path(model_dir))
+    if model_family == "deepseek_v4":
+        executor_kwargs["compile_kernels"] = True
+    parallel_config = ParallelConfig(
+        data_parallel_size=args.data_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+        pipeline_parallel_size=args.pipeline_parallel_size,
+        enable_expert_parallel=args.enable_expert_parallel,
+        expert_placement_strategy=args.expert_placement_strategy,
+        all2all_backend=args.all2all_backend,
+        devices=devices,
+        data_parallel_routing=args.data_parallel_routing,
+    )
+    _validate_model_topology(model_family, args, parallel_config)
+    device_groups = parallel_config.replica_device_groups
+    first_group = device_groups[0]
+    worker_device_ids = first_group if parallel_config.data_parallel_size == 1 else devices
+    enable_prefix_cache = args.enable_prefix_caching
+    if model_family == "deepseek_v4":
+        enable_prefix_cache = False
 
     return EngineConfig(
         model_id=args.served_model_name or Path(args.model).name,
         model_dir=model_dir,
         platform=args.platform,
-        device_id=args.device,
-        executor_cls="PyptoQwen14BExecutor",
+        device_id=first_group[0],
+        device_ids=worker_device_ids,
+        parallel_config=parallel_config,
+        executor_cls=_executor_cls_for_model_family(model_family),
         executor_kwargs=executor_kwargs,
         runtime_config=_build_runtime_config(args),
         max_num_running_reqs=args.max_num_seqs,
         max_num_scheduled_tokens=args.max_num_batched_tokens,
         long_prefill_token_threshold=args.long_prefill_token_threshold,
-        enable_prefix_cache=args.enable_prefix_caching,
+        enable_prefix_cache=enable_prefix_cache,
         enable_chunk_prefill=args.enable_chunked_prefill,
     )
 
@@ -144,6 +193,60 @@ def _build_executor_kwargs() -> dict[str, object]:
     return executor_kwargs
 
 
+def _detect_model_family(model_dir: Path) -> str:
+    """Return the serving model family inferred from config.json."""
+    config_path = model_dir / "config.json"
+    if not config_path.exists():
+        return "qwen"
+    try:
+        config_data = json.loads(config_path.read_text())
+    except json.JSONDecodeError:
+        return "qwen"
+    model_type = str(config_data.get("model_type", "")).lower()
+    architectures = {str(item).lower() for item in config_data.get("architectures", [])}
+    if model_type == "deepseek_v4" or "deepseekv4forcausallm" in architectures:
+        return "deepseek_v4"
+    return "qwen"
+
+
+def _executor_cls_for_model_family(model_family: str) -> str:
+    """Map model family metadata to the worker executor class id."""
+    if model_family == "deepseek_v4":
+        return "PyptoDeepSeekV4Executor"
+    return "PyptoQwen14BExecutor"
+
+
+def _validate_model_topology(
+    model_family: str,
+    args: argparse.Namespace,
+    parallel_config,
+) -> None:
+    """Validate model-specific serving topology constraints."""
+    if model_family != "deepseek_v4":
+        return
+    config_data = json.loads((Path(args.model).resolve() / "config.json").read_text())
+    quantization = config_data.get("quantization_config", {})
+    if quantization.get("quant_method") != "compressed-tensors":
+        raise ValueError(
+            "DeepSeekV4 serving requires the quantized W8A8 compressed-tensors checkpoint "
+            "such as /data/models/dsv4-flash-w8a8; the original checkpoint is too large for 8 NPUs."
+        )
+    if parallel_config.data_parallel_size != 1 or parallel_config.tensor_parallel_size != 8:
+        raise ValueError("DeepSeekV4 serving requires --dp 1 --tp 8")
+    if len(parallel_config.devices) != 8:
+        raise ValueError("DeepSeekV4 serving requires exactly 8 NPU device ids")
+    if args.block_size != 128:
+        raise ValueError("DeepSeekV4 kernels require --block-size 128")
+    if args.max_num_seqs > 64:
+        raise ValueError("DeepSeekV4 decode kernels support at most --max-num-seqs 64")
+    if args.max_model_len > 260:
+        raise ValueError(
+            "DeepSeekV4 pypto-lib decode CSA state tables currently support at most "
+            "--max-model-len 260. Increase the decode CSA state table depth in pypto-lib "
+            "before serving longer contexts."
+        )
+
+
 def run_serve(
     config: EngineConfig,
     *,
@@ -155,15 +258,18 @@ def run_serve(
     except ImportError as e:
         raise ImportError("Serving mode requires uvicorn. Install with: pip install uvicorn") from e
 
-    from ..core.async_engine import AsyncLLMEngine
-    from ..core.server import create_serving_app
-    from ..core.tokenizer import TransformersTokenizerAdapter
+    from python.core.async_engine import AsyncLLMEngineClient, DPEngineCore
+    from python.core.server import create_serving_app
+    from python.core.tokenizer import TransformersTokenizerAdapter
 
     model_id = config.model_id
     get_profiler(process_name="pypto-serving-api")
     tokenizer = TransformersTokenizerAdapter.from_pretrained(config.model_dir)
+    engine_cls = DPEngineCore
+    if config.parallel_config is not None and config.parallel_config.data_parallel_size > 1:
+        engine_cls = AsyncLLMEngineClient
 
-    async_engine = AsyncLLMEngine(
+    async_engine = engine_cls(
         config=config,
         tokenizer=tokenizer,
         eos_token_id=tokenizer.eos_token_id,
@@ -183,7 +289,7 @@ def run_serve(
 
     print(f"Starting PyPTO serving on {host}:{port}")
     print(f"  Model: {model_id} (loaded in worker process)")
-    print(f"  Platform: {config.platform}, Device: {config.device_id}")
+    print(f"  Platform: {config.platform}, Device groups: {_format_device_groups(config)}")
     print(f"  Max running requests: {config.max_num_running_reqs}")
     print(f"  Max scheduled tokens/iter: {config.max_num_scheduled_tokens}")
     print(f"  Chunked prefill threshold: {config.long_prefill_token_threshold}")
@@ -192,6 +298,13 @@ def run_serve(
     print("  Endpoints: /v1/completions, /v1/chat/completions, /v1/models, /health")
 
     uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+def _format_device_groups(config: EngineConfig) -> str:
+    parallel_config = config.parallel_config
+    if parallel_config is None:
+        return str(list(config.worker_device_ids()))
+    return str([list(group) for group in parallel_config.replica_device_groups])
 
 
 def _validate_backend(backend: str) -> None:
@@ -215,7 +328,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _ensure_core_imports() -> None:
-    global RuntimeConfig
+    global ParallelConfig, RuntimeConfig, parse_device_ids
 
     if RuntimeConfig is None:
         try:
@@ -224,6 +337,16 @@ def _ensure_core_imports() -> None:
             from python.core import RuntimeConfig as imported_runtime_config
 
         RuntimeConfig = imported_runtime_config
+    if ParallelConfig is None or parse_device_ids is None:
+        try:
+            from ..core.parallel import ParallelConfig as imported_parallel_config
+            from ..core.parallel import parse_device_ids as imported_parse_device_ids
+        except ImportError:
+            from python.core.parallel import ParallelConfig as imported_parallel_config
+            from python.core.parallel import parse_device_ids as imported_parse_device_ids
+
+        ParallelConfig = imported_parallel_config
+        parse_device_ids = imported_parse_device_ids
 
 
 @contextlib.contextmanager

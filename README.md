@@ -80,37 +80,42 @@ task-submit --device auto --max-time 0 --run \
 ## HTTP Serving (OpenAI-compatible API)
 
 Start the serving server with a multiprocess worker. When launching through
-`task-submit`, keep `--device {}` so the selected NPU ID is substituted into the
-server command:
+`task-submit`, use single quotes around the `--run` payload so `$TASK_DEVICE`
+expands inside the task:
 
 ```bash
-task-submit --device auto --run \
-  "python -m python.cli.main \
-    --model /path/to/Qwen3-14B \
+task-submit --device auto --max-time 1200 --run \
+  'export PTO2_RING_HEAP=4294967296 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_DEP_POOL=131072; \
+  python python/cli/main.py \
+    --model /data/linyifan/models/Qwen3-14B \
     --backend npu \
     --platform a2a3 \
-    --device {} \
-    --port 8899"
+    --device "$TASK_DEVICE" \
+    --dp 1 \
+    --tp 1 \
+    --max-model-len 512 \
+    --max-new-tokens 16 \
+    --port 19340'
 ```
 
 Send a generation request after the server logs `Application startup complete`:
 
 ```bash
 # Health check
-curl --noproxy "*" http://127.0.0.1:8899/health
+curl --noproxy "*" http://127.0.0.1:19340/health
 
 # Completion
-curl --noproxy "*" http://127.0.0.1:8899/v1/completions \
+curl --noproxy "*" http://127.0.0.1:19340/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Huawei is", "max_tokens": 32, "temperature": 0.0}'
 
 # Streaming
-curl --noproxy "*" http://127.0.0.1:8899/v1/completions \
+curl --noproxy "*" http://127.0.0.1:19340/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Huawei is", "max_tokens": 32, "stream": true}'
 
 # Chat completion
-curl --noproxy "*" http://127.0.0.1:8899/v1/chat/completions \
+curl --noproxy "*" http://127.0.0.1:19340/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages": [{"role": "user", "content": "What is 1+1?"}], "max_tokens": 32}'
 ```
@@ -118,31 +123,83 @@ curl --noproxy "*" http://127.0.0.1:8899/v1/chat/completions \
 Run the serving benchmark:
 
 ```bash
-python tests/bench_serving.py --port 8899 --stream -n 8 -c 4 --max-tokens 16
+python tests/bench_serving.py --port 19340 --stream -n 8 -c 4 --max-tokens 16
 ```
 
+### Parallel Strategy V1
+
+Serving supports a v1 `DP x TP` device topology. Data parallelism creates one
+independent serving engine per replica, and tensor parallelism passes one device
+group to the PyPTO L3 distributed worker for that replica. Single-device serving
+remains the default. Pipeline parallelism and expert parallelism are accepted in
+the config surface but rejected until the model kernels support them.
+
+For example, run two data-parallel replicas on the two devices selected by
+`task-submit`:
+
+```bash
+task-submit --device auto --device-num 2 --max-time 1800 --run \
+  'export PTO2_RING_HEAP=4294967296 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_DEP_POOL=131072; \
+  python python/cli/main.py \
+    --model /data/linyifan/models/Qwen3-14B \
+    --backend npu \
+    --platform a2a3 \
+    --devices "$TASK_DEVICE" \
+    --dp 2 \
+    --tp 1 \
+    --max-model-len 512 \
+    --max-new-tokens 16 \
+    --port 19339'
+```
+
+Send a completion request to the DP=2 server:
+
+```bash
+curl --noproxy "*" http://127.0.0.1:19339/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Huawei is","max_tokens":16,"temperature":0.0}'
+```
+
+Offline `npu_generate.py` supports `--devices` and `--tp` for one logical TP
+replica. It intentionally rejects `--dp > 1`; launch separate offline jobs if
+data-parallel offline generation is needed.
+
 Single-request HTTP serving does not require the larger PTO2 ring settings. For
-concurrent NPU serving, start the server with the larger PTO2 ring settings:
+concurrent NPU serving, use topology-specific ring settings.
+
+Single-replica concurrent serving uses the larger task window and dependency
+pool:
 
 ```bash
 task-submit --device auto --run \
-  "PTO2_RING_HEAP=4294967296 PTO2_RING_TASK_WINDOW=1048576 PTO2_RING_DEP_POOL=1048576 \
-  python -m python.cli.main \
+  'export PTO2_RING_HEAP=4294967296 PTO2_RING_TASK_WINDOW=1048576 PTO2_RING_DEP_POOL=1048576; \
+  python python/cli/main.py \
     --model /path/to/Qwen3-14B \
     --backend npu \
     --platform a2a3 \
-    --device {} \
-    --port 8899"
+    --device "$TASK_DEVICE" \
+    --port 8899'
+```
+
+DP=2+ concurrent serving should keep the smaller task window and dependency
+pool used by the DP=2 command above:
+
+```bash
+PTO2_RING_HEAP=4294967296 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_DEP_POOL=131072
 ```
 
 Without these settings, multi-request serving may return HTTP 200 while
 generating no tokens and logging worker runtime failures such as `rtMalloc
 failed: 207001`, `507018`, or `507046`.
 
+For DP=2+, setting `PTO2_RING_TASK_WINDOW` and `PTO2_RING_DEP_POOL` to `1048576`
+with a 4 GiB heap can reserve about 19 GiB of runtime arena per replica and fail
+with `rtMalloc failed: 207001`.
+
 ## Notes
 
 - All model/device/runtime options are passed via CLI arguments. Run
-  `python -m python.cli.main --help` for the full list.
+  `python python/cli/main.py --help` for the full list.
 - Generated kernel artifacts are written under `build_output/` and are ignored
   by git.
 - This repository expects PyPTO, CANN, torch, safetensors, transformers, and the

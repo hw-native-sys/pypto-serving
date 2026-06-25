@@ -52,6 +52,29 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class KVCacheSpec:
+    """Describes one KV cache family's shape and memory budget per block."""
+
+    block_size: int
+    page_size_bytes: int
+    compress_ratio: int = 1
+
+    @property
+    def storage_block_size(self) -> int:
+        return self.block_size // self.compress_ratio
+
+
+@dataclass(frozen=True)
+class KVCacheGroupSpec:
+    """Maps a named cache group to a KVCacheSpec and the layers that use it."""
+
+    name: str
+    layer_indices: tuple[int, ...]
+    spec: KVCacheSpec
+    max_blocks_per_seq: int
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     """Runtime limits and device placement for one loaded model."""
 
@@ -64,6 +87,7 @@ class RuntimeConfig:
     total_kv_pages: int | None = None
     # Compile-time generation limit used by model-specific runners.
     max_new_tokens: int = 256
+    kv_cache_groups: tuple[KVCacheGroupSpec, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -105,6 +129,7 @@ class RuntimeModel:
     final_norm_weight: torch.Tensor
     lm_head: torch.Tensor
     layers: list[LayerWeights]
+    extra: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -181,6 +206,7 @@ class PrefillBatch:
     kv_allocations: list[KvAllocation] = field(default_factory=list)
     positions: torch.Tensor | None = None
     block_ids: list[list[int]] = field(default_factory=list)
+    block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
 
 
 @dataclass
@@ -201,6 +227,7 @@ class DecodeBatch:
     seq_lens: torch.Tensor
     kv_allocations: list[KvAllocation] = field(default_factory=list)
     block_ids: list[list[int]] = field(default_factory=list)
+    block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
 
 
 @dataclass
