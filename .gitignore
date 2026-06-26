@@ -27,3 +27,6 @@ profile_out/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Personal Claude Code guidance
+CLAUDE.local.md

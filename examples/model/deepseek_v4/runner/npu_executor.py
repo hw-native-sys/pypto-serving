@@ -34,9 +34,12 @@ from examples.model.deepseek_v4.runner.npu_runner import (
     DeepSeekV4CompiledKernels,
     DeepSeekV4L3Callable,
     DeepSeekV4ModelRunner,
-    _DECODE_TENSOR_ORDER,
-    _PREFILL_TENSOR_ORDER,
+    _DECODE_FWD_TENSOR_ORDER,
+    _PREFILL_FWD_TENSOR_ORDER,
     build_deepseek_v4_layer_plan,
+    DEEPSEEK_V4_CSA_NUM_LAYERS,
+    DEEPSEEK_V4_FWD_NUM_LAYERS,
+    DEEPSEEK_V4_HCA_NUM_LAYERS,
 )
 from examples.model.deepseek_v4.runner.weight_loader import deepseek_v4_lm_head_layout
 from examples.model.deepseek_v4.runner.weight_loader import DeepSeekV4WeightStore
@@ -52,6 +55,34 @@ _AST_INT_OPERATORS = {
     ast.Mult: operator.mul,
     ast.FloorDiv: operator.floordiv,
 }
+# CSA-group (x21) and HCA-group (x20) layer-stacked weight names emitted by the
+# per-layer common dummy builder. Everything else there is a FWD weight (x43).
+# Shared single-copy inputs (freqs/input_ids) are handled explicitly, not stacked.
+_DECODE_FWD_CSA_STACKED_NAMES = frozenset(
+    {
+        "csa_cmp_wkv",
+        "csa_cmp_wgate",
+        "csa_cmp_ape",
+        "csa_cmp_norm_w",
+        "csa_idx_wq_b",
+        "csa_idx_wq_b_scale",
+        "csa_weights_proj",
+        "csa_hadamard_idx",
+        "csa_inner_wkv",
+        "csa_inner_wgate",
+        "csa_inner_ape",
+        "csa_inner_norm_w",
+    }
+)
+_DECODE_FWD_HCA_STACKED_NAMES = frozenset(
+    {
+        "hca_cmp_wkv",
+        "hca_cmp_wgate",
+        "hca_cmp_ape",
+        "hca_cmp_norm_w",
+    }
+)
+_DECODE_FWD_SHARED_COMMON_NAMES = frozenset({"freqs_cos", "freqs_sin", "input_ids"})
 _DEEPSEEK_V4_IMPORT_MODULES = (
     "config",
     "moe",
@@ -59,6 +90,7 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
     "decode_attention_csa",
     "decode_attention_hca",
     "decode_attention_swa",
+    "decode_fwd",
     "decode_indexer",
     "decode_indexer_compressor",
     "decode_layer",
@@ -78,6 +110,7 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
     "prefill_attention_swa",
     "prefill_indexer_compressor",
     "prefill_layer",
+    "prefill_fwd",
     "prefill_sparse_attn",
     "qkv_proj_rope",
     "rmsnorm",
@@ -172,7 +205,14 @@ def _is_deepseek_v4_module_file(path: Path, kernel_dir: Path) -> bool:
 
 
 @contextlib.contextmanager
-def _deepseek_v4_import_context(kernel_dir: Path, *, pypto_root: Path, ep: int, moe_shape: str | None = None):
+def _deepseek_v4_import_context(
+    kernel_dir: Path,
+    *,
+    pypto_root: Path,
+    ep: int,
+    moe_shape: str | None = None,
+    num_layers: int | None = None,
+):
     """Temporarily import DeepSeekV4 pypto-lib modules with a fixed EP argv."""
     old_argv = list(sys.argv)
     old_path = list(sys.path)
@@ -184,6 +224,10 @@ def _deepseek_v4_import_context(kernel_dir: Path, *, pypto_root: Path, ep: int, 
     sys.argv = ["pypto-serving-deepseek-v4", "--ep", str(int(ep))]
     if moe_shape is not None:
         sys.argv.extend(["--moe-shape", moe_shape])
+    if num_layers is not None:
+        # prefill_fwd freezes its layer-stack span from ``--num-layers`` at import;
+        # serving always packs the full 43-layer forward.
+        sys.argv.extend(["--num-layers", str(int(num_layers))])
     sys.path.insert(0, str(kernel_dir))
     sys.path.insert(0, str(pypto_root))
     try:
@@ -309,12 +353,12 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             modules = self._load_kernel_modules()
             prefill = self._compile_l3_callable(
                 "deepseek_v4_prefill",
-                modules["prefill_layer"].l3_prefill_layer,
+                modules["prefill_fwd"].l3_prefill_fwd,
                 self._prefill_dummy_args(model, layout, modules["config"]),
             )
             decode = self._compile_l3_callable(
                 "deepseek_v4_decode",
-                modules["decode_layer"].l3_decode_layer,
+                modules["decode_fwd"].l3_decode_fwd,
                 self._decode_dummy_args(model, layout, modules["config"]),
             )
             lm_head = self._compile_l3_callable(
@@ -347,14 +391,23 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         """Import DeepSeekV4 pypto-lib modules with EP fixed to the serving world size."""
         pypto_root = self._kernel_dir.parents[2]
         ranks = DeepSeekV4CacheLayout().ranks
-        with _deepseek_v4_import_context(self._kernel_dir, pypto_root=pypto_root, ep=ranks, moe_shape="prefill"):
-            prefill = importlib.import_module("prefill_layer")
+        fwd_layers = DEEPSEEK_V4_FWD_NUM_LAYERS
+        with _deepseek_v4_import_context(
+            self._kernel_dir,
+            pypto_root=pypto_root,
+            ep=ranks,
+            moe_shape="prefill",
+            num_layers=fwd_layers,
+        ):
+            prefill_layer = importlib.import_module("prefill_layer")
+            prefill_fwd = importlib.import_module("prefill_fwd")
         with _deepseek_v4_import_context(self._kernel_dir, pypto_root=pypto_root, ep=ranks, moe_shape="decode"):
             modules = {
                 name: importlib.import_module(name)
-                for name in ("config", "decode_layer", "lm_head", "rope_tables")
+                for name in ("config", "decode_layer", "decode_fwd", "lm_head", "rope_tables")
             }
-        modules["prefill_layer"] = prefill
+        modules["prefill_layer"] = prefill_layer
+        modules["prefill_fwd"] = prefill_fwd
         return modules
 
     def _compile_l3_callable(self, name: str, jit_fn: object, dummy_args: Sequence[Any]) -> DeepSeekV4L3Callable:
@@ -394,25 +447,60 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         layout: DeepSeekV4CacheLayout,
         config_module: object,
     ) -> tuple[Any, ...]:
-        """Return explicit serving dummy args for ``l3_prefill_layer``."""
+        """Return explicit serving dummy args for the packed ``l3_prefill_fwd``.
+
+        Like the packed decode_fwd kernel, every weight is layer-stacked on dim 1:
+        FWD weights stack across all 43 hidden layers, CSA-group weights across the
+        21 compress_ratio==4 layers, HCA-group weights across the 20
+        compress_ratio==128 layers. Prefill additionally packs the per-layer
+        forward metadata (slot mappings, block tables, sparse tables, position ids,
+        input ids) and the prefill compressor-state / work caches on the layer axis,
+        and -- unlike decode -- carries the RoPE tables per-layer (x43). The single
+        trailing ``num_tokens`` scalar replaces the per-layer ``layer_id`` scalars.
+        """
         cfg = config_module.FLASH
-        values = self._layer_common_dummy_tensors(
+        single = self._layer_common_dummy_tensors(
             model,
             layout,
             cfg,
             tokens=layout.prefill_seq,
             include_decode_indexer=True,
-            include_prefill_temporaries=True,
+            include_prefill_temporaries=False,
         )
         ranks = layout.ranks
+        seq = layout.prefill_seq
         hidden = model.config.hidden_size
+        head_dim = model.config.head_dim
+
+        fwd = DEEPSEEK_V4_FWD_NUM_LAYERS
+        csa = DEEPSEEK_V4_CSA_NUM_LAYERS
+        hca = DEEPSEEK_V4_HCA_NUM_LAYERS
+
+        def stacked(name: str, count: int) -> torch.Tensor:
+            base = single[name]
+            shape = (base.shape[0], count * base.shape[1], *base.shape[2:])
+            return torch.empty(shape, dtype=base.dtype)
+
+        values: dict[str, torch.Tensor] = {}
+        # CSA-group weights stack x21; HCA-group weights stack x20; everything else
+        # in the per-layer common tensors is a FWD weight and stacks x43. Prefill
+        # packs the RoPE tables per-layer, so they are FWD-stacked rather than shared.
+        for name, base in single.items():
+            if name in _DECODE_FWD_CSA_STACKED_NAMES:
+                values[name] = stacked(name, csa)
+            elif name in _DECODE_FWD_HCA_STACKED_NAMES:
+                values[name] = stacked(name, hca)
+            else:
+                values[name] = stacked(name, fwd)
+
         values.update(
             {
-                "x_hc": torch.empty((ranks, layout.prefill_seq, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.bfloat16),
+                "x_hc": torch.empty((ranks, seq, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.bfloat16),
+                # HCA-group prefill compressor state (x20).
                 "hca_cmp_kv_state": torch.empty(
                     (
                         ranks,
-                        layout.prefill_hca_state_max_blocks,
+                        hca * layout.prefill_hca_state_max_blocks,
                         layout.c128_state_block_size,
                         DEEPSEEK_V4_HCA_MAIN_OUT_DIM,
                     ),
@@ -421,20 +509,21 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "hca_cmp_score_state": torch.empty(
                     (
                         ranks,
-                        layout.prefill_hca_state_max_blocks,
+                        hca * layout.prefill_hca_state_max_blocks,
                         layout.c128_state_block_size,
                         DEEPSEEK_V4_HCA_MAIN_OUT_DIM,
                     ),
                     dtype=torch.float32,
                 ),
                 "hca_compress_state_block_table": torch.empty(
-                    (ranks, layout.prefill_hca_state_max_blocks),
+                    (ranks, hca * layout.prefill_hca_state_max_blocks),
                     dtype=torch.int32,
                 ),
+                # CSA-group prefill compressor state (x21).
                 "csa_cmp_kv_state": torch.empty(
                     (
                         ranks,
-                        layout.prefill_csa_state_max_blocks,
+                        csa * layout.prefill_csa_state_max_blocks,
                         layout.c4_state_block_size,
                         DEEPSEEK_V4_CSA_MAIN_OUT_DIM,
                     ),
@@ -443,20 +532,20 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "csa_cmp_score_state": torch.empty(
                     (
                         ranks,
-                        layout.prefill_csa_state_max_blocks,
+                        csa * layout.prefill_csa_state_max_blocks,
                         layout.c4_state_block_size,
                         DEEPSEEK_V4_CSA_MAIN_OUT_DIM,
                     ),
                     dtype=torch.float32,
                 ),
                 "csa_compress_state_block_table": torch.empty(
-                    (ranks, layout.prefill_csa_state_max_blocks),
+                    (ranks, csa * layout.prefill_csa_state_max_blocks),
                     dtype=torch.int32,
                 ),
                 "csa_inner_kv_state": torch.empty(
                     (
                         ranks,
-                        layout.prefill_csa_inner_state_max_blocks,
+                        csa * layout.prefill_csa_inner_state_max_blocks,
                         layout.c4_state_block_size,
                         DEEPSEEK_V4_CSA_INNER_OUT_DIM,
                     ),
@@ -465,48 +554,51 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "csa_inner_score_state": torch.empty(
                     (
                         ranks,
-                        layout.prefill_csa_inner_state_max_blocks,
+                        csa * layout.prefill_csa_inner_state_max_blocks,
                         layout.c4_state_block_size,
                         DEEPSEEK_V4_CSA_INNER_OUT_DIM,
                     ),
                     dtype=torch.float32,
                 ),
                 "csa_inner_compress_state_block_table": torch.empty(
-                    (ranks, layout.prefill_csa_inner_state_max_blocks),
+                    (ranks, csa * layout.prefill_csa_inner_state_max_blocks),
                     dtype=torch.int32,
                 ),
+                # FWD-stacked prefill work caches (x43); each carries an explicit
+                # per-layer block dim that the kernel reshapes internally.
                 "kv_cache": torch.empty(
-                    (ranks, layout.ori_max_blocks, layout.block_size, 1, model.config.head_dim),
+                    (ranks, fwd, layout.ori_max_blocks, layout.block_size, 1, head_dim),
                     dtype=torch.bfloat16,
                 ),
-                "ori_block_table": torch.empty((ranks, layout.ori_max_blocks), dtype=torch.int32),
-                "ori_slot_mapping": torch.empty((ranks, layout.prefill_seq), dtype=torch.long),
+                "ori_block_table": torch.empty((ranks, fwd * layout.ori_max_blocks), dtype=torch.int32),
+                "ori_slot_mapping": torch.empty((ranks, fwd * seq), dtype=torch.long),
                 "cmp_kv": torch.empty(
-                    (ranks, layout.prefill_cmp_max_blocks, layout.block_size, 1, model.config.head_dim),
+                    (ranks, fwd, layout.prefill_cmp_max_blocks, layout.block_size, 1, head_dim),
                     dtype=torch.bfloat16,
                 ),
-                "cmp_block_table": torch.empty((ranks, layout.prefill_cmp_max_blocks), dtype=torch.int32),
+                "cmp_block_table": torch.empty((ranks, fwd * layout.prefill_cmp_max_blocks), dtype=torch.int32),
                 "cmp_sparse_indices": torch.empty(
-                    (ranks, layout.prefill_seq, layout.prefill_sparse_topk),
+                    (ranks, fwd * seq, layout.prefill_sparse_topk),
                     dtype=torch.int32,
                 ),
-                "cmp_sparse_lens": torch.empty((ranks, layout.prefill_seq), dtype=torch.int32),
+                "cmp_sparse_lens": torch.empty((ranks, fwd * seq), dtype=torch.int32),
                 "idx_kv_cache": torch.empty(
-                    (ranks, layout.prefill_cmp_max_blocks, layout.block_size, 1, DEEPSEEK_V4_IDX_HEAD_DIM),
+                    (ranks, fwd, layout.prefill_cmp_max_blocks, layout.block_size, 1, DEEPSEEK_V4_IDX_HEAD_DIM),
                     dtype=torch.bfloat16,
                 ),
-                "idx_block_table": torch.empty((ranks, layout.prefill_idx_max_blocks), dtype=torch.int32),
-                "position_ids": torch.empty((ranks, layout.prefill_seq), dtype=torch.int32),
-                "hca_cmp_slot_mapping": torch.empty((ranks, layout.prefill_seq), dtype=torch.long),
-                "hca_state_slot_mapping": torch.empty((ranks, layout.prefill_seq), dtype=torch.long),
-                "csa_cmp_slot_mapping": torch.empty((ranks, layout.prefill_seq), dtype=torch.long),
-                "csa_idx_slot_mapping": torch.empty((ranks, layout.prefill_seq), dtype=torch.long),
-                "csa_state_slot_mapping": torch.empty((ranks, layout.prefill_seq), dtype=torch.long),
-                "csa_inner_state_slot_mapping": torch.empty((ranks, layout.prefill_seq), dtype=torch.long),
-                "x_next": torch.empty((ranks, layout.prefill_seq, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.bfloat16),
+                "idx_block_table": torch.empty((ranks, fwd * layout.prefill_idx_max_blocks), dtype=torch.int32),
+                "position_ids": torch.empty((ranks, fwd * seq), dtype=torch.int32),
+                "hca_cmp_slot_mapping": torch.empty((ranks, fwd * seq), dtype=torch.long),
+                "hca_state_slot_mapping": torch.empty((ranks, fwd * seq), dtype=torch.long),
+                "csa_cmp_slot_mapping": torch.empty((ranks, fwd * seq), dtype=torch.long),
+                "csa_idx_slot_mapping": torch.empty((ranks, fwd * seq), dtype=torch.long),
+                "csa_state_slot_mapping": torch.empty((ranks, fwd * seq), dtype=torch.long),
+                "csa_inner_state_slot_mapping": torch.empty((ranks, fwd * seq), dtype=torch.long),
+                "input_ids": torch.empty((ranks, fwd * seq), dtype=torch.long),
+                "x_out": torch.empty((ranks, seq, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.bfloat16),
             }
         )
-        return (*self._ordered_dummy_args(values, _PREFILL_TENSOR_ORDER), self._int32_arg(layout.prefill_seq), self._int32_arg(0))
+        return (*self._ordered_dummy_args(values, _PREFILL_FWD_TENSOR_ORDER), self._int32_arg(seq))
 
     def _decode_dummy_args(
         self,
@@ -514,9 +606,15 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         layout: DeepSeekV4CacheLayout,
         config_module: object,
     ) -> tuple[Any, ...]:
-        """Return explicit serving dummy args for ``l3_decode_layer``."""
+        """Return explicit serving dummy args for the packed ``l3_decode_fwd``.
+
+        Every weight/state argument is layer-stacked on dim 1: FWD weights and
+        the kv/cmp work caches stack across all 43 hidden layers; CSA-group
+        weights and state stack across the 21 compress_ratio==4 layers; HCA-group
+        weights and state stack across the 20 compress_ratio==128 layers.
+        """
         cfg = config_module.FLASH
-        values = self._layer_common_dummy_tensors(
+        single = self._layer_common_dummy_tensors(
             model,
             layout,
             cfg,
@@ -528,13 +626,95 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         batch = layout.decode_batch
         tokens = layout.decode_tokens
         hidden = model.config.hidden_size
+        hc_dim = int(cfg.hc_dim)
+
+        fwd = DEEPSEEK_V4_FWD_NUM_LAYERS
+        csa = DEEPSEEK_V4_CSA_NUM_LAYERS
+        hca = DEEPSEEK_V4_HCA_NUM_LAYERS
+
+        def stacked(name: str, count: int) -> torch.Tensor:
+            base = single[name]
+            shape = (base.shape[0], count * base.shape[1], *base.shape[2:])
+            return torch.empty(shape, dtype=base.dtype)
+
+        values: dict[str, torch.Tensor] = {}
+        # CSA-group weights stack x21; HCA-group weights stack x20; everything
+        # else in the per-layer common tensors is a FWD weight and stacks x43.
+        # Shared single-copy inputs (freqs/input_ids) are populated explicitly.
+        for name, base in single.items():
+            if name in _DECODE_FWD_SHARED_COMMON_NAMES:
+                values[name] = base
+            elif name in _DECODE_FWD_CSA_STACKED_NAMES:
+                values[name] = stacked(name, csa)
+            elif name in _DECODE_FWD_HCA_STACKED_NAMES:
+                values[name] = stacked(name, hca)
+            else:
+                values[name] = stacked(name, fwd)
+
         values.update(
             {
                 "x_hc": torch.empty((ranks, tokens, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.bfloat16),
+                # FWD-stacked work caches (x43).
                 "kv_cache": torch.empty(
-                    (ranks, batch * layout.ori_max_blocks, layout.block_size, 1, model.config.head_dim),
+                    (
+                        ranks,
+                        fwd * batch * layout.ori_max_blocks,
+                        layout.block_size,
+                        1,
+                        model.config.head_dim,
+                    ),
                     dtype=torch.bfloat16,
                 ),
+                "cmp_kv": torch.empty(
+                    (
+                        ranks,
+                        fwd * batch * layout.cmp_max_blocks,
+                        layout.block_size,
+                        1,
+                        model.config.head_dim,
+                    ),
+                    dtype=torch.bfloat16,
+                ),
+                # CSA-group state (x21).
+                "idx_kv_cache": torch.empty(
+                    (
+                        ranks,
+                        csa * batch * layout.idx_max_blocks,
+                        layout.block_size,
+                        1,
+                        DEEPSEEK_V4_IDX_HEAD_DIM,
+                    ),
+                    dtype=torch.bfloat16,
+                ),
+                "csa_compress_state": torch.empty(
+                    (
+                        ranks,
+                        csa * batch * layout.csa_state_max_blocks,
+                        layout.c4_state_block_size,
+                        DEEPSEEK_V4_CSA_STATE_DIM,
+                    ),
+                    dtype=torch.float32,
+                ),
+                "csa_inner_compress_state": torch.empty(
+                    (
+                        ranks,
+                        csa * batch * layout.csa_inner_state_max_blocks,
+                        layout.c4_state_block_size,
+                        DEEPSEEK_V4_CSA_INNER_STATE_DIM,
+                    ),
+                    dtype=torch.float32,
+                ),
+                # HCA-group state (x20).
+                "hca_compress_state": torch.empty(
+                    (
+                        ranks,
+                        hca * batch * layout.hca_state_max_blocks,
+                        layout.c128_state_block_size,
+                        DEEPSEEK_V4_HCA_STATE_DIM,
+                    ),
+                    dtype=torch.float32,
+                ),
+                # Shared single-copy per-step inputs.
                 "block_table": torch.empty((ranks, batch, layout.ori_max_blocks), dtype=torch.int32),
                 "ori_slot_mapping": torch.empty((ranks, tokens), dtype=torch.long),
                 "hca_cmp_slot_mapping": torch.empty((ranks, tokens), dtype=torch.long),
@@ -545,63 +725,28 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "csa_inner_state_slot_mapping": torch.empty((ranks, tokens), dtype=torch.long),
                 "position_ids": torch.empty((ranks, tokens), dtype=torch.int32),
                 "kv_seq_lens": torch.empty((ranks, batch), dtype=torch.int32),
-                "hca_compress_state": torch.empty(
-                    (
-                        ranks,
-                        batch * layout.hca_state_max_blocks,
-                        layout.c128_state_block_size,
-                        DEEPSEEK_V4_HCA_STATE_DIM,
-                    ),
-                    dtype=torch.float32,
-                ),
                 "hca_compress_state_block_table": torch.empty(
                     (ranks, batch, layout.hca_state_max_blocks),
                     dtype=torch.int32,
-                ),
-                "csa_compress_state": torch.empty(
-                    (
-                        ranks,
-                        batch * layout.csa_state_max_blocks,
-                        layout.c4_state_block_size,
-                        DEEPSEEK_V4_CSA_STATE_DIM,
-                    ),
-                    dtype=torch.float32,
                 ),
                 "csa_compress_state_block_table": torch.empty(
                     (ranks, batch, layout.csa_state_max_blocks),
                     dtype=torch.int32,
                 ),
-                "csa_inner_compress_state": torch.empty(
-                    (
-                        ranks,
-                        batch * layout.csa_inner_state_max_blocks,
-                        layout.c4_state_block_size,
-                        DEEPSEEK_V4_CSA_INNER_STATE_DIM,
-                    ),
-                    dtype=torch.float32,
-                ),
                 "csa_inner_compress_state_block_table": torch.empty(
                     (ranks, batch, layout.csa_inner_state_max_blocks),
                     dtype=torch.int32,
                 ),
-                "cmp_kv": torch.empty(
-                    (ranks, batch * layout.cmp_max_blocks, layout.block_size, 1, model.config.head_dim),
-                    dtype=torch.bfloat16,
-                ),
                 "cmp_block_table": torch.empty((ranks, batch, layout.cmp_max_blocks), dtype=torch.int32),
-                "idx_kv_cache": torch.empty(
-                    (ranks, batch * layout.idx_max_blocks, layout.block_size, 1, DEEPSEEK_V4_IDX_HEAD_DIM),
-                    dtype=torch.bfloat16,
-                ),
                 "idx_block_table": torch.empty((ranks, batch, layout.idx_max_blocks), dtype=torch.int32),
-                "x_next": torch.empty((ranks, tokens, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.bfloat16),
+                # hc_head output-collapse weights (single copy per rank).
+                "hc_head_fn": torch.empty((ranks, DEEPSEEK_V4_HC_MULT, hc_dim), dtype=torch.float32),
+                "hc_head_scale": torch.empty((ranks, 1), dtype=torch.float32),
+                "hc_head_base": torch.empty((ranks, DEEPSEEK_V4_HC_MULT), dtype=torch.float32),
+                "x_out": torch.empty((ranks, tokens, hidden), dtype=torch.bfloat16),
             }
         )
-        return (
-            *self._ordered_dummy_args(values, _DECODE_TENSOR_ORDER),
-            self._int32_arg(0),
-            self._int32_arg(layout.decode_tokens),
-        )
+        return self._ordered_dummy_args(values, _DECODE_FWD_TENSOR_ORDER)
 
     def _lm_head_dummy_args(self, model: RuntimeModel, layout: DeepSeekV4CacheLayout) -> tuple[torch.Tensor, ...]:
         """Return explicit serving dummy args for ``l3_lm_head``."""
@@ -740,7 +885,14 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
 
     def _validate_kernel_contract(self, layout: DeepSeekV4CacheLayout) -> None:
         """Fail fast when the checked-out pypto-lib kernels do not match serving topology."""
-        required_modules = ("config.py", "prefill_layer.py", "decode_layer.py", "lm_head.py")
+        required_modules = (
+            "config.py",
+            "prefill_layer.py",
+            "prefill_fwd.py",
+            "decode_layer.py",
+            "decode_fwd.py",
+            "lm_head.py",
+        )
         missing = [name for name in required_modules if not (self._kernel_dir / name).is_file()]
         if missing:
             raise FileNotFoundError(

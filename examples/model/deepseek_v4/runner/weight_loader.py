@@ -155,6 +155,55 @@ class DeepSeekV4PackedLayerWeights:
         return tuple(self.tensors[name] for name in names)
 
 
+# Layer-stacking groups for the packed all-layer ``l3_decode_fwd`` kernel. These
+# mirror the name groups in pypto-lib decode_fwd.py, but only cover *loaded*
+# weights -- the per-layer work-cache/state tensors (kv_cache, cmp_kv,
+# idx_kv_cache, *_compress_state) are owned by the runner work cache and are not
+# emitted by the weight loader.
+DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES = (
+    "csa_cmp_wkv",
+    "csa_cmp_wgate",
+    "csa_cmp_ape",
+    "csa_cmp_norm_w",
+    "csa_idx_wq_b",
+    "csa_idx_wq_b_scale",
+    "csa_weights_proj",
+    "csa_hadamard_idx",
+    "csa_inner_wkv",
+    "csa_inner_wgate",
+    "csa_inner_ape",
+    "csa_inner_norm_w",
+)
+DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES = (
+    "hca_cmp_wkv",
+    "hca_cmp_wgate",
+    "hca_cmp_ape",
+    "hca_cmp_norm_w",
+)
+_DEEPSEEK_V4_CSA_COMPRESS_RATIO_VALUE = 4
+_DEEPSEEK_V4_HCA_COMPRESS_RATIO_VALUE = 128
+
+
+@dataclass(frozen=True)
+class DeepSeekV4StackedLayerWeights:
+    """All hidden-layer weights stacked on the layer axis for ``l3_decode_fwd``.
+
+    Each tensor fuses its layer axis into dim 1: ``[ranks, layer_count*d1, ...]``.
+    FWD weights stack across all 43 hidden layers; CSA-group weights stack across
+    the 21 compress_ratio==4 layers in order; HCA-group weights stack across the
+    20 compress_ratio==128 layers in order.
+    """
+
+    tensors: Mapping[str, torch.Tensor]
+
+    def args(self, names: Sequence[str]) -> tuple[torch.Tensor, ...]:
+        """Return stacked tensors in a kernel host order."""
+        missing = [name for name in names if name not in self.tensors]
+        if missing:
+            raise KeyError(f"Stacked DeepSeekV4 weights are missing tensors: {', '.join(missing)}")
+        return tuple(self.tensors[name] for name in names)
+
+
 def deepseek_v4_lm_head_layout(
     *,
     vocab_size: int,
@@ -531,6 +580,78 @@ class DeepSeekV4WeightStore:
             include_tid2eid=include_tid2eid,
             include_gate_bias=include_gate_bias,
         )
+
+    def load_stacked_layer_weights(
+        self,
+        *,
+        ranks: int,
+        n_routed_experts: int,
+        compress_ratios: Sequence[int],
+        num_hash_layers: int,
+    ) -> DeepSeekV4StackedLayerWeights:
+        """Load every hidden layer once and stack weights on the layer axis.
+
+        FWD weights are concatenated across all hidden layers in order; CSA-group
+        weights across the compress_ratio==4 layers in order; HCA-group weights
+        across the compress_ratio==128 layers in order. Each per-layer tensor is
+        ``[ranks, d1, ...]`` and stacking concatenates on dim 1.
+        """
+        num_hidden_layers = len(compress_ratios)
+        if num_hidden_layers <= 0:
+            raise ValueError("compress_ratios must include at least one entry per hidden layer")
+        per_layer: list[DeepSeekV4PackedLayerWeights] = []
+        for layer_id in range(num_hidden_layers):
+            per_layer.append(
+                self.load_packed_layer_weights(
+                    layer_id,
+                    ranks=ranks,
+                    n_routed_experts=n_routed_experts,
+                    compress_ratio=int(compress_ratios[layer_id]),
+                    include_tid2eid=layer_id < num_hash_layers,
+                    include_gate_bias=layer_id >= num_hash_layers,
+                )
+            )
+        return stack_deepseek_v4_layer_weights(per_layer, compress_ratios=compress_ratios)
+
+
+def stack_deepseek_v4_layer_weights(
+    per_layer: Sequence[DeepSeekV4PackedLayerWeights],
+    *,
+    compress_ratios: Sequence[int],
+) -> DeepSeekV4StackedLayerWeights:
+    """Concatenate per-layer packed weights into the layer-stacked decode_fwd groups."""
+    num_hidden_layers = len(per_layer)
+    if num_hidden_layers != len(compress_ratios):
+        raise ValueError("per_layer count must match compress_ratios length")
+    if num_hidden_layers <= 0:
+        raise ValueError("per_layer must include at least one layer")
+
+    csa_layers = [i for i in range(num_hidden_layers) if int(compress_ratios[i]) == _DEEPSEEK_V4_CSA_COMPRESS_RATIO_VALUE]
+    hca_layers = [i for i in range(num_hidden_layers) if int(compress_ratios[i]) == _DEEPSEEK_V4_HCA_COMPRESS_RATIO_VALUE]
+
+    csa_grouped = set(DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES)
+    hca_grouped = set(DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES)
+    fwd_names = [
+        name
+        for name in per_layer[0].tensors
+        if name not in csa_grouped and name not in hca_grouped
+    ]
+
+    def cat(names: Sequence[str], layer_ids: Sequence[int]) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+        for name in names:
+            tensors = []
+            for layer_id in layer_ids:
+                tensor = per_layer[layer_id].tensors[name]
+                tensors.append(tensor.contiguous().cpu())
+            out[name] = torch.cat(tensors, dim=1).contiguous()
+        return out
+
+    stacked: dict[str, torch.Tensor] = {}
+    stacked.update(cat(fwd_names, range(num_hidden_layers)))
+    stacked.update(cat(DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES, csa_layers))
+    stacked.update(cat(DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES, hca_layers))
+    return DeepSeekV4StackedLayerWeights(tensors=stacked)
 
 
 def pack_deepseek_v4_layer_weights(
