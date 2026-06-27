@@ -160,8 +160,11 @@ _PREFILL_FWD_TENSOR_ORDER = (
 )
 
 # Argument order for the packed all-43-layer ``l3_decode_fwd`` kernel. This
-# mirrors pypto-lib decode_fwd.py ``build_tensor_specs`` ``ordered_names`` (the
-# host signature follows it exactly, with ``x_out`` appended as the last output).
+# mirrors pypto-lib decode_fwd.py ``l3_decode_fwd`` host signature: after the
+# ``hc_head`` collapse weights the kernel now performs the final RMSNorm and LM
+# head in-kernel, so it takes ``final_norm_w`` + ``lm_head_weight`` inputs and a
+# ``logits`` output (the trailing ``num_tokens`` scalar is appended at dispatch,
+# like prefill, and is not part of this tensor tuple).
 _DECODE_FWD_TENSOR_ORDER = (
     "x_hc",
     "hc_attn_fn",
@@ -240,7 +243,9 @@ _DECODE_FWD_TENSOR_ORDER = (
     "hc_head_fn",
     "hc_head_scale",
     "hc_head_base",
-    "x_out",
+    "final_norm_w",
+    "lm_head_weight",
+    "logits",
 )
 
 _DECODE_INPUT_TENSOR_FIELDS = (
@@ -572,8 +577,13 @@ class DeepSeekV4InputBuilder:
             dtype=embeddings.dtype,
             device=embeddings.device,
         )
+        # When the caller supplies a full per-row embedding tensor (one row per
+        # decode-batch slot), use each row's own embedding so the MoE gate routes
+        # the 128 tokens across many experts. Otherwise replicate slot 0 into the
+        # padding rows as before.
+        per_row = embeddings.shape[0] >= self.layout.decode_batch
         for row in range(self.layout.decode_batch):
-            source_row = row if row < actual_batch else 0
+            source_row = row if per_row else (row if row < actual_batch else 0)
             start = row * self.layout.decode_seq
             rows[start : start + self.layout.decode_seq].copy_(
                 embeddings[source_row : source_row + 1].expand(self.layout.decode_seq, self.hidden_size)
@@ -828,6 +838,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._prefill_cache_snapshots: dict[int, DeepSeekV4LayerCacheSnapshot] = {}
         self._global_weights: DeepSeekV4GlobalWeights | None = None
         self._static_lm_head_weight: torch.Tensor | None = None
+        self._static_final_norm_weight: torch.Tensor | None = None
         self._static_freqs_cos: torch.Tensor | None = None
         self._static_freqs_sin: torch.Tensor | None = None
         self._prefill_fwd_buffers: _DeepSeekV4PrefillFwdSharedBuffers | None = None
@@ -836,6 +847,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._hc_head_buffers: dict[str, torch.Tensor] | None = None
         self._lm_head_hidden_buffer: torch.Tensor | None = None
         self._lm_head_logits_buffer: torch.Tensor | None = None
+        self._decode_logits_buffer: torch.Tensor | None = None
 
     def init_kv_cache(self, model_id: str, config: ModelConfig, runtime: RuntimeConfig) -> None:
         """DeepSeekV4 owns several cache families, so generic KV allocation is bypassed."""
@@ -1033,7 +1045,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
             actual_batch,
             vocab_size=model.config.vocab_size,
         )
-        x_hc = builder.decode_x_hc(batch.hidden_states.to(torch.bfloat16).cpu(), actual_batch=actual_batch)
+        decode_embeds = batch.hidden_states.to(torch.bfloat16).cpu()
+        if os.environ.get("PYPTO_DSV4_DIVERSE_DECODE_PAD") == "1" and actual_batch < layout.decode_batch:
+            decode_embeds = self._diverse_decode_pad_embeddings(model, decode_embeds, actual_batch)
+        x_hc = builder.decode_x_hc(decode_embeds, actual_batch=actual_batch)
         decode_slots = self._decode_kernel_slots(slots)
         decode_positions = (*positions, *((positions[0],) * (layout.decode_batch - actual_batch)))
         ori_slot_mapping = self.cache_manager.sliding_window_slot_mapping(
@@ -1144,6 +1159,31 @@ class DeepSeekV4ModelRunner(ModelRunner):
             csa_inner_state_slot_mapping=self._rank_stack(csa_inner_state_slot_mapping.reshape(-1)),
         )
 
+    def _diverse_decode_pad_embeddings(
+        self, model, active_embeds: torch.Tensor, actual_batch: int
+    ) -> torch.Tensor:
+        """Diagnostic: build a full [decode_batch, hidden] embedding tensor whose
+        padding rows carry distinct real token embeddings, so the decode MoE gate
+        routes the 128 tokens across many experts instead of all padding rows
+        mirroring slot 0. Active rows keep their real embeddings."""
+        layout = self._compiled.layout
+        embed = getattr(self, "_diverse_embed_cache", None)
+        if embed is None:
+            embed = self._compiled.weight_store.load_tensor("embed.weight").contiguous()
+            self._diverse_embed_cache = embed
+        vocab = int(model.config.vocab_size)
+        hidden = int(embed.shape[1])
+        full = torch.zeros((layout.decode_batch, hidden), dtype=active_embeds.dtype)
+        full[:actual_batch].copy_(active_embeds[:actual_batch].to(full.dtype))
+        # Distinct, spread-out, non-special token ids for the padding rows.
+        pad_ids = [
+            max(100, (1000 + row * 2659) % vocab)
+            for row in range(actual_batch, layout.decode_batch)
+        ]
+        pad_embed = embed.index_select(0, torch.tensor(pad_ids, dtype=torch.long)).to(full.dtype)
+        full[actual_batch:].copy_(pad_embed)
+        return full
+
     def _alloc_kv_cache_tensor(self, shape: tuple[int, ...], dtype: torch.dtype) -> DeviceTensor:
         raise NotImplementedError("DeepSeekV4 uses model-specific cache pools, not generic KV tensors")
 
@@ -1160,6 +1200,12 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._ensure_lm_head_buffers()
         self._ensure_decode_buffers(model.config.hidden_size)
         self._ensure_decode_work_cache()
+        # The packed decode kernel emits logits directly and runs the final
+        # RMSNorm + LM head in-kernel; stage its output buffer and the
+        # final_norm_w / lm_head_weight inputs before the worker forks.
+        self._require_decode_logits_buffer(model.config.vocab_size)
+        self._static_final_norm_weight_tensor()
+        self._require_static_lm_head_weight()
         # Pre-allocate the packed shared buffers (stacked layer weights, hc_head and
         # packed prefill caches/metadata) before the prefill dispatch forks the L3
         # worker, so the child inherits them.
@@ -1178,6 +1224,16 @@ class DeepSeekV4ModelRunner(ModelRunner):
         x_out.zero_()
         args = self._prefill_fwd_args(x_out)
         self._debug_prefill_dispatch(inputs, args)
+        if os.environ.get("PYPTO_DSV4_SKIP_PREFILL_KERNEL") == "1":
+            # Diagnostic: skip the prefill kernel dispatch to isolate the decode
+            # deadlock from prefill device/ring state. All host-side prep above
+            # ran; we only skip the device kernel. Snapshot the (un-run) packed
+            # caches so decode can proceed, and force the first token to " a"
+            # (id 260) so decode runs on a realistic input.
+            self._snapshot_prefill_fwd_caches()
+            forced = torch.zeros((1, int(model.config.vocab_size)), dtype=torch.float32)
+            forced[0, 260] = 1.0e4
+            return PrefillResult(last_hidden=None, logits=forced)
         try:
             self._run_l3(
                 self._require_prefill_callable(),
@@ -1202,6 +1258,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._static_freqs_cos_tensor()
         self._static_freqs_sin_tensor()
         self._ensure_lm_head_buffers()
+        self._require_decode_logits_buffer(model.config.vocab_size)
+        self._static_final_norm_weight_tensor()
+        self._require_static_lm_head_weight()
         self._ensure_decode_work_cache()
         inputs = self._stage_decode_inputs(self.prepare_decode_inputs(model, batch))
         if inputs.actual_batch != 1 or inputs.slots != (0,):
@@ -1218,31 +1277,39 @@ class DeepSeekV4ModelRunner(ModelRunner):
         active_decode_tokens = inputs.actual_batch
         self._debug_tensor_stats("decode.input.initial.active", x_hc[:, :active_decode_tokens, :, :])
 
-        x_out = self._require_decode_output_buffer(model.config.hidden_size)
-        x_out.zero_()
-        args = self._decode_fwd_args(inputs, x_hc, x_out)
+        logits_buffer = self._require_decode_logits_buffer(model.config.vocab_size)
+        logits_buffer.zero_()
+        # The packed decode kernel now runs the final RMSNorm + LM head in-kernel,
+        # emitting per-rank logits directly. ``num_tokens`` is the real active token
+        # count (actual_batch decode rows x decode_seq), mirroring prefill's
+        # actual_tokens scalar.
+        num_tokens = inputs.actual_batch * self._compiled.layout.decode_seq
+        args = self._decode_fwd_args(inputs, x_hc, logits_buffer)
         self._debug_decode_dispatch(inputs, args)
         try:
-            self._run_l3(self._require_decode_callable(), *args)
+            self._run_l3(
+                self._require_decode_callable(),
+                *args,
+                self._int32_scalar(num_tokens),
+            )
         except RuntimeError as exc:
             raise RuntimeError(
                 "DeepSeekV4 packed decode dispatch failed "
                 f"(actual_batch={inputs.actual_batch}, slots={inputs.slots})"
             ) from exc
         self._debug_tensor_stats(
-            "decode.output.active",
-            x_out[:, :active_decode_tokens, :],
+            "decode.output.logits.active",
+            logits_buffer[:, :active_decode_tokens, :],
             per_rank=True,
         )
         if self._debug_tensor_stats_enabled() and not self._tensor_is_finite(
-            x_out[:, :active_decode_tokens, :]
+            logits_buffer[:, :active_decode_tokens, :]
         ):
-            raise RuntimeError("DeepSeekV4 packed decode produced non-finite active hidden rows")
+            raise RuntimeError("DeepSeekV4 packed decode produced non-finite active logits rows")
 
         active_rows = tuple(row * self._compiled.layout.decode_seq for row in range(inputs.actual_batch))
-        logits = self._logits_for_hidden(x_out, active_rows=active_rows, label="decode")
-        hidden = self._final_norm(x_out)[0, list(active_rows)].float()
-        return DecodeResult(hidden_states=hidden, logits=logits)
+        logits = logits_buffer[0, list(active_rows), :].contiguous().float()
+        return DecodeResult(hidden_states=None, logits=logits)
 
     def _require_prefill_callable(self) -> DeepSeekV4L3Callable:
         if self._compiled.prefill is None:
@@ -1279,7 +1346,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self,
         inputs: DeepSeekV4PreparedDecodeInputs,
         x_hc: torch.Tensor,
-        x_out: torch.Tensor,
+        logits: torch.Tensor,
     ) -> tuple[Any, ...]:
         """Build the single packed ``l3_decode_fwd`` argument tuple."""
         cache = self._require_decode_work_cache()
@@ -1316,7 +1383,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "hc_head_fn": hc_head["hc_head_fn"],
                 "hc_head_scale": hc_head["hc_head_scale"],
                 "hc_head_base": hc_head["hc_head_base"],
-                "x_out": x_out,
+                "final_norm_w": self._static_final_norm_weight_tensor(),
+                "lm_head_weight": self._require_static_lm_head_weight(),
+                "logits": logits,
             }
         )
         return self._ordered_layer_args(values, _DECODE_FWD_TENSOR_ORDER)
@@ -1413,7 +1482,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "position_ids",
             "kv_seq_lens",
             "input_ids",
-            "x_out",
+            "logits",
         )
         tensor_names = [
             name
@@ -1926,6 +1995,43 @@ class DeepSeekV4ModelRunner(ModelRunner):
 
     def _require_decode_output_buffer(self, hidden_size: int) -> torch.Tensor:
         return self._ensure_decode_buffers(int(hidden_size)).x_out
+
+    def _require_decode_logits_buffer(self, vocab_size: int) -> torch.Tensor:
+        """Return the shared ``[ranks, decode_tokens, vocab]`` decode logits output.
+
+        The packed ``l3_decode_fwd`` kernel emits logits directly, so decode no
+        longer reuses the separate-lm_head logits buffer.
+        """
+        layout = self._compiled.layout
+        logits_shape = (layout.ranks, layout.decode_tokens, int(vocab_size))
+        if self._decode_logits_buffer is None:
+            self._ensure_shared_host_allocation_before_worker("decode_logits")
+            self._decode_logits_buffer = self._shared_empty(logits_shape, torch.float32, name="decode_logits")
+        return self._decode_logits_buffer
+
+    def _require_static_lm_head_weight(self) -> torch.Tensor:
+        """Return the worker-resident per-rank LM-head weight shards.
+
+        Reuses the exact tensor staged for the separate-lm_head step
+        (``[ranks, VOCAB_PER_TP, hidden]`` packed shards).
+        """
+        if self._static_lm_head_weight is None:
+            global_weights = self.load_packed_global_weights()
+            self._static_lm_head_weight = self._static_device_tensor(global_weights.lm_head_weight)
+        return self._static_lm_head_weight
+
+    def _static_final_norm_weight_tensor(self) -> torch.Tensor:
+        """Return the worker-resident per-rank final RMSNorm weight ``[ranks, D]``.
+
+        Reuses the same ``final_norm_weight`` already loaded for the host-side
+        ``_final_norm`` collapse, rank-replicated and cast to bf16 for the kernel.
+        """
+        if self._static_final_norm_weight is None:
+            global_weights = self.load_packed_global_weights()
+            self._ensure_shared_host_allocation_before_worker("final_norm_w")
+            final_norm_w = global_weights.final_norm_weight.to(torch.bfloat16).contiguous().cpu()
+            self._static_final_norm_weight = self._static_device_tensor(self._rank_stack(final_norm_w))
+        return self._static_final_norm_weight
 
     def _static_freqs_cos_tensor(self) -> torch.Tensor:
         if self._static_freqs_cos is None:

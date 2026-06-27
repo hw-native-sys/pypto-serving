@@ -273,11 +273,13 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     # The packed l3_prefill_fwd takes 79 layer-stacked tensors (incl. the CSA
     # indexer wq_b/scale/weights_proj) and a single trailing num_tokens scalar.
     assert len(compiled_args["deepseek_v4_prefill"]) == 80
-    # The packed l3_decode_fwd takes 78 layer-stacked tensors and NO trailing scalars.
-    assert len(compiled_args["deepseek_v4_decode"]) == 78
+    # The packed l3_decode_fwd takes 80 layer-stacked tensors (the in-kernel final
+    # RMSNorm + LM head replaced x_out with final_norm_w + lm_head_weight inputs and
+    # a logits output) plus a single trailing num_tokens scalar.
+    assert len(compiled_args["deepseek_v4_decode"]) == 81
     assert len(compiled_args["deepseek_v4_lm_head"]) == 3
     assert isinstance(compiled_args["deepseek_v4_prefill"][-1], ctypes.c_int32)
-    assert isinstance(compiled_args["deepseek_v4_decode"][-1], torch.Tensor)
+    assert isinstance(compiled_args["deepseek_v4_decode"][-1], ctypes.c_int32)
     assert compiled_args["deepseek_v4_prefill"][0].shape == (8, 128, 4, 4096)
     assert compiled_args["deepseek_v4_decode"][0].shape == (8, 128, 4, 4096)
     prefill_order = npu_executor._PREFILL_FWD_TENSOR_ORDER
@@ -304,7 +306,11 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
         4,
         512,
     )
-    assert compiled_args["deepseek_v4_decode"][decode_order.index("x_out")].shape == (8, 128, 4096)
+    # In-kernel final RMSNorm + LM head: per-rank norm weight + TP vocab shards in,
+    # per-rank [ranks, decode_tokens, vocab] logits out.
+    assert compiled_args["deepseek_v4_decode"][decode_order.index("final_norm_w")].shape == (8, 4096)
+    assert compiled_args["deepseek_v4_decode"][decode_order.index("lm_head_weight")].shape == (8, 16384, 4096)
+    assert compiled_args["deepseek_v4_decode"][decode_order.index("logits")].shape == (8, 128, 129280)
     assert compiled_args["deepseek_v4_lm_head"][1].shape == (8, 16384, 4096)
 
 

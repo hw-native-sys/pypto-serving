@@ -627,6 +627,11 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         tokens = layout.decode_tokens
         hidden = model.config.hidden_size
         hc_dim = int(cfg.hc_dim)
+        lm_layout = deepseek_v4_lm_head_layout(
+            vocab_size=model.config.vocab_size,
+            hidden_size=hidden,
+            ranks=ranks,
+        )
 
         fwd = DEEPSEEK_V4_FWD_NUM_LAYERS
         csa = DEEPSEEK_V4_CSA_NUM_LAYERS
@@ -743,10 +748,19 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "hc_head_fn": torch.empty((ranks, DEEPSEEK_V4_HC_MULT, hc_dim), dtype=torch.float32),
                 "hc_head_scale": torch.empty((ranks, 1), dtype=torch.float32),
                 "hc_head_base": torch.empty((ranks, DEEPSEEK_V4_HC_MULT), dtype=torch.float32),
-                "x_out": torch.empty((ranks, tokens, hidden), dtype=torch.bfloat16),
+                # In-kernel final RMSNorm + LM head: per-rank norm weight and TP
+                # vocab shards in, per-rank logits out (the kernel replaced x_out).
+                "final_norm_w": torch.empty((ranks, hidden), dtype=torch.bfloat16),
+                "lm_head_weight": torch.empty(
+                    (ranks, lm_layout.padded_vocab_per_rank, hidden),
+                    dtype=torch.bfloat16,
+                ),
+                "logits": torch.empty((ranks, tokens, model.config.vocab_size), dtype=torch.float32),
             }
         )
-        return self._ordered_dummy_args(values, _DECODE_FWD_TENSOR_ORDER)
+        # The packed decode kernel takes a trailing INT32 ``num_tokens`` scalar
+        # (the real active token count), mirroring prefill.
+        return (*self._ordered_dummy_args(values, _DECODE_FWD_TENSOR_ORDER), self._int32_arg(tokens))
 
     def _lm_head_dummy_args(self, model: RuntimeModel, layout: DeepSeekV4CacheLayout) -> tuple[torch.Tensor, ...]:
         """Return explicit serving dummy args for ``l3_lm_head``."""
