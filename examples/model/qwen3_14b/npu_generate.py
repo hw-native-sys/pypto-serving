@@ -33,6 +33,7 @@ _bootstrap_package_root()
 
 from python.core import GenerateConfig, LLMEngine, RuntimeConfig
 from python.core.kv_cache import KvCacheManager
+from python.core.parallel import ParallelConfig, parse_device_ids
 from python.profile import get_profiler, merge_profile, profile_span
 from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
 from python.core.types import LoadedModel
@@ -346,6 +347,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-id", default="qwen3-14b-local")
     parser.add_argument("--platform", default="a2a3", choices=["a2a3sim", "a2a3", "a5sim", "a5"])
     parser.add_argument("--device-id", type=int, default=0)
+    parser.add_argument(
+        "--devices",
+        default=None,
+        help="Comma-separated NPU device ids for one tensor-parallel L3 worker group.",
+    )
+    parser.add_argument("--tp", "--tensor-parallel-size", dest="tensor_parallel_size", type=int, default=1)
+    parser.add_argument(
+        "--dp",
+        "--data-parallel-size",
+        dest="data_parallel_size",
+        type=int,
+        default=1,
+        help="Offline generation does not launch DP replicas; values > 1 fail fast.",
+    )
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -384,12 +399,21 @@ def main() -> None:
 
     profile_enabled = args.profile or args.profile_verbose
     collector = _TimingCollector() if profile_enabled else None
+    parallel_config = ParallelConfig(
+        data_parallel_size=args.data_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+        devices=parse_device_ids(args.devices, default_device=args.device_id),
+    )
+    if parallel_config.data_parallel_size != 1:
+        raise ValueError("offline npu_generate.py supports tensor parallelism only; data_parallel_size must be 1")
+    device_ids = parallel_config.replica_device_groups[0]
 
     kv_cache_manager = KvCacheManager()
     executor = PyptoExecutor(
         kv_cache_manager,
         platform=args.platform,
-        device_id=args.device_id,
+        device_id=device_ids[0],
+        device_ids=device_ids,
         save_kernels_dir=args.save_kernels_dir,
         l3_trace=args.profile_verbose,
     )

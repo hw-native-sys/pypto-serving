@@ -380,6 +380,13 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
     manager.free(decode_alloc)
 
 
+def test_pypto_executor_preserves_device_group():
+    executor = PyptoExecutor(device_id=3, device_ids=[3, 4])
+
+    assert executor._device_id == 3
+    assert executor._device_ids == (3, 4)
+
+
 def test_kernel_profile_helpers_emit_kernel_name_and_runtime_timing():
     args = {"runtime": "tensormap_and_ringbuffer"}
     host_wall_us, device_wall_us = _run_timing_us(

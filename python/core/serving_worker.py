@@ -58,16 +58,23 @@ class WorkerProcess:
         from .sampler import Sampler
         from .types import ModelRecord
 
+        device_ids = self.config.worker_device_ids()
+        device_label = ",".join(str(device_id) for device_id in device_ids)
         if mp.current_process().name != "MainProcess":
-            get_profiler(process_name=f"serving-worker-{self.config.device_id}")
+            get_profiler(process_name=f"serving-worker-{device_label}")
         with profile_span(
             "WorkerProcess.init_device_and_model",
             cat="worker",
-            args={"model_id": self.config.model_id, "device_id": self.config.device_id},
+            args={
+                "model_id": self.config.model_id,
+                "device_id": self.config.device_id,
+                "device_ids": list(device_ids),
+                "dp_rank": self.config.dp_rank,
+            },
         ):
             logger.info(
                 f"Worker initializing: platform={self.config.platform}, "
-                f"device={self.config.device_id}"
+                f"devices={list(device_ids)}, dp_rank={self.config.dp_rank}"
             )
 
             self.sampler = Sampler()
@@ -76,6 +83,7 @@ class WorkerProcess:
             self.executor = executor_cls(
                 platform=self.config.platform,
                 device_id=self.config.device_id,
+                device_ids=device_ids,
                 **self.config.executor_kwargs,
             )
 
@@ -105,6 +113,9 @@ class WorkerProcess:
         if self.config.executor_cls == "PyptoQwen14BExecutor":
             from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor
             return Qwen314BPyptoExecutor
+        if self.config.executor_cls == "PyptoDeepSeekV4Executor":
+            from examples.model.deepseek_v4.runner.npu_executor import DeepSeekV4PyptoExecutor
+            return DeepSeekV4PyptoExecutor
         from .executor import ModelExecutor
         return ModelExecutor
 
@@ -121,7 +132,9 @@ class WorkerProcess:
                 break
             elif cmd.type == "step":
                 if cmd.finished_request_ids:
-                    pass  # No allocation cleanup needed
+                    release_finished = getattr(self.executor, "release_finished_requests", None)
+                    if callable(release_finished):
+                        release_finished(cmd.finished_request_ids)
 
                 try:
                     result = self._execute_step(cmd.scheduler_output)

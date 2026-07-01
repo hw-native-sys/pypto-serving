@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 
 from .executor import ModelExecutor
 from .kv_cache import KvCacheManager
@@ -40,12 +41,16 @@ class PyptoExecutor(ModelExecutor, ABC):
         *,
         platform: str = "a2a3sim",
         device_id: int = 0,
+        device_ids: Sequence[int] | None = None,
         save_kernels_dir: str | None = None,
     ) -> None:
         """Initialize common PyPTO runtime options and model registries."""
         super().__init__(kv_cache_manager)
         self._platform = platform
-        self._device_id = device_id
+        self._device_ids = tuple(int(device) for device in (device_ids if device_ids is not None else (device_id,)))
+        if not self._device_ids:
+            raise ValueError("device_ids must contain at least one device id")
+        self._device_id = self._device_ids[0]
         self._save_kernels_dir = save_kernels_dir
         self._runners: dict[str, ModelRunner] = {}
         self._compiled: dict[str, object] = {}

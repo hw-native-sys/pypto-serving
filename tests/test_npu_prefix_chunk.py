@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from python.core.async_engine import AsyncLLMEngine, EngineConfig
+from python.core.async_engine import DPEngineCore, EngineConfig
 from python.core.tokenizer import TransformersTokenizerAdapter
 from python.core.types import GenerateConfig, RuntimeConfig
 
@@ -71,7 +71,7 @@ async def main():
         long_prefill_token_threshold=128,
     )
 
-    engine = AsyncLLMEngine(
+    engine = DPEngineCore(
         config=engine_config,
         tokenizer=tokenizer,
         eos_token_id=tokenizer.eos_token_id,
