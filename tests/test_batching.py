@@ -42,6 +42,8 @@ from python.runtime.worker import WorkerTensor
 
 
 ROOT = Path(__file__).resolve().parents[1]
+QWEN3_NPU_EXECUTOR = ROOT / "examples" / "model" / "qwen3_14b" / "runner" / "npu_executor.py"
+QWEN3_RUNNER = ROOT / "examples" / "model" / "qwen3_14b" / "runner" / "npu_runner.py"
 QWEN3_DISPATCH = ROOT / "examples" / "model" / "qwen3_14b" / "runner" / "qwen3_l3_dispatch.py"
 QWEN3_KERNEL_DIR = ROOT / "pypto-lib" / "models" / "qwen3" / "14b"
 
@@ -131,8 +133,6 @@ def _compiled_kernels(
     return _CompiledKernels(
         prefill=callable_,
         decode=callable_,
-        greedy_sample=callable_,
-        token_embed=callable_,
         final_norm_weight=torch.ones(1, hidden_size),
         rope_cos=torch.zeros(max_seq, head_dim),
         rope_sin=torch.zeros(max_seq, head_dim),
@@ -147,8 +147,6 @@ def _compiled_kernels(
         prefill_block_table_buffer=torch.empty(kernel_batch * max_blocks, dtype=torch.int32),
         prefill_slot_mapping_buffer=torch.empty(kernel_batch * max_seq, dtype=torch.int32),
         prefill_logits_buffer=torch.empty(kernel_batch, model.config.vocab_size),
-        prefill_sampled_ids_buffer=torch.empty(kernel_batch, 1, dtype=torch.int32),
-        prefill_next_hidden_buffer=torch.empty(kernel_batch, hidden_size, dtype=torch.bfloat16),
         decode_hidden_buffer=torch.zeros(kernel_batch, hidden_size, dtype=torch.bfloat16),
         decode_seq_lens_buffer=torch.zeros(kernel_batch, dtype=torch.int32),
         decode_block_table_buffer=torch.zeros(kernel_batch * max_blocks, dtype=torch.int32),
@@ -325,6 +323,32 @@ def test_decode_kernel_inputs_reject_multi_token_rows():
                 slot_mapping=torch.zeros(1, dtype=torch.int32),
             ),
         )
+
+
+def test_decode_kernel_padding_uses_private_scratch_pages():
+    model = _model(max_batch_size=3, max_seq_len=4, page_size=2)
+    runner = ModelRunner(compiled=_compiled_kernels(model))
+
+    prepared = runner._pad_decode_inputs(
+        model,
+        SimpleNamespace(
+            actual_batch=1,
+            token_ids=torch.tensor([[3]], dtype=torch.int32),
+            hidden=torch.ones(1, model.config.hidden_size, dtype=torch.bfloat16),
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            block_table=torch.tensor([0, -1], dtype=torch.int32),
+            slot_mapping=torch.tensor([0], dtype=torch.int32),
+        ),
+    )
+
+    block_table = prepared.block_table.reshape(model.runtime.max_batch_size, 2)
+    assert block_table.tolist() == [
+        [0, -1],
+        [2, 3],
+        [4, 5],
+    ]
+    assert prepared.token_ids.tolist() == [[3], [3], [3]]
+    assert prepared.slot_mapping.tolist() == [0, 4, 8]
 
 
 def test_engine_generate_batch_uses_batched_executor_results():
@@ -615,21 +639,36 @@ def test_kernel_profile_helpers_emit_kernel_name_and_runtime_timing():
 def test_decode_host_inlines_embedding_and_sampling_into_decode_fwd():
     module_source = QWEN3_DISPATCH.read_text(encoding="utf-8")
     start = module_source.index("def qwen3_decode_host")
-    end = module_source.index("def qwen3_greedy_sample_host")
-    source = module_source[start:end]
+    source = module_source[start:]
 
     assert source.count("decode_fwd(") == 1
     assert "token_embed_fwd(" not in source
     assert "greedy_sample_fwd(" not in source
+    assert "def qwen3_greedy_sample_host" not in module_source
+    assert "def qwen3_token_embed_host" not in module_source
 
     if not QWEN3_KERNEL_DIR.is_dir():
         pytest.skip("pypto-lib submodule is not checked out")
-    decode_source = (QWEN3_KERNEL_DIR / "decode_layer.py").read_text(encoding="utf-8")
+    decode_source = (QWEN3_KERNEL_DIR / "decode_fwd.py").read_text(encoding="utf-8")
     assert 'name_hint="token_embed"' in decode_source
     assert 'name_hint="greedy_sample"' in decode_source
 
 
-def test_prefill_host_keeps_sampling_as_standalone_kernel():
+def test_qwen_runner_uses_fused_decode_sampling_and_embedding():
+    executor_source = QWEN3_NPU_EXECUTOR.read_text(encoding="utf-8")
+    runner_source = QWEN3_RUNNER.read_text(encoding="utf-8")
+
+    assert "return True" in executor_source[
+        executor_source.index("def supports_device_sampling") : executor_source.index("def supports_device_embedding")
+    ]
+    assert "return True" in executor_source[executor_source.index("def supports_device_embedding") :]
+    assert "_run_decode_via_prefill" not in runner_source
+    assert "_stage_decode_embeddings" not in runner_source
+    assert "torch.arange(actual_batch" not in runner_source
+    assert "active_token_ids" in runner_source
+
+
+def test_prefill_host_keeps_sampling_out_of_prefill_kernel():
     module_source = QWEN3_DISPATCH.read_text(encoding="utf-8")
     start = module_source.index("def qwen3_prefill_host")
     end = module_source.index("def qwen3_decode_host")
@@ -644,6 +683,20 @@ def test_prefill_host_keeps_sampling_as_standalone_kernel():
     prefill_source = (QWEN3_KERNEL_DIR / "prefill_fwd.py").read_text(encoding="utf-8")
     assert 'name_hint="greedy_sample"' not in prefill_source
     assert 'name_hint="token_embed"' not in prefill_source
+
+
+def test_qwen_serving_uses_native_pypto_lib_kernel_sources():
+    executor_source = QWEN3_NPU_EXECUTOR.read_text(encoding="utf-8")
+    dispatch_source = QWEN3_DISPATCH.read_text(encoding="utf-8")
+
+    assert "_materialize_pypto_lib_kernel_adapter" not in executor_source
+    assert "_KERNEL_SIGNATURE_PATCHES" not in executor_source
+    assert "_KERNEL_FLOW_PATCHES" not in executor_source
+    assert "build_output/pypto_lib_adapters" not in executor_source
+    assert "pl.InOut" not in dispatch_source
+    assert "arg_directions" not in dispatch_source
+    assert "logits, k_cache, v_cache = prefill_fwd(" not in dispatch_source
+    assert "logits, sampled_ids, next_hidden, k_cache, v_cache = decode_fwd(" not in dispatch_source
 
 
 def _layer(hidden_size: int, intermediate_size: int, head_dim: int) -> LayerWeights:
@@ -783,12 +836,16 @@ class _FakeWorker:
     def __init__(self) -> None:
         self._next_ptr = 1
         self.initialized = True
+        self.copies: list[tuple[int, int, int]] = []
 
     def alloc_tensor(self, shape, dtype, init=None):
         nbytes = torch.empty(tuple(shape), dtype=dtype).nbytes
         tensor = WorkerTensor(self._next_ptr, tuple(shape), self._DTYPES[dtype])
         self._next_ptr += nbytes
         return tensor
+
+    def copy_to(self, dst_dev_ptr, src_host_ptr, nbytes, worker_id=0):
+        self.copies.append((dst_dev_ptr, src_host_ptr, nbytes))
 
     def free_tensor(self, tensor):
         return None

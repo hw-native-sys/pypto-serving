@@ -16,8 +16,6 @@ import pypto.language as pl
 
 prefill_fwd = None
 decode_fwd = None
-greedy_sample_fwd = None
-token_embed_fwd = None
 
 
 @pl.jit.host
@@ -133,27 +131,3 @@ def qwen3_decode_host(
         next_hidden,
     )
     return logits, sampled_ids, next_hidden
-
-
-@pl.jit.host
-def qwen3_greedy_sample_host(
-    logits: pl.Tensor,
-    sampled_ids: pl.Out[pl.Tensor],
-) -> pl.Tensor:
-    return greedy_sample_fwd(
-        logits,
-        sampled_ids,
-    )
-
-
-@pl.jit.host
-def qwen3_token_embed_host(
-    sampled_ids: pl.Tensor,
-    embed_weight: pl.Tensor,
-    next_hidden: pl.Out[pl.Tensor],
-) -> pl.Tensor:
-    return token_embed_fwd(
-        sampled_ids,
-        embed_weight,
-        next_hidden,
-    )

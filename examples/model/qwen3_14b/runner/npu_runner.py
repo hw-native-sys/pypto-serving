@@ -75,8 +75,6 @@ class _CompiledKernels:
 
     prefill: _L3Callable
     decode: _L3Callable
-    greedy_sample: _L3Callable
-    token_embed: _L3Callable
     final_norm_weight: torch.Tensor
     rope_cos: torch.Tensor
     rope_sin: torch.Tensor
@@ -91,8 +89,6 @@ class _CompiledKernels:
     prefill_block_table_buffer: torch.Tensor
     prefill_slot_mapping_buffer: torch.Tensor
     prefill_logits_buffer: torch.Tensor
-    prefill_sampled_ids_buffer: torch.Tensor
-    prefill_next_hidden_buffer: torch.Tensor
     decode_hidden_buffer: torch.Tensor
     decode_seq_lens_buffer: torch.Tensor
     decode_block_table_buffer: torch.Tensor
@@ -259,8 +255,6 @@ class Qwen314BModelRunner(ModelRunner):
             compiled.prefill_block_table_buffer,
             compiled.prefill_slot_mapping_buffer,
             compiled.prefill_logits_buffer,
-            compiled.prefill_sampled_ids_buffer,
-            compiled.prefill_next_hidden_buffer,
             compiled.decode_hidden_buffer,
             compiled.decode_seq_lens_buffer,
             compiled.decode_block_table_buffer,
@@ -312,22 +306,15 @@ class Qwen314BModelRunner(ModelRunner):
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             seq_len = int(batch.seq_lens[batch_idx].item())
             alloc.tokens_used = max(alloc.tokens_used, seq_len)
-        sampled_ids, next_hidden = self._maybe_run_sample_embed(
-            logits_padded,
-            compiled.prefill_sampled_ids_buffer,
-            compiled.prefill_next_hidden_buffer,
-            prefill_inputs.actual_batch,
-            allow=batch.allow_device_greedy_sampling,
-        )
         return PrefillResult(
             last_hidden=None,
             logits=logits_padded[: prefill_inputs.actual_batch, : model.config.vocab_size],
-            sampled_token_ids=sampled_ids,
-            next_hidden_states=next_hidden,
+            sampled_token_ids=None,
+            next_hidden_states=None,
         )
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
-        """Run the fused all-layer PAGED ``decode_layer.decode_fwd`` and return logits.
+        """Run the fused all-layer PAGED ``decode_fwd.decode_fwd`` and return logits.
 
         ``decode_fwd`` runs all NUM_LAYERS + the LM head in one dispatch over the
         PAGED KV pool, addressing KV via ``block_table`` + ``slot_mapping``, the
@@ -336,11 +323,10 @@ class Qwen314BModelRunner(ModelRunner):
         kernel row, so a request may occupy any row each step (no stable-slot shim).
 
         The kernel is FIXED-BATCH (it computes all max_batch_size rows and writes
-        each row's current-token KV). Pad the active batch up to the kernel batch by
-        REPLICATING active row 0's inputs into the padding rows: those rows then
-        recompute row 0's K/V and write row 0's own slot with byte-identical values
-        (an idempotent, safe write), and their logits are trimmed off below. This
-        avoids padded rows clobbering an unrelated request's physical page.
+        each row's current-token KV). Pad the active batch up to the kernel batch
+        with row-0 token/length inputs, but route padded rows to disjoint scratch
+        KV pages outside the active rows. Their logits are ignored, and they do
+        not race the active row's current-token KV write.
         """
         compiled = self._compiled
         model_id = model.config.model_id
@@ -402,29 +388,6 @@ class Qwen314BModelRunner(ModelRunner):
         return (
             sampled_ids_buffer[:actual_batch, :1].clone(),
             next_hidden,
-        )
-
-    def _maybe_run_sample_embed(
-        self,
-        logits: torch.Tensor,
-        sampled_ids_buffer: torch.Tensor,
-        next_hidden_buffer: torch.Tensor,
-        actual_batch: int,
-        *,
-        allow: bool,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Run device greedy sampling when the request is greedy."""
-        if not allow:
-            return None, None
-        compiled = self._compiled
-        self._run_distributed_program(
-            compiled.greedy_sample,
-            logits,
-            sampled_ids_buffer,
-        )
-        return (
-            sampled_ids_buffer[:actual_batch, :1].clone(),
-            None,
         )
 
     def _prefill_kernel_args(
@@ -551,19 +514,21 @@ class Qwen314BModelRunner(ModelRunner):
                 kernel_batch,
                 rows_each=1,
             ),
-            block_table=self._copy_replicated_rows(
+            block_table=self._copy_decode_block_table_rows(
                 compiled.decode_block_table_buffer,
                 inputs.block_table,
                 actual_batch,
                 kernel_batch,
-                rows_each=max_blocks,
+                max_blocks=max_blocks,
             ),
-            slot_mapping=self._copy_replicated_rows(
+            slot_mapping=self._copy_decode_slot_mapping_rows(
                 compiled.decode_slot_mapping_buffer,
                 inputs.slot_mapping,
+                compiled.decode_seq_lens_buffer,
                 actual_batch,
                 kernel_batch,
-                rows_each=1,
+                max_blocks=max_blocks,
+                page_size=model.runtime.page_size,
             ),
             logits=compiled.decode_logits_buffer,
         )
@@ -604,8 +569,6 @@ class Qwen314BModelRunner(ModelRunner):
             worker = DistributedWorker([
                 self._compiled.prefill.compiled,
                 self._compiled.decode.compiled,
-                self._compiled.greedy_sample.compiled,
-                self._compiled.token_embed.compiled,
             ])
             self._l3_worker = worker
         return worker
@@ -652,6 +615,51 @@ class Qwen314BModelRunner(ModelRunner):
         dst_view[:actual_batch].copy_(active_view)
         if actual_batch < kernel_batch:
             dst_view[actual_batch:].copy_(active_view[0:1].expand(kernel_batch - actual_batch, rows_each))
+        return dst
+
+    @staticmethod
+    def _copy_decode_block_table_rows(
+        dst: torch.Tensor,
+        active: torch.Tensor,
+        actual_batch: int,
+        kernel_batch: int,
+        *,
+        max_blocks: int,
+    ) -> torch.Tensor:
+        """Copy active decode block rows and give padded rows private scratch pages."""
+        active_view = active.reshape(actual_batch, max_blocks)
+        dst_view = dst.reshape(kernel_batch, max_blocks)
+        dst_view[:actual_batch].copy_(active_view)
+        for row in range(actual_batch, kernel_batch):
+            page_base = row * max_blocks
+            dst_view[row].copy_(
+                torch.arange(
+                    page_base,
+                    page_base + max_blocks,
+                    dtype=dst.dtype,
+                    device=dst.device,
+                )
+            )
+        return dst
+
+    @staticmethod
+    def _copy_decode_slot_mapping_rows(
+        dst: torch.Tensor,
+        active: torch.Tensor,
+        seq_lens: torch.Tensor,
+        actual_batch: int,
+        kernel_batch: int,
+        *,
+        max_blocks: int,
+        page_size: int,
+    ) -> torch.Tensor:
+        """Copy active decode slots and map padded rows into their scratch pages."""
+        dst[:actual_batch].copy_(active.reshape(actual_batch))
+        for row in range(actual_batch, kernel_batch):
+            tokens_used = int(seq_lens[row].item()) - 1
+            page_idx = tokens_used // page_size
+            offset = tokens_used % page_size
+            dst[row] = (row * max_blocks + page_idx) * page_size + offset
         return dst
 
     @staticmethod

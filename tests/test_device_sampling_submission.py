@@ -33,39 +33,37 @@ def test_device_sampling_is_limited_by_runtime_vocab_size() -> None:
     executor = _source(ROOT / "examples" / "model" / "qwen3_14b" / "runner" / "npu_executor.py")
     runner = _source(ROOT / "examples" / "model" / "qwen3_14b" / "runner" / "npu_runner.py")
     config = _source(QWEN / "config.py")
-    greedy = _source(QWEN / "greedy_sample.py")
+    decode = _source(QWEN / "decode_fwd.py")
 
     assert "valid_vocab_size" not in dispatch
     assert "REAL_VOCAB = 151936" in config
     assert "REAL_VOCAB" in executor
     assert "lm_head_weight[:1].expand" in executor
     assert "valid_vocab_size" not in runner
-    assert "valid_vocab_size" not in greedy
-    assert "REAL_NUM_FULL_VOCAB_CHUNKS" in greedy
-    assert "REAL_VOCAB_TAIL" in greedy
-    assert "token_id >= pl.cast(REAL_VOCAB" in greedy
+    assert "valid_vocab_size" not in decode
+    assert "SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS" in decode
+    assert "SAMPLE_REAL_VOCAB_TAIL" in decode
+    assert "token_id >= pl.cast(REAL_VOCAB" in decode
 
 
 def test_device_greedy_tie_break_matches_host_argmax() -> None:
-    greedy = _source(QWEN / "greedy_sample.py")
-    decode = _source(QWEN / "decode_layer.py")
+    decode = _source(QWEN / "decode_fwd.py")
 
-    for source in (greedy, decode):
-        assert "local_token = pl.cast(0, pl.INT32)" in source
-        assert "scan_c = (" in source
-        assert "scan_t = (" in source
-        assert "local_token = pl.cast(scan_t, pl.INT32)" in source
-        assert "if val == best_val:" in source
+    assert "local_token = pl.cast(0, pl.INT32)" in decode
+    assert "scan_c = (" in decode
+    assert "scan_t = (" in decode
+    assert "local_token = pl.cast(scan_t, pl.INT32)" in decode
+    assert "if val == best_val:" in decode
 
 
-def test_prefill_keeps_sampling_in_standalone_device_kernel() -> None:
+def test_prefill_keeps_sampling_outside_prefill_kernel() -> None:
     prefill = _source(QWEN / "prefill_fwd.py")
     runner = _source(ROOT / "examples" / "model" / "qwen3_14b" / "runner" / "npu_runner.py")
 
     assert "_greedy_sample_inline" not in prefill
     assert "_token_embed_inline" not in prefill
-    assert "compiled.greedy_sample" in runner
-    assert "_maybe_run_sample_embed(" in runner
+    assert "compiled.greedy_sample" not in runner
+    assert "_maybe_run_sample_embed(" not in runner
 
 
 def _device_greedy_argmax_with_clamp(logits):
