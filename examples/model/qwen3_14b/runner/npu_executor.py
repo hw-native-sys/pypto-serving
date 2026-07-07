@@ -212,12 +212,18 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 f"{padded_vocab} (round_up({model.config.vocab_size}, {_VOCAB_PAD_MULTIPLE})); "
                 "they must match for the decode logits buffer / lm_head weight to line up."
             )
-        if model.config.vocab_size != int(qwen3_decode_layer.REAL_VOCAB):
-            raise ValueError(
-                "decode_layer.decode_fwd hard-codes REAL_VOCAB for padded-token masking, "
-                f"but the runtime model vocab_size is {model.config.vocab_size}; expected "
-                f"{int(qwen3_decode_layer.REAL_VOCAB)}."
-            )
+        if not self._tq_mode:
+            # REAL_VOCAB / greedy_sample / token_embed are constants of the
+            # non-TQ fused decode + device-side sampling kernels. The TQ decode
+            # kernel (decode_tq) has none of these (sampling/embedding differ),
+            # so the whole validation block is non-TQ only; TQ uses
+            # sampled_ids_width=1 below.
+            if model.config.vocab_size != int(qwen3_decode_layer.REAL_VOCAB):
+                raise ValueError(
+                    "decode_layer.decode_fwd hard-codes REAL_VOCAB for padded-token masking, "
+                    f"but the runtime model vocab_size is {model.config.vocab_size}; expected "
+                    f"{int(qwen3_decode_layer.REAL_VOCAB)}."
+                )
             if int(qwen3_greedy_sample.BATCH) != kernel_batch:
                 raise ValueError(
                     "greedy_sample_fwd is compiled for a fixed kernel BATCH of "
