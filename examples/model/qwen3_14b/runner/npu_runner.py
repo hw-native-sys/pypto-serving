@@ -254,11 +254,7 @@ class Qwen314BModelRunner(ModelRunner):
             try:
                 logger.info(f"[init_kv_cache] num_pages={num_pages}, allocating …")
                 ModelRunner.init_kv_cache(self, model_id, config, runtime, num_pages=num_pages)
-                bytes_per_page = (
-                    config.num_hidden_layers * 2 * config.num_key_value_heads
-                    * runtime.page_size * config.head_dim
-                    * getattr(torch, runtime.kv_dtype).itemsize
-                )
+                bytes_per_page = Qwen314BModelRunner._kv_bytes_per_page(config, runtime)
                 logger.info(
                     f"[init_kv_cache] allocated {num_pages} pages "
                     f"(requested {requested}, downgraded after OOM): "
@@ -280,6 +276,22 @@ class Qwen314BModelRunner(ModelRunner):
         )
 
     @staticmethod
+    def _kv_bytes_per_page(config: ModelConfig, runtime: RuntimeConfig) -> int:
+        """Device HBM bytes per KV page, accounting for TurboQuant compression.
+
+        Non-TQ: bf16 K+V (``2 * head_dim * dtype_bytes`` per row).
+        TQ: uint8 quantized K+V (1 byte/elem) + one fp32 scale per K and per V
+        row (4 bytes each) — roughly half of bf16, so the same HBM budget fits
+        ~2x the pages.
+        """
+        per_page_rows = config.num_hidden_layers * config.num_key_value_heads * runtime.page_size
+        qcfg = getattr(runtime, "kv_quant_config", None)
+        if qcfg is not None and qcfg.enabled:
+            return per_page_rows * (2 * config.head_dim + 2 * 4)
+        dtype_bytes = getattr(torch, runtime.kv_dtype).itemsize
+        return per_page_rows * 2 * config.head_dim * dtype_bytes
+
+    @staticmethod
     def _compute_kv_cache_pages(config: ModelConfig, runtime: RuntimeConfig, device_id: int = 0) -> int:
         """Compute KV cache pages, vLLM-style: total x utilization − peak_non_kv.
 
@@ -291,19 +303,17 @@ class Qwen314BModelRunner(ModelRunner):
         than ``free x fraction`` whose headroom shrinks when free is small).
         """
         free_bytes, total_bytes = torch.npu.mem_get_info(f"npu:{device_id}")
-        dtype_bytes = getattr(torch, runtime.kv_dtype).itemsize
-        bytes_per_page = (
-            config.num_hidden_layers * 2 * config.num_key_value_heads
-            * runtime.page_size * config.head_dim * dtype_bytes
-        )
+        bytes_per_page = Qwen314BModelRunner._kv_bytes_per_page(config, runtime)
+        qcfg = getattr(runtime, "kv_quant_config", None)
+        tq = qcfg is not None and qcfg.enabled
         utilization = getattr(runtime, "npu_memory_utilization", 0.90)
         peak_non_kv = total_bytes - free_bytes
         kv_budget = int(total_bytes * utilization - peak_non_kv)
         num_pages = max(kv_budget // bytes_per_page, 1)
         logger.info(
-            "KV cache sizing (vLLM-style): total=%.2f GB, utilization=%.2f, "
+            "KV cache sizing (vLLM-style%s): total=%.2f GB, utilization=%.2f, "
             "peak_non_kv=%.2f GB, kv_budget=%.2f GB, requested_pages=%d (%.1f MB/page)",
-            total_bytes / 1e9, utilization, peak_non_kv / 1e9,
+            ", TQ uint8" if tq else "", total_bytes / 1e9, utilization, peak_non_kv / 1e9,
             kv_budget / 1e9, num_pages, bytes_per_page / 1e6,
         )
         return num_pages
@@ -341,10 +351,7 @@ class Qwen314BModelRunner(ModelRunner):
         weight_bytes = int(wt_params * dtype_bytes)
 
         # KV cache — exact (num_pages already reflects the real allocation).
-        bytes_per_page = (
-            config.num_hidden_layers * 2 * config.num_key_value_heads
-            * runtime.page_size * config.head_dim * dtype_bytes
-        )
+        bytes_per_page = Qwen314BModelRunner._kv_bytes_per_page(config, runtime)
         kv_bytes = num_pages * bytes_per_page
 
         # Simpler ring-heap arena — from env (matches _compute_kv_cache_pages).
