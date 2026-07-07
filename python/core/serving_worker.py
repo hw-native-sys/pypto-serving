@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -402,6 +403,17 @@ def _worker_entry(
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     for _n in ("simpler_setup", "pypto", "simpler"):
         logging.getLogger(_n).setLevel(logging.WARNING)
+
+    # Spawned workers do not inherit the parent's logging config; configure a
+    # stderr handler so per-stage progress logs (weight load, preflight) are
+    # visible alongside kernel/perf output.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s.%(msecs)03d %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+        force=True,
+    )
 
     worker = WorkerProcess(config, input_queue, output_queue)
     try:

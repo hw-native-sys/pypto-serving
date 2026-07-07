@@ -66,6 +66,41 @@ class ModelFormatLoader(Protocol):
         raise NotImplementedError
 
 
+def _load_safetensors_weight_map(model_dir: Path) -> dict[str, str]:
+    """Return the ``{tensor_name: shard_filename}`` map from a safetensors index.
+
+    Reads ``model.safetensors.index.json`` when present; otherwise synthesizes a
+    flat map from every ``*.safetensors`` shard in the directory (each shard
+    owning all of its tensors, which is only correct for the single-shard case).
+    Shared by every format loader that needs checkpoint layout without reading
+    tensor payloads.
+    """
+    index_path = model_dir / "model.safetensors.index.json"
+    if index_path.exists():
+        index_data = json.loads(index_path.read_text())
+        return dict(index_data.get("weight_map", {}))
+    shards = sorted(path.name for path in model_dir.glob("*.safetensors"))
+    if not shards:
+        raise FileNotFoundError(f"No .safetensors files found in {model_dir}")
+    if len(shards) == 1:
+        try:
+            from safetensors import safe_open
+
+            with safe_open(str(model_dir / shards[0]), framework="pt", device="cpu") as reader:
+                return {name: shards[0] for name in reader.keys()}
+        except ImportError:
+            raise RuntimeError("safetensors is required to read weight names from a single-shard checkpoint.")
+    raise FileNotFoundError(
+        f"{model_dir} has multiple safetensors shards but no model.safetensors.index.json; "
+        "the index is required to map tensor names to shards."
+    )
+
+
+def _safetensors_shard_filenames(weight_map: dict[str, str]) -> list[str]:
+    """Return the sorted unique shard filenames referenced by a weight map."""
+    return sorted(set(weight_map.values()))
+
+
 def _load_safetensors_dir(model_dir: Path) -> dict[str, torch.Tensor]:
     """Load all safetensors shards from a local Hugging Face directory."""
     try:
@@ -73,15 +108,8 @@ def _load_safetensors_dir(model_dir: Path) -> dict[str, torch.Tensor]:
     except ImportError as exc:
         raise RuntimeError("safetensors is required to load weights from a local model directory.") from exc
 
-    index_path = model_dir / "model.safetensors.index.json"
-    if index_path.exists():
-        index_data = json.loads(index_path.read_text())
-        filenames = sorted(set(index_data["weight_map"].values()))
-    else:
-        filenames = sorted(path.name for path in model_dir.glob("*.safetensors"))
-    if not filenames:
-        raise FileNotFoundError(f"No .safetensors files found in {model_dir}")
-
+    weight_map = _load_safetensors_weight_map(model_dir)
+    filenames = _safetensors_shard_filenames(weight_map)
     state_dict: dict[str, torch.Tensor] = {}
     for filename in filenames:
         state_dict.update(load_file(str(model_dir / filename)))
@@ -101,6 +129,20 @@ def _optional_tensor(state_dict: dict[str, torch.Tensor], names: list[str]) -> t
         if name in state_dict:
             return state_dict[name]
     return None
+
+
+def _build_tokenizer(model_path: Path, *, trust_remote_code: bool = False) -> TokenizerAdapter:
+    """Build a tokenizer adapter, preferring a fast ``tokenizer.json`` when present.
+
+    Shared by every format loader so new models do not re-implement the
+    ``tokenizer.json``-first, ``from_pretrained``-fallback heuristic.
+    """
+    if (model_path / "tokenizer.json").exists():
+        return TransformersTokenizerAdapter.from_tokenizer_file(str(model_path))
+    return TransformersTokenizerAdapter.from_pretrained(
+        str(model_path),
+        trust_remote_code=trust_remote_code,
+    )
 
 
 def _build_model_config(model_id: str, config_data: dict, tokenizer: TokenizerAdapter) -> ModelConfig:
@@ -188,10 +230,7 @@ class HuggingFaceDirectoryLoader:
             raise FileNotFoundError(f"Missing config.json in {model_path}")
 
         trust_remote_code = bool(request.loader_options.get("trust_remote_code", False))
-        tokenizer = TransformersTokenizerAdapter.from_pretrained(
-            str(model_path),
-            trust_remote_code=trust_remote_code,
-        )
+        tokenizer = _build_tokenizer(model_path, trust_remote_code=trust_remote_code)
         _mark("load_tokenizer")
         config_data = json.loads(config_path.read_text())
         config = _build_model_config(request.model_id, config_data, tokenizer)
@@ -318,18 +357,11 @@ class DeepSeekV4W8A8DirectoryLoader:
             )
 
         trust_remote_code = bool(request.loader_options.get("trust_remote_code", False))
-        if (model_path / "tokenizer.json").exists():
-            tokenizer = TransformersTokenizerAdapter.from_tokenizer_file(str(model_path))
-        else:
-            tokenizer = TransformersTokenizerAdapter.from_pretrained(
-                str(model_path),
-                trust_remote_code=trust_remote_code,
-            )
+        tokenizer = _build_tokenizer(model_path, trust_remote_code=trust_remote_code)
         config = _build_deepseek_v4_model_config(request.model_id, config_data, tokenizer)
         runtime = request.runtime_config or RuntimeConfig(max_seq_len=min(config.max_position_embeddings, 8192))
         layer_specs = _build_layer_specs(config)
-        index_data = json.loads(index_path.read_text())
-        weight_map = dict(index_data.get("weight_map", {}))
+        weight_map = _load_safetensors_weight_map(model_path)
         _validate_deepseek_v4_weight_index(weight_map, config_data)
 
         placeholder = torch.empty(0, config.hidden_size, dtype=torch.bfloat16)

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import math
+import logging
 import os
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
@@ -26,11 +27,14 @@ from python.core.types import (
     DecodeBatch,
     DecodeResult,
     ModelConfig,
+    ModelRecord,
     PrefillBatch,
     PrefillResult,
     RuntimeConfig,
     RuntimeModel,
 )
+
+logger = logging.getLogger(__name__)
 
 
 DEEPSEEK_V4_RANKS = 8
@@ -905,6 +909,17 @@ class DeepSeekV4ModelRunner(ModelRunner):
         if request_ids:
             self._prefill_cache_snapshots.clear()
             self._decode_cache_seeded_slots.clear()
+
+    def preflight(self, record: ModelRecord) -> None:
+        """Eagerly load all W8A8 weights and stage shared buffers before ready.
+
+        DeepSeekV4 defers safetensors reads and layer-stacking to first inference
+        by design (the model loader only parses config/index). Move that work
+        here so the serving worker only signals ready once weights are fully
+        materialized, matching the Qwen eager-load contract. ``_ensure_l3_shared_buffers``
+        is idempotent, so the first real request still takes the same fast path.
+        """
+        self._ensure_l3_shared_buffers(record.runtime_model)
 
     def load_packed_global_weights(self) -> DeepSeekV4GlobalWeights:
         """Load global tensors and pack the LM head for host-side projection."""

@@ -53,16 +53,22 @@ class PyptoExecutor(ModelExecutor, ABC):
         self._runners: dict[str, ModelRunner] = {}
         self._compiled: dict[str, object] = {}
 
-    def register_model(self, model_id: str, record: ModelRecord) -> int:
+    def register_model(self, model_id: str, record: ModelRecord) -> None:
         """Compile kernels for ``record`` and attach a runner to ``model_id``.
 
         Returns the number of KV cache pages allocated on the device so the
         caller can synchronise host-side block metadata.
         """
         print("[register_model] compiling kernels …", flush=True)
+    def register_model(self, model_id: str, record: ModelRecord) -> None:
+        """Compile kernels for ``record`` and attach a runner to ``model_id``."""
+        import time
+
         with profile_span("PyptoExecutor.register_model", cat="executor", args={"model_id": model_id}):
+            start_t0 = time.perf_counter()
             compiled = self._compile_model(record.runtime_model)
             runner = self._create_runner(model_id, compiled)
+
             try:
                 num_pages = runner.init_kv_cache(model_id, record.config, record.runtime)
             except Exception:
@@ -70,7 +76,14 @@ class PyptoExecutor(ModelExecutor, ABC):
                 if callable(close):
                     close()
                 raise
-            self._compiled[model_id] = compiled
+
+            with profile_span("PyptoExecutor.preflight", cat="executor", args={"model_id": model_id}):
+                runner.preflight(record)
+            logger.info(
+                "PyptoExecutor %s: model loaded (%.1fs total)",
+                model_id,
+                time.perf_counter() - start_t0,
+            )
             self._runners[model_id] = runner
         return num_pages
 

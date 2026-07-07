@@ -27,7 +27,7 @@ from .types import RuntimeConfig, StepOutput, WorkerCommand
 from .serving_worker import spawn_worker
 
 logger = logging.getLogger(__name__)
-_DEFAULT_WORKER_INIT_TIMEOUT_SECONDS = 600.0
+_DEFAULT_WORKER_INIT_TIMEOUT_SECONDS = 1800.0
 _DEFAULT_WORKER_STEP_TIMEOUT_SECONDS = 300.0
 _DEFAULT_DEEPSEEK_V4_WORKER_STEP_TIMEOUT_SECONDS = 1200.0
 
@@ -178,9 +178,13 @@ class ReplicaEngineCore:
 
             logger.info("Waiting for worker to initialize model...")
             try:
-                ready = await asyncio.to_thread(ready_event.wait, timeout=600)
+                init_timeout = _worker_init_timeout_seconds()
+                ready = await asyncio.to_thread(ready_event.wait, timeout=init_timeout)
                 if not ready:
-                    raise RuntimeError("Worker failed to initialize within timeout")
+                    raise RuntimeError(
+                        f"Worker failed to initialize within {init_timeout:g}s timeout; "
+                        "set PYPTO_WORKER_INIT_TIMEOUT to allow more time for large checkpoints"
+                    )
             except BaseException:
                 await asyncio.to_thread(self._shutdown_worker, timeout=5)
                 raise

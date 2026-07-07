@@ -21,6 +21,7 @@ from .types import (
     DecodeBatch,
     DecodeResult,
     ModelConfig,
+    ModelRecord,
     PrefillBatch,
     PrefillResult,
     RuntimeConfig,
@@ -90,6 +91,17 @@ class ModelRunner(ABC):
             self._free_kv_cache_tensor(pool.key_pages)
             self._free_kv_cache_tensor(pool.value_pages)
         self._kv_caches.clear()
+
+    def preflight(self, record: ModelRecord) -> None:
+        """Eagerly materialize weights and shared buffers before the worker signals ready.
+
+        Called once by ``PyptoExecutor.register_model`` after ``init_kv_cache``,
+        before the serving worker sets its ready event. Runners whose weights are
+        already loaded by the model loader (e.g. HuggingFace eager load) inherit
+        this no-op; runners that defer weight reads to first inference override
+        it so the serving "ready" contract means weights are fully loaded.
+        """
+        del record
 
     @abstractmethod
     def _alloc_kv_cache_tensor(self, shape: tuple[int, ...], dtype: torch.dtype) -> DeviceTensor:
