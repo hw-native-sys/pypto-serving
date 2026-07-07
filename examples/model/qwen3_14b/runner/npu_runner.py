@@ -449,7 +449,7 @@ class Qwen314BModelRunner(ModelRunner):
         self._run_distributed_program(
             compiled.prefill,
             *self._prefill_kernel_args(
-                prefill_inputs, kv_cache.key_pages, kv_cache.value_pages,
+                prefill_inputs, kv_cache,
                 compiled.prefill_logits_buffer,
             ),
         )
@@ -479,7 +479,7 @@ class Qwen314BModelRunner(ModelRunner):
         t0 = time.perf_counter()
         self._run_distributed_program(
             compiled.decode,
-            *self._decode_kernel_args(decode_kernel_inputs, kv_cache.key_pages, kv_cache.value_pages),
+            *self._decode_kernel_args(decode_kernel_inputs, kv_cache),
         )
         logger.info(f"[warmup] decode done ({time.perf_counter() - t0:.2f} s)")
 
@@ -579,6 +579,16 @@ class Qwen314BModelRunner(ModelRunner):
                 name: self._static_device_tensor(tensor)
                 for name, tensor in compiled.decode_weights.items()
             },
+            rot_matrices=(
+                self._static_device_tensor(compiled.rot_matrices)
+                if compiled.rot_matrices is not None
+                else None
+            ),
+            tq_codebook=(
+                self._static_device_tensor(compiled.tq_codebook)
+                if compiled.tq_codebook is not None
+                else None
+            ),
         )
 
     def _require_static_args(self) -> _StaticKernelArgs:
@@ -595,13 +605,12 @@ class Qwen314BModelRunner(ModelRunner):
         logits_padded = compiled.prefill_logits_buffer
 
         kv_cache = self._materialize_kv_cache(model)
-        k_cache = kv_cache.key_pages
-        v_cache = kv_cache.value_pages
-        self._validate_kv_cache_bounds(model, prefill_inputs.block_table, prefill_inputs.slot_mapping, k_cache)
+        bound_cache = kv_cache.quant_k_pages if self._compiled.tq_mode else kv_cache.key_pages
+        self._validate_kv_cache_bounds(model, prefill_inputs.block_table, prefill_inputs.slot_mapping, bound_cache)
 
         self._run_distributed_program(
             compiled.prefill,
-            *self._prefill_kernel_args(prefill_inputs, k_cache, v_cache, logits_padded),
+            *self._prefill_kernel_args(prefill_inputs, kv_cache, logits_padded),
         )
 
         for batch_idx, alloc in enumerate(batch.kv_allocations):
@@ -644,18 +653,17 @@ class Qwen314BModelRunner(ModelRunner):
         kv_cache = self._kv_caches.get(model_id)
         if kv_cache is None:
             raise RuntimeError(f"KV cache for model {model_id!r} is not initialized")
-        k_cache = kv_cache.key_pages
-        v_cache = kv_cache.value_pages
+        bound_cache = kv_cache.quant_k_pages if self._compiled.tq_mode else kv_cache.key_pages
 
         kernel_inputs = self._pad_decode_inputs(model, decode_inputs)
 
         # Padded block_table / slot_mapping only ever reference row 0's
         # already-valid pages, so bound-check exactly what the kernel will read.
-        self._validate_kv_cache_bounds(model, kernel_inputs.block_table, kernel_inputs.slot_mapping, k_cache)
+        self._validate_kv_cache_bounds(model, kernel_inputs.block_table, kernel_inputs.slot_mapping, bound_cache)
 
         self._run_distributed_program(
             compiled.decode,
-            *self._decode_kernel_args(kernel_inputs, k_cache, v_cache),
+            *self._decode_kernel_args(kernel_inputs, kv_cache),
         )
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
@@ -725,13 +733,44 @@ class Qwen314BModelRunner(ModelRunner):
     def _prefill_kernel_args(
         self,
         inputs: _PrefillInputs,
-        k_cache: DeviceTensor,
-        v_cache: DeviceTensor,
+        kv_cache: Any,
         logits: torch.Tensor,
     ) -> tuple[Any, ...]:
-        """Return arguments in ``qwen3_prefill_host`` signature order."""
+        """Return arguments in ``qwen3_prefill_host`` (or ``_tq_host``) order."""
         static = self._require_static_args()
         weights = static.decode_weights
+        if self._compiled.tq_mode:
+            # qwen3_prefill_tq_host: 26 params, no chunk_lens/offsets; uint8
+            # quantized K/V caches + (cache_rows,1) FP32 scales; rotation
+            # matrices + codebook; weight order wo, post_rms, w_gate, w_up, w_down.
+            return (
+                inputs.hidden,
+                inputs.seq_lens,
+                weights["decode_input_rms_weight"],
+                weights["decode_wq"],
+                weights["decode_wk"],
+                weights["decode_wv"],
+                weights["decode_q_norm_weight"],
+                weights["decode_k_norm_weight"],
+                static.rope_cos,
+                static.rope_sin,
+                inputs.block_table,
+                inputs.slot_mapping,
+                kv_cache.quant_k_pages,
+                kv_cache.quant_v_pages,
+                kv_cache.k_scales_pages,
+                kv_cache.v_scales_pages,
+                static.rot_matrices,
+                static.tq_codebook,
+                weights["decode_wo"],
+                weights["decode_post_rms_weight"],
+                weights["decode_w_gate"],
+                weights["decode_w_up"],
+                weights["decode_w_down"],
+                static.final_norm_weight,
+                static.padded_lm_head_weight,
+                logits,
+            )
         return (
             inputs.hidden,
             inputs.seq_lens,
@@ -747,8 +786,8 @@ class Qwen314BModelRunner(ModelRunner):
             static.rope_sin,
             inputs.block_table,
             inputs.slot_mapping,
-            k_cache,
-            v_cache,
+            kv_cache.key_pages,
+            kv_cache.value_pages,
             weights["decode_wo"],
             weights["decode_w_gate"],
             weights["decode_w_up"],
@@ -762,12 +801,43 @@ class Qwen314BModelRunner(ModelRunner):
     def _decode_kernel_args(
         self,
         inputs: _DecodeKernelInputs,
-        k_cache: DeviceTensor,
-        v_cache: DeviceTensor,
+        kv_cache: Any,
     ) -> tuple[Any, ...]:
-        """Return arguments in ``qwen3_decode_host`` signature order."""
+        """Return arguments in ``qwen3_decode_host`` (or ``_tq_host``) order."""
         static = self._require_static_args()
         weights = static.decode_weights
+        if self._compiled.tq_mode:
+            # qwen3_decode_tq_host: 26 params. No device-side embed/token_ids/
+            # sampled buffers (TQ samples on CPU); uint8 quantized caches +
+            # scales + rotation/codebook; weight order wo, post_rms, w_gate...
+            return (
+                inputs.hidden,
+                weights["decode_input_rms_weight"],
+                weights["decode_wq"],
+                weights["decode_wk"],
+                weights["decode_wv"],
+                weights["decode_q_norm_weight"],
+                weights["decode_k_norm_weight"],
+                inputs.seq_lens,
+                inputs.block_table,
+                inputs.slot_mapping,
+                static.rope_cos,
+                static.rope_sin,
+                kv_cache.quant_k_pages,
+                kv_cache.quant_v_pages,
+                kv_cache.k_scales_pages,
+                kv_cache.v_scales_pages,
+                static.rot_matrices,
+                static.tq_codebook,
+                weights["decode_wo"],
+                weights["decode_post_rms_weight"],
+                weights["decode_w_gate"],
+                weights["decode_w_up"],
+                weights["decode_w_down"],
+                static.final_norm_weight,
+                static.padded_lm_head_weight,
+                inputs.logits,
+            )
         return (
             inputs.hidden,
             weights["decode_input_rms_weight"],
@@ -781,8 +851,8 @@ class Qwen314BModelRunner(ModelRunner):
             inputs.slot_mapping,
             static.rope_cos,
             static.rope_sin,
-            k_cache,
-            v_cache,
+            kv_cache.key_pages,
+            kv_cache.value_pages,
             weights["decode_wo"],
             weights["decode_w_gate"],
             weights["decode_w_up"],
