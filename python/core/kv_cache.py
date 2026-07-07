@@ -198,6 +198,14 @@ class KvCacheManager:
         # total_kv_pages explicitly to cover simultaneous workspace demand.
         kv_quant_config = runtime.kv_quant_config
         num_pages = runtime.total_kv_pages
+        if num_pages is None and kv_quant_config is not None and kv_quant_config.enabled:
+            # NOTE: The fused NPU decode kernel has the per-layer cache stride
+            # (num_pages * num_kv_heads * page_size) baked in at compile time.
+            # Reducing the page count would cause incorrect layer offsets and a
+            # device hang.  Keep the full page count; TurboQuant saves memory by
+            # compressing old tokens in-place (freeing bf16 pages back to the
+            # pool for reuse by *other* requests on the same model).
+            num_pages = runtime.max_batch_size * max_blocks_per_seq
         if num_pages is None:
             num_pages = runtime.max_batch_size * max_blocks_per_seq
         self._init_blocks(num_pages, runtime.page_size)
