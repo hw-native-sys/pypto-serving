@@ -6,13 +6,12 @@ Provides per-layer compressors with asymmetric key/value bit-widths.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 
-from .lloyd_max import LloydMaxCodebook
+from .lloyd_max import get_codebook, limited_cpu_threads
 
 
 def _generate_rotation_matrix(d: int, seed: int, device: str = "cpu") -> torch.Tensor:
@@ -27,6 +26,29 @@ def _generate_rotation_matrix(d: int, seed: int, device: str = "cpu") -> torch.T
     return Q.to(device)
 
 
+def _generate_rotation_matrices(
+    seeds: list[int], d: int, device: str = "cpu"
+) -> torch.Tensor:
+    """Generate orthogonal rotation matrices for many seeds in one batched QR.
+
+    Batching is essential on hosts with many CPU cores: torch dispatches small
+    per-matrix QR calls across all cores, and the thread-contention overhead on
+    128x128 matrices dominates wall time (observed ~140 ms/matrix at 320 threads
+    vs <2 ms batched). Returns a (len(seeds), d, d) tensor.
+    """
+    mats = []
+    for seed in seeds:
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(seed)
+        mats.append(torch.randn(d, d, generator=gen))
+    G = torch.stack(mats)  # (N, d, d)
+    with limited_cpu_threads():
+        Q, R = torch.linalg.qr(G)  # batched QR
+    diag_sign = torch.sign(torch.diagonal(R, dim1=1, dim2=2))  # (N, d)
+    diag_sign[diag_sign == 0] = 1.0
+    return (Q * diag_sign.unsqueeze(1)).to(device)  # (N, d, d)
+
+
 class MSECompressor:
     """Single-stage MSE-optimal compressor for one side (keys or values).
 
@@ -34,13 +56,26 @@ class MSECompressor:
     and stores bit-packed indices + norms.
     """
 
-    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu"):
+    def __init__(
+        self,
+        head_dim: int,
+        bits: int,
+        seed: int,
+        device: str = "cpu",
+        rotation: torch.Tensor | None = None,
+    ):
         self.head_dim = head_dim
         self.bits = bits
         self.device = device
 
-        self.Pi = _generate_rotation_matrix(head_dim, seed=seed, device=device)
-        self.centroids = LloydMaxCodebook(head_dim, bits).centroids.to(device)
+        # Allow callers that batch many rotation matrices (e.g. KVCompressor) to
+        # pass a precomputed matrix and skip the per-instance QR.
+        self.Pi = (
+            rotation
+            if rotation is not None
+            else _generate_rotation_matrix(head_dim, seed=seed, device=device)
+        )
+        self.centroids = get_codebook(head_dim, bits).centroids.to(device)
 
     @torch.no_grad()
     def compress(self, states: torch.Tensor) -> dict:
@@ -144,6 +179,15 @@ class KVCompressor:
         self.key_compressors: list[MSECompressor] = []
         self.val_compressors: list[MSECompressor] = []
 
+        # Precompute every layer's key/value rotation matrix in a single batched
+        # QR (see _generate_rotation_matrices). seeds are interleaved key, val.
+        rotation_seeds: list[int] = []
+        for layer_idx in range(num_layers):
+            seed_base = seed + layer_idx * 1000
+            rotation_seeds.append(seed_base)        # key
+            rotation_seeds.append(seed_base + 500)  # val
+        rotations = _generate_rotation_matrices(rotation_seeds, head_dim, device=device)
+
         for layer_idx in range(num_layers):
             is_protected = (
                 layer_idx < config.protected_layers
@@ -154,12 +198,23 @@ class KVCompressor:
             effective_key_bits = min(effective_key_bits, 8)
             effective_val_bits = min(effective_val_bits, 8)
 
-            seed_base = seed + layer_idx * 1000
             self.key_compressors.append(
-                MSECompressor(head_dim, effective_key_bits, seed=seed_base, device=device)
+                MSECompressor(
+                    head_dim,
+                    effective_key_bits,
+                    seed=rotation_seeds[2 * layer_idx],
+                    device=device,
+                    rotation=rotations[2 * layer_idx],
+                )
             )
             self.val_compressors.append(
-                MSECompressor(head_dim, effective_val_bits, seed=seed_base + 500, device=device)
+                MSECompressor(
+                    head_dim,
+                    effective_val_bits,
+                    seed=rotation_seeds[2 * layer_idx + 1],
+                    device=device,
+                    rotation=rotations[2 * layer_idx + 1],
+                )
             )
 
     @torch.no_grad()
