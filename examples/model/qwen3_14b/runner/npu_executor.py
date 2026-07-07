@@ -126,13 +126,20 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
 
     @property
     def supports_device_sampling(self) -> bool:
-        """Qwen3 NPU runner can return greedy sampled token ids."""
-        return True
+        """Qwen3 NPU runner can return greedy sampled token ids.
+
+        Non-TQ only: TurboQuant does not compile the device sampling/embedding
+        kernels (greedy_sample/token_embed), it samples on the CPU instead.
+        """
+        return not self._tq_mode
 
     @property
     def supports_device_embedding(self) -> bool:
-        """Qwen3 NPU decode embeds greedy token ids inside the device kernel."""
-        return True
+        """Qwen3 NPU decode embeds greedy token ids inside the device kernel.
+
+        Non-TQ only (see supports_device_sampling).
+        """
+        return not self._tq_mode
 
     def _create_runner(self, model_id: str, compiled: object) -> ModelRunner:
         """Create the Qwen3-14B runtime runner for compiled kernels."""

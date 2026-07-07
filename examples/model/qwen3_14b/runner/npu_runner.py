@@ -896,12 +896,18 @@ class Qwen314BModelRunner(ModelRunner):
         if worker is None:
             from pypto.runtime import DistributedWorker  # noqa: PLC0415
 
-            worker = DistributedWorker([
+            # greedy_sample / token_embed are None in TQ mode (TQ samples on
+            # CPU); worker.run dispatches by compiled-program reference, so the
+            # program set may omit them without changing prefill/decode indexing.
+            programs = [
                 self._compiled.prefill.compiled,
                 self._compiled.decode.compiled,
-                self._compiled.greedy_sample.compiled,
-                self._compiled.token_embed.compiled,
-            ])
+            ]
+            if self._compiled.greedy_sample is not None:
+                programs.append(self._compiled.greedy_sample.compiled)
+            if self._compiled.token_embed is not None:
+                programs.append(self._compiled.token_embed.compiled)
+            worker = DistributedWorker(programs)
             self._l3_worker = worker
         return worker
 
