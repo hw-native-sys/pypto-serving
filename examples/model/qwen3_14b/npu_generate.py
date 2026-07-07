@@ -478,10 +478,6 @@ def main() -> None:
                 kv_quant_config=KvQuantConfig(enabled=True) if args.tq_mode else None,
                 npu_memory_utilization=args.npu_memory_utilization,
                 max_num_batched_tokens=args.max_num_batched_tokens,
-                # Conservative default — the decode kernel is compiled
-                # with this baked-in shape and cannot be resized later.
-                # 200 pages x 128 tokens = 25 600 tokens total capacity.
-                total_kv_pages=200,
             ),
         )
         if collector is not None:
