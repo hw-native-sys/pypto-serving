@@ -33,6 +33,7 @@ _bootstrap_package_root()
 
 from python.core import GenerateConfig, LLMEngine, RuntimeConfig
 from python.core.kv_cache import KvCacheManager
+from python.core.parallel import ParallelConfig, parse_device_ids
 from python.profile import get_profiler, merge_profile, profile_span
 from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
 from python.core.types import KvQuantConfig, LoadedModel
@@ -345,9 +346,46 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt", required=True, help="Prompt text.")
     parser.add_argument("--model-id", default="qwen3-14b-local")
     parser.add_argument("--platform", default="a2a3", choices=["a2a3sim", "a2a3", "a5sim", "a5"])
-    parser.add_argument("--device-id", type=int, default=0)
+    parser.add_argument("--device-id", type=int, default=0, help="Default NPU device id when --devices is unset.")
+    parser.add_argument(
+        "--devices",
+        default=None,
+        help="Comma-separated NPU device ids for one tensor-parallel L3 worker group. Overrides --device-id.",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size",
+        "--tp",
+        type=int,
+        default=1,
+        help="Tensor-parallel group size.",
+    )
+    parser.add_argument(
+        "--data-parallel-size",
+        "--dp",
+        type=int,
+        default=1,
+        help="Offline generation does not launch DP replicas; values > 1 fail fast.",
+    )
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--max-num-seqs", type=int, default=16, help="Max batch size / concurrent requests.")
+    parser.add_argument("--block-size", type=int, default=128, help="KV cache page size.")
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=4096,
+        help="Total tokens per scheduling step (used by warmup). NOTE: the 40-layer "
+        "fused prefill deadlocks the single-die ring-heap above ~415 total tokens, "
+        "so set this low enough that the per-request count stays under the ceiling.",
+    )
+    parser.add_argument(
+        "--npu-memory-utilization",
+        type=float,
+        default=0.90,
+        help="Fraction of total NPU HBM the server is allowed to use (weights + KV).",
+    )
+    parser.add_argument("--dtype", default="bfloat16", help="Weight data type.")
+    parser.add_argument("--kv-cache-dtype", default="bfloat16", help="KV cache data type.")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=None)
@@ -383,6 +421,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    for _n in ("simpler_setup", "pypto", "simpler"):
+        logging.getLogger(_n).setLevel(logging.WARNING)
     get_profiler(process_name="npu_generate")
     model_dir = Path(args.model_dir).resolve()
     if not model_dir.is_dir():
@@ -390,12 +432,23 @@ def main() -> None:
 
     profile_enabled = args.profile or args.profile_verbose
     collector = _TimingCollector() if profile_enabled else None
+    parallel_config = ParallelConfig(
+        data_parallel_size=args.data_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+        devices=parse_device_ids(args.devices, default_device=args.device_id),
+    )
+    if parallel_config.data_parallel_size != 1:
+        raise ValueError(
+            "offline npu_generate.py uses the single-process LLMEngine and does not launch "
+            "serving replicas; data_parallel_size must be 1"
+        )
+    device_ids = parallel_config.replica_device_groups[0]
 
     kv_cache_manager = KvCacheManager()
     executor = PyptoExecutor(
         kv_cache_manager,
         platform=args.platform,
-        device_id=args.device_id,
+        device_ids=device_ids,
         save_kernels_dir=args.save_kernels_dir,
         l3_trace=args.profile_verbose,
         tq_mode=args.tq_mode,
@@ -415,14 +468,22 @@ def main() -> None:
             model_dir=str(model_dir),
             model_format="huggingface",
             runtime_config=RuntimeConfig(
-                page_size=128,
-                max_batch_size=16,
+                page_size=args.block_size,
+                max_batch_size=args.max_num_seqs,
                 max_seq_len=args.max_seq_len,
                 max_new_tokens=args.max_new_tokens,
                 device="cpu",
                 kv_dtype="bfloat16",
                 weight_dtype="bfloat16",
                 kv_quant_config=KvQuantConfig(enabled=True) if args.tq_mode else None,
+                kv_dtype=args.kv_cache_dtype,
+                weight_dtype=args.dtype,
+                npu_memory_utilization=args.npu_memory_utilization,
+                max_num_batched_tokens=args.max_num_batched_tokens,
+                # Conservative default — the decode kernel is compiled
+                # with this baked-in shape and cannot be resized later.
+                # 200 pages x 128 tokens = 25 600 tokens total capacity.
+                total_kv_pages=200,
             ),
         )
         if collector is not None:

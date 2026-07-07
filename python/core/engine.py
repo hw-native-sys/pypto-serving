@@ -187,6 +187,11 @@ class LLMEngine:
                 )
 
             max_prompt_len = max(len(token_ids) for token_ids in prompt_token_ids)
+            allow_device_greedy_sampling = (
+                generate_config.temperature <= 0.0
+                and self._executor.supports_device_sampling
+                and self._executor.supports_device_embedding
+            )
             token_tensor = torch.zeros(
                 (len(prompt_token_ids), max_prompt_len),
                 dtype=torch.long,
@@ -214,6 +219,7 @@ class LLMEngine:
                     dtype=torch.int32,
                     device=runtime_model.runtime.device,
                 ),
+                allow_device_greedy_sampling=allow_device_greedy_sampling,
                 kv_allocations=allocations,
             )
             fast_path_result = self._executor.try_generate_batch(
@@ -230,16 +236,20 @@ class LLMEngine:
                     runtime_model,
                     prefill_batch,
                 )
+                prefill_logits = prefill_result.logits
+                prefill_sampled_token_ids = (
+                    prefill_result.sampled_token_ids
+                    if allow_device_greedy_sampling
+                    else None
+                )
 
                 sampling_params = self._sampler.from_generate_config(generate_config)
-                current_tokens = []
-                for batch_idx in range(len(requests)):
-                    current_tokens.append(
-                        self._sampler.sample(
-                            self._select_batch_row(prefill_result.logits, batch_idx),
-                            sampling_params,
-                        )
-                    )
+                current_tokens = self._sample_batch_rows(
+                    prefill_logits,
+                    sampling_params,
+                    len(requests),
+                    prefill_sampled_token_ids,
+                )
                 active_indices = list(range(len(requests)))
                 finish_reasons = ["length"] * len(requests)
 
@@ -278,7 +288,10 @@ class LLMEngine:
                         dtype=torch.long,
                         device=runtime_model.runtime.device,
                     )
-                    decode_embeddings = self._executor.lookup_embeddings(runtime_model, decode_token_tensor)
+                    decode_embeddings = self._decode_embeddings_from_cache_or_lookup(
+                        runtime_model,
+                        decode_token_tensor,
+                    )
                     active_allocations = []
                     for idx in next_active:
                         alloc = requests[idx].kv_allocation
@@ -296,14 +309,18 @@ class LLMEngine:
                                 dtype=torch.int32,
                                 device=runtime_model.runtime.device,
                             ),
+                            allow_device_greedy_sampling=allow_device_greedy_sampling,
                             kv_allocations=active_allocations,
                         ),
                     )
+                    decoded_tokens = self._sample_batch_rows(
+                        decode_result.logits,
+                        sampling_params,
+                        len(next_active),
+                        decode_result.sampled_token_ids if allow_device_greedy_sampling else None,
+                    )
                     for row_idx, request_idx in enumerate(next_active):
-                        current_tokens[request_idx] = self._sampler.sample(
-                            self._select_batch_row(decode_result.logits, row_idx),
-                            sampling_params,
-                        )
+                        current_tokens[request_idx] = decoded_tokens[row_idx]
                     active_indices = next_active
         finally:
             for alloc in allocations:
@@ -415,6 +432,43 @@ class LLMEngine:
     def _generate_result(self, model_id: str, prompt: str, config: GenerateConfig) -> GenerateResult:
         """Generate one result by reusing the batch path."""
         return self.generate_batch(model_id, [prompt], config)[0]
+
+    def _sample_batch_rows(
+        self,
+        logits: torch.Tensor,
+        sampling_params,
+        row_count: int,
+        sampled_token_ids: torch.Tensor | None = None,
+    ) -> list[int]:
+        """Return sampled token IDs, preferring executor-provided device samples."""
+        if sampled_token_ids is not None:
+            flat_ids = sampled_token_ids.view(-1)
+            if flat_ids.numel() < row_count:
+                raise ValueError(
+                    f"sampled_token_ids has {flat_ids.numel()} rows, expected at least {row_count}"
+                )
+            return [int(flat_ids[idx].item()) for idx in range(row_count)]
+        return [
+            self._sampler.sample(
+                self._select_batch_row(logits, row_idx),
+                sampling_params,
+            )
+            for row_idx in range(row_count)
+        ]
+
+    def _decode_embeddings_from_cache_or_lookup(
+        self,
+        runtime_model,
+        decode_token_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build decode hidden states; device-embedding executors only need a placeholder."""
+        if self._executor.supports_device_embedding:
+            return torch.zeros(
+                (decode_token_tensor.shape[0], runtime_model.config.hidden_size),
+                dtype=runtime_model.embed_tokens.dtype,
+                device=decode_token_tensor.device,
+            )
+        return self._executor.lookup_embeddings(runtime_model, decode_token_tensor)
 
     @staticmethod
     def _select_batch_row(tensor: torch.Tensor, row_idx: int) -> torch.Tensor:

@@ -69,8 +69,8 @@ class TransformersTokenizerAdapter(TokenizerAdapter):
         return list(self.tokenizer.encode(text, add_special_tokens=False))
 
     def decode(self, token_ids: list[int]) -> str:
-        """Decode token IDs without stripping special tokens."""
-        return self.tokenizer.decode(token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        """Decode token IDs, stripping special tokens (EOS / pad / im_end ...) from output."""
+        return self.tokenizer.decode(token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
 
     @property
     def bos_token_id(self) -> int | None:

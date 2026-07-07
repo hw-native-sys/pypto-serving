@@ -52,15 +52,31 @@ class ModelRunner(ABC):
         self._kv_caches: dict[str, _KvCachePool] = {}
 
     def init_kv_cache(
-        self, model_id: str, config: ModelConfig, runtime: RuntimeConfig
-    ) -> None:
-        """Create the paged KV cache directly in runner-owned device memory."""
+        self, model_id: str, config: ModelConfig, runtime: RuntimeConfig,
+        *, num_pages: int | None = None,
+    ) -> int:
+        """Create the paged KV cache directly in runner-owned device memory.
+
+        When *num_pages* is ``None`` (default), the total page count is derived
+        from ``runtime.total_kv_pages`` or the static capacity formula.  NPU
+        runners should pass an explicit value computed from available device
+        memory after model weights have been uploaded.
+
+        Returns the number of pages allocated.
+        """
         if model_id in self._kv_caches:
-            return
+            cache_rows = self._kv_caches[model_id].key_pages.shape[0]
+            pages = cache_rows // (
+                config.num_hidden_layers * config.num_key_value_heads * runtime.page_size
+            )
+            return pages
         max_blocks_per_seq = math.ceil(runtime.max_seq_len / runtime.page_size)
-        num_pages = runtime.total_kv_pages
         if num_pages is None:
             num_pages = runtime.max_batch_size * max_blocks_per_seq
+            num_pages = runtime.total_kv_pages
+            if num_pages is None:
+                num_pages = runtime.max_batch_size * max_blocks_per_seq
+        kv_dtype = getattr(torch, runtime.kv_dtype)
         cache_rows = config.num_hidden_layers * num_pages * config.num_key_value_heads * runtime.page_size
         cache_shape = (
             cache_rows,
@@ -110,6 +126,7 @@ class ModelRunner(ABC):
             key_pages=key_pages,
             value_pages=value_pages,
         )
+        return num_pages
 
     def close_kv_cache(self) -> None:
         """Release all runner-owned KV cache tensors."""
@@ -137,6 +154,15 @@ class ModelRunner(ABC):
     def _free_kv_cache_tensor(self, tensor: DeviceTensor) -> None:
         """Free one worker-resident KV cache tensor."""
         raise NotImplementedError
+
+    def warmup(self, model: RuntimeModel) -> None:
+        """Run a minimal prefill + decode to warm up device kernels.
+
+        The default implementation is a no-op.  NPU runners should override
+        this to dispatch one dummy prefill and one dummy decode so that all
+        device kernels are compiled and cached before the first real request.
+        """
+        del model  # unused in the default no-op
 
     @abstractmethod
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:

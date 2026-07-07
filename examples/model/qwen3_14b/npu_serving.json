@@ -22,8 +22,12 @@
   },
   "npu": {
     "platform": "a2a3",
-    "device_id": 0,
     "save_kernels_dir": null,
     "l3": false
+  },
+  "parallel": {
+    "devices": [0],
+    "data_parallel_size": 1,
+    "tensor_parallel_size": 1
   }
 }

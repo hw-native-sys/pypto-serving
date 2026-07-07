@@ -27,3 +27,6 @@ profile_out/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Platform build dir
+platform/build

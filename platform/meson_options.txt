@@ -1,0 +1,18 @@
+option('engines',
+       type : 'array',
+       choices : [ 'mpi' ],
+       description : 'Specifies which engines enable distributed execution',
+       value: [ 'mpi' ]
+)
+
+option('buildExamples', type : 'boolean', value : false,
+       description: 'Indicates whether to build example apps'
+)
+
+option('buildTests', type : 'boolean', value : false,
+       description: 'Indicates whether to build tests'
+)
+
+option('compileWarningsAsErrors', type : 'boolean', value : false,
+       description: 'Indicates whether a compilation warning should result in a fatal error. This is useful for CI testing but may result in inconveniences for normal users, hence it should be false by default'
+)

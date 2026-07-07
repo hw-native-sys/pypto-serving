@@ -7,8 +7,19 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+from .async_engine import AsyncLLMEngine, EngineConfig, ReplicaEngineCore
 from .engine import LLMEngine
 from .model_loader import ModelLoader
+from .parallel import ParallelConfig
 from .types import GenerateConfig, RuntimeConfig
 
-__all__ = ["GenerateConfig", "LLMEngine", "ModelLoader", "RuntimeConfig"]
+__all__ = [
+    "AsyncLLMEngine",
+    "EngineConfig",
+    "GenerateConfig",
+    "LLMEngine",
+    "ModelLoader",
+    "ParallelConfig",
+    "ReplicaEngineCore",
+    "RuntimeConfig",
+]

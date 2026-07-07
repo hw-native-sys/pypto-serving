@@ -45,6 +45,21 @@ class ModelExecutor(ABC):
         """Return whether model loading and execution should emit stage timings."""
         return False
 
+    @property
+    def supports_device_sampling(self) -> bool:
+        """Return whether executor results may include already-sampled token IDs."""
+        return False
+
+    @property
+    def supports_device_embedding(self) -> bool:
+        """Return whether decode token embedding can be handled inside the device kernel.
+
+        When true, callers may pass a same-shape placeholder hidden tensor for
+        decode because the executor's decode kernel is responsible for gathering
+        the current token embedding from ``DecodeBatch.token_ids``.
+        """
+        return False
+
     def lookup_embeddings(self, model: RuntimeModel, token_ids: torch.Tensor) -> torch.Tensor:
         """Return embedding rows for ``token_ids`` on the model runtime device."""
         token_ids = token_ids.to(device=model.runtime.device, dtype=torch.long)

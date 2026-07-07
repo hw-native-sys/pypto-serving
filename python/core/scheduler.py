@@ -9,12 +9,15 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from .kv_cache import KvCacheManager
+
+logger = logging.getLogger(__name__)
 
 
 class RequestStatus(Enum):
@@ -64,6 +67,7 @@ class Request:
     cached_block_ids: list[int] = field(default_factory=list)
     allocated_block_ids: list[int] = field(default_factory=list)
     block_hashes: list[int] = field(default_factory=list)
+    num_blocks_cached: int = 0  # Track how many blocks have been published to prefix cache
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -127,8 +131,35 @@ class Scheduler:
         self.requests: dict[str, Request] = {}
 
     def add_request(self, request: Request) -> None:
-        if len(request.prompt_token_ids) > self.config.max_seq_len:
-            request.prompt_token_ids = request.prompt_token_ids[: self.config.max_seq_len]
+        prompt_len = len(request.prompt_token_ids)
+        max_seq_len = self.config.max_seq_len
+        if prompt_len > max_seq_len:
+            # vLLM-style: reject rather than silently truncate. A prompt that
+            # cannot fit max_seq_len can never be served, so failing loudly is
+            # safer than silently dropping the tail of the prompt.
+            raise ValueError(
+                f"Request {request.request_id} prompt length {prompt_len} "
+                f"exceeds max_seq_len {max_seq_len}; request rejected."
+            )
+        # Cap generation so prompt + generated tokens never exceed max_seq_len
+        # (vLLM-style: effective max_tokens = max_seq_len - prompt_len). This
+        # keeps every request within the KV-cache capacity budgeted per request
+        # and avoids overflow-driven preemption.
+        remaining = max_seq_len - prompt_len
+        if remaining <= 0:
+            raise ValueError(
+                f"Request {request.request_id} prompt length {prompt_len} "
+                f"leaves no room for generation within max_seq_len {max_seq_len}; "
+                f"request rejected."
+            )
+        if request.max_new_tokens > remaining:
+            logger.warning(
+                "Request %s: capping max_new_tokens %d -> %d to fit max_seq_len %d "
+                "(prompt_len=%d).",
+                request.request_id, request.max_new_tokens, remaining,
+                max_seq_len, prompt_len,
+            )
+            request.max_new_tokens = remaining
         if self.config.enable_prefix_cache:
             request.block_hashes = self.kv_cache_manager.compute_block_hashes(request.prompt_token_ids)
         request.status = RequestStatus.WAITING
@@ -229,6 +260,7 @@ class Scheduler:
                 if cached_blocks:
                     request.cached_block_ids = [b.block_id for b in cached_blocks]
                     request.num_computed_tokens = len(cached_blocks) * self.kv_cache_manager.block_size
+                    request.num_blocks_cached = len(cached_blocks)  # Mark cached blocks as already published
             else:
                 cached_blocks = []
 
@@ -238,8 +270,15 @@ class Scheduler:
             num_new = min(num_new, token_budget)
 
             if num_new <= 0:
-                remaining_waiting.append(request)
-                continue
+                # Full prefix-cache hit: leave 1 token for prefill so the
+                # output uses the SAME kernel as the cold run (prefill, not
+                # decode), producing identical first generated token.
+                if request.num_computed_tokens >= request.num_prompt_tokens:
+                    request.num_computed_tokens = max(0, request.num_prompt_tokens - 1)
+                    num_new = 1
+                else:
+                    remaining_waiting.append(request)
+                    continue
 
             num_blocks_needed = self._blocks_needed(request, num_new)
             if not self._try_allocate_blocks(request, num_blocks_needed):
@@ -386,6 +425,7 @@ class Scheduler:
         victim.num_computed_tokens = 0
         victim.cached_block_ids = []
         victim.allocated_block_ids = []
+        victim.num_blocks_cached = 0
         self.running = [r for r in self.running if r.request_id != victim.request_id]
         self.waiting.appendleft(victim)
         return {"request": victim, "returned_tokens": returned_tokens}
@@ -402,8 +442,13 @@ class Scheduler:
         """Register completed blocks in the prefix cache."""
         if not self.config.enable_prefix_cache:
             return
-        total_blocks_computed = request.num_computed_tokens // self.kv_cache_manager.block_size
-        already_cached = len(request.cached_block_ids)
+        total_blocks_computed = min(
+            request.num_computed_tokens // self.kv_cache_manager.block_size,
+            len(request.block_hashes)
+        )
+        already_cached = request.num_blocks_cached
+        if total_blocks_computed <= already_cached:
+            return  # Nothing new to cache
         all_block_ids = request.cached_block_ids + request.allocated_block_ids
         self.kv_cache_manager.cache_block_ids(
             all_block_ids,
@@ -411,3 +456,4 @@ class Scheduler:
             already_cached,
             total_blocks_computed,
         )
+        request.num_blocks_cached = total_blocks_computed

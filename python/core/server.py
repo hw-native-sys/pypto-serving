@@ -57,6 +57,7 @@ class ChatCompletionRequest(BaseModel):
     top_k: int | None = None
     stop: list[str] | None = None
     stream: bool = False
+    chat_template_kwargs: dict | None = None
 
 
 class CompletionChoice(BaseModel):
@@ -95,7 +96,18 @@ class ServingServer:
         self.engine = async_engine
         self.model_id = model_id
         self.app = FastAPI(title="PyPTO Serving")
+        self._register_exception_handlers()
         self._register_routes()
+
+    def _register_exception_handlers(self) -> None:
+        # Surface scheduler/engine rejections (e.g. a prompt longer than
+        # max_seq_len) as a clean HTTP 400 instead of an unhandled 500.
+        @self.app.exception_handler(ValueError)
+        async def _value_error_handler(request, exc: ValueError) -> JSONResponse:  # noqa: ANN001
+            return JSONResponse(
+                status_code=400,
+                content={"object": "error", "message": str(exc)},
+            )
 
     def _register_routes(self) -> None:
         self.app.add_api_route("/health", self._health, methods=["GET"])
@@ -152,7 +164,7 @@ class ServingServer:
 
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-        prompt = self._apply_chat_template(request.messages)
+        prompt = self._apply_chat_template(request.messages, request.chat_template_kwargs)
         config = GenerateConfig(
             max_new_tokens=request.max_tokens,
             temperature=request.temperature,
@@ -251,18 +263,22 @@ class ServingServer:
                     yield "data: [DONE]\n\n"
                     break
 
-    def _apply_chat_template(self, messages: list[ChatMessage]) -> str:
-        """Simple chat template — can be replaced with tokenizer's chat_template."""
-        parts = []
-        for msg in messages:
-            if msg.role == "system":
-                parts.append(f"<|system|>\n{msg.content}")
-            elif msg.role == "user":
-                parts.append(f"<|user|>\n{msg.content}")
-            elif msg.role == "assistant":
-                parts.append(f"<|assistant|>\n{msg.content}")
-        parts.append("<|assistant|>\n")
-        return "\n".join(parts)
+    def _apply_chat_template(
+        self, messages: list[ChatMessage], chat_template_kwargs: dict | None = None,
+    ) -> str:
+        """Apply the model's official chat template, forwarding chat_template_kwargs.
+
+        ``chat_template_kwargs`` (e.g. ``{"enable_thinking": False}`` for Qwen3) is
+        passed straight through to ``apply_chat_template``, mirroring vLLM so clients
+        control thinking mode per request.
+        """
+        hf_messages = [{"role": m.role, "content": m.content} for m in messages]
+        kwargs: dict = {"tokenize": False, "add_generation_prompt": True}
+        if chat_template_kwargs:
+            kwargs.update(chat_template_kwargs)
+        kwargs["tokenize"] = False
+        kwargs["add_generation_prompt"] = True
+        return self.engine.tokenizer.tokenizer.apply_chat_template(hf_messages, **kwargs)
 
     @staticmethod
     def _map_finish_reason(reason: str) -> str:

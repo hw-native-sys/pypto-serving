@@ -29,7 +29,7 @@ git submodule update --init --recursive
 Run the main unit tests:
 
 ```bash
-python -m pytest tests/test_cli.py tests/test_batching.py
+python -m pytest tests/test_batching.py tests/test_parallel.py
 ```
 
 Run lint checks used by pre-commit:

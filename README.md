@@ -13,16 +13,31 @@ python/
   core/                        engine, scheduler, KV cache, model loading, async serving
   runtime/                     Simpler worker wrapper for NPU dispatch
 pypto-lib/                     submodule providing Qwen3-14B PyPTO kernels
+platform/                      C++ platform-management layer (engine lifecycle, channels, modules)
 examples/
   pypto-serving                executable CLI wrapper
   model/qwen3_14b/
-    cpu_generate.py            CPU reference generation example
     npu_generate.py            NPU generation/profiling example
     npu_serving.json           sample serving config
     runner/                    Qwen3 executors and runner glue
-    src/                       PyPTO kernel/program builders
 tests/                         CLI, batching, E2E serving, and benchmark tests
 ```
+
+## Platform
+
+The `platform/` subtree is the first-party C++ platform-management layer for
+PyPTO Serving. It is separate from the Python model-serving path and manages
+distributed-system bootstrap, deployment metadata, channel lifecycle, module
+services, and instance lifecycle. Model support keeps ownership of LLM-specific
+behavior (batching, KV cache policy, token scheduling, sampling, execution),
+while the platform orchestrates and supervises instances without sitting in the
+per-token execution hot path.
+
+It is built around `serving::system::Engine`, which owns a set of
+`serving::modules::Module` instances and starts, supervises, and finalizes them
+across instances over RPC, using host-side channel primitives for control
+traffic. See [`platform/docs/README.md`](platform/docs/README.md) for the full
+design split, source layout, and runtime shape.
 
 ## Quick Checks
 
@@ -35,7 +50,7 @@ git submodule update --init --recursive
 Run the unit tests:
 
 ```bash
-python -m pytest tests/test_cli.py tests/test_batching.py
+python -m pytest tests/test_batching.py tests/test_parallel.py
 ```
 
 Show CLI help:
@@ -50,13 +65,13 @@ python -m python.cli --help
 One-shot generation:
 
 ```bash
-task-submit --device auto --max-time 0 --run \
-  "python examples/model/qwen3_14b/npu_generate.py \
-    --model-dir /path/to/Qwen3-14B \
-    --prompt 'Huawei is' \
-    --platform a2a3 \
-    --max-seq-len 512 \
-    --max-new-tokens 5"
+python examples/model/qwen3_14b/npu_generate.py \
+  --model-dir /path/to/Qwen3-14B \
+  --prompt 'Huawei is' \
+  --platform a2a3 \
+  --device-id 0 \
+  --max-seq-len 512 \
+  --max-new-tokens 5
 ```
 
 Offline generation does not require the larger PTO2 ring settings used for
@@ -66,31 +81,30 @@ Add `--profile` to print timing and write a Chrome trace when `SA_PROFILE_OUTPUT
 or `SA_PROFILE_LEVEL` is set:
 
 ```bash
-task-submit --device auto --max-time 0 --run \
-  "SA_PROFILE_OUTPUT=/tmp/pypto-serving-profile-offline SA_PROFILE_LEVEL=verbose \
-  python examples/model/qwen3_14b/npu_generate.py \
-    --model-dir /path/to/Qwen3-14B \
-    --prompt 'Huawei is' \
-    --platform a2a3 \
-    --max-seq-len 512 \
-    --max-new-tokens 5 \
-    --profile"
+SA_PROFILE_OUTPUT=/tmp/pypto-serving-profile-offline SA_PROFILE_LEVEL=verbose \
+python examples/model/qwen3_14b/npu_generate.py \
+  --model-dir /path/to/Qwen3-14B \
+  --prompt 'Huawei is' \
+  --platform a2a3 \
+  --device-id 0 \
+  --max-seq-len 512 \
+  --max-new-tokens 5 \
+  --profile
 ```
 
 ## HTTP Serving (OpenAI-compatible API)
 
-Start the serving server with a multiprocess worker. When launching through
-`task-submit`, keep `--device {}` so the selected NPU ID is substituted into the
-server command:
+Start the serving server with a multiprocess worker:
 
 ```bash
-task-submit --device auto --run \
-  "python -m python.cli.main \
-    --model /path/to/Qwen3-14B \
-    --backend npu \
-    --platform a2a3 \
-    --device {} \
-    --port 8899"
+python -m python.cli.main \
+  --model /path/to/Qwen3-14B \
+  --backend npu \
+  --platform a2a3 \
+  --device 0 \
+  --max-model-len 512 \
+  --max-new-tokens 16 \
+  --port 8899
 ```
 
 Send a generation request after the server logs `Application startup complete`:
@@ -121,28 +135,11 @@ Run the serving benchmark:
 python tests/bench_serving.py --port 8899 --stream -n 8 -c 4 --max-tokens 16
 ```
 
-Single-request HTTP serving does not require the larger PTO2 ring settings. For
-concurrent NPU serving, start the server with the larger PTO2 ring settings:
-
-```bash
-task-submit --device auto --run \
-  "PTO2_RING_HEAP=4294967296 PTO2_RING_TASK_WINDOW=1048576 PTO2_RING_DEP_POOL=1048576 \
-  python -m python.cli.main \
-    --model /path/to/Qwen3-14B \
-    --backend npu \
-    --platform a2a3 \
-    --device {} \
-    --port 8899"
-```
-
-Without these settings, multi-request serving may return HTTP 200 while
-generating no tokens and logging worker runtime failures such as `rtMalloc
-failed: 207001`, `507018`, or `507046`.
-
 ## Notes
 
 - All model/device/runtime options are passed via CLI arguments. Run
-  `python -m python.cli.main --help` for the full list.
+  `python python/cli/main.py --help` for the full list.
+- Parallel serving development notes live in `docs/dev/parallel.md`.
 - Generated kernel artifacts are written under `build_output/` and are ignored
   by git.
 - This repository expects PyPTO, CANN, torch, safetensors, transformers, and the

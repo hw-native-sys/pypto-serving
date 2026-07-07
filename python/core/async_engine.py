@@ -10,14 +10,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import queue
 import time
-from collections.abc import AsyncGenerator
-from dataclasses import dataclass, field
+from collections.abc import AsyncGenerator, Sequence
+from dataclasses import dataclass, field, replace
+from typing import Callable
 
 from .kv_cache import KvCacheManager
 from python.profile import profile_instant, profile_span
+from .parallel import ParallelConfig
 from .scheduler import Request, RequestStatus, Scheduler, SchedulerConfig, SchedulerOutput
 from .types import RuntimeConfig, StepOutput, WorkerCommand
 from .serving_worker import spawn_worker
@@ -34,6 +37,9 @@ class EngineConfig:
     # Device / executor
     platform: str = "a2a3"
     device_id: int = 0
+    device_ids: tuple[int, ...] = ()
+    parallel_config: ParallelConfig | None = None
+    dp_rank: int = 0
     executor_cls: str = "PyptoQwen14BExecutor"
     executor_kwargs: dict = field(default_factory=dict)
 
@@ -50,6 +56,22 @@ class EngineConfig:
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
 
+    def worker_device_ids(self) -> tuple[int, ...]:
+        """Return the device ids this engine worker should own."""
+        if self.parallel_config is not None:
+            groups = self.parallel_config.replica_device_groups
+            if len(groups) == 1:
+                return groups[0]
+            if 0 <= self.dp_rank < len(groups):
+                return groups[self.dp_rank]
+            raise ValueError(
+                f"dp_rank {self.dp_rank} is outside configured replica groups: "
+                f"{len(groups)}"
+            )
+        if self.device_ids:
+            return tuple(int(device) for device in self.device_ids)
+        return (int(self.device_id),)
+
 
 @dataclass
 class _RequestContext:
@@ -65,12 +87,13 @@ class TokenOutput:
     finish_reason: str = ""
 
 
-class AsyncLLMEngine:
-    """Async engine with multiprocess worker for NPU execution.
+class ReplicaEngineCore:
+    """Engine core for one serving replica.
 
-    Architecture:
-      Main process: scheduler + API serving + output processing
-      Worker process: NPU device + model execution (single-card, extensible to multi-card)
+    A core owns all mutable serving state for one replica: one scheduler, one
+    KV cache manager, one worker process, one executor/model runtime, and one
+    tensor-parallel device group. Requests assigned to this core are scheduled
+    only against this core's local KV cache and worker state.
     """
 
     def __init__(
@@ -87,10 +110,12 @@ class AsyncLLMEngine:
 
         runtime = self.config.runtime_config or RuntimeConfig()
         block_size = runtime.page_size
-        max_blocks_per_seq = (runtime.max_seq_len + block_size - 1) // block_size
-        num_blocks = runtime.total_kv_pages or runtime.max_batch_size * max_blocks_per_seq
+        self._runtime = runtime
+        # Block metadata is initialised lazily after the worker reports the
+        # actual device-side KV cache page count (computed from remaining
+        # NPU memory after model weight upload).
         self.kv_cache_manager = KvCacheManager(
-            num_blocks=num_blocks,
+            num_blocks=None,
             block_size=block_size,
             enable_prefix_cache=self.config.enable_prefix_cache,
         )
@@ -118,20 +143,37 @@ class AsyncLLMEngine:
     async def start(self) -> None:
         """Start worker process and engine loop."""
         with profile_span("AsyncLLMEngine.start", cat="serving"):
-            process, input_q, output_q, ready_event = spawn_worker(self.config)
+            process, input_q, output_q, ready_event, num_pages_value = spawn_worker(self.config)
             self._worker_process = process
             self._input_queue = input_q
             self._output_queue = output_q
 
             logger.info("Waiting for worker to initialize model...")
-            await asyncio.to_thread(ready_event.wait, timeout=600)
-            if not ready_event.is_set():
-                raise RuntimeError("Worker failed to initialize within timeout")
+            try:
+                ready = await asyncio.to_thread(ready_event.wait, timeout=600)
+                if not ready:
+                    raise RuntimeError("Worker failed to initialize within timeout")
+            except BaseException:
+                self._shutdown_worker(timeout=5)
+                raise
             logger.info("Worker ready")
+
+            # Synchronise block metadata with the actual device-side KV cache size.
+            actual_num_pages = num_pages_value.value
+            if actual_num_pages <= 0:
+                raise RuntimeError(
+                    f"Worker reported invalid KV cache page count: {actual_num_pages}"
+                )
+            self.kv_cache_manager._init_blocks(actual_num_pages, self._runtime.page_size)
+            logger.info(
+                "KV cache block pool initialised: num_blocks=%d, block_size=%d",
+                actual_num_pages,
+                self._runtime.page_size,
+            )
 
         self._running = True
         self._loop_task = asyncio.create_task(self._engine_loop())
-        logger.info("AsyncLLMEngine started")
+        logger.info("ReplicaEngineCore started")
 
     async def stop(self) -> None:
         """Stop engine loop and worker process."""
@@ -140,35 +182,43 @@ class AsyncLLMEngine:
             await self._loop_task
             self._loop_task = None
 
-        if self._input_queue is not None:
-            self._input_queue.put(WorkerCommand(type="shutdown"))
-
-        if self._worker_process is not None:
-            self._worker_process.join(timeout=30)
-            if self._worker_process.is_alive():
-                self._worker_process.terminate()
-            self._worker_process = None
-        logger.info("AsyncLLMEngine stopped")
+        self._shutdown_worker(timeout=30)
+        logger.info("ReplicaEngineCore stopped")
 
     def generate_request_id(self) -> str:
         self._request_counter += 1
         return f"serving-req-{self._request_counter}"
+
+    def pending_token_load(self) -> int:
+        """Estimate unfinished work for routing new data-parallel requests."""
+        load = 0
+        for request in self.scheduler.requests.values():
+            if request.status.is_finished:
+                continue
+            prompt_remaining = max(0, request.num_prompt_tokens - request.num_computed_tokens)
+            generation_remaining = max(0, request.max_new_tokens - len(request.output_token_ids))
+            load += prompt_remaining + generation_remaining
+        return load
 
     async def add_request(
         self,
         request_id: str,
         prompt: str,
         config,
+        *,
+        on_queued: Callable[[], None] | None = None,
+        prompt_token_ids: Sequence[int] | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
         if self.tokenizer is None:
             raise RuntimeError("Tokenizer is required for request processing")
         with profile_span(
-            "AsyncLLMEngine.add_request",
+            "ReplicaEngineCore.add_request",
             cat="serving",
             args={"request_id": request_id, "max_new_tokens": config.max_new_tokens},
         ):
-            prompt_token_ids = self.tokenizer.encode(prompt)
+            if prompt_token_ids is None:
+                prompt_token_ids = self.tokenizer.encode(prompt)
             if not prompt_token_ids and self.bos_token_id is not None:
                 prompt_token_ids = [self.bos_token_id]
             if not prompt_token_ids:
@@ -189,6 +239,12 @@ class AsyncLLMEngine:
             ctx = _RequestContext(request=request)
             self._request_contexts[request_id] = ctx
             self.scheduler.add_request(request)
+            logger.info(
+                "request %s received: prompt=%d tokens, max_new_tokens=%d",
+                request_id, len(prompt_token_ids), config.max_new_tokens,
+            )
+            if on_queued is not None:
+                on_queued()
             profile_instant(
                 "request.queued",
                 cat="serving",
@@ -200,6 +256,13 @@ class AsyncLLMEngine:
                 output: TokenOutput = await ctx.queue.get()
                 yield output
                 if output.finished:
+                    e2e = time.time() - request.arrival_time
+                    n_out = len(request.output_token_ids)
+                    logger.info(
+                        "request %s finished: prompt=%d out=%d reason=%s e2e=%.2fs (%.1f tok/s)",
+                        request_id, len(prompt_token_ids), n_out, output.finish_reason,
+                        e2e, (n_out / e2e) if e2e > 0 else 0.0,
+                    )
                     break
         finally:
             if request_id in self._request_contexts:
@@ -314,3 +377,191 @@ class AsyncLLMEngine:
                     TokenOutput(finished=True, finish_reason="error")
                 )
             self.scheduler.abort_request(sr.request.request_id)
+
+    def _shutdown_worker(self, *, timeout: float) -> None:
+        input_q = self._input_queue
+        process = self._worker_process
+
+        if input_q is not None:
+            with contextlib.suppress(Exception):
+                input_q.put(WorkerCommand(type="shutdown"))
+
+        if process is not None:
+            with contextlib.suppress(Exception):
+                process.join(timeout=timeout)
+            with contextlib.suppress(Exception):
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=1)
+
+        self._worker_process = None
+        self._input_queue = None
+        self._output_queue = None
+
+
+class AsyncLLMEngine:
+    """Async serving engine that routes requests across replica cores.
+
+    The engine owns one or more ``ReplicaEngineCore`` instances and exposes the
+    server-facing async API: ``start``, ``stop``, ``add_request``,
+    ``abort_request``, and ``generate_request_id``. For ``data_parallel_size=1``
+    it wraps a single core. For DP>1 it selects a core for each request and
+    records request placement so aborts are sent to the correct replica.
+    """
+
+    def __init__(
+        self,
+        config: EngineConfig,
+        tokenizer=None,
+        eos_token_id: int | None = None,
+        bos_token_id: int | None = None,
+        *,
+        core_factory: Callable[..., ReplicaEngineCore] = ReplicaEngineCore,
+    ) -> None:
+        parallel = config.parallel_config
+        if parallel is None:
+            worker_devices = config.worker_device_ids()
+            parallel = ParallelConfig(
+                tensor_parallel_size=len(worker_devices),
+                devices=worker_devices,
+            )
+            config = replace(config, parallel_config=parallel)
+
+        self.config = config
+        self.tokenizer = tokenizer
+        self.eos_token_id = eos_token_id
+        self.bos_token_id = bos_token_id
+        self.parallel_config = parallel
+        self._request_counter = 0
+        self._route_counter = 0
+        self._request_to_replica: dict[str, int] = {}
+        self._route_extra_load = [0 for _ in parallel.replica_device_groups]
+        self._cores: list[ReplicaEngineCore] = []
+
+        for dp_rank, device_group in enumerate(parallel.replica_device_groups):
+            replica_parallel = parallel.for_replica(device_group)
+            replica_config = replace(
+                config,
+                device_id=device_group[0],
+                parallel_config=replica_parallel,
+                dp_rank=dp_rank,
+            )
+            self._cores.append(
+                core_factory(
+                    config=replica_config,
+                    tokenizer=tokenizer,
+                    eos_token_id=eos_token_id,
+                    bos_token_id=bos_token_id,
+                )
+            )
+
+    async def start(self) -> None:
+        """Start all DP engine cores in parallel."""
+        tasks = [asyncio.create_task(core.start()) for core in self._cores]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await self.stop()
+            raise
+
+    async def stop(self) -> None:
+        """Stop all DP engine cores."""
+        for core in reversed(self._cores):
+            await core.stop()
+
+    def generate_request_id(self) -> str:
+        self._request_counter += 1
+        return f"serving-req-{self._request_counter}"
+
+    def pending_token_load(self) -> int:
+        return sum(core.pending_token_load() for core in self._cores)
+
+    @property
+    def scheduler(self) -> Scheduler:
+        return self._single_core().scheduler
+
+    @property
+    def kv_cache_manager(self) -> KvCacheManager:
+        return self._single_core().kv_cache_manager
+
+    async def add_request(
+        self,
+        request_id: str,
+        prompt: str,
+        config,
+    ) -> AsyncGenerator[TokenOutput, None]:
+        replica_idx = self._select_replica()
+        prompt_token_ids = self._tokenize_prompt(prompt)
+        request_load = self._estimate_request_load(prompt_token_ids, config)
+        self._route_extra_load[replica_idx] += request_load
+        self._request_to_replica[request_id] = replica_idx
+        route_extra_active = True
+
+        def clear_route_extra_load() -> None:
+            nonlocal route_extra_active
+            if not route_extra_active:
+                return
+            self._route_extra_load[replica_idx] = max(
+                0,
+                self._route_extra_load[replica_idx] - request_load,
+            )
+            route_extra_active = False
+
+        try:
+            core = self._cores[replica_idx]
+            async for output in core.add_request(
+                request_id,
+                prompt,
+                config,
+                on_queued=clear_route_extra_load,
+                prompt_token_ids=prompt_token_ids,
+            ):
+                yield output
+        finally:
+            self._request_to_replica.pop(request_id, None)
+            clear_route_extra_load()
+
+    async def abort_request(self, request_id: str) -> None:
+        replica_idx = self._request_to_replica.get(request_id)
+        if replica_idx is not None:
+            await self._cores[replica_idx].abort_request(request_id)
+            return
+        for core in self._cores:
+            await core.abort_request(request_id)
+
+    def _select_replica(self) -> int:
+        loads = [
+            core.pending_token_load() + self._route_extra_load[idx]
+            for idx, core in enumerate(self._cores)
+        ]
+        replica_count = len(self._cores)
+        ordered = [
+            (loads[idx], (idx - self._route_counter) % replica_count, idx)
+            for idx in range(replica_count)
+        ]
+        replica_idx = min(ordered)[2]
+        self._route_counter = (replica_idx + 1) % replica_count
+        return replica_idx
+
+    def _single_core(self):
+        if len(self._cores) != 1:
+            raise AttributeError("scheduler and kv_cache_manager are only exposed for single-replica engines")
+        return self._cores[0]
+
+    def _tokenize_prompt(self, prompt: str) -> Sequence[int] | None:
+        if self.tokenizer is not None:
+            prompt_token_ids = self.tokenizer.encode(prompt)
+            if not prompt_token_ids and self.bos_token_id is not None:
+                prompt_token_ids = [self.bos_token_id]
+            if not prompt_token_ids:
+                raise ValueError("Prompt tokenization produced no tokens.")
+            return prompt_token_ids
+        return None
+
+    def _estimate_request_load(self, prompt_token_ids: Sequence[int] | None, config) -> int:
+        prompt_tokens = len(prompt_token_ids) if prompt_token_ids is not None else 0
+        return prompt_tokens + int(getattr(config, "max_new_tokens", 0))

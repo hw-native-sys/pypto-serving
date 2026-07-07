@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 from python.profile import get_profiler, merge_profile
 
 RuntimeConfig = None
+ParallelConfig = None
+parse_device_ids = None
 
 
 _VALID_BACKENDS = {"npu"}
@@ -42,16 +44,47 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend", default="npu", choices=sorted(_VALID_BACKENDS), help="Inference backend (default: npu).")
     parser.add_argument("--platform", default="a2a3", help="NPU platform (default: a2a3).")
     parser.add_argument("--device", type=int, default=0, help="NPU device ID (default: 0).")
+    parser.add_argument(
+        "--devices",
+        default=None,
+        help="Comma-separated NPU device ids for DP x TP placement, for example 0,1,2,3.",
+    )
+    parser.add_argument(
+        "--data-parallel-size",
+        "--dp",
+        type=int,
+        default=1,
+        help="Data-parallel replica count.",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size",
+        "--tp",
+        type=int,
+        default=1,
+        help="Tensor-parallel group size.",
+    )
+    parser.add_argument(
+        "--data-parallel-routing",
+        default="least_pending_tokens",
+        choices=["least_pending_tokens"],
+        help="Data-parallel request routing policy.",
+    )
     # Dtype
-    parser.add_argument("--dtype", default="float32", help="Weight data type (default: float32).")
+    parser.add_argument("--dtype", default="bfloat16", help="Weight data type (default: bfloat16).")
     parser.add_argument("--kv-cache-dtype", default="bfloat16", help="KV cache data type. 'auto' follows --dtype (default: bfloat16).")
 
     # Runtime
-    parser.add_argument("--max-model-len", type=int, default=512, help="Maximum sequence length (default: 512).")
+    parser.add_argument("--max-model-len", type=int, default=1024, help="Maximum sequence length (prompt + generated; default: 1024).")
     parser.add_argument("--block-size", type=int, default=128, help="KV cache block size (default: 128).")
+    parser.add_argument(
+        "--npu-memory-utilization",
+        type=float,
+        default=0.90,
+        help="Fraction of total NPU HBM the server is allowed to use "
+        "(weights + activations + KV cache). Default: 0.90.",
+    )
 
     # Generation
-    parser.add_argument("--max-new-tokens", type=int, default=32, help="Maximum new tokens to generate (default: 32).")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (default: 0.0).")
     parser.add_argument("--top-p", type=float, default=1.0, help="Nucleus sampling probability (default: 1.0).")
     parser.add_argument("--top-k", type=int, default=None, help="Top-k sampling cutoff (default: disabled).")
@@ -107,12 +140,22 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
 
     model_dir = str(Path(args.model).resolve())
     executor_kwargs = _build_executor_kwargs(args)
+    executor_kwargs = _build_executor_kwargs()
+    devices = parse_device_ids(args.devices, default_device=args.device)
+    parallel_config = ParallelConfig(
+        data_parallel_size=args.data_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+        devices=devices,
+        data_parallel_routing=args.data_parallel_routing,
+    )
+    first_group = parallel_config.replica_device_groups[0]
 
     return EngineConfig(
         model_id=args.served_model_name or Path(args.model).name,
         model_dir=model_dir,
         platform=args.platform,
-        device_id=args.device,
+        device_id=first_group[0],
+        parallel_config=parallel_config,
         executor_cls="PyptoQwen14BExecutor",
         executor_kwargs=executor_kwargs,
         runtime_config=_build_runtime_config(args),
@@ -146,6 +189,8 @@ def _build_runtime_config(args: argparse.Namespace):
         weight_dtype=args.dtype,
         max_new_tokens=args.max_new_tokens,
         kv_quant_config=kv_quant_config,
+        npu_memory_utilization=args.npu_memory_utilization,
+        max_num_batched_tokens=args.max_num_batched_tokens,
     )
 
 
@@ -168,19 +213,22 @@ def run_serve(
     host: str = "0.0.0.0",
     port: int = 8000,
 ) -> None:
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    for _n in ("simpler_setup", "pypto", "simpler"):
+        logging.getLogger(_n).setLevel(logging.WARNING)
     try:
         import uvicorn
     except ImportError as e:
         raise ImportError("Serving mode requires uvicorn. Install with: pip install uvicorn") from e
 
-    from ..core.async_engine import AsyncLLMEngine
-    from ..core.server import create_serving_app
-    from ..core.tokenizer import TransformersTokenizerAdapter
+    from python.core.async_engine import AsyncLLMEngine
+    from python.core.server import create_serving_app
+    from python.core.tokenizer import TransformersTokenizerAdapter
 
     model_id = config.model_id
     get_profiler(process_name="pypto-serving-api")
     tokenizer = TransformersTokenizerAdapter.from_pretrained(config.model_dir)
-
     async_engine = AsyncLLMEngine(
         config=config,
         tokenizer=tokenizer,
@@ -201,7 +249,7 @@ def run_serve(
 
     print(f"Starting PyPTO serving on {host}:{port}")
     print(f"  Model: {model_id} (loaded in worker process)")
-    print(f"  Platform: {config.platform}, Device: {config.device_id}")
+    print(f"  Platform: {config.platform}, Device groups: {_format_device_groups(config)}")
     print(f"  Max running requests: {config.max_num_running_reqs}")
     print(f"  Max scheduled tokens/iter: {config.max_num_scheduled_tokens}")
     print(f"  Chunked prefill threshold: {config.long_prefill_token_threshold}")
@@ -210,6 +258,13 @@ def run_serve(
     print("  Endpoints: /v1/completions, /v1/chat/completions, /v1/models, /health")
 
     uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+def _format_device_groups(config: EngineConfig) -> str:
+    parallel_config = config.parallel_config
+    if parallel_config is None:
+        return str(list(config.worker_device_ids()))
+    return str([list(group) for group in parallel_config.replica_device_groups])
 
 
 def _validate_backend(backend: str) -> None:
@@ -233,7 +288,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _ensure_core_imports() -> None:
-    global RuntimeConfig
+    global ParallelConfig, RuntimeConfig, parse_device_ids
 
     if RuntimeConfig is None:
         try:
@@ -242,6 +297,16 @@ def _ensure_core_imports() -> None:
             from python.core import RuntimeConfig as imported_runtime_config
 
         RuntimeConfig = imported_runtime_config
+    if ParallelConfig is None or parse_device_ids is None:
+        try:
+            from ..core.parallel import ParallelConfig as imported_parallel_config
+            from ..core.parallel import parse_device_ids as imported_parse_device_ids
+        except ImportError:
+            from python.core.parallel import ParallelConfig as imported_parallel_config
+            from python.core.parallel import parse_device_ids as imported_parse_device_ids
+
+        ParallelConfig = imported_parallel_config
+        parse_device_ids = imported_parse_device_ids
 
 
 @contextlib.contextmanager

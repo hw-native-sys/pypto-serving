@@ -24,6 +24,7 @@ from typing import Any
 
 import torch
 from simpler.task_interface import DataType, Tensor
+from simpler.task_interface import DataType
 from simpler.worker import Worker as SimplerWorker
 
 

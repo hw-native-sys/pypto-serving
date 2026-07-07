@@ -1,3 +1,9 @@
 [submodule "pypto-lib"]
 	path = pypto-lib
 	url = https://github.com/hw-native-sys/pypto-lib.git
+[submodule "platform/extern/HiCR"]
+	path = platform/extern/HiCR
+	url = https://github.com/huawei-csl/HiCR.git
+[submodule "platform/extern/TaskR"]
+	path = platform/extern/TaskR
+	url = https://github.com/huawei-csl/TaskR.git
