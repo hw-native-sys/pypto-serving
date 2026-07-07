@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -104,7 +105,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         kv_cache_manager=None,
         *,
         platform: str = "a2a3sim",
-        device_id: int = 0,
+        device_ids: Sequence[int] = (0,),
         save_kernels_dir: str | None = None,
         l3_trace: bool = False,
         tq_mode: bool = False,
@@ -112,7 +113,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         super().__init__(
             kv_cache_manager,
             platform=platform,
-            device_id=device_id,
+            device_ids=device_ids,
             save_kernels_dir=save_kernels_dir,
         )
         self._l3_trace = l3_trace
@@ -123,12 +124,23 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         """Return whether compile and L3 execution timing logs are enabled."""
         return self._l3_trace
 
+    @property
+    def supports_device_sampling(self) -> bool:
+        """Qwen3 NPU runner can return greedy sampled token ids."""
+        return True
+
+    @property
+    def supports_device_embedding(self) -> bool:
+        """Qwen3 NPU decode embeds greedy token ids inside the device kernel."""
+        return True
+
     def _create_runner(self, model_id: str, compiled: object) -> ModelRunner:
         """Create the Qwen3-14B runtime runner for compiled kernels."""
         if not isinstance(compiled, _CompiledKernels):
             raise TypeError("Qwen314BPyptoExecutor requires Qwen3-14B compiled kernels.")
         return Qwen314BModelRunner(
             compiled=compiled,
+            device_id=self._device_ids[0],
             tq_mode=self._tq_mode,
         )
 
@@ -143,28 +155,38 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         def _mark(label: str) -> None:
             timer.mark(label)
 
-        # The fused all-layer decode lives in decode_layer.decode_fwd (the
-        # standalone decode_fwd.py module was removed in pypto-lib). It is now
-        # PAGED: it consumes block_table + slot_mapping and reads/writes the SAME
-        # device-resident paged KV pool prefill writes (self._kv_caches), so no
-        # contiguous bridge / MAX_SEQ env is needed.
         if self._tq_mode:
-            # TurboQuant: load the quantized prefill/decode kernels and bind
-            # them to the TQ host wrappers in qwen3_l3_dispatch.
+            # TurboQuant: load quantized prefill/decode kernels.
             qwen3_prefill_fwd = _load_pypto_lib_qwen14b_module("prefill_tq")
             qwen3_decode_layer = _load_pypto_lib_qwen14b_module("decode_tq")
             qwen3_l3_dispatch.prefill_fwd_tq = qwen3_prefill_fwd.prefill_fwd_tq
             qwen3_l3_dispatch.decode_fwd_tq = qwen3_decode_layer.decode_fwd_tq
         else:
             qwen3_prefill_fwd = _load_pypto_lib_qwen14b_module("prefill_fwd")
+            # The fused all-layer decode lives in decode_layer.decode_fwd.
             qwen3_decode_layer = _load_pypto_lib_qwen14b_module("decode_layer")
+            qwen3_greedy_sample = _load_pypto_lib_qwen14b_module("greedy_sample")
+            qwen3_token_embed = _load_pypto_lib_qwen14b_module("token_embed")
             qwen3_l3_dispatch.prefill_fwd = qwen3_prefill_fwd.prefill_fwd
             qwen3_l3_dispatch.decode_fwd = qwen3_decode_layer.decode_fwd
+            qwen3_l3_dispatch.greedy_sample_fwd = qwen3_greedy_sample.greedy_sample_fwd
+            qwen3_l3_dispatch.token_embed_fwd = qwen3_token_embed.token_embed_fwd
 
         _mark("imports")
 
         self._validate_supported_shape(model)
         kernel_batch = model.runtime.max_batch_size
+
+        kernel_max_seq = int(getattr(qwen3_decode_layer, "MAX_SEQ", 4096))
+        if model.runtime.max_seq_len > kernel_max_seq:
+            raise ValueError(
+                f"max_model_len {model.runtime.max_seq_len} exceeds the kernel's "
+                f"compile-time MAX_SEQ {kernel_max_seq} (config.py). The decode/prefill "
+                "kernels precompute MAX_CTX_BLOCKS, NUM_PAGES, and rope table sizes from "
+                "MAX_SEQ; a larger runtime value silently produces wrong attention and "
+                "out-of-bounds rope reads. Rebuild the kernel with a larger MAX_SEQ."
+            )
+
         if int(qwen3_decode_layer.BATCH) != kernel_batch:
             raise ValueError(
                 "decode_layer.decode_fwd is compiled for a fixed kernel BATCH of "
@@ -190,6 +212,42 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 f"{padded_vocab} (round_up({model.config.vocab_size}, {_VOCAB_PAD_MULTIPLE})); "
                 "they must match for the decode logits buffer / lm_head weight to line up."
             )
+        if model.config.vocab_size != int(qwen3_decode_layer.REAL_VOCAB):
+            raise ValueError(
+                "decode_layer.decode_fwd hard-codes REAL_VOCAB for padded-token masking, "
+                f"but the runtime model vocab_size is {model.config.vocab_size}; expected "
+                f"{int(qwen3_decode_layer.REAL_VOCAB)}."
+            )
+            if int(qwen3_greedy_sample.BATCH) != kernel_batch:
+                raise ValueError(
+                    "greedy_sample_fwd is compiled for a fixed kernel BATCH of "
+                    f"{int(qwen3_greedy_sample.BATCH)}, but runtime max_batch_size is {kernel_batch}."
+                )
+            if int(qwen3_greedy_sample.VOCAB) != padded_vocab:
+                raise ValueError(
+                    "greedy_sample_fwd VOCAB must match the padded logits vocab: "
+                    f"{int(qwen3_greedy_sample.VOCAB)} != {padded_vocab}."
+                )
+            if int(qwen3_token_embed.BATCH) != kernel_batch:
+                raise ValueError(
+                    "token_embed_fwd is compiled for a fixed kernel BATCH of "
+                    f"{int(qwen3_token_embed.BATCH)}, but runtime max_batch_size is {kernel_batch}."
+                )
+            if int(qwen3_token_embed.VOCAB) != padded_vocab:
+                raise ValueError(
+                    "token_embed_fwd VOCAB must match the padded embedding vocab: "
+                    f"{int(qwen3_token_embed.VOCAB)} != {padded_vocab}."
+                )
+            if int(qwen3_token_embed.HIDDEN) != model.config.hidden_size:
+                raise ValueError(
+                    "token_embed_fwd HIDDEN must match model hidden_size: "
+                    f"{int(qwen3_token_embed.HIDDEN)} != {model.config.hidden_size}."
+                )
+            sampled_ids_width = int(
+                getattr(qwen3_decode_layer, "SAMPLED_IDS_PAD", getattr(qwen3_greedy_sample, "SAMPLED_IDS_PAD", 1))
+            )
+        else:
+            sampled_ids_width = 1
         page_size = model.runtime.page_size
         max_blocks_per_seq = (model.runtime.max_seq_len + page_size - 1) // page_size
         if self._tq_mode:
@@ -237,6 +295,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 vocab_size=padded_vocab,
                 block_table_stride=max_blocks_per_seq,
                 page_size=page_size,
+                sampled_ids_width=sampled_ids_width,
             )
             _mark("compile_prefill")
             decode = self._compile_decode_fwd_callable(
@@ -252,8 +311,24 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 num_layers=model.config.num_hidden_layers,
                 vocab_size=padded_vocab,
                 page_size=page_size,
+                sampled_ids_width=sampled_ids_width,
             )
             _mark("compile_decode")
+            greedy_sample = self._compile_greedy_sample_callable(
+                qwen3_l3_dispatch.qwen3_greedy_sample_host,
+                batch=kernel_batch,
+                sampled_ids_width=sampled_ids_width,
+                vocab_size=padded_vocab,
+            )
+            _mark("compile_greedy_sample")
+            token_embed = self._compile_token_embed_callable(
+                qwen3_l3_dispatch.qwen3_token_embed_host,
+                batch=kernel_batch,
+                hidden_size=model.config.hidden_size,
+                sampled_ids_width=sampled_ids_width,
+                vocab_size=padded_vocab,
+            )
+            _mark("compile_token_embed")
         rope_cos_raw, rope_sin_raw = rope_tables(
             model.runtime.max_seq_len,
             model.config.head_dim,
@@ -266,39 +341,42 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
 
         # TurboQuant artifacts: per-layer random orthogonal rotation matrices
         # + a Lloyd-Max 4-bit codebook. Built only when tq_mode is enabled.
-        rot_matrices: torch.Tensor | None = None
-        tq_codebook: torch.Tensor | None = None
+        rot_matrices = None
+        tq_codebook = None
         if self._tq_mode:
-            head_dim = model.config.head_dim
-            num_layers = model.config.num_hidden_layers
+            hd_tq = model.config.head_dim
+            nl_tq = model.config.num_hidden_layers
             rot_list = []
-            for layer_idx in range(num_layers):
-                gen = torch.Generator(device="cpu").manual_seed(42 + layer_idx * 1000)
-                q_rot, r_rot = torch.linalg.qr(torch.randn(head_dim, head_dim, generator=gen))
-                diag_sign = torch.sign(torch.diag(r_rot))
-                diag_sign[diag_sign == 0] = 1.0
-                rot_list.append(q_rot * diag_sign.unsqueeze(0))
-            rot_matrices = self._shared_tensor(
-                torch.cat(rot_list, dim=0).to(torch.bfloat16).contiguous().cpu()
-            )
+            for _ in range(nl_tq):
+                rot = torch.randn(hd_tq, hd_tq)
+                q, _ = torch.linalg.qr(rot)
+                rot_list.append(q.to(torch.bfloat16))
+            rot_matrices = self._shared_tensor(torch.cat(rot_list, dim=0).contiguous().cpu())
             tq_mod = _load_pypto_lib_qwen14b_module("turboquant_kv")
-            centroids, _ = tq_mod.solve_lloyd_max(head_dim, bits=4)
+            centroids, _ = tq_mod.solve_lloyd_max(hd_tq, bits=4)
             tq_codebook = self._shared_tensor(
-                centroids.float().unsqueeze(0).contiguous().cpu()  # [1, 16]
+                torch.tensor(centroids, dtype=torch.float32).view(1, -1).cpu()
             )
             _mark("tq_artifacts")
 
         lm_head_weight = model.lm_head
         if padded_vocab != lm_head_weight.shape[0]:
             pad_rows = padded_vocab - lm_head_weight.shape[0]
-            padding = torch.zeros(
-                (pad_rows, lm_head_weight.shape[1]),
-                dtype=lm_head_weight.dtype,
-                device=lm_head_weight.device,
-            )
+            padding = lm_head_weight[:1].expand(pad_rows, -1).clone()
             lm_head_weight = torch.cat([lm_head_weight, padding], dim=0)
         padded_lm_head_weight = self._shared_tensor(lm_head_weight.to(torch.bfloat16).contiguous().cpu())
         _mark("pad_lm_head")
+        embed_weight = model.embed_tokens
+        if padded_vocab != embed_weight.shape[0]:
+            pad_rows = padded_vocab - embed_weight.shape[0]
+            padding = torch.zeros(
+                (pad_rows, embed_weight.shape[1]),
+                dtype=embed_weight.dtype,
+                device=embed_weight.device,
+            )
+            embed_weight = torch.cat([embed_weight, padding], dim=0)
+        padded_embed_weight = self._shared_tensor(embed_weight.to(torch.bfloat16).contiguous().cpu())
+        _mark("pad_embed")
         layers = []
         for layer in model.layers:
             layers.append(self._kernel_layer_weights(layer))
@@ -330,6 +408,14 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             (kernel_batch, padded_vocab),
             dtype=torch.float32,
         ).share_memory_()
+        prefill_sampled_ids_buffer = torch.empty(
+            (kernel_batch, sampled_ids_width),
+            dtype=torch.int32,
+        ).share_memory_()
+        prefill_next_hidden_buffer = torch.empty(
+            (kernel_batch, model.config.hidden_size),
+            dtype=torch.bfloat16,
+        ).share_memory_()
         _mark("prefill_buffers")
         decode_logits_buffer = torch.empty(
             (kernel_batch, padded_vocab),
@@ -345,18 +431,36 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             dtype=torch.int32,
         ).share_memory_()
         decode_slot_mapping_buffer = torch.empty((kernel_batch,), dtype=torch.int32).share_memory_()
+        decode_token_ids_buffer = torch.empty(
+            (kernel_batch, sampled_ids_width),
+            dtype=torch.int32,
+        ).share_memory_()
+        decode_sampled_ids_buffer = torch.empty(
+            (kernel_batch, sampled_ids_width),
+            dtype=torch.int32,
+        ).share_memory_()
+        decode_next_hidden_buffer = torch.empty(
+            (kernel_batch, model.config.hidden_size),
+            dtype=torch.bfloat16,
+        ).share_memory_()
         _mark("decode_logits_buffer")
 
         timer.report()
 
+        if self._tq_mode:
+            greedy_sample = None
+            token_embed = None
         return _CompiledKernels(
             prefill=prefill,
             decode=decode,
+            greedy_sample=greedy_sample,
+            token_embed=token_embed,
             final_norm_weight=final_norm_weight,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
             padded_vocab=padded_vocab,
             padded_lm_head_weight=padded_lm_head_weight,
+            padded_embed_weight=padded_embed_weight,
             decode_weights=decode_weights,
             prefill_hidden_buffer=prefill_hidden_buffer,
             prefill_seq_lens_buffer=prefill_seq_lens_buffer,
@@ -365,11 +469,16 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             prefill_block_table_buffer=prefill_block_table_buffer,
             prefill_slot_mapping_buffer=prefill_slot_mapping_buffer,
             prefill_logits_buffer=prefill_logits_buffer,
+            prefill_sampled_ids_buffer=prefill_sampled_ids_buffer,
+            prefill_next_hidden_buffer=prefill_next_hidden_buffer,
             decode_hidden_buffer=decode_hidden_buffer,
             decode_seq_lens_buffer=decode_seq_lens_buffer,
             decode_block_table_buffer=decode_block_table_buffer,
             decode_slot_mapping_buffer=decode_slot_mapping_buffer,
             decode_logits_buffer=decode_logits_buffer,
+            decode_token_ids_buffer=decode_token_ids_buffer,
+            decode_sampled_ids_buffer=decode_sampled_ids_buffer,
+            decode_next_hidden_buffer=decode_next_hidden_buffer,
             tq_mode=self._tq_mode,
             rot_matrices=rot_matrices,
             tq_codebook=tq_codebook,
@@ -390,6 +499,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         num_layers: int,
         vocab_size: int,
         page_size: int,
+        sampled_ids_width: int,
     ) -> _L3Callable:
         """Compile the prefill HOST wrapper into a distributed program."""
         kv_hidden = num_kv_heads * head_dim
@@ -414,10 +524,10 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
             torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
             torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((num_layers, hidden_size), dtype=torch.float32),
             torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
             torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
             torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),
             torch.empty((1, hidden_size), dtype=torch.float32),
             torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),
             torch.empty((batch, vocab_size), dtype=torch.float32),
@@ -439,6 +549,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         num_layers: int,
         vocab_size: int,
         page_size: int,
+        sampled_ids_width: int,
     ) -> _L3Callable:
         """Compile the fused all-layer PAGED decode HOST wrapper into a distributed program.
 
@@ -482,130 +593,44 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             torch.empty((1, hidden_size), dtype=torch.float32),                                # final_norm_weight
             torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),                      # lm_head_weight
             torch.empty((batch, vocab_size), dtype=torch.float32),                             # out
+            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),                      # embed_weight
+            torch.empty((batch, sampled_ids_width), dtype=torch.int32),                        # sampled_ids_in
+            torch.empty((batch, sampled_ids_width), dtype=torch.int32),                        # sampled_ids_out
+            torch.empty((batch, hidden_size), dtype=torch.bfloat16),                           # next_hidden
         ]
         return self._compile_jit_fwd_callable("decode_fwd", jit_fn, dummy_args)
 
-    def _compile_prefill_fwd_tq_callable(
+    def _compile_greedy_sample_callable(
         self,
         jit_fn: object,
         *,
         batch: int,
-        max_seq: int,
-        block_table_stride: int,
-        hidden_size: int,
-        intermediate_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        num_layers: int,
+        sampled_ids_width: int,
         vocab_size: int,
-        page_size: int,
     ) -> _L3Callable:
-        """Compile the TurboQuant ``prefill_fwd_tq`` HOST wrapper into an L3 callable.
-
-        The TQ prefill signature (26 args) differs from non-TQ (24 args):
-        chunk_lens/chunk_offsets and the BF16 k_cache/v_cache are replaced by
-        UINT8 quant_k/quant_v caches, FP32 per-row scales, the BF16 rotation
-        matrices, and the FP32 Lloyd-Max codebook.
-        """
-        kv_hidden = num_kv_heads * head_dim
-        total_tokens = batch * max_seq
-        runtime_cache_blocks = (max_seq + page_size - 1) // page_size
-        cache_rows = batch * runtime_cache_blocks * num_layers * num_kv_heads * page_size
-        rot_rows = num_layers * head_dim
+        """Compile the greedy sampling HOST wrapper."""
         dummy_args = [
-            # args 0-1
-            torch.empty((total_tokens, hidden_size), dtype=torch.bfloat16),                   # hidden_states
-            torch.empty((batch,), dtype=torch.int32),                                        # seq_lens
-            # args 2-7: weights (NO chunk_lens/chunk_offsets in TQ)
-            torch.empty((num_layers, hidden_size), dtype=torch.float32),                     # input_rms_weight
-            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),      # wq
-            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),        # wk
-            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),        # wv
-            torch.empty((num_layers, head_dim), dtype=torch.float32),                        # q_norm_weight
-            torch.empty((num_layers, head_dim), dtype=torch.float32),                        # k_norm_weight
-            # args 8-11: rope + addressing
-            torch.empty((max_seq, head_dim), dtype=torch.float32),                           # rope_cos
-            torch.empty((max_seq, head_dim), dtype=torch.float32),                           # rope_sin
-            torch.empty((batch * block_table_stride,), dtype=torch.int32),                   # block_table
-            torch.empty((total_tokens,), dtype=torch.int32),                                 # slot_mapping
-            # args 12-17: TQ quantized caches + scales + rotation + codebook
-            torch.empty((cache_rows, head_dim), dtype=torch.uint8),                          # quant_k_cache
-            torch.empty((cache_rows, head_dim), dtype=torch.uint8),                          # quant_v_cache
-            torch.empty((cache_rows, 1), dtype=torch.float32),                               # quant_k_scales
-            torch.empty((cache_rows, 1), dtype=torch.float32),                               # quant_v_scales
-            torch.empty((rot_rows, head_dim), dtype=torch.bfloat16),                         # rot_matrices
-            torch.empty((1, 16), dtype=torch.float32),                                       # tq_codebook
-            # args 18-25: standard weights
-            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),      # wo
-            torch.empty((num_layers, hidden_size), dtype=torch.float32),                     # post_rms_weight
-            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),  # w_gate
-            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),  # w_up
-            torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),  # w_down
-            torch.empty((1, hidden_size), dtype=torch.float32),                              # final_norm_weight
-            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),                    # lm_head_weight
-            torch.empty((batch, vocab_size), dtype=torch.float32),                           # out
+            torch.empty((batch, vocab_size), dtype=torch.float32),
+            torch.empty((batch, sampled_ids_width), dtype=torch.int32),
         ]
-        return self._compile_jit_fwd_callable("prefill_fwd_tq", jit_fn, dummy_args)
+        return self._compile_jit_fwd_callable("greedy_sample_fwd", jit_fn, dummy_args)
 
-    def _compile_decode_fwd_tq_callable(
+    def _compile_token_embed_callable(
         self,
         jit_fn: object,
         *,
         batch: int,
-        max_seq: int,
-        block_table_stride: int,
         hidden_size: int,
-        intermediate_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        num_layers: int,
+        sampled_ids_width: int,
         vocab_size: int,
-        page_size: int,
     ) -> _L3Callable:
-        """Compile the TurboQuant ``decode_fwd_tq`` HOST wrapper into an L3 callable.
-
-        TQ decode replaces the BF16 k_cache/v_cache with the same six TQ tensors
-        (quant caches + scales + rotation + codebook). Weight order is
-        wo, post_rms, w_gate, w_up, w_down. Total: 26 args (vs 22 for non-TQ).
-        """
-        kv_hidden = num_kv_heads * head_dim
-        runtime_cache_blocks = (max_seq + page_size - 1) // page_size
-        cache_rows = num_layers * batch * runtime_cache_blocks * num_kv_heads * page_size
-        rot_rows = num_layers * head_dim
+        """Compile the embedding lookup HOST wrapper."""
         dummy_args = [
-            # args 0-11: same as non-TQ decode
-            torch.empty((batch, hidden_size), dtype=torch.bfloat16),                          # hidden_states
-            torch.empty((num_layers, hidden_size), dtype=torch.float32),                      # input_rms_weight
-            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),       # wq
-            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),         # wk
-            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),         # wv
-            torch.empty((num_layers, head_dim), dtype=torch.float32),                         # q_norm_weight
-            torch.empty((num_layers, head_dim), dtype=torch.float32),                         # k_norm_weight
-            torch.empty((batch,), dtype=torch.int32),                                         # seq_lens
-            torch.empty((batch * block_table_stride,), dtype=torch.int32),                    # block_table
-            torch.empty((batch,), dtype=torch.int32),                                         # slot_mapping
-            torch.empty((max_seq, head_dim), dtype=torch.float32),                            # rope_cos
-            torch.empty((max_seq, head_dim), dtype=torch.float32),                            # rope_sin
-            # args 12-17: TQ quantized caches + scales + rotation + codebook
-            torch.empty((cache_rows, head_dim), dtype=torch.uint8),                           # quant_k_cache
-            torch.empty((cache_rows, head_dim), dtype=torch.uint8),                           # quant_v_cache
-            torch.empty((cache_rows, 1), dtype=torch.float32),                                # quant_k_scales
-            torch.empty((cache_rows, 1), dtype=torch.float32),                                # quant_v_scales
-            torch.empty((rot_rows, head_dim), dtype=torch.bfloat16),                          # rot_matrices
-            torch.empty((1, 16), dtype=torch.float32),                                        # tq_codebook
-            # args 18-25: weights (TQ order: wo, post_rms, w_gate, w_up, w_down)
-            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),       # wo
-            torch.empty((num_layers, hidden_size), dtype=torch.float32),                      # post_rms_weight
-            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),  # w_gate
-            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),  # w_up
-            torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),  # w_down
-            torch.empty((1, hidden_size), dtype=torch.float32),                               # final_norm_weight
-            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),                     # lm_head_weight
-            torch.empty((batch, vocab_size), dtype=torch.float32),                            # out
+            torch.empty((batch, sampled_ids_width), dtype=torch.int32),
+            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((batch, hidden_size), dtype=torch.bfloat16),
         ]
-        return self._compile_jit_fwd_callable("decode_fwd_tq", jit_fn, dummy_args)
+        return self._compile_jit_fwd_callable("token_embed_fwd", jit_fn, dummy_args)
 
     def _compile_jit_fwd_callable(
         self,
@@ -620,7 +645,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
 
         config = self._run_config(codegen_only=True)
         distributed_config = DistributedConfig(
-            device_ids=[self._device_id],
+            device_ids=list(self._device_ids),
             num_sub_workers=0,
             block_dim=_QWEN14B_BLOCK_DIM,
             aicpu_thread_num=4,
@@ -691,14 +716,13 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
 
     @classmethod
     def _validate_total_kv_pages(cls, model: RuntimeModel, kernel_batch: int) -> None:
-        """Validate that runtime KV page count matches compiled capacity."""
+        """Validate that runtime KV page count covers the batch capacity."""
         if model.runtime.total_kv_pages is None:
             return
-        expected_pages = kernel_batch * (model.runtime.max_seq_len + model.runtime.page_size - 1) // model.runtime.page_size
-        if model.runtime.total_kv_pages != expected_pages:
+        if model.runtime.total_kv_pages < kernel_batch:
             raise ValueError(
-                "PyPTO Qwen3-14B kernels require total_kv_pages to match the runtime batch capacity: "
-                f"{model.runtime.total_kv_pages} provided, {expected_pages} required."
+                f"total_kv_pages must be at least kernel_batch ({kernel_batch}), "
+                f"got {model.runtime.total_kv_pages}"
             )
 
     @staticmethod
@@ -774,3 +798,104 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 "PyPTO Qwen3-14B kernels require runtime page_size "
                 f"{_QWEN14B_PAGE_SIZE}, got {model.runtime.page_size}."
             )
+
+    def _compile_prefill_fwd_tq_callable(
+        self,
+        jit_fn: object,
+        *,
+        batch: int,
+        max_seq: int,
+        block_table_stride: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        num_layers: int,
+        vocab_size: int,
+        page_size: int,
+    ) -> _L3Callable:
+        """Compile the TurboQuant ``prefill_fwd_tq`` HOST wrapper into an L3 callable."""
+        kv_hidden = num_kv_heads * head_dim
+        total_tokens = batch * max_seq
+        runtime_cache_blocks = (max_seq + page_size - 1) // page_size
+        cache_rows = batch * runtime_cache_blocks * num_layers * num_kv_heads * page_size
+        rot_rows = num_layers * head_dim
+        dummy_args = [
+            torch.empty((total_tokens, hidden_size), dtype=torch.bfloat16),
+            torch.empty((batch,), dtype=torch.int32),
+            torch.empty((batch,), dtype=torch.int32),
+            torch.empty((batch,), dtype=torch.int32),
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),
+            torch.empty((num_layers, head_dim), dtype=torch.float32),
+            torch.empty((num_layers, head_dim), dtype=torch.float32),
+            torch.empty((max_seq, head_dim), dtype=torch.float32),
+            torch.empty((max_seq, head_dim), dtype=torch.float32),
+            torch.empty((batch * block_table_stride,), dtype=torch.int32),
+            torch.empty((total_tokens,), dtype=torch.int32),
+            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
+            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
+            torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((1, hidden_size), dtype=torch.float32),
+            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((batch, vocab_size), dtype=torch.float32),
+            torch.empty((rot_rows, head_dim), dtype=torch.bfloat16),
+            torch.empty((1, 16), dtype=torch.float32),
+        ]
+        return self._compile_jit_fwd_callable("prefill_fwd_tq", jit_fn, dummy_args)
+
+    def _compile_decode_fwd_tq_callable(
+        self,
+        jit_fn: object,
+        *,
+        batch: int,
+        max_seq: int,
+        block_table_stride: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        num_layers: int,
+        vocab_size: int,
+        page_size: int,
+    ) -> _L3Callable:
+        """Compile the TurboQuant ``decode_fwd_tq`` HOST wrapper into an L3 callable."""
+        kv_hidden = num_kv_heads * head_dim
+        runtime_cache_blocks = (max_seq + page_size - 1) // page_size
+        cache_rows = num_layers * batch * runtime_cache_blocks * num_kv_heads * page_size
+        rot_rows = num_layers * head_dim
+        dummy_args = [
+            torch.empty((batch, hidden_size), dtype=torch.bfloat16),
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),
+            torch.empty((num_layers, head_dim), dtype=torch.float32),
+            torch.empty((num_layers, head_dim), dtype=torch.float32),
+            torch.empty((batch,), dtype=torch.int32),
+            torch.empty((batch * block_table_stride,), dtype=torch.int32),
+            torch.empty((batch,), dtype=torch.int32),
+            torch.empty((max_seq, head_dim), dtype=torch.float32),
+            torch.empty((max_seq, head_dim), dtype=torch.float32),
+            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
+            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
+            torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),
+            torch.empty((1, hidden_size), dtype=torch.float32),
+            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((batch, vocab_size), dtype=torch.float32),
+            torch.empty((rot_rows, head_dim), dtype=torch.bfloat16),
+            torch.empty((1, 16), dtype=torch.float32),
+        ]
+        return self._compile_jit_fwd_callable("decode_fwd_tq", jit_fn, dummy_args)
