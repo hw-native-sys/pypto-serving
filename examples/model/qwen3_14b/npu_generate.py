@@ -473,11 +473,9 @@ def main() -> None:
                 max_seq_len=args.max_seq_len,
                 max_new_tokens=args.max_new_tokens,
                 device="cpu",
-                kv_dtype="bfloat16",
-                weight_dtype="bfloat16",
-                kv_quant_config=KvQuantConfig(enabled=True) if args.tq_mode else None,
                 kv_dtype=args.kv_cache_dtype,
                 weight_dtype=args.dtype,
+                kv_quant_config=KvQuantConfig(enabled=True) if args.tq_mode else None,
                 npu_memory_utilization=args.npu_memory_utilization,
                 max_num_batched_tokens=args.max_num_batched_tokens,
                 # Conservative default — the decode kernel is compiled
