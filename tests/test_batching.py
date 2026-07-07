@@ -327,6 +327,34 @@ def test_decode_kernel_inputs_reject_multi_token_rows():
         )
 
 
+def test_decode_kernel_padding_uses_private_scratch_pages():
+    model = _model(max_batch_size=3, max_seq_len=4, page_size=2)
+    runner = ModelRunner(compiled=_compiled_kernels(model))
+
+    prepared = runner._pad_decode_inputs(
+        model,
+        SimpleNamespace(
+            actual_batch=1,
+            token_ids=torch.tensor([[3]], dtype=torch.int32),
+            hidden=torch.ones(1, model.config.hidden_size, dtype=torch.bfloat16),
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            block_table=torch.tensor([0, -1], dtype=torch.int32),
+            slot_mapping=torch.tensor([0], dtype=torch.int32),
+        ),
+        max_pages=3,
+        scratch_page=2,
+    )
+
+    block_table = prepared.block_table.reshape(model.runtime.max_batch_size, 2)
+    assert block_table.tolist() == [
+        [0, -1],
+        [0, -1],
+        [0, -1],
+    ]
+    assert prepared.token_ids.tolist() == [[3], [3], [3]]
+    assert prepared.slot_mapping.tolist() == [0, 4, 4]
+
+
 def test_engine_generate_batch_uses_batched_executor_results():
     model = _model(max_batch_size=2, eos_token_id=0)
     manager = KvCacheManager()

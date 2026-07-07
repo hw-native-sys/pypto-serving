@@ -189,6 +189,7 @@ class Qwen314BModelRunner(ModelRunner):
     #: Scratch KV pages for the profile pass — slot=-1 means only page 0
     #: is ever touched (reads via block_table=0, writes via slot clamp to 0).
     _PROFILE_PAGES = 1
+    _DECODE_SCRATCH_PAGES = 1
 
     def init_kv_cache(self, model_id: str, config: ModelConfig, runtime: RuntimeConfig) -> int:
         """Create the L3 worker-resident cache before the first request.
@@ -230,9 +231,15 @@ class Qwen314BModelRunner(ModelRunner):
         logger.info("[init_kv_cache] computing KV cache pages …")
         num_pages = self._compute_kv_cache_pages(config, runtime, self._device_id)
         num_pages = self._alloc_kv_cache_with_retry(model_id, config, runtime, num_pages)
-        self._print_memory_breakdown("after KV cache alloc", config, runtime, num_pages, self._device_id)
+        if num_pages <= self._DECODE_SCRATCH_PAGES:
+            raise RuntimeError(
+                "KV cache allocation did not leave room for decode scratch pages: "
+                f"num_pages={num_pages}, scratch_pages={self._DECODE_SCRATCH_PAGES}"
+            )
+        usable_pages = num_pages - self._DECODE_SCRATCH_PAGES
+        self._print_memory_breakdown("after KV cache alloc", config, runtime, usable_pages, self._device_id)
         logger.info("[init_kv_cache] done")
-        return num_pages
+        return usable_pages
 
     def _alloc_kv_cache_with_retry(
         self, model_id: str, config: ModelConfig, runtime: RuntimeConfig, num_pages: int,
@@ -512,8 +519,7 @@ class Qwen314BModelRunner(ModelRunner):
         max_block_id = int(valid_blocks.max().item()) if valid_blocks.numel() else -1
         max_slot_block = int(valid_slots.max().item()) // model.runtime.page_size if valid_slots.numel() else -1
         max_page_id = max(max_block_id, max_slot_block)
-        rows_per_layer = cache.shape[0] // model.config.num_hidden_layers
-        max_pages = rows_per_layer // (model.config.num_key_value_heads * model.runtime.page_size)
+        max_pages = Qwen314BModelRunner._kv_cache_page_capacity(model, cache)
         if max_page_id >= max_pages:
             raise RuntimeError(
                 "KV cache page id exceeds runner device cache capacity: "
@@ -521,6 +527,11 @@ class Qwen314BModelRunner(ModelRunner):
                 f"cache_shape={cache.shape}, block_table_shape={tuple(block_table.shape)}, "
                 f"slot_mapping_shape={tuple(slot_mapping.shape)}"
             )
+
+    @staticmethod
+    def _kv_cache_page_capacity(model: RuntimeModel, cache: Any) -> int:
+        rows_per_layer = cache.shape[0] // model.config.num_hidden_layers
+        return rows_per_layer // (model.config.num_key_value_heads * model.runtime.page_size)
 
     def _share_static_kernel_tensors(self) -> None:
         """Move static kernel inputs to shared memory before worker creation."""
@@ -637,10 +648,12 @@ class Qwen314BModelRunner(ModelRunner):
         k_cache = kv_cache.key_pages
         v_cache = kv_cache.value_pages
 
-        kernel_inputs = self._pad_decode_inputs(model, decode_inputs)
+        max_pages = self._kv_cache_page_capacity(model, k_cache)
+        scratch_page = max_pages - self._DECODE_SCRATCH_PAGES
+        kernel_inputs = self._pad_decode_inputs(model, decode_inputs, max_pages=max_pages, scratch_page=scratch_page)
 
-        # Padded block_table / slot_mapping only ever reference row 0's
-        # already-valid pages, so bound-check exactly what the kernel will read.
+        # Padded rows read valid active pages and write to allocated scratch
+        # pages, so bound-check exactly what the kernel will access.
         self._validate_kv_cache_bounds(model, kernel_inputs.block_table, kernel_inputs.slot_mapping, k_cache)
 
         self._run_distributed_program(
@@ -787,17 +800,28 @@ class Qwen314BModelRunner(ModelRunner):
             self._compiled.decode_next_hidden_buffer,
         )
 
-    def _pad_decode_inputs(self, model: RuntimeModel, inputs: _DecodeInputs) -> _DecodeKernelInputs:
+    def _pad_decode_inputs(
+        self,
+        model: RuntimeModel,
+        inputs: _DecodeInputs,
+        *,
+        max_pages: int | None = None,
+        scratch_page: int | None = None,
+    ) -> _DecodeKernelInputs:
         """Pad active decode rows to the fixed kernel batch.
 
         The fused decode kernel computes all ``max_batch_size`` rows. Inactive
-        rows replicate row 0 so their KV writes are idempotent instead of
-        targeting unrelated pages.
+        rows replicate row 0 compute/read inputs, but write their current-token
+        KV into allocated scratch pages so they cannot race active rows.
         """
         compiled = self._compiled
         actual_batch = inputs.actual_batch
         kernel_batch = model.runtime.max_batch_size
         max_blocks = self._max_blocks_per_seq(model)
+        if max_pages is None:
+            max_pages = kernel_batch * max_blocks
+        if scratch_page is None:
+            scratch_page = max_pages - 1
 
         if kernel_batch > compiled.decode_logits_buffer.shape[0]:
             raise ValueError(
@@ -836,19 +860,24 @@ class Qwen314BModelRunner(ModelRunner):
                 kernel_batch,
                 rows_each=1,
             ),
-            block_table=self._copy_replicated_rows(
+            block_table=self._copy_decode_block_table_rows(
                 compiled.decode_block_table_buffer,
                 inputs.block_table,
                 actual_batch,
                 kernel_batch,
-                rows_each=max_blocks,
+                max_blocks=max_blocks,
             ),
-            slot_mapping=self._copy_replicated_rows(
+            slot_mapping=self._copy_decode_slot_mapping_rows(
                 compiled.decode_slot_mapping_buffer,
                 inputs.slot_mapping,
+                compiled.decode_seq_lens_buffer,
+                compiled.decode_block_table_buffer,
                 actual_batch,
                 kernel_batch,
-                rows_each=1,
+                max_blocks=max_blocks,
+                max_pages=max_pages,
+                scratch_page=scratch_page,
+                page_size=model.runtime.page_size,
             ),
             logits=compiled.decode_logits_buffer,
         )
@@ -937,6 +966,55 @@ class Qwen314BModelRunner(ModelRunner):
         dst_view[:actual_batch].copy_(active_view)
         if actual_batch < kernel_batch:
             dst_view[actual_batch:].copy_(active_view[0:1].expand(kernel_batch - actual_batch, rows_each))
+        return dst
+
+    @staticmethod
+    def _copy_decode_block_table_rows(
+        dst: torch.Tensor,
+        active: torch.Tensor,
+        actual_batch: int,
+        kernel_batch: int,
+        *,
+        max_blocks: int,
+    ) -> torch.Tensor:
+        """Copy active block tables and give inactive rows valid KV reads."""
+        active_view = active.reshape(actual_batch, max_blocks)
+        dst_view = dst.reshape(kernel_batch, max_blocks)
+        dst_view[:actual_batch].copy_(active_view)
+        if actual_batch < kernel_batch:
+            dst_view[actual_batch:].copy_(active_view[0:1].expand(kernel_batch - actual_batch, max_blocks))
+        return dst
+
+    @staticmethod
+    def _copy_decode_slot_mapping_rows(
+        dst: torch.Tensor,
+        active: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        actual_batch: int,
+        kernel_batch: int,
+        *,
+        max_blocks: int,
+        max_pages: int,
+        scratch_page: int,
+        page_size: int,
+    ) -> torch.Tensor:
+        """Copy active slots and map inactive writes to the reserved scratch page."""
+        active_view = active.reshape(actual_batch, 1)
+        dst_view = dst.reshape(kernel_batch, 1)
+        dst_view[:actual_batch].copy_(active_view)
+        active_pages = block_table.reshape(kernel_batch, max_blocks)[:actual_batch].reshape(-1)
+        if torch.any(active_pages == scratch_page):
+            raise RuntimeError(
+                "Active decode row references the reserved KV scratch page: "
+                f"scratch_page={scratch_page}, actual_batch={actual_batch}"
+            )
+        if not 0 <= scratch_page < max_pages:
+            raise RuntimeError(f"reserved KV scratch page is out of range: {scratch_page} not in [0, {max_pages})")
+        for row in range(actual_batch, kernel_batch):
+            tokens_used = max(int(seq_lens[row].item()) - 1, 0)
+            offset = tokens_used % page_size
+            dst_view[row, 0] = scratch_page * page_size + offset
         return dst
 
     @staticmethod
