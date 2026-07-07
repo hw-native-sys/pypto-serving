@@ -827,33 +827,38 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         runtime_cache_blocks = (max_seq + page_size - 1) // page_size
         cache_rows = batch * runtime_cache_blocks * num_layers * num_kv_heads * page_size
         rot_rows = num_layers * head_dim
+        # Must match qwen3_prefill_tq_host param order exactly (26 params:
+        # 25 in + 1 out). TQ quantized caches are UINT8 with per-row FP32
+        # scales; the device kernel slices [CMP_CHUNK, head_dim//2] uint8
+        # indices out of quant_k_cache, so the dtype/shape here must be uint8
+        # or the specializer cannot infer the sliced quant_indices tensor.
         dummy_args = [
-            torch.empty((total_tokens, hidden_size), dtype=torch.bfloat16),
-            torch.empty((batch,), dtype=torch.int32),
-            torch.empty((batch,), dtype=torch.int32),
-            torch.empty((batch,), dtype=torch.int32),
-            torch.empty((num_layers, hidden_size), dtype=torch.float32),
-            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),
-            torch.empty((num_layers, head_dim), dtype=torch.float32),
-            torch.empty((num_layers, head_dim), dtype=torch.float32),
-            torch.empty((max_seq, head_dim), dtype=torch.float32),
-            torch.empty((max_seq, head_dim), dtype=torch.float32),
-            torch.empty((batch * block_table_stride,), dtype=torch.int32),
-            torch.empty((total_tokens,), dtype=torch.int32),
-            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
-            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((num_layers, hidden_size), dtype=torch.float32),
-            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
-            torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((1, hidden_size), dtype=torch.float32),
-            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((batch, vocab_size), dtype=torch.float32),
-            torch.empty((rot_rows, head_dim), dtype=torch.bfloat16),
-            torch.empty((1, 16), dtype=torch.float32),
+            torch.empty((total_tokens, hidden_size), dtype=torch.bfloat16),                  # hidden_states
+            torch.empty((batch,), dtype=torch.int32),                                        # seq_lens
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),                     # input_rms_weight
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),      # wq
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),        # wk
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),        # wv
+            torch.empty((num_layers, head_dim), dtype=torch.float32),                        # q_norm_weight
+            torch.empty((num_layers, head_dim), dtype=torch.float32),                        # k_norm_weight
+            torch.empty((max_seq, head_dim), dtype=torch.float32),                           # rope_cos
+            torch.empty((max_seq, head_dim), dtype=torch.float32),                           # rope_sin
+            torch.empty((batch * block_table_stride,), dtype=torch.int32),                   # block_table
+            torch.empty((total_tokens,), dtype=torch.int32),                                 # slot_mapping
+            torch.empty((cache_rows, head_dim), dtype=torch.uint8),                          # quant_k_cache
+            torch.empty((cache_rows, head_dim), dtype=torch.uint8),                          # quant_v_cache
+            torch.empty((cache_rows, 1), dtype=torch.float32),                               # quant_k_scales
+            torch.empty((cache_rows, 1), dtype=torch.float32),                               # quant_v_scales
+            torch.empty((rot_rows, head_dim), dtype=torch.bfloat16),                         # rot_matrices
+            torch.empty((1, 16), dtype=torch.float32),                                       # tq_codebook
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),      # wo
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),                     # post_rms_weight
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),  # w_gate
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),  # w_up
+            torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),  # w_down
+            torch.empty((1, hidden_size), dtype=torch.float32),                              # final_norm_weight
+            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),                    # lm_head_weight
+            torch.empty((batch, vocab_size), dtype=torch.float32),                           # out
         ]
         return self._compile_jit_fwd_callable("prefill_fwd_tq", jit_fn, dummy_args)
 
@@ -878,30 +883,36 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         runtime_cache_blocks = (max_seq + page_size - 1) // page_size
         cache_rows = num_layers * batch * runtime_cache_blocks * num_kv_heads * page_size
         rot_rows = num_layers * head_dim
+        # Must match qwen3_decode_tq_host param order exactly (26 params:
+        # 25 in + 1 out). Same TQ dtype/shape rules as prefill: uint8 quantized
+        # caches + (cache_rows, 1) FP32 scales, so the specializer can infer the
+        # sliced quant_indices tensor.
         dummy_args = [
-            torch.empty((batch, hidden_size), dtype=torch.bfloat16),
-            torch.empty((num_layers, hidden_size), dtype=torch.float32),
-            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),
-            torch.empty((num_layers, head_dim), dtype=torch.float32),
-            torch.empty((num_layers, head_dim), dtype=torch.float32),
-            torch.empty((batch,), dtype=torch.int32),
-            torch.empty((batch * block_table_stride,), dtype=torch.int32),
-            torch.empty((batch,), dtype=torch.int32),
-            torch.empty((max_seq, head_dim), dtype=torch.float32),
-            torch.empty((max_seq, head_dim), dtype=torch.float32),
-            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
-            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
-            torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((num_layers, hidden_size), dtype=torch.float32),
-            torch.empty((1, hidden_size), dtype=torch.float32),
-            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((batch, vocab_size), dtype=torch.float32),
-            torch.empty((rot_rows, head_dim), dtype=torch.bfloat16),
-            torch.empty((1, 16), dtype=torch.float32),
+            torch.empty((batch, hidden_size), dtype=torch.bfloat16),                  # hidden_states
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),               # input_rms_weight
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),  # wq
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),    # wk
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),    # wv
+            torch.empty((num_layers, head_dim), dtype=torch.float32),                  # q_norm_weight
+            torch.empty((num_layers, head_dim), dtype=torch.float32),                  # k_norm_weight
+            torch.empty((batch,), dtype=torch.int32),                                  # seq_lens
+            torch.empty((batch * block_table_stride,), dtype=torch.int32),             # block_table
+            torch.empty((batch,), dtype=torch.int32),                                  # slot_mapping
+            torch.empty((max_seq, head_dim), dtype=torch.float32),                     # rope_cos
+            torch.empty((max_seq, head_dim), dtype=torch.float32),                     # rope_sin
+            torch.empty((cache_rows, head_dim), dtype=torch.uint8),                    # quant_k_cache
+            torch.empty((cache_rows, head_dim), dtype=torch.uint8),                    # quant_v_cache
+            torch.empty((cache_rows, 1), dtype=torch.float32),                         # quant_k_scales
+            torch.empty((cache_rows, 1), dtype=torch.float32),                         # quant_v_scales
+            torch.empty((rot_rows, head_dim), dtype=torch.bfloat16),                   # rot_matrices
+            torch.empty((1, 16), dtype=torch.float32),                                 # tq_codebook
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),  # wo
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),               # post_rms_weight
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),  # w_gate
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),  # w_up
+            torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),  # w_down
+            torch.empty((1, hidden_size), dtype=torch.float32),                        # final_norm_weight
+            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),              # lm_head_weight
+            torch.empty((batch, vocab_size), dtype=torch.float32),                     # out
         ]
         return self._compile_jit_fwd_callable("decode_fwd_tq", jit_fn, dummy_args)
