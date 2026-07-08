@@ -16,6 +16,10 @@ import pypto.language as pl
 
 prefill_fwd = None
 decode_fwd = None
+# Device-side sampling + embedding kernels (assigned by the executor before
+# compilation). Used by _maybe_run_sample_embed for the prefill first token.
+greedy_sample_fwd = None
+token_embed_fwd = None
 # TurboQuant (TQ) device kernels; assigned by the executor before compilation
 # when tq_mode is enabled. The TQ wrappers below forward to these.
 prefill_fwd_tq = None
@@ -135,6 +139,30 @@ def qwen3_decode_host(
         next_hidden,
     )
     return logits, sampled_ids, next_hidden
+
+
+@pl.jit.host
+def qwen3_greedy_sample_host(
+    logits: pl.Tensor,
+    sampled_ids: pl.Out[pl.Tensor],
+) -> pl.Tensor:
+    return greedy_sample_fwd(
+        logits,
+        sampled_ids,
+    )
+
+
+@pl.jit.host
+def qwen3_token_embed_host(
+    sampled_ids: pl.Tensor,
+    embed_weight: pl.Tensor,
+    next_hidden: pl.Out[pl.Tensor],
+) -> pl.Tensor:
+    return token_embed_fwd(
+        sampled_ids,
+        embed_weight,
+        next_hidden,
+    )
 
 
 @pl.jit.host
