@@ -66,6 +66,41 @@ class ModelFormatLoader(Protocol):
         raise NotImplementedError
 
 
+def _load_safetensors_weight_map(model_dir: Path) -> dict[str, str]:
+    """Return the ``{tensor_name: shard_filename}`` map from a safetensors index.
+
+    Reads ``model.safetensors.index.json`` when present; otherwise synthesizes a
+    flat map from every ``*.safetensors`` shard in the directory (each shard
+    owning all of its tensors, which is only correct for the single-shard case).
+    Shared by every format loader that needs checkpoint layout without reading
+    tensor payloads.
+    """
+    index_path = model_dir / "model.safetensors.index.json"
+    if index_path.exists():
+        index_data = json.loads(index_path.read_text())
+        return dict(index_data.get("weight_map", {}))
+    shards = sorted(path.name for path in model_dir.glob("*.safetensors"))
+    if not shards:
+        raise FileNotFoundError(f"No .safetensors files found in {model_dir}")
+    if len(shards) == 1:
+        try:
+            from safetensors import safe_open
+
+            with safe_open(str(model_dir / shards[0]), framework="pt", device="cpu") as reader:
+                return {name: shards[0] for name in reader.keys()}
+        except ImportError:
+            raise RuntimeError("safetensors is required to read weight names from a single-shard checkpoint.")
+    raise FileNotFoundError(
+        f"{model_dir} has multiple safetensors shards but no model.safetensors.index.json; "
+        "the index is required to map tensor names to shards."
+    )
+
+
+def _safetensors_shard_filenames(weight_map: dict[str, str]) -> list[str]:
+    """Return the sorted unique shard filenames referenced by a weight map."""
+    return sorted(set(weight_map.values()))
+
+
 def _load_safetensors_dir(model_dir: Path) -> dict[str, torch.Tensor]:
     """Load all safetensors shards from a local Hugging Face directory."""
     try:
@@ -73,15 +108,8 @@ def _load_safetensors_dir(model_dir: Path) -> dict[str, torch.Tensor]:
     except ImportError as exc:
         raise RuntimeError("safetensors is required to load weights from a local model directory.") from exc
 
-    index_path = model_dir / "model.safetensors.index.json"
-    if index_path.exists():
-        index_data = json.loads(index_path.read_text())
-        filenames = sorted(set(index_data["weight_map"].values()))
-    else:
-        filenames = sorted(path.name for path in model_dir.glob("*.safetensors"))
-    if not filenames:
-        raise FileNotFoundError(f"No .safetensors files found in {model_dir}")
-
+    weight_map = _load_safetensors_weight_map(model_dir)
+    filenames = _safetensors_shard_filenames(weight_map)
     state_dict: dict[str, torch.Tensor] = {}
     for filename in filenames:
         state_dict.update(load_file(str(model_dir / filename)))
@@ -101,6 +129,20 @@ def _optional_tensor(state_dict: dict[str, torch.Tensor], names: list[str]) -> t
         if name in state_dict:
             return state_dict[name]
     return None
+
+
+def _build_tokenizer(model_path: Path, *, trust_remote_code: bool = False) -> TokenizerAdapter:
+    """Build a tokenizer adapter, preferring a fast ``tokenizer.json`` when present.
+
+    Shared by every format loader so new models do not re-implement the
+    ``tokenizer.json``-first, ``from_pretrained``-fallback heuristic.
+    """
+    if (model_path / "tokenizer.json").exists():
+        return TransformersTokenizerAdapter.from_tokenizer_file(str(model_path))
+    return TransformersTokenizerAdapter.from_pretrained(
+        str(model_path),
+        trust_remote_code=trust_remote_code,
+    )
 
 
 def _build_model_config(model_id: str, config_data: dict, tokenizer: TokenizerAdapter) -> ModelConfig:
@@ -188,10 +230,7 @@ class HuggingFaceDirectoryLoader:
             raise FileNotFoundError(f"Missing config.json in {model_path}")
 
         trust_remote_code = bool(request.loader_options.get("trust_remote_code", False))
-        tokenizer = TransformersTokenizerAdapter.from_pretrained(
-            str(model_path),
-            trust_remote_code=trust_remote_code,
-        )
+        tokenizer = _build_tokenizer(model_path, trust_remote_code=trust_remote_code)
         _mark("load_tokenizer")
         config_data = json.loads(config_path.read_text())
         config = _build_model_config(request.model_id, config_data, tokenizer)
@@ -276,12 +315,146 @@ class HuggingFaceDirectoryLoader:
         )
 
 
+class DeepSeekV4W8A8DirectoryLoader:
+    """Lazy loader for the local DeepSeekV4 Flash W8A8 checkpoint."""
+
+    format_names = ("deepseek_v4_w8a8", "deepseek-v4-w8a8", "dsv4-w8a8")
+
+    def supports_format(self, model_format: str) -> bool:
+        """Return whether ``model_format`` names the DeepSeekV4 W8A8 loader."""
+        return model_format.lower() in self.format_names
+
+    def can_load(self, model_path: Path) -> bool:
+        """Detect a DeepSeekV4 compressed-tensors checkpoint directory."""
+        config_path = model_path / "config.json"
+        index_path = model_path / "model.safetensors.index.json"
+        if not config_path.exists() or not index_path.exists():
+            return False
+        try:
+            config_data = json.loads(config_path.read_text())
+        except json.JSONDecodeError:
+            return False
+        return _is_deepseek_v4_config(config_data)
+
+    def load(self, request: ModelLoadRequest) -> LoadedModel:
+        """Load tokenizer and metadata without materializing all quantized weights."""
+        model_path = Path(request.model_dir)
+        config_path = model_path / "config.json"
+        index_path = model_path / "model.safetensors.index.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"Missing config.json in {model_path}")
+        if not index_path.exists():
+            raise FileNotFoundError(f"Missing model.safetensors.index.json in {model_path}")
+
+        config_data = json.loads(config_path.read_text())
+        if not _is_deepseek_v4_config(config_data):
+            raise ValueError(f"{model_path} is not a DeepSeekV4 checkpoint")
+        quantization = config_data.get("quantization_config", {})
+        if quantization.get("quant_method") != "compressed-tensors":
+            raise ValueError(
+                "DeepSeekV4 serving requires the W8A8 compressed-tensors checkpoint; "
+                f"got quant_method={quantization.get('quant_method')!r}"
+            )
+
+        trust_remote_code = bool(request.loader_options.get("trust_remote_code", False))
+        tokenizer = _build_tokenizer(model_path, trust_remote_code=trust_remote_code)
+        config = _build_deepseek_v4_model_config(request.model_id, config_data, tokenizer)
+        runtime = request.runtime_config or RuntimeConfig(max_seq_len=min(config.max_position_embeddings, 8192))
+        layer_specs = _build_layer_specs(config)
+        weight_map = _load_safetensors_weight_map(model_path)
+        _validate_deepseek_v4_weight_index(weight_map, config_data)
+
+        placeholder = torch.empty(0, config.hidden_size, dtype=torch.bfloat16)
+        runtime_model = RuntimeModel(
+            config=config,
+            runtime=runtime,
+            embed_tokens=placeholder,
+            final_norm_weight=torch.empty(0, dtype=torch.bfloat16),
+            lm_head=placeholder,
+            layers=[],
+            extra={
+                "family": "deepseek_v4",
+                "checkpoint_format": "w8a8-compressed-tensors",
+                "config_data": config_data,
+                "quantization_config": quantization,
+                "weight_map": weight_map,
+                "model_dir": str(model_path),
+                "compress_ratios": tuple(int(ratio) for ratio in config_data["compress_ratios"]),
+            },
+        )
+
+        return LoadedModel(
+            model_id=request.model_id,
+            model_dir=str(model_path),
+            config=config,
+            tokenizer=tokenizer,
+            layer_specs=layer_specs,
+            runtime_model=runtime_model,
+        )
+
+
+def _is_deepseek_v4_config(config_data: dict) -> bool:
+    """Return whether config metadata names DeepSeekV4."""
+    model_type = str(config_data.get("model_type", "")).lower()
+    architectures = {str(item).lower() for item in config_data.get("architectures", [])}
+    return model_type == "deepseek_v4" or "deepseekv4forcausallm" in architectures
+
+
+def _build_deepseek_v4_model_config(
+    model_id: str,
+    config_data: dict,
+    tokenizer: TokenizerAdapter,
+) -> ModelConfig:
+    """Build internal metadata for DeepSeekV4 Flash."""
+    return ModelConfig(
+        model_id=model_id,
+        architecture=str(config_data.get("architectures", ["DeepseekV4ForCausalLM"])[0]),
+        vocab_size=int(config_data["vocab_size"]),
+        hidden_size=int(config_data["hidden_size"]),
+        intermediate_size=int(config_data["moe_intermediate_size"]),
+        num_hidden_layers=int(config_data["num_hidden_layers"]),
+        num_attention_heads=int(config_data["num_attention_heads"]),
+        num_key_value_heads=int(config_data.get("num_key_value_heads", 1)),
+        head_dim=int(config_data["head_dim"]),
+        max_position_embeddings=int(config_data["max_position_embeddings"]),
+        rms_norm_eps=float(config_data["rms_norm_eps"]),
+        rope_theta=float(config_data["rope_theta"]),
+        bos_token_id=config_data.get("bos_token_id", tokenizer.bos_token_id),
+        eos_token_id=config_data.get("eos_token_id", tokenizer.eos_token_id),
+        pad_token_id=config_data.get("pad_token_id", tokenizer.pad_token_id),
+        torch_dtype=str(config_data.get("torch_dtype", "bfloat16")),
+    )
+
+
+def _validate_deepseek_v4_weight_index(weight_map: dict[str, str], config_data: dict) -> None:
+    """Fail early if the W8A8 checkpoint does not expose required tensor names."""
+    required = [
+        "embed.weight",
+        "norm.weight",
+        "head.weight",
+        "layers.0.attn.wq_b.weight",
+        "layers.0.attn.wq_b.scale",
+        "layers.0.attn.wo_b.weight",
+        "layers.0.attn.wo_b.scale",
+        "layers.0.ffn.experts.0.w1.weight",
+        "layers.0.ffn.experts.0.w1.scale",
+    ]
+    missing = [name for name in required if name not in weight_map]
+    if missing:
+        raise KeyError(f"DeepSeekV4 W8A8 checkpoint is missing required tensors: {', '.join(missing)}")
+    ratios = config_data.get("compress_ratios")
+    if not isinstance(ratios, list) or len(ratios) != int(config_data["num_hidden_layers"]) + 1:
+        raise ValueError(
+            "DeepSeekV4 config compress_ratios must include one entry per hidden layer plus MTP/final entry"
+        )
+
+
 class ModelLoader:
     """Registry that selects a model-format loader and loads models."""
 
     def __init__(self, format_loaders: list[ModelFormatLoader] | None = None) -> None:
         """Create a loader registry with optional custom format loaders."""
-        self._format_loaders = format_loaders or [HuggingFaceDirectoryLoader()]
+        self._format_loaders = format_loaders or [DeepSeekV4W8A8DirectoryLoader(), HuggingFaceDirectoryLoader()]
 
     def register(self, format_loader: ModelFormatLoader) -> None:
         """Register an additional model format loader."""

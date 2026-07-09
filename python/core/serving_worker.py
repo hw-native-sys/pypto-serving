@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -120,6 +121,9 @@ class WorkerProcess:
         if self.config.executor_cls == "PyptoQwen14BExecutor":
             from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor
             return Qwen314BPyptoExecutor
+        if self.config.executor_cls == "PyptoDeepSeekV4Executor":
+            from examples.model.deepseek_v4.runner.npu_executor import DeepSeekV4PyptoExecutor
+            return DeepSeekV4PyptoExecutor
         from .executor import ModelExecutor
         return ModelExecutor
 
@@ -144,7 +148,9 @@ class WorkerProcess:
                 break
             elif cmd.type == "step":
                 if cmd.finished_request_ids:
-                    pass  # No allocation cleanup needed
+                    release_finished = getattr(self.executor, "release_finished_requests", None)
+                    if callable(release_finished):
+                        release_finished(cmd.finished_request_ids)
 
                 try:
                     result = self._execute_step(cmd.scheduler_output)
@@ -288,6 +294,7 @@ class WorkerProcess:
             device = runtime_model.runtime.device
 
             decode_tokens = []
+            prev_tokens = []
             block_ids_list = []
             seq_lens = []
             allow_device_greedy_sampling = (
@@ -297,12 +304,19 @@ class WorkerProcess:
 
             for sr in scheduled:
                 request = sr.request
-                last_token = (
-                    request.output_token_ids[-1]
-                    if request.output_token_ids
-                    else request.prompt_token_ids[-1]
-                )
+                output_ids = request.output_token_ids
+                prompt_ids = request.prompt_token_ids
+                last_token = output_ids[-1] if output_ids else prompt_ids[-1]
+                # Token at absolute position ``seq_len-2``; guard the single-token
+                # edge so we never index out of range.
+                if len(output_ids) >= 2:
+                    prev_token = output_ids[-2]
+                elif output_ids and prompt_ids:
+                    prev_token = prompt_ids[-1]
+                else:
+                    prev_token = last_token
                 decode_tokens.append(last_token)
+                prev_tokens.append(prev_token)
                 block_ids_list.append(sr.block_ids)
                 seq_lens.append(request.num_tokens)
 
@@ -313,8 +327,14 @@ class WorkerProcess:
                     dtype=runtime_model.embed_tokens.dtype,
                     device=device,
                 )
+                prev_embeddings = torch.zeros_like(decode_embeddings)
             else:
                 decode_embeddings = self.executor.lookup_embeddings(runtime_model, decode_token_tensor)
+                prev_token_tensor = torch.tensor(prev_tokens, dtype=torch.long, device=device)
+                prev_embeddings = self.executor.lookup_embeddings(runtime_model, prev_token_tensor)
+
+            if self.executor.supports_device_embedding:
+                prev_token_tensor = torch.tensor(prev_tokens, dtype=torch.long, device=device)
 
             decode_result = self.executor.run_decode(
                 runtime_model,
@@ -325,6 +345,8 @@ class WorkerProcess:
                     seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
                     allow_device_greedy_sampling=allow_device_greedy_sampling,
                     block_ids=block_ids_list,
+                    prev_token_ids=prev_token_tensor,
+                    prev_hidden_states=prev_embeddings,
                 ),
             )
 
@@ -381,6 +403,17 @@ def _worker_entry(
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     for _n in ("simpler_setup", "pypto", "simpler"):
         logging.getLogger(_n).setLevel(logging.WARNING)
+
+    # Spawned workers do not inherit the parent's logging config; configure a
+    # stderr handler so per-stage progress logs (weight load, preflight) are
+    # visible alongside kernel/perf output.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s.%(msecs)03d %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+        force=True,
+    )
 
     worker = WorkerProcess(config, input_queue, output_queue)
     try:

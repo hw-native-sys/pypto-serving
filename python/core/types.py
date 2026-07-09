@@ -111,6 +111,7 @@ class RuntimeModel:
     final_norm_weight: torch.Tensor
     lm_head: torch.Tensor
     layers: list[LayerWeights]
+    extra: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -211,6 +212,12 @@ class DecodeBatch:
     allow_device_greedy_sampling: bool = False
     kv_allocations: list[KvAllocation] = field(default_factory=list)
     block_ids: list[list[int]] = field(default_factory=list)
+    # Optional MTP context for models (e.g. DeepSeek V4) that decode two real
+    # trailing tokens per step. ``prev_token_ids`` holds the token id at absolute
+    # position ``seq_len-2`` per request (shape ``[B]``) and ``prev_hidden_states``
+    # its embedding (shape ``[B, hidden]``). Left ``None`` for single-token decoders.
+    prev_token_ids: torch.Tensor | None = None
+    prev_hidden_states: torch.Tensor | None = None
 
 
 @dataclass

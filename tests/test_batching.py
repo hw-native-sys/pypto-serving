@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ import pytest
 import torch
 from simpler.task_interface import DataType
 
+from python.core.async_engine import ReplicaEngineCore, TokenOutput
 from python.core.engine import LLMEngine
 from python.core.executor import ModelExecutor
 from python.core.kv_cache import KvCacheManager
@@ -52,6 +54,33 @@ class _Tokenizer:
 
     def decode(self, token_ids: list[int]) -> str:
         return " ".join(str(token_id) for token_id in token_ids)
+
+
+def test_worker_step_error_queues_finished_ids_for_executor_release():
+    aborted: list[str] = []
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.scheduler = SimpleNamespace(abort_request=aborted.append)
+    core._pending_free_ids = []
+    core._request_contexts = {
+        "req-a": SimpleNamespace(queue=asyncio.Queue()),
+        "req-b": SimpleNamespace(queue=asyncio.Queue()),
+    }
+    scheduler_output = SimpleNamespace(
+        scheduled_requests=[
+            SimpleNamespace(request=SimpleNamespace(request_id="req-a")),
+            SimpleNamespace(request=SimpleNamespace(request_id="req-b")),
+        ]
+    )
+
+    core._handle_step_error(scheduler_output)
+
+    assert aborted == ["req-a", "req-b"]
+    assert core._pending_free_ids == ["req-a", "req-b"]
+    for request_id in ("req-a", "req-b"):
+        token = core._request_contexts[request_id].queue.get_nowait()
+        assert isinstance(token, TokenOutput)
+        assert token.finished is True
+        assert token.finish_reason == "error"
 
 
 def _model(
@@ -547,7 +576,7 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         compiled=compiled,
     )
     monkeypatch.setattr(runner, "_shared_l3_worker", lambda: _FakeWorker())
-    monkeypatch.setattr(runner, "_compute_kv_cache_pages", lambda config, runtime: 1)
+    monkeypatch.setattr(runner, "_compute_kv_cache_pages", lambda config, runtime, device_id=0: 1)
     monkeypatch.setattr(runner, "_print_memory_breakdown", lambda *a, **kw: None)
     runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
     monkeypatch.setattr(runner, "_static_device_tensor", lambda tensor: tensor)
@@ -626,7 +655,10 @@ def test_decode_host_inlines_embedding_and_sampling_into_decode_fwd():
 
     if not QWEN3_KERNEL_DIR.is_dir():
         pytest.skip("pypto-lib submodule is not checked out")
-    decode_source = (QWEN3_KERNEL_DIR / "decode_layer.py").read_text(encoding="utf-8")
+    decode_path = QWEN3_KERNEL_DIR / "decode_layer.py"
+    if not decode_path.is_file():
+        decode_path = QWEN3_KERNEL_DIR / "decode_fwd.py"
+    decode_source = decode_path.read_text(encoding="utf-8")
     assert 'name_hint="token_embed"' in decode_source
     assert 'name_hint="greedy_sample"' in decode_source
 

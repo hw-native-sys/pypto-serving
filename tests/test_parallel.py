@@ -29,7 +29,6 @@ from python.core.types import GenerateConfig
 def _parse_cli_args(argv: list[str]):
     return cli.build_parser().parse_args(argv)
 
-
 def test_parallel_config_groups_dp_replicas_into_tp_groups():
     config = ParallelConfig(
         data_parallel_size=2,
