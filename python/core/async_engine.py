@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import queue
 import time
 from collections.abc import AsyncGenerator, Sequence
@@ -26,6 +27,33 @@ from .types import RuntimeConfig, StepOutput, WorkerCommand
 from .serving_worker import spawn_worker
 
 logger = logging.getLogger(__name__)
+_DEFAULT_WORKER_INIT_TIMEOUT_SECONDS = 600.0
+_DEFAULT_WORKER_STEP_TIMEOUT_SECONDS = 300.0
+_DEFAULT_DEEPSEEK_V4_WORKER_STEP_TIMEOUT_SECONDS = 1200.0
+
+
+def _positive_env_timeout_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        timeout = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive number of seconds") from exc
+    if timeout <= 0:
+        raise ValueError(f"{name} must be a positive number of seconds")
+    return timeout
+
+
+def _worker_init_timeout_seconds() -> float:
+    return _positive_env_timeout_seconds("PYPTO_WORKER_INIT_TIMEOUT", _DEFAULT_WORKER_INIT_TIMEOUT_SECONDS)
+
+
+def _worker_step_timeout_seconds(executor_cls: str = "") -> float:
+    default = _DEFAULT_WORKER_STEP_TIMEOUT_SECONDS
+    if executor_cls == "PyptoDeepSeekV4Executor":
+        default = _DEFAULT_DEEPSEEK_V4_WORKER_STEP_TIMEOUT_SECONDS
+    return _positive_env_timeout_seconds("SERVING_WORKER_STEP_TIMEOUT", default)
 
 
 @dataclass
@@ -154,7 +182,7 @@ class ReplicaEngineCore:
                 if not ready:
                     raise RuntimeError("Worker failed to initialize within timeout")
             except BaseException:
-                self._shutdown_worker(timeout=5)
+                await asyncio.to_thread(self._shutdown_worker, timeout=5)
                 raise
             logger.info("Worker ready")
 
@@ -182,7 +210,7 @@ class ReplicaEngineCore:
             await self._loop_task
             self._loop_task = None
 
-        self._shutdown_worker(timeout=30)
+        await asyncio.to_thread(self._shutdown_worker, timeout=30)
         logger.info("ReplicaEngineCore stopped")
 
     def generate_request_id(self) -> str:
@@ -308,11 +336,12 @@ class ReplicaEngineCore:
 
             try:
                 with profile_span("scheduler.wait_worker_output", cat="scheduler"):
+                    step_timeout = _worker_step_timeout_seconds(self.config.executor_cls)
                     step_output: StepOutput = await asyncio.to_thread(
-                        self._output_queue.get, timeout=300
+                        self._output_queue.get, timeout=step_timeout
                     )
             except queue.Empty:
-                logger.error("Worker response timed out (300s)")
+                logger.error(f"Worker response timed out ({step_timeout:g}s)")
                 self._handle_step_error(scheduler_output)
                 continue
 
@@ -371,12 +400,15 @@ class ReplicaEngineCore:
     def _handle_step_error(self, scheduler_output: SchedulerOutput) -> None:
         """On worker error, abort all requests in the failed batch."""
         for sr in scheduler_output.scheduled_requests:
-            ctx = self._request_contexts.get(sr.request.request_id)
+            request_id = sr.request.request_id
+            ctx = self._request_contexts.get(request_id)
             if ctx is not None:
                 ctx.queue.put_nowait(
                     TokenOutput(finished=True, finish_reason="error")
                 )
-            self.scheduler.abort_request(sr.request.request_id)
+            if request_id not in self._pending_free_ids:
+                self._pending_free_ids.append(request_id)
+            self.scheduler.abort_request(request_id)
 
     def _shutdown_worker(self, *, timeout: float) -> None:
         input_q = self._input_queue
@@ -470,8 +502,7 @@ class AsyncLLMEngine:
 
     async def stop(self) -> None:
         """Stop all DP engine cores."""
-        for core in reversed(self._cores):
-            await core.stop()
+        await asyncio.gather(*(core.stop() for core in reversed(self._cores)))
 
     def generate_request_id(self) -> str:
         self._request_counter += 1

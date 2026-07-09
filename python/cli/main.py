@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import sys
 from collections.abc import Iterator, Sequence
@@ -134,27 +135,36 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     model_dir = str(Path(args.model).resolve())
     executor_kwargs = _build_executor_kwargs()
     devices = parse_device_ids(args.devices, default_device=args.device)
+    model_family = _detect_model_family(Path(model_dir))
+    if model_family == "deepseek_v4":
+        executor_kwargs["compile_kernels"] = True
     parallel_config = ParallelConfig(
         data_parallel_size=args.data_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
         devices=devices,
         data_parallel_routing=args.data_parallel_routing,
     )
+    _validate_model_topology(model_family, args, parallel_config)
     first_group = parallel_config.replica_device_groups[0]
+    worker_device_ids = first_group if parallel_config.data_parallel_size == 1 else ()
+    enable_prefix_cache = args.enable_prefix_caching
+    if model_family == "deepseek_v4":
+        enable_prefix_cache = False
 
     return EngineConfig(
         model_id=args.served_model_name or Path(args.model).name,
         model_dir=model_dir,
         platform=args.platform,
         device_id=first_group[0],
+        device_ids=worker_device_ids,
         parallel_config=parallel_config,
-        executor_cls="PyptoQwen14BExecutor",
+        executor_cls=_executor_cls_for_model_family(model_family),
         executor_kwargs=executor_kwargs,
         runtime_config=_build_runtime_config(args),
         max_num_running_reqs=args.max_num_seqs,
         max_num_scheduled_tokens=args.max_num_batched_tokens,
         long_prefill_token_threshold=args.long_prefill_token_threshold,
-        enable_prefix_cache=args.enable_prefix_caching,
+        enable_prefix_cache=enable_prefix_cache,
         enable_chunk_prefill=args.enable_chunked_prefill,
     )
 
@@ -185,6 +195,60 @@ def _build_executor_kwargs() -> dict[str, object]:
     if save_kernels_dir:
         executor_kwargs["save_kernels_dir"] = save_kernels_dir
     return executor_kwargs
+
+
+def _detect_model_family(model_dir: Path) -> str:
+    """Return the serving model family inferred from config.json."""
+    config_path = model_dir / "config.json"
+    if not config_path.exists():
+        return "qwen"
+    try:
+        config_data = json.loads(config_path.read_text())
+    except json.JSONDecodeError:
+        return "qwen"
+    model_type = str(config_data.get("model_type") or "").lower()
+    architectures = {str(item).lower() for item in (config_data.get("architectures") or [])}
+    if model_type == "deepseek_v4" or "deepseekv4forcausallm" in architectures:
+        return "deepseek_v4"
+    return "qwen"
+
+
+def _executor_cls_for_model_family(model_family: str) -> str:
+    """Map model family metadata to the worker executor class id."""
+    if model_family == "deepseek_v4":
+        return "PyptoDeepSeekV4Executor"
+    return "PyptoQwen14BExecutor"
+
+
+def _validate_model_topology(
+    model_family: str,
+    args: argparse.Namespace,
+    parallel_config,
+) -> None:
+    """Validate model-specific serving topology constraints."""
+    if model_family != "deepseek_v4":
+        return
+    config_data = json.loads((Path(args.model).resolve() / "config.json").read_text())
+    quantization = config_data.get("quantization_config") or {}
+    if quantization.get("quant_method") != "compressed-tensors":
+        raise ValueError(
+            "DeepSeekV4 serving requires the quantized W8A8 compressed-tensors checkpoint "
+            "such as /data/models/dsv4-flash-w8a8; the original checkpoint is too large for 8 NPUs."
+        )
+    if parallel_config.data_parallel_size != 1 or parallel_config.tensor_parallel_size != 8:
+        raise ValueError("DeepSeekV4 serving requires --dp 1 --tp 8")
+    if len(parallel_config.devices) != 8:
+        raise ValueError("DeepSeekV4 serving requires exactly 8 NPU device ids")
+    if args.block_size != 128:
+        raise ValueError("DeepSeekV4 kernels require --block-size 128")
+    if args.max_num_seqs > 64:
+        raise ValueError("DeepSeekV4 decode kernels support at most --max-num-seqs 64")
+    if args.max_model_len > 260:
+        raise ValueError(
+            "DeepSeekV4 pypto-lib decode CSA state tables currently support at most "
+            "--max-model-len 260. Increase the decode CSA state table depth in pypto-lib "
+            "before serving longer contexts."
+        )
 
 
 def run_serve(
@@ -281,7 +345,7 @@ def _ensure_core_imports() -> None:
         try:
             from ..core.parallel import ParallelConfig as imported_parallel_config
             from ..core.parallel import parse_device_ids as imported_parse_device_ids
-        except ImportError:
+        except (ImportError, ValueError):
             from python.core.parallel import ParallelConfig as imported_parallel_config
             from python.core.parallel import parse_device_ids as imported_parse_device_ids
 

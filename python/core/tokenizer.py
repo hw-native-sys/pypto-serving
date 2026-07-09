@@ -9,8 +9,13 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
 
 
 class TokenizerAdapter:
@@ -50,19 +55,40 @@ class TransformersTokenizerAdapter(TokenizerAdapter):
     def from_pretrained(cls, model_dir: str, trust_remote_code: bool = False) -> "TransformersTokenizerAdapter":
         """Load a local Hugging Face tokenizer directory."""
         try:
-            from transformers import AutoTokenizer
+            from transformers import AutoTokenizer, PreTrainedTokenizerFast
         except ImportError as exc:
             raise RuntimeError(
                 "transformers is required for the current local Hugging Face tokenizer adapter."
             ) from exc
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            str(Path(model_dir)),
-            local_files_only=True,
-            trust_remote_code=trust_remote_code,
-            use_fast=True,
-        )
+        model_path = Path(model_dir)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                str(model_path),
+                local_files_only=True,
+                trust_remote_code=trust_remote_code,
+                use_fast=True,
+            )
+        except (OSError, ValueError, AttributeError) as exc:
+            logger.warning(
+                "AutoTokenizer.from_pretrained failed for %s: %s; falling back to local tokenizer.json",
+                model_path,
+                exc,
+            )
+            tokenizer = _load_fast_tokenizer_from_file(model_path, PreTrainedTokenizerFast)
         return cls(tokenizer=tokenizer)
+
+    @classmethod
+    def from_tokenizer_file(cls, model_dir: str) -> "TransformersTokenizerAdapter":
+        """Load ``tokenizer.json`` directly without consulting model config."""
+        try:
+            from transformers import PreTrainedTokenizerFast
+        except ImportError as exc:
+            raise RuntimeError(
+                "transformers is required for the current local Hugging Face tokenizer adapter."
+            ) from exc
+
+        return cls(tokenizer=_load_fast_tokenizer_from_file(Path(model_dir), PreTrainedTokenizerFast))
 
     def encode(self, text: str) -> list[int]:
         """Encode text using the wrapped Hugging Face tokenizer."""
@@ -86,3 +112,26 @@ class TransformersTokenizerAdapter(TokenizerAdapter):
     def pad_token_id(self) -> int | None:
         """Return the wrapped tokenizer PAD token ID."""
         return self.tokenizer.pad_token_id
+
+
+def _token_content(value: object) -> str | None:
+    """Extract a special token string from tokenizer_config JSON."""
+    if isinstance(value, dict):
+        content = value.get("content")
+        return content if isinstance(content, str) else None
+    return value if isinstance(value, str) else None
+
+
+def _load_fast_tokenizer_from_file(model_path: Path, tokenizer_cls: type) -> object:
+    """Load a local tokenizer.json with special tokens from tokenizer_config."""
+    tokenizer_file = model_path / "tokenizer.json"
+    if not tokenizer_file.exists():
+        raise FileNotFoundError(f"Missing tokenizer.json in {model_path}")
+    config_path = model_path / "tokenizer_config.json"
+    tokenizer_config = json.loads(config_path.read_text()) if config_path.exists() else {}
+    special_tokens = {
+        name: _token_content(tokenizer_config.get(name))
+        for name in ("bos_token", "eos_token", "pad_token", "unk_token")
+        if _token_content(tokenizer_config.get(name)) is not None
+    }
+    return tokenizer_cls(tokenizer_file=str(tokenizer_file), **special_tokens)
