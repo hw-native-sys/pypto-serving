@@ -17,12 +17,18 @@ from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 
-from pypto_serving import GenerateConfig, LLMEngine, RuntimeConfig
+from pypto_serving import GenerateConfig, LLMEngine, ModelLoader, RuntimeConfig
 from pypto_serving.config.parallel import ParallelConfig, parse_device_ids
 from pypto_serving.config.types import LoadedModel
-from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
+from pypto_serving.model.qwen.a8w8_loader import Qwen3A8W8DirectoryLoader
+from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor
+from pypto_serving.model.qwen.npu_executor_a8w8 import Qwen314BA8W8PyptoExecutor
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.tools.profile import get_profiler, merge_profile, profile_span
+
+
+_QWEN3_BF16_FORMAT = "qwen3-14b"
+_QWEN3_A8W8_FORMAT = "qwen3-a8w8"
 
 
 # -----------------------------------------------------------------------------
@@ -54,24 +60,6 @@ class _TimingCollector:
             yield
         finally:
             self.phases[name] = self.phases.get(name, 0.0) + (time.perf_counter() - t0)
-
-    def WrapKernel(self, fn, name: str, *, group_by_decode_step: bool = False):
-        """Return a wrapper that records every call's duration under `name`."""
-
-        def wrapper(*args, **kwargs):
-            t0 = time.perf_counter()
-            try:
-                return fn(*args, **kwargs)
-            finally:
-                dt = time.perf_counter() - t0
-                self.kernel_times[name].append(dt)
-                if group_by_decode_step and self._decode_step_idx >= 0:
-                    bucket = self.kernel_per_decode_step[name]
-                    while len(bucket) <= self._decode_step_idx:
-                        bucket.append([])
-                    bucket[self._decode_step_idx].append(dt)
-
-        return wrapper
 
     def BeginDecodeStep(self) -> None:
         self._decode_step_idx += 1
@@ -130,24 +118,23 @@ def InstallProfiling(engine: LLMEngine, model_id: str, collector: _TimingCollect
     """
     executor = engine._executor  # type: ignore[attr-defined]
     compiled = executor._compiled[model_id]  # type: ignore[attr-defined]
+    runner = executor._runners[model_id]  # type: ignore[attr-defined]
+    kernel_names = {
+        id(compiled.prefill): ("kernel.prefill_fwd", False),
+        id(compiled.decode): ("kernel.decode_layer", True),
+    }
 
-    # Kernels are dispatched by Qwen314BModelRunner.
-    if hasattr(compiled.prefill, "chip_callable") or hasattr(compiled.prefill, "compiled"):
-        runner = executor._runners[model_id]  # type: ignore[attr-defined]
-        orig_run_program = runner._run_distributed_program  # type: ignore[attr-defined]
-        kernel_names = {
-            id(compiled.prefill): ("kernel.prefill_fwd", False),
-            id(compiled.decode): ("kernel.decode_layer", True),
-        }
+    def install_runner_kernel_timing(method_name: str) -> None:
+        orig_run = getattr(runner, method_name)
 
-        def timed_run_program(callable_spec, *args, **kwargs):
+        def timed_run(callable_spec, *args, **kwargs):
             kernel_info = kernel_names.get(id(callable_spec))
             if kernel_info is None:
-                return orig_run_program(callable_spec, *args, **kwargs)
+                return orig_run(callable_spec, *args, **kwargs)
             name, group_by_decode_step = kernel_info
             t0 = time.perf_counter()
             try:
-                timing = orig_run_program(callable_spec, *args, **kwargs)
+                timing = orig_run(callable_spec, *args, **kwargs)
             finally:
                 dt = time.perf_counter() - t0
                 collector.kernel_times[name].append(dt)
@@ -159,14 +146,16 @@ def InstallProfiling(engine: LLMEngine, model_id: str, collector: _TimingCollect
             collector.RecordRunTiming(name, timing)
             return timing
 
-        runner._run_distributed_program = timed_run_program  # type: ignore[attr-defined]
+        setattr(runner, method_name, timed_run)
+
+    # A8W8 kernels are dispatched as L2 callables by Qwen314BA8W8ModelRunner.
+    if hasattr(compiled.prefill, "chip_callable"):
+        install_runner_kernel_timing("_run_l2_program")
+    # Original Qwen3-14B kernels are dispatched by the L3 model runner.
+    elif hasattr(compiled.prefill, "compiled"):
+        install_runner_kernel_timing("_run_distributed_program")
     else:
-        # Per-layer kernel wrappers. compiled.prefill / compiled.decode are invoked
-        # once per transformer layer inside run_prefill / run_decode respectively.
-        compiled.prefill = collector.WrapKernel(compiled.prefill, "kernel.prefill_fwd")
-        compiled.decode = collector.WrapKernel(
-            compiled.decode, "kernel.decode_layer", group_by_decode_step=True
-        )
+        raise TypeError("unsupported compiled kernel wrapper for profiling")
 
     # Top-level executor API wrappers.
     orig_prefill = executor.run_prefill
@@ -330,6 +319,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-dir", required=True, help="Local model directory, e.g. a Hugging Face snapshot.")
     parser.add_argument("--prompt", required=True, help="Prompt text.")
     parser.add_argument("--model-id", default="qwen3-14b-local")
+    parser.add_argument(
+        "--model-format",
+        default=_QWEN3_BF16_FORMAT,
+        choices=[_QWEN3_BF16_FORMAT, _QWEN3_A8W8_FORMAT],
+        help=(
+            "Qwen3-14B weight format. Use qwen3-14b for the original BF16/L3 path "
+            "or qwen3-a8w8 for compressed-tensors W8A8 checkpoints."
+        ),
+    )
     parser.add_argument("--platform", default="a2a3", choices=["a2a3sim", "a2a3", "a5sim", "a5"])
     parser.add_argument("--device-id", type=int, default=0, help="Default NPU device id when --devices is unset.")
     parser.add_argument(
@@ -353,6 +351,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--max-batch-size", type=int, default=16)
     parser.add_argument("--max-num-seqs", type=int, default=16, help="Max batch size / concurrent requests.")
     parser.add_argument("--num-prompts", type=int, default=1,
                         help="Number of prompts to generate (replicates --prompt). When > 1 calls "
@@ -372,18 +371,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dtype", default="bfloat16", help="Weight data type.")
     parser.add_argument("--kv-cache-dtype", default="bfloat16", help="KV cache data type.")
+    parser.add_argument(
+        "--decode-backend",
+        default="a8w8",
+        choices=["a8w8"],
+        help="For qwen3-a8w8 only: run the A8W8 prefill/decode backend.",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--stream", action="store_true", default=False)
     parser.add_argument("--save-kernels-dir", default=None)
     parser.add_argument(
+        "--pto-isa-commit",
+        default=None,
+        help="For qwen3-a8w8 only: pin PyPTO compile/assemble to the installed runtime's pto-isa revision.",
+    )
+    parser.add_argument(
         "--num-layers-override",
         type=int,
         default=None,
-        help="Validation knob: truncate the loaded model to N transformer "
+        help="BF16/L3 validation knob: truncate the loaded model to N transformer "
              "layers before compile/dispatch. Used to reduce HBM footprint "
-             "while validating Qwen3-14B kernels on memory-constrained devices.",
+             "while validating Qwen3-14B kernels on memory-constrained devices. "
+             "Unsupported for qwen3-a8w8 because its fused decode kernel is "
+             "compiled for the full fixed layer count.",
     )
     parser.add_argument(
         "--profile",
@@ -405,12 +417,43 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _model_loader_for_format(model_format: str) -> ModelLoader | None:
+    if model_format != _QWEN3_A8W8_FORMAT:
+        return None
+    model_loader = ModelLoader()
+    model_loader.register(Qwen3A8W8DirectoryLoader())
+    return model_loader
+
+
+def _executor_class_for_format(model_format: str):
+    if model_format == _QWEN3_A8W8_FORMAT:
+        return Qwen314BA8W8PyptoExecutor
+    if model_format == _QWEN3_BF16_FORMAT:
+        return Qwen314BPyptoExecutor
+    raise ValueError(f"unsupported model_format: {model_format!r}")
+
+
+def _validate_generation_args(args: argparse.Namespace) -> None:
+    if args.model_format != _QWEN3_A8W8_FORMAT:
+        return
+    if args.num_layers_override is not None:
+        raise ValueError("--num-layers-override is not supported for qwen3-a8w8 fused decode kernels")
+    if args.tensor_parallel_size != 1:
+        raise ValueError("qwen3-a8w8 currently requires --tp 1")
+
+
+def _validate_a8w8_device_group(model_format: str, device_ids: tuple[int, ...]) -> None:
+    if model_format == _QWEN3_A8W8_FORMAT and len(device_ids) != 1:
+        raise ValueError("qwen3-a8w8 currently requires exactly one device")
+
+
 def main() -> None:
     args = build_parser().parse_args()
     import logging
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     for _n in ("simpler_setup", "pypto", "simpler"):
         logging.getLogger(_n).setLevel(logging.WARNING)
+    _validate_generation_args(args)
     get_profiler(process_name="npu_generate")
     model_dir = Path(args.model_dir).resolve()
     if not model_dir.is_dir():
@@ -429,17 +472,27 @@ def main() -> None:
             "serving replicas; data_parallel_size must be 1"
         )
     device_ids = parallel_config.replica_device_groups[0]
+    _validate_a8w8_device_group(args.model_format, device_ids)
 
     kv_cache_manager = KvCacheManager(
         enable_prefix_cache=not args.no_enable_prefix_caching,
     )
-    executor = PyptoExecutor(
+    executor_cls = _executor_class_for_format(args.model_format)
+    executor_kwargs = {
+        "platform": args.platform,
+        "device_ids": device_ids,
+        "save_kernels_dir": args.save_kernels_dir,
+    }
+    if args.model_format == _QWEN3_A8W8_FORMAT:
+        executor_kwargs["pto_isa_commit"] = args.pto_isa_commit
+        executor_kwargs["l3_trace"] = args.profile_verbose
+    executor = executor_cls(
         kv_cache_manager,
-        platform=args.platform,
-        device_ids=device_ids,
-        save_kernels_dir=args.save_kernels_dir,
+        **executor_kwargs,
     )
+    model_loader = _model_loader_for_format(args.model_format)
     engine = LLMEngine(
+        model_loader=model_loader,
         kv_cache_manager=kv_cache_manager,
         executor=executor,
     )
@@ -452,15 +505,16 @@ def main() -> None:
         engine.init_model(
             model_id=args.model_id,
             model_dir=str(model_dir),
-            model_format="huggingface",
+            model_format=_QWEN3_A8W8_FORMAT if args.model_format == _QWEN3_A8W8_FORMAT else "huggingface",
+            decode_backend=args.decode_backend,
             runtime_config=RuntimeConfig(
-                page_size=args.block_size,
-                max_batch_size=args.max_num_seqs,
+                page_size=128 if args.model_format == _QWEN3_A8W8_FORMAT else args.block_size,
+                max_batch_size=args.max_batch_size if args.model_format == _QWEN3_A8W8_FORMAT else args.max_num_seqs,
                 max_seq_len=args.max_seq_len,
                 max_new_tokens=args.max_new_tokens,
                 device="cpu",
-                kv_dtype=args.kv_cache_dtype,
-                weight_dtype=args.dtype,
+                kv_dtype="int8" if args.model_format == _QWEN3_A8W8_FORMAT else args.kv_cache_dtype,
+                weight_dtype="bfloat16" if args.model_format == _QWEN3_A8W8_FORMAT else args.dtype,
                 npu_memory_utilization=args.npu_memory_utilization,
                 max_num_batched_tokens=args.max_num_batched_tokens,
             ),

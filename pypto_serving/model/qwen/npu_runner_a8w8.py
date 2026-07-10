@@ -88,7 +88,6 @@ class _CompiledKernels:
     rope_sin: torch.Tensor
     padded_vocab: int
     padded_lm_head_weight: torch.Tensor
-    layers: list[_KernelLayerWeights]
     decode_weights: dict[str, torch.Tensor]
     decode_logits_buffer: torch.Tensor
 

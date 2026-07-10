@@ -8,6 +8,9 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import asyncio
+import argparse
+import json
+import struct
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,7 +34,9 @@ from pypto_serving.config.types import (
     RuntimeModel,
 )
 from pypto_serving.model.common.executor.executor import ModelExecutor
+from pypto_serving.model.qwen.a8w8_loader import Qwen3A8W8DirectoryLoader, _SafeTensorIndex
 from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
+from pypto_serving.model.qwen.npu_executor_a8w8 import Qwen314BA8W8PyptoExecutor
 from pypto_serving.model.qwen.npu_runner import (
     _CompiledKernels,
     _L3Callable,
@@ -39,6 +44,10 @@ from pypto_serving.model.qwen.npu_runner import (
     _add_run_timing_args,
     _kernel_trace_name,
     _run_timing_us,
+)
+from pypto_serving.model.qwen.npu_runner_a8w8 import (
+    Qwen314BA8W8ModelRunner,
+    _KernelLayerWeights,
 )
 from pypto_serving.serving.engine.async_engine import (
     ReplicaEngineCore,
@@ -69,11 +78,30 @@ from pypto_serving.serving.server.ipc import (
 )
 from pypto_serving.serving.server.serving_worker import WorkerProcess
 from pypto_serving.worker.worker import WorkerTensor
+from examples.model.qwen3_14b.npu_generate import _validate_generation_args
 
 
 ROOT = Path(__file__).resolve().parents[1]
 QWEN3_DISPATCH = ROOT / "pypto_serving" / "model" / "qwen" / "qwen3_l3_dispatch.py"
 QWEN3_KERNEL_DIR = ROOT / "pypto-lib" / "models" / "qwen3" / "14b"
+
+
+def _write_safetensor(path: Path, name: str, tensor: torch.Tensor) -> None:
+    raw = tensor.contiguous().numpy().tobytes()
+    dtype_names = {
+        torch.int8: "I8",
+        torch.float32: "F32",
+        torch.bfloat16: "BF16",
+    }
+    header = {
+        name: {
+            "dtype": dtype_names[tensor.dtype],
+            "shape": list(tensor.shape),
+            "data_offsets": [0, len(raw)],
+        }
+    }
+    header_bytes = json.dumps(header).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + raw)
 
 
 class _Tokenizer:
@@ -746,6 +774,119 @@ def test_prepare_decode_inputs_caches_block_table_until_pages_change():
     assert prepared.block_table.tolist() == alloc.page_ids
 
 
+def test_a8w8_decode_inputs_use_actual_user_batch_without_padding_lanes():
+    model = _model(max_batch_size=16)
+    manager = KvCacheManager()
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    runner = Qwen314BA8W8ModelRunner(
+        compiled=None,  # type: ignore[arg-type]
+    )
+    alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 1)
+    hidden_states = torch.ones(1, model.config.hidden_size)
+
+    prepared = runner._prepare_decode_inputs(
+        model,
+        DecodeBatch(
+            request_ids=[alloc.request_id],
+            token_ids=torch.zeros(1, 1, dtype=torch.long),
+            hidden_states=hidden_states,
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            kv_allocations=[alloc],
+        ),
+    )
+
+    assert prepared.actual_batch == 1
+    assert prepared.hidden.shape == (1, model.config.hidden_size)
+    assert prepared.seq_lens.tolist() == [1]
+    assert prepared.block_table.shape == (2,)
+    assert prepared.block_table[0].item() == alloc.page_ids[0]
+    assert prepared.slot_mapping.tolist() == [manager.slot_mapping_for_request(alloc)]
+
+
+def test_a8w8_init_kv_cache_returns_page_count_for_first_and_repeated_init(monkeypatch):
+    model = _model(max_batch_size=16, max_seq_len=128, page_size=64)
+    runner = Qwen314BA8W8ModelRunner(
+        compiled=None,  # type: ignore[arg-type]
+    )
+    allocated_shapes = []
+
+    def alloc_kv_cache_tensor(shape, dtype):
+        allocated_shapes.append((shape, dtype))
+        return WorkerTensor(
+            data_ptr=len(allocated_shapes),
+            shape=shape,
+            dtype=_FakeWorker._DTYPES[dtype],
+        )
+
+    monkeypatch.setattr(runner, "_alloc_kv_cache_tensor", alloc_kv_cache_tensor)
+    monkeypatch.setattr(runner, "_free_kv_cache_tensor", lambda tensor: None)
+
+    first_pages = runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
+    second_pages = runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
+
+    assert first_pages == 32
+    assert second_pages == 32
+    cache_rows = model.config.num_hidden_layers * 32 * model.config.num_key_value_heads * model.runtime.page_size
+    assert allocated_shapes == [
+        ((cache_rows, model.config.head_dim), torch.bfloat16),
+        ((cache_rows, model.config.head_dim), torch.bfloat16),
+        ((cache_rows, 8), torch.float32),
+        ((cache_rows, 8), torch.float32),
+    ]
+
+
+def test_a8w8_runtime_contract_rejects_mismatched_page_size():
+    model = _model(max_batch_size=16, max_seq_len=128, page_size=64)
+
+    with pytest.raises(ValueError, match="page_size=128"):
+        Qwen314BA8W8PyptoExecutor._validate_kernel_runtime_contract(
+            model,
+            SimpleNamespace(MAX_SEQ=128),
+            SimpleNamespace(BLOCK_SIZE=128),
+        )
+
+
+def test_a8w8_runtime_contract_rejects_excessive_max_seq_len():
+    model = _model(max_batch_size=16, max_seq_len=256, page_size=128)
+
+    with pytest.raises(ValueError, match="max_seq_len <= 128"):
+        Qwen314BA8W8PyptoExecutor._validate_kernel_runtime_contract(
+            model,
+            SimpleNamespace(MAX_SEQ=128),
+            SimpleNamespace(BLOCK_SIZE=128),
+        )
+
+
+def test_a8w8_stack_decode_weights_releases_per_layer_sources():
+    def layer(value: float) -> _KernelLayerWeights:
+        return _KernelLayerWeights(
+            input_rms_weight=torch.full((1, 2), value),
+            wq=torch.full((2, 2), value),
+            wk=torch.full((2, 1), value),
+            wv=torch.full((2, 1), value),
+            q_norm_weight=torch.full((1, 1), value),
+            k_norm_weight=torch.full((1, 1), value),
+            wo=torch.full((2, 2), value),
+            post_rms_weight=torch.full((1, 2), value),
+            w_gate=torch.full((2, 3), value),
+            w_up=torch.full((2, 3), value),
+            w_down=torch.full((3, 2), value),
+            wq_scale=torch.full((1, 2), value),
+            wk_scale=torch.full((1, 1), value),
+            wv_scale=torch.full((1, 1), value),
+            wo_scale=torch.full((1, 2), value),
+        )
+
+    layers = [layer(1.0), layer(2.0)]
+
+    weights = Qwen314BA8W8PyptoExecutor._stack_decode_weights(layers)
+
+    assert weights["decode_wq"].shape == (4, 2)
+    assert weights["decode_wq_scale"].shape == (2, 2)
+    assert all(layer_weights.wq.numel() == 0 for layer_weights in layers)
+    assert all(layer_weights.wq_scale is not None and layer_weights.wq_scale.numel() == 0 for layer_weights in layers)
+
+
 def test_decode_kernel_inputs_reject_multi_token_rows():
     model = _model(max_batch_size=2)
     runner = ModelRunner(compiled=_compiled_kernels(model))
@@ -916,6 +1057,54 @@ def test_engine_ignores_device_sampled_tokens_for_non_greedy_config():
     assert executor.prefill_calls == 1
     assert executor.decode_calls == 0
     assert sampler.sample_calls == 1
+
+
+def test_a8w8_loader_detects_unindexed_safetensors(tmp_path):
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    _write_safetensor(tmp_path / "weights.safetensors", "tensor", torch.tensor([[1, 2]], dtype=torch.int8))
+
+    loader = Qwen3A8W8DirectoryLoader()
+    index = _SafeTensorIndex(tmp_path)
+
+    assert loader.can_load(tmp_path)
+    assert torch.equal(index.load("tensor"), torch.tensor([[1, 2]], dtype=torch.int8))
+
+
+def test_a8w8_loader_uses_index_shard_names(tmp_path):
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    _write_safetensor(tmp_path / "custom-shard.safetensors", "tensor", torch.tensor([3], dtype=torch.int8))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"tensor": "custom-shard.safetensors"}}),
+        encoding="utf-8",
+    )
+
+    loader = Qwen3A8W8DirectoryLoader()
+    index = _SafeTensorIndex(tmp_path)
+
+    assert loader.can_load(tmp_path)
+    assert torch.equal(index.load("tensor"), torch.tensor([3], dtype=torch.int8))
+
+
+def test_a8w8_num_layers_override_fails_fast():
+    with pytest.raises(ValueError, match="num-layers-override"):
+        _validate_generation_args(
+            argparse.Namespace(
+                model_format="qwen3-a8w8",
+                num_layers_override=1,
+                tensor_parallel_size=1,
+            )
+        )
+
+
+def test_a8w8_tensor_parallel_fails_fast():
+    with pytest.raises(ValueError, match="requires --tp 1"):
+        _validate_generation_args(
+            argparse.Namespace(
+                model_format="qwen3-a8w8",
+                num_layers_override=None,
+                tensor_parallel_size=2,
+            )
+        )
 
 
 def test_serving_worker_skips_decode_host_embedding_when_executor_embeds_on_device():
@@ -1467,7 +1656,7 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         compiled=compiled,
     )
     monkeypatch.setattr(runner, "_shared_l3_worker", lambda: _FakeWorker())
-    monkeypatch.setattr(runner, "_compute_kv_cache_pages", lambda config, runtime, device_id=0: 1)
+    monkeypatch.setattr(runner, "_compute_kv_cache_pages", lambda config, runtime, device_id=None: 1)
     monkeypatch.setattr(runner, "_print_memory_breakdown", lambda *a, **kw: None)
     runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
     monkeypatch.setattr(
@@ -1545,10 +1734,12 @@ def test_decode_host_inlines_embedding_and_sampling_into_decode_fwd():
 
     if not QWEN3_KERNEL_DIR.is_dir():
         pytest.skip("pypto-lib submodule is not checked out")
-    decode_path = QWEN3_KERNEL_DIR / "decode_layer.py"
-    if not decode_path.is_file():
-        decode_path = QWEN3_KERNEL_DIR / "decode_fwd.py"
-    decode_source = decode_path.read_text(encoding="utf-8")
+    decode_kernel = QWEN3_KERNEL_DIR / "decode_layer.py"
+    if not decode_kernel.is_file():
+        decode_kernel = QWEN3_KERNEL_DIR / "decode_fwd.py"
+    if not decode_kernel.is_file():
+        pytest.skip("pypto-lib decode kernel source is not checked out")
+    decode_source = decode_kernel.read_text(encoding="utf-8")
     assert 'name_hint="token_embed"' in decode_source
     assert 'name_hint="greedy_sample"' in decode_source
 
