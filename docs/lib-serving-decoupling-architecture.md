@@ -120,12 +120,13 @@ Repository responsibility boundaries:
 `pypto-lib` owns:
 
 - model-specific serving ABI
+- model-owned serving stage specifications
 - kernel file layout
 - kernel function mapping
 - kernel constant interpretation
 - host-side JIT wrapper signatures
-- compile-time argument construction
-- runtime kernel argument construction
+- compile dummy argument construction
+- runtime raw argument tuple construction
 - weight layout preparation
 - model/kernel compatibility validation
 
@@ -148,6 +149,7 @@ Cross-boundary constraints:
 - Serving does not own model-specific host-side JIT wrapper signatures.
 - Serving does not duplicate kernel argument tuple ordering.
 - Serving does not duplicate model-specific weight layouts.
+- Serving does not construct model-specific compile dummy tensors.
 
 ## 4. Detailed Design
 
@@ -181,23 +183,28 @@ Multi-model extension:
 
 ### 4.2 `ModelServingContract`
 
-`ModelServingContract` is the top-level description of a model serving ABI. It describes the capabilities, limits, execution graph, kernel metadata, weight layout, and hooks exposed by a model contract to serving.
+`ModelServingContract` is the top-level description of a model serving ABI. It
+describes the model identity, runtime capabilities, execution graph, kernel
+stages, and lib-owned hooks exposed by a model contract to serving.
 
-Core fields:
+Phase 1 required fields:
 
 - `schema_version`: the format version of the contract schema.
 - `model`: stable model identity, including family, variant, size, quantization, and similar fields.
 - `capabilities`: capabilities supported by the model contract, such as paged KV, chunked prefill, and device greedy sampling.
 - `limits`: model/kernel limits, such as batch size, maximum sequence length, vocabulary size, and page size.
-- `resources`: resources required for model execution.
-- `cache`: KV cache layout and page metadata.
 - `execution`: the stage graph for serving phases such as prefill and decode.
 - `kernels`: mapping from logical kernel stages to `KernelSpec`.
-- `weights`: model weight layout metadata.
 - `kernel_binder`: binds loaded kernel functions to lib-owned host wrappers.
 - `prepare_weights`: model-specific weight layout preparation function.
 - `load_kernels`: lib-owned kernel loader.
 - `validate_kernels`: lib-owned kernel/module/model validation function.
+
+Future extension fields:
+
+- `resources`: resources required for model execution.
+- `cache`: KV cache layout and page metadata.
+- `weights`: structured weight layout metadata, if serving later needs generic introspection.
 
 The key point of `ModelServingContract` is to expose only the structured ABI information that serving must know. The actual kernel files, constant names, and internal module organization remain implementation details owned by lib.
 
@@ -205,18 +212,122 @@ The key point of `ModelServingContract` is to expose only the structured ABI inf
 
 `KernelSpec` describes a logical kernel stage. Serving does not directly care about kernel file names or the module that contains a Python function; it only cares about the ABI metadata exposed by this stage for a serving phase.
 
-Core fields:
+Phase 1 required fields:
 
 - `name`: logical stage name, such as `prefill` or `decode`.
 - `public_name`: stable name for logging and profiling, such as `qwen3.prefill`.
-- `runtime_args`: ordered argument metadata, including name, dtype, shape expression, and direction.
-- `outputs`: logical outputs produced by the kernel stage.
-- `capabilities`: capabilities provided by the stage.
+- `args`: ordered tensor argument metadata, including name, dtype, shape expression, and direction.
 - `host_jit_fn`: lib-owned host-side JIT wrapper function.
 - `compile_args_builder`: builder for compile dummy arguments.
 - `runtime_args_builder`: builder that maps logical runtime inputs to the raw kernel ABI tuple.
 
+Future extension fields:
+
+- `outputs`: logical outputs produced by the kernel stage.
+- `capabilities`: capabilities provided by the stage.
+- `validate_runtime`: optional validator for runtime configuration and actual argument tensors.
+
 The purpose of `KernelSpec` is to keep ABI changes inside the lib contract. Serving uses `KernelSpec` to orchestrate compilation and execution, but it does not duplicate signatures.
+
+`KernelSpec` should live next to the kernel implementation that owns the ABI. A
+Qwen3-14B implementation should not keep a parallel `models/qwen3/serving/*`
+mirror that restates kernel signatures far away from the kernel entry points.
+For example:
+
+```text
+models/qwen3/14b/
+  constants.py
+  config.py
+  prefill_fwd.py        # may expose PREFILL_STAGE
+  decode_layer.py       # may expose DECODE_STAGE
+  greedy_sample.py      # may expose GREEDY_SAMPLE_STAGE
+  token_embed.py        # may expose TOKEN_EMBED_STAGE
+  serving_contract.py   # aggregates the stage specs into ModelServingContract
+  serving_host.py       # optional colocated host-side wrappers
+  serving_weights.py    # optional colocated weight layout preparation
+```
+
+The important rule is locality: when a kernel entry function changes, the stage
+spec and its contract tests should be in the same variant-owned area as the
+kernel, so the kernel author sees and updates the ABI contract at the same time.
+
+### 4.3.1 `TensorArgSpec`
+
+`TensorArgSpec` describes one tensor argument in a kernel stage. It should
+describe a shape contract rather than one incidental compile-time tensor shape.
+Compile dummy arguments and runtime actual arguments are two instantiations of
+the same `TensorArgSpec`.
+
+Phase 1 required fields:
+
+- `name`: parameter name in the host/kernel ABI.
+- `dtype`: element dtype, such as `bf16`, `fp32`, or `int32`.
+- `direction`: `in`, `out`, or `inout`.
+- `shape`: ordered dimension expressions represented as `int` values or string expressions.
+
+Future extension fields:
+
+- `role`: semantic role, such as `runtime`, `weight`, `cache`, `output`, `scratch`, or `static`.
+- `source`: logical source used by the runtime argument builder, such as `inputs.seq_lens`, `weights.decode_wq`, `static.rope_cos`, or `runtime.k_cache`.
+- `constraints`: structured validation rules for this argument.
+
+For Phase 1, shape expressions are intentionally simple strings. They are not a
+general expression language owned by serving; they are lib-owned labels used for
+metadata, diagnostics, fingerprinting, and focused contract tests. Lib-owned
+compile/runtime builders and validators remain responsible for evaluating the
+actual model-specific shape rules.
+
+```python
+TensorArgSpec(
+    name="hidden_states",
+    dtype="bf16",
+    direction="in",
+    shape=("PREFILL_TOKENS", "H"),
+)
+
+TensorArgSpec(
+    name="k_cache",
+    dtype="bf16",
+    direction="inout",
+    shape=("KV_CACHE_ROWS", "D"),
+)
+```
+
+The concrete dimension environment is supplied by model metadata, kernel
+constants, and runtime configuration. For example:
+
+```text
+B = kernel batch limit
+H = model hidden size
+L = number of layers
+D = attention head dimension
+MAX_SEQ = kernel maximum sequence length
+PAGE_SIZE = KV cache page size
+PREFILL_TOKENS = runtime prefill token count
+KV_CACHE_ROWS = runtime KV cache row capacity
+```
+
+The contract must distinguish fixed dimensions from dynamic dimensions. A
+runtime tensor may vary only on dimensions that the lib-owned ABI marks dynamic
+and that the kernel implementation actually handles dynamically, either through
+explicit tensor annotations such as `pl.Tensor[[M, H], pl.BF16]` or through
+lib-owned `bind_dynamic` usage. Bare `pl.Tensor` annotations are sufficient for
+PyPTO to specialize from compile dummy tensors, but they are not sufficient as a
+cross-repository serving ABI source because serving would need to know the dummy
+tensor shape before lib has described it.
+
+In Phase 1, dynamic-range validation can live in lib-owned validator code rather
+than in `TensorArgSpec` itself. A later schema revision may replace string shape
+expressions with structured dimension objects if generic validation or automatic
+argument allocation becomes necessary.
+
+When the PyPTO kernel entry signature already contains complete
+`pl.Tensor[[shape], dtype]` annotations, lib may derive `TensorArgSpec` from the
+function signature. This is an implementation convenience, not a serving
+responsibility. If the signature is incomplete, the kernel module must expose an
+explicit colocated stage spec or complete the annotations. The serving contract
+must never rely on serving-side dummy arguments as the first source of ABI
+truth.
 
 ### 4.4 `LoadedKernelModules`
 
@@ -286,9 +397,9 @@ The lib-side loader is responsible for:
 Serving-side API calls:
 
 ```python
-loaded_kernels = contract_load_kernels(contract)
-contract_validate_kernels(contract, loaded_kernels, model)
-bind_contract_kernel_functions(contract, **loaded_kernels.functions)
+loaded_kernels = contract.load_kernels()
+contract.validate_kernels(contract, loaded_kernels, model)
+contract.kernel_binder(**loaded_kernels.functions)
 ```
 
 Kernel constant mismatch errors are produced by the lib validator. Serving only calls the loader, validator, and binder, while following the repository responsibility boundaries defined in Section 3.
@@ -301,15 +412,35 @@ Design:
 
 - Lib defines host-side JIT wrappers.
 - Lib receives the actual loaded kernel functions through a binder.
-- Serving obtains the host JIT function through `contract_host_jit_fn(contract, stage)`.
+- Serving obtains the host JIT function from `KernelSpec.host_jit_fn`.
 - Serving does not maintain wrapper signatures.
 
-Compile arguments are generated by lib builders:
+Compile dummy arguments are generated by lib builders:
 
 ```python
-dummy_args = contract_compile_args(contract, stage, model_config, runtime_config)
-compiled = host_jit_fn.compile(*dummy_args, config=run_config)
+stage = contract.kernels["prefill"]
+dummy_args = stage.compile_args_builder(model_config, runtime_config)
+compiled = stage.host_jit_fn.compile(*dummy_args, config=run_config)
 ```
+
+Compile dummy arguments are not a separate ABI. They are concrete
+`torch.Tensor` instances generated from the same `TensorArgSpec` used for
+runtime dispatch. Their contents are irrelevant; their metadata is used by
+PyPTO specialization and compilation.
+
+The compile profile must satisfy the stage argument contract:
+
+- argument count and order match the host JIT wrapper;
+- direction, dtype, and rank match the stage ABI;
+- static dimensions match the kernel contract;
+- dynamic dimensions use a valid compile-time profile for the runtime mode;
+- shared dynamic dimensions are bound consistently.
+
+PyPTO can infer tensor shape and dtype from the dummy tensors passed to
+`.compile()`. That inference is a lower-level JIT specialization mechanism; it
+must not be the serving/lib contract boundary. The contract must exist before
+dummy tensors are built, otherwise serving would need to know the model-specific
+ABI in order to ask lib what the ABI is.
 
 Design benefits:
 
@@ -331,15 +462,57 @@ The lib-side runtime argument builder is responsible for:
 Serving dispatch flow:
 
 ```python
-args = contract_runtime_args(contract, stage, inputs, static, **runtime_objects)
+stage = contract.kernels["prefill"]
+args = stage.runtime_args_builder(inputs, static, **runtime_objects)
 compiled_callable(*args)
 ```
 
-Serving may know the logical concepts, but raw argument ordering stays in the lib runtime argument builder. Runtime ABI changes should affect only the lib builder and contract tests.
+Runtime actual arguments must satisfy the same `TensorArgSpec` used to build
+compile dummy arguments. Dummy arguments provide a valid compile-time profile;
+actual arguments carry real request data, prepared weights, cache pages, and
+output buffers while still satisfying the same ABI contract.
+
+The intended flow is:
+
+```text
+ABI spec
+  -> compile-time dummy args
+  -> runtime actual args
+```
+
+Serving may know the logical concepts, but raw argument ordering stays in the
+lib runtime argument builder. Runtime ABI changes should affect only the lib
+builder and contract tests.
+
+Runtime shape variability is allowed only where the lib-owned ABI marks a
+dimension dynamic and the kernel implementation supports that dynamic dimension.
+If a runtime tensor is outside the supported range, the lib-owned validator
+should raise a structured compatibility error before dispatch. Examples:
+
+- `user_batch <= kernel_batch`
+- `prefill_tokens <= user_batch * max_seq`
+- `max_seq_len <= kernel_max_seq`
+- `page_size == kernel_page_size`
+- `vocab == kernel_padded_vocab`
+- `real_vocab == model_vocab`
+- `num_layers == kernel_num_layers`
+- `kv_cache_rows` is sufficient for the allocated pages, layers, KV heads, and page size.
+
+This means a serving instance can provide tensors sized for its actual request
+batch and cache allocation, but lib owns the rules that decide whether those
+tensors are valid for the compiled stage.
 
 ### 4.10 Weight Layout
 
 Weight layout is part of the model kernel ABI, so it is owned by the lib contract.
+
+Weight layout means the shape, order, dtype, padding, transposition, stacking,
+and memory-export form that the kernel expects for model weights. Hugging
+Face-style loaded weights are usually not already in this form. For Qwen3, for
+example, per-layer weights may need to be transposed and stacked into tensors
+such as `decode_wq`, `decode_wk`, `decode_wv`, `decode_w_gate`, and
+`decode_w_down`; embedding and LM-head weights may need vocabulary padding; norm
+weights may need shape normalization such as `[1, H]` or `[L, H]`.
 
 Lib-side weight preparation is responsible for:
 
@@ -355,7 +528,7 @@ Serving is responsible for:
 - Loading model weights.
 - Holding the runtime model record.
 - Providing a tensor exporter, such as shared-memory placement.
-- Calling `contract_prepare_weights`.
+- Calling `contract.prepare_weights`.
 
 Qwen3 and future models may have completely different layouts. Serving should not duplicate Qwen3 layout rules.
 
@@ -440,11 +613,12 @@ DeepSeek-V4 Flash/Pro should be integrated through independent contracts:
 
 Future model integration path:
 
-1. Add a model contract in `pypto-lib`.
-2. Add a kernel loader and validator in `pypto-lib`.
-3. Add host wrappers, compile/runtime argument builders, and weight layout in `pypto-lib`.
-4. Add an executor mapping in `pypto-serving` only if the model requires a new executor class.
-5. Do not add kernel ABI detail code in serving.
+1. Add colocated kernel stage specs in `pypto-lib`, next to the model variant's kernel entry points.
+2. Add a model contract aggregator in `pypto-lib` for the model variant.
+3. Add a kernel loader and validator in `pypto-lib`.
+4. Add host wrappers, compile dummy argument builders, runtime argument builders, and weight layout in `pypto-lib`.
+5. Add an executor mapping in `pypto-serving` only if the model requires a new executor class.
+6. Do not add kernel ABI detail code in serving.
 
 ### 4.13 Model Config Boundary
 
@@ -490,7 +664,7 @@ Contract responsibilities inside the executor flow:
 - Provide host JIT functions.
 - Provide compile dummy arguments.
 - Prepare model-specific weights.
-- Map logical runtime inputs to ABI tuples.
+- Map logical runtime inputs to raw ABI tuples.
 - Validate loaded kernels using model/runtime metadata.
 
 Adding a new model should not automatically require a new executor class. A new executor class is needed only when device orchestration, runner behavior, or runtime integration differs. If the difference is limited to the kernel ABI, weight layout, execution graph, or argument builders, it should be expressed through a new lib contract.
@@ -518,12 +692,22 @@ sequenceDiagram
     W->>C: validate kernels with model and runtime information
     W->>C: bind kernel functions to host-side JIT wrappers
     W->>E: create executor for contract
-    E->>C: get host_jit_fn and compile arguments
+    E->>C: get host_jit_fn and compile dummy args from stage spec
     E->>E: compile host-side JIT wrappers
     E->>C: prepare weight layout
     E->>Runner: create runner with compiled kernels and contract
     Runner-->>W: model registration complete
 ```
+
+The compile path is intentionally lib-driven:
+
+```text
+Executor -> KernelSpec.compile_args_builder(model_config, runtime_config)
+         -> dummy torch.Tensor tuple
+         -> KernelSpec.host_jit_fn.compile(*dummy_args)
+```
+
+The executor does not construct model-specific dummy tensors itself.
 
 Prefill/decode flow:
 
@@ -536,12 +720,24 @@ sequenceDiagram
 
     S-->>Runner: scheduled logical batch
     Runner->>Runner: construct logical input objects
-    Runner->>C: construct runtime args for stage
+    Runner->>C: validate and construct runtime args for stage
     C-->>Runner: raw kernel ABI tuple
     Runner->>K: call compiled callable
     K-->>Runner: logits / sampled ids / hidden states
     Runner-->>S: serving outputs
 ```
+
+The runtime path is also lib-driven at the raw ABI boundary:
+
+```text
+Runner logical inputs + prepared weights + runtime buffers
+  -> KernelSpec.runtime_args_builder(...)
+  -> raw argument tuple in kernel order
+  -> compiled callable
+```
+
+Serving owns the logical inputs and buffer lifecycle; lib owns the conversion
+from those logical objects to the kernel ABI tuple.
 
 Failure ownership:
 
@@ -557,8 +753,10 @@ Failure ownership:
 
 - Contract metadata tests.
 - ABI fingerprint stability tests.
-- Compile argument construction tests.
-- Runtime argument construction tests.
+- Stage spec and kernel entry signature consistency tests.
+- TensorArgSpec validation tests for static dimensions, dynamic dimensions, dtype, rank, and direction.
+- Compile dummy argument construction tests.
+- Runtime raw argument construction tests.
 - Weight layout tests.
 - Kernel loader tests.
 - Kernel validator tests.
@@ -569,6 +767,7 @@ Failure ownership:
 - Contract compatibility tests.
 - Executor selection tests.
 - Source-text coupling absence tests.
+- Absence of model-specific compile dummy tensor construction in serving.
 - Batching and scheduler regression tests.
 - Qwen3 E2E tests.
 
@@ -586,15 +785,17 @@ Cross-repository validation:
 - Serving does not import kernel files by file name.
 - Serving does not read model-specific kernel constants.
 - Serving does not own model-specific host-side JIT wrapper signatures.
-- Serving does not construct model-specific compile/runtime argument tuples.
+- Serving does not construct model-specific runtime raw argument tuples.
+- Serving does not construct model-specific compile dummy tensors.
 - Serving does not duplicate the Qwen3 weight layout.
 - Serving does not assert against lib source text.
 - The lib contract is the single source of truth for the serving ABI.
+- Qwen3 stage specs are colocated with Qwen3-14B kernel entry points or in the same variant-owned directory.
 - Qwen3 serving E2E passes.
 
 ### 7.2 Future Model Extension Readiness
 
-- New model integration primarily adds lib contracts, loaders, validators, builders, and weight layouts.
+- New model integration primarily adds lib stage specs, contract aggregators, loaders, validators, builders, and weight layouts.
 - When model differences are limited to ABI, graph, weights, or runtime argument layout, serving does not need new kernel ABI details.
 - Serving needs a new executor mapping only when device orchestration or runner behavior differs.
 - For heterogeneous `config.json` files, the `ModelConfig` boundary remains a clear open issue; future model extension readiness does not mean this schema has been finalized.
