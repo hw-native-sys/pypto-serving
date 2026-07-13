@@ -227,17 +227,11 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
 
         # Populate the HOST wrappers' annotation globals so they can be compiled
         # straight from their signatures (no throwaway torch.empty dummies). The
-        # dynamic-dim vars are pulled from the loaded prefill kernel so host and
-        # kernel share the SAME pl.dynamic instances (dims unify across the call).
+        # model constants + dynamic-dim vars come from the loaded prefill kernel
+        # (all validated equal to this model above), so host and kernel share the
+        # SAME pl.dynamic instances (dims unify across the call).
         self._inject_dispatch_shapes(
             qwen3_prefill_fwd,
-            hidden_size=model.config.hidden_size,
-            kv_hidden=model.config.num_key_value_heads * model.config.head_dim,
-            head_dim=model.config.head_dim,
-            intermediate_size=model.config.intermediate_size,
-            vocab_size=padded_vocab,
-            num_layers=model.config.num_hidden_layers,
-            batch=kernel_batch,
             sampled_ids_width=sampled_ids_width,
             rope_seq=model.runtime.max_seq_len,
             decode_block_table_flat=kernel_batch * max_blocks_per_seq,
@@ -374,17 +368,21 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             decode_next_hidden_buffer=decode_next_hidden_buffer,
         )
 
-    @staticmethod
+    #: Names the prefill kernel module re-exports (``from config import ...``)
+    #: that the HOST-wrapper annotations reference: static model constants plus
+    #: the shared ``pl.dynamic`` dim vars. Pulling the exact same instances the
+    #: kernels use lets each host dim unify with the same dim in the callee.
+    _DISPATCH_KERNEL_NAMES = (
+        "HIDDEN", "KV_HIDDEN", "HEAD_DIM", "INTERMEDIATE", "VOCAB", "NUM_LAYERS", "BATCH",
+        "USER_BATCH_DYN", "PREFILL_TOKENS_DYN", "KV_CACHE_ROWS_DYN", "BLOCK_TABLE_FLAT_DYN",
+        "LAYER_DYN", "LAYER_HIDDEN_ROWS_DYN", "LAYER_INTER_ROWS_DYN",
+    )
+
+    @classmethod
     def _inject_dispatch_shapes(
+        cls,
         prefill_module: object,
         *,
-        hidden_size: int,
-        kv_hidden: int,
-        head_dim: int,
-        intermediate_size: int,
-        vocab_size: int,
-        num_layers: int,
-        batch: int,
         sampled_ids_width: int,
         rope_seq: int,
         decode_block_table_flat: int,
@@ -394,31 +392,16 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         The wrappers in ``qwen3_l3_dispatch`` are compiled with ``compile()`` (no
         sample tensors), so their ``pl.Tensor[[...], dtype]`` annotations — lazy
         strings under ``from __future__ import annotations`` — are resolved from
-        that module's globals when compiling. Static extents come from the
-        validated model config; the ``pl.dynamic`` vars are re-exported by the
-        loaded prefill kernel (``from config import ...``), so binding those exact
-        instances lets each host dim unify with the same dim in the callee.
+        that module's globals when compiling. Model constants and the shared
+        ``pl.dynamic`` dim vars are copied straight from the loaded prefill kernel
+        (all validated equal to this model in ``_compile_model``); only the
+        per-runtime / per-kernel-scalar extents are supplied by the caller.
         """
-        qwen3_l3_dispatch.HIDDEN = hidden_size
-        qwen3_l3_dispatch.KV_HIDDEN = kv_hidden
-        qwen3_l3_dispatch.HEAD_DIM = head_dim
-        qwen3_l3_dispatch.INTERMEDIATE = intermediate_size
-        qwen3_l3_dispatch.VOCAB = vocab_size
-        qwen3_l3_dispatch.NUM_LAYERS = num_layers
-        qwen3_l3_dispatch.BATCH = batch
+        for name in cls._DISPATCH_KERNEL_NAMES:
+            setattr(qwen3_l3_dispatch, name, getattr(prefill_module, name))
         qwen3_l3_dispatch.SAMPLED_IDS_PAD = sampled_ids_width
         qwen3_l3_dispatch.ROPE_SEQ = rope_seq
         qwen3_l3_dispatch.DEC_BLOCK_TABLE_FLAT = decode_block_table_flat
-        for dyn_name in (
-            "USER_BATCH_DYN",
-            "PREFILL_TOKENS_DYN",
-            "KV_CACHE_ROWS_DYN",
-            "BLOCK_TABLE_FLAT_DYN",
-            "LAYER_DYN",
-            "LAYER_HIDDEN_ROWS_DYN",
-            "LAYER_INTER_ROWS_DYN",
-        ):
-            setattr(qwen3_l3_dispatch, dyn_name, getattr(prefill_module, dyn_name))
 
     def _compile_jit_fwd_callable(
         self,
