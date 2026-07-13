@@ -224,43 +224,31 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         )
         page_size = model.runtime.page_size
         max_blocks_per_seq = (model.runtime.max_seq_len + page_size - 1) // page_size
-        prefill = self._compile_prefill_fwd_callable(
-            qwen3_l3_dispatch.qwen3_prefill_host,
-            batch=kernel_batch,
-            max_seq=model.runtime.max_seq_len,
+
+        # Populate the HOST wrappers' annotation globals so they can be compiled
+        # straight from their signatures (no throwaway torch.empty dummies). The
+        # dynamic-dim vars are pulled from the loaded prefill kernel so host and
+        # kernel share the SAME pl.dynamic instances (dims unify across the call).
+        self._inject_dispatch_shapes(
+            qwen3_prefill_fwd,
             hidden_size=model.config.hidden_size,
-            intermediate_size=model.config.intermediate_size,
-            num_heads=model.config.num_attention_heads,
-            num_kv_heads=model.config.num_key_value_heads,
+            kv_hidden=model.config.num_key_value_heads * model.config.head_dim,
             head_dim=model.config.head_dim,
-            num_layers=model.config.num_hidden_layers,
+            intermediate_size=model.config.intermediate_size,
             vocab_size=padded_vocab,
-            block_table_stride=max_blocks_per_seq,
-            page_size=page_size,
+            num_layers=model.config.num_hidden_layers,
+            batch=kernel_batch,
             sampled_ids_width=sampled_ids_width,
+            rope_seq=model.runtime.max_seq_len,
+            decode_block_table_flat=kernel_batch * max_blocks_per_seq,
         )
+
+        prefill = self._compile_jit_fwd_callable("prefill_fwd", qwen3_l3_dispatch.qwen3_prefill_host)
         _mark("compile_prefill")
-        decode = self._compile_decode_fwd_callable(
-            qwen3_l3_dispatch.qwen3_decode_host,
-            batch=kernel_batch,
-            max_seq=model.runtime.max_seq_len,
-            block_table_stride=max_blocks_per_seq,
-            hidden_size=model.config.hidden_size,
-            intermediate_size=model.config.intermediate_size,
-            num_heads=model.config.num_attention_heads,
-            num_kv_heads=model.config.num_key_value_heads,
-            head_dim=model.config.head_dim,
-            num_layers=model.config.num_hidden_layers,
-            vocab_size=padded_vocab,
-            page_size=page_size,
-            sampled_ids_width=sampled_ids_width,
-        )
+        decode = self._compile_jit_fwd_callable("decode_fwd", qwen3_l3_dispatch.qwen3_decode_host)
         _mark("compile_decode")
-        greedy_sample = self._compile_greedy_sample_callable(
-            qwen3_l3_dispatch.qwen3_greedy_sample_host,
-            batch=kernel_batch,
-            sampled_ids_width=sampled_ids_width,
-            vocab_size=padded_vocab,
+        greedy_sample = self._compile_jit_fwd_callable(
+            "greedy_sample_fwd", qwen3_l3_dispatch.qwen3_greedy_sample_host
         )
         _mark("compile_greedy_sample")
         rope_cos_raw, rope_sin_raw = rope_tables(
@@ -386,143 +374,63 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             decode_next_hidden_buffer=decode_next_hidden_buffer,
         )
 
-    def _compile_prefill_fwd_callable(
-        self,
-        jit_fn: object,
+    @staticmethod
+    def _inject_dispatch_shapes(
+        prefill_module: object,
         *,
-        batch: int,
-        max_seq: int,
-        block_table_stride: int,
         hidden_size: int,
-        intermediate_size: int,
-        num_heads: int,
-        num_kv_heads: int,
+        kv_hidden: int,
         head_dim: int,
-        num_layers: int,
+        intermediate_size: int,
         vocab_size: int,
-        page_size: int,
-        sampled_ids_width: int,
-    ) -> _L3Callable:
-        """Compile the prefill HOST wrapper into a distributed program."""
-        kv_hidden = num_kv_heads * head_dim
-        total_tokens = batch * max_seq
-        runtime_cache_blocks = (max_seq + page_size - 1) // page_size
-        cache_rows = batch * runtime_cache_blocks * num_layers * num_kv_heads * page_size
-        dummy_args = [
-            torch.empty((total_tokens, hidden_size), dtype=torch.bfloat16),
-            torch.empty((batch,), dtype=torch.int32),
-            torch.empty((batch,), dtype=torch.int32),
-            torch.empty((batch,), dtype=torch.int32),
-            torch.empty((num_layers, hidden_size), dtype=torch.float32),
-            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),
-            torch.empty((num_layers, head_dim), dtype=torch.float32),
-            torch.empty((num_layers, head_dim), dtype=torch.float32),
-            torch.empty((max_seq, head_dim), dtype=torch.float32),
-            torch.empty((max_seq, head_dim), dtype=torch.float32),
-            torch.empty((batch * block_table_stride,), dtype=torch.int32),
-            torch.empty((total_tokens,), dtype=torch.int32),
-            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
-            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
-            torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((num_layers, hidden_size), dtype=torch.float32),
-            torch.empty((1, hidden_size), dtype=torch.float32),
-            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((batch, vocab_size), dtype=torch.float32),
-        ]
-        return self._compile_jit_fwd_callable("prefill_fwd", jit_fn, dummy_args)
-
-    def _compile_decode_fwd_callable(
-        self,
-        jit_fn: object,
-        *,
+        num_layers: int,
         batch: int,
-        max_seq: int,
-        block_table_stride: int,
-        hidden_size: int,
-        intermediate_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        num_layers: int,
-        vocab_size: int,
-        page_size: int,
         sampled_ids_width: int,
-    ) -> _L3Callable:
-        """Compile the fused all-layer PAGED decode HOST wrapper into a distributed program.
+        rope_seq: int,
+        decode_block_table_flat: int,
+    ) -> None:
+        """Bind the HOST wrappers' annotation globals for signature-mode compile.
 
-        Signature (21 args; PAGED KV via block_table + slot_mapping, same pool as
-        prefill):
-          input_rms_weight, wq, wk, wv, q_norm_weight,
-          k_norm_weight, seq_lens, block_table, slot_mapping, rope_cos, rope_sin,
-          k_cache, v_cache, wo, w_gate, w_up, w_down, post_rms_weight,
-          final_norm_weight, lm_head_weight, out.
-
-        k_cache/v_cache are the PAGED pool (rows = num_layers * batch *
-        runtime_cache_blocks * num_kv_heads * page_size — identical to prefill);
-        the kernel derives the per-layer stride + max_blocks_per_seq from the
-        tensor dims. Projection weights are stacked ``[num_layers*HIDDEN, ...]``
-        and norm gammas ``[num_layers, dim]`` — exactly what
-        ``_stack_decode_weights`` produces.
+        The wrappers in ``qwen3_l3_dispatch`` are compiled with ``compile()`` (no
+        sample tensors), so their ``pl.Tensor[[...], dtype]`` annotations — lazy
+        strings under ``from __future__ import annotations`` — are resolved from
+        that module's globals when compiling. Static extents come from the
+        validated model config; the ``pl.dynamic`` vars are re-exported by the
+        loaded prefill kernel (``from config import ...``), so binding those exact
+        instances lets each host dim unify with the same dim in the callee.
         """
-        kv_hidden = num_kv_heads * head_dim
-        runtime_cache_blocks = (max_seq + page_size - 1) // page_size
-        cache_rows = num_layers * batch * runtime_cache_blocks * num_kv_heads * page_size
-        dummy_args = [
-            torch.empty((num_layers, hidden_size), dtype=torch.float32),                      # input_rms_weight
-            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),        # wq
-            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),          # wk
-            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),          # wv
-            torch.empty((num_layers, head_dim), dtype=torch.float32),                          # q_norm_weight
-            torch.empty((num_layers, head_dim), dtype=torch.float32),                          # k_norm_weight
-            torch.empty((batch,), dtype=torch.int32),                                          # seq_lens
-            torch.empty((batch * block_table_stride,), dtype=torch.int32),                     # block_table
-            torch.empty((batch,), dtype=torch.int32),                                          # slot_mapping
-            torch.empty((max_seq, head_dim), dtype=torch.float32),                             # rope_cos
-            torch.empty((max_seq, head_dim), dtype=torch.float32),                             # rope_sin
-            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),                         # k_cache (paged pool)
-            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),                         # v_cache (paged pool)
-            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),        # wo
-            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),  # w_gate
-            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),  # w_up
-            torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),  # w_down
-            torch.empty((num_layers, hidden_size), dtype=torch.float32),                       # post_rms_weight
-            torch.empty((1, hidden_size), dtype=torch.float32),                                # final_norm_weight
-            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),                      # lm_head_weight
-            torch.empty((batch, vocab_size), dtype=torch.float32),                             # out
-            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),                      # embed_weight
-            torch.empty((batch, sampled_ids_width), dtype=torch.int32),                        # sampled_ids_in
-            torch.empty((batch, sampled_ids_width), dtype=torch.int32),                        # sampled_ids_out
-            torch.empty((batch, hidden_size), dtype=torch.bfloat16),                           # next_hidden
-        ]
-        return self._compile_jit_fwd_callable("decode_fwd", jit_fn, dummy_args)
-
-    def _compile_greedy_sample_callable(
-        self,
-        jit_fn: object,
-        *,
-        batch: int,
-        sampled_ids_width: int,
-        vocab_size: int,
-    ) -> _L3Callable:
-        """Compile the greedy sampling HOST wrapper."""
-        dummy_args = [
-            torch.empty((batch, vocab_size), dtype=torch.float32),
-            torch.empty((batch, sampled_ids_width), dtype=torch.int32),
-        ]
-        return self._compile_jit_fwd_callable("greedy_sample_fwd", jit_fn, dummy_args)
+        qwen3_l3_dispatch.HIDDEN = hidden_size
+        qwen3_l3_dispatch.KV_HIDDEN = kv_hidden
+        qwen3_l3_dispatch.HEAD_DIM = head_dim
+        qwen3_l3_dispatch.INTERMEDIATE = intermediate_size
+        qwen3_l3_dispatch.VOCAB = vocab_size
+        qwen3_l3_dispatch.NUM_LAYERS = num_layers
+        qwen3_l3_dispatch.BATCH = batch
+        qwen3_l3_dispatch.SAMPLED_IDS_PAD = sampled_ids_width
+        qwen3_l3_dispatch.ROPE_SEQ = rope_seq
+        qwen3_l3_dispatch.DEC_BLOCK_TABLE_FLAT = decode_block_table_flat
+        for dyn_name in (
+            "USER_BATCH_DYN",
+            "PREFILL_TOKENS_DYN",
+            "KV_CACHE_ROWS_DYN",
+            "BLOCK_TABLE_FLAT_DYN",
+            "LAYER_DYN",
+            "LAYER_HIDDEN_ROWS_DYN",
+            "LAYER_INTER_ROWS_DYN",
+        ):
+            setattr(qwen3_l3_dispatch, dyn_name, getattr(prefill_module, dyn_name))
 
     def _compile_jit_fwd_callable(
         self,
         name: str,
         jit_fn: object,
-        dummy_args: list[torch.Tensor],
     ) -> _L3Callable:
-        """Compile a HOST wrapper into a PyPTO DistributedCompiledProgram."""
+        """Compile a HOST wrapper into a PyPTO DistributedCompiledProgram.
+
+        Compiled straight from the wrapper's fully-annotated signature (pypto
+        #2014): ``compile()`` reads the shape/dtype contract from the parameter
+        annotations, so no throwaway ``torch.empty`` sample tensors are built.
+        """
         from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
         from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
         from pypto.runtime import RunConfig  # noqa: PLC0415
@@ -549,7 +457,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             compile_profiling=config.compile_profiling,
             distributed_config=distributed_config,
         )
-        compiled = jit_fn.compile(*dummy_args, config=run_config)
+        compiled = jit_fn.compile(config=run_config)
         if not isinstance(compiled, DistributedCompiledProgram):
             raise TypeError(
                 f"{name} did not compile to DistributedCompiledProgram; got {type(compiled).__name__}"

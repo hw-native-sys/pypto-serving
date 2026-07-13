@@ -329,7 +329,9 @@ def test_decode_inputs_use_actual_user_batch_without_padding_lanes():
     )
 
     assert prepared.actual_batch == 1
-    assert prepared.hidden.shape == (1, model.config.hidden_size)
+    # The fused decode kernel embeds token ids on-device, so decode inputs no
+    # longer carry a hidden buffer; token_ids is the per-row input instead.
+    assert prepared.token_ids.shape == (1, 1)
     assert prepared.seq_lens.tolist() == [1]
     assert prepared.block_table.shape == (2,)
     assert prepared.block_table[0].item() == alloc.page_ids[0]
@@ -696,12 +698,21 @@ def _layer(hidden_size: int, intermediate_size: int, head_dim: int) -> LayerWeig
 
 
 class _CopyKernel:
-    def __call__(self, hidden, *args, config=None):
-        out = args[-1]
-        if out.shape == hidden.shape:
-            out.copy_(hidden)
+    def __call__(self, *args, config=None):
+        # Fake compiled kernel used only to let a dispatch complete. It tolerates
+        # non-tensor args (e.g. _StaticDeviceTensor weight markers) so it works
+        # for both the prefill signature and the fused decode signature (whose
+        # first arg is a stacked weight, not a hidden tensor). Copies the first
+        # real tensor into the last when shapes match, else zeroes it.
+        tensors = [arg for arg in args if isinstance(arg, torch.Tensor)]
+        if len(tensors) < 2:
+            return None
+        src, out = tensors[0], tensors[-1]
+        if out.shape == src.shape:
+            out.copy_(src)
         else:
             out.zero_()
+        return None
 
 
 class _ImmediateEosExecutor(ModelExecutor):
