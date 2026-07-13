@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-import tempfile
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -22,6 +21,7 @@ from pypto_serving.config.types import RuntimeModel
 from pypto_serving.model.common.executor.pypto_executor import PyptoExecutor as CorePyptoExecutor
 from pypto_serving.model.common.executor.utils import rope_tables, round_up
 from pypto_serving.model.common.runner.model_runner import ModelRunner
+from pypto_serving.model.qwen import qwen3_l3_dispatch
 from pypto_serving.model.qwen.npu_executor import (
     _QWEN14B_BLOCK_DIM,
     _VOCAB_PAD_MULTIPLE,
@@ -31,7 +31,7 @@ from pypto_serving.model.qwen.npu_executor import (
 from pypto_serving.model.qwen.npu_runner_a8w8 import (
     _CompiledKernels,
     _KernelLayerWeights,
-    _L2Callable,
+    _L3Callable,
     Qwen314BA8W8ModelRunner,
 )
 
@@ -148,25 +148,13 @@ class Qwen314BA8W8PyptoExecutor(CorePyptoExecutor):
             pto_isa_commit=pto_isa_commit,
         )
         self._l3_trace = l3_trace
-        self._l2_compile_root: Path | None = None
         self._pypto_root = pypto_root
-
-    @property
-    def profile_verbose(self) -> bool:
-        """Return whether compile and L3 execution timing logs are enabled."""
-        return self._l3_trace
 
     def _create_runner(self, model_id: str, compiled: object) -> ModelRunner:
         """Create the Qwen3-14B runtime runner for compiled kernels."""
         if not isinstance(compiled, _CompiledKernels):
             raise TypeError("Qwen314BA8W8PyptoExecutor requires Qwen3-14B compiled kernels.")
-        return Qwen314BA8W8ModelRunner(
-            model_id=model_id,
-            compiled=compiled,
-            platform=self._platform,
-            device_id=self._device_ids[0],
-            save_kernels_dir=self._save_kernels_dir,
-        )
+        return Qwen314BA8W8ModelRunner(compiled=compiled)
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
         """Compile Qwen3-14B PyPTO kernels and pack runtime artifacts."""
@@ -190,6 +178,10 @@ class Qwen314BA8W8PyptoExecutor(CorePyptoExecutor):
         # device-resident paged KV pool prefill writes (self._kv_caches), so no
         # contiguous bridge / MAX_SEQ env is needed.
         qwen3_decode_layer = _load_pypto_lib_qwen14b_module("decode_layer_a8w8", kernel_dir)
+        prefill_jit, decode_jit = qwen3_l3_dispatch.create_qwen3_a8w8_dispatch(
+            qwen3_prefill_fwd.prefill_hidden_a8w8,
+            qwen3_decode_layer.decode_fwd,
+        )
         _mark("imports")
 
         self._validate_supported_shape(model)
@@ -224,12 +216,11 @@ class Qwen314BA8W8PyptoExecutor(CorePyptoExecutor):
         page_size = model.runtime.page_size
         max_blocks_per_seq = (model.runtime.max_seq_len + page_size - 1) // page_size
         prefill = self._compile_prefill_fwd_callable_a8w8(
-            qwen3_prefill_fwd.prefill_hidden_a8w8,
+            prefill_jit,
             batch=kernel_batch,
             max_seq=model.runtime.max_seq_len,
             hidden_size=model.config.hidden_size,
             intermediate_size=model.config.intermediate_size,
-            num_heads=model.config.num_attention_heads,
             num_kv_heads=model.config.num_key_value_heads,
             head_dim=model.config.head_dim,
             num_layers=min(model.config.num_hidden_layers, _QWEN14B_A8W8_PREFILL_CHUNK_LAYERS),
@@ -239,13 +230,12 @@ class Qwen314BA8W8PyptoExecutor(CorePyptoExecutor):
         )
         _mark("compile_prefill")
         decode = self._compile_decode_fwd_callable_a8w8(
-            qwen3_decode_layer.decode_fwd,
+            decode_jit,
             batch=kernel_batch,
             max_seq=model.runtime.max_seq_len,
             block_table_stride=max_blocks_per_seq,
             hidden_size=model.config.hidden_size,
             intermediate_size=model.config.intermediate_size,
-            num_heads=model.config.num_attention_heads,
             num_kv_heads=model.config.num_key_value_heads,
             head_dim=model.config.head_dim,
             num_layers=model.config.num_hidden_layers,
@@ -290,6 +280,37 @@ class Qwen314BA8W8PyptoExecutor(CorePyptoExecutor):
             dtype=torch.float32,
         ).share_memory_()
         _mark("decode_logits_buffer")
+        max_prefill_tokens = kernel_batch * model.runtime.max_seq_len
+        l3_buffers = {
+            "prefill_hidden_buffer": torch.empty(
+                (max_prefill_tokens, model.config.hidden_size),
+                dtype=torch.bfloat16,
+            ).share_memory_(),
+            "prefill_next_hidden_buffer": torch.empty(
+                (max_prefill_tokens, model.config.hidden_size),
+                dtype=torch.bfloat16,
+            ).share_memory_(),
+            "prefill_seq_lens_buffer": torch.empty((kernel_batch,), dtype=torch.int32).share_memory_(),
+            "prefill_chunk_lens_buffer": torch.empty((kernel_batch,), dtype=torch.int32).share_memory_(),
+            "prefill_chunk_offsets_buffer": torch.empty((kernel_batch,), dtype=torch.int32).share_memory_(),
+            "prefill_block_table_buffer": torch.empty(
+                (kernel_batch * max_blocks_per_seq,),
+                dtype=torch.int32,
+            ).share_memory_(),
+            "prefill_slot_mapping_buffer": torch.empty((max_prefill_tokens,), dtype=torch.int32).share_memory_(),
+            "prefill_logits_buffer": torch.empty((kernel_batch, padded_vocab), dtype=torch.float32).share_memory_(),
+            "decode_hidden_buffer": torch.empty(
+                (kernel_batch, model.config.hidden_size),
+                dtype=torch.bfloat16,
+            ).share_memory_(),
+            "decode_seq_lens_buffer": torch.empty((kernel_batch,), dtype=torch.int32).share_memory_(),
+            "decode_block_table_buffer": torch.empty(
+                (kernel_batch * max_blocks_per_seq,),
+                dtype=torch.int32,
+            ).share_memory_(),
+            "decode_slot_mapping_buffer": torch.empty((kernel_batch,), dtype=torch.int32).share_memory_(),
+        }
+        _mark("l3_buffers")
 
         timer.report()
 
@@ -303,6 +324,7 @@ class Qwen314BA8W8PyptoExecutor(CorePyptoExecutor):
             padded_lm_head_weight=padded_lm_head_weight,
             decode_weights=decode_weights,
             decode_logits_buffer=decode_logits_buffer,
+            **l3_buffers,
         )
 
     def _compile_prefill_fwd_callable_a8w8(
@@ -314,14 +336,13 @@ class Qwen314BA8W8PyptoExecutor(CorePyptoExecutor):
         block_table_stride: int,
         hidden_size: int,
         intermediate_size: int,
-        num_heads: int,
         num_kv_heads: int,
         head_dim: int,
         num_layers: int,
         vocab_size: int,
         page_size: int,
-    ) -> _L2Callable:
-        """Compile the A8W8 all-layer prefill kernel into an L2 callable."""
+    ) -> _L3Callable:
+        """Compile the A8W8 all-layer prefill host wrapper into an L3 callable."""
         kv_hidden = num_kv_heads * head_dim
         total_tokens = batch * max_seq
         runtime_cache_blocks = (max_seq + page_size - 1) // page_size
@@ -359,7 +380,7 @@ class Qwen314BA8W8PyptoExecutor(CorePyptoExecutor):
             torch.empty((batch, vocab_size), dtype=torch.float32),
             torch.empty((total_tokens, hidden_size), dtype=torch.bfloat16),
         ]
-        return self._compile_jit_fwd_callable("prefill_hidden_a8w8", jit_fn, dummy_args)
+        return self._compile_l3_jit_fwd_callable("prefill_hidden_a8w8", jit_fn, dummy_args)
 
     def _compile_decode_fwd_callable_a8w8(
         self,
@@ -370,14 +391,13 @@ class Qwen314BA8W8PyptoExecutor(CorePyptoExecutor):
         block_table_stride: int,
         hidden_size: int,
         intermediate_size: int,
-        num_heads: int,
         num_kv_heads: int,
         head_dim: int,
         num_layers: int,
         vocab_size: int,
         page_size: int,
-    ) -> _L2Callable:
-        """Compile the A8W8 fused all-layer paged decode kernel."""
+    ) -> _L3Callable:
+        """Compile the A8W8 fused all-layer paged decode host wrapper."""
         kv_hidden = num_kv_heads * head_dim
         runtime_cache_blocks = (max_seq + page_size - 1) // page_size
         cache_rows = num_layers * batch * runtime_cache_blocks * num_kv_heads * page_size
@@ -411,55 +431,53 @@ class Qwen314BA8W8PyptoExecutor(CorePyptoExecutor):
             torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),
             torch.empty((batch, vocab_size), dtype=torch.float32),
         ]
-        return self._compile_jit_fwd_callable("decode_fwd_a8w8", jit_fn, dummy_args)
+        return self._compile_l3_jit_fwd_callable("decode_fwd_a8w8", jit_fn, dummy_args)
 
-    def _compile_jit_fwd_callable(
+    def _compile_l3_jit_fwd_callable(
         self,
         name: str,
         jit_fn: object,
         dummy_args: list[torch.Tensor],
-    ) -> _L2Callable:
-        """Compile a top-level ``@pl.jit`` kernel into an L2 callable."""
-        from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
-        from pypto.runtime.runner import _patch_orchestration_headers  # noqa: PLC0415
+    ) -> _L3Callable:
+        """Compile a HOST wrapper into a PyPTO DistributedCompiledProgram."""
+        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
+        from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
+        from pypto.runtime import RunConfig  # noqa: PLC0415
 
         config = self._run_config(codegen_only=True)
-        compiled = jit_fn.compile(*dummy_args, config=config)
-        work_dir = Path(compiled.output_dir)
-        _patch_orchestration_headers(work_dir)
-        _patch_aicore_bitcast_helpers(work_dir)
-        assembled = compile_and_assemble(
-            work_dir,
-            self._platform,
+        distributed_config = DistributedConfig(
+            device_ids=list(self._device_ids),
+            num_sub_workers=0,
+            block_dim=_QWEN14B_BLOCK_DIM,
+            aicpu_thread_num=4,
+        )
+        run_config = RunConfig(
+            platform=config.platform,
+            device_id=config.device_id,
+            backend_type=config.backend_type,
+            strategy=config.strategy,
+            dump_passes=config.dump_passes,
+            save_kernels=config.save_kernels,
+            save_kernels_dir=config.save_kernels_dir,
+            codegen_only=True,
             pto_isa_commit=config.pto_isa_commit,
+            diagnostic_phase=config.diagnostic_phase,
+            disabled_diagnostics=config.disabled_diagnostics,
+            compile_profiling=config.compile_profiling,
+            distributed_config=distributed_config,
         )
-        if len(assembled) == 2:
-            chip_callable, runtime_name = assembled
-            runtime_config = {}
-        else:
-            chip_callable, runtime_name, runtime_config = assembled
-        runtime_config = runtime_config or {}
-        param_infos, _, _ = compiled._get_metadata()
-        return _L2Callable(
-            chip_callable=chip_callable,
+        compiled = jit_fn.compile(*dummy_args, config=run_config)
+        _patch_aicore_bitcast_helpers(Path(compiled.output_dir))
+        if not isinstance(compiled, DistributedCompiledProgram):
+            raise TypeError(
+                f"{name} did not compile to DistributedCompiledProgram; got {type(compiled).__name__}"
+            )
+        return _L3Callable(
+            compiled=compiled,
             name=name,
-            runtime_name=runtime_name,
-            block_dim=int(runtime_config.get("block_dim", _QWEN14B_BLOCK_DIM)),
-            aicpu_thread_num=int(runtime_config.get("aicpu_thread_num", 4)),
-            param_infos=tuple(param_infos),
+            block_dim=_QWEN14B_BLOCK_DIM,
+            aicpu_thread_num=4,
         )
-
-    def _l2_work_dir(self, name: str) -> Path:
-        """Return a dedicated compile directory for one non-L3 program."""
-        if self._save_kernels_dir is not None:
-            root = Path(self._save_kernels_dir)
-        else:
-            if self._l2_compile_root is None:
-                self._l2_compile_root = Path(tempfile.mkdtemp(prefix="qwen3_14b_l2_"))
-            root = self._l2_compile_root
-        work_dir = root / name
-        work_dir.mkdir(parents=True, exist_ok=True)
-        return work_dir
 
     @staticmethod
     def _validate_kernel_runtime_contract(
@@ -467,7 +485,7 @@ class Qwen314BA8W8PyptoExecutor(CorePyptoExecutor):
         qwen3_prefill_fwd: object,
         qwen3_decode_layer: object,
     ) -> None:
-        """Validate runtime dimensions baked into the A8W8 L2 kernels."""
+        """Validate runtime dimensions baked into the A8W8 kernels."""
         expected_page_size = int(qwen3_decode_layer.BLOCK_SIZE)
         if int(model.runtime.page_size) != expected_page_size:
             raise ValueError(

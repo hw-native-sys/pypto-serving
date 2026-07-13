@@ -779,7 +779,7 @@ def test_a8w8_decode_inputs_use_actual_user_batch_without_padding_lanes():
     manager = KvCacheManager()
     manager.register_model(model.config.model_id, model.config, model.runtime)
     runner = Qwen314BA8W8ModelRunner(
-        compiled=None,  # type: ignore[arg-type]
+        compiled=None,
     )
     alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 1)
     hidden_states = torch.ones(1, model.config.hidden_size)
@@ -806,8 +806,9 @@ def test_a8w8_decode_inputs_use_actual_user_batch_without_padding_lanes():
 def test_a8w8_init_kv_cache_returns_page_count_for_first_and_repeated_init(monkeypatch):
     model = _model(max_batch_size=16, max_seq_len=128, page_size=64)
     runner = Qwen314BA8W8ModelRunner(
-        compiled=None,  # type: ignore[arg-type]
+        compiled=None,
     )
+    monkeypatch.setattr(runner, "_shared_l3_worker", lambda: _FakeWorker())
     allocated_shapes = []
 
     def alloc_kv_cache_tensor(shape, dtype):
@@ -1656,7 +1657,7 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         compiled=compiled,
     )
     monkeypatch.setattr(runner, "_shared_l3_worker", lambda: _FakeWorker())
-    monkeypatch.setattr(runner, "_compute_kv_cache_pages", lambda config, runtime, device_id=None: 1)
+    monkeypatch.setattr(runner, "_compute_kv_cache_pages", lambda config, runtime, device_id=0: 1)
     monkeypatch.setattr(runner, "_print_memory_breakdown", lambda *a, **kw: None)
     runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
     monkeypatch.setattr(
@@ -1734,12 +1735,10 @@ def test_decode_host_inlines_embedding_and_sampling_into_decode_fwd():
 
     if not QWEN3_KERNEL_DIR.is_dir():
         pytest.skip("pypto-lib submodule is not checked out")
-    decode_kernel = QWEN3_KERNEL_DIR / "decode_layer.py"
-    if not decode_kernel.is_file():
-        decode_kernel = QWEN3_KERNEL_DIR / "decode_fwd.py"
-    if not decode_kernel.is_file():
-        pytest.skip("pypto-lib decode kernel source is not checked out")
-    decode_source = decode_kernel.read_text(encoding="utf-8")
+    decode_path = QWEN3_KERNEL_DIR / "decode_layer.py"
+    if not decode_path.is_file():
+        decode_path = QWEN3_KERNEL_DIR / "decode_fwd.py"
+    decode_source = decode_path.read_text(encoding="utf-8")
     assert 'name_hint="token_embed"' in decode_source
     assert 'name_hint="greedy_sample"' in decode_source
 
