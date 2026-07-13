@@ -134,7 +134,7 @@ class _DecodeInputs:
 
 @dataclass
 class _DecodeKernelInputs:
-    """Fixed-batch tensors passed to the fused decode kernel."""
+    """Active-prefix tensors passed to the fused decode kernel."""
 
     actual_batch: int
     token_ids: torch.Tensor
@@ -142,6 +142,8 @@ class _DecodeKernelInputs:
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     logits: torch.Tensor
+    sampled_ids: torch.Tensor
+    next_hidden: torch.Tensor
 
 
 @dataclass
@@ -183,8 +185,8 @@ class Qwen314BModelRunner(ModelRunner):
             self._share_static_kernel_tensors()
             self._static_args = self._build_static_kernel_args()
 
-    #: Scratch KV pages for the profile pass — slot=-1 means only page 0
-    #: is ever touched (reads via block_table=0, writes via slot clamp to 0).
+    #: Scratch KV pages for the profile pass. Warmup maps every read and write
+    #: to slot 0, so one page covers the full synthetic batch.
     _PROFILE_PAGES = 1
 
     def init_kv_cache(self, model_id: str, config: ModelConfig, runtime: RuntimeConfig) -> int:
@@ -192,7 +194,7 @@ class Qwen314BModelRunner(ModelRunner):
 
         Order (vLLM-style): run a profile warmup FIRST so the simpler arena
         is allocated before the KV cache competes for HBM.  The profile uses
-        ``slot_mapping=-1`` / ``block_table=0`` so only a single dummy page
+        ``slot_mapping=0`` / ``block_table=0`` so only a single dummy page
         is needed.  The KV cache size is then computed by the estimation
         formula and allocated into the remaining space; if allocation fails
         the page count is halved and retried.
@@ -213,7 +215,7 @@ class Qwen314BModelRunner(ModelRunner):
             self._materialize_static_tensors()
 
         # -- phase 1: profile warmup → arena allocated ----------------------
-        # Uses slot_mapping=-1 so no real KV cache pages are needed; the
+        # Uses slot_mapping=0 so no real KV cache pages are needed; the
         # 1-page scratch is the dummy target for all reads/writes.
         logger.info(f"[init_kv_cache] profile warmup (scratch {self._PROFILE_PAGES} page) …")
         ModelRunner.init_kv_cache(self, model_id, config, runtime, num_pages=self._PROFILE_PAGES)
@@ -381,15 +383,12 @@ class Qwen314BModelRunner(ModelRunner):
         self._warmup_dispatch(model.runtime)
 
     def _warmup_dispatch(self, runtime: RuntimeConfig) -> None:
-        """Production-scale prefill + decode warm-up with slot_mapping=-1.
+        """Production-scale prefill + decode warm-up mapped to scratch slot 0.
 
         Sizes the prefill to one serving scheduling step — total tokens =
         ``max_num_batched_tokens`` spread across ``max_batch`` requests.
-        This deliberately exercises the kernel at the configured capacity so
-        that a too-large ``max_num_batched_tokens`` (which would hit the
-        single-die attention heap ceiling around seq≈415 in the 40-layer
-        fused prefill) fails at startup rather than on the first real
-        request.
+        This exercises the configured capacity so ring sizing or allocation
+        failures surface at startup rather than on the first real request.
         """
         batch = runtime.max_batch_size
         max_seq = runtime.max_seq_len
@@ -400,7 +399,7 @@ class Qwen314BModelRunner(ModelRunner):
 
         logger.info(
             f"[warmup] starting (batch={batch}, max_num_batched_tokens={mnb}, "
-            f"max_seq={max_seq}, per_req={per_req}, total_tokens={total_tokens}, slot=-1)",
+            f"max_seq={max_seq}, per_req={per_req}, total_tokens={total_tokens}, slot=0)",
             
         )
         compiled = self._compiled
@@ -412,7 +411,7 @@ class Qwen314BModelRunner(ModelRunner):
         compiled.prefill_chunk_lens_buffer.zero_()
         compiled.prefill_chunk_offsets_buffer.zero_()
         compiled.prefill_block_table_buffer.fill_(0)    # all reads from page 0
-        compiled.prefill_slot_mapping_buffer.fill_(-1)  # all writes to page 0
+        compiled.prefill_slot_mapping_buffer.zero_()      # all writes to page 0
 
         token_offset = 0
         for b in range(batch):
@@ -442,11 +441,11 @@ class Qwen314BModelRunner(ModelRunner):
         )
         logger.info(f"[warmup] prefill done ({time.perf_counter() - t0:.2f} s)")
 
-        # -- decode (full fixed batch, minimal seq) -------------------------
+        # -- decode (full capacity batch, minimal seq) ----------------------
         compiled.decode_token_ids_buffer.zero_()
         compiled.decode_seq_lens_buffer.zero_()
         compiled.decode_block_table_buffer.fill_(0)     # all reads from page 0
-        compiled.decode_slot_mapping_buffer.fill_(-1)   # all writes to page 0
+        compiled.decode_slot_mapping_buffer.zero_()      # all writes to page 0
 
         for b in range(batch):
             compiled.decode_seq_lens_buffer[b] = min(per_req + 1, max_seq)
@@ -458,6 +457,8 @@ class Qwen314BModelRunner(ModelRunner):
             block_table=compiled.decode_block_table_buffer,
             slot_mapping=compiled.decode_slot_mapping_buffer,
             logits=compiled.decode_logits_buffer,
+            sampled_ids=compiled.decode_sampled_ids_buffer,
+            next_hidden=compiled.decode_next_hidden_buffer,
         )
 
         logger.info(f"[warmup] decode dispatch … (batch={batch}, seq_len={per_req + 1})")
@@ -614,12 +615,9 @@ class Qwen314BModelRunner(ModelRunner):
         KV is already in place with no bridge. KV is keyed by block_table page id, not by
         kernel row, so a request may occupy any row each step (no stable-slot shim).
 
-        The kernel is FIXED-BATCH (it computes all max_batch_size rows and writes
-        each row's current-token KV). Pad the active batch up to the kernel batch by
-        REPLICATING active row 0's inputs into the padding rows: those rows then
-        recompute row 0's K/V and write row 0's own slot with byte-identical values
-        (an idempotent, safe write), and their logits are trimmed off below. This
-        avoids padded rows clobbering an unrelated request's physical page.
+        The public decode batch is either one active row or all 16 independent
+        rows. Dynamic tensor descriptors carry only that active prefix into the
+        kernel; B1 never materializes or computes replicated KV rows.
         """
         compiled = self._compiled
         model_id = model.config.model_id
@@ -631,10 +629,8 @@ class Qwen314BModelRunner(ModelRunner):
         k_cache = kv_cache.key_pages
         v_cache = kv_cache.value_pages
 
-        kernel_inputs = self._pad_decode_inputs(model, decode_inputs)
+        kernel_inputs = self._stage_decode_inputs(model, decode_inputs)
 
-        # Padded block_table / slot_mapping only ever reference row 0's
-        # already-valid pages, so bound-check exactly what the kernel will read.
         self._validate_kv_cache_bounds(model, kernel_inputs.block_table, kernel_inputs.slot_mapping, k_cache)
 
         self._run_distributed_program(
@@ -644,7 +640,7 @@ class Qwen314BModelRunner(ModelRunner):
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
         sampled_ids, next_hidden = self._integrated_sample_result(
-            compiled.decode_sampled_ids_buffer,
+            kernel_inputs.sampled_ids,
             # decode_fwd's next_hidden output is the embedding for sampled_ids_in
             # used by this decode step. The newly sampled token is embedded at the
             # start of the following decode_fwd call, so there is no next-step
@@ -655,9 +651,7 @@ class Qwen314BModelRunner(ModelRunner):
         )
         return DecodeResult(
             hidden_states=decode_inputs.hidden.float(),
-            logits=kernel_inputs.logits[: kernel_inputs.actual_batch, : model.config.vocab_size].to(
-                decode_inputs.hidden.device
-            ),
+            logits=kernel_inputs.logits[:, : model.config.vocab_size].to(decode_inputs.hidden.device),
             sampled_token_ids=sampled_ids,
             next_hidden_states=next_hidden,
         )
@@ -776,21 +770,22 @@ class Qwen314BModelRunner(ModelRunner):
             inputs.logits,
             static.padded_embed_weight,
             inputs.token_ids,
-            self._compiled.decode_sampled_ids_buffer,
-            self._compiled.decode_next_hidden_buffer,
+            inputs.sampled_ids,
+            inputs.next_hidden,
         )
 
-    def _pad_decode_inputs(self, model: RuntimeModel, inputs: _DecodeInputs) -> _DecodeKernelInputs:
-        """Pad active decode rows to the fixed kernel batch.
-
-        The fused decode kernel computes all ``max_batch_size`` rows. Inactive
-        rows replicate row 0 so their KV writes are idempotent instead of
-        targeting unrelated pages.
-        """
+    def _stage_decode_inputs(self, model: RuntimeModel, inputs: _DecodeInputs) -> _DecodeKernelInputs:
+        """Copy active decode rows into shared buffers and return prefix views."""
         compiled = self._compiled
         actual_batch = inputs.actual_batch
         kernel_batch = model.runtime.max_batch_size
         max_blocks = self._max_blocks_per_seq(model)
+
+        if actual_batch not in (1, kernel_batch):
+            raise ValueError(
+                "Qwen3 direct CANN FAI decode supports only batch 1 or the "
+                f"full batch capacity {kernel_batch}, got {actual_batch}"
+            )
 
         if kernel_batch > compiled.decode_logits_buffer.shape[0]:
             raise ValueError(
@@ -808,36 +803,23 @@ class Qwen314BModelRunner(ModelRunner):
             )
         width = 1
         token_ids[:actual_batch, :width].copy_(active_token_ids[:, :width])
-        if actual_batch < kernel_batch:
-            token_ids[actual_batch:, :width].copy_(
-                active_token_ids[0:1, :width].expand(kernel_batch - actual_batch, width)
-            )
+
+        seq_lens = compiled.decode_seq_lens_buffer[:actual_batch]
+        block_table = compiled.decode_block_table_buffer[: actual_batch * max_blocks]
+        slot_mapping = compiled.decode_slot_mapping_buffer[:actual_batch]
+        seq_lens.copy_(inputs.seq_lens.reshape(actual_batch))
+        block_table.copy_(inputs.block_table.reshape(actual_batch * max_blocks))
+        slot_mapping.copy_(inputs.slot_mapping.reshape(actual_batch))
 
         return _DecodeKernelInputs(
             actual_batch=actual_batch,
-            token_ids=token_ids,
-            seq_lens=self._copy_replicated_rows(
-                compiled.decode_seq_lens_buffer,
-                inputs.seq_lens,
-                actual_batch,
-                kernel_batch,
-                rows_each=1,
-            ),
-            block_table=self._copy_replicated_rows(
-                compiled.decode_block_table_buffer,
-                inputs.block_table,
-                actual_batch,
-                kernel_batch,
-                rows_each=max_blocks,
-            ),
-            slot_mapping=self._copy_replicated_rows(
-                compiled.decode_slot_mapping_buffer,
-                inputs.slot_mapping,
-                actual_batch,
-                kernel_batch,
-                rows_each=1,
-            ),
-            logits=compiled.decode_logits_buffer,
+            token_ids=token_ids[:actual_batch],
+            seq_lens=seq_lens,
+            block_table=block_table,
+            slot_mapping=slot_mapping,
+            logits=compiled.decode_logits_buffer[:actual_batch],
+            sampled_ids=compiled.decode_sampled_ids_buffer[:actual_batch],
+            next_hidden=compiled.decode_next_hidden_buffer[:actual_batch],
         )
 
     def _run_distributed_program(self, callable_spec: _L3Callable, *args: Any) -> Any:
@@ -907,23 +889,6 @@ class Qwen314BModelRunner(ModelRunner):
             *static.decode_weights.values(),
         ):
             self._coerce_l3_arg(worker, arg)
-
-    @staticmethod
-    def _copy_replicated_rows(
-        dst: torch.Tensor,
-        active: torch.Tensor,
-        actual_batch: int,
-        kernel_batch: int,
-        *,
-        rows_each: int,
-    ) -> torch.Tensor:
-        """Copy active rows and fill inactive rows by replicating row 0."""
-        active_view = active.reshape(actual_batch, rows_each)
-        dst_view = dst.reshape(kernel_batch, rows_each)
-        dst_view[:actual_batch].copy_(active_view)
-        if actual_batch < kernel_batch:
-            dst_view[actual_batch:].copy_(active_view[0:1].expand(kernel_batch - actual_batch, rows_each))
-        return dst
 
     @staticmethod
     def _static_device_tensor(tensor: torch.Tensor) -> _StaticDeviceTensor:

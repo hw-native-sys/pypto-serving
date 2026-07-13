@@ -27,7 +27,7 @@ from examples.model.qwen3_14b.runner import qwen3_l3_dispatch
 from python.core._profiling import StageTimer
 from python.core.model_runner import ModelRunner
 from python.core.pypto_executor import PyptoExecutor as CorePyptoExecutor
-from python.core.types import RuntimeModel
+from python.core.types import GenerateConfig, ModelRecord, RuntimeModel
 from python.core.utils import rope_tables, round_up
 
 
@@ -104,11 +104,13 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         self,
         kv_cache_manager=None,
         *,
-        platform: str = "a2a3sim",
+        platform: str = "a2a3",
         device_ids: Sequence[int] = (0,),
         save_kernels_dir: str | None = None,
         l3_trace: bool = False,
     ) -> None:
+        if platform != "a2a3":
+            raise ValueError("Qwen3 direct CANN FAI decode supports only A2/A3 onboard")
         super().__init__(
             kv_cache_manager,
             platform=platform,
@@ -131,6 +133,21 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
     def supports_device_embedding(self) -> bool:
         """Qwen3 NPU decode embeds greedy token ids inside the device kernel."""
         return True
+
+    def validate_generate_batch(
+        self,
+        record: ModelRecord,
+        batch_size: int,
+        config: GenerateConfig,
+    ) -> None:
+        """Accept only the active B1 prefix or all B16 KV-cache rows."""
+        del config
+        kernel_batch = record.runtime.max_batch_size
+        if batch_size not in (1, kernel_batch):
+            raise ValueError(
+                "Qwen3 direct CANN FAI decode supports only batch 1 or the "
+                f"full batch capacity {kernel_batch}, got {batch_size}"
+            )
 
     def _create_runner(self, model_id: str, compiled: object) -> ModelRunner:
         """Create the Qwen3-14B runtime runner for compiled kernels."""
@@ -180,10 +197,10 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
 
         if int(qwen3_decode_fwd.BATCH) != kernel_batch:
             raise ValueError(
-                "decode_fwd.decode_fwd is compiled for a fixed kernel BATCH of "
+                "decode_fwd.decode_fwd has an internal batch capacity of "
                 f"{int(qwen3_decode_fwd.BATCH)}, but runtime max_batch_size is "
-                f"{kernel_batch}; they must match (decode statically computes and "
-                "writes BATCH rows / BATCH logit rows)."
+                f"{kernel_batch}; they must match. Runtime dispatch supports only "
+                "batch 1 or the full batch capacity."
             )
         if int(model.config.num_hidden_layers) != int(qwen3_decode_fwd.NUM_LAYERS):
             raise ValueError(
@@ -455,12 +472,13 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
     ) -> _L3Callable:
         """Compile the fused all-layer PAGED decode HOST wrapper into a distributed program.
 
-        Signature (21 args; PAGED KV via block_table + slot_mapping, same pool as
+        Signature (25 args; PAGED KV via block_table + slot_mapping, same pool as
         prefill):
           input_rms_weight, wq, wk, wv, q_norm_weight,
           k_norm_weight, seq_lens, block_table, slot_mapping, rope_cos, rope_sin,
           k_cache, v_cache, wo, w_gate, w_up, w_down, post_rms_weight,
-          final_norm_weight, lm_head_weight, out.
+          final_norm_weight, lm_head_weight, out, embed_weight,
+          sampled_ids_in, sampled_ids_out, next_hidden.
 
         k_cache/v_cache are the PAGED pool (rows = num_layers * batch *
         runtime_cache_blocks * num_kv_heads * page_size — identical to prefill);

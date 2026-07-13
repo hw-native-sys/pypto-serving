@@ -17,7 +17,7 @@ that real path and guards three optimizations, each of which must keep greedy
 output identical to the baseline while the scheduler is observed to actually
 apply the optimization:
 
-* multi-batch   - several concurrent requests co-batched by the scheduler
+* full batch    - 16 independent requests co-batched by the scheduler
 * chunked prefill - one prompt split across multiple prefill steps
 * prefix cache  - a repeated long prompt reusing cached prefix blocks
 
@@ -55,7 +55,7 @@ DEVICE_ID = int(DEVICE_ID_ENV) if DEVICE_ID_ENV is not None else None
 
 # Kernel requires page_size == 128 (examples/.../npu_executor.py), so a full
 # prefix-cache block is 128 tokens. Short prompts therefore never populate the
-# prefix cache, keeping the multi-batch / chunked-prefill tests isolated from it.
+# prefix cache, keeping the full-batch / chunked-prefill tests isolated from it.
 PAGE_SIZE = 128
 MAX_BATCH_SIZE = 16
 MAX_SEQ_LEN = 512
@@ -67,6 +67,7 @@ RUNTIME_MAX_NEW_TOKENS = 16
 # serving path shares the executor kernels, so greedy output must match.
 PROMPT = "The capital of France is"
 SHORT_NEW_TOKENS = 8
+FULL_BATCH_NEW_TOKENS = 2
 EXPECTED_TOKEN_IDS = [12095, 13, 3555, 374, 279, 6722, 315, 279]
 
 # A prompt long enough to fill at least one 128-token prefix-cache block.
@@ -207,8 +208,11 @@ def harness():
             asyncio.set_event_loop(None)
 
 
-def _max_batch_width(events: list[list[tuple[str, bool, int]]]) -> int:
-    return max((len(event) for event in events), default=0)
+def _max_decode_batch_width(events: list[list[tuple[str, bool, int]]]) -> int:
+    return max(
+        (sum(not is_prefill for _, is_prefill, _ in event) for event in events),
+        default=0,
+    )
 
 
 def test_serving_single_request_matches_expected_tokens(harness):
@@ -224,30 +228,38 @@ def test_serving_single_request_matches_expected_tokens(harness):
     )
 
 
-def test_multi_batch_matches_single_request(harness):
-    """Several concurrent requests are co-batched and each matches the baseline."""
+def test_full_batch_matches_single_request(harness):
+    """Sixteen distinct KV histories share one decode batch and match B1."""
     harness.reset()
-    num_requests = 4
+    num_requests = MAX_BATCH_SIZE
+    prompts = [f"Request {idx}: {PROMPT}" for idx in range(num_requests)]
+    references = [
+        harness.run(_collect(harness.engine, prompt, FULL_BATCH_NEW_TOKENS))
+        for prompt in prompts
+    ]
+    harness.reset()
 
     async def _run_all():
         return await asyncio.gather(
-            *(_collect(harness.engine, PROMPT, SHORT_NEW_TOKENS) for _ in range(num_requests))
+            *(
+                _collect(harness.engine, prompt, FULL_BATCH_NEW_TOKENS)
+                for prompt in prompts
+            )
         )
 
     results = harness.run(_run_all())
 
-    for idx, tokens in enumerate(results):
-        assert tokens == EXPECTED_TOKEN_IDS, (
-            f"Batched request {idx} diverged from the baseline:\n"
-            f"expected: {EXPECTED_TOKEN_IDS}\n"
+    for idx, (tokens, expected) in enumerate(zip(results, references, strict=True)):
+        assert tokens == expected, (
+            f"Batched request {idx} diverged from its B1 result:\n"
+            f"expected: {expected}\n"
             f"actual:   {tokens}"
         )
 
-    # Prove the scheduler actually co-batched at least two requests in one step.
-    max_width = _max_batch_width(harness.schedule_events)
-    assert max_width >= 2, (
-        f"Expected the scheduler to co-batch >=2 requests in one step, "
-        f"but the widest step had {max_width} request(s)."
+    max_width = _max_decode_batch_width(harness.schedule_events)
+    assert max_width == MAX_BATCH_SIZE, (
+        f"Expected one decode step with {MAX_BATCH_SIZE} independent requests, "
+        f"but the widest decode step had {max_width} request(s)."
     )
 
 

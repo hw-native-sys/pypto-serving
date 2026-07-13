@@ -32,11 +32,11 @@ def test_device_sampling_is_limited_by_runtime_vocab_size() -> None:
     dispatch = _source(ROOT / "examples" / "model" / "qwen3_14b" / "runner" / "qwen3_l3_dispatch.py")
     executor = _source(ROOT / "examples" / "model" / "qwen3_14b" / "runner" / "npu_executor.py")
     runner = _source(ROOT / "examples" / "model" / "qwen3_14b" / "runner" / "npu_runner.py")
-    config = _source(QWEN / "config.py")
+    constants = _source(QWEN / "constants.py")
     greedy = _source(QWEN / "greedy_sample.py")
 
     assert "valid_vocab_size" not in dispatch
-    assert "REAL_VOCAB = 151936" in config
+    assert "real_vocab=151936" in constants
     assert "REAL_VOCAB" in executor
     assert "lm_head_weight[:1].expand" in executor
     assert "valid_vocab_size" not in runner

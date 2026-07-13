@@ -102,7 +102,7 @@ def qwen3_decode_host(
     sampled_ids: pl.Out[pl.Tensor],
     next_hidden: pl.Out[pl.Tensor],
 ) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor]:
-    logits, sampled_ids, next_hidden = decode_fwd(
+    out, sampled_ids, next_hidden = decode_fwd(
         input_rms_weight,
         wq,
         wk,
@@ -129,7 +129,7 @@ def qwen3_decode_host(
         sampled_ids,
         next_hidden,
     )
-    return logits, sampled_ids, next_hidden
+    return out, sampled_ids, next_hidden
 
 
 @pl.jit.host

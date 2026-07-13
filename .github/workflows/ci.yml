@@ -174,7 +174,7 @@ jobs:
           PYPTO_QWEN3_MODEL_DIR: /data/l00955553/model/Qwen3-14B
           PTO2_RING_DEP_POOL: 16384
           PTO2_RING_TASK_WINDOW: 16384
-          PTO2_RING_HEAP: 1073741824
+          PTO2_RING_HEAP: 2147483648
         run: |
           source activate.sh
           marker="pypto-serving-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -196,7 +196,7 @@ jobs:
           PYPTO_QWEN3_MODEL_DIR: /data/l00955553/model/Qwen3-14B
           PTO2_RING_DEP_POOL: 16384
           PTO2_RING_TASK_WINDOW: 16384
-          PTO2_RING_HEAP: 1073741824
+          PTO2_RING_HEAP: 2147483648
         run: |
           source activate.sh
           marker="pypto-serving-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"

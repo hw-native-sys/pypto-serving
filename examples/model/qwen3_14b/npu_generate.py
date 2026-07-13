@@ -345,7 +345,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-dir", required=True, help="Local model directory, e.g. a Hugging Face snapshot.")
     parser.add_argument("--prompt", required=True, help="Prompt text.")
     parser.add_argument("--model-id", default="qwen3-14b-local")
-    parser.add_argument("--platform", default="a2a3", choices=["a2a3sim", "a2a3", "a5sim", "a5"])
+    parser.add_argument("--platform", default="a2a3", choices=["a2a3"])
     parser.add_argument("--device-id", type=int, default=0, help="Default NPU device id when --devices is unset.")
     parser.add_argument(
         "--devices",
@@ -374,9 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-num-batched-tokens",
         type=int,
         default=4096,
-        help="Total tokens per scheduling step (used by warmup). NOTE: the 40-layer "
-        "fused prefill deadlocks the single-die ring-heap above ~415 total tokens, "
-        "so set this low enough that the per-request count stays under the ceiling.",
+        help="Total tokens per scheduling step and production-scale warmup.",
     )
     parser.add_argument(
         "--npu-memory-utilization",

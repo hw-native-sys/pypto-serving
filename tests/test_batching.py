@@ -181,8 +181,8 @@ def _compiled_kernels(
         decode_block_table_buffer=torch.zeros(kernel_batch * max_blocks, dtype=torch.int32),
         decode_slot_mapping_buffer=torch.zeros(kernel_batch, dtype=torch.int32),
         decode_logits_buffer=torch.zeros(kernel_batch, model.config.vocab_size),
-        decode_token_ids_buffer=torch.empty(kernel_batch, 1, dtype=torch.int32),
-        decode_sampled_ids_buffer=torch.empty(kernel_batch, 1, dtype=torch.int32),
+        decode_token_ids_buffer=torch.empty(kernel_batch, 8, dtype=torch.int32),
+        decode_sampled_ids_buffer=torch.empty(kernel_batch, 8, dtype=torch.int32),
         decode_next_hidden_buffer=torch.empty(kernel_batch, hidden_size, dtype=torch.bfloat16),
     )
 
@@ -341,7 +341,7 @@ def test_decode_kernel_inputs_reject_multi_token_rows():
     runner = ModelRunner(compiled=_compiled_kernels(model))
 
     with pytest.raises(ValueError, match="exactly one token per row"):
-        runner._pad_decode_inputs(
+        runner._stage_decode_inputs(
             model,
             SimpleNamespace(
                 actual_batch=1,
@@ -352,6 +352,103 @@ def test_decode_kernel_inputs_reject_multi_token_rows():
                 slot_mapping=torch.zeros(1, dtype=torch.int32),
             ),
         )
+
+
+@pytest.mark.parametrize("actual_batch", [1, 16])
+def test_decode_dispatch_uses_only_active_prefix_views(actual_batch):
+    model = _model(max_batch_size=16)
+    compiled = _compiled_kernels(model)
+    runner = ModelRunner(compiled=compiled)
+    max_blocks = (model.runtime.max_seq_len + model.runtime.page_size - 1) // model.runtime.page_size
+    inputs = SimpleNamespace(
+        actual_batch=actual_batch,
+        token_ids=torch.arange(10, 10 + actual_batch, dtype=torch.int32).reshape(actual_batch, 1),
+        hidden=torch.ones(actual_batch, model.config.hidden_size, dtype=torch.bfloat16),
+        seq_lens=torch.arange(100, 100 + actual_batch, dtype=torch.int32),
+        block_table=torch.arange(200, 200 + actual_batch * max_blocks, dtype=torch.int32),
+        slot_mapping=torch.arange(300, 300 + actual_batch, dtype=torch.int32),
+    )
+
+    staged = runner._stage_decode_inputs(model, inputs)
+    args = runner._decode_kernel_args(staged, object(), object())
+
+    assert staged.token_ids.shape == (actual_batch, 8)
+    assert staged.seq_lens.shape == (actual_batch,)
+    assert staged.block_table.shape == (actual_batch * max_blocks,)
+    assert staged.slot_mapping.shape == (actual_batch,)
+    assert staged.logits.shape == (actual_batch, model.config.vocab_size)
+    assert staged.sampled_ids.shape == (actual_batch, 8)
+    assert staged.next_hidden.shape == (actual_batch, model.config.hidden_size)
+    assert staged.token_ids[:, 0].tolist() == list(range(10, 10 + actual_batch))
+    assert torch.count_nonzero(staged.token_ids[:, 1:]).item() == 0
+    assert staged.seq_lens.tolist() == list(range(100, 100 + actual_batch))
+    assert staged.block_table.tolist() == list(range(200, 200 + actual_batch * max_blocks))
+    assert staged.slot_mapping.tolist() == list(range(300, 300 + actual_batch))
+    assert args[6] is staged.seq_lens
+    assert args[7] is staged.block_table
+    assert args[8] is staged.slot_mapping
+    assert args[20] is staged.logits
+    assert args[22] is staged.token_ids
+    assert args[23] is staged.sampled_ids
+    assert args[24] is staged.next_hidden
+
+
+def test_decode_dispatch_rejects_intermediate_batch_size():
+    model = _model(max_batch_size=16)
+    runner = ModelRunner(compiled=_compiled_kernels(model))
+
+    with pytest.raises(ValueError, match="only batch 1 or the full batch capacity 16"):
+        runner._stage_decode_inputs(
+            model,
+            SimpleNamespace(
+                actual_batch=3,
+                token_ids=torch.zeros(3, 1, dtype=torch.int32),
+                hidden=torch.ones(3, model.config.hidden_size, dtype=torch.bfloat16),
+                seq_lens=torch.ones(3, dtype=torch.int32),
+                block_table=torch.zeros(6, dtype=torch.int32),
+                slot_mapping=torch.zeros(3, dtype=torch.int32),
+            ),
+        )
+
+
+def test_warmup_uses_page_zero_slot_mappings(monkeypatch):
+    model = _model(max_batch_size=16, page_size=128)
+    runner = ModelRunner(compiled=_compiled_kernels(model))
+    runner._kv_caches[model.config.model_id] = SimpleNamespace(
+        key_pages=object(),
+        value_pages=object(),
+    )
+    calls = []
+    monkeypatch.setattr(
+        runner,
+        "_run_distributed_program",
+        lambda callable_spec, *args: calls.append(args),
+    )
+
+    runner._warmup_dispatch(model.runtime)
+
+    assert len(calls) == 2
+    assert torch.count_nonzero(calls[0][13]).item() == 0
+    assert torch.count_nonzero(calls[1][8]).item() == 0
+
+
+@pytest.mark.parametrize("batch_size", [2, 15])
+def test_qwen_serving_rejects_intermediate_batch_before_allocation(batch_size):
+    model = _model(max_batch_size=16)
+    executor = PyptoExecutor(platform="a2a3")
+
+    with pytest.raises(ValueError, match="only batch 1 or the full batch capacity 16"):
+        executor.validate_generate_batch(
+            SimpleNamespace(runtime=model.runtime),
+            batch_size,
+            GenerateConfig(max_new_tokens=1),
+        )
+
+
+@pytest.mark.parametrize("platform", ["a2a3sim", "a5"])
+def test_qwen_cann_fai_executor_rejects_non_onboard_a2a3(platform):
+    with pytest.raises(ValueError, match="supports only A2/A3"):
+        PyptoExecutor(platform=platform)
 
 
 def test_engine_generate_batch_uses_batched_executor_results():
@@ -577,11 +674,13 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
     monkeypatch.setattr(runner, "_compute_kv_cache_pages", lambda config, runtime, device_id=0: 1)
     monkeypatch.setattr(runner, "_print_memory_breakdown", lambda *a, **kw: None)
     runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
-    monkeypatch.setattr(runner, "_static_device_tensor", lambda tensor: tensor)
+    def run_fake_kernel(callable_spec, *args):
+        callable_spec.compiled(*(getattr(arg, "tensor", arg) for arg in args))
+
     monkeypatch.setattr(
         runner,
         "_run_distributed_program",
-        lambda callable_spec, *args: callable_spec.compiled(*args),
+        run_fake_kernel,
     )
     executor._runners[model.config.model_id] = runner
     monkeypatch.setattr(
@@ -650,6 +749,8 @@ def test_decode_host_inlines_embedding_and_sampling_into_decode_fwd():
     assert source.count("decode_fwd(") == 1
     assert "token_embed_fwd(" not in source
     assert "greedy_sample_fwd(" not in source
+    assert "out, sampled_ids, next_hidden = decode_fwd(" in source
+    assert "return out, sampled_ids, next_hidden" in source
 
     if not QWEN3_KERNEL_DIR.is_dir():
         pytest.skip("pypto-lib submodule is not checked out")
