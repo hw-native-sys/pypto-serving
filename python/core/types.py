@@ -222,10 +222,16 @@ class DecodeBatch:
 
 @dataclass
 class DecodeResult:
-    """Outputs from one decode step."""
+    """Outputs from one decode step.
 
-    hidden_states: torch.Tensor
-    logits: torch.Tensor
+    ``hidden_states`` and ``logits`` are optional: device-sampling executors
+    that produce the next token id inside the decode kernel may return ``None``
+    for both, keeping the full ``[B, VOCAB]`` logits device-resident (no d2h)
+    and skipping the unused decode hidden-state copy.
+    """
+
+    hidden_states: torch.Tensor | None
+    logits: torch.Tensor | None
     sampled_token_ids: torch.Tensor | None = None
     next_hidden_states: torch.Tensor | None = None
 
