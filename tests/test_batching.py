@@ -46,6 +46,7 @@ from python.runtime.worker import WorkerTensor
 ROOT = Path(__file__).resolve().parents[1]
 QWEN3_DISPATCH = ROOT / "examples" / "model" / "qwen3_14b" / "runner" / "qwen3_l3_dispatch.py"
 QWEN3_KERNEL_DIR = ROOT / "pypto-lib" / "models" / "qwen3" / "14b"
+PYPTO_LIB_DIR = ROOT / "pypto-lib"
 
 
 class _Tokenizer:
@@ -158,6 +159,7 @@ def _compiled_kernels(
             "decode_w_down": torch.zeros(intermediate_size, hidden_size),
         }
     return _CompiledKernels(
+        contract=_qwen3_contract(),
         prefill=callable_,
         decode=callable_,
         greedy_sample=callable_,
@@ -185,6 +187,21 @@ def _compiled_kernels(
         decode_sampled_ids_buffer=torch.empty(kernel_batch, 1, dtype=torch.int32),
         decode_next_hidden_buffer=torch.empty(kernel_batch, hidden_size, dtype=torch.bfloat16),
     )
+
+
+def _qwen3_contract():
+    import sys
+
+    sys.path.insert(0, str(PYPTO_LIB_DIR))
+    try:
+        from contract.registry import get_contract
+
+        return get_contract("qwen3", "14b")
+    finally:
+        try:
+            sys.path.remove(str(PYPTO_LIB_DIR))
+        except ValueError:
+            pass
 
 
 def test_kv_cache_capacity_uses_actual_runtime_batch_size():
@@ -556,7 +573,13 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
     manager = KvCacheManager()
     manager.register_model(model.config.model_id, model.config, model.runtime)
     executor = PyptoExecutor(manager)
-    cached_layer = executor._kernel_layer_weights(model.layers[0])
+    prepared_weights = _qwen3_contract().prepare_weights(
+        model,
+        lambda tensor: tensor,
+        padded_vocab=model.config.vocab_size,
+        release_layers=True,
+    )
+    assert model.layers[0].wq.numel() == 0
     fake_kernel = _CopyKernel()
     fake_callable = _L3Callable(
         compiled=fake_kernel,
@@ -567,7 +590,7 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
     compiled = _compiled_kernels(
         model,
         callable_=fake_callable,
-        decode_weights=executor._stack_decode_weights([cached_layer]),
+        decode_weights=prepared_weights.decode_weights,
     )
     executor._compiled[model.config.model_id] = compiled
     runner = ModelRunner(
@@ -578,17 +601,17 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
     monkeypatch.setattr(runner, "_print_memory_breakdown", lambda *a, **kw: None)
     runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
     monkeypatch.setattr(runner, "_static_device_tensor", lambda tensor: tensor)
+
+    def run_fake_kernel(callable_spec, *args):
+        unwrapped = tuple(getattr(arg, "tensor", arg) for arg in args)
+        return callable_spec.compiled(*unwrapped)
+
     monkeypatch.setattr(
         runner,
         "_run_distributed_program",
-        lambda callable_spec, *args: callable_spec.compiled(*args),
+        run_fake_kernel,
     )
     executor._runners[model.config.model_id] = runner
-    monkeypatch.setattr(
-        PyptoExecutor,
-        "_kernel_weight",
-        staticmethod(lambda weight: (_ for _ in ()).throw(AssertionError("_kernel_weight should be cached"))),
-    )
 
     prefill_alloc = manager.allocate_for_prompt(model.config.model_id, "prefill", 1)
     executor.run_prefill(
