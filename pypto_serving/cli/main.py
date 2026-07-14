@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 from pypto_serving.tools.profile import get_profiler, merge_profile
 
 RuntimeConfig = None
+KvQuantConfig = None
 ParallelConfig = None
 parse_device_ids = None
 
@@ -127,6 +128,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable chunked prefill (default: True). Use --no-enable-chunked-prefill to disable.",
     )
 
+    # TurboQuant
+    parser.add_argument(
+        "--tq",
+        "--tq-mode",
+        dest="tq_mode",
+        action="store_true",
+        help="Enable TurboQuant (TQ) KV-cache quantization. Allocates nibble-packed "
+        "UINT8 KV caches + FP32 scales and dispatches the TQ prefill/decode kernels "
+        "(host-side sampling). Implies page_size=128.",
+    )
+
     # Misc
     parser.add_argument(
         "--show-startup-logs",
@@ -143,7 +155,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     from pypto_serving.serving.engine.async_engine import EngineConfig
 
     model_dir = str(Path(args.model).resolve())
-    executor_kwargs = _build_executor_kwargs()
+    executor_kwargs = _build_executor_kwargs(args)
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = _read_model_config(Path(model_dir))
     model_family = _detect_model_family(Path(model_dir), config_data=model_config_data)
@@ -219,6 +231,10 @@ def _build_runtime_config(
             compress_ratios,
             decode_batch=4 if args.enable_mtp else 8,
         )
+    kv_quant_config = None
+    if getattr(args, "tq_mode", False):
+        _ensure_core_imports()
+        kv_quant_config = KvQuantConfig(enabled=True)
 
     return RuntimeConfig(
         page_size=args.block_size,
@@ -231,10 +247,11 @@ def _build_runtime_config(
         max_num_batched_tokens=args.max_num_batched_tokens,
         num_speculative_tokens=1 if args.enable_mtp else 0,
         kv_cache_groups=kv_cache_groups,
+        kv_quant_config=kv_quant_config,
     )
 
 
-def _build_executor_kwargs() -> dict[str, object]:
+def _build_executor_kwargs(args: argparse.Namespace) -> dict[str, object]:
     executor_kwargs: dict[str, object] = {}
     pypto_root = os.environ.get("PYPTO_ROOT")
     save_kernels_dir = os.environ.get("PYPTO_SAVE_KERNELS_DIR")
@@ -242,6 +259,8 @@ def _build_executor_kwargs() -> dict[str, object]:
         executor_kwargs["pypto_root"] = pypto_root
     if save_kernels_dir:
         executor_kwargs["save_kernels_dir"] = save_kernels_dir
+    if getattr(args, "tq_mode", False):
+        executor_kwargs["tq_mode"] = True
     return executor_kwargs
 
 
@@ -418,12 +437,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _ensure_core_imports() -> None:
-    global ParallelConfig, RuntimeConfig, parse_device_ids
+    global ParallelConfig, RuntimeConfig, KvQuantConfig, parse_device_ids
 
     if RuntimeConfig is None:
         from pypto_serving.config.types import RuntimeConfig as imported_runtime_config
 
         RuntimeConfig = imported_runtime_config
+    if KvQuantConfig is None:
+        from pypto_serving.config.types import KvQuantConfig as imported_kv_quant_config
+
+        KvQuantConfig = imported_kv_quant_config
     if ParallelConfig is None or parse_device_ids is None:
         from pypto_serving.config.parallel import ParallelConfig as imported_parallel_config
         from pypto_serving.config.parallel import parse_device_ids as imported_parse_device_ids

@@ -17,7 +17,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 
-from pypto_serving import GenerateConfig, LLMEngine, RuntimeConfig
+from pypto_serving import GenerateConfig, KvQuantConfig, LLMEngine, RuntimeConfig
 from pypto_serving.config.parallel import ParallelConfig, parse_device_ids
 from pypto_serving.config.types import LoadedModel
 from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
@@ -402,6 +402,14 @@ def build_parser() -> argparse.ArgumentParser:
         dest="no_enable_prefix_caching",
         help="Disable prefix caching in the KV cache manager.",
     )
+    parser.add_argument(
+        "--tq",
+        "--tq-mode",
+        dest="tq_mode",
+        action="store_true",
+        help="Enable TurboQuant (TQ) KV-cache quantization (nibble-packed UINT8 KV "
+        "caches + FP32 scales, host-side sampling).",
+    )
     return parser
 
 
@@ -438,6 +446,8 @@ def main() -> None:
         platform=args.platform,
         device_ids=device_ids,
         save_kernels_dir=args.save_kernels_dir,
+        l3_trace=args.profile_verbose,
+        tq_mode=args.tq_mode,
     )
     engine = LLMEngine(
         kv_cache_manager=kv_cache_manager,
@@ -463,6 +473,11 @@ def main() -> None:
                 weight_dtype=args.dtype,
                 npu_memory_utilization=args.npu_memory_utilization,
                 max_num_batched_tokens=args.max_num_batched_tokens,
+                # Conservative default — the decode kernel is compiled
+                # with this baked-in shape and cannot be resized later.
+                # 200 pages x 128 tokens = 25 600 tokens total capacity.
+                total_kv_pages=200,
+                kv_quant_config=KvQuantConfig(enabled=True) if args.tq_mode else None,
             ),
         )
         if collector is not None:

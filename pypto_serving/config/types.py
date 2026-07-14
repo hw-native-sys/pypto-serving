@@ -103,6 +103,23 @@ class KVCacheGroupSpec:
 
 
 @dataclass(frozen=True)
+class KvQuantConfig:
+    """TurboQuant (TQ) KV-cache quantization options.
+
+    When ``enabled`` is True the runner allocates nibble-packed UINT8 quantized
+    KV caches (``head_dim // 2`` bytes/row) plus per-row FP32 scales instead of
+    the default BF16 caches, and dispatches the TurboQuant prefill/decode kernels.
+    """
+
+    enabled: bool = False
+    key_bits: int = 4
+    value_bits: int = 4
+    residual_window: int = 128
+    protected_layers: int = 0
+    protected_bits: int = 4
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     """Runtime limits and device placement for one loaded model."""
 
@@ -125,6 +142,10 @@ class RuntimeConfig:
     num_speculative_tokens: int = 0
     # Model-specific cache families. Empty means the generic single KV pool.
     kv_cache_groups: tuple[KVCacheGroupSpec, ...] = ()
+    # TurboQuant KV-cache quantization.  When set (and ``enabled``), the runner
+    # allocates UINT8 nibble-packed quantized KV caches + FP32 scales and
+    # dispatches the TQ prefill/decode kernels (CPU-side sampling).
+    kv_quant_config: KvQuantConfig | None = None
 
 
 @dataclass(frozen=True)
