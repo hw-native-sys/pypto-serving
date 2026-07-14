@@ -116,6 +116,21 @@ jobs:
           export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
           EOF
 
+      - name: Inspect task-submit CLI
+        run: |
+          source activate.sh
+          task_submit="$(command -v task-submit)"
+          echo "task-submit PATH entries:"
+          type -a task-submit
+          echo "resolved=$task_submit"
+          echo "canonical=$(readlink -f "$task_submit")"
+          sha256sum "$task_submit"
+          file "$task_submit"
+          echo "Relevant help entries:"
+          task-submit --help | grep -E -- '--run|--device-num|--ignore-whitelist' || true
+          echo "Relevant implementation entries:"
+          grep -n -C 6 -E -- '--run\)|--device-num\)|--ignore-whitelist' "$task_submit" || true
+
       - name: Show ccache stats (before)
         run: ccache -s || true
 
