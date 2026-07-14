@@ -369,6 +369,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--max-num-seqs", type=int, default=16, help="Max batch size / concurrent requests.")
+    parser.add_argument("--batch-size", type=int, default=1, help="Number of INDEPENDENT requests to run as one real batch-N (distinct KV each).")
     parser.add_argument("--block-size", type=int, default=128, help="KV cache page size.")
     parser.add_argument(
         "--max-num-batched-tokens",
@@ -473,7 +474,11 @@ def main() -> None:
                 # Conservative default — the decode kernel is compiled
                 # with this baked-in shape and cannot be resized later.
                 # 200 pages x 128 tokens = 25 600 tokens total capacity.
-                total_kv_pages=200,
+                # Block-manager pool must cover batch_size independent sequences,
+                # each up to max_seq_len; scale with batch so real batch-N fits.
+                total_kv_pages=max(
+                    200, args.batch_size * ((args.max_seq_len + args.block_size - 1) // args.block_size)
+                ),
             ),
         )
         if collector is not None:
@@ -505,7 +510,15 @@ def main() -> None:
                 "stream": args.stream,
             },
         ):
-            if args.stream:
+            if args.batch_size > 1:
+                # REAL batch-N: N independent requests, each with its OWN KV pages
+                # (distinct decode attention, N x KV read) — not the replicate-to-16
+                # padding (which shares row 0's KV = batch-1 workload).
+                prompts = [args.prompt] * args.batch_size
+                results = engine.generate_batch(args.model_id, prompts, config)
+                num_tokens = sum(len(r.token_ids) for r in results)
+                print(f"batch_size: {args.batch_size}")
+            elif args.stream:
                 text_parts: list[str] = []
                 result = engine.generate(args.model_id, args.prompt, config)
                 for chunk in result:

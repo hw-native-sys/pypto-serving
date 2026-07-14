@@ -231,15 +231,55 @@ class LLMEngine:
             if fast_path_result is not None:
                 return fast_path_result
 
+            # Chunked prefill: group the requests so each run_prefill call packs at
+            # most ``max_num_batched_tokens`` tokens. The offline all-at-once prefill
+            # materializes [total_tokens, HIDDEN] FP32 staging (resid1_all/mlp_out_acc),
+            # which is ~1.1GB for 16x3.3k; grouping bounds it per call.
+            _budget = int(getattr(record.runtime, "max_num_batched_tokens", 0) or 4096)
+            _groups: list[list[int]] = []
+            _cur: list[int] = []
+            _cur_toks = 0
+            for _i, _tok in enumerate(prompt_token_ids):
+                _n = len(_tok)
+                if _cur and _cur_toks + _n > _budget:
+                    _groups.append(_cur)
+                    _cur = []
+                    _cur_toks = 0
+                _cur.append(_i)
+                _cur_toks += _n
+            if _cur:
+                _groups.append(_cur)
+
             with self._executor.session():
-                prefill_result = self._executor.run_prefill(
-                    runtime_model,
-                    prefill_batch,
-                )
-                prefill_logits = prefill_result.logits
+                prefill_logits = None
+                _sampled_rows: list = [None] * len(requests)
+                for _grp in _groups:
+                    _sub = PrefillBatch(
+                        request_ids=[requests[i].request_id for i in _grp],
+                        token_ids=token_tensor[_grp],
+                        input_embeddings=embeddings[_grp],
+                        seq_lens=torch.tensor(
+                            [len(prompt_token_ids[i]) for i in _grp],
+                            dtype=torch.int32,
+                            device=runtime_model.runtime.device,
+                        ),
+                        allow_device_greedy_sampling=allow_device_greedy_sampling,
+                        kv_allocations=[allocations[i] for i in _grp],
+                    )
+                    _res = self._executor.run_prefill(runtime_model, _sub)
+                    if prefill_logits is None:
+                        prefill_logits = torch.zeros(
+                            (len(requests), _res.logits.shape[-1]),
+                            dtype=_res.logits.dtype,
+                            device=_res.logits.device,
+                        )
+                    for _j, _i in enumerate(_grp):
+                        prefill_logits[_i] = _res.logits[_j]
+                        if allow_device_greedy_sampling and _res.sampled_token_ids is not None:
+                            _sampled_rows[_i] = _res.sampled_token_ids[_j]
                 prefill_sampled_token_ids = (
-                    prefill_result.sampled_token_ids
-                    if allow_device_greedy_sampling
+                    torch.stack(_sampled_rows)
+                    if allow_device_greedy_sampling and all(x is not None for x in _sampled_rows)
                     else None
                 )
 
