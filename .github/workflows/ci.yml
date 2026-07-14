@@ -274,8 +274,11 @@ jobs:
           while read -r task_id; do
             [ -n "$task_id" ] || continue
             echo "  killing $task_id"
-            task-submit --kill "$task_id" || echo "::warning::failed to kill $task_id"
-            n=$((n + 1))
+            if task-submit --kill "$task_id"; then
+              n=$((n + 1))
+            else
+              echo "::warning::failed to kill $task_id"
+            fi
           done <<< "$ids"
           echo "killed $n orphaned task(s)"
 
