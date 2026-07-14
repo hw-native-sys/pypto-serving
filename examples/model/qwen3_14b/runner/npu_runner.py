@@ -126,7 +126,6 @@ class _DecodeInputs:
 
     actual_batch: int
     token_ids: torch.Tensor
-    hidden: torch.Tensor
     seq_lens: torch.Tensor
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
@@ -177,6 +176,7 @@ class Qwen314BModelRunner(ModelRunner):
         self._device_id = device_id
         self._l3_worker: Any | None = None
         self._l3_static_tensors: dict[tuple[int, tuple[int, ...], torch.dtype], object] = {}
+        self._decode_device_scratch_cache: dict[str, Any] = {}
         self._static_args: _StaticKernelArgs | None = None
         self._pending_kv_cache_specs: dict[str, tuple[ModelConfig, RuntimeConfig]] = {}
         if compiled is not None:
@@ -623,6 +623,7 @@ class Qwen314BModelRunner(ModelRunner):
         """
         compiled = self._compiled
         model_id = model.config.model_id
+        allow_device_greedy = batch.allow_device_greedy_sampling
         decode_inputs = self._prepare_decode_inputs(model, batch)
 
         kv_cache = self._kv_caches.get(model_id)
@@ -631,7 +632,16 @@ class Qwen314BModelRunner(ModelRunner):
         k_cache = kv_cache.key_pages
         v_cache = kv_cache.value_pages
 
-        kernel_inputs = self._pad_decode_inputs(model, decode_inputs)
+        # In the device greedy path the sampled token id is produced inside the
+        # kernel, so the full [B, VOCAB] logits never reach the host: point the
+        # kernel's logits `out` slot at a worker-resident DeviceTensor instead of
+        # the shared host buffer to skip a ~B*VOCAB*4B d2h every decode step.
+        logits_target = (
+            self._decode_device_scratch("logits", compiled.decode_logits_buffer)
+            if allow_device_greedy
+            else None
+        )
+        kernel_inputs = self._pad_decode_inputs(model, decode_inputs, logits_override=logits_target)
 
         # Padded block_table / slot_mapping only ever reference row 0's
         # already-valid pages, so bound-check exactly what the kernel will read.
@@ -651,13 +661,20 @@ class Qwen314BModelRunner(ModelRunner):
             # hidden row to return here.
             None,
             kernel_inputs.actual_batch,
-            allow=batch.allow_device_greedy_sampling,
+            allow=allow_device_greedy,
+        )
+        # Host logits are only consumed by host-side sampling (non-greedy). In
+        # the greedy path logits stayed device-resident, so return None; the
+        # decode hidden state is a device-embedded placeholder that no caller
+        # reads, so it is never materialized.
+        logits = (
+            None
+            if allow_device_greedy
+            else kernel_inputs.logits[: kernel_inputs.actual_batch, : model.config.vocab_size]
         )
         return DecodeResult(
-            hidden_states=decode_inputs.hidden.float(),
-            logits=kernel_inputs.logits[: kernel_inputs.actual_batch, : model.config.vocab_size].to(
-                decode_inputs.hidden.device
-            ),
+            hidden_states=None,
+            logits=logits,
             sampled_token_ids=sampled_ids,
             next_hidden_states=next_hidden,
         )
@@ -778,15 +795,47 @@ class Qwen314BModelRunner(ModelRunner):
             static.padded_embed_weight,
             inputs.token_ids,
             self._compiled.decode_sampled_ids_buffer,
-            self._compiled.decode_next_hidden_buffer,
+            # next_hidden is never read back in decode; keep it device-resident
+            # so the kernel's write does not trigger a per-step d2h.
+            self._decode_device_scratch("next_hidden", self._compiled.decode_next_hidden_buffer),
         )
 
-    def _pad_decode_inputs(self, model: RuntimeModel, inputs: _DecodeInputs) -> _DecodeKernelInputs:
+    def _decode_device_scratch(self, name: str, host: torch.Tensor) -> Any:
+        """Return a reusable worker-resident scratch buffer shaped like ``host``.
+
+        Some decode kernel ``out`` slots have their device→host copy wasted:
+
+        * ``logits`` — in the greedy path the token id is sampled on-device, so
+          the full ``[BATCH, VOCAB]`` logits never need to reach the host.
+        * ``next_hidden`` — decode never returns it (``run_decode`` passes
+          ``None`` to ``_integrated_sample_result``), so it is pure scratch.
+
+        Pointing those slots at a resident DeviceTensor keeps the kernel's write
+        (and, for logits, its internal argmax) device-local and skips a per-step
+        d2h. Buffers are allocated lazily on the shared worker and reused across
+        steps.
+        """
+        tensor = self._decode_device_scratch_cache.get(name)
+        if tensor is None:
+            tensor = self._shared_l3_worker().alloc_tensor(tuple(host.shape), host.dtype)
+            self._decode_device_scratch_cache[name] = tensor
+        return tensor
+
+    def _pad_decode_inputs(
+        self,
+        model: RuntimeModel,
+        inputs: _DecodeInputs,
+        logits_override: Any | None = None,
+    ) -> _DecodeKernelInputs:
         """Pad active decode rows to the fixed kernel batch.
 
         The fused decode kernel computes all ``max_batch_size`` rows. Inactive
         rows replicate row 0 so their KV writes are idempotent instead of
         targeting unrelated pages.
+
+        ``logits_override`` selects the kernel's logits ``out`` target: a
+        worker-resident DeviceTensor for the greedy path (no d2h) or ``None`` to
+        use the shared host ``decode_logits_buffer`` when host logits are needed.
         """
         compiled = self._compiled
         actual_batch = inputs.actual_batch
@@ -838,7 +887,7 @@ class Qwen314BModelRunner(ModelRunner):
                 kernel_batch,
                 rows_each=1,
             ),
-            logits=compiled.decode_logits_buffer,
+            logits=compiled.decode_logits_buffer if logits_override is None else logits_override,
         )
 
     def _run_distributed_program(self, callable_spec: _L3Callable, *args: Any) -> Any:
@@ -954,6 +1003,9 @@ class Qwen314BModelRunner(ModelRunner):
             finally:
                 self._l3_worker = None
                 self._l3_static_tensors.clear()
+                # worker.close() frees all worker-resident DeviceTensors; just
+                # drop our references to the reusable decode scratch buffers.
+                self._decode_device_scratch_cache.clear()
 
     def _prepare_prefill_inputs(
         self,
@@ -1064,11 +1116,12 @@ class Qwen314BModelRunner(ModelRunner):
         """Pack active decode requests into fused decode-kernel inputs."""
         batch_count = len(batch.kv_allocations) if batch.kv_allocations else int(batch.seq_lens.shape[0])
         actual_batch = self._validate_batch_size(model, batch_count)
-        hidden_size = model.config.hidden_size
         page_size = model.runtime.page_size
         max_blocks = self._max_blocks_per_seq(model)
 
-        hidden = torch.zeros((actual_batch, hidden_size), dtype=torch.bfloat16)
+        # The fused decode kernel embeds the token ids on-device, so it never
+        # consumes batch.hidden_states (a zeros placeholder). No decode hidden
+        # buffer is built or returned.
         seq_lens = torch.empty((actual_batch,), dtype=torch.int32)
         block_table = torch.full((actual_batch * max_blocks,), -1, dtype=torch.int32)
         slot_mapping = torch.empty((actual_batch,), dtype=torch.int32)
@@ -1082,7 +1135,6 @@ class Qwen314BModelRunner(ModelRunner):
                 raise ValueError(
                     f"decode seq_len {seq_len} exceeds max_seq_len {model.runtime.max_seq_len}"
                 )
-            hidden[batch_idx, :] = batch.hidden_states[batch_idx].to(torch.bfloat16).cpu()
             seq_lens[batch_idx] = seq_len
 
             if alloc is not None:
@@ -1101,7 +1153,6 @@ class Qwen314BModelRunner(ModelRunner):
         return _DecodeInputs(
             actual_batch=actual_batch,
             token_ids=batch.token_ids.to(torch.int32).cpu(),
-            hidden=hidden,
             seq_lens=seq_lens,
             block_table=block_table,
             slot_mapping=slot_mapping,
