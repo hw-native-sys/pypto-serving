@@ -79,6 +79,7 @@ class _L3Callable:
 class _CompiledKernels:
     """Compiled Qwen3-14B kernels and immutable runtime tensors."""
 
+    contract: object
     prefill: _L3Callable
     decode: _L3Callable
     greedy_sample: _L3Callable
@@ -713,34 +714,13 @@ class Qwen314BModelRunner(ModelRunner):
         v_cache: DeviceTensor,
         logits: torch.Tensor,
     ) -> tuple[Any, ...]:
-        """Return arguments in ``qwen3_prefill_host`` signature order."""
-        static = self._require_static_args()
-        weights = static.decode_weights
-        return (
-            inputs.hidden,
-            inputs.seq_lens,
-            inputs.chunk_lens,
-            inputs.chunk_offsets,
-            weights["decode_input_rms_weight"],
-            weights["decode_wq"],
-            weights["decode_wk"],
-            weights["decode_wv"],
-            weights["decode_q_norm_weight"],
-            weights["decode_k_norm_weight"],
-            static.rope_cos,
-            static.rope_sin,
-            inputs.block_table,
-            inputs.slot_mapping,
-            k_cache,
-            v_cache,
-            weights["decode_wo"],
-            weights["decode_w_gate"],
-            weights["decode_w_up"],
-            weights["decode_w_down"],
-            weights["decode_post_rms_weight"],
-            static.final_norm_weight,
-            static.padded_lm_head_weight,
-            logits,
+        """Return contract-owned prefill kernel arguments."""
+        return self._compiled.contract.kernels["prefill"].runtime_args_builder(
+            inputs,
+            self._require_static_args(),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            logits=logits,
         )
 
     def _decode_kernel_args(
@@ -749,35 +729,14 @@ class Qwen314BModelRunner(ModelRunner):
         k_cache: DeviceTensor,
         v_cache: DeviceTensor,
     ) -> tuple[Any, ...]:
-        """Return arguments in ``qwen3_decode_host`` signature order."""
-        static = self._require_static_args()
-        weights = static.decode_weights
-        return (
-            weights["decode_input_rms_weight"],
-            weights["decode_wq"],
-            weights["decode_wk"],
-            weights["decode_wv"],
-            weights["decode_q_norm_weight"],
-            weights["decode_k_norm_weight"],
-            inputs.seq_lens,
-            inputs.block_table,
-            inputs.slot_mapping,
-            static.rope_cos,
-            static.rope_sin,
-            k_cache,
-            v_cache,
-            weights["decode_wo"],
-            weights["decode_w_gate"],
-            weights["decode_w_up"],
-            weights["decode_w_down"],
-            weights["decode_post_rms_weight"],
-            static.final_norm_weight,
-            static.padded_lm_head_weight,
-            inputs.logits,
-            static.padded_embed_weight,
-            inputs.token_ids,
-            self._compiled.decode_sampled_ids_buffer,
-            self._compiled.decode_next_hidden_buffer,
+        """Return contract-owned decode kernel arguments."""
+        return self._compiled.contract.kernels["decode"].runtime_args_builder(
+            inputs,
+            self._require_static_args(),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            sampled_ids_buffer=self._compiled.decode_sampled_ids_buffer,
+            next_hidden_buffer=self._compiled.decode_next_hidden_buffer,
         )
 
     def _pad_decode_inputs(self, model: RuntimeModel, inputs: _DecodeInputs) -> _DecodeKernelInputs:
