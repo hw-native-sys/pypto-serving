@@ -55,6 +55,14 @@ SIGNAL_TERM_GRACE_SECONDS = 1.0
 # prctl(2) option number. Not exposed by the signal/os modules, so spell it out.
 _PR_SET_PDEATHSIG = 1
 
+# Load libc once, at import time. _set_pdeathsig() runs as a preexec_fn — after
+# fork but before exec — where calling ctypes.CDLL() would dlopen in the child and
+# is unsafe if any other thread in the parent held the loader lock across the fork.
+try:
+    _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+except (OSError, AttributeError):
+    _libc = None
+
 _TERMINATION_SIGNALS = tuple(
     sig
     for sig in (
@@ -129,8 +137,9 @@ def _set_pdeathsig() -> None:
     server's own workers can in principle linger; treat this as a safety net under
     _raise_on_termination(), not as a replacement for it.
     """
-    libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    if libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+    if _libc is None:
+        raise OSError("libc.so.6 not loaded")
+    if _libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
         raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
     # Close the fork/prctl race: if the parent already died in that window, the
     # death signal fired before we asked for it and will never be re-sent.
@@ -353,6 +362,7 @@ def test_deepseek_v4_http_completion_matches_expected_text(tmp_path: Path) -> No
                 # fork and assignment still reaches the teardown. Popen's own internals
                 # are covered by PR_SET_PDEATHSIG.
                 process = None
+                interrupted = False
                 try:
                     process = subprocess.Popen(
                         _server_command(model_dir, devices, port),
@@ -372,12 +382,14 @@ def test_deepseek_v4_http_completion_matches_expected_text(tmp_path: Path) -> No
                     assert isinstance(choices, list) and len(choices) == 1
                     assert choices[0].get("text") == EXPECTED_TEXT
                     assert choices[0].get("finish_reason") == "length"
+                except TerminatedBySignal:
+                    interrupted = True
+                    raise
                 finally:
                     if process is not None:
                         # Being torn down by the runner means we have ~3s before SIGKILL,
                         # so escalate to SIGKILL fast. On the normal path, be patient and
                         # let the engine shut down cleanly.
-                        interrupted = isinstance(sys.exc_info()[1], TerminatedBySignal)
                         _stop_process_group(
                             process,
                             term_grace=(
