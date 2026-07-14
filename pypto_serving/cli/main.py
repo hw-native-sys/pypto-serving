@@ -141,6 +141,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable prefix caching (default: True). Use --no-enable-prefix-caching to disable.",
     )
     parser.add_argument(
+        "--prefix-cache-backend",
+        choices=("hash", "radix"),
+        default="hash",
+        help="Prefix cache implementation (default: hash).",
+    )
+    parser.add_argument(
         "--enable-chunked-prefill",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -246,6 +252,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         long_prefill_token_threshold=args.long_prefill_token_threshold,
         enable_prefix_cache=enable_prefix_cache,
         enable_chunk_prefill=args.enable_chunked_prefill,
+        prefix_cache_backend=args.prefix_cache_backend,
     )
 
 

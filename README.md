@@ -47,6 +47,12 @@ git submodule update --init --recursive
 python -m pip install --no-deps -e .
 ```
 
+Run the unit tests:
+
+```bash
+python -m pytest tests/test_batching.py tests/test_parallel.py tests/test_radix_cache.py
+```
+
 Show CLI help:
 
 ```bash
@@ -75,11 +81,18 @@ Start the serving server with a multiprocess worker:
 pypto-serving \
   --model /path/to/Qwen3-14B \
   --backend npu \
+  --prefix-cache-backend radix \
   --platform a2a3 \
   --device 0 \
   --max-model-len 512 \
   --port 8899
 ```
+
+`--prefix-cache-backend radix` enables the Stage 1 SGLang-style Radix prefix
+cache. Omit it to retain the compatible `hash` default. The Radix backend uses
+the existing paged Qwen KV tensors and page size while adding tree-based prefix
+matching, committed-output reuse, canonical page deduplication, path locks, and
+LRU eviction.
 
 Send a generation request after the server logs `Application startup complete`:
 

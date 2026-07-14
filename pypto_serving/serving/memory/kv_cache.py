@@ -16,6 +16,8 @@ import torch
 
 from pypto_serving.config.types import KVCacheGroupSpec, KvAllocation, ModelConfig, RuntimeConfig
 
+from .prefix_cache import InsertResult, MatchResult, RadixCache, RadixKey
+
 
 NONE_HASH = hash(("__none__",))
 
@@ -35,6 +37,8 @@ class KVCacheBlock:
 
     block_id: int
     ref_cnt: int = 0
+    active_ref_cnt: int = 0
+    radix_ref_cnt: int = 0
     block_hash: int | None = None
     prev_free: "KVCacheBlock | None" = field(default=None, repr=False)
     next_free: "KVCacheBlock | None" = field(default=None, repr=False)
@@ -165,6 +169,12 @@ class KvCacheManager:
         self._group_pools: dict[str, _GroupBlockPool] = {}
         self._group_request_partitions: dict[str, int] = {}
         self._next_group_partition = 0
+        self.radix_cache = RadixCache(
+            page_size=block_size,
+            disable=not enable_prefix_cache,
+            retain_pages=self.retain_pages_for_cache,
+            release_pages=self.release_pages_from_cache,
+        )
         if num_blocks is not None:
             self._init_blocks(num_blocks, block_size)
 
@@ -209,6 +219,16 @@ class KvCacheManager:
                 raise ValueError("KV block pool is already initialized with different dimensions")
             return
         self.block_size = block_size
+        # Offline engines may construct this manager before the model runtime is
+        # known, using the default block size. No physical blocks or valid cache
+        # entries exist yet, so align the empty Radix cache with the final page size.
+        if self.radix_cache.page_size != block_size:
+            self.radix_cache = RadixCache(
+                page_size=block_size,
+                disable=not self.enable_prefix_cache,
+                retain_pages=self.retain_pages_for_cache,
+                release_pages=self.release_pages_from_cache,
+            )
         self.blocks = [KVCacheBlock(block_id=i) for i in range(num_blocks)]
         for block in self.blocks:
             self.free_queue.append(block)
@@ -270,7 +290,12 @@ class KvCacheManager:
         if num_blocks <= 0:
             return []
         if self.num_free_blocks < num_blocks:
-            return None
+            missing_tokens = (num_blocks - self.num_free_blocks) * self.block_size
+            self.radix_cache.evict(missing_tokens)
+            # Locked Radix paths may prevent eviction from freeing the full
+            # shortfall, so validate the authoritative free queue afterwards.
+            if self.num_free_blocks < num_blocks:
+                return None
         blocks: list[KVCacheBlock] = []
         for _ in range(num_blocks):
             block = self.free_queue.popleft()
@@ -282,6 +307,8 @@ class KvCacheManager:
                 self.hash_to_block.pop(block.block_hash, None)
                 block.block_hash = None
             block.ref_cnt = 1
+            block.active_ref_cnt = 1
+            block.radix_ref_cnt = 0
             blocks.append(block)
         return blocks
 
@@ -295,8 +322,7 @@ class KvCacheManager:
     def release_blocks_by_ids(self, *block_id_groups: list[int]) -> None:
         """Release request references for one or more groups of physical block IDs."""
         for block_ids in block_id_groups:
-            for block_id in block_ids:
-                self.release(self.blocks[block_id])
+            self.release_pages_from_request(block_ids)
 
     def release_cached_blocks(self, blocks: list[KVCacheBlock]) -> None:
         """Release cached block objects returned by ``get_computed_blocks``."""
@@ -319,6 +345,7 @@ class KvCacheManager:
         if block.ref_cnt == 0:
             self.free_queue.remove(block)
         block.ref_cnt += 1
+        block.active_ref_cnt += 1
         return block
 
     def cache_block(self, block: KVCacheBlock, block_hash: int) -> None:
@@ -341,11 +368,68 @@ class KvCacheManager:
 
     def release(self, block: KVCacheBlock) -> None:
         """Release one request reference to a block."""
-        if block.ref_cnt <= 0:
+        if block.active_ref_cnt <= 0:
             return
+        block.active_ref_cnt -= 1
         block.ref_cnt -= 1
         if block.ref_cnt == 0:
             self.free_queue.append(block)
+
+    def retain_pages_for_request(self, page_ids: list[int]) -> None:
+        """Add active request ownership for physical KV pages."""
+        for page_id in page_ids:
+            block = self.blocks[page_id]
+            if block.ref_cnt == 0:
+                self.free_queue.remove(block)
+            block.active_ref_cnt += 1
+            block.ref_cnt += 1
+
+    def release_pages_from_request(self, page_ids: list[int]) -> None:
+        """Release active request ownership for physical KV pages."""
+        for page_id in page_ids:
+            self.release(self.blocks[page_id])
+
+    def retain_pages_for_cache(self, page_ids: list[int]) -> None:
+        """Add Radix tree ownership for physical KV pages."""
+        for page_id in page_ids:
+            block = self.blocks[page_id]
+            if block.ref_cnt == 0:
+                self.free_queue.remove(block)
+            block.radix_ref_cnt += 1
+            block.ref_cnt += 1
+
+    def release_pages_from_cache(self, page_ids: list[int]) -> None:
+        """Release Radix tree ownership for physical KV pages."""
+        for page_id in page_ids:
+            block = self.blocks[page_id]
+            if block.radix_ref_cnt <= 0:
+                raise RuntimeError(f"KV page {page_id} has no Radix cache reference")
+            block.radix_ref_cnt -= 1
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0:
+                self.free_queue.append(block)
+
+    def match_radix_prefix(
+        self,
+        token_ids: list[int],
+        *,
+        extra_key: tuple[str, ...] = (),
+    ) -> MatchResult:
+        """Return the longest page-aligned Radix match for a token sequence."""
+        key = RadixKey.from_tokens(token_ids, extra_key=extra_key, limit=max(0, len(token_ids) - 1))
+        return self.radix_cache.match_prefix(key)
+
+    def insert_radix_prefix(
+        self,
+        token_ids: list[int],
+        slot_indices: list[int],
+        *,
+        extra_key: tuple[str, ...] = (),
+        priority: int = 0,
+    ) -> InsertResult:
+        """Publish a committed page-aligned request mapping to the Radix tree."""
+        key = RadixKey.from_tokens(token_ids, extra_key=extra_key, limit=len(slot_indices))
+        return self.radix_cache.insert(key, slot_indices, priority=priority)
 
     def _iter_block_hashes(self, token_ids: list[int]):
         """Yield (block_index, block_hash) for each full block in the token sequence."""

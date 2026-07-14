@@ -137,6 +137,11 @@ jobs:
           pip install torch transformers safetensors numpy fastapi uvicorn pytest msgspec
           pip install --no-deps -e .
 
+      - name: Run Radix prefix cache unit tests
+        run: |
+          source activate.sh
+          python -m pytest tests/test_radix_cache.py -q
+
       - name: Show ccache stats (after)
         run: ccache -s || true
 
@@ -211,6 +216,32 @@ jobs:
           run_cmd="$run_cmd PTO2_RING_TASK_WINDOW=$PTO2_RING_TASK_WINDOW"
           run_cmd="$run_cmd PTO2_RING_HEAP=$PTO2_RING_HEAP"
           run_cmd="$run_cmd python -m pytest tests/test_qwen3_serving.py -q -s"
+          task-submit --device auto --timeout 1200 --max-time 1800 --run "$run_cmd"
+
+      - name: Run Qwen3 Radix prefix cache serving guard
+        env:
+          PYTHONPATH: ${{ github.workspace }}/dist-checkout
+          PYPTO_QWEN3_MODEL_DIR: /data/l00955553/model/Qwen3-14B
+          PYPTO_PREFIX_CACHE_BACKEND: radix
+          PTO2_RING_DEP_POOL: 16384
+          PTO2_RING_TASK_WINDOW: 16384
+          PTO2_RING_HEAP: 1073741824
+        run: |
+          source activate.sh
+          marker="pypto-serving-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          run_cmd="export CI_TASK_MARKER=$marker"
+          run_cmd="$run_cmd && cd $GITHUB_WORKSPACE/dist-checkout"
+          run_cmd="$run_cmd && source activate.sh"
+          run_cmd="$run_cmd && DEVICE_ID=\$TASK_DEVICE"
+          run_cmd="$run_cmd PYTHONPATH=$PYTHONPATH"
+          run_cmd="$run_cmd PYPTO_QWEN3_MODEL_DIR=$PYPTO_QWEN3_MODEL_DIR"
+          run_cmd="$run_cmd PYPTO_PREFIX_CACHE_BACKEND=$PYPTO_PREFIX_CACHE_BACKEND"
+          run_cmd="$run_cmd PTO2_RING_DEP_POOL=$PTO2_RING_DEP_POOL"
+          run_cmd="$run_cmd PTO2_RING_TASK_WINDOW=$PTO2_RING_TASK_WINDOW"
+          run_cmd="$run_cmd PTO2_RING_HEAP=$PTO2_RING_HEAP"
+          run_cmd="$run_cmd python -m pytest"
+          run_cmd="$run_cmd tests/test_qwen3_serving.py::test_prefix_cache_reuses_prefix_and_preserves_output"
+          run_cmd="$run_cmd -q -s"
           task-submit --device auto --timeout 1200 --max-time 1800 --run "$run_cmd"
 
       - name: Run DeepSeek V4 HTTP generation accuracy guard

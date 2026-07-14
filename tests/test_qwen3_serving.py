@@ -46,6 +46,9 @@ MODEL_ID = "qwen3-14b-serving"
 PLATFORM = os.environ.get("PYPTO_QWEN3_PLATFORM", "a2a3")
 DEVICE_ID_ENV = os.environ.get("DEVICE_ID")
 DEVICE_ID = int(DEVICE_ID_ENV) if DEVICE_ID_ENV is not None else None
+PREFIX_CACHE_BACKEND = os.environ.get("PYPTO_PREFIX_CACHE_BACKEND", "hash")
+if PREFIX_CACHE_BACKEND not in ("hash", "radix"):
+    raise ValueError("PYPTO_PREFIX_CACHE_BACKEND must be 'hash' or 'radix'")
 
 # Kernel requires page_size == 128 (pypto_serving/model/qwen/npu_executor.py), so a full
 # prefix-cache block is 128 tokens. Short prompts therefore never populate the
@@ -145,6 +148,7 @@ def harness():
         long_prefill_token_threshold=default_threshold,
         enable_prefix_cache=True,
         enable_chunk_prefill=True,
+        prefix_cache_backend=PREFIX_CACHE_BACKEND,
         # Exercise the pipelined (depth-2) scheduler explicitly: greedy output
         # must stay identical to the sync baseline (EXPECTED_TOKEN_IDS).
         async_scheduling=True,
@@ -178,14 +182,24 @@ def harness():
 
     engine.scheduler.schedule = schedule_spy
 
-    orig_get_computed = engine.kv_cache_manager.get_computed_blocks
+    if PREFIX_CACHE_BACKEND == "radix":
+        orig_match_radix = engine.kv_cache_manager.match_radix_prefix
 
-    def get_computed_spy(token_ids):
-        blocks = orig_get_computed(token_ids)
-        h.cache_hits.append(len(blocks))
-        return blocks
+        def match_radix_spy(token_ids, *, extra_key=()):
+            result = orig_match_radix(token_ids, extra_key=extra_key)
+            h.cache_hits.append(len(result.device_indices) // PAGE_SIZE)
+            return result
 
-    engine.kv_cache_manager.get_computed_blocks = get_computed_spy
+        engine.kv_cache_manager.match_radix_prefix = match_radix_spy
+    else:
+        orig_get_computed = engine.kv_cache_manager.get_computed_blocks
+
+        def get_computed_spy(token_ids):
+            blocks = orig_get_computed(token_ids)
+            h.cache_hits.append(len(blocks))
+            return blocks
+
+        engine.kv_cache_manager.get_computed_blocks = get_computed_spy
 
     try:
         loop.run_until_complete(engine.start())
