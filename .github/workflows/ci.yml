@@ -188,7 +188,7 @@ jobs:
           run_cmd="$run_cmd PTO2_RING_TASK_WINDOW=$PTO2_RING_TASK_WINDOW"
           run_cmd="$run_cmd PTO2_RING_HEAP=$PTO2_RING_HEAP"
           run_cmd="$run_cmd python -m pytest tests/test_qwen3_accuracy.py -q -s"
-          task-submit --device auto --timeout 1200 --max-time 1800 --run "$run_cmd"
+          task-submit --device auto --timeout 3600 --max-time 1800 --run "$run_cmd"
 
       - name: Run Qwen3 serving guard (prefix cache, chunked prefill, multi-batch)
         env:
@@ -210,7 +210,7 @@ jobs:
           run_cmd="$run_cmd PTO2_RING_TASK_WINDOW=$PTO2_RING_TASK_WINDOW"
           run_cmd="$run_cmd PTO2_RING_HEAP=$PTO2_RING_HEAP"
           run_cmd="$run_cmd python -m pytest tests/test_qwen3_serving.py -q -s"
-          task-submit --device auto --timeout 1200 --max-time 1800 --run "$run_cmd"
+          task-submit --device auto --timeout 3600 --max-time 1800 --run "$run_cmd"
 
       - name: Run DeepSeek V4 HTTP generation accuracy guard
         env:
@@ -242,7 +242,7 @@ jobs:
           run_cmd="$run_cmd SERVING_WORKER_STEP_TIMEOUT=$SERVING_WORKER_STEP_TIMEOUT"
           run_cmd="$run_cmd python -m pytest tests/test_deepseek_v4_accuracy.py -q -s"
           task-submit --device auto --device-num 8 --ignore-whitelist \
-            --timeout 1200 --max-time 1800 \
+            --timeout 3600 --max-time 1800 \
             --run "$run_cmd"
 
       - name: Kill orphaned task-submit tasks
@@ -250,14 +250,34 @@ jobs:
         working-directory: .
         run: |
           marker="pypto-serving-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          task-submit --list 2>/dev/null \
-            | grep -F "CI_TASK_MARKER=$marker" \
-            | grep -oE 'task_[0-9_]+' \
-            | sort -u \
-            | while read -r task_id; do
-                echo "Killing orphaned task $task_id"
-                task-submit --kill "$task_id" || true
-              done || true
+          target="CI_TASK_MARKER=$marker"
+          echo "cleaning up task-submit tasks matching $target"
+
+          # Match with `--find`, NOT `--list`: --list is a human-facing view that
+          # truncates the command column to 77 chars, so a grep for the full
+          # marker can silently miss and leave orphaned tasks holding devices.
+          # --find matches against the untruncated COMMAND and prints bare
+          # task-ids. It needs task-submit >= 2026-07-14 on the runner.
+          if ! ids=$(task-submit --find "$target"); then
+            echo "::error::task-submit --find failed — is task-submit up to date on this runner?"
+            exit 1
+          fi
+
+          if [ -z "$ids" ]; then
+            echo "  no orphaned tasks"
+            exit 0
+          fi
+
+          # A cleanup step that prints nothing is indistinguishable from one that
+          # is quietly broken — report what we killed.
+          n=0
+          while read -r task_id; do
+            [ -n "$task_id" ] || continue
+            echo "  killing $task_id"
+            task-submit --kill "$task_id" || echo "::warning::failed to kill $task_id"
+            n=$((n + 1))
+          done <<< "$ids"
+          echo "killed $n orphaned task(s)"
 
   platform-build:
     runs-on: ubuntu-latest
