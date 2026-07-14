@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,7 +70,50 @@ def test_prefill_keeps_sampling_in_standalone_device_kernel() -> None:
     assert "_greedy_sample_inline" not in prefill
     assert "_token_embed_inline" not in prefill
     assert "compiled.greedy_sample" in runner
-    assert "_maybe_run_sample_embed(" in runner
+    assert "_device_sampling_outputs(" in runner
+
+
+def test_device_greedy_keeps_large_outputs_worker_resident(monkeypatch) -> None:
+    from examples.model.qwen3_14b.runner.npu_runner import Qwen314BModelRunner
+    from pypto.runtime import DeviceTensor
+
+    class _FakeWorker:
+        def __init__(self) -> None:
+            self.alloc_calls = 0
+
+        def alloc_tensor(self, shape, dtype):
+            self.alloc_calls += 1
+            return DeviceTensor(self.alloc_calls, tuple(shape), dtype)
+
+    runner = object.__new__(Qwen314BModelRunner)
+    runner._l3_output_tensors = {}
+    worker = _FakeWorker()
+    monkeypatch.setattr(runner, "_shared_l3_worker", lambda: worker)
+
+    host_buffer = torch.empty((2, 4), dtype=torch.float32)
+    first = runner._output_kernel_arg("decode_logits", host_buffer)
+    second = runner._output_kernel_arg("decode_logits", host_buffer)
+    other = runner._output_kernel_arg("prefill_logits", host_buffer)
+
+    assert first is second
+    assert other is not first
+    assert worker.alloc_calls == 2
+
+    model = SimpleNamespace(
+        runtime=SimpleNamespace(device=torch.device("meta")),
+        config=SimpleNamespace(vocab_size=3),
+    )
+    host_logits = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    assert torch.equal(
+        runner._result_logits(model, 1, host_logits),
+        host_logits[:1, :3],
+    )
+
+    device_logits = DeviceTensor(99, (2, 4), torch.float32)
+    placeholder = runner._result_logits(model, 2, device_logits)
+    assert placeholder.shape == (2, 0)
+    assert placeholder.dtype == torch.float32
+    assert placeholder.device.type == "cpu"
 
 
 def _device_greedy_argmax_with_clamp(logits):

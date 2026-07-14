@@ -274,11 +274,6 @@ class WorkerProcess:
                 request = sr.request
                 will_be_computed = sr.num_computed_tokens + sr.num_new_tokens
                 if will_be_computed >= request.num_prompt_tokens:
-                    logits = (
-                        prefill_result.logits[i]
-                        if prefill_result.logits.dim() > 1
-                        else prefill_result.logits
-                    )
                     params = SamplingParams(
                         temperature=request.temperature,
                         top_p=request.top_p,
@@ -286,7 +281,6 @@ class WorkerProcess:
                     )
                     token_id = self._sample_result_row(
                         prefill_result,
-                        logits,
                         params,
                         i,
                         allow_device_greedy_sampling,
@@ -365,11 +359,6 @@ class WorkerProcess:
 
             for i, sr in enumerate(scheduled):
                 request = sr.request
-                logits = (
-                    decode_result.logits[i]
-                    if decode_result.logits.dim() > 1
-                    else decode_result.logits
-                )
                 params = SamplingParams(
                     temperature=request.temperature,
                     top_p=request.top_p,
@@ -377,7 +366,6 @@ class WorkerProcess:
                 )
                 token_id = self._sample_result_row(
                     decode_result,
-                    logits,
                     params,
                     i,
                     allow_device_greedy_sampling,
@@ -387,7 +375,6 @@ class WorkerProcess:
     def _sample_result_row(
         self,
         result,
-        logits: torch.Tensor,
         params: SamplingParams,
         row_idx: int,
         allow_device_sampled: bool,
@@ -401,6 +388,7 @@ class WorkerProcess:
                     f"sampled_token_ids has {flat.numel()} rows, expected row {row_idx}"
                 )
             return int(flat[row_idx].item())
+        logits = result.logits[row_idx] if result.logits.dim() > 1 else result.logits
         return self.sampler.sample(logits, params)
 
 def _worker_entry(

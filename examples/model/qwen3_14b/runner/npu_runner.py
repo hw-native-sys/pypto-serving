@@ -141,7 +141,7 @@ class _DecodeKernelInputs:
     seq_lens: torch.Tensor
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
-    logits: torch.Tensor
+    logits: torch.Tensor | DeviceTensor
 
 
 @dataclass
@@ -177,6 +177,7 @@ class Qwen314BModelRunner(ModelRunner):
         self._device_id = device_id
         self._l3_worker: Any | None = None
         self._l3_static_tensors: dict[tuple[int, tuple[int, ...], torch.dtype], object] = {}
+        self._l3_output_tensors: dict[tuple[str, tuple[int, ...], torch.dtype], DeviceTensor] = {}
         self._static_args: _StaticKernelArgs | None = None
         self._pending_kv_cache_specs: dict[str, tuple[ModelConfig, RuntimeConfig]] = {}
         if compiled is not None:
@@ -576,7 +577,11 @@ class Qwen314BModelRunner(ModelRunner):
         compiled = self._compiled
         prefill_inputs = self._prepare_prefill_inputs(model, batch)
 
-        logits_padded = compiled.prefill_logits_buffer
+        logits_padded = (
+            self._output_kernel_arg("prefill_logits", compiled.prefill_logits_buffer)
+            if batch.allow_device_greedy_sampling
+            else compiled.prefill_logits_buffer
+        )
 
         kv_cache = self._materialize_kv_cache(model)
         k_cache = kv_cache.key_pages
@@ -591,16 +596,16 @@ class Qwen314BModelRunner(ModelRunner):
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             seq_len = int(batch.seq_lens[batch_idx].item())
             alloc.tokens_used = max(alloc.tokens_used, seq_len)
-        sampled_ids, next_hidden = self._maybe_run_sample_embed(
+        sampled_ids, next_hidden = self._device_sampling_outputs(
             logits_padded,
             compiled.prefill_sampled_ids_buffer,
-            compiled.prefill_next_hidden_buffer,
+            None,
             prefill_inputs.actual_batch,
             allow=batch.allow_device_greedy_sampling,
         )
         return PrefillResult(
             last_hidden=None,
-            logits=logits_padded[: prefill_inputs.actual_batch, : model.config.vocab_size],
+            logits=self._result_logits(model, prefill_inputs.actual_batch, logits_padded),
             sampled_token_ids=sampled_ids,
             next_hidden_states=next_hidden,
         )
@@ -631,7 +636,11 @@ class Qwen314BModelRunner(ModelRunner):
         k_cache = kv_cache.key_pages
         v_cache = kv_cache.value_pages
 
-        kernel_inputs = self._pad_decode_inputs(model, decode_inputs)
+        kernel_inputs = self._pad_decode_inputs(
+            model,
+            decode_inputs,
+            device_outputs=batch.allow_device_greedy_sampling,
+        )
 
         # Padded block_table / slot_mapping only ever reference row 0's
         # already-valid pages, so bound-check exactly what the kernel will read.
@@ -643,7 +652,8 @@ class Qwen314BModelRunner(ModelRunner):
         )
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
-        sampled_ids, next_hidden = self._integrated_sample_result(
+        sampled_ids, next_hidden = self._device_sampling_outputs(
+            None,
             compiled.decode_sampled_ids_buffer,
             # decode_fwd's next_hidden output is the embedding for sampled_ids_in
             # used by this decode step. The newly sampled token is embedded at the
@@ -655,24 +665,31 @@ class Qwen314BModelRunner(ModelRunner):
         )
         return DecodeResult(
             hidden_states=decode_inputs.hidden.float(),
-            logits=kernel_inputs.logits[: kernel_inputs.actual_batch, : model.config.vocab_size].to(
+            logits=self._result_logits(model, kernel_inputs.actual_batch, kernel_inputs.logits).to(
                 decode_inputs.hidden.device
             ),
             sampled_token_ids=sampled_ids,
             next_hidden_states=next_hidden,
         )
 
-    @staticmethod
-    def _integrated_sample_result(
+    def _device_sampling_outputs(
+        self,
+        logits: torch.Tensor | DeviceTensor | None,
         sampled_ids_buffer: torch.Tensor,
         next_hidden_buffer: torch.Tensor | None,
         actual_batch: int,
         *,
         allow: bool,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Read device sampling output and optional precomputed next hidden rows."""
+        """Run or read device greedy sampling outputs."""
         if not allow:
             return None, None
+        if logits is not None:
+            self._run_distributed_program(
+                self._compiled.greedy_sample,
+                logits,
+                sampled_ids_buffer,
+            )
         next_hidden = (
             next_hidden_buffer[:actual_batch].clone()
             if next_hidden_buffer is not None
@@ -683,35 +700,12 @@ class Qwen314BModelRunner(ModelRunner):
             next_hidden,
         )
 
-    def _maybe_run_sample_embed(
-        self,
-        logits: torch.Tensor,
-        sampled_ids_buffer: torch.Tensor,
-        next_hidden_buffer: torch.Tensor,
-        actual_batch: int,
-        *,
-        allow: bool,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Run device greedy sampling when the request is greedy."""
-        if not allow:
-            return None, None
-        compiled = self._compiled
-        self._run_distributed_program(
-            compiled.greedy_sample,
-            logits,
-            sampled_ids_buffer,
-        )
-        return (
-            sampled_ids_buffer[:actual_batch, :1].clone(),
-            None,
-        )
-
     def _prefill_kernel_args(
         self,
         inputs: _PrefillInputs,
         k_cache: DeviceTensor,
         v_cache: DeviceTensor,
-        logits: torch.Tensor,
+        logits: torch.Tensor | DeviceTensor,
     ) -> tuple[Any, ...]:
         """Return arguments in ``qwen3_prefill_host`` signature order."""
         static = self._require_static_args()
@@ -781,7 +775,38 @@ class Qwen314BModelRunner(ModelRunner):
             self._compiled.decode_next_hidden_buffer,
         )
 
-    def _pad_decode_inputs(self, model: RuntimeModel, inputs: _DecodeInputs) -> _DecodeKernelInputs:
+    def _output_kernel_arg(self, name: str, host_buffer: torch.Tensor) -> DeviceTensor:
+        """Allocate a reusable worker-resident buffer for a large kernel output."""
+        key = (name, tuple(host_buffer.shape), host_buffer.dtype)
+        cached = self._l3_output_tensors.get(key)
+        if cached is not None:
+            return cached
+        dev = self._shared_l3_worker().alloc_tensor(tuple(host_buffer.shape), host_buffer.dtype)
+        self._l3_output_tensors[key] = dev
+        return dev
+
+    @staticmethod
+    def _result_logits(
+        model: RuntimeModel,
+        actual_batch: int,
+        logits: torch.Tensor | DeviceTensor,
+    ) -> torch.Tensor:
+        """Return host logits when available, otherwise a greedy-only empty placeholder."""
+        if isinstance(logits, DeviceTensor):
+            return torch.empty(
+                (actual_batch, 0),
+                dtype=torch.float32,
+                device="cpu",
+            )
+        return logits[:actual_batch, : model.config.vocab_size]
+
+    def _pad_decode_inputs(
+        self,
+        model: RuntimeModel,
+        inputs: _DecodeInputs,
+        *,
+        device_outputs: bool = False,
+    ) -> _DecodeKernelInputs:
         """Pad active decode rows to the fixed kernel batch.
 
         The fused decode kernel computes all ``max_batch_size`` rows. Inactive
@@ -838,7 +863,11 @@ class Qwen314BModelRunner(ModelRunner):
                 kernel_batch,
                 rows_each=1,
             ),
-            logits=compiled.decode_logits_buffer,
+            logits=(
+                self._output_kernel_arg("decode_logits", compiled.decode_logits_buffer)
+                if device_outputs
+                else compiled.decode_logits_buffer
+            ),
         )
 
     def _run_distributed_program(self, callable_spec: _L3Callable, *args: Any) -> Any:
@@ -954,6 +983,7 @@ class Qwen314BModelRunner(ModelRunner):
             finally:
                 self._l3_worker = None
                 self._l3_static_tensors.clear()
+                self._l3_output_tensors.clear()
 
     def _prepare_prefill_inputs(
         self,

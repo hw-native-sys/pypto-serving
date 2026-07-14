@@ -140,6 +140,7 @@ def harness():
             device="cpu",
             kv_dtype="bfloat16",
             weight_dtype="float32",
+            max_num_batched_tokens=MAX_SEQ_LEN,
         ),
         max_num_running_reqs=MAX_BATCH_SIZE,
         long_prefill_token_threshold=default_threshold,

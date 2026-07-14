@@ -239,19 +239,12 @@ class LLMEngine:
                     runtime_model,
                     prefill_batch,
                 )
-                prefill_logits = prefill_result.logits
-                prefill_sampled_token_ids = (
-                    prefill_result.sampled_token_ids
-                    if allow_device_greedy_sampling
-                    else None
-                )
-
                 sampling_params = self._sampler.from_generate_config(generate_config)
-                current_tokens = self._sample_batch_rows(
-                    prefill_logits,
+                current_tokens = self._sample_result_rows(
+                    prefill_result,
                     sampling_params,
                     len(requests),
-                    prefill_sampled_token_ids,
+                    allow_device_greedy_sampling,
                 )
                 active_indices = list(range(len(requests)))
                 finish_reasons = ["length"] * len(requests)
@@ -316,11 +309,11 @@ class LLMEngine:
                             kv_allocations=active_allocations,
                         ),
                     )
-                    decoded_tokens = self._sample_batch_rows(
-                        decode_result.logits,
+                    decoded_tokens = self._sample_result_rows(
+                        decode_result,
                         sampling_params,
                         len(next_active),
-                        decode_result.sampled_token_ids if allow_device_greedy_sampling else None,
+                        allow_device_greedy_sampling,
                     )
                     for row_idx, request_idx in enumerate(next_active):
                         current_tokens[request_idx] = decoded_tokens[row_idx]
@@ -438,14 +431,15 @@ class LLMEngine:
         """Generate one result by reusing the batch path."""
         return self.generate_batch(model_id, [prompt], config)[0]
 
-    def _sample_batch_rows(
+    def _sample_result_rows(
         self,
-        logits: torch.Tensor,
+        result,
         sampling_params,
         row_count: int,
-        sampled_token_ids: torch.Tensor | None = None,
+        allow_device_sampled: bool,
     ) -> list[int]:
         """Return sampled token IDs, preferring executor-provided device samples."""
+        sampled_token_ids = result.sampled_token_ids if allow_device_sampled else None
         if sampled_token_ids is not None:
             flat_ids = sampled_token_ids.view(-1)
             if flat_ids.numel() < row_count:
@@ -453,6 +447,7 @@ class LLMEngine:
                     f"sampled_token_ids has {flat_ids.numel()} rows, expected at least {row_count}"
                 )
             return [int(flat_ids[idx].item()) for idx in range(row_count)]
+        logits = result.logits
         return [
             self._sampler.sample(
                 self._select_batch_row(logits, row_idx),
