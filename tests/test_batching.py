@@ -92,6 +92,11 @@ def test_scheduler_speculative_output_counts_only_tokens_retained_before_eos():
     assert [(output.new_token_id, output.finished) for output in outputs] == [(7, True)]
 
 
+class _CharacterTokenizer(_Tokenizer):
+    def encode(self, text: str) -> list[int]:
+        return [(ord(char) % 15) + 1 for char in text]
+
+
 def test_worker_step_error_queues_finished_ids_for_executor_release():
     aborted: list[str] = []
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
@@ -124,6 +129,8 @@ def _model(
     max_seq_len: int = 128,
     page_size: int = 64,
     eos_token_id: int | None = None,
+    max_num_batched_tokens: int = 4096,
+    long_prefill_token_threshold: int = 256,
 ) -> RuntimeModel:
     config = ModelConfig(
         model_id="test-model",
@@ -148,6 +155,8 @@ def _model(
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         device="cpu",
+        max_num_batched_tokens=max_num_batched_tokens,
+        long_prefill_token_threshold=long_prefill_token_threshold,
     )
     return RuntimeModel(
         config=config,
@@ -384,7 +393,7 @@ def test_decode_kernel_inputs_reject_multi_token_rows():
 def test_engine_generate_batch_uses_batched_executor_results():
     model = _model(max_batch_size=2, eos_token_id=0)
     manager = KvCacheManager()
-    executor = _ImmediateEosExecutor(manager)
+    executor = _RecordingPrefillExecutor(manager)
     engine = LLMEngine(kv_cache_manager=manager, executor=executor)
     manager.register_model(model.config.model_id, model.config, model.runtime)
     engine._models[model.config.model_id] = ModelRecord(
@@ -403,10 +412,119 @@ def test_engine_generate_batch_uses_batched_executor_results():
 
     assert [result.token_ids for result in results] == [[0], [0]]
     assert [result.finish_reason for result in results] == ["eos", "eos"]
+    assert len(executor.prefill_batches) == 1
+    assert len(executor.prefill_batches[0].request_ids) == 2
+
+
+def test_engine_chunks_offline_batch_within_effective_token_budget():
+    model = _model(
+        max_batch_size=2,
+        eos_token_id=0,
+        max_num_batched_tokens=8,
+        long_prefill_token_threshold=3,
+    )
+    manager = KvCacheManager()
+    executor = _RecordingPrefillExecutor(manager)
+    engine = LLMEngine(kv_cache_manager=manager, executor=executor)
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    engine._models[model.config.model_id] = ModelRecord(
+        config=model.config,
+        runtime=model.runtime,
+        tokenizer=_CharacterTokenizer(),
+        layer_specs=[],
+        runtime_model=model,
+    )
+
+    results = engine.generate_batch(
+        model.config.model_id,
+        ["abcde", "abcdefg"],
+        GenerateConfig(max_new_tokens=1, temperature=0.0),
+    )
+
+    assert [result.token_ids for result in results] == [[0], [0]]
+    positions_by_request: dict[str, list[int]] = {}
+    token_ids_by_request: dict[str, list[int]] = {}
+    for batch in executor.prefill_batches:
+        assert batch.positions is not None
+        assert int((batch.positions >= 0).sum().item()) <= 3
+        for row, request_id in enumerate(batch.request_ids):
+            valid_positions = batch.positions[row][batch.positions[row] >= 0]
+            valid_tokens = batch.token_ids[row, : valid_positions.numel()]
+            positions_by_request.setdefault(request_id, []).extend(valid_positions.tolist())
+            token_ids_by_request.setdefault(request_id, []).extend(valid_tokens.tolist())
+            assert int(batch.seq_lens[row].item()) == int(valid_positions[-1].item()) + 1
+
+    assert sorted(positions_by_request.values(), key=len) == [list(range(5)), list(range(7))]
+    assert sorted(token_ids_by_request.values(), key=len) == sorted(
+        [_CharacterTokenizer().encode("abcde"), _CharacterTokenizer().encode("abcdefg")],
+        key=len,
+    )
+
+
+def test_engine_rotates_requests_when_budget_is_smaller_than_batch():
+    model = _model(
+        max_batch_size=3,
+        eos_token_id=0,
+        max_num_batched_tokens=2,
+        long_prefill_token_threshold=256,
+    )
+    manager = KvCacheManager()
+    executor = _RecordingPrefillExecutor(manager)
+    engine = LLMEngine(kv_cache_manager=manager, executor=executor)
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    engine._models[model.config.model_id] = ModelRecord(
+        config=model.config,
+        runtime=model.runtime,
+        tokenizer=_CharacterTokenizer(),
+        layer_specs=[],
+        runtime_model=model,
+    )
+
+    engine.generate_batch(
+        model.config.model_id,
+        ["abc", "defg", "hijkl"],
+        GenerateConfig(max_new_tokens=1, temperature=0.0),
+    )
+
+    positions_by_request: dict[str, list[int]] = {}
+    token_ids_by_request: dict[str, list[int]] = {}
+    for batch in executor.prefill_batches:
+        assert batch.positions is not None
+        assert len(batch.request_ids) == 1
+        for row, request_id in enumerate(batch.request_ids):
+            valid_positions = batch.positions[row][batch.positions[row] >= 0]
+            valid_tokens = batch.token_ids[row, : valid_positions.numel()]
+            positions_by_request.setdefault(request_id, []).extend(valid_positions.tolist())
+            token_ids_by_request.setdefault(request_id, []).extend(valid_tokens.tolist())
+
+    assert sorted(positions_by_request.values(), key=len) == [
+        list(range(3)),
+        list(range(4)),
+        list(range(5)),
+    ]
+    assert sorted(token_ids_by_request.values(), key=len) == sorted(
+        [
+            _CharacterTokenizer().encode("abc"),
+            _CharacterTokenizer().encode("defg"),
+            _CharacterTokenizer().encode("hijkl"),
+        ],
+        key=len,
+    )
+
+
+def test_qwen_warmup_prefill_does_not_exceed_budget_below_batch_size():
+    runtime = RuntimeConfig(
+        max_batch_size=4,
+        max_seq_len=128,
+        max_num_batched_tokens=8,
+        long_prefill_token_threshold=2,
+    )
+
+    assert ModelRunner._warmup_prefill_shape(runtime) == (2, 1, 2)
 
 
 def test_engine_uses_device_sampled_prefill_token_when_available():
-    model = _model(max_batch_size=1, eos_token_id=0)
+    model = _model(max_batch_size=1, eos_token_id=0, long_prefill_token_threshold=2)
     model.embed_tokens = torch.arange(model.config.vocab_size * model.config.hidden_size, dtype=torch.float32).view(
         model.config.vocab_size,
         model.config.hidden_size,
@@ -419,7 +537,7 @@ def test_engine_uses_device_sampled_prefill_token_when_available():
     engine._models[model.config.model_id] = ModelRecord(
         config=model.config,
         runtime=model.runtime,
-        tokenizer=_Tokenizer(),
+        tokenizer=_CharacterTokenizer(),
         layer_specs=[],
         runtime_model=model,
     )
@@ -431,7 +549,8 @@ def test_engine_uses_device_sampled_prefill_token_when_available():
     )[0]
 
     assert result.token_ids == [3]
-    assert executor.prefill_calls == 1
+    assert executor.prefill_calls == 2
+    assert executor.prefill_sampling_flags == [False, True]
     assert executor.decode_calls == 0
     assert sampler.sample_calls == 0
 
@@ -754,6 +873,16 @@ class _ImmediateEosExecutor(ModelExecutor):
         return DecodeResult(hidden_states=hidden, logits=logits)
 
 
+class _RecordingPrefillExecutor(_ImmediateEosExecutor):
+    def __init__(self, kv_cache_manager: KvCacheManager) -> None:
+        super().__init__(kv_cache_manager)
+        self.prefill_batches: list[PrefillBatch] = []
+
+    def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
+        self.prefill_batches.append(batch)
+        return super().run_prefill(model, batch)
+
+
 class _NoopKernel:
     def __call__(self, *args, config=None):
         return None
@@ -798,6 +927,7 @@ class _DeviceSamplingExecutor(ModelExecutor):
         self.second_token = second_token
         self.return_next_hidden = return_next_hidden
         self.prefill_calls = 0
+        self.prefill_sampling_flags: list[bool] = []
         self.decode_calls = 0
         self.lookup_calls = 0
         self.decode_hidden_seen: list[torch.Tensor] = []
@@ -816,13 +946,18 @@ class _DeviceSamplingExecutor(ModelExecutor):
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         self.prefill_calls += 1
+        self.prefill_sampling_flags.append(batch.allow_device_greedy_sampling)
         assert batch.input_embeddings is None
         token = torch.tensor([self.first_token], dtype=torch.int64)
+        sampled_token_ids = token.to(torch.int32) if batch.allow_device_greedy_sampling else None
+        next_hidden_states = None
+        if batch.allow_device_greedy_sampling and self.return_next_hidden:
+            next_hidden_states = model.embed_tokens.index_select(0, token)
         return PrefillResult(
             last_hidden=None,
             logits=torch.zeros(1, model.config.vocab_size),
-            sampled_token_ids=token.to(torch.int32),
-            next_hidden_states=model.embed_tokens.index_select(0, token) if self.return_next_hidden else None,
+            sampled_token_ids=sampled_token_ids,
+            next_hidden_states=next_hidden_states,
         )
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:

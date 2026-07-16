@@ -402,15 +402,16 @@ class Qwen314BModelRunner(ModelRunner):
         fused prefill) fails at startup rather than on the first real
         request.
         """
-        batch = runtime.max_batch_size
+        kernel_batch = runtime.max_batch_size
         max_seq = runtime.max_seq_len
-        mnb = getattr(runtime, "max_num_batched_tokens", 4096)
-        step_tokens = min(mnb, batch * max_seq)
-        per_req = max(step_tokens // batch, 1)
-        total_tokens = per_req * batch
+        batch, per_req, total_tokens = self._warmup_prefill_shape(runtime)
+        mnb = runtime.max_num_batched_tokens
+        long_prefill_threshold = runtime.long_prefill_token_threshold
 
         logger.info(
-            f"[warmup] starting (batch={batch}, max_num_batched_tokens={mnb}, "
+            f"[warmup] starting (prefill_batch={batch}, kernel_batch={kernel_batch}, "
+            f"max_num_batched_tokens={mnb}, "
+            f"long_prefill_token_threshold={long_prefill_threshold}, "
             f"max_seq={max_seq}, per_req={per_req}, total_tokens={total_tokens}, slot=-1)",
             
         )
@@ -459,11 +460,11 @@ class Qwen314BModelRunner(ModelRunner):
         compiled.decode_block_table_buffer.fill_(0)     # all reads from page 0
         compiled.decode_slot_mapping_buffer.fill_(-1)   # all writes to page 0
 
-        for b in range(batch):
+        for b in range(kernel_batch):
             compiled.decode_seq_lens_buffer[b] = min(per_req + 1, max_seq)
 
         decode_kernel_inputs = _DecodeKernelInputs(
-            actual_batch=batch,
+            actual_batch=kernel_batch,
             token_ids=compiled.decode_token_ids_buffer,
             seq_lens=compiled.decode_seq_lens_buffer,
             block_table=compiled.decode_block_table_buffer,
@@ -471,7 +472,7 @@ class Qwen314BModelRunner(ModelRunner):
             logits=compiled.decode_logits_buffer,
         )
 
-        logger.info(f"[warmup] decode dispatch … (batch={batch}, seq_len={per_req + 1})")
+        logger.info(f"[warmup] decode dispatch … (batch={kernel_batch}, seq_len={per_req + 1})")
         t0 = time.perf_counter()
         self._run_distributed_program(
             compiled.decode,
@@ -480,6 +481,21 @@ class Qwen314BModelRunner(ModelRunner):
         logger.info(f"[warmup] decode done ({time.perf_counter() - t0:.2f} s)")
 
         logger.info("[warmup] complete")
+
+    @staticmethod
+    def _warmup_prefill_shape(runtime: RuntimeConfig) -> tuple[int, int, int]:
+        """Return active batch, tokens per request, and total warmup tokens."""
+        max_batch = runtime.max_batch_size
+        effective_budget = runtime.max_num_batched_tokens
+        if runtime.long_prefill_token_threshold > 0:
+            effective_budget = min(effective_budget, runtime.long_prefill_token_threshold)
+        step_tokens = min(effective_budget, max_batch * runtime.max_seq_len)
+        if step_tokens <= 0:
+            raise ValueError("warmup prefill token budget must be positive")
+        active_batch = min(max_batch, step_tokens)
+        per_request_tokens = step_tokens // active_batch
+        total_tokens = per_request_tokens * active_batch
+        return active_batch, per_request_tokens, total_tokens
 
     def _alloc_kv_cache_tensor(self, shape: tuple[int, ...], dtype: torch.dtype) -> DeviceTensor:
         """Allocate one worker-resident KV cache tensor shared by prefill/decode."""

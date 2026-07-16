@@ -207,26 +207,39 @@ class LLMEngine:
                 allow_device_greedy_sampling=allow_device_greedy_sampling,
                 kv_allocations=allocations,
             )
-            fast_path_result = self._executor.try_generate_batch(
-                record,
-                requests,
-                prefill_batch,
-                generate_config,
-            )
-            if fast_path_result is not None:
-                return fast_path_result
+            prefill_token_budget = record.runtime.max_num_batched_tokens
+            if prefill_token_budget <= 0:
+                raise ValueError("max_num_batched_tokens must be positive")
+            long_prefill_threshold = record.runtime.long_prefill_token_threshold
+            if long_prefill_threshold > 0:
+                prefill_token_budget = min(prefill_token_budget, long_prefill_threshold)
+            total_prefill_tokens = sum(len(token_ids) for token_ids in prompt_token_ids)
+            batch_fits_budget = total_prefill_tokens <= prefill_token_budget
+            if batch_fits_budget:
+                fast_path_result = self._executor.try_generate_batch(
+                    record,
+                    requests,
+                    prefill_batch,
+                    generate_config,
+                )
+                if fast_path_result is not None:
+                    return fast_path_result
 
             with self._executor.session():
-                prefill_result = self._executor.run_prefill(
-                    runtime_model,
-                    prefill_batch,
-                )
-                prefill_logits = prefill_result.logits
-                prefill_sampled_token_ids = (
-                    prefill_result.sampled_token_ids
-                    if allow_device_greedy_sampling
-                    else None
-                )
+                if batch_fits_budget:
+                    prefill_result = self._executor.run_prefill(runtime_model, prefill_batch)
+                    prefill_logits = prefill_result.logits
+                    prefill_sampled_token_ids = (
+                        prefill_result.sampled_token_ids
+                        if prefill_batch.allow_device_greedy_sampling
+                        else None
+                    )
+                else:
+                    prefill_logits, prefill_sampled_token_ids = self._run_prefill_in_chunks(
+                        runtime_model,
+                        prefill_batch,
+                        prefill_token_budget,
+                    )
 
                 sampling_params = self._sampler.from_generate_config(generate_config)
                 current_tokens = self._sample_batch_rows(
@@ -419,6 +432,135 @@ class LLMEngine:
     def _generate_result(self, model_id: str, prompt: str, config: GenerateConfig) -> GenerateResult:
         """Generate one result by reusing the batch path."""
         return self.generate_batch(model_id, [prompt], config)[0]
+
+    def _run_prefill_in_chunks(
+        self,
+        runtime_model,
+        batch: PrefillBatch,
+        token_budget: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run prefill calls whose combined chunk size does not exceed the budget."""
+        if token_budget <= 0:
+            raise ValueError("max_num_batched_tokens must be positive")
+
+        row_count = len(batch.request_ids)
+        prompt_lengths = [int(batch.seq_lens[row].item()) for row in range(row_count)]
+        computed_tokens = [0] * row_count
+        final_logits: list[torch.Tensor | None] = [None] * row_count
+        final_sampled_ids: list[torch.Tensor | None] = [None] * row_count
+        next_request_idx = 0
+
+        while any(computed_tokens[row] < prompt_lengths[row] for row in range(row_count)):
+            active_rows: list[int] = []
+            for offset in range(row_count):
+                row = (next_request_idx + offset) % row_count
+                if computed_tokens[row] < prompt_lengths[row]:
+                    active_rows.append(row)
+            selected_rows = active_rows[:1]
+            per_request_budget = token_budget
+            chunk_lengths = [
+                min(prompt_lengths[row] - computed_tokens[row], per_request_budget)
+                for row in selected_rows
+            ]
+            max_chunk_len = max(chunk_lengths)
+
+            chunk_token_ids = batch.token_ids.new_zeros((len(selected_rows), max_chunk_len))
+            chunk_embeddings = None
+            if batch.input_embeddings is not None:
+                chunk_embeddings = batch.input_embeddings.new_zeros(
+                    (len(selected_rows), max_chunk_len, *batch.input_embeddings.shape[2:])
+                )
+            chunk_positions = torch.full(
+                (len(selected_rows), max_chunk_len),
+                -1,
+                dtype=torch.long,
+                device=batch.token_ids.device,
+            )
+            chunk_seq_lens = batch.seq_lens.new_empty((len(selected_rows),))
+
+            for chunk_row, (request_row, chunk_len) in enumerate(
+                zip(selected_rows, chunk_lengths, strict=True)
+            ):
+                chunk_start = computed_tokens[request_row]
+                chunk_end = chunk_start + chunk_len
+                chunk_token_ids[chunk_row, :chunk_len] = batch.token_ids[
+                    request_row, chunk_start:chunk_end
+                ]
+                if chunk_embeddings is not None and batch.input_embeddings is not None:
+                    chunk_embeddings[chunk_row, :chunk_len] = batch.input_embeddings[
+                        request_row, chunk_start:chunk_end
+                    ]
+                chunk_positions[chunk_row, :chunk_len] = torch.arange(
+                    chunk_start,
+                    chunk_end,
+                    dtype=torch.long,
+                    device=batch.token_ids.device,
+                )
+                chunk_seq_lens[chunk_row] = chunk_end
+
+            prefill_result = self._executor.run_prefill(
+                runtime_model,
+                PrefillBatch(
+                    request_ids=[batch.request_ids[row] for row in selected_rows],
+                    token_ids=chunk_token_ids,
+                    input_embeddings=chunk_embeddings,
+                    seq_lens=chunk_seq_lens,
+                    allow_device_greedy_sampling=(
+                        batch.allow_device_greedy_sampling
+                        and any(
+                            computed_tokens[row] + chunk_len == prompt_lengths[row]
+                            for row, chunk_len in zip(
+                                selected_rows,
+                                chunk_lengths,
+                                strict=True,
+                            )
+                        )
+                    ),
+                    kv_allocations=[batch.kv_allocations[row] for row in selected_rows],
+                    positions=chunk_positions,
+                    block_ids=(
+                        [batch.block_ids[row] for row in selected_rows]
+                        if batch.block_ids
+                        else []
+                    ),
+                ),
+            )
+
+            for chunk_row, (request_row, chunk_len) in enumerate(
+                zip(selected_rows, chunk_lengths, strict=True)
+            ):
+                computed_tokens[request_row] += chunk_len
+                if computed_tokens[request_row] != prompt_lengths[request_row]:
+                    continue
+                final_logits[request_row] = self._select_batch_row(
+                    prefill_result.logits,
+                    chunk_row,
+                ).clone()
+                sampled_ids = (
+                    prefill_result.sampled_token_ids
+                    if batch.allow_device_greedy_sampling
+                    else None
+                )
+                if sampled_ids is not None:
+                    if sampled_ids.dim() == 0:
+                        sampled_id = sampled_ids
+                    elif sampled_ids.dim() == 1:
+                        sampled_id = sampled_ids[chunk_row]
+                    else:
+                        sampled_id = sampled_ids[chunk_row].reshape(-1)[0]
+                    final_sampled_ids[request_row] = sampled_id.clone()
+
+            next_request_idx = (selected_rows[-1] + 1) % row_count
+
+        if any(logits is None for logits in final_logits):
+            raise RuntimeError("prefill did not produce final logits for every request")
+        logits = torch.stack([row for row in final_logits if row is not None])
+        sampled_ids = None
+        if all(sampled_id is not None for sampled_id in final_sampled_ids):
+            sampled_ids = torch.stack(
+                [sampled_id for sampled_id in final_sampled_ids if sampled_id is not None]
+            )
+        return logits, sampled_ids
 
     def _sample_batch_rows(
         self,
