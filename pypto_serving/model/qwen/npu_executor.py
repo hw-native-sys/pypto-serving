@@ -34,6 +34,11 @@ from pypto_serving.model.qwen.npu_runner import (
 _VOCAB_PAD_MULTIPLE = 512  # must be a multiple of lm_head.VOCAB_CHUNK (64)
 _QWEN14B_PAGE_SIZE = 128
 _QWEN14B_BLOCK_DIM = 24
+# PTO2 ring-task heap size the Qwen3-14B warmup needs. The runtime's own default
+# (256MB) is too small for the default max_num_batched_tokens (4096): the warmup
+# prefill overflows the ring allocator and startup aborts with
+# HEAP_RING_DEADLOCK. 512MB is the smallest that clears it on a 14B.
+_QWEN14B_DEFAULT_RING_HEAP = 512 * 1024 * 1024
 
 
 @dataclass
@@ -114,6 +119,12 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         save_kernels_dir: str | None = None,
         pypto_root: str | None = None,
     ) -> None:
+        # Ensure the PTO2 ring heap is large enough for the Qwen3-14B warmup
+        # before anything else runs -- including base-class init, in case it
+        # ever touches the runtime. The caller can still override via the
+        # PTO2_RING_HEAP env var; set in the executor so both the serving and
+        # offline paths get it and a plain launch never hits HEAP_RING_DEADLOCK.
+        os.environ.setdefault("PTO2_RING_HEAP", str(_QWEN14B_DEFAULT_RING_HEAP))
         super().__init__(
             kv_cache_manager,
             platform=platform,

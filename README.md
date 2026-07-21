@@ -81,6 +81,10 @@ pypto-serving \
   --port 8899
 ```
 
+> Qwen3-14B raises the PTO2 ring-task heap to 512MB automatically — the runtime
+> default (256MB) overflows during warmup and aborts with `HEAP_RING_DEADLOCK`.
+> Override with `export PTO2_RING_HEAP=<bytes>` only if you need a different size.
+
 Send a generation request after the server logs `Application startup complete`:
 
 ```bash
