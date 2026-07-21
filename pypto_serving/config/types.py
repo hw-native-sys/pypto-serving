@@ -68,6 +68,8 @@ class RuntimeConfig:
     npu_memory_utilization: float = 0.90
     # Max tokens processed per scheduling step (chunked-prefill granularity).
     max_num_batched_tokens: int = 4096
+    # Per-dispatch safety cap for long offline prefill; zero disables the cap.
+    long_prefill_token_threshold: int = 256
     # Compile-time generation limit used by model-specific runners.
     max_new_tokens: int = 256
 
