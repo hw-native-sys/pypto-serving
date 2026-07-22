@@ -122,23 +122,32 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
 )
 
 
+# pypto-lib renamed models/deepseek/v4 -> v4-flash (splitting the variant into
+# v4-flash + v4-pro). Accept either path so serving keeps working across the
+# rename: the pypto-lib submodule pinned here may still carry the old v4 dir
+# until it is bumped. v4-flash is preferred.
+_DEEPSEEK_V4_KERNEL_VARIANTS = ("v4-flash", "v4")
+
+
 def _find_pypto_lib_deepseek_v4_dir(pypto_root: str | None = None) -> Path:
-    """Find the DeepSeekV4 kernel directory."""
+    """Find the DeepSeekV4 kernel directory (models/deepseek/v4-flash, or v4)."""
     if pypto_root is None:
         pypto_root = os.environ.get("PYPTO_ROOT")
     if pypto_root:
         root = Path(pypto_root)
-        candidate = root / "models" / "deepseek" / "v4"
-        if candidate.is_dir():
-            return candidate
+        for variant in _DEEPSEEK_V4_KERNEL_VARIANTS:
+            candidate = root / "models" / "deepseek" / variant
+            if candidate.is_dir():
+                return candidate
         raise FileNotFoundError(f"DeepSeekV4 kernel directory not found under PYPTO_ROOT={pypto_root!r}")
 
     start_dir = Path(__file__).resolve().parent
     for directory in (start_dir, *start_dir.parents):
         pypto_lib_dir = directory / "pypto-lib"
-        candidate = pypto_lib_dir / "models" / "deepseek" / "v4"
-        if candidate.is_dir():
-            return candidate
+        for variant in _DEEPSEEK_V4_KERNEL_VARIANTS:
+            candidate = pypto_lib_dir / "models" / "deepseek" / variant
+            if candidate.is_dir():
+                return candidate
 
     raise FileNotFoundError(
         "Cannot locate DeepSeekV4 kernels. Run from a checkout with pypto-lib available "
@@ -204,7 +213,12 @@ def _is_deepseek_v4_module_file(path: Path, kernel_dir: Path) -> bool:
     if resolved.is_relative_to(kernel_dir):
         return True
     parts = resolved.parts
-    return len(parts) >= 4 and parts[-4:-1] == ("models", "deepseek", "v4")
+    # .../models/deepseek/<variant>/<module>.py, where <variant> is v4-flash or v4.
+    return (
+        len(parts) >= 4
+        and parts[-4:-2] == ("models", "deepseek")
+        and parts[-2] in _DEEPSEEK_V4_KERNEL_VARIANTS
+    )
 
 
 @contextlib.contextmanager
