@@ -136,7 +136,6 @@ class Qwen314BA8W8PyptoExecutor(CorePyptoExecutor):
         platform: str = "a2a3sim",
         device_ids: Sequence[int] = (0,),
         save_kernels_dir: str | None = None,
-        pto_isa_commit: str | None = None,
         l3_trace: bool = False,
         pypto_root: str | None = None,
     ) -> None:
@@ -145,7 +144,6 @@ class Qwen314BA8W8PyptoExecutor(CorePyptoExecutor):
             platform=platform,
             device_ids=device_ids,
             save_kernels_dir=save_kernels_dir,
-            pto_isa_commit=pto_isa_commit,
         )
         self._l3_trace = l3_trace
         self._pypto_root = pypto_root
@@ -462,7 +460,6 @@ class Qwen314BA8W8PyptoExecutor(CorePyptoExecutor):
             save_kernels=config.save_kernels,
             save_kernels_dir=config.save_kernels_dir,
             codegen_only=True,
-            pto_isa_commit=config.pto_isa_commit,
             diagnostic_phase=config.diagnostic_phase,
             disabled_diagnostics=config.disabled_diagnostics,
             compile_profiling=config.compile_profiling,

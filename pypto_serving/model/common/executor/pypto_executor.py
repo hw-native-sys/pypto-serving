@@ -42,7 +42,6 @@ class PyptoExecutor(ModelExecutor, ABC):
         platform: str = "a2a3sim",
         device_ids: Sequence[int] = (0,),
         save_kernels_dir: str | None = None,
-        pto_isa_commit: str | None = None,
     ) -> None:
         """Initialize common PyPTO runtime options and model registries."""
         super().__init__(kv_cache_manager)
@@ -51,7 +50,6 @@ class PyptoExecutor(ModelExecutor, ABC):
         if not self._device_ids:
             raise ValueError("device_ids must contain at least one device id")
         self._save_kernels_dir = save_kernels_dir
-        self._pto_isa_commit = pto_isa_commit
         self._runners: dict[str, ModelRunner] = {}
         self._compiled: dict[str, object] = {}
 
@@ -127,7 +125,6 @@ class PyptoExecutor(ModelExecutor, ABC):
             codegen_only=codegen_only,
             save_kernels=self._save_kernels_dir is not None,
             save_kernels_dir=self._save_kernels_dir,
-            pto_isa_commit=self._pto_isa_commit,
         )
 
     @abstractmethod

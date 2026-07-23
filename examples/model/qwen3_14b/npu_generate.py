@@ -393,11 +393,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stream", action="store_true", default=False)
     parser.add_argument("--save-kernels-dir", default=None)
     parser.add_argument(
-        "--pto-isa-commit",
-        default=None,
-        help="For qwen3-a8w8 only: pin PyPTO compile/assemble to the installed runtime's pto-isa revision.",
-    )
-    parser.add_argument(
         "--num-layers-override",
         type=int,
         default=None,
@@ -488,7 +483,6 @@ def main() -> None:
         "save_kernels_dir": args.save_kernels_dir,
     }
     if args.model_format == _QWEN3_A8W8_FORMAT:
-        executor_kwargs["pto_isa_commit"] = args.pto_isa_commit
         executor_kwargs["l3_trace"] = args.profile_verbose
     executor = executor_cls(
         kv_cache_manager,
