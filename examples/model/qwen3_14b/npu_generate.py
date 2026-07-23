@@ -516,7 +516,7 @@ def main() -> None:
                 max_seq_len=args.max_seq_len,
                 max_new_tokens=args.max_new_tokens,
                 device="cpu",
-                kv_dtype="int8" if args.model_format == _QWEN3_A8W8_FORMAT else args.kv_cache_dtype,
+                kv_dtype="bfloat16" if args.model_format == _QWEN3_A8W8_FORMAT else args.kv_cache_dtype,
                 weight_dtype="bfloat16" if args.model_format == _QWEN3_A8W8_FORMAT else args.dtype,
                 npu_memory_utilization=args.npu_memory_utilization,
                 max_num_batched_tokens=args.max_num_batched_tokens,

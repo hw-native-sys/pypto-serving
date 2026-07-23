@@ -61,6 +61,8 @@ class _KernelLayerWeights:
     w_gate: torch.Tensor
     w_up: torch.Tensor
     w_down: torch.Tensor
+    w_gate_scale: torch.Tensor | None = None
+    w_up_scale: torch.Tensor | None = None
     wq_scale: torch.Tensor | None = None
     wk_scale: torch.Tensor | None = None
     wv_scale: torch.Tensor | None = None
@@ -90,6 +92,7 @@ class _CompiledKernels:
     prefill_logits_buffer: torch.Tensor
     decode_hidden_buffer: torch.Tensor
     decode_seq_lens_buffer: torch.Tensor
+    decode_active_batch_buffer: torch.Tensor
     decode_block_table_buffer: torch.Tensor
     decode_slot_mapping_buffer: torch.Tensor
 
@@ -136,42 +139,18 @@ class Qwen314BA8W8ModelRunner(ModelRunner):
         self._l3_worker: Any | None = None
         self._l3_static_storage_tensors: dict[int, object] = {}
         self._l3_static_host_tensors: dict[int, torch.Tensor] = {}
-        self._kv_scale_caches: dict[str, tuple[Any, Any]] = {}
         if compiled is not None:
             self._register_l3_static_host_tensors()
 
     def init_kv_cache(self, model_id: str, config, runtime) -> int:
-        """Create the runner-owned KV cache, plus INT8 scale pages for A8W8."""
+        """Create the runner-owned BF16 KV cache."""
         self._l3_log("init_kv_cache: preparing DistributedWorker")
         self._shared_l3_worker()
         self._l3_log("init_kv_cache: DistributedWorker ready")
         self._l3_log("init_kv_cache: allocating KV cache")
         num_pages = super().init_kv_cache(model_id, config, runtime)
         self._l3_log(f"init_kv_cache: KV cache pages={num_pages}")
-        if model_id in self._kv_scale_caches:
-            return num_pages
-        cache_rows = config.num_hidden_layers * num_pages * config.num_key_value_heads * runtime.page_size
-        self._l3_log("init_kv_cache: allocating KV scale cache")
-        self._l3_log("init_kv_cache: allocating key scale")
-        key_scale = self._alloc_kv_cache_tensor((cache_rows, 8), torch.float32)
-        self._l3_log("init_kv_cache: key scale allocated")
-        try:
-            self._l3_log("init_kv_cache: allocating value scale")
-            value_scale = self._alloc_kv_cache_tensor((cache_rows, 8), torch.float32)
-            self._l3_log("init_kv_cache: value scale allocated")
-        except Exception:
-            self._free_kv_cache_tensor(key_scale)
-            raise
-        self._kv_scale_caches[model_id] = (key_scale, value_scale)
-        self._l3_log("init_kv_cache: scale cache ready")
         return num_pages
-
-    def close_kv_cache(self) -> None:
-        for key_scale, value_scale in list(self._kv_scale_caches.values()):
-            self._free_kv_cache_tensor(key_scale)
-            self._free_kv_cache_tensor(value_scale)
-        self._kv_scale_caches.clear()
-        super().close_kv_cache()
 
     def _alloc_kv_cache_tensor(self, shape: tuple[int, ...], dtype: torch.dtype) -> Any:
         """Allocate one KV cache tensor on the active NPU worker."""
@@ -221,11 +200,7 @@ class Qwen314BA8W8ModelRunner(ModelRunner):
         k_cache = kv_cache.key_pages
         v_cache = kv_cache.value_pages
         self._validate_kv_cache_bounds(model, prefill_inputs.block_table, prefill_inputs.slot_mapping, k_cache)
-        kv_scales = self._kv_scale_caches.get(model.config.model_id)
 
-        if kv_scales is None:
-            raise RuntimeError(f"missing A8W8 KV scale cache for model {model.config.model_id!r}")
-        k_cache_scale, v_cache_scale = kv_scales
         rows_per_layer = k_cache.shape[0] // model.config.num_hidden_layers
         hidden = prefill_inputs.hidden
 
@@ -272,21 +247,21 @@ class Qwen314BA8W8ModelRunner(ModelRunner):
                     k_cache,
                     cache_row_start * model.config.head_dim,
                     (cache_rows, model.config.head_dim),
-                    1,
+                    2,
                 ),
                 self._device_tensor_view(
                     v_cache,
                     cache_row_start * model.config.head_dim,
                     (cache_rows, model.config.head_dim),
-                    1,
+                    2,
                 ),
-                self._device_tensor_view(k_cache_scale, cache_row_start * 8, (cache_rows, 8), 4),
-                self._device_tensor_view(v_cache_scale, cache_row_start * 8, (cache_rows, 8), 4),
                 weight_slice("decode_wo", layer_start, layer_count, model.config.hidden_size),
                 weight_slice("decode_wo_scale", layer_start, layer_count),
                 weight_slice("decode_post_rms_weight", layer_start, layer_count),
                 weight_slice("decode_w_gate", layer_start, layer_count, model.config.hidden_size),
                 weight_slice("decode_w_up", layer_start, layer_count, model.config.hidden_size),
+                weight_slice("decode_w_gate_scale", layer_start, layer_count),
+                weight_slice("decode_w_up_scale", layer_start, layer_count),
                 weight_slice("decode_w_down", layer_start, layer_count, model.config.intermediate_size),
                 self._kernel_static_tensor(compiled.final_norm_weight),
                 self._kernel_static_tensor(compiled.padded_lm_head_weight),
@@ -315,12 +290,11 @@ class Qwen314BA8W8ModelRunner(ModelRunner):
         KV is already in place with no bridge. KV is keyed by block_table page id, not by
         kernel row, so a request may occupy any row each step (no stable-slot shim).
 
-        The kernel is FIXED-BATCH (it computes all max_batch_size rows and writes
-        each row's current-token KV). Pad the active batch up to the kernel batch by
-        REPLICATING active row 0's inputs into the padding rows: those rows then
-        recompute row 0's K/V and write row 0's own slot with byte-identical values
-        (an idempotent, safe write), and their logits are trimmed off below. This
-        avoids padded rows clobbering an unrelated request's physical page.
+        Projection and MLP kernels retain their fixed max_batch_size ABI. Inputs are
+        padded by replicating active row 0, while ``active_batch`` lets attention
+        skip those duplicate rows and copy row 0's attention output into them before
+        the fixed-batch projection resumes. Padding rows therefore remain
+        byte-compatible without rereading the same long KV sequence.
         """
         self._l3_log("run_decode: start")
         compiled = self._compiled
@@ -336,7 +310,6 @@ class Qwen314BA8W8ModelRunner(ModelRunner):
             raise RuntimeError(f"KV cache for model {model_id!r} is not initialized")
         k_cache = kv_cache.key_pages
         v_cache = kv_cache.value_pages
-        kv_scales = self._kv_scale_caches.get(model_id)
 
         if kernel_batch > compiled.decode_logits_buffer.shape[0]:
             raise ValueError(
@@ -354,6 +327,8 @@ class Qwen314BA8W8ModelRunner(ModelRunner):
             kernel_batch,
             rows_each=1,
         )
+        active_batch = compiled.decode_active_batch_buffer
+        active_batch[0] = actual_batch
         block_table = self._copy_replicated_rows(
             compiled.decode_block_table_buffer,
             decode_inputs.block_table,
@@ -374,9 +349,6 @@ class Qwen314BA8W8ModelRunner(ModelRunner):
         self._validate_kv_cache_bounds(model, block_table, slot_mapping, k_cache)
 
         logits_padded = compiled.decode_logits_buffer  # full [kernel_batch, vocab]; trimmed below
-        if kv_scales is None:
-            raise RuntimeError(f"missing A8W8 KV scale cache for model {model_id!r}")
-        k_cache_scale, v_cache_scale = kv_scales
         self._run_distributed_program(
             compiled.decode,
             hidden,
@@ -390,18 +362,19 @@ class Qwen314BA8W8ModelRunner(ModelRunner):
             self._kernel_static_tensor(dw["decode_q_norm_weight"]),
             self._kernel_static_tensor(dw["decode_k_norm_weight"]),
             seq_lens,
+            active_batch,
             block_table,
             slot_mapping,
             self._kernel_static_tensor(compiled.rope_cos),
             self._kernel_static_tensor(compiled.rope_sin),
             k_cache,
             v_cache,
-            k_cache_scale,
-            v_cache_scale,
             self._kernel_static_tensor(dw["decode_wo"]),
             self._kernel_static_tensor(dw["decode_wo_scale"]),
             self._kernel_static_tensor(dw["decode_w_gate"]),
             self._kernel_static_tensor(dw["decode_w_up"]),
+            self._kernel_static_tensor(dw["decode_w_gate_scale"]),
+            self._kernel_static_tensor(dw["decode_w_up_scale"]),
             self._kernel_static_tensor(dw["decode_w_down"]),
             self._kernel_static_tensor(dw["decode_post_rms_weight"]),
             self._kernel_static_tensor(compiled.final_norm_weight),

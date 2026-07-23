@@ -831,8 +831,6 @@ def test_a8w8_init_kv_cache_returns_page_count_for_first_and_repeated_init(monke
     assert allocated_shapes == [
         ((cache_rows, model.config.head_dim), torch.bfloat16),
         ((cache_rows, model.config.head_dim), torch.bfloat16),
-        ((cache_rows, 8), torch.float32),
-        ((cache_rows, 8), torch.float32),
     ]
 
 
@@ -872,6 +870,8 @@ def test_a8w8_stack_decode_weights_releases_per_layer_sources():
             w_gate=torch.full((2, 3), value),
             w_up=torch.full((2, 3), value),
             w_down=torch.full((3, 2), value),
+            w_gate_scale=torch.full((1, 3), value),
+            w_up_scale=torch.full((1, 3), value),
             wq_scale=torch.full((1, 2), value),
             wk_scale=torch.full((1, 1), value),
             wv_scale=torch.full((1, 1), value),
@@ -884,6 +884,7 @@ def test_a8w8_stack_decode_weights_releases_per_layer_sources():
 
     assert weights["decode_wq"].shape == (4, 2)
     assert weights["decode_wq_scale"].shape == (2, 2)
+    assert weights["decode_w_gate_scale"].shape == (2, 3)
     assert all(layer_weights.wq.numel() == 0 for layer_weights in layers)
     assert all(layer_weights.wq_scale is not None and layer_weights.wq_scale.numel() == 0 for layer_weights in layers)
 
@@ -1759,7 +1760,8 @@ def test_prefill_host_inlines_embedding_and_keeps_sampling_standalone():
         pytest.skip("pypto-lib submodule is not checked out")
     prefill_source = (QWEN3_KERNEL_DIR / "prefill_fwd.py").read_text(encoding="utf-8")
     assert 'name_hint="greedy_sample"' not in prefill_source
-    assert 'name_hint="token_embed"' in prefill_source
+    assert 'name_hint="token_embed_single"' in prefill_source
+    assert 'name_hint="token_embed_group"' in prefill_source
 
 
 def _layer(hidden_size: int, intermediate_size: int, head_dim: int) -> LayerWeights:

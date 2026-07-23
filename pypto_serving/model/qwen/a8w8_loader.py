@@ -151,21 +151,15 @@ class Qwen3A8W8DirectoryLoader:
                 wo=_hf_linear_to_kernel_i8(index, f"{prefix}.self_attn.o_proj.weight"),
                 wo_scale=_hf_scale_to_kernel(index, f"{prefix}.self_attn.o_proj.weight_scale"),
                 post_rms_weight=index.load(f"{prefix}.post_attention_layernorm.weight").reshape(1, -1).float(),
-                w_gate=_hf_linear_to_bf16(
-                    index,
-                    f"{prefix}.mlp.gate_proj.weight",
-                    f"{prefix}.mlp.gate_proj.weight_scale",
-                ),
-                w_up=_hf_linear_to_bf16(
-                    index,
-                    f"{prefix}.mlp.up_proj.weight",
-                    f"{prefix}.mlp.up_proj.weight_scale",
-                ),
+                w_gate=_hf_linear_to_kernel_i8(index, f"{prefix}.mlp.gate_proj.weight"),
+                w_up=_hf_linear_to_kernel_i8(index, f"{prefix}.mlp.up_proj.weight"),
                 w_down=_hf_linear_to_bf16(
                     index,
                     f"{prefix}.mlp.down_proj.weight",
                     f"{prefix}.mlp.down_proj.weight_scale",
                 ),
+                w_gate_scale=_hf_scale_to_kernel(index, f"{prefix}.mlp.gate_proj.weight_scale"),
+                w_up_scale=_hf_scale_to_kernel(index, f"{prefix}.mlp.up_proj.weight_scale"),
             )
             layers.append(layer)
 
