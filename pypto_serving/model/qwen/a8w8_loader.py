@@ -118,8 +118,9 @@ class Qwen3A8W8DirectoryLoader:
         model_path = Path(request.model_dir)
         config_data = json.loads((model_path / "config.json").read_text())
         trust_remote_code = bool(request.loader_options.get("trust_remote_code", False))
+        tokenizer_path = Path(str(request.loader_options.get("tokenizer_dir") or model_path))
         tokenizer = TransformersTokenizerAdapter.from_pretrained(
-            str(model_path),
+            str(tokenizer_path),
             trust_remote_code=trust_remote_code,
         )
         config = _build_model_config(request.model_id, config_data, tokenizer)

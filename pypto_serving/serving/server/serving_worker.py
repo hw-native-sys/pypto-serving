@@ -77,7 +77,6 @@ class WorkerProcess:
     def init_device_and_model(self) -> int:
         from pypto_serving.config.types import ModelRecord
         from pypto_serving.model.common.executor.sampler import Sampler
-        from pypto_serving.model.model_loader import ModelLoader
 
         device_ids = self.config.worker_device_ids()
         device_label = ",".join(str(device_id) for device_id in device_ids)
@@ -110,10 +109,13 @@ class WorkerProcess:
                 **self.config.executor_kwargs,
             )
 
-            loaded = ModelLoader().load(
+            model_loader = self._create_model_loader()
+            loaded = model_loader.load(
                 model_id=self.config.model_id,
                 model_dir=self.config.model_dir,
                 runtime_config=self.config.runtime_config,
+                model_format=self.config.model_format,
+                tokenizer_dir=self.config.tokenizer_dir,
             )
 
             self.model_record = ModelRecord(
@@ -135,11 +137,26 @@ class WorkerProcess:
             logger.info("Worker model loaded and ready")
             return num_pages
 
+    def _create_model_loader(self):
+        """Create the worker-local loader registry for the selected format."""
+        from pypto_serving.model.model_loader import ModelLoader
+
+        model_loader = ModelLoader()
+        if self.config.model_format == "qwen3-a8w8":
+            from pypto_serving.model.qwen.a8w8_loader import Qwen3A8W8DirectoryLoader
+
+            model_loader.register(Qwen3A8W8DirectoryLoader())
+        return model_loader
+
     def _resolve_executor_cls(self):
         if self.config.executor_cls == "PyptoQwen14BExecutor":
             from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor
 
             return Qwen314BPyptoExecutor
+        if self.config.executor_cls == "PyptoQwen14BA8W8Executor":
+            from pypto_serving.model.qwen.npu_executor_a8w8 import Qwen314BA8W8PyptoExecutor
+
+            return Qwen314BA8W8PyptoExecutor
         if self.config.executor_cls == "PyptoDeepSeekV4Executor":
             from pypto_serving.model.deepseek.npu_executor import DeepSeekV4PyptoExecutor
 

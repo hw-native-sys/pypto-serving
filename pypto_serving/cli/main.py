@@ -29,6 +29,11 @@ parse_device_ids = None
 
 
 _VALID_BACKENDS = {"npu"}
+_MODEL_FORMAT_AUTO = "auto"
+_QWEN3_BF16_FORMAT = "qwen3-14b"
+_QWEN3_A8W8_FORMAT = "qwen3-a8w8"
+_MODEL_FORMATS = (_MODEL_FORMAT_AUTO, _QWEN3_BF16_FORMAT, _QWEN3_A8W8_FORMAT)
+_QWEN3_A8W8_KERNEL_BATCH = 16
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,6 +45,23 @@ def build_parser() -> argparse.ArgumentParser:
     # Model
     parser.add_argument("--model", required=True, help="Path to the model directory.")
     parser.add_argument("--served-model-name", default=None, help="Model name used in the API. Defaults to the model directory name.")
+    parser.add_argument(
+        "--model-format",
+        default=_MODEL_FORMAT_AUTO,
+        choices=_MODEL_FORMATS,
+        help=(
+            "Model checkpoint format. Use qwen3-a8w8 for compressed-tensors W8A8 "
+            "checkpoints; auto preserves existing model-family detection."
+        ),
+    )
+    parser.add_argument(
+        "--tokenizer",
+        default=None,
+        help=(
+            "Optional tokenizer directory. Defaults to --model; useful when a "
+            "quantized checkpoint omits tokenizer metadata such as chat_template."
+        ),
+    )
 
     # Backend and device
     parser.add_argument("--backend", default="npu", choices=sorted(_VALID_BACKENDS), help="Inference backend (default: npu).")
@@ -143,10 +165,14 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     from pypto_serving.serving.engine.async_engine import EngineConfig
 
     model_dir = str(Path(args.model).resolve())
+    tokenizer_dir = str(Path(args.tokenizer).resolve()) if args.tokenizer else None
     executor_kwargs = _build_executor_kwargs()
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = _read_model_config(Path(model_dir))
     model_family = _detect_model_family(Path(model_dir), config_data=model_config_data)
+    model_format = _resolve_model_format(args.model_format, model_family)
+    if model_format == _QWEN3_A8W8_FORMAT:
+        model_family = "qwen_a8w8"
     if model_family == "deepseek_v4":
         executor_kwargs["compile_kernels"] = True
         executor_kwargs["enable_mtp"] = args.enable_mtp
@@ -176,6 +202,8 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     return EngineConfig(
         model_id=args.served_model_name or Path(args.model).name,
         model_dir=model_dir,
+        model_format=model_format,
+        tokenizer_dir=tokenizer_dir,
         platform=args.platform,
         device_id=first_group[0],
         device_ids=worker_device_ids,
@@ -204,6 +232,14 @@ def _build_runtime_config(
     kv_dtype = args.kv_cache_dtype
     if kv_dtype == "auto":
         kv_dtype = args.dtype
+    page_size = args.block_size
+    max_batch_size = args.max_num_seqs
+    weight_dtype = args.dtype
+    if model_family == "qwen_a8w8":
+        page_size = 128
+        max_batch_size = _QWEN3_A8W8_KERNEL_BATCH
+        kv_dtype = "bfloat16"
+        weight_dtype = "bfloat16"
 
     kv_cache_groups = ()
     if model_family == "deepseek_v4":
@@ -221,12 +257,12 @@ def _build_runtime_config(
         )
 
     return RuntimeConfig(
-        page_size=args.block_size,
-        max_batch_size=args.max_num_seqs,
+        page_size=page_size,
+        max_batch_size=max_batch_size,
         max_seq_len=args.max_model_len,
         device="cpu",
         kv_dtype=kv_dtype,
-        weight_dtype=args.dtype,
+        weight_dtype=weight_dtype,
         npu_memory_utilization=args.npu_memory_utilization,
         max_num_batched_tokens=args.max_num_batched_tokens,
         num_speculative_tokens=1 if args.enable_mtp else 0,
@@ -271,10 +307,23 @@ def _detect_model_family(
     return "qwen"
 
 
+def _resolve_model_format(requested_format: str, detected_family: str) -> str | None:
+    """Resolve a CLI model format into the format name passed to ModelLoader."""
+    if requested_format == _MODEL_FORMAT_AUTO:
+        return None
+    if detected_family == "deepseek_v4":
+        raise ValueError(f"--model-format {requested_format} is not valid for a DeepSeek V4 checkpoint")
+    if requested_format == _QWEN3_BF16_FORMAT:
+        return "huggingface"
+    return requested_format
+
+
 def _executor_cls_for_model_family(model_family: str) -> str:
     """Map model family metadata to the worker executor class id."""
     if model_family == "deepseek_v4":
         return "PyptoDeepSeekV4Executor"
+    if model_family == "qwen_a8w8":
+        return "PyptoQwen14BA8W8Executor"
     return "PyptoQwen14BExecutor"
 
 
@@ -286,6 +335,34 @@ def _validate_model_topology(
     config_data: dict[str, object] | None = None,
 ) -> None:
     """Validate model-specific serving topology constraints."""
+    if model_family == "qwen_a8w8":
+        if (
+            parallel_config.data_parallel_size != 1
+            or parallel_config.tensor_parallel_size != 1
+            or parallel_config.expert_parallel_size != 1
+            or len(parallel_config.devices) != 1
+        ):
+            raise ValueError("Qwen3 A8W8 serving currently requires one device with --dp 1 --tp 1 --ep 1")
+        if args.block_size != 128:
+            raise ValueError("Qwen3 A8W8 kernels require --block-size 128")
+        if not 1 <= args.max_num_seqs <= _QWEN3_A8W8_KERNEL_BATCH:
+            raise ValueError(
+                "Qwen3 A8W8 serving requires --max-num-seqs in "
+                f"[1, {_QWEN3_A8W8_KERNEL_BATCH}]"
+            )
+        if args.kv_cache_dtype.lower() not in {"auto", "bf16", "bfloat16"}:
+            raise ValueError("Qwen3 A8W8 serving requires a BF16 KV cache")
+        if args.dtype.lower() not in {"bf16", "bfloat16"}:
+            raise ValueError(
+                "Qwen3 A8W8 runtime tensors use BF16; select quantization with "
+                "--model-format qwen3-a8w8 instead of --dtype"
+            )
+        if config_data is None:
+            config_data = _read_model_config(Path(args.model).resolve())
+        quantization = config_data.get("quantization_config") or {}
+        if quantization and quantization.get("quant_method") != "compressed-tensors":
+            raise ValueError("Qwen3 A8W8 serving requires a compressed-tensors checkpoint")
+        return
     if model_family != "deepseek_v4":
         return
     if config_data is None:
@@ -340,13 +417,16 @@ def run_serve(
     except ImportError as e:
         raise ImportError("Serving mode requires uvicorn. Install with: pip install uvicorn") from e
 
-    from pypto_serving.model.tokenizer import load_tokenizer
+    from pypto_serving.model.tokenizer import TransformersTokenizerAdapter, load_tokenizer
     from pypto_serving.serving.engine.async_engine import AsyncLLMEngine
     from pypto_serving.serving.server.server import create_serving_app
 
     model_id = config.model_id
     get_profiler(process_name="pypto-serving-api")
-    tokenizer = load_tokenizer(config.model_dir)
+    if config.tokenizer_dir:
+        tokenizer = TransformersTokenizerAdapter.from_pretrained(config.tokenizer_dir)
+    else:
+        tokenizer = load_tokenizer(config.model_dir)
     async_engine = AsyncLLMEngine(
         config=config,
         tokenizer=tokenizer
@@ -365,6 +445,8 @@ def run_serve(
 
     print(f"Starting PyPTO serving on {host}:{port}")
     print(f"  Model: {model_id} (loaded in worker process)")
+    print(f"  Model format: {config.model_format or 'auto'}")
+    print(f"  Tokenizer: {config.tokenizer_dir or config.model_dir}")
     print(f"  Platform: {config.platform}, Device groups: {_format_device_groups(config)}")
     print(f"  Parallelism: {_format_parallelism(config)}")
     print(f"  Max running requests: {config.max_num_running_reqs}")

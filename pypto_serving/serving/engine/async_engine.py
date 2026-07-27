@@ -55,6 +55,8 @@ class EngineConfig:
     # Model
     model_id: str = ""
     model_dir: str = ""
+    model_format: str | None = None
+    tokenizer_dir: str | None = None
 
     # Device / executor
     platform: str = "a2a3"
