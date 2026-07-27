@@ -31,10 +31,29 @@ from pypto_serving.config.types import (
 
 @dataclass
 class _KvCachePool:
-    """Worker-resident flat all-layer KV cache for one model."""
+    """Worker-resident flat all-layer KV cache for one model.
 
-    key_pages: DeviceTensor
-    value_pages: DeviceTensor
+    FP path uses ``key_pages``/``value_pages`` (BF16, ``[cache_rows, head_dim]``).
+    TurboQuant path uses the four ``quant_*``/``*_scales_pages`` tensors instead:
+    nibble-packed UINT8 caches (``[cache_rows, head_dim // 2]``) plus per-row FP32
+    scales (``[cache_rows, 1]``).  ``cache_rows`` is identical across both paths
+    (``num_layers * num_pages * num_kv_heads * page_size``).
+    """
+
+    key_pages: DeviceTensor | None = None
+    value_pages: DeviceTensor | None = None
+    quant_k_pages: DeviceTensor | None = None
+    quant_v_pages: DeviceTensor | None = None
+    k_scales_pages: DeviceTensor | None = None
+    v_scales_pages: DeviceTensor | None = None
+
+    @property
+    def rows_tensor(self) -> DeviceTensor:
+        """Return any resident cache tensor (used to read the row count)."""
+        for tensor in (self.key_pages, self.quant_k_pages):
+            if tensor is not None:
+                return tensor
+        raise RuntimeError("KV cache pool has no resident tensors")
 
 
 class ModelRunner(ABC):
@@ -57,7 +76,7 @@ class ModelRunner(ABC):
         Returns the number of pages allocated.
         """
         if model_id in self._kv_caches:
-            cache_rows = self._kv_caches[model_id].key_pages.shape[0]
+            cache_rows = self._kv_caches[model_id].rows_tensor.shape[0]
             pages = cache_rows // (
                 config.num_hidden_layers * config.num_key_value_heads * runtime.page_size
             )
@@ -67,8 +86,30 @@ class ModelRunner(ABC):
             num_pages = runtime.total_kv_pages
             if num_pages is None:
                 num_pages = runtime.max_batch_size * max_blocks_per_seq
-        kv_dtype = getattr(torch, runtime.kv_dtype)
         cache_rows = config.num_hidden_layers * num_pages * config.num_key_value_heads * runtime.page_size
+
+        kv_quant = getattr(runtime, "kv_quant_config", None)
+        if kv_quant is not None and kv_quant.enabled:
+            # TurboQuant: nibble-packed UINT8 caches + per-row FP32 scales.
+            quant_shape = (cache_rows, config.head_dim // 2)
+            scale_shape = (cache_rows, 1)
+            quant_k_pages = self._alloc_kv_cache_tensor(quant_shape, torch.uint8)
+            try:
+                quant_v_pages = self._alloc_kv_cache_tensor(quant_shape, torch.uint8)
+                k_scales_pages = self._alloc_kv_cache_tensor(scale_shape, torch.float32)
+                v_scales_pages = self._alloc_kv_cache_tensor(scale_shape, torch.float32)
+            except Exception:
+                self._free_kv_cache_tensor(quant_k_pages)
+                raise
+            self._kv_caches[model_id] = _KvCachePool(
+                quant_k_pages=quant_k_pages,
+                quant_v_pages=quant_v_pages,
+                k_scales_pages=k_scales_pages,
+                v_scales_pages=v_scales_pages,
+            )
+            return num_pages
+
+        kv_dtype = getattr(torch, runtime.kv_dtype)
         cache_shape = (
             cache_rows,
             config.head_dim,
@@ -88,8 +129,16 @@ class ModelRunner(ABC):
     def close_kv_cache(self) -> None:
         """Release all runner-owned KV cache tensors."""
         for pool in list(self._kv_caches.values()):
-            self._free_kv_cache_tensor(pool.key_pages)
-            self._free_kv_cache_tensor(pool.value_pages)
+            for tensor in (
+                pool.key_pages,
+                pool.value_pages,
+                pool.quant_k_pages,
+                pool.quant_v_pages,
+                pool.k_scales_pages,
+                pool.v_scales_pages,
+            ):
+                if tensor is not None:
+                    self._free_kv_cache_tensor(tensor)
         self._kv_caches.clear()
 
     def preflight(self, record: ModelRecord) -> None:

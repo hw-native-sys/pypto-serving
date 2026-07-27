@@ -27,7 +27,7 @@ from pypto_serving.config.types import (
     RuntimeConfig,
     RuntimeModel,
 )
-from pypto_serving.model.common.runner.model_runner import ModelRunner
+from pypto_serving.model.common.runner.model_runner import ModelRunner, _KvCachePool
 from pypto_serving.tools.profile import profile_span
 
 
@@ -81,30 +81,37 @@ class _CompiledKernels:
 
     prefill: _L3Callable
     decode: _L3Callable
-    greedy_sample: _L3Callable
-    final_norm_weight: torch.Tensor
-    rope_cos: torch.Tensor
-    rope_sin: torch.Tensor
-    padded_vocab: int
-    padded_lm_head_weight: torch.Tensor
-    padded_embed_weight: torch.Tensor
-    decode_weights: dict[str, torch.Tensor]
-    prefill_token_ids_buffer: torch.Tensor
-    prefill_seq_lens_buffer: torch.Tensor
-    prefill_chunk_lens_buffer: torch.Tensor
-    prefill_chunk_offsets_buffer: torch.Tensor
-    prefill_block_table_buffer: torch.Tensor
-    prefill_slot_mapping_buffer: torch.Tensor
-    prefill_logits_buffer: torch.Tensor
-    prefill_sampled_ids_buffer: torch.Tensor
-    prefill_next_hidden_buffer: torch.Tensor
-    decode_seq_lens_buffer: torch.Tensor
-    decode_block_table_buffer: torch.Tensor
-    decode_slot_mapping_buffer: torch.Tensor
-    decode_logits_buffer: torch.Tensor
-    decode_token_ids_buffer: torch.Tensor
-    decode_sampled_ids_buffer: torch.Tensor
-    decode_next_hidden_buffer: torch.Tensor
+    greedy_sample: _L3Callable | None = None
+    tq_mode: bool = False
+    rot_matrices: torch.Tensor | None = None
+    tq_codebook: torch.Tensor | None = None
+    tq_prefill_rope_cos: torch.Tensor | None = None
+    tq_prefill_rope_sin: torch.Tensor | None = None
+    final_norm_weight: torch.Tensor | None = None
+    rope_cos: torch.Tensor | None = None
+    rope_sin: torch.Tensor | None = None
+    padded_vocab: int = 0
+    padded_lm_head_weight: torch.Tensor | None = None
+    padded_embed_weight: torch.Tensor | None = None
+    decode_weights: dict[str, torch.Tensor] | None = None
+    prefill_token_ids_buffer: torch.Tensor | None = None
+    prefill_hidden_buffer: torch.Tensor | None = None
+    prefill_seq_lens_buffer: torch.Tensor | None = None
+    prefill_chunk_lens_buffer: torch.Tensor | None = None
+    prefill_chunk_offsets_buffer: torch.Tensor | None = None
+    prefill_block_table_buffer: torch.Tensor | None = None
+    prefill_slot_mapping_buffer: torch.Tensor | None = None
+    prefill_logits_buffer: torch.Tensor | None = None
+    prefill_sampled_ids_buffer: torch.Tensor | None = None
+    prefill_next_hidden_buffer: torch.Tensor | None = None
+    decode_seq_lens_buffer: torch.Tensor | None = None
+    decode_block_table_buffer: torch.Tensor | None = None
+    decode_slot_mapping_buffer: torch.Tensor | None = None
+    decode_logits_buffer: torch.Tensor | None = None
+    decode_token_ids_buffer: torch.Tensor | None = None
+    decode_sampled_ids_buffer: torch.Tensor | None = None
+    decode_next_hidden_buffer: torch.Tensor | None = None
+    decode_hidden_buffer: torch.Tensor | None = None
 
 
 @dataclass
@@ -112,12 +119,15 @@ class _PrefillInputs:
     """Host tensors passed to the prefill kernel."""
 
     actual_batch: int
-    token_ids: torch.Tensor
     seq_lens: torch.Tensor
     chunk_lens: torch.Tensor
     chunk_offsets: torch.Tensor
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
+    # FP prefill embeds internally from ``token_ids``; TurboQuant prefill takes
+    # the input embedding (hidden_states) directly. The unused one stays None.
+    token_ids: torch.Tensor | None = None
+    hidden: torch.Tensor | None = None
 
 
 @dataclass
@@ -130,6 +140,9 @@ class _DecodeKernelInputs:
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     logits: torch.Tensor
+    # TurboQuant decode takes the input embedding (hidden_states) as its first
+    # argument; FP decode embeds internally from ``token_ids`` and leaves this None.
+    hidden: torch.Tensor | None = None
 
 
 @dataclass
@@ -149,6 +162,11 @@ class _StaticKernelArgs:
     padded_lm_head_weight: _StaticDeviceTensor
     padded_embed_weight: _StaticDeviceTensor
     decode_weights: dict[str, _StaticDeviceTensor]
+    # TurboQuant-only statics (None on the FP path).
+    rot_matrices: _StaticDeviceTensor | None = None
+    tq_codebook: _StaticDeviceTensor | None = None
+    tq_prefill_rope_cos: _StaticDeviceTensor | None = None
+    tq_prefill_rope_sin: _StaticDeviceTensor | None = None
 
 
 class Qwen314BModelRunner(ModelRunner):
@@ -159,10 +177,12 @@ class Qwen314BModelRunner(ModelRunner):
         *,
         compiled: _CompiledKernels,
         device_id: int = 0,
+        tq_mode: bool = False,
     ) -> None:
         super().__init__()
         self._compiled = compiled
         self._device_id = device_id
+        self._tq_mode = tq_mode or getattr(compiled, "tq_mode", False)
         self._l3_worker: Any | None = None
         self._l3_static_tensors: dict[tuple[int, tuple[int, ...], torch.dtype], object] = {}
         # Device-resident decode output scratch (greedy path): allocated directly on
@@ -196,7 +216,7 @@ class Qwen314BModelRunner(ModelRunner):
         the page count is halved and retried.
         """
         if model_id in self._kv_caches:
-            num_pages = self._kv_caches[model_id].key_pages.shape[0] // (
+            num_pages = self._kv_caches[model_id].rows_tensor.shape[0] // (
                 config.num_hidden_layers * config.num_key_value_heads * runtime.page_size
             )
             return num_pages
@@ -229,9 +249,11 @@ class Qwen314BModelRunner(ModelRunner):
 
         # -- phase 2: real KV cache, halve-and-retry on OOM -----------------
         logger.info("[init_kv_cache] computing KV cache pages …")
-        num_pages = self._compute_kv_cache_pages(config, runtime, self._device_id)
+        num_pages = self._compute_kv_cache_pages(config, runtime, self._device_id, tq_mode=self._tq_mode)
         num_pages = self._alloc_kv_cache_with_retry(model_id, config, runtime, num_pages)
-        self._print_memory_breakdown("after KV cache alloc", config, runtime, num_pages, self._device_id)
+        self._print_memory_breakdown(
+            "after KV cache alloc", config, runtime, num_pages, self._device_id, tq_mode=self._tq_mode,
+        )
         logger.info("[init_kv_cache] done")
         return num_pages
 
@@ -246,11 +268,7 @@ class Qwen314BModelRunner(ModelRunner):
             try:
                 logger.info(f"[init_kv_cache] num_pages={num_pages}, allocating …")
                 ModelRunner.init_kv_cache(self, model_id, config, runtime, num_pages=num_pages)
-                bytes_per_page = (
-                    config.num_hidden_layers * 2 * config.num_key_value_heads
-                    * runtime.page_size * config.head_dim
-                    * getattr(torch, runtime.kv_dtype).itemsize
-                )
+                bytes_per_page = self._kv_bytes_per_page(config, runtime, tq_mode=self._tq_mode)
                 logger.info(
                     f"[init_kv_cache] allocated {num_pages} pages "
                     f"(requested {requested}, downgraded after OOM): "
@@ -272,7 +290,25 @@ class Qwen314BModelRunner(ModelRunner):
         )
 
     @staticmethod
-    def _compute_kv_cache_pages(config: ModelConfig, runtime: RuntimeConfig, device_id: int = 0) -> int:
+    def _kv_bytes_per_page(
+        config: ModelConfig, runtime: RuntimeConfig, *, tq_mode: bool = False,
+    ) -> int:
+        """Bytes of device KV cache backing one page (all layers, k + v).
+
+        FP: ``num_layers * 2 * num_kv_heads * page_size * head_dim * dtype``.
+        TQ: nibble-packed UINT8 cache (``head_dim // 2`` bytes/row) + one FP32
+        scale (4 bytes/row) per k/v row.
+        """
+        rows_per_page = config.num_hidden_layers * config.num_key_value_heads * runtime.page_size
+        if tq_mode:
+            return rows_per_page * 2 * (config.head_dim // 2 + 4)
+        dtype_bytes = getattr(torch, runtime.kv_dtype).itemsize
+        return rows_per_page * 2 * config.head_dim * dtype_bytes
+
+    @staticmethod
+    def _compute_kv_cache_pages(
+        config: ModelConfig, runtime: RuntimeConfig, device_id: int = 0, *, tq_mode: bool = False,
+    ) -> int:
         """Compute KV cache pages, vLLM-style: total x utilization − peak_non_kv.
 
         Called AFTER the profile warm-up, so weights, the simpler ring-heap
@@ -283,11 +319,7 @@ class Qwen314BModelRunner(ModelRunner):
         than ``free x fraction`` whose headroom shrinks when free is small).
         """
         free_bytes, total_bytes = torch.npu.mem_get_info(f"npu:{device_id}")
-        dtype_bytes = getattr(torch, runtime.kv_dtype).itemsize
-        bytes_per_page = (
-            config.num_hidden_layers * 2 * config.num_key_value_heads
-            * runtime.page_size * config.head_dim * dtype_bytes
-        )
+        bytes_per_page = Qwen314BModelRunner._kv_bytes_per_page(config, runtime, tq_mode=tq_mode)
         utilization = getattr(runtime, "npu_memory_utilization", 0.90)
         peak_non_kv = total_bytes - free_bytes
         kv_budget = int(total_bytes * utilization - peak_non_kv)
@@ -303,7 +335,7 @@ class Qwen314BModelRunner(ModelRunner):
     @staticmethod
     def _print_memory_breakdown(
         label: str, config: ModelConfig, runtime: RuntimeConfig, num_pages: int,
-        device_id: int = 0,
+        device_id: int = 0, *, tq_mode: bool = False,
     ) -> None:
         """Print a per-component NPU memory breakdown at ``label``.
 
@@ -332,10 +364,7 @@ class Qwen314BModelRunner(ModelRunner):
         weight_bytes = int(wt_params * dtype_bytes)
 
         # KV cache — exact (num_pages already reflects the real allocation).
-        bytes_per_page = (
-            config.num_hidden_layers * 2 * config.num_key_value_heads
-            * runtime.page_size * config.head_dim * dtype_bytes
-        )
+        bytes_per_page = Qwen314BModelRunner._kv_bytes_per_page(config, runtime, tq_mode=tq_mode)
         kv_bytes = num_pages * bytes_per_page
 
         # Simpler ring-heap arena — from env (matches _compute_kv_cache_pages).
@@ -400,6 +429,10 @@ class Qwen314BModelRunner(ModelRunner):
         mnb = getattr(runtime, "max_num_batched_tokens", 4096)
         step_tokens = min(mnb, batch * max_seq)
         per_req = max(step_tokens // batch, 1)
+        # TQ prefill declares a STATIC rope table (draft MAX_SEQ=128); keep the
+        # warmup prefill within it so the rope index stays in bounds.
+        if self._tq_mode and self._compiled.tq_prefill_rope_cos is not None:
+            per_req = min(per_req, self._compiled.tq_prefill_rope_cos.shape[0])
         total_tokens = per_req * batch
 
         logger.info(
@@ -411,7 +444,10 @@ class Qwen314BModelRunner(ModelRunner):
         kv_cache = list(self._kv_caches.values())[0]
 
         # -- prefill ---------------------------------------------------------
-        compiled.prefill_token_ids_buffer[:total_tokens].zero_()
+        # FP prefill embeds from token_ids; TurboQuant prefill takes the input
+        # embedding (hidden_states) directly, so warm up the matching buffer.
+        prefill_primary = compiled.prefill_hidden_buffer if self._tq_mode else compiled.prefill_token_ids_buffer
+        prefill_primary[:total_tokens].zero_()
         compiled.prefill_seq_lens_buffer.zero_()
         compiled.prefill_chunk_lens_buffer.zero_()
         compiled.prefill_chunk_offsets_buffer.zero_()
@@ -427,7 +463,8 @@ class Qwen314BModelRunner(ModelRunner):
 
         prefill_inputs = _PrefillInputs(
             actual_batch=batch,
-            token_ids=compiled.prefill_token_ids_buffer[:total_tokens],
+            token_ids=None if self._tq_mode else prefill_primary[:total_tokens],
+            hidden=prefill_primary[:total_tokens] if self._tq_mode else None,
             seq_lens=compiled.prefill_seq_lens_buffer,
             chunk_lens=compiled.prefill_chunk_lens_buffer,
             chunk_offsets=compiled.prefill_chunk_offsets_buffer,
@@ -440,7 +477,7 @@ class Qwen314BModelRunner(ModelRunner):
         self._run_distributed_program(
             compiled.prefill,
             *self._prefill_kernel_args(
-                prefill_inputs, kv_cache.key_pages, kv_cache.value_pages,
+                prefill_inputs, kv_cache,
                 compiled.prefill_logits_buffer,
             ),
         )
@@ -457,6 +494,12 @@ class Qwen314BModelRunner(ModelRunner):
         for b in range(batch):
             compiled.decode_seq_lens_buffer[b] = min(per_req + 1, max_seq)
 
+        # TQ decode takes a hidden_states input (zeros are fine for warmup).
+        warmup_hidden = None
+        if self._tq_mode and compiled.decode_hidden_buffer is not None:
+            compiled.decode_hidden_buffer.zero_()
+            warmup_hidden = compiled.decode_hidden_buffer
+
         decode_kernel_inputs = _DecodeKernelInputs(
             actual_batch=batch,
             token_ids=compiled.decode_token_ids_buffer,
@@ -464,13 +507,14 @@ class Qwen314BModelRunner(ModelRunner):
             block_table=compiled.decode_block_table_buffer,
             slot_mapping=compiled.decode_slot_mapping_buffer,
             logits=compiled.decode_logits_buffer,
+            hidden=warmup_hidden,
         )
 
         logger.info(f"[warmup] decode dispatch … (batch={batch}, seq_len={per_req + 1})")
         t0 = time.perf_counter()
         self._run_distributed_program(
             compiled.decode,
-            *self._decode_kernel_args(decode_kernel_inputs, kv_cache.key_pages, kv_cache.value_pages),
+            *self._decode_kernel_args(decode_kernel_inputs, kv_cache),
         )
         logger.info(f"[warmup] decode done ({time.perf_counter() - t0:.2f} s)")
 
@@ -531,14 +575,14 @@ class Qwen314BModelRunner(ModelRunner):
     def _iter_static_host_tensors(self) -> tuple[torch.Tensor, ...]:
         """Return host tensors that must be shared before the worker forks."""
         compiled = self._compiled
-        return (
+        tensors = [
             compiled.final_norm_weight,
             compiled.rope_cos,
             compiled.rope_sin,
             compiled.padded_lm_head_weight,
             compiled.padded_embed_weight,
             *compiled.decode_weights.values(),
-            compiled.prefill_token_ids_buffer,
+            compiled.prefill_hidden_buffer if self._tq_mode else compiled.prefill_token_ids_buffer,
             compiled.prefill_seq_lens_buffer,
             compiled.prefill_chunk_lens_buffer,
             compiled.prefill_chunk_offsets_buffer,
@@ -554,12 +598,21 @@ class Qwen314BModelRunner(ModelRunner):
             compiled.decode_token_ids_buffer,
             compiled.decode_sampled_ids_buffer,
             compiled.decode_next_hidden_buffer,
-        )
+        ]
+        if self._tq_mode:
+            tensors.extend([
+                compiled.rot_matrices,
+                compiled.tq_codebook,
+                compiled.tq_prefill_rope_cos,
+                compiled.tq_prefill_rope_sin,
+                compiled.decode_hidden_buffer,
+            ])
+        return tuple(tensors)
 
     def _build_static_kernel_args(self) -> _StaticKernelArgs:
         """Create static device-upload markers once per runner."""
         compiled = self._compiled
-        return _StaticKernelArgs(
+        static = _StaticKernelArgs(
             final_norm_weight=self._static_device_tensor(compiled.final_norm_weight),
             rope_cos=self._static_device_tensor(compiled.rope_cos),
             rope_sin=self._static_device_tensor(compiled.rope_sin),
@@ -570,6 +623,12 @@ class Qwen314BModelRunner(ModelRunner):
                 for name, tensor in compiled.decode_weights.items()
             },
         )
+        if self._tq_mode:
+            static.rot_matrices = self._static_device_tensor(compiled.rot_matrices)
+            static.tq_codebook = self._static_device_tensor(compiled.tq_codebook)
+            static.tq_prefill_rope_cos = self._static_device_tensor(compiled.tq_prefill_rope_cos)
+            static.tq_prefill_rope_sin = self._static_device_tensor(compiled.tq_prefill_rope_sin)
+        return static
 
     def _require_static_args(self) -> _StaticKernelArgs:
         """Return prebuilt static args for dispatch."""
@@ -585,13 +644,12 @@ class Qwen314BModelRunner(ModelRunner):
         logits_padded = compiled.prefill_logits_buffer
 
         kv_cache = self._materialize_kv_cache(model)
-        k_cache = kv_cache.key_pages
-        v_cache = kv_cache.value_pages
-        self._validate_kv_cache_bounds(model, prefill_inputs.block_table, prefill_inputs.slot_mapping, k_cache)
+        bounds_cache = kv_cache.rows_tensor
+        self._validate_kv_cache_bounds(model, prefill_inputs.block_table, prefill_inputs.slot_mapping, bounds_cache)
 
         self._run_distributed_program(
             compiled.prefill,
-            *self._prefill_kernel_args(prefill_inputs, k_cache, v_cache, logits_padded),
+            *self._prefill_kernel_args(prefill_inputs, kv_cache, logits_padded),
         )
 
         for batch_idx, alloc in enumerate(batch.kv_allocations):
@@ -634,17 +692,16 @@ class Qwen314BModelRunner(ModelRunner):
         kv_cache = self._kv_caches.get(model_id)
         if kv_cache is None:
             raise RuntimeError(f"KV cache for model {model_id!r} is not initialized")
-        k_cache = kv_cache.key_pages
-        v_cache = kv_cache.value_pages
+        bounds_cache = kv_cache.rows_tensor
 
         # Padded block_table / slot_mapping only ever reference row 0's
         # already-valid pages, so bound-check exactly what the kernel will read.
-        self._validate_kv_cache_bounds(model, kernel_inputs.block_table, kernel_inputs.slot_mapping, k_cache)
+        self._validate_kv_cache_bounds(model, kernel_inputs.block_table, kernel_inputs.slot_mapping, bounds_cache)
 
         device_greedy = batch.allow_device_greedy_sampling
         self._run_distributed_program(
             compiled.decode,
-            *self._decode_kernel_args(kernel_inputs, k_cache, v_cache, device_greedy=device_greedy),
+            *self._decode_kernel_args(kernel_inputs, kv_cache, device_greedy=device_greedy),
         )
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
@@ -718,13 +775,45 @@ class Qwen314BModelRunner(ModelRunner):
     def _prefill_kernel_args(
         self,
         inputs: _PrefillInputs,
-        k_cache: DeviceTensor,
-        v_cache: DeviceTensor,
+        kv_cache: _KvCachePool,
         logits: torch.Tensor,
     ) -> tuple[Any, ...]:
-        """Return arguments in ``qwen3_prefill_host`` signature order."""
+        """Return arguments in ``qwen3_prefill_host`` (FP) or
+        ``qwen3_prefill_tq_host`` (TQ) signature order."""
         static = self._require_static_args()
         weights = static.decode_weights
+        if self._tq_mode:
+            # 26-param TQ order: NO chunk_lens/chunk_offsets; seq_lens at pos 1;
+            # static [tq_prefill_max_seq, head_dim] rope; quant caches + scales;
+            # rot/codebook; wo, post_rms, w_gate, w_up, w_down tail.
+            return (
+                inputs.hidden,                                  # hidden_states
+                inputs.seq_lens,                                # seq_lens
+                weights["decode_input_rms_weight"],
+                weights["decode_wq"],
+                weights["decode_wk"],
+                weights["decode_wv"],
+                weights["decode_q_norm_weight"],
+                weights["decode_k_norm_weight"],
+                static.tq_prefill_rope_cos,
+                static.tq_prefill_rope_sin,
+                inputs.block_table,
+                inputs.slot_mapping,
+                kv_cache.quant_k_pages,
+                kv_cache.quant_v_pages,
+                kv_cache.k_scales_pages,
+                kv_cache.v_scales_pages,
+                static.rot_matrices,
+                static.tq_codebook,
+                weights["decode_wo"],
+                weights["decode_post_rms_weight"],
+                weights["decode_w_gate"],
+                weights["decode_w_up"],
+                weights["decode_w_down"],
+                static.final_norm_weight,
+                static.padded_lm_head_weight,
+                logits,
+            )
         return (
             inputs.token_ids,
             inputs.seq_lens,
@@ -740,8 +829,8 @@ class Qwen314BModelRunner(ModelRunner):
             static.rope_sin,
             inputs.block_table,
             inputs.slot_mapping,
-            k_cache,
-            v_cache,
+            kv_cache.key_pages,
+            kv_cache.value_pages,
             weights["decode_wo"],
             weights["decode_w_gate"],
             weights["decode_w_up"],
@@ -756,19 +845,52 @@ class Qwen314BModelRunner(ModelRunner):
     def _decode_kernel_args(
         self,
         inputs: _DecodeKernelInputs,
-        k_cache: DeviceTensor,
-        v_cache: DeviceTensor,
+        kv_cache: _KvCachePool,
         *,
         device_greedy: bool = False,
     ) -> tuple[Any, ...]:
-        """Return arguments in ``qwen3_decode_host`` signature order.
+        """Return arguments in ``qwen3_decode_host`` (FP) or
+        ``qwen3_decode_tq_host`` (TQ) signature order.
 
-        On ``device_greedy`` the logits + next_hidden outputs are passed as
-        worker-resident (device) tensors so they are never staged/copied-back
+        On ``device_greedy`` (FP only) the logits + next_hidden outputs are passed
+        as worker-resident (device) tensors so they are never staged/copied-back
         per step (no memset, no D2H); only the tiny sampled_ids stays host-visible.
+        TQ decode returns raw logits (host sampling), so device_greedy is N/A.
         """
         static = self._require_static_args()
         weights = static.decode_weights
+        if self._tq_mode:
+            # 26-param TQ order: hidden_states first; quant caches + scales;
+            # rot/codebook; wo, post_rms, w_gate, w_up, w_down tail; no
+            # embed/sampled_ids/next_hidden.
+            return (
+                inputs.hidden,                                  # hidden_states
+                weights["decode_input_rms_weight"],
+                weights["decode_wq"],
+                weights["decode_wk"],
+                weights["decode_wv"],
+                weights["decode_q_norm_weight"],
+                weights["decode_k_norm_weight"],
+                inputs.seq_lens,
+                inputs.block_table,
+                inputs.slot_mapping,
+                static.rope_cos,
+                static.rope_sin,
+                kv_cache.quant_k_pages,
+                kv_cache.quant_v_pages,
+                kv_cache.k_scales_pages,
+                kv_cache.v_scales_pages,
+                static.rot_matrices,
+                static.tq_codebook,
+                weights["decode_wo"],
+                weights["decode_post_rms_weight"],
+                weights["decode_w_gate"],
+                weights["decode_w_up"],
+                weights["decode_w_down"],
+                static.final_norm_weight,
+                static.padded_lm_head_weight,
+                inputs.logits,
+            )
         logits_arg = self._decode_logits_device_arg() if device_greedy else inputs.logits
         next_hidden_arg = (
             self._decode_next_hidden_device_arg() if device_greedy else self._compiled.decode_next_hidden_buffer
@@ -785,8 +907,8 @@ class Qwen314BModelRunner(ModelRunner):
             inputs.slot_mapping,
             static.rope_cos,
             static.rope_sin,
-            k_cache,
-            v_cache,
+            kv_cache.key_pages,
+            kv_cache.value_pages,
             weights["decode_wo"],
             weights["decode_w_gate"],
             weights["decode_w_up"],
@@ -834,11 +956,15 @@ class Qwen314BModelRunner(ModelRunner):
         if worker is None:
             from pypto.runtime import DistributedWorker  # noqa: PLC0415
 
-            worker = DistributedWorker([
+            programs = [
                 self._compiled.prefill.compiled,
                 self._compiled.decode.compiled,
-                self._compiled.greedy_sample.compiled,
-            ])
+            ]
+            # FP path also registers the device greedy-sampling program; TQ
+            # samples on the host (no device sampling program).
+            if not self._tq_mode and self._compiled.greedy_sample is not None:
+                programs.append(self._compiled.greedy_sample.compiled)
+            worker = DistributedWorker(programs)
             self._l3_worker = worker
         return worker
 
@@ -883,14 +1009,22 @@ class Qwen314BModelRunner(ModelRunner):
         """Upload static kernel tensors into the shared L3 worker before serving."""
         worker = self._shared_l3_worker()
         static = self._require_static_args()
-        for arg in (
+        args = [
             static.final_norm_weight,
             static.rope_cos,
             static.rope_sin,
             static.padded_lm_head_weight,
             static.padded_embed_weight,
             *static.decode_weights.values(),
-        ):
+        ]
+        if self._tq_mode:
+            args.extend([
+                static.rot_matrices,
+                static.tq_codebook,
+                static.tq_prefill_rope_cos,
+                static.tq_prefill_rope_sin,
+            ])
+        for arg in args:
             self._coerce_l3_arg(worker, arg)
 
     @staticmethod
@@ -974,7 +1108,12 @@ class Qwen314BModelRunner(ModelRunner):
         if total_tokens > max_tokens:
             raise ValueError(f"prefill total tokens {total_tokens} exceeds kernel capacity {max_tokens}")
 
-        token_ids = compiled.prefill_token_ids_buffer[:total_tokens]
+        if self._tq_mode:
+            hidden = compiled.prefill_hidden_buffer[:total_tokens]
+            token_ids = None
+        else:
+            token_ids = compiled.prefill_token_ids_buffer[:total_tokens]
+            hidden = None
         seq_lens = compiled.prefill_seq_lens_buffer
         chunk_lens = compiled.prefill_chunk_lens_buffer
         chunk_offsets = compiled.prefill_chunk_offsets_buffer
@@ -998,8 +1137,12 @@ class Qwen314BModelRunner(ModelRunner):
             chunk_start = chunk_start_values[batch_idx]
             chunk_lens[batch_idx] = chunk_len
             chunk_offsets[batch_idx] = token_offset
-            chunk_token_ids = batch.token_ids[batch_idx, :chunk_len].to(torch.int32).cpu()
-            token_ids[token_offset : token_offset + chunk_len] = chunk_token_ids
+            if self._tq_mode:
+                embeddings = batch.input_embeddings[batch_idx, :chunk_len, :].to(torch.bfloat16).cpu()
+                hidden[token_offset : token_offset + chunk_len, :] = embeddings
+            else:
+                chunk_token_ids = batch.token_ids[batch_idx, :chunk_len].to(torch.int32).cpu()
+                token_ids[token_offset : token_offset + chunk_len] = chunk_token_ids
 
             if alloc is not None:
                 page_ids = alloc.page_ids
@@ -1016,6 +1159,7 @@ class Qwen314BModelRunner(ModelRunner):
         return _PrefillInputs(
             actual_batch=actual_batch,
             token_ids=token_ids,
+            hidden=hidden,
             seq_lens=seq_lens,
             chunk_lens=chunk_lens,
             chunk_offsets=chunk_offsets,
@@ -1124,6 +1268,19 @@ class Qwen314BModelRunner(ModelRunner):
             for batch_idx in range(actual_batch, kernel_batch):
                 self._write_cached_decode_block_table_row(block_table_rows, batch_idx, first_page_ids)
 
+        # TurboQuant decode consumes the input embedding (hidden_states) directly
+        # instead of embedding inside the kernel; stage the host-provided
+        # ``batch.hidden_states`` into the persistent device buffer (padding rows
+        # replicate row 0 so their KV writes stay idempotent).
+        hidden_arg = None
+        if self._tq_mode and batch.hidden_states is not None and compiled.decode_hidden_buffer is not None:
+            hidden_arg = compiled.decode_hidden_buffer
+            hidden_arg[:actual_batch].copy_(batch.hidden_states)
+            if actual_batch < kernel_batch:
+                hidden_arg[actual_batch:].copy_(
+                    batch.hidden_states[0:1].expand(kernel_batch - actual_batch, -1)
+                )
+
         return _DecodeKernelInputs(
             actual_batch=actual_batch,
             token_ids=token_ids,
@@ -1131,6 +1288,7 @@ class Qwen314BModelRunner(ModelRunner):
             block_table=block_table,
             slot_mapping=slot_mapping,
             logits=compiled.decode_logits_buffer,
+            hidden=hidden_arg,
         )
 
     def _write_cached_decode_block_table_row(
