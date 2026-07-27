@@ -17,12 +17,18 @@ from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 
-from pypto_serving import GenerateConfig, LLMEngine, RuntimeConfig
+from pypto_serving import GenerateConfig, LLMEngine, ModelLoader, RuntimeConfig
 from pypto_serving.config.parallel import ParallelConfig, parse_device_ids
 from pypto_serving.config.types import LoadedModel
-from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
+from pypto_serving.model.qwen.a8w8_loader import Qwen3A8W8DirectoryLoader
+from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor
+from pypto_serving.model.qwen.npu_executor_a8w8 import Qwen314BA8W8PyptoExecutor
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.tools.profile import get_profiler, merge_profile, profile_span
+
+
+_QWEN3_BF16_FORMAT = "qwen3-14b"
+_QWEN3_A8W8_FORMAT = "qwen3-a8w8"
 
 
 # -----------------------------------------------------------------------------
@@ -330,6 +336,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-dir", required=True, help="Local model directory, e.g. a Hugging Face snapshot.")
     parser.add_argument("--prompt", required=True, help="Prompt text.")
     parser.add_argument("--model-id", default="qwen3-14b-local")
+    parser.add_argument(
+        "--model-format",
+        default=_QWEN3_BF16_FORMAT,
+        choices=[_QWEN3_BF16_FORMAT, _QWEN3_A8W8_FORMAT],
+        help=(
+            "Qwen3-14B weight format. Use qwen3-14b for the original BF16/L3 path "
+            "or qwen3-a8w8 for compressed-tensors W8A8 checkpoints."
+        ),
+    )
     parser.add_argument("--platform", default="a2a3", choices=["a2a3sim", "a2a3", "a5sim", "a5"])
     parser.add_argument("--device-id", type=int, default=0, help="Default NPU device id when --devices is unset.")
     parser.add_argument(
@@ -381,9 +396,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--num-layers-override",
         type=int,
         default=None,
-        help="Validation knob: truncate the loaded model to N transformer "
+        help="BF16/L3 validation knob: truncate the loaded model to N transformer "
              "layers before compile/dispatch. Used to reduce HBM footprint "
-             "while validating Qwen3-14B kernels on memory-constrained devices.",
+             "while validating Qwen3-14B kernels on memory-constrained devices. "
+             "Unsupported for qwen3-a8w8 because its fused decode kernel is "
+             "compiled for the full fixed layer count.",
     )
     parser.add_argument(
         "--profile",
@@ -405,12 +422,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _model_loader_for_format(model_format: str) -> ModelLoader | None:
+    if model_format != _QWEN3_A8W8_FORMAT:
+        return None
+    model_loader = ModelLoader()
+    model_loader.register(Qwen3A8W8DirectoryLoader())
+    return model_loader
+
+
+def _executor_class_for_format(model_format: str):
+    if model_format == _QWEN3_A8W8_FORMAT:
+        return Qwen314BA8W8PyptoExecutor
+    if model_format == _QWEN3_BF16_FORMAT:
+        return Qwen314BPyptoExecutor
+    raise ValueError(f"unsupported model_format: {model_format!r}")
+
+
+def _validate_generation_args(args: argparse.Namespace) -> None:
+    if args.model_format != _QWEN3_A8W8_FORMAT:
+        return
+    if args.num_layers_override is not None:
+        raise ValueError("--num-layers-override is not supported for qwen3-a8w8 fused decode kernels")
+    if args.tensor_parallel_size != 1:
+        raise ValueError("qwen3-a8w8 currently requires --tp 1")
+
+
 def main() -> None:
     args = build_parser().parse_args()
     import logging
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     for _n in ("simpler_setup", "pypto", "simpler"):
         logging.getLogger(_n).setLevel(logging.WARNING)
+    _validate_generation_args(args)
     get_profiler(process_name="npu_generate")
     model_dir = Path(args.model_dir).resolve()
     if not model_dir.is_dir():
@@ -433,13 +476,21 @@ def main() -> None:
     kv_cache_manager = KvCacheManager(
         enable_prefix_cache=not args.no_enable_prefix_caching,
     )
-    executor = PyptoExecutor(
+    executor_cls = _executor_class_for_format(args.model_format)
+    executor_kwargs = {
+        "platform": args.platform,
+        "device_ids": device_ids,
+        "save_kernels_dir": args.save_kernels_dir,
+    }
+    if args.model_format == _QWEN3_A8W8_FORMAT:
+        executor_kwargs["l3_trace"] = args.profile_verbose
+    executor = executor_cls(
         kv_cache_manager,
-        platform=args.platform,
-        device_ids=device_ids,
-        save_kernels_dir=args.save_kernels_dir,
+        **executor_kwargs,
     )
+    model_loader = _model_loader_for_format(args.model_format)
     engine = LLMEngine(
+        model_loader=model_loader,
         kv_cache_manager=kv_cache_manager,
         executor=executor,
     )
@@ -452,15 +503,15 @@ def main() -> None:
         engine.init_model(
             model_id=args.model_id,
             model_dir=str(model_dir),
-            model_format="huggingface",
+            model_format=_QWEN3_A8W8_FORMAT if args.model_format == _QWEN3_A8W8_FORMAT else "huggingface",
             runtime_config=RuntimeConfig(
-                page_size=args.block_size,
+                page_size=128 if args.model_format == _QWEN3_A8W8_FORMAT else args.block_size,
                 max_batch_size=args.max_num_seqs,
                 max_seq_len=args.max_seq_len,
                 max_new_tokens=args.max_new_tokens,
                 device="cpu",
-                kv_dtype=args.kv_cache_dtype,
-                weight_dtype=args.dtype,
+                kv_dtype="bfloat16" if args.model_format == _QWEN3_A8W8_FORMAT else args.kv_cache_dtype,
+                weight_dtype="bfloat16" if args.model_format == _QWEN3_A8W8_FORMAT else args.dtype,
                 npu_memory_utilization=args.npu_memory_utilization,
                 max_num_batched_tokens=args.max_num_batched_tokens,
             ),
