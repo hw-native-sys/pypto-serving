@@ -14,8 +14,14 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from typing import TYPE_CHECKING
 
 from pypto_serving.serving.memory.kv_cache import KVCacheCapacityError, KvCacheManager
+from pypto_serving.serving.memory.prefix_cache import PrefixCacheStats, RadixKey
+from pypto_serving.serving.memory.request_kv_pool import RequestKVPool
+
+if TYPE_CHECKING:
+    from pypto_serving.serving.memory.prefix_cache import TreeNode
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +54,8 @@ class SchedulerConfig:
     # Feature flags
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
+    prefix_cache_backend: str = "hash"
+    enable_radix_in_batch_dedup: bool = True
     num_speculative_tokens: int = 0
     # Async (pipelined) scheduling: schedule step N+1 before step N's sampled
     # token returns, advancing request state optimistically via placeholders.
@@ -63,6 +71,7 @@ class Request:
     request_id: str
     prompt_token_ids: list[int]
     max_new_tokens: int
+    model_id: str = ""
     arrival_time: float = field(default_factory=time.time)
     status: RequestStatus = RequestStatus.WAITING
     num_computed_tokens: int = 0
@@ -82,6 +91,10 @@ class Request:
     # Stands in for output tokens still in flight so the next schedule() advances
     # correctly; decremented as real tokens are applied in update_from_output.
     num_output_placeholders: int = 0
+    prefix_indices: list[int] = field(default_factory=list)
+    last_node: "TreeNode | None" = None
+    cache_protected_len: int = 0
+    kv_committed_len: int = 0
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -143,10 +156,14 @@ class Scheduler:
     """Continuous batching scheduler with chunked prefill and preemption."""
 
     def __init__(self, config: SchedulerConfig, kv_cache_manager: KvCacheManager) -> None:
+        if config.prefix_cache_backend not in ("hash", "radix"):
+            raise ValueError("prefix_cache_backend must be 'hash' or 'radix'")
         self.config = config
         self.kv_cache_manager = kv_cache_manager
         if self.kv_cache_manager.has_groups and self.config.enable_prefix_cache:
             raise ValueError("Prefix caching is not supported with grouped KV caches")
+        self.request_kv_pool = RequestKVPool(kv_cache_manager.block_size)
+        self.prefix_cache_stats = PrefixCacheStats()
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
         self.requests: dict[str, Request] = {}
@@ -181,7 +198,7 @@ class Scheduler:
                 max_seq_len, prompt_len,
             )
             request.max_new_tokens = remaining
-        if self.config.enable_prefix_cache:
+        if self.config.enable_prefix_cache and not self._use_radix_cache:
             request.block_hashes = self.kv_cache_manager.compute_block_hashes(request.prompt_token_ids)
         request.status = RequestStatus.WAITING
         self.waiting.append(request)
@@ -264,7 +281,7 @@ class Scheduler:
                     running_to_keep.append(request)
                     continue
 
-            all_block_ids = request.cached_block_ids + request.allocated_block_ids
+            all_block_ids = self._request_block_ids(request)
             output.scheduled_requests.append(
                 ScheduledRequest(
                     request=request,
@@ -283,6 +300,8 @@ class Scheduler:
             num_scheduled_tokens[request.request_id] = scheduled_tokens
             if is_prefill:
                 output.num_prefill_tokens += num_new
+                if self._use_radix_cache:
+                    self.prefix_cache_stats.scheduled_prefill_tokens += num_new
             else:
                 output.num_decode_tokens += scheduled_tokens
             token_budget -= scheduled_tokens
@@ -312,7 +331,15 @@ class Scheduler:
             request = self.waiting.popleft()
 
             # Prefix cache lookup
-            if self.config.enable_prefix_cache:
+            if self._use_radix_cache:
+                self._match_radix_request(request)
+                cached_blocks = []
+                if self._should_defer_for_radix_producer(request):
+                    self.prefix_cache_stats.in_batch_deferred += 1
+                    self._release_radix_request(request)
+                    remaining_waiting.append(request)
+                    continue
+            elif self.config.enable_prefix_cache:
                 cached_blocks = self.kv_cache_manager.get_computed_blocks(request.prompt_token_ids)
                 if cached_blocks:
                     request.cached_block_ids = [b.block_id for b in cached_blocks]
@@ -338,7 +365,10 @@ class Scheduler:
                     continue
 
             if not self._try_allocate_request_blocks(request, num_new):
-                self.kv_cache_manager.release_cached_blocks(cached_blocks)
+                if self._use_radix_cache:
+                    self._release_radix_request(request)
+                else:
+                    self.kv_cache_manager.release_cached_blocks(cached_blocks)
                 request.cached_block_ids = []
                 request.num_computed_tokens = 0
                 remaining_waiting.append(request)
@@ -346,7 +376,7 @@ class Scheduler:
 
             request.status = RequestStatus.RUNNING
             self.running.append(request)
-            all_block_ids = request.cached_block_ids + request.allocated_block_ids
+            all_block_ids = self._request_block_ids(request)
             output.scheduled_requests.append(
                 ScheduledRequest(
                     request=request,
@@ -362,6 +392,8 @@ class Scheduler:
                 )
             )
             output.num_prefill_tokens += num_new
+            if self._use_radix_cache:
+                self.prefix_cache_stats.scheduled_prefill_tokens += num_new
             token_budget -= num_new
 
         remaining_waiting.extend(self.waiting)
@@ -475,7 +507,7 @@ class Scheduler:
                 self._reconcile_async_output(request, scheduled, token_ids, outputs)
             elif scheduled.is_prefill:
                 request.num_computed_tokens += scheduled.num_new_tokens
-                self._cache_completed_blocks(request)
+                self._cache_request_prefix(request)
                 if request.num_computed_tokens < request.num_prompt_tokens:
                     continue
                 for token_id in token_ids:
@@ -492,7 +524,7 @@ class Scheduler:
                     if self._check_finish(request) is not None:
                         break
                 request.num_computed_tokens += retained_tokens
-                self._cache_completed_blocks(request)
+                self._cache_request_prefix(request)
 
         finished_ids: list[str] = []
         for request in self.running:
@@ -535,10 +567,9 @@ class Scheduler:
         reserved ``num_output_placeholders`` for the token(s) this step would
         sample. Here — now that the worker has CONFIRMED the step — we:
 
-        - release the placeholder(s) reserved for this step,
-        - publish the now-computed prefix-cache blocks (deferred from dispatch so
-          a failed/timed-out step never leaves hashes for uncomputed KV), and
-        - append the real token(s) that came back, emitting RequestOutputs.
+        - append the retained token(s) and release this step's placeholders, and
+        - publish exactly the KV range confirmed by this result (deferred from
+          dispatch so failed/timed-out work never becomes prefix-visible).
 
         A prefill chunk that did not complete the prompt sampled nothing (no
         placeholder was reserved and ``token_ids`` is empty), so it emits nothing
@@ -563,9 +594,6 @@ class Scheduler:
             if sampled_this_step
             else 0
         )
-
-        # Publish confirmed blocks now (worker succeeded), not at dispatch.
-        self._cache_completed_blocks(request)
 
         retained_tokens = 0
         for token_id in token_ids:
@@ -595,6 +623,14 @@ class Scheduler:
                     0, request.num_computed_tokens - unused_speculative
                 )
 
+        # Publish only the range confirmed by this worker result. In depth-2
+        # mode, request.num_computed_tokens may already include the next
+        # in-flight step, which must not become visible to prefix matching yet.
+        confirmed_kv_len = scheduled.num_computed_tokens + scheduled.num_new_tokens
+        if not scheduled.is_prefill:
+            confirmed_kv_len += max(0, retained_tokens - 1)
+        self._cache_request_prefix(request, computed_kv_len=confirmed_kv_len)
+
     def _check_finish(self, request: Request) -> RequestStatus | None:
         if not request.output_token_ids:
             return None
@@ -607,6 +643,8 @@ class Scheduler:
 
     def _blocks_needed(self, request: Request, num_new_tokens: int) -> int:
         current_total_tokens = request.num_computed_tokens + num_new_tokens
+        if self._use_radix_cache:
+            return self.request_kv_pool.blocks_needed(request.request_id, current_total_tokens)
         current_blocks = len(request.cached_block_ids) + len(request.allocated_block_ids)
         block_size = self.kv_cache_manager.block_size
         needed_blocks = (current_total_tokens + block_size - 1) // block_size
@@ -615,12 +653,18 @@ class Scheduler:
     def _try_allocate_blocks(self, request: Request, num_blocks: int) -> bool:
         if num_blocks <= 0:
             return True
-        if self.kv_cache_manager.num_free_blocks < num_blocks:
-            return False
+        radix_size_before = (
+            self.kv_cache_manager.radix_cache.total_size() if self._use_radix_cache else 0
+        )
         block_ids = self.kv_cache_manager.allocate_block_ids(num_blocks)
+        if self._use_radix_cache:
+            radix_size_after = self.kv_cache_manager.radix_cache.total_size()
+            self.prefix_cache_stats.evicted_tokens += max(0, radix_size_before - radix_size_after)
         if block_ids is None:
             return False
         request.allocated_block_ids.extend(block_ids)
+        if self._use_radix_cache:
+            self.request_kv_pool.extend_pages(request.request_id, block_ids)
         return True
 
     def _try_allocate_request_blocks(self, request: Request, num_new_tokens: int) -> bool:
@@ -677,6 +721,8 @@ class Scheduler:
             ]
             if victim.is_prefill:
                 output.num_prefill_tokens -= returned_tokens
+                if self._use_radix_cache:
+                    self.prefix_cache_stats.scheduled_prefill_tokens -= returned_tokens
             else:
                 output.num_decode_tokens -= returned_tokens
 
@@ -697,6 +743,9 @@ class Scheduler:
         return {"request": victim, "returned_tokens": returned_tokens}
 
     def _free_request_blocks(self, request: Request) -> None:
+        if self._use_radix_cache:
+            self._release_radix_request(request)
+            return
         self.kv_cache_manager.release_blocks_by_ids(
             request.cached_block_ids,
             request.allocated_block_ids,
@@ -708,12 +757,154 @@ class Scheduler:
             request.allocated_group_block_ids = {}
         request.cache_partition = None
 
-    def _cache_completed_blocks(self, request: Request) -> None:
+    @property
+    def _use_radix_cache(self) -> bool:
+        return self.config.enable_prefix_cache and self.config.prefix_cache_backend == "radix"
+
+    def _request_block_ids(self, request: Request) -> list[int]:
+        if self._use_radix_cache:
+            return self.request_kv_pool.page_ids(request.request_id)
+        return request.cached_block_ids + request.allocated_block_ids
+
+    def _radix_extra_key(self, request: Request) -> tuple[str, ...]:
+        return (request.model_id,)
+
+    def _match_radix_request(self, request: Request) -> None:
+        result = self.kv_cache_manager.match_radix_prefix(
+            request.all_token_ids,
+            extra_key=self._radix_extra_key(request),
+        )
+        matched_slots = list(result.device_indices)
+        matched_pages = self.request_kv_pool.page_ids_from_slots(matched_slots)
+        if matched_pages:
+            self.kv_cache_manager.retain_pages_for_request(matched_pages)
+        self.kv_cache_manager.radix_cache.inc_lock_ref(result.last_device_node)
+        self.request_kv_pool.set_pages(request.request_id, matched_pages)
+        request.prefix_indices = matched_slots
+        request.cached_block_ids = matched_pages
+        request.allocated_block_ids = []
+        request.last_node = result.last_device_node
+        request.cache_protected_len = len(matched_slots)
+        request.kv_committed_len = len(matched_slots)
+        request.num_computed_tokens = len(matched_slots)
+        request.num_blocks_cached = len(matched_pages)
+        self.prefix_cache_stats.lookups += 1
+        self.prefix_cache_stats.matched_tokens += len(matched_slots)
+
+    def _cache_unfinished_radix(
+        self,
+        request: Request,
+        *,
+        computed_kv_len: int | None = None,
+    ) -> None:
+        page_size = self.kv_cache_manager.block_size
+        if computed_kv_len is None:
+            computed_kv_len = request.num_computed_tokens
+        computed_kv_len = min(computed_kv_len, len(request.all_token_ids))
+        committed_len = computed_kv_len // page_size * page_size
+        if committed_len <= request.kv_committed_len:
+            request.prefix_indices = self.request_kv_pool.slot_indices(
+                request.request_id,
+                computed_kv_len,
+            )
+            return
+
+        slots = self.request_kv_pool.slot_indices(request.request_id, committed_len)
+        insert_result = self.kv_cache_manager.insert_radix_prefix(
+            request.all_token_ids,
+            slots,
+            extra_key=self._radix_extra_key(request),
+        )
+        key = RadixKey.from_tokens(
+            request.all_token_ids,
+            extra_key=self._radix_extra_key(request),
+            limit=committed_len,
+        )
+        match_result = self.kv_cache_manager.radix_cache.match_prefix(key)
+        canonical_slots = list(match_result.device_indices)
+        if len(canonical_slots) != committed_len:
+            raise RuntimeError("Radix cache failed to return the prefix that was just inserted")
+        canonical_pages = self.request_kv_pool.page_ids_from_slots(canonical_slots)
+
+        old_pages = self.request_kv_pool.page_ids(request.request_id)
+        private_tail = old_pages[committed_len // page_size :]
+        new_pages = canonical_pages + private_tail
+        old_page_set = set(old_pages)
+        new_page_set = set(new_pages)
+        added_pages = [page_id for page_id in new_pages if page_id not in old_page_set]
+        removed_pages = [page_id for page_id in old_pages if page_id not in new_page_set]
+        if added_pages:
+            self.kv_cache_manager.retain_pages_for_request(added_pages)
+        if removed_pages:
+            self.kv_cache_manager.release_pages_from_request(removed_pages)
+        self.request_kv_pool.set_pages(request.request_id, new_pages)
+
+        new_node = match_result.last_device_node
+        self.kv_cache_manager.radix_cache.inc_lock_ref(new_node)
+        if request.last_node is not None:
+            self.kv_cache_manager.radix_cache.dec_lock_ref(request.last_node)
+
+        mapped_slots = self.request_kv_pool.slot_indices(request.request_id, computed_kv_len)
+        request.prefix_indices = canonical_slots + mapped_slots[committed_len:]
+        request.cached_block_ids = canonical_pages
+        request.allocated_block_ids = private_tail
+        request.last_node = new_node
+        request.cache_protected_len = committed_len
+        request.kv_committed_len = committed_len
+        request.num_blocks_cached = len(canonical_pages)
+        self.prefix_cache_stats.inserts += 1
+        self.prefix_cache_stats.inserted_tokens += insert_result.inserted_len
+        self.prefix_cache_stats.duplicate_pages_freed += len(removed_pages)
+
+    def _release_radix_request(self, request: Request) -> None:
+        pages = self.request_kv_pool.free(request.request_id)
+        if pages:
+            self.kv_cache_manager.release_pages_from_request(pages)
+        if request.last_node is not None:
+            self.kv_cache_manager.radix_cache.dec_lock_ref(request.last_node)
+        request.cached_block_ids = []
+        request.allocated_block_ids = []
+        request.prefix_indices = []
+        request.last_node = None
+        request.cache_protected_len = 0
+        request.kv_committed_len = 0
+        request.num_blocks_cached = 0
+
+    def _should_defer_for_radix_producer(self, request: Request) -> bool:
+        if not self.config.enable_radix_in_batch_dedup or request.num_computed_tokens > 0:
+            return False
+        page_size = self.kv_cache_manager.block_size
+        if len(request.all_token_ids) < page_size:
+            return False
+        first_page = tuple(request.all_token_ids[:page_size])
+        namespace = self._radix_extra_key(request)
+        for producer in self.running:
+            if producer.request_id == request.request_id:
+                continue
+            # num_computed_tokens can advance optimistically before the worker
+            # result arrives. Only a committed page means the producer's first
+            # page is actually available through the Radix tree.
+            if producer.kv_committed_len >= page_size:
+                continue
+            if self._radix_extra_key(producer) != namespace:
+                continue
+            if tuple(producer.all_token_ids[:page_size]) == first_page:
+                return True
+        return False
+
+    def _cache_completed_blocks(
+        self,
+        request: Request,
+        *,
+        computed_kv_len: int | None = None,
+    ) -> None:
         """Register completed blocks in the prefix cache."""
         if not self.config.enable_prefix_cache:
             return
+        if computed_kv_len is None:
+            computed_kv_len = request.num_computed_tokens
         total_blocks_computed = min(
-            request.num_computed_tokens // self.kv_cache_manager.block_size,
+            computed_kv_len // self.kv_cache_manager.block_size,
             len(request.block_hashes)
         )
         already_cached = request.num_blocks_cached
@@ -727,3 +918,14 @@ class Scheduler:
             total_blocks_computed,
         )
         request.num_blocks_cached = total_blocks_computed
+
+    def _cache_request_prefix(
+        self,
+        request: Request,
+        *,
+        computed_kv_len: int | None = None,
+    ) -> None:
+        if self._use_radix_cache:
+            self._cache_unfinished_radix(request, computed_kv_len=computed_kv_len)
+        else:
+            self._cache_completed_blocks(request, computed_kv_len=computed_kv_len)

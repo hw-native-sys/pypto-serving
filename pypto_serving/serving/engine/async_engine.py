@@ -87,6 +87,7 @@ class EngineConfig:
     # Feature flags
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
+    prefix_cache_backend: str = "hash"
     # Async (pipelined) scheduling. None = auto (on). Speculative/MTP decoders
     # are supported: the scheduler optimistically reserves the upper bound of
     # tokens per step and subtracts the shortfall once the worker replies.
@@ -182,6 +183,7 @@ class ReplicaEngineCore:
             max_seq_len=runtime.max_seq_len,
             enable_prefix_cache=self.config.enable_prefix_cache,
             enable_chunk_prefill=self.config.enable_chunk_prefill,
+            prefix_cache_backend=self.config.prefix_cache_backend,
             num_speculative_tokens=runtime.num_speculative_tokens,
             async_scheduling=self._async_scheduling,
         )
@@ -363,6 +365,7 @@ class ReplicaEngineCore:
                 request_id=request_id,
                 prompt_token_ids=prompt_token_ids,
                 max_new_tokens=config.max_new_tokens,
+                model_id=self.config.model_id,
                 arrival_time=time.time(),
                 stop_strings=tuple(config.stop) if config.stop else (),
                 eos_token_id=None if config.ignore_eos else self.tokenizer.eos_token_id,
