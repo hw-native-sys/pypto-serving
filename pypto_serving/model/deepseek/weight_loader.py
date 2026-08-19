@@ -20,28 +20,20 @@ import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ContextManager, Protocol
+from typing import ContextManager
 
 import numpy as np
 import torch
 
+from pypto_serving.model.common.weights.store import LazySafetensorsStore, SafeOpenFn, SafeTensorReader
+
 logger = logging.getLogger(__name__)
 
 
-class _SafeTensorReader(Protocol):
-    """Minimal safetensors reader protocol used by the lazy weight store."""
-
-    def get_tensor(self, name: str) -> torch.Tensor:
-        """Return one tensor by name."""
-        raise NotImplementedError
-
-
-class _SafeOpenFn(Protocol):
-    """Callable shape for injectable safetensors openers."""
-
-    def __call__(self, path: Path, device: str) -> ContextManager[_SafeTensorReader]:
-        """Open one safetensors shard."""
-        raise NotImplementedError
+# The reader/opener shapes are family-neutral and now live with the shared store; the
+# private aliases stay so this module's annotations and its callers read unchanged.
+_SafeTensorReader = SafeTensorReader
+_SafeOpenFn = SafeOpenFn
 
 
 _GLOBAL_WEIGHT_NAMES = (
@@ -616,45 +608,23 @@ def deepseek_v4_mtp_startup_weight_names(n_routed_experts: int) -> tuple[str, ..
     return tuple(dict.fromkeys((*layer_names, *projection_and_head)))
 
 
-class DeepSeekV4WeightStore:
-    """Lazy name-based safetensors access for DeepSeekV4 W8A8 checkpoints."""
+class DeepSeekV4WeightStore(LazySafetensorsStore):
+    """Lazy name-based safetensors access for DeepSeekV4 W8A8 checkpoints.
 
-    def __init__(
-        self,
-        *,
-        model_dir: str | Path,
-        weight_map: Mapping[str, str],
-        device: str = "cpu",
-        safe_open_fn: _SafeOpenFn | None = None,
-    ) -> None:
-        """Create a store from the Hugging Face safetensors index."""
-        self.model_dir = Path(model_dir)
-        self.weight_map = dict(weight_map)
-        self.device = device
-        self._safe_open_fn = _default_safe_open if safe_open_fn is None else safe_open_fn
+    The index handling and the grouped reads come from
+    :class:`~pypto_serving.model.common.weights.store.LazySafetensorsStore`; what stays
+    here is the DeepSeekV4 contract — which names a checkpoint must expose, and how the
+    global and per-layer tensors are packed for the fused kernels.
+    """
 
-    def __contains__(self, name: object) -> bool:
-        """Return whether the checkpoint index exposes ``name``."""
-        return isinstance(name, str) and name in self.weight_map
+    missing_name_error = "Missing DeepSeekV4 weight tensor in index: {name}"
+    missing_names_error = "DeepSeekV4 W8A8 checkpoint is missing required tensors: {names}"
+    missing_shard_error = "Missing safetensors shard for DeepSeekV4 weight load: {path}"
 
-    def filename_for(self, name: str) -> str:
-        """Return the safetensors shard filename for ``name``."""
-        try:
-            return self.weight_map[name]
-        except KeyError as exc:
-            raise KeyError(f"Missing DeepSeekV4 weight tensor in index: {name}") from exc
-
-    def path_for(self, name: str) -> Path:
-        """Return the shard path containing ``name``."""
-        return self.model_dir / self.filename_for(name)
-
-    def require(self, names: Iterable[str]) -> None:
-        """Validate that all tensor names are present in the checkpoint index."""
-        missing = [name for name in names if name not in self.weight_map]
-        if missing:
-            preview = ", ".join(missing[:8])
-            suffix = "" if len(missing) <= 8 else f", ... ({len(missing)} total)"
-            raise KeyError(f"DeepSeekV4 W8A8 checkpoint is missing required tensors: {preview}{suffix}")
+    def _default_open_fn(self) -> SafeOpenFn:
+        # Resolved through this module's global on purpose: the opener carries the
+        # DeepSeekV4-specific import diagnostic, and tests patch it by name here.
+        return _default_safe_open
 
     def validate_startup_contract(
         self,
@@ -677,30 +647,6 @@ class DeepSeekV4WeightStore:
     def validate_mtp_startup_contract(self, *, n_routed_experts: int) -> None:
         """Validate MTP metadata without opening checkpoint shards."""
         self.require(deepseek_v4_mtp_startup_weight_names(n_routed_experts))
-
-    def load_tensor(self, name: str) -> torch.Tensor:
-        """Load one tensor by name, leaving all unrelated shard tensors untouched."""
-        return self.load_many([name])[name]
-
-    def load_many(self, names: Sequence[str]) -> dict[str, torch.Tensor]:
-        """Load a set of named tensors grouped by shard file."""
-        unique_names = tuple(dict.fromkeys(names))
-        self.require(unique_names)
-
-        groups: dict[str, list[str]] = {}
-        for name in unique_names:
-            groups.setdefault(self.filename_for(name), []).append(name)
-
-        loaded: dict[str, torch.Tensor] = {}
-        for filename, shard_names in groups.items():
-            path = self.model_dir / filename
-            if not path.exists():
-                raise FileNotFoundError(f"Missing safetensors shard for DeepSeekV4 weight load: {path}")
-            with self._safe_open_fn(path, self.device) as reader:
-                for name in shard_names:
-                    loaded[name] = reader.get_tensor(name)
-
-        return {name: loaded[name] for name in unique_names}
 
     def load_global_weights(self) -> dict[str, torch.Tensor]:
         """Load embedding, final norm, and LM head tensors."""
