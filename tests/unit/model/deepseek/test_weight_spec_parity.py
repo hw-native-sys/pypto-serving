@@ -6,10 +6,15 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# Differential parity: the declarative core rules must reproduce the hand-written pack table.
+# Differential parity: the rule table must reproduce the hand-written pack table.
 #
 # This is the gate #163 asks for at step 3 — old and new importable side by side, compared
 # directly on the same input, rather than a golden file that only says "something changed".
+#
+# `pack_deepseek_v4_layer_weights` now evaluates the rules, so the comparison is against
+# `_pack_deepseek_v4_layer_weights_legacy`, which stays until #163's cleanup step precisely so
+# that this suite compares two independent implementations. Pointing both sides at the public
+# function would make every assertion below tautologically true.
 from __future__ import annotations
 
 import pytest
@@ -17,7 +22,10 @@ import torch
 
 from pypto_serving.model.common.weights.packer import pack_layer
 from pypto_serving.model.common.weights.spec import LayerContext
-from pypto_serving.model.deepseek.weight_loader import pack_deepseek_v4_layer_weights
+from pypto_serving.model.deepseek.weight_loader import (
+    _pack_deepseek_v4_layer_weights_legacy,
+    pack_deepseek_v4_layer_weights,
+)
 from pypto_serving.model.deepseek.weight_spec import (
     DEEPSEEK_V4_CORE_LAYER_RULES,
     DEEPSEEK_V4_LAYER_RULES,
@@ -42,7 +50,7 @@ def _raw_for_layer(checkpoint, layer_id: int = 0) -> dict[str, torch.Tensor]:
 
 
 def _legacy(raw, layer_id: int = 0, destinations=None):
-    return pack_deepseek_v4_layer_weights(
+    return _pack_deepseek_v4_layer_weights_legacy(
         layer_id,
         raw,
         ranks=_RANKS,
@@ -138,7 +146,7 @@ def test_a_subset_of_destinations_packs_only_that_subset(deepseek_checkpoint):
 
 
 def _legacy_full(raw, *, ratio, tid2eid, gate_bias, destinations=None):
-    return pack_deepseek_v4_layer_weights(
+    return _pack_deepseek_v4_layer_weights_legacy(
         0,
         raw,
         ranks=_RANKS,
@@ -233,3 +241,48 @@ def test_a_required_router_source_still_raises_when_absent(deepseek_checkpoint):
 
     with pytest.raises(KeyError, match="tid2eid"):
         _spec_full(raw, ratio=0, tid2eid=True, gate_bias=False)
+
+
+@pytest.mark.parametrize("ratio", [0, 4, 128])
+def test_public_entry_point_matches_the_legacy_packer(ratio, deepseek_checkpoint, fingerprint_tensors):
+    """The wrapper's own wiring is under test here, not just the rule evaluator.
+
+    `pack_deepseek_v4_layer_weights` builds the context and picks the policies and factories
+    itself; a wrong expert policy or a forgotten factory would produce plausible output that a
+    test calling `pack_layer` directly would never notice.
+    """
+    checkpoint = deepseek_checkpoint(compress_ratios=(ratio,), n_routed_experts=_EXPERTS, num_hash_layers=1)
+    raw = _raw_for_layer(checkpoint)
+    flags = {"ratio": ratio, "tid2eid": True, "gate_bias": False}
+
+    legacy = _legacy_full(raw, **flags).tensors
+    public = pack_deepseek_v4_layer_weights(
+        0,
+        raw,
+        ranks=_RANKS,
+        n_routed_experts=_EXPERTS,
+        compress_ratio=ratio,
+        include_tid2eid=True,
+        include_gate_bias=False,
+    ).tensors
+
+    assert list(legacy) == list(public)
+    assert fingerprint_tensors(legacy) == fingerprint_tensors(public)
+
+
+def test_public_entry_point_keeps_the_family_diagnostics(deepseek_checkpoint):
+    """The error wording is part of the contract its users grep for."""
+    checkpoint = deepseek_checkpoint(compress_ratios=(0,), n_routed_experts=_EXPERTS, num_hash_layers=1)
+    raw = dict(_raw_for_layer(checkpoint))
+    del raw["layers.0.attn.wq_a.weight"]
+
+    with pytest.raises(KeyError, match="missing raw DeepSeekV4 layer tensor: layers.0.attn.wq_a.weight"):
+        pack_deepseek_v4_layer_weights(
+            0,
+            raw,
+            ranks=_RANKS,
+            n_routed_experts=_EXPERTS,
+            compress_ratio=0,
+            include_tid2eid=True,
+            include_gate_bias=False,
+        )

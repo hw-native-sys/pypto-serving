@@ -44,6 +44,8 @@ def pack_layer(
     expert_policy: ExpertParallel | None = None,
     factories: Mapping[str, Callable[[], torch.Tensor]] | None = None,
     destinations: Mapping[str, torch.Tensor] | None = None,
+    missing_source_error: str = "missing raw layer tensor: {name}",
+    missing_expert_error: str = "missing raw expert tensor: {name}",
 ) -> dict[str, torch.Tensor]:
     """Evaluate ``rules`` against ``raw``, writing into ``destinations`` when given.
 
@@ -70,7 +72,7 @@ def pack_layer(
                 try:
                     return raw[name]
                 except KeyError as exc:
-                    raise KeyError(f"missing raw expert tensor: {name}") from exc
+                    raise KeyError(missing_expert_error.format(name=name)) from exc
 
             packed[rule.name] = expert_policy.apply(
                 rule.name, _expert, dtype=rule.dtype, destination=destination
@@ -113,7 +115,7 @@ def pack_layer(
             tensor = raw.get(context.source_name(rule.source))
             if tensor is None:
                 if getattr(context, rule.required_when):
-                    raise KeyError(f"missing raw layer tensor: {context.source_name(rule.source)}")
+                    raise KeyError(missing_source_error.format(name=context.source_name(rule.source)))
                 tensor = torch.zeros(resolve_shape(rule.default_shape, context), dtype=rule.dtype)
             packed[rule.name] = policy.apply(
                 rule.name, tensor, dtype=rule.dtype, destination=destination
@@ -127,7 +129,7 @@ def pack_layer(
         try:
             tensor = raw[source_name]
         except KeyError as exc:
-            raise KeyError(f"missing raw layer tensor: {source_name}") from exc
+            raise KeyError(missing_source_error.format(name=source_name)) from exc
         if rule.reshape_groups is not None:
             tensor = _reshaped_groups(rule.name, tensor, rule.reshape_groups)
         if rule.transpose:

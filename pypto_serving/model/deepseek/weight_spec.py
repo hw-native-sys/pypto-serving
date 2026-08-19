@@ -52,6 +52,9 @@ _VOCAB_SIZE = 129280
 _TOPK = 6
 
 _MISMATCH_ERROR = "packed DeepSeekV4 destination {name} shape/dtype mismatch: expected={expected}, got={got}"
+# The wording the loader's users already recognise, kept identical across the rewire.
+DEEPSEEK_V4_SOURCE_MISSING_ERROR = "missing raw DeepSeekV4 layer tensor: {name}"
+DEEPSEEK_V4_EXPERT_MISSING_ERROR = "missing raw DeepSeekV4 expert tensor: {name}"
 
 DEEPSEEK_V4_CORE_LAYER_RULES: tuple[LayerWeightRule, ...] = (
     LayerWeightRule("hc_attn_fn", "hc_attn_fn", torch.float32),

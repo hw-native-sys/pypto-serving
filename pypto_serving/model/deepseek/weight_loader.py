@@ -1131,7 +1131,7 @@ def _replicate_weight(
     return source.contiguous().unsqueeze(0).expand(ranks, *source.shape).contiguous()
 
 
-def pack_deepseek_v4_layer_weights(
+def _pack_deepseek_v4_layer_weights_legacy(
     layer_id: int,
     raw: Mapping[str, torch.Tensor],
     *,
@@ -1143,7 +1143,14 @@ def pack_deepseek_v4_layer_weights(
     destinations: Mapping[str, torch.Tensor] | None = None,
     prefix: str | None = None,
 ) -> DeepSeekV4PackedLayerWeights:
-    """Pack raw checkpoint tensors into new buffers or final-layout destinations."""
+    """Pack raw checkpoint tensors by hand — kept only as the parity reference.
+
+    Superseded by :func:`pack_deepseek_v4_layer_weights`, which evaluates the rule table in
+    ``weight_spec.py``. This implementation stays until #163's cleanup step so the two can be
+    compared directly on the same input: a parity test that exercised one implementation
+    against itself would license exactly the byte-level regression it exists to catch. Do not
+    call it from production code.
+    """
     prefix = f"layers.{int(layer_id)}" if prefix is None else prefix
 
     def get(suffix: str) -> torch.Tensor:
@@ -1238,6 +1245,60 @@ def pack_deepseek_v4_layer_weights(
             n_routed_experts=n_routed_experts,
             destinations=destinations,
         )
+    )
+    return DeepSeekV4PackedLayerWeights(layer_id=layer_id, tensors=tensors)
+
+
+def pack_deepseek_v4_layer_weights(
+    layer_id: int,
+    raw: Mapping[str, torch.Tensor],
+    *,
+    ranks: int,
+    n_routed_experts: int,
+    compress_ratio: int,
+    include_tid2eid: bool,
+    include_gate_bias: bool,
+    destinations: Mapping[str, torch.Tensor] | None = None,
+    prefix: str | None = None,
+) -> DeepSeekV4PackedLayerWeights:
+    """Pack raw checkpoint tensors into new buffers or final-layout destinations.
+
+    Evaluates the declarative layer contract in ``weight_spec.py`` rather than building the
+    49 weights by hand. Signature, output names, order, dtypes and diagnostics are unchanged;
+    ``_pack_deepseek_v4_layer_weights_legacy`` remains as the reference the parity suite
+    compares against.
+    """
+    from pypto_serving.model.common.weights.packer import pack_layer  # noqa: PLC0415
+    from pypto_serving.model.common.weights.spec import LayerContext  # noqa: PLC0415
+
+    from .weight_spec import (  # noqa: PLC0415
+        DEEPSEEK_V4_EXPERT_MISSING_ERROR,
+        DEEPSEEK_V4_LAYER_RULES,
+        DEEPSEEK_V4_SOURCE_MISSING_ERROR,
+        deepseek_v4_expert_parallel,
+        deepseek_v4_factories,
+        deepseek_v4_replicate,
+    )
+
+    context = LayerContext(
+        layer_id=int(layer_id),
+        prefix=f"layers.{int(layer_id)}" if prefix is None else prefix,
+        ranks=int(ranks),
+        compress_ratio=int(compress_ratio),
+        n_routed_experts=int(n_routed_experts),
+        include_tid2eid=bool(include_tid2eid),
+        include_gate_bias=bool(include_gate_bias),
+    )
+    tensors = pack_layer(
+        DEEPSEEK_V4_LAYER_RULES,
+        raw,
+        context,
+        policy=deepseek_v4_replicate(int(ranks)),
+        expert_policy=deepseek_v4_expert_parallel(int(ranks), int(n_routed_experts)),
+        factories=deepseek_v4_factories(),
+        destinations=destinations,
+        missing_source_error=DEEPSEEK_V4_SOURCE_MISSING_ERROR,
+        missing_expert_error=DEEPSEEK_V4_EXPERT_MISSING_ERROR,
     )
     return DeepSeekV4PackedLayerWeights(layer_id=layer_id, tensors=tensors)
 
