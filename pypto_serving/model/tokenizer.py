@@ -29,6 +29,14 @@ class TokenizerAdapter:
         """Decode token IDs into text."""
         raise NotImplementedError
 
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        chat_template_kwargs: dict[str, object] | None = None,
+    ) -> str:
+        """Render chat messages into a generation prompt."""
+        raise NotImplementedError
+
     @property
     def bos_token_id(self) -> int | None:
         """Return the beginning-of-sequence token ID, if available."""
@@ -107,6 +115,20 @@ class TransformersTokenizerAdapter(TokenizerAdapter):
     def decode(self, token_ids: list[int]) -> str:
         """Decode token IDs, stripping special tokens (EOS / pad / im_end ...) from output."""
         return self.tokenizer.decode(token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        chat_template_kwargs: dict[str, object] | None = None,
+    ) -> str:
+        """Render chat messages without exposing the wrapped tokenizer."""
+        kwargs = dict(chat_template_kwargs or {})
+        kwargs["tokenize"] = False
+        kwargs["add_generation_prompt"] = True
+        prompt = self.tokenizer.apply_chat_template(messages, **kwargs)
+        if not isinstance(prompt, str):
+            raise TypeError("Tokenizer chat template must return a string when tokenize=False")
+        return prompt
 
     @property
     def bos_token_id(self) -> int | None:

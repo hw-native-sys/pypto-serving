@@ -16,7 +16,7 @@ import time
 import uuid
 
 from pypto_serving.config.types import GenerateConfig
-from pypto_serving.serving.engine.async_engine import AsyncLLMEngine
+from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput
 from pypto_serving.tools.profile import (
     get_profiler,
     merge_profile,
@@ -40,15 +40,18 @@ except ImportError as e:
 
 # --- Request/Response Models ---
 
-class CompletionRequest(BaseModel):
+class _GenerationRequest(BaseModel):
     model: str = ""
-    prompt: str = ""
     max_tokens: int = 256
     temperature: float = 0.8
     top_p: float = 0.95
     top_k: int | None = None
     stop: list[str] | None = None
     stream: bool = False
+
+
+class CompletionRequest(_GenerationRequest):
+    prompt: str = ""
 
 
 class ChatMessage(BaseModel):
@@ -56,16 +59,9 @@ class ChatMessage(BaseModel):
     content: str
 
 
-class ChatCompletionRequest(BaseModel):
-    model: str = ""
+class ChatCompletionRequest(_GenerationRequest):
     messages: list[ChatMessage]
-    max_tokens: int = 256
-    temperature: float = 0.8
-    top_p: float = 0.95
-    top_k: int | None = None
-    stop: list[str] | None = None
-    stream: bool = False
-    chat_template_kwargs: dict | None = None
+    chat_template_kwargs: dict[str, object] | None = None
 
 
 class CompletionChoice(BaseModel):
@@ -180,17 +176,42 @@ class ServingServer:
                 raise stop_error
         return Response(status_code=200)
 
-    async def _completions(self, request: CompletionRequest) -> StreamingResponse | JSONResponse:
-        request_id = f"cmpl-{uuid.uuid4().hex[:8]}"
-        config = GenerateConfig(
+    @staticmethod
+    def _build_generate_config(
+        request: _GenerationRequest,
+        *,
+        ignore_eos: bool = False,
+    ) -> GenerateConfig:
+        return GenerateConfig(
             max_new_tokens=request.max_tokens,
             temperature=request.temperature,
             top_p=request.top_p,
             top_k=request.top_k,
-            stop=tuple(request.stop) if request.stop else (),
+            stop=tuple(request.stop or ()),
             stream=request.stream,
-            ignore_eos=True,
+            ignore_eos=ignore_eos,
         )
+
+    async def _collect_generation(
+        self,
+        request_id: str,
+        prompt: str,
+        config: GenerateConfig,
+    ) -> tuple[str, str, ResponseUsage | None]:
+        full_text = ""
+        finish_reason = ""
+        usage = None
+        async for output in self.engine.add_request(request_id, prompt, config):
+            if output.text:
+                full_text = output.text
+            if output.finished:
+                finish_reason = self._map_finish_reason(output.finish_reason)
+                usage = self._response_usage(output)
+        return full_text, finish_reason, usage
+
+    async def _completions(self, request: CompletionRequest) -> StreamingResponse | JSONResponse:
+        request_id = f"cmpl-{uuid.uuid4().hex[:8]}"
+        config = self._build_generate_config(request, ignore_eos=True)
 
         with profile_span(
             "http.completions",
@@ -203,19 +224,11 @@ class ServingServer:
                     media_type="text/event-stream",
                 )
 
-            full_text = ""
-            finish_reason = ""
-            usage = None
-            async for output in self.engine.add_request(request_id, request.prompt, config):
-                if output.text:
-                    full_text = output.text
-                if output.finished:
-                    finish_reason = self._map_finish_reason(output.finish_reason)
-                    usage = ResponseUsage(
-                        prompt_tokens=output.prompt_tokens,
-                        completion_tokens=output.completion_tokens,
-                        total_tokens=output.prompt_tokens + output.completion_tokens,
-                    )
+            full_text, finish_reason, usage = await self._collect_generation(
+                request_id,
+                request.prompt,
+                config,
+            )
 
             response = CompletionResponse(
                 id=request_id,
@@ -229,14 +242,7 @@ class ServingServer:
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         prompt = self._apply_chat_template(request.messages, request.chat_template_kwargs)
-        config = GenerateConfig(
-            max_new_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            top_k=request.top_k,
-            stop=tuple(request.stop) if request.stop else (),
-            stream=request.stream,
-        )
+        config = self._build_generate_config(request)
 
         with profile_span(
             "http.chat_completions",
@@ -249,19 +255,11 @@ class ServingServer:
                     media_type="text/event-stream",
                 )
 
-            full_text = ""
-            finish_reason = ""
-            usage = None
-            async for output in self.engine.add_request(request_id, prompt, config):
-                if output.text:
-                    full_text = output.text
-                if output.finished:
-                    finish_reason = self._map_finish_reason(output.finish_reason)
-                    usage = ResponseUsage(
-                        prompt_tokens=output.prompt_tokens,
-                        completion_tokens=output.completion_tokens,
-                        total_tokens=output.prompt_tokens + output.completion_tokens,
-                    )
+            full_text, finish_reason, usage = await self._collect_generation(
+                request_id,
+                prompt,
+                config,
+            )
 
             response = ChatCompletionResponse(
                 id=request_id,
@@ -279,86 +277,77 @@ class ServingServer:
     async def _stream_completion(
         self, request_id: str, prompt: str, config: GenerateConfig, model: str
     ):
-        with profile_span("http.stream_completion", cat="request", args={"request_id": request_id}):
-            prev_text = ""
-            async for output in self.engine.add_request(request_id, prompt, config):
-                delta = output.text[len(prev_text):] if output.text else ""
-                prev_text = output.text or prev_text
-                finish_reason = self._map_finish_reason(output.finish_reason) if output.finished else None
-
-                chunk = CompletionResponse(
-                    id=request_id,
-                    created=int(time.time()),
-                    model=model,
-                    choices=[CompletionChoice(text=delta, finish_reason=finish_reason)],
-                )
-                yield f"data: {json.dumps(chunk.model_dump())}\n\n"
-
-                if output.finished:
-                    # Terminal usage chunk (OpenAI stream_options.include_usage
-                    # shape): empty choices, authoritative counts from the engine.
-                    usage_chunk = CompletionResponse(
-                        id=request_id,
-                        created=int(time.time()),
-                        model=model,
-                        choices=[],
-                        usage=ResponseUsage(
-                            prompt_tokens=output.prompt_tokens,
-                            completion_tokens=output.completion_tokens,
-                            total_tokens=output.prompt_tokens + output.completion_tokens,
-                        ),
-                    )
-                    yield f"data: {json.dumps(usage_chunk.model_dump())}\n\n"
-
-                    profile_instant(
-                        "http.stream_completion.finished",
-                        cat="request",
-                        args={"request_id": request_id, "finish_reason": finish_reason},
-                    )
-                    yield "data: [DONE]\n\n"
-                    break
+        async for chunk in self._stream_response(request_id, prompt, config, model, is_chat=False):
+            yield chunk
 
     async def _stream_chat_completion(
         self, request_id: str, prompt: str, config: GenerateConfig, model: str
     ):
-        with profile_span("http.stream_chat_completion", cat="request", args={"request_id": request_id}):
+        async for chunk in self._stream_response(request_id, prompt, config, model, is_chat=True):
+            yield chunk
+
+    async def _stream_response(
+        self,
+        request_id: str,
+        prompt: str,
+        config: GenerateConfig,
+        model: str,
+        *,
+        is_chat: bool,
+    ):
+        span_name = "http.stream_chat_completion" if is_chat else "http.stream_completion"
+        finished_event = "http.stream_chat.finished" if is_chat else "http.stream_completion.finished"
+        with profile_span(span_name, cat="request", args={"request_id": request_id}):
             prev_text = ""
             async for output in self.engine.add_request(request_id, prompt, config):
                 delta = output.text[len(prev_text):] if output.text else ""
                 prev_text = output.text or prev_text
                 finish_reason = self._map_finish_reason(output.finish_reason) if output.finished else None
 
-                chunk = ChatCompletionResponse(
-                    id=request_id,
-                    object="chat.completion.chunk",
-                    created=int(time.time()),
-                    model=model,
-                    choices=[ChatCompletionChoice(
-                        delta=ChatMessage(role="assistant", content=delta),
-                        finish_reason=finish_reason,
-                    )],
-                )
+                if is_chat:
+                    chunk = ChatCompletionResponse(
+                        id=request_id,
+                        object="chat.completion.chunk",
+                        created=int(time.time()),
+                        model=model,
+                        choices=[ChatCompletionChoice(
+                            delta=ChatMessage(role="assistant", content=delta),
+                            finish_reason=finish_reason,
+                        )],
+                    )
+                else:
+                    chunk = CompletionResponse(
+                        id=request_id,
+                        created=int(time.time()),
+                        model=model,
+                        choices=[CompletionChoice(text=delta, finish_reason=finish_reason)],
+                    )
                 yield f"data: {json.dumps(chunk.model_dump())}\n\n"
 
                 if output.finished:
                     # Terminal usage chunk (OpenAI stream_options.include_usage
                     # shape): empty choices, authoritative counts from the engine.
-                    usage_chunk = ChatCompletionResponse(
-                        id=request_id,
-                        object="chat.completion.chunk",
-                        created=int(time.time()),
-                        model=model,
-                        choices=[],
-                        usage=ResponseUsage(
-                            prompt_tokens=output.prompt_tokens,
-                            completion_tokens=output.completion_tokens,
-                            total_tokens=output.prompt_tokens + output.completion_tokens,
-                        ),
-                    )
+                    if is_chat:
+                        usage_chunk = ChatCompletionResponse(
+                            id=request_id,
+                            object="chat.completion.chunk",
+                            created=int(time.time()),
+                            model=model,
+                            choices=[],
+                            usage=self._response_usage(output),
+                        )
+                    else:
+                        usage_chunk = CompletionResponse(
+                            id=request_id,
+                            created=int(time.time()),
+                            model=model,
+                            choices=[],
+                            usage=self._response_usage(output),
+                        )
                     yield f"data: {json.dumps(usage_chunk.model_dump())}\n\n"
 
                     profile_instant(
-                        "http.stream_chat.finished",
+                        finished_event,
                         cat="request",
                         args={"request_id": request_id, "finish_reason": finish_reason},
                     )
@@ -375,12 +364,15 @@ class ServingServer:
         control thinking mode per request.
         """
         hf_messages = [{"role": m.role, "content": m.content} for m in messages]
-        kwargs: dict = {"tokenize": False, "add_generation_prompt": True}
-        if chat_template_kwargs:
-            kwargs.update(chat_template_kwargs)
-        kwargs["tokenize"] = False
-        kwargs["add_generation_prompt"] = True
-        return self.engine.tokenizer.tokenizer.apply_chat_template(hf_messages, **kwargs)
+        return self.engine.tokenizer.apply_chat_template(hf_messages, chat_template_kwargs)
+
+    @staticmethod
+    def _response_usage(output: TokenOutput) -> ResponseUsage:
+        return ResponseUsage(
+            prompt_tokens=output.prompt_tokens,
+            completion_tokens=output.completion_tokens,
+            total_tokens=output.prompt_tokens + output.completion_tokens,
+        )
 
     @staticmethod
     def _map_finish_reason(reason: str) -> str:
