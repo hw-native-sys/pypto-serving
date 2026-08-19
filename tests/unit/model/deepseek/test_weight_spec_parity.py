@@ -12,6 +12,7 @@
 # directly on the same input, rather than a golden file that only says "something changed".
 from __future__ import annotations
 
+import pytest
 import torch
 
 from pypto_serving.model.common.weights.packer import pack_layer
@@ -19,6 +20,9 @@ from pypto_serving.model.common.weights.spec import LayerContext
 from pypto_serving.model.deepseek.weight_loader import pack_deepseek_v4_layer_weights
 from pypto_serving.model.deepseek.weight_spec import (
     DEEPSEEK_V4_CORE_LAYER_RULES,
+    DEEPSEEK_V4_LAYER_RULES,
+    deepseek_v4_expert_parallel,
+    deepseek_v4_factories,
     deepseek_v4_replicate,
 )
 
@@ -131,3 +135,101 @@ def test_a_subset_of_destinations_packs_only_that_subset(deepseek_checkpoint):
     packed = _from_spec(raw, destinations={wanted: torch.zeros_like(template[wanted])})
 
     assert list(packed) == [wanted]
+
+
+def _legacy_full(raw, *, ratio, tid2eid, gate_bias, destinations=None):
+    return pack_deepseek_v4_layer_weights(
+        0,
+        raw,
+        ranks=_RANKS,
+        n_routed_experts=_EXPERTS,
+        compress_ratio=ratio,
+        include_tid2eid=tid2eid,
+        include_gate_bias=gate_bias,
+        destinations=destinations,
+    )
+
+
+def _spec_full(raw, *, ratio, tid2eid, gate_bias, destinations=None):
+    return pack_layer(
+        DEEPSEEK_V4_LAYER_RULES,
+        raw,
+        LayerContext(
+            layer_id=0,
+            prefix="layers.0",
+            ranks=_RANKS,
+            compress_ratio=ratio,
+            n_routed_experts=_EXPERTS,
+            include_tid2eid=tid2eid,
+            include_gate_bias=gate_bias,
+        ),
+        policy=deepseek_v4_replicate(_RANKS),
+        expert_policy=deepseek_v4_expert_parallel(_RANKS, _EXPERTS),
+        factories=deepseek_v4_factories(),
+        destinations=destinations,
+    )
+
+
+@pytest.mark.parametrize("ratio", [0, 4, 128])
+def test_full_rule_table_reproduces_the_packer_byte_for_byte(
+    ratio, deepseek_checkpoint, fingerprint_tensors
+):
+    """All 49 names, every attention kind, direct path.
+
+    Parametrised over the three kinds because the zero-filled branches are the ones a
+    declarative rule can get wrong without changing a single shape.
+    """
+    checkpoint = deepseek_checkpoint(compress_ratios=(ratio,), n_routed_experts=_EXPERTS, num_hash_layers=1)
+    raw = _raw_for_layer(checkpoint)
+    flags = {"ratio": ratio, "tid2eid": True, "gate_bias": False}
+
+    legacy = _legacy_full(raw, **flags).tensors
+    spec = _spec_full(raw, **flags)
+
+    assert list(legacy) == list(spec), "name order must match the hand-written table"
+    assert fingerprint_tensors(legacy) == fingerprint_tensors(spec)
+
+
+@pytest.mark.parametrize("ratio", [0, 4, 128])
+def test_full_rule_table_matches_on_the_destination_path(ratio, deepseek_checkpoint, fingerprint_tensors):
+    """Same 49 names written into preallocated slabs instead of fresh buffers."""
+    checkpoint = deepseek_checkpoint(compress_ratios=(ratio,), n_routed_experts=_EXPERTS, num_hash_layers=1)
+    raw = _raw_for_layer(checkpoint)
+    flags = {"ratio": ratio, "tid2eid": True, "gate_bias": False}
+    reference = _legacy_full(raw, **flags).tensors
+
+    legacy_slabs = {name: torch.zeros_like(tensor) for name, tensor in reference.items()}
+    spec_slabs = {name: torch.zeros_like(tensor) for name, tensor in reference.items()}
+    _legacy_full(raw, **flags, destinations=legacy_slabs)
+    _spec_full(raw, **flags, destinations=spec_slabs)
+
+    assert fingerprint_tensors(legacy_slabs) == fingerprint_tensors(spec_slabs)
+
+
+def test_router_placeholder_matches_when_the_layer_carries_the_other_mode(
+    deepseek_checkpoint, fingerprint_tensors
+):
+    """A layer with gate_bias and no tid2eid: the placeholder is the interesting half."""
+    checkpoint = deepseek_checkpoint(
+        compress_ratios=(0, 0), n_routed_experts=_EXPERTS, num_hash_layers=1
+    )
+    raw = checkpoint.store().load_layer_weights(
+        1, n_routed_experts=_EXPERTS, compress_ratio=0, include_tid2eid=False, include_gate_bias=True
+    )
+    raw = {name.replace("layers.1", "layers.0", 1): tensor for name, tensor in raw.items()}
+    flags = {"ratio": 0, "tid2eid": False, "gate_bias": True}
+
+    legacy = _legacy_full(raw, **flags).tensors
+    spec = _spec_full(raw, **flags)
+
+    assert fingerprint_tensors(legacy) == fingerprint_tensors(spec)
+
+
+def test_a_required_router_source_still_raises_when_absent(deepseek_checkpoint):
+    """The requirement flag must not be softened into a silent zero fill."""
+    checkpoint = deepseek_checkpoint(compress_ratios=(0,), n_routed_experts=_EXPERTS, num_hash_layers=1)
+    raw = dict(_raw_for_layer(checkpoint))
+    del raw["layers.0.ffn.gate.tid2eid"]
+
+    with pytest.raises(KeyError, match="tid2eid"):
+        _spec_full(raw, ratio=0, tid2eid=True, gate_bias=False)

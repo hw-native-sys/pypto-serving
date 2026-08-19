@@ -8,12 +8,21 @@
 # -----------------------------------------------------------------------------------------------------------
 """Generic per-layer evaluator: rules plus raw tensors in, packed kernel weights out."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import torch
 
-from .shard import Replicate
-from .spec import LayerContext, LayerWeightRule
+from .shard import ExpertParallel, Replicate
+from .spec import (
+    DefaultedWeightRule,
+    ExpertWeightRule,
+    LayerContext,
+    LayerRule,
+    LayerWeightRule,
+    OptionalWeightRule,
+    SyntheticWeightRule,
+    resolve_shape,
+)
 
 
 def _reshaped_groups(name: str, weight: torch.Tensor, groups: int) -> torch.Tensor:
@@ -27,11 +36,13 @@ def _reshaped_groups(name: str, weight: torch.Tensor, groups: int) -> torch.Tens
 
 
 def pack_layer(
-    rules: Sequence[LayerWeightRule],
+    rules: Sequence[LayerRule],
     raw: Mapping[str, torch.Tensor],
     context: LayerContext,
     *,
     policy: Replicate,
+    expert_policy: ExpertParallel | None = None,
+    factories: Mapping[str, Callable[[], torch.Tensor]] | None = None,
     destinations: Mapping[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Evaluate ``rules`` against ``raw``, writing into ``destinations`` when given.
@@ -48,6 +59,70 @@ def pack_layer(
     for rule in rules:
         if destinations is not None and rule.name not in destinations:
             continue
+        destination = None if destinations is None else destinations[rule.name]
+
+        if isinstance(rule, ExpertWeightRule):
+            if expert_policy is None:
+                raise ValueError(f"{rule.name} needs an expert policy but none was given")
+
+            def _expert(expert_id: int, rule: ExpertWeightRule = rule) -> torch.Tensor:
+                name = context.source_name(f"ffn.experts.{expert_id}.{rule.source}")
+                try:
+                    return raw[name]
+                except KeyError as exc:
+                    raise KeyError(f"missing raw expert tensor: {name}") from exc
+
+            packed[rule.name] = expert_policy.apply(
+                rule.name, _expert, dtype=rule.dtype, destination=destination
+            )
+            continue
+
+        if isinstance(rule, SyntheticWeightRule):
+            factory = (factories or {}).get(rule.factory)
+            if factory is None:
+                raise ValueError(f"{rule.name} needs the {rule.factory!r} factory but none was given")
+            packed[rule.name] = policy.apply(
+                rule.name, factory(), dtype=rule.dtype, destination=destination
+            )
+            continue
+
+        if isinstance(rule, OptionalWeightRule):
+            tensor = (
+                raw.get(context.source_name(rule.source))
+                if rule.enabled_for(context.compress_ratio)
+                else None
+            )
+            if tensor is None:
+                packed[rule.name] = _zero_filled(
+                    rule.name,
+                    resolve_shape(rule.absent_shape, context),
+                    rule.dtype,
+                    ranks=policy.ranks,
+                    destination=destination,
+                    mismatch_error=policy.mismatch_error,
+                )
+                continue
+            if rule.transpose:
+                tensor = tensor.transpose(0, 1)
+            packed[rule.name] = policy.apply(
+                rule.name, tensor, dtype=rule.dtype, destination=destination
+            )
+            continue
+
+        if isinstance(rule, DefaultedWeightRule):
+            tensor = raw.get(context.source_name(rule.source))
+            if tensor is None:
+                if getattr(context, rule.required_when):
+                    raise KeyError(f"missing raw layer tensor: {context.source_name(rule.source)}")
+                tensor = torch.zeros(resolve_shape(rule.default_shape, context), dtype=rule.dtype)
+            packed[rule.name] = policy.apply(
+                rule.name, tensor, dtype=rule.dtype, destination=destination
+            )
+            continue
+
+        if not isinstance(rule, LayerWeightRule):  # pragma: no cover - guards a new rule kind
+            raise TypeError(f"unsupported weight rule: {type(rule).__name__}")
+
         source_name = context.source_name(rule.source)
         try:
             tensor = raw[source_name]
@@ -58,9 +133,36 @@ def pack_layer(
         if rule.transpose:
             tensor = tensor.transpose(0, 1)
         packed[rule.name] = policy.apply(
-            rule.name,
-            tensor,
-            dtype=rule.dtype,
-            destination=None if destinations is None else destinations[rule.name],
+            rule.name, tensor, dtype=rule.dtype, destination=destination
         )
     return packed
+
+
+def _zero_filled(
+    name: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    *,
+    ranks: int,
+    destination: torch.Tensor | None,
+    mismatch_error: str,
+) -> torch.Tensor:
+    """Zero an inactive branch, validating the destination's shape before touching it.
+
+    The validation comes first on purpose: a mismatch here means the slab was allocated from
+    a template that disagrees with this rule, and zeroing it anyway would hide that behind
+    plausible-looking output.
+    """
+    expected_shape = (ranks, *shape)
+    if destination is None:
+        return torch.zeros(expected_shape, dtype=dtype)
+    if tuple(destination.shape) != expected_shape or destination.dtype != dtype:
+        raise ValueError(
+            mismatch_error.format(
+                name=name,
+                expected=f"{expected_shape}/{dtype}",
+                got=f"{tuple(destination.shape)}/{destination.dtype}",
+            )
+        )
+    destination.zero_()
+    return destination

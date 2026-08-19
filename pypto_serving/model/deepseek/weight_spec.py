@@ -21,11 +21,35 @@ already written, so new entries go at the end of the group they belong to.
 
 import torch
 
-from pypto_serving.model.common.weights.shard import Replicate
-from pypto_serving.model.common.weights.spec import LayerWeightRule
+from pypto_serving.model.common.weights.shard import ExpertParallel, Replicate
+from pypto_serving.model.common.weights.spec import (
+    DefaultedWeightRule,
+    ExpertWeightRule,
+    LayerRule,
+    LayerWeightRule,
+    OptionalWeightRule,
+    SyntheticWeightRule,
+)
 
 # `wo_a` arrives flattened and is split into this many output groups.
 DEEPSEEK_V4_O_GROUPS = 8
+
+# Attention kinds, and the fixed dimensions their compressor/indexer weights have. These are
+# model constants rather than config knobs: the packer validates the active branch against
+# them and zero-fills the inactive branch at the same sizes, so every layer presents one
+# kernel signature.
+DEEPSEEK_V4_CSA_RATIO = 4
+DEEPSEEK_V4_HCA_RATIO = 128
+_HIDDEN = 4096
+_HEAD_DIM = 512
+_HCA_OUT = 512
+_CSA_OUT = 1024
+_CSA_INNER_OUT = 256
+_Q_LORA = 1024
+_ATTENTION_OUT = 64 * 512
+_HADAMARD_DIM = 128
+_VOCAB_SIZE = 129280
+_TOPK = 6
 
 _MISMATCH_ERROR = "packed DeepSeekV4 destination {name} shape/dtype mismatch: expected={expected}, got={got}"
 
@@ -61,3 +85,149 @@ DEEPSEEK_V4_CORE_LAYER_RULES: tuple[LayerWeightRule, ...] = (
 def deepseek_v4_replicate(ranks: int) -> Replicate:
     """The rank policy for DeepSeekV4, carrying the diagnostics its users recognise."""
     return Replicate(ranks=ranks, mismatch_error=_MISMATCH_ERROR)
+
+
+# Compressor and indexer weights: present for one attention kind, zeros for the others. Order
+# is the hand-written table's order, including where the synthetic Hadamard index sits.
+DEEPSEEK_V4_OPTIONAL_LAYER_RULES: tuple[LayerRule, ...] = (
+    OptionalWeightRule(
+        "hca_cmp_wkv", "attn.compressor.wkv.weight", torch.bfloat16, (_HCA_OUT, _HIDDEN), (DEEPSEEK_V4_HCA_RATIO,)
+    ),
+    OptionalWeightRule(
+        "hca_cmp_wgate",
+        "attn.compressor.wgate.weight",
+        torch.bfloat16,
+        (_HCA_OUT, _HIDDEN),
+        (DEEPSEEK_V4_HCA_RATIO,),
+    ),
+    OptionalWeightRule(
+        "hca_cmp_ape",
+        "attn.compressor.ape",
+        torch.float32,
+        (DEEPSEEK_V4_HCA_RATIO, _HCA_OUT),
+        (DEEPSEEK_V4_HCA_RATIO,),
+    ),
+    OptionalWeightRule(
+        "hca_cmp_norm_w", "attn.compressor.norm.weight", torch.bfloat16, (_HEAD_DIM,), (DEEPSEEK_V4_HCA_RATIO,)
+    ),
+    OptionalWeightRule(
+        "csa_cmp_wkv", "attn.compressor.wkv.weight", torch.bfloat16, (_CSA_OUT, _HIDDEN), (DEEPSEEK_V4_CSA_RATIO,)
+    ),
+    OptionalWeightRule(
+        "csa_cmp_wgate",
+        "attn.compressor.wgate.weight",
+        torch.bfloat16,
+        (_CSA_OUT, _HIDDEN),
+        (DEEPSEEK_V4_CSA_RATIO,),
+    ),
+    OptionalWeightRule(
+        "csa_cmp_ape",
+        "attn.compressor.ape",
+        torch.float32,
+        (DEEPSEEK_V4_CSA_RATIO, _CSA_OUT),
+        (DEEPSEEK_V4_CSA_RATIO,),
+    ),
+    OptionalWeightRule(
+        "csa_cmp_norm_w", "attn.compressor.norm.weight", torch.bfloat16, (_HEAD_DIM,), (DEEPSEEK_V4_CSA_RATIO,)
+    ),
+    OptionalWeightRule(
+        "csa_idx_wq_b",
+        "attn.indexer.wq_b.weight",
+        torch.int8,
+        (_Q_LORA, _ATTENTION_OUT // 4),
+        (DEEPSEEK_V4_CSA_RATIO,),
+        transpose=True,
+    ),
+    OptionalWeightRule(
+        "csa_idx_wq_b_scale",
+        "attn.indexer.wq_b.scale",
+        torch.float32,
+        (_ATTENTION_OUT // 4,),
+        (DEEPSEEK_V4_CSA_RATIO,),
+    ),
+    OptionalWeightRule(
+        "csa_weights_proj",
+        "attn.indexer.weights_proj.weight",
+        torch.bfloat16,
+        (_HIDDEN, 64),
+        (DEEPSEEK_V4_CSA_RATIO,),
+        transpose=True,
+    ),
+    SyntheticWeightRule("csa_hadamard_idx", torch.bfloat16, "hadamard_idx"),
+    OptionalWeightRule(
+        "csa_inner_wkv",
+        "attn.indexer.compressor.wkv.weight",
+        torch.bfloat16,
+        (_CSA_INNER_OUT, _HIDDEN),
+        (DEEPSEEK_V4_CSA_RATIO,),
+    ),
+    OptionalWeightRule(
+        "csa_inner_wgate",
+        "attn.indexer.compressor.wgate.weight",
+        torch.bfloat16,
+        (_CSA_INNER_OUT, _HIDDEN),
+        (DEEPSEEK_V4_CSA_RATIO,),
+    ),
+    OptionalWeightRule(
+        "csa_inner_ape",
+        "attn.indexer.compressor.ape",
+        torch.float32,
+        (DEEPSEEK_V4_CSA_RATIO, _CSA_INNER_OUT),
+        (DEEPSEEK_V4_CSA_RATIO,),
+    ),
+    OptionalWeightRule(
+        "csa_inner_norm_w",
+        "attn.indexer.compressor.norm.weight",
+        torch.bfloat16,
+        (_HADAMARD_DIM,),
+        (DEEPSEEK_V4_CSA_RATIO,),
+    ),
+)
+
+# Router weights: the checkpoint carries one or the other depending on the layer, and the
+# unused mode is a zero placeholder of the shape its kernel signature expects.
+DEEPSEEK_V4_ROUTER_LAYER_RULES: tuple[LayerRule, ...] = (
+    DefaultedWeightRule("gate_bias", "ffn.gate.bias", torch.float32, ("n_routed_experts",), "include_gate_bias"),
+    DefaultedWeightRule("tid2eid", "ffn.gate.tid2eid", torch.int32, (_VOCAB_SIZE, _TOPK), "include_tid2eid"),
+)
+
+# Routed experts, sharded across ranks rather than replicated.
+DEEPSEEK_V4_EXPERT_LAYER_RULES: tuple[LayerRule, ...] = (
+    ExpertWeightRule("routed_w1", "w1.weight", torch.int8),
+    ExpertWeightRule("routed_w1_scale", "w1.scale", torch.float32),
+    ExpertWeightRule("routed_w3", "w3.weight", torch.int8),
+    ExpertWeightRule("routed_w3_scale", "w3.scale", torch.float32),
+    ExpertWeightRule("routed_w2", "w2.weight", torch.int8),
+    ExpertWeightRule("routed_w2_scale", "w2.scale", torch.float32),
+)
+
+# The full 49-name layer contract, in the order the hand-written packer builds it.
+DEEPSEEK_V4_LAYER_RULES: tuple[LayerRule, ...] = (
+    *DEEPSEEK_V4_CORE_LAYER_RULES,
+    *DEEPSEEK_V4_OPTIONAL_LAYER_RULES,
+    *DEEPSEEK_V4_ROUTER_LAYER_RULES,
+    *DEEPSEEK_V4_EXPERT_LAYER_RULES,
+)
+
+
+def deepseek_v4_expert_parallel(ranks: int, n_routed_experts: int) -> ExpertParallel:
+    """The expert placement policy, taking rank ownership from the loader's own helper."""
+    from pypto_serving.model.deepseek.weight_loader import (  # noqa: PLC0415 -- cycle at import time
+        deepseek_v4_local_expert_ids,
+    )
+
+    return ExpertParallel(
+        ranks=ranks,
+        n_experts=n_routed_experts,
+        local_ids=deepseek_v4_local_expert_ids,
+        mismatch_error=_MISMATCH_ERROR,
+    )
+
+
+def deepseek_v4_factories() -> dict[str, object]:
+    """Synthetic-weight factories, keyed the way the rules refer to them."""
+    from pypto_serving.model.deepseek.weight_loader import (  # noqa: PLC0415 -- cycle at import time
+        deepseek_v4_hadamard_idx,
+    )
+
+    return {"hadamard_idx": deepseek_v4_hadamard_idx}
