@@ -124,6 +124,26 @@ curl --noproxy "*" http://127.0.0.1:8899/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "What is 1+1?"}], "max_tokens": 32}'
 ```
 
+## Local Monitoring
+
+The serving process exposes cumulative engine metrics at `/metrics` in
+Prometheus text format and at `/metrics/json` as structured JSON. Metrics cover
+request latency, token traffic and throughput inputs, scheduler queues, KV cache
+usage, prefix-cache hits, and request outcomes.
+
+For a self-contained local dashboard with SQLite history, start the companion
+tool from the repository root:
+
+```bash
+python -m tools.monitor \
+  --target http://127.0.0.1:8899 \
+  --port 9090
+```
+
+Open <http://127.0.0.1:9090>. See
+[`tools/monitor/README.md`](tools/monitor/README.md) for retention, database, and
+timezone options.
+
 ## Notes
 
 - All model/device/runtime options are passed via CLI arguments. Run

@@ -54,6 +54,33 @@ def test_scheduler_speculative_output_counts_only_tokens_retained_before_eos():
     assert [(output.new_token_id, output.finished) for output in outputs] == [(7, True)]
 
 
+def test_prefix_cache_metrics_count_cacheable_and_hit_tokens_once():
+    manager = KvCacheManager(num_blocks=16, block_size=2, enable_prefix_cache=True)
+    scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=True), manager)
+    cold = Request(
+        request_id="cold",
+        prompt_token_ids=[1, 2, 3, 4],
+        max_new_tokens=1,
+    )
+    scheduler.add_request(cold)
+
+    cold_output = scheduler.schedule()
+    assert cold_output.prefix_cache_queries == 4
+    assert cold_output.prefix_cache_hits == 0
+    scheduler.update_from_output(cold_output, {"cold": 9})
+
+    warm = Request(
+        request_id="warm",
+        prompt_token_ids=[1, 2, 3, 4],
+        max_new_tokens=1,
+    )
+    scheduler.add_request(warm)
+    warm_output = scheduler.schedule()
+
+    assert warm_output.prefix_cache_queries == 4
+    assert warm_output.prefix_cache_hits == 4
+
+
 def _running_decode_request(req_id="r", prompt=(1, 2), first_output=99):
     """A RUNNING request that finished prefill and has one decoded token, i.e.
     ready to schedule its next decode step (num_new_tokens_needed == 1)."""

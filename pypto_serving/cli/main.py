@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from pypto_serving.serving.engine.async_engine import EngineConfig
 
+from pypto_serving.observability.access_log import create_uvicorn_log_config
 from pypto_serving.tools.profile import (
     ProfileConfig,
     configure_profiler,
@@ -511,12 +512,13 @@ def run_serve(
     print(f"  Chunked prefill threshold: {config.long_prefill_token_threshold}")
     print(f"  Prefix cache: {'enabled' if config.enable_prefix_cache else 'disabled'}")
     print(f"  Chunk prefill: {'enabled' if config.enable_chunk_prefill else 'disabled'}")
-    endpoints = "/v1/completions, /v1/chat/completions, /v1/models, /health"
+    endpoints = "/v1/completions, /v1/chat/completions, /v1/models, /health, /metrics"
     if get_profiler().enabled:
         endpoints += ", /start_profile, /stop_profile"
     print(f"  Endpoints: {endpoints}")
 
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    log_config = create_uvicorn_log_config(["/metrics", "/metrics/json"])
+    uvicorn.run(app, host=host, port=port, log_level="info", log_config=log_config)
 
 
 def _format_device_groups(config: EngineConfig) -> str:
