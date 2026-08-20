@@ -105,7 +105,9 @@ def _install_num_layers_override(engine: LLMEngine, n: int) -> None:
         if n >= loaded.config.num_hidden_layers:
             return loaded
         new_config = dataclasses.replace(loaded.config, num_hidden_layers=n)
-        loaded.runtime_model.layers = loaded.runtime_model.layers[:n]
+        # The layer count is the whole override now: staging reads `config.num_hidden_layers`
+        # and pulls exactly that many layers from the checkpoint, so there is no eager
+        # `runtime_model.layers` list left to truncate.
         loaded.runtime_model.config = new_config
         print(
             f"[override] num_hidden_layers: "

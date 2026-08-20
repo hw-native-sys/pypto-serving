@@ -19,7 +19,6 @@ import torch
 from .tokenizer import TokenizerAdapter, load_tokenizer
 from pypto_serving.config.types import (
     LayerSpec,
-    LayerWeights,
     LoadedModel,
     ModelConfig,
     RuntimeConfig,
@@ -267,19 +266,15 @@ class HuggingFaceDirectoryLoader:
         else:
             lm_head = _cast_weight(lm_head, runtime)
 
-        # Left empty on purpose: the Qwen executor stages the layers itself, one at a time,
-        # reading each through the store it builds from `RuntimeModel.extra`. Populating this
-        # eagerly cost a second copy of the model at the peak — the state dict, the cast
-        # `LayerWeights`, and the stacked destinations all alive together.
-        layers: list[LayerWeights] = []
-
         runtime_model = RuntimeModel(
             config=config,
             runtime=runtime,
             embed_tokens=embed_tokens,
             final_norm_weight=final_norm_weight,
             lm_head=lm_head,
-            layers=layers,
+            # `layers` is left at its default: the executor stages each layer as it reads it,
+            # through the metadata below. Populating it eagerly cost a second copy of the model
+            # at the staging peak.
             extra={"model_dir": str(model_path), "weight_map": weight_map},
         )
 
