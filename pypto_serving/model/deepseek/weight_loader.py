@@ -933,40 +933,45 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
             include_tid2eid=num_hash_layers > 0,
             include_gate_bias=num_hash_layers <= 0,
         )
-        stacked, fwd_names = _allocate_stacked_layer_weights(first, compress_ratios=compress_ratios)
-        csa_order = 0
-        hca_order = 0
-        for layer_id in range(num_hidden_layers):
-            compress_ratio = int(compress_ratios[layer_id])
-            destinations = _stacked_layer_destinations(
-                stacked,
-                first,
-                fwd_names=fwd_names,
-                layer_id=layer_id,
-                compress_ratio=compress_ratio,
-                csa_order=csa_order,
-                hca_order=hca_order,
+        from pypto_serving.model.common.weights.stacker import stack_layers  # noqa: PLC0415
+
+        from .weight_spec import (  # noqa: PLC0415
+            DEEPSEEK_V4_RANK_ERROR,
+            DEEPSEEK_V4_STACK_MISMATCH_ERROR,
+            deepseek_v4_stack_groups,
+        )
+
+        def pack_into(layer_id: int, destinations: Mapping[str, torch.Tensor]) -> None:
+            self.load_packed_layer_weights(
+                layer_id,
+                ranks=ranks,
+                n_routed_experts=n_routed_experts,
+                compress_ratio=int(compress_ratios[layer_id]),
+                include_tid2eid=layer_id < num_hash_layers,
+                include_gate_bias=layer_id >= num_hash_layers,
+                destinations=destinations,
             )
-            if layer_id == 0:
-                _copy_packed_layer(first, destinations)
-            else:
-                self.load_packed_layer_weights(
-                    layer_id,
-                    ranks=ranks,
-                    n_routed_experts=n_routed_experts,
-                    compress_ratio=compress_ratio,
-                    include_tid2eid=layer_id < num_hash_layers,
-                    include_gate_bias=layer_id >= num_hash_layers,
-                    destinations=destinations,
-                )
+
+        def log_progress(layer_id: int) -> None:
+            # Every fifth layer plus the last, and layer 0 included: it takes the template path
+            # rather than pack_into, so logging there would drop the first line of progress.
             if layer_id % 5 == 0 or layer_id == num_hidden_layers - 1:
                 logger.info(
                     "DeepSeekV4 weight load progress: layer %d/%d",
                     layer_id + 1,
                     num_hidden_layers,
                 )
-            csa_order += int(compress_ratio == _DEEPSEEK_V4_CSA_COMPRESS_RATIO)
-            hca_order += int(compress_ratio == _DEEPSEEK_V4_HCA_COMPRESS_RATIO)
+
+        stacked = stack_layers(
+            deepseek_v4_stack_groups(compress_ratios),
+            first.tensors,
+            layer_ids=range(num_hidden_layers),
+            pack_into=pack_into,
+            template_layer_id=0,
+            on_layer_done=log_progress,
+            rank_error=DEEPSEEK_V4_RANK_ERROR,
+            mismatch_error=DEEPSEEK_V4_STACK_MISMATCH_ERROR,
+        )
         return DeepSeekV4StackedLayerWeights(tensors=stacked)
 
     def load_mtp_weights(

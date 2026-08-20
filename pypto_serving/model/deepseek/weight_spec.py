@@ -19,6 +19,8 @@ the resulting name-to-offset map. Reordering these entries would invalidate ever
 already written, so new entries go at the end of the group they belong to.
 """
 
+from collections.abc import Sequence
+
 import torch
 
 from pypto_serving.model.common.weights.shard import ExpertParallel, Replicate
@@ -30,6 +32,7 @@ from pypto_serving.model.common.weights.spec import (
     OptionalWeightRule,
     SyntheticWeightRule,
 )
+from pypto_serving.model.common.weights.stacker import StackGroup
 
 # `wo_a` arrives flattened and is split into this many output groups.
 DEEPSEEK_V4_O_GROUPS = 8
@@ -234,3 +237,41 @@ def deepseek_v4_factories() -> dict[str, object]:
     )
 
     return {"hadamard_idx": deepseek_v4_hadamard_idx}
+
+
+DEEPSEEK_V4_RANK_ERROR = "packed DeepSeekV4 weight {name} must have rank >= 2, got {ndim}"
+DEEPSEEK_V4_STACK_MISMATCH_ERROR = (
+    "packed DeepSeekV4 weight {name} shape/dtype mismatch: source={source}, destination={destination}"
+)
+
+
+def deepseek_v4_stack_groups(compress_ratios: Sequence[int]) -> tuple[StackGroup, ...]:
+    """Describe the three whole-model slab groups for a given per-layer attention layout.
+
+    Every layer contributes to the FWD group; a layer also contributes to CSA or HCA depending
+    on its compress ratio. Membership is expressed as the ordered list of layer ids in each
+    group, so a group's slab holds its layers contiguously in first-appearance order — which is
+    what the fused kernels index, and what the prepacked sidecar's offsets were written from.
+
+    The FWD group declares ``members=None``: it is everything the other two do not claim, taken
+    in the packer's own order, so a new weight joins it without being named here.
+    """
+    from pypto_serving.model.deepseek.weight_loader import (  # noqa: PLC0415 -- cycle at import time
+        DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES,
+        DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES,
+    )
+
+    ratios = [int(ratio) for ratio in compress_ratios]
+    return (
+        StackGroup(id="fwd", members=None, layer_ids=tuple(range(len(ratios)))),
+        StackGroup(
+            id="csa",
+            members=tuple(DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES),
+            layer_ids=tuple(i for i, ratio in enumerate(ratios) if ratio == DEEPSEEK_V4_CSA_RATIO),
+        ),
+        StackGroup(
+            id="hca",
+            members=tuple(DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES),
+            layer_ids=tuple(i for i, ratio in enumerate(ratios) if ratio == DEEPSEEK_V4_HCA_RATIO),
+        ),
+    )
