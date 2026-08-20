@@ -938,8 +938,10 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
         from .weight_spec import (  # noqa: PLC0415
             DEEPSEEK_V4_RANK_ERROR,
             DEEPSEEK_V4_STACK_MISMATCH_ERROR,
+            DEEPSEEK_V4_STAGING_POLICY,
             deepseek_v4_stack_groups,
         )
+
 
         def pack_into(layer_id: int, destinations: Mapping[str, torch.Tensor]) -> None:
             self.load_packed_layer_weights(
@@ -969,6 +971,7 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
             pack_into=pack_into,
             template_layer_id=0,
             on_layer_done=log_progress,
+            policy=DEEPSEEK_V4_STAGING_POLICY,
             rank_error=DEEPSEEK_V4_RANK_ERROR,
             mismatch_error=DEEPSEEK_V4_STACK_MISMATCH_ERROR,
         )

@@ -16,6 +16,7 @@ from .shard import ExpertParallel, Replicate
 from .spec import (
     DefaultedWeightRule,
     ExpertWeightRule,
+    GlobalWeightRule,
     LayerContext,
     LayerRule,
     LayerWeightRule,
@@ -168,3 +169,66 @@ def _zero_filled(
         )
     destination.zero_()
     return destination
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return -(-int(value) // int(multiple)) * int(multiple)
+
+
+def pad_rows(
+    name: str,
+    weight: torch.Tensor,
+    *,
+    rows: int,
+    fill: str,
+) -> torch.Tensor:
+    """Grow *weight* to ``rows`` along dim 0, filling the new rows per ``fill``.
+
+    ``"zeros"`` is the neutral choice for an embedding: a padded token id is never looked up.
+    ``"first_row"`` replicates row 0, which is what an LM head needs — zero rows there would
+    give every padded vocabulary entry the same finite logit rather than an impossible one, so
+    the error would look like sampling noise instead of a crash.
+    """
+    have = int(weight.shape[0])
+    if rows == have:
+        return weight
+    if rows < have:
+        raise ValueError(f"{name} has {have} rows, cannot pad down to {rows}")
+    missing = rows - have
+    if fill == "zeros":
+        padding = torch.zeros((missing, *weight.shape[1:]), dtype=weight.dtype, device=weight.device)
+    elif fill == "first_row":
+        padding = weight[:1].expand(missing, *weight.shape[1:]).clone()
+    else:
+        raise ValueError(f"{name} has unsupported pad fill {fill!r}")
+    return torch.cat([weight, padding], dim=0)
+
+
+def pack_globals(
+    rules: Sequence[GlobalWeightRule],
+    available: Mapping[str, torch.Tensor],
+    *,
+    padded_rows: Mapping[str, int] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Resolve, pad and cast the whole-model weights named by ``rules``.
+
+    ``padded_rows`` lets a caller state the target row count directly — a fused kernel's
+    hard-coded vocabulary, say — instead of it being derived here; a rule with
+    ``pad_to_multiple`` and no explicit target rounds its own row count up.
+
+    ``torch.cat`` appears here, unlike in the stacker, and deliberately: padding grows a weight
+    that has no preallocated destination, and the whole-model weights are a handful of tensors
+    rather than the bulk of the model.
+    """
+    packed: dict[str, torch.Tensor] = {}
+    for rule in rules:
+        tensor = rule.resolve(available)
+        target = None if padded_rows is None else padded_rows.get(rule.name)
+        if target is None and rule.pad_to_multiple is not None:
+            target = _round_up(int(tensor.shape[0]), rule.pad_to_multiple)
+        if target is not None:
+            tensor = pad_rows(rule.name, tensor, rows=target, fill=rule.pad_fill)
+        if rule.flatten_to_row:
+            tensor = tensor.view(1, -1)
+        packed[rule.name] = tensor.to(dtype=rule.dtype).contiguous().cpu()
+    return packed

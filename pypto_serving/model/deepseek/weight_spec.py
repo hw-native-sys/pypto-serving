@@ -23,10 +23,12 @@ from collections.abc import Sequence
 
 import torch
 
+from pypto_serving.model.common.weights.pipeline import StagingPolicy
 from pypto_serving.model.common.weights.shard import ExpertParallel, Replicate
 from pypto_serving.model.common.weights.spec import (
     DefaultedWeightRule,
     ExpertWeightRule,
+    GlobalWeightRule,
     LayerRule,
     LayerWeightRule,
     OptionalWeightRule,
@@ -275,3 +277,20 @@ def deepseek_v4_stack_groups(compress_ratios: Sequence[int]) -> tuple[StackGroup
             layer_ids=tuple(i for i, ratio in enumerate(ratios) if ratio == DEEPSEEK_V4_HCA_RATIO),
         ),
     )
+
+
+# DeepSeekV4 stages serially: packing one layer allocates ~8 GB of intermediates (256 routed
+# experts, each stacked and rank-replicated), so overlapping layers multiplies the peak and
+# contends on memory bandwidth rather than hiding latency.
+DEEPSEEK_V4_STAGING_POLICY = StagingPolicy(workers=1)
+
+# The whole-model weights. `head.weight` has no fallback here: unlike Qwen, a DeepSeekV4
+# checkpoint always ships an untied LM head, and the packing it needs (contiguous TP vocab
+# shards) is not expressible as a padded cast, so it stays in `pack_deepseek_v4_lm_head_weight`.
+DEEPSEEK_V4_GLOBAL_RULES: tuple[GlobalWeightRule, ...] = (
+    GlobalWeightRule("embed_weight", "embed.weight", torch.bfloat16),
+    GlobalWeightRule("final_norm_weight", "norm.weight", torch.bfloat16),
+    GlobalWeightRule("hc_head_fn", "hc_head_fn", torch.float32),
+    GlobalWeightRule("hc_head_scale", "hc_head_scale", torch.float32),
+    GlobalWeightRule("hc_head_base", "hc_head_base", torch.float32),
+)

@@ -20,8 +20,12 @@ have to pay, so nothing here ever calls ``torch.cat``.
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from .pipeline import StagingPolicy
 
 
 @dataclass(frozen=True)
@@ -161,6 +165,7 @@ def stack_layers(
     pack_into: Callable[[int, Mapping[str, torch.Tensor]], None],
     template_layer_id: int | None = None,
     on_layer_done: Callable[[int], None] | None = None,
+    policy: "StagingPolicy | None" = None,
     rank_error: str = "packed weight {name} must have rank >= 2, got {ndim}",
     mismatch_error: str = (
         "packed weight {name} shape/dtype mismatch: source={source}, destination={destination}"
@@ -175,15 +180,29 @@ def stack_layers(
 
     ``on_layer_done`` fires once per layer whichever path it took, so progress reporting does
     not silently skip the template layer.
+
+    ``policy`` decides whether layers are staged one at a time or overlapped. Overlapping is
+    safe here by construction — each layer writes a disjoint slice of each slab, so no two
+    workers touch the same bytes — but it is not always *faster*, which is why it is the
+    caller's call: a family whose per-layer packing allocates gigabytes of intermediates pays
+    more in peak memory and bandwidth contention than it gains in hidden latency.
     """
+    from .pipeline import StagingPolicy, stage_layers  # noqa: PLC0415 -- avoids a cycle
+
     resolved = resolve_members(groups, template)
     slabs = allocate_slabs(resolved, template, rank_error=rank_error)
-    for layer_id in layer_ids:
+
+    def _stage(layer_id: int) -> None:
         destinations = destinations_for(slabs, resolved, template, layer_id=layer_id)
         if template_layer_id is not None and int(layer_id) == int(template_layer_id):
             copy_packed_layer(template, destinations, mismatch_error=mismatch_error)
         else:
             pack_into(int(layer_id), destinations)
-        if on_layer_done is not None:
-            on_layer_done(int(layer_id))
+
+    stage_layers(
+        list(layer_ids),
+        stage=_stage,
+        policy=policy if policy is not None else StagingPolicy(workers=1),
+        on_layer_done=on_layer_done,
+    )
     return slabs

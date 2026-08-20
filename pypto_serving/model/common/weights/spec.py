@@ -15,7 +15,7 @@ hand-written pack function; the point of keeping it small is that every field he
 be reproducible byte-for-byte by the evaluator.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -126,3 +126,44 @@ class ExpertWeightRule:
 
 
 LayerRule = LayerWeightRule | OptionalWeightRule | DefaultedWeightRule | SyntheticWeightRule | ExpertWeightRule
+
+
+@dataclass(frozen=True)
+class GlobalWeightRule:
+    """A whole-model weight — embedding, LM head, final norm — and how it is conditioned.
+
+    These differ from layer weights in three ways that all have to be expressible, because
+    getting any of them wrong is silent rather than loud:
+
+    * ``fallback_source`` — a checkpoint with tied embeddings ships no ``lm_head``, and the
+      embedding is used in its place. Falling back is correct; inventing zeros is not.
+    * ``pad_to_multiple`` — the fused LM head hard-codes a padded vocabulary, so the weight has
+      to be grown to match it. The padded rows are never selected at runtime, but they are
+      matmul operands, so what goes in them still matters numerically.
+    * ``pad_fill`` — and it is not the same for the two: the embedding pads with zeros, while
+      the LM head pads by **replicating its first row**. Zero rows in an LM head would score
+      every padded token identically at logit 0, which is a plausible-looking value rather than
+      an impossible one, so a wrong choice here survives review and shows up as sampling noise.
+    """
+
+    name: str
+    source: str
+    dtype: torch.dtype
+    fallback_source: str | None = None
+    pad_to_multiple: int | None = None
+    pad_fill: str = "zeros"
+    flatten_to_row: bool = False
+
+    def resolve(self, available: "Mapping[str, torch.Tensor]") -> torch.Tensor:
+        """Pick this weight's source tensor, honouring the tied-weight fallback."""
+        tensor = available.get(self.source)
+        if tensor is not None:
+            return tensor
+        if self.fallback_source is not None:
+            fallback = available.get(self.fallback_source)
+            if fallback is not None:
+                return fallback
+        raise KeyError(
+            f"missing global weight {self.name}: neither {self.source!r} nor its fallback "
+            f"{self.fallback_source!r} is present"
+        )
