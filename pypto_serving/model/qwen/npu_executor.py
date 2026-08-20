@@ -342,90 +342,88 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
 
     @classmethod
     def _stage_stacked_decode_weights(cls, model: RuntimeModel) -> dict[str, torch.Tensor]:
-        """Stage per-layer weights into pre-allocated stacked shm tensors,
-        copying layers in parallel across worker threads.
+        """Stage per-layer weights into pre-allocated stacked shm tensors, one layer at a time.
 
-        Each weight kind gets one stacked tensor (num_layers slabs along dim 0):
-        projections are transposed to bf16, norm gammas to [1, N] float. Peak
-        host memory is ~1x (only the stacked destination plus the transient views
-        live at once). The per-layer copies dominate startup (~90s serially for a
-        14B), so they run on a thread pool: each layer owns a disjoint row-slice
-        of every stacked tensor, and ``copy_`` releases the GIL for the memcpy +
-        dtype cast, so the copies genuinely overlap.
+        Each weight kind gets one stacked tensor (num_layers slabs along dim 0): projections are
+        transposed to bf16, norm gammas become ``[1, N]`` float32 rows. The layout, the dtypes
+        and the checkpoint names it reads all come from ``qwen/weight_spec.py``; what stays here
+        is the wiring.
+
+        Peak host memory is ~1x: one layer's raw tensors are read, written into their slice, and
+        dropped before the next layer is read. Reading the whole checkpoint up front — as the
+        loader used to — kept the state dict, the cast per-layer copies and the destinations all
+        alive at once.
+
+        The per-layer copies dominate startup (~90s serially for a 14B), so they run on a thread
+        pool: each layer owns a disjoint row-slice of every stacked tensor, and ``copy_`` releases
+        the GIL for the memcpy and the dtype cast, so they genuinely overlap.
         """
-        from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+        from pypto_serving.model.common.weights.packer import pack_layer  # noqa: PLC0415
+        from pypto_serving.model.common.weights.spec import LayerContext  # noqa: PLC0415
+        from pypto_serving.model.common.weights.stacker import stack_layers  # noqa: PLC0415
 
-        layers = model.layers
-        num_layers = len(layers)
-        fields = (
-            ("input_rms_weight", "decode_input_rms_weight", "norm"),
-            ("wq", "decode_wq", "proj"),
-            ("wk", "decode_wk", "proj"),
-            ("wv", "decode_wv", "proj"),
-            ("q_norm_weight", "decode_q_norm_weight", "norm"),
-            ("k_norm_weight", "decode_k_norm_weight", "norm"),
-            ("wo", "decode_wo", "proj"),
-            ("post_rms_weight", "decode_post_rms_weight", "norm"),
-            ("w_gate", "decode_w_gate", "proj"),
-            ("w_up", "decode_w_up", "proj"),
-            ("w_down", "decode_w_down", "proj"),
+        from .weight_spec import (  # noqa: PLC0415
+            QWEN_LAYER_RULES,
+            QwenWeightStore,
+            qwen_layer_prefix,
+            qwen_layer_weight_names,
+            qwen_policy,
+            qwen_stack_groups,
+            qwen_staging_policy,
         )
 
-        def _ready_view(layer, attr: str, kind: str):
-            t = getattr(layer, attr).cpu()
-            # reshape (not view): norm gammas are 1-D contiguous today, but
-            # reshape also handles a non-contiguous source without raising.
-            return t.transpose(0, 1) if kind == "proj" else t.reshape(1, -1)
+        num_layers = int(model.config.num_hidden_layers)
+        store = cls._weight_store(model, QwenWeightStore)
+        head_dim = int(model.config.head_dim)
 
-        # Pre-allocate every stacked shm tensor once (shapes taken from layer 0,
-        # uniform across a transformer) so the parallel loop only writes into
-        # already-sized, disjoint slices -- no dict mutation or allocation race.
-        # Sizes come straight from tensor metadata: a "proj" weight [out, in]
-        # stacks its transpose to [num_layers*in, out]; a "norm" gamma [dim]
-        # stacks to [num_layers, dim]. Reading only .shape/.dtype avoids a
-        # redundant .cpu()/transpose of layer 0 (which _stage_layer(0) redoes).
-        stacked: dict[str, torch.Tensor] = {}
-        rows_by_key: dict[str, int] = {}
-        first = layers[0]
-        for attr, key, kind in fields:
-            t = getattr(first, attr)
-            if kind == "proj":
-                rows = t.shape[1]
-                shape = (num_layers * rows, t.shape[0])
-                dtype = torch.bfloat16
-            else:
-                rows = 1
-                shape = (num_layers, t.shape[0])
-                dtype = torch.float32
-            rows_by_key[key] = rows
-            stacked[key] = torch.empty(shape, dtype=dtype).share_memory_()
+        def context(layer_id: int) -> LayerContext:
+            return LayerContext(
+                layer_id=layer_id,
+                prefix=qwen_layer_prefix(layer_id),
+                ranks=1,
+                dims={"head_dim": head_dim},
+            )
 
-        def _stage_layer(i: int) -> None:
-            layer = layers[i]
-            for attr, key, kind in fields:
-                rows = rows_by_key[key]
-                # Disjoint per-layer slice -> safe to write concurrently.
-                stacked[key][i * rows:(i + 1) * rows].copy_(_ready_view(layer, attr, kind))
-            cls._release_layer_weights(layer)
+        def read(layer_id: int) -> dict[str, torch.Tensor]:
+            # Optional names (the QK norms) may be absent; the rules default them.
+            names = [name for name in qwen_layer_weight_names(layer_id) if name in store]
+            return store.load_many(names)
 
-        workers = cls._staging_worker_count(num_layers)
-        if workers <= 1:
-            for i in range(num_layers):
-                _stage_layer(i)
-        else:
-            # Pin torch intra-op parallelism to 1 for the duration of the pool:
-            # each copy_ would otherwise fan out to its own OpenMP/MKL threads,
-            # and N pool threads x that fan-out oversubscribes a many-core host
-            # (the >32-thread staging regression). One intra-op thread per copy
-            # keeps the coarse per-layer parallelism clean.
-            orig_threads = torch.get_num_threads()
-            torch.set_num_threads(1)
-            try:
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    list(pool.map(_stage_layer, range(num_layers)))
-            finally:
-                torch.set_num_threads(orig_threads)
-        return stacked
+        # Layer 0 packed on its own sizes the slabs; the shapes are uniform across a transformer.
+        template = pack_layer(QWEN_LAYER_RULES, read(0), context(0), policy=qwen_policy())
+
+        def pack_into(layer_id: int, destinations: dict[str, torch.Tensor]) -> None:
+            pack_layer(
+                QWEN_LAYER_RULES,
+                read(layer_id),
+                context(layer_id),
+                policy=qwen_policy(),
+                destinations=destinations,
+            )
+
+        return stack_layers(
+            qwen_stack_groups(num_layers),
+            template,
+            layer_ids=range(num_layers),
+            pack_into=pack_into,
+            template_layer_id=0,
+            stack_axis=0,
+            allocate=lambda shape, dtype: torch.empty(shape, dtype=dtype).share_memory_(),
+            policy=qwen_staging_policy(num_layers, cls._staging_worker_count(num_layers)),
+        )
+
+    @staticmethod
+    def _weight_store(model: RuntimeModel, store_cls):
+        """Open a lazy checkpoint store from the metadata the loader left in ``extra``."""
+        model_dir = model.extra.get("model_dir")
+        weight_map = model.extra.get("weight_map")
+        if not model_dir or not isinstance(weight_map, dict):
+            raise ValueError(
+                "Qwen3 staging needs the checkpoint metadata the loader records in "
+                "RuntimeModel.extra ('model_dir' and 'weight_map'); this model was loaded "
+                "without them."
+            )
+        return store_cls(model_dir=model_dir, weight_map=weight_map)
 
     @staticmethod
     def _staging_worker_count(num_layers: int) -> int:
@@ -457,22 +455,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         if tensor.device.type == "cpu" and not tensor.is_shared():
             return tensor.share_memory_()
         return tensor
-
-    @staticmethod
-    def _release_layer_weights(layer) -> None:
-        """Drop original layer tensors after kernel-ready copies are built."""
-        empty = torch.empty(0)
-        layer.input_rms_weight = empty
-        layer.wq = empty
-        layer.wk = empty
-        layer.wv = empty
-        layer.q_norm_weight = empty
-        layer.k_norm_weight = empty
-        layer.wo = empty
-        layer.post_rms_weight = empty
-        layer.w_gate = empty
-        layer.w_up = empty
-        layer.w_down = empty
 
     @staticmethod
     def _validate_supported_shape(model: RuntimeModel) -> None:

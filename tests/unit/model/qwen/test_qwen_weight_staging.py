@@ -14,6 +14,7 @@
 # transposed. This reproduces `_stage_stacked_decode_weights` and compares.
 from __future__ import annotations
 
+import pytest
 import torch
 
 from pypto_serving.model.common.weights.packer import pack_globals, pack_layer
@@ -247,3 +248,123 @@ class TestQwenGlobals:
         from pypto_serving.model.qwen.weight_spec import QWEN_VOCAB_PAD_MULTIPLE
 
         assert QWEN_VOCAB_PAD_MULTIPLE % 64 == 0
+
+
+# --- end to end -----------------------------------------------------------------------------
+#
+# Everything above compares the rule table against a reproduction of the executor's old loop.
+# That is necessary but not sufficient: it proves the table matches *my reading* of the loop.
+# The tests below drive the real `_stage_stacked_decode_weights` against a checkpoint on disk
+# and compare it to the same reproduction, which is what closes the loop.
+
+
+def _write_hf_checkpoint(tmp_path, *, with_qk_norm=True, layers=_LAYERS):
+    """Write a minimal Hugging Face-style Qwen3 checkpoint: one shard plus an index."""
+    import json
+
+    from safetensors.torch import save_file
+
+    tensors = {}
+    for layer_id in range(layers):
+        prefix = qwen_layer_prefix(layer_id)
+        for index, (suffix, shape) in enumerate(_SHAPES.items()):
+            if not with_qk_norm and suffix in {"self_attn.q_norm.weight", "self_attn.k_norm.weight"}:
+                continue
+            count = 1
+            for dim in shape:
+                count *= dim
+            values = torch.arange(count, dtype=torch.float32) + (layer_id * 1000 + index * 10)
+            tensors[f"{prefix}.{suffix}"] = values.reshape(shape).to(torch.bfloat16)
+    tensors["model.embed_tokens.weight"] = torch.arange(
+        _VOCAB * _HIDDEN, dtype=torch.float32
+    ).reshape(_VOCAB, _HIDDEN).to(torch.bfloat16)
+    tensors["model.norm.weight"] = torch.ones(_HIDDEN, dtype=torch.bfloat16)
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: "model.safetensors" for name in tensors}})
+    )
+    return {name: "model.safetensors" for name in tensors}
+
+
+def _runtime_model(tmp_path, weight_map, *, layers=_LAYERS):
+    """A RuntimeModel shaped like what the metadata-only loader now produces."""
+    from pypto_serving.config.types import ModelConfig, RuntimeConfig, RuntimeModel
+
+    config = ModelConfig(
+        model_id="qwen-test",
+        architecture="Qwen3ForCausalLM",
+        vocab_size=_VOCAB,
+        hidden_size=_HIDDEN,
+        intermediate_size=_INTERMEDIATE,
+        num_hidden_layers=layers,
+        num_attention_heads=_HEADS,
+        num_key_value_heads=_HEADS,
+        head_dim=_HEAD_DIM,
+        max_position_embeddings=64,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        bos_token_id=0,
+        eos_token_id=1,
+        pad_token_id=None,
+        torch_dtype="bfloat16",
+    )
+    return RuntimeModel(
+        config=config,
+        runtime=RuntimeConfig(max_seq_len=64),
+        embed_tokens=torch.zeros(_VOCAB, _HIDDEN),
+        final_norm_weight=torch.ones(_HIDDEN),
+        lm_head=torch.zeros(_VOCAB, _HIDDEN),
+        layers=[],
+        extra={"model_dir": str(tmp_path), "weight_map": weight_map},
+    )
+
+
+def test_the_executor_stages_what_the_old_loop_staged(tmp_path, fingerprint_tensors):
+    """The real staging path, on a checkpoint on disk, against the old behaviour."""
+    from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor
+
+    weight_map = _write_hf_checkpoint(tmp_path)
+    model = _runtime_model(tmp_path, weight_map)
+
+    staged = Qwen314BPyptoExecutor._stage_stacked_decode_weights(model)
+
+    legacy = _legacy_stage(_raw_layers())
+    assert list(staged) == list(legacy)
+    assert fingerprint_tensors(staged) == fingerprint_tensors(legacy)
+
+
+def test_staged_slabs_are_shared_memory(tmp_path):
+    """The upload reads these from a forked child, so they have to be shared, not private."""
+    from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor
+
+    weight_map = _write_hf_checkpoint(tmp_path)
+
+    staged = Qwen314BPyptoExecutor._stage_stacked_decode_weights(_runtime_model(tmp_path, weight_map))
+
+    for name, tensor in staged.items():
+        assert tensor.is_shared(), f"{name} is not in shared memory"
+
+
+def test_a_checkpoint_without_qk_norms_still_stages(tmp_path, fingerprint_tensors):
+    """The absent-QK-norm variant, through the real path rather than the reproduction."""
+    from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor
+
+    weight_map = _write_hf_checkpoint(tmp_path, with_qk_norm=False)
+
+    staged = Qwen314BPyptoExecutor._stage_stacked_decode_weights(_runtime_model(tmp_path, weight_map))
+
+    assert fingerprint_tensors(staged) == fingerprint_tensors(
+        _legacy_stage(_raw_layers(with_qk_norm=False), with_qk_norm=False)
+    )
+
+
+def test_staging_without_the_loader_metadata_says_so(tmp_path):
+    """A model loaded by some other path must fail with an actionable message, not a KeyError."""
+    from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor
+
+    weight_map = _write_hf_checkpoint(tmp_path)
+    model = _runtime_model(tmp_path, weight_map)
+    model.extra.pop("weight_map")
+
+    with pytest.raises(ValueError, match="RuntimeModel.extra"):
+        Qwen314BPyptoExecutor._stage_stacked_decode_weights(model)

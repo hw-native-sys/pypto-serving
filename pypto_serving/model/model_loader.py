@@ -107,18 +107,36 @@ def _safetensors_shard_filenames(weight_map: dict[str, str]) -> list[str]:
     return sorted(set(weight_map.values()))
 
 
-def _load_safetensors_dir(model_dir: Path) -> dict[str, torch.Tensor]:
-    """Load all safetensors shards from a local Hugging Face directory."""
+def _load_safetensors_subset(
+    model_dir: Path,
+    weight_map: dict[str, str],
+    names: tuple[str, ...],
+) -> dict[str, torch.Tensor]:
+    """Load only *names*, opening each shard once and skipping absent optional weights.
+
+    Reads through `safe_open` rather than `load_file` so a shard contributes only the tensors
+    asked for: the point of this path is that the checkpoint is never fully resident, and
+    `load_file` would materialize a whole shard to reach one tensor in it.
+    """
     try:
-        from safetensors.torch import load_file
+        from safetensors import safe_open
     except ImportError as exc:
         raise RuntimeError("safetensors is required to load weights from a local model directory.") from exc
 
-    weight_map = _load_safetensors_weight_map(model_dir)
-    filenames = _safetensors_shard_filenames(weight_map)
+    wanted: dict[str, list[str]] = {}
+    for name in names:
+        filename = weight_map.get(name)
+        if filename is None:
+            # Optional weights (a tied `lm_head`, an alternative final-norm name) are absent by
+            # design; the caller decides what a missing one means.
+            continue
+        wanted.setdefault(filename, []).append(name)
+
     state_dict: dict[str, torch.Tensor] = {}
-    for filename in filenames:
-        state_dict.update(load_file(str(model_dir / filename)))
+    for filename, shard_names in wanted.items():
+        with safe_open(str(model_dir / filename), framework="pt", device="cpu") as reader:
+            for name in shard_names:
+                state_dict[name] = reader.get_tensor(name)
     return state_dict
 
 
@@ -217,7 +235,20 @@ class HuggingFaceDirectoryLoader:
         config = _build_model_config(request.model_id, config_data, tokenizer)
         runtime = request.runtime_config or RuntimeConfig(max_seq_len=config.max_position_embeddings)
         layer_specs = _build_layer_specs(config)
-        state_dict = _load_safetensors_dir(model_path)
+        weight_map = _load_safetensors_weight_map(model_path)
+        # Metadata plus the globals only. `embed_tokens` has to stay resident because
+        # `Executor.lookup_embeddings` reads it at request time; the other two are one tensor
+        # each. Every per-layer tensor is read later, while it is staged.
+        state_dict = _load_safetensors_subset(
+            model_path,
+            weight_map,
+            (
+                "model.embed_tokens.weight",
+                "model.norm.weight",
+                "model.final_layernorm.weight",
+                "lm_head.weight",
+            ),
+        )
 
         if config.architecture.lower() not in {"qwen2forcausallm", "qwen3forcausallm", "qwen2model", "qwen3model"}:
             raise ValueError(
@@ -236,38 +267,11 @@ class HuggingFaceDirectoryLoader:
         else:
             lm_head = _cast_weight(lm_head, runtime)
 
+        # Left empty on purpose: the Qwen executor stages the layers itself, one at a time,
+        # reading each through the store it builds from `RuntimeModel.extra`. Populating this
+        # eagerly cost a second copy of the model at the peak — the state dict, the cast
+        # `LayerWeights`, and the stacked destinations all alive together.
         layers: list[LayerWeights] = []
-        default_dtype = _torch_dtype_from_name(runtime.weight_dtype)
-        for spec in layer_specs:
-            prefix = f"model.layers.{spec.layer_idx}"
-            q_norm = _optional_tensor(state_dict, [f"{prefix}.self_attn.q_norm.weight"])
-            k_norm = _optional_tensor(state_dict, [f"{prefix}.self_attn.k_norm.weight"])
-            if q_norm is None:
-                q_norm = torch.ones(spec.head_dim, device=runtime.device, dtype=default_dtype)
-            else:
-                q_norm = _cast_weight(q_norm, runtime)
-            if k_norm is None:
-                k_norm = torch.ones(spec.head_dim, device=runtime.device, dtype=default_dtype)
-            else:
-                k_norm = _cast_weight(k_norm, runtime)
-            layers.append(
-                LayerWeights(
-                    input_rms_weight=_cast_weight(_require_tensor(state_dict, f"{prefix}.input_layernorm.weight"), runtime),
-                    wq=_cast_weight(_require_tensor(state_dict, f"{prefix}.self_attn.q_proj.weight"), runtime),
-                    wk=_cast_weight(_require_tensor(state_dict, f"{prefix}.self_attn.k_proj.weight"), runtime),
-                    wv=_cast_weight(_require_tensor(state_dict, f"{prefix}.self_attn.v_proj.weight"), runtime),
-                    q_norm_weight=q_norm,
-                    k_norm_weight=k_norm,
-                    wo=_cast_weight(_require_tensor(state_dict, f"{prefix}.self_attn.o_proj.weight"), runtime),
-                    post_rms_weight=_cast_weight(
-                        _require_tensor(state_dict, f"{prefix}.post_attention_layernorm.weight"),
-                        runtime,
-                    ),
-                    w_gate=_cast_weight(_require_tensor(state_dict, f"{prefix}.mlp.gate_proj.weight"), runtime),
-                    w_up=_cast_weight(_require_tensor(state_dict, f"{prefix}.mlp.up_proj.weight"), runtime),
-                    w_down=_cast_weight(_require_tensor(state_dict, f"{prefix}.mlp.down_proj.weight"), runtime),
-                )
-            )
 
         runtime_model = RuntimeModel(
             config=config,
@@ -276,6 +280,7 @@ class HuggingFaceDirectoryLoader:
             final_norm_weight=final_norm_weight,
             lm_head=lm_head,
             layers=layers,
+            extra={"model_dir": str(model_path), "weight_map": weight_map},
         )
 
         return LoadedModel(
