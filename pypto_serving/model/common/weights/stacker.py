@@ -85,14 +85,24 @@ def allocate_slabs(
     groups: Sequence[StackGroup],
     template: Mapping[str, torch.Tensor],
     *,
+    stack_axis: int = 1,
+    allocate: Callable[[tuple[int, ...], torch.dtype], torch.Tensor] | None = None,
     rank_error: str = "packed weight {name} must have rank >= 2, got {ndim}",
 ) -> dict[str, torch.Tensor]:
     """Allocate one whole-model slab per weight, sized from *template* and the group's layers.
 
     A group with no layers allocates nothing: a model that uses none of an attention kind must
-    not reserve slabs for it. Stacking is on dim 1 because dim 0 is the rank axis, which
-    ``alloc_stacked_tensor`` shards on.
+    not reserve slabs for it.
+
+    ``stack_axis`` is where the layers go. It differs per family and is not cosmetic: a
+    DeepSeekV4 weight leads with the rank axis that ``alloc_stacked_tensor`` shards on, so its
+    layers stack on axis 1, while a rank-less Qwen weight stacks on axis 0. Getting it wrong
+    produces a correctly-sized slab holding a transposed model.
+
+    ``allocate`` builds each slab, defaulting to plain host memory. A family whose upload reads
+    the slab from a forked child passes one that returns shared memory instead.
     """
+    build = allocate if allocate is not None else (lambda shape, dtype: torch.empty(shape, dtype=dtype, device="cpu"))
     slabs: dict[str, torch.Tensor] = {}
     for group in groups:
         count = len(group.layer_ids)
@@ -102,8 +112,11 @@ def allocate_slabs(
             source = template[name]
             if source.ndim < 2:
                 raise ValueError(rank_error.format(name=name, ndim=source.ndim))
-            shape = (int(source.shape[0]), count * int(source.shape[1]), *source.shape[2:])
-            slabs[name] = torch.empty(shape, dtype=source.dtype, device="cpu")
+            if not -source.ndim <= stack_axis < source.ndim:
+                raise ValueError(f"stack_axis {stack_axis} is out of range for {name} with rank {source.ndim}")
+            shape = list(int(dim) for dim in source.shape)
+            shape[stack_axis] *= count
+            slabs[name] = build(tuple(shape), source.dtype)
     return slabs
 
 
@@ -113,6 +126,7 @@ def destinations_for(
     template: Mapping[str, torch.Tensor],
     *,
     layer_id: int,
+    stack_axis: int = 1,
 ) -> dict[str, torch.Tensor]:
     """Return this layer's slice of every slab it belongs to, as views into the slabs.
 
@@ -125,8 +139,8 @@ def destinations_for(
         if position is None:
             continue
         for name in group.members or ():
-            width = int(template[name].shape[1])
-            destinations[name] = slabs[name][:, position * width : (position + 1) * width]
+            width = int(template[name].shape[stack_axis])
+            destinations[name] = slabs[name].narrow(stack_axis, position * width, width)
     return destinations
 
 
@@ -166,6 +180,8 @@ def stack_layers(
     template_layer_id: int | None = None,
     on_layer_done: Callable[[int], None] | None = None,
     policy: "StagingPolicy | None" = None,
+    stack_axis: int = 1,
+    allocate: Callable[[tuple[int, ...], torch.dtype], torch.Tensor] | None = None,
     rank_error: str = "packed weight {name} must have rank >= 2, got {ndim}",
     mismatch_error: str = (
         "packed weight {name} shape/dtype mismatch: source={source}, destination={destination}"
@@ -190,10 +206,14 @@ def stack_layers(
     from .pipeline import StagingPolicy, stage_layers  # noqa: PLC0415 -- avoids a cycle
 
     resolved = resolve_members(groups, template)
-    slabs = allocate_slabs(resolved, template, rank_error=rank_error)
+    slabs = allocate_slabs(
+        resolved, template, stack_axis=stack_axis, allocate=allocate, rank_error=rank_error
+    )
 
     def _stage(layer_id: int) -> None:
-        destinations = destinations_for(slabs, resolved, template, layer_id=layer_id)
+        destinations = destinations_for(
+            slabs, resolved, template, layer_id=layer_id, stack_axis=stack_axis
+        )
         if template_layer_id is not None and int(layer_id) == int(template_layer_id):
             copy_packed_layer(template, destinations, mismatch_error=mismatch_error)
         else:

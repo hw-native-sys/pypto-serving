@@ -194,9 +194,24 @@ DEEPSEEK_V4_OPTIONAL_LAYER_RULES: tuple[LayerRule, ...] = (
 
 # Router weights: the checkpoint carries one or the other depending on the layer, and the
 # unused mode is a zero placeholder of the shape its kernel signature expects.
+# `required_when` and beyond are passed by keyword on purpose: these rules grew two optional
+# fields after `default_shape`, and a positional argument silently landing in the wrong one is
+# the kind of mistake that produces a plausible tensor of the wrong shape.
 DEEPSEEK_V4_ROUTER_LAYER_RULES: tuple[LayerRule, ...] = (
-    DefaultedWeightRule("gate_bias", "ffn.gate.bias", torch.float32, ("n_routed_experts",), "include_gate_bias"),
-    DefaultedWeightRule("tid2eid", "ffn.gate.tid2eid", torch.int32, (_VOCAB_SIZE, _TOPK), "include_tid2eid"),
+    DefaultedWeightRule(
+        "gate_bias",
+        "ffn.gate.bias",
+        torch.float32,
+        ("n_routed_experts",),
+        required_when="include_gate_bias",
+    ),
+    DefaultedWeightRule(
+        "tid2eid",
+        "ffn.gate.tid2eid",
+        torch.int32,
+        (_VOCAB_SIZE, _TOPK),
+        required_when="include_tid2eid",
+    ),
 )
 
 # Routed experts, sharded across ranks rather than replicated.

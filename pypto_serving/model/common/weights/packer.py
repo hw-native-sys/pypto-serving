@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 
 import torch
 
-from .shard import ExpertParallel, Replicate
+from .shard import ExpertParallel, NoShard, Replicate
 from .spec import (
     DefaultedWeightRule,
     ExpertWeightRule,
@@ -41,7 +41,7 @@ def pack_layer(
     raw: Mapping[str, torch.Tensor],
     context: LayerContext,
     *,
-    policy: Replicate,
+    policy: Replicate | NoShard,
     expert_policy: ExpertParallel | None = None,
     factories: Mapping[str, Callable[[], torch.Tensor]] | None = None,
     destinations: Mapping[str, torch.Tensor] | None = None,
@@ -115,9 +115,17 @@ def pack_layer(
         if isinstance(rule, DefaultedWeightRule):
             tensor = raw.get(context.source_name(rule.source))
             if tensor is None:
-                if getattr(context, rule.required_when):
+                if rule.required_when is not None and getattr(context, rule.required_when):
                     raise KeyError(missing_source_error.format(name=context.source_name(rule.source)))
-                tensor = torch.zeros(resolve_shape(rule.default_shape, context), dtype=rule.dtype)
+                shape = resolve_shape(rule.default_shape, context)
+                if rule.default_fill == "zeros":
+                    tensor = torch.zeros(shape, dtype=rule.dtype)
+                elif rule.default_fill == "ones":
+                    tensor = torch.ones(shape, dtype=rule.dtype)
+                else:
+                    raise ValueError(f"{rule.name} has unsupported default fill {rule.default_fill!r}")
+            if rule.flatten_to_row:
+                tensor = tensor.reshape(1, -1)
             packed[rule.name] = policy.apply(
                 rule.name, tensor, dtype=rule.dtype, destination=destination
             )
@@ -135,6 +143,10 @@ def pack_layer(
             tensor = _reshaped_groups(rule.name, tensor, rule.reshape_groups)
         if rule.transpose:
             tensor = tensor.transpose(0, 1)
+        if rule.flatten_to_row:
+            # reshape, not view: a gamma is 1-D contiguous today, but reshape also handles a
+            # non-contiguous source instead of raising.
+            tensor = tensor.reshape(1, -1)
         packed[rule.name] = policy.apply(
             rule.name, tensor, dtype=rule.dtype, destination=destination
         )

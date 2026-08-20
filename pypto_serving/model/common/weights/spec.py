@@ -16,7 +16,7 @@ be reproducible byte-for-byte by the evaluator.
 """
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -32,6 +32,10 @@ class LayerContext:
     n_routed_experts: int = 0
     include_tid2eid: bool = False
     include_gate_bias: bool = False
+    # Family dimensions a rule may need to size a default or a placeholder — `head_dim` for
+    # Qwen's absent QK norms, say. Kept as a map rather than as more fields, so one family's
+    # config vocabulary does not accumulate on a type every family shares.
+    dims: Mapping[str, int] = field(default_factory=dict)
 
     def source_name(self, suffix: str) -> str:
         """Return the checkpoint name for ``suffix`` under this layer's prefix."""
@@ -53,6 +57,9 @@ class LayerWeightRule:
     dtype: torch.dtype
     transpose: bool = False
     reshape_groups: int | None = None
+    # A 1-D gamma has nothing to stack on: reshaping it to `[1, dim]` is what makes it stackable
+    # over layers at all, and it is the shape the kernels read.
+    flatten_to_row: bool = False
 
 # A dimension is either a literal or the name of a `LayerContext` field to read, which keeps
 # a shape that depends on the model config expressible as data rather than as a lambda.
@@ -60,11 +67,18 @@ Dim = int | str
 
 
 def resolve_shape(shape: Sequence[Dim], context: "LayerContext") -> tuple[int, ...]:
-    """Resolve literal and context-derived dimensions into a concrete shape."""
+    """Resolve literal and context-derived dimensions into a concrete shape.
+
+    A named dimension is looked up in ``context.dims`` first and then among the context's own
+    fields, so a family can supply `head_dim` without it becoming a field on the shared type.
+    """
     resolved: list[int] = []
     for dim in shape:
         if isinstance(dim, str):
-            resolved.append(int(getattr(context, dim)))
+            if dim in context.dims:
+                resolved.append(int(context.dims[dim]))
+            else:
+                resolved.append(int(getattr(context, dim)))
         else:
             resolved.append(int(dim))
     return tuple(resolved)
@@ -104,7 +118,13 @@ class DefaultedWeightRule:
     source: str
     dtype: torch.dtype
     default_shape: tuple[Dim, ...]
-    required_when: str
+    # `None` means the source is genuinely optional: its absence is a model variant, not an
+    # error. Qwen's QK norms are the case — a checkpoint without them is not broken.
+    required_when: str | None = None
+    # "zeros" for a router placeholder the kernel will not read; "ones" for a norm gamma, where
+    # zeros would silently annihilate the activations it scales instead of leaving them be.
+    default_fill: str = "zeros"
+    flatten_to_row: bool = False
 
 
 @dataclass(frozen=True)

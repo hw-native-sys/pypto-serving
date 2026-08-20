@@ -111,3 +111,43 @@ class ExpertParallel:
             for rank in range(self.ranks)
         ]
         return torch.stack(per_rank, dim=0).contiguous()
+
+
+@dataclass(frozen=True)
+class NoShard:
+    """Keep the tensor as it is — no rank axis at all.
+
+    For a family whose kernels take one copy of each weight, so there is nothing to distribute.
+    It is a distinct policy rather than ``Replicate(ranks=1)`` because the shapes differ: a
+    replicated weight is ``[1, *shape]`` and a rank-less one is ``[*shape]``, and a slab built
+    from the wrong one is the right size with an extra axis nothing indexes.
+    """
+
+    mismatch_error: str = "packed destination {name} shape/dtype mismatch: expected={expected}, got={got}"
+
+    def apply(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        *,
+        dtype: torch.dtype | None,
+        destination: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Cast *tensor*, writing into ``destination`` when one is given."""
+        source = tensor.cpu() if tensor.device.type != "cpu" else tensor
+        output_dtype = source.dtype if dtype is None else dtype
+        if destination is not None:
+            if tuple(destination.shape) != tuple(source.shape) or destination.dtype != output_dtype:
+                raise ValueError(
+                    self.mismatch_error.format(
+                        name=name,
+                        expected=f"{tuple(source.shape)}/{output_dtype}",
+                        got=f"{tuple(destination.shape)}/{destination.dtype}",
+                    )
+                )
+            # The cast rides along inside copy_, as it does on the replicated path.
+            destination.copy_(source)
+            return destination
+        if dtype is not None:
+            source = source.to(dtype=dtype)
+        return source.contiguous()
