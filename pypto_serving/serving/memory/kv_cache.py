@@ -178,6 +178,19 @@ class KvCacheManager:
         """Return the total number of physical KV blocks."""
         return len(self.blocks)
 
+    @property
+    def usage(self) -> float:
+        """Return the highest allocation pressure across configured cache pools."""
+        if self._group_pools:
+            usages = []
+            for pool in self._group_pools.values():
+                total = len(pool.blocks)
+                free = sum(queue.count for queue in pool.free_queues)
+                usages.append((total - free) / total if total else 0.0)
+            return max(usages, default=0.0)
+        total = self.num_blocks
+        return (total - self.num_free_blocks) / total if total else 0.0
+
     def initialize(
         self,
         runtime: RuntimeConfig,

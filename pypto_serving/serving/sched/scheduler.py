@@ -83,6 +83,7 @@ class Request:
     cache_partition: int | None = None
     block_hashes: list[int] = field(default_factory=list)
     num_blocks_cached: int = 0  # Track how many blocks have been published to prefix cache
+    prefix_cache_metrics_recorded: bool = False
     # Async scheduling: tokens scheduled optimistically but not yet sampled.
     # Stands in for output tokens still in flight so the next schedule() advances
     # correctly; decremented as real tokens are applied in update_from_output.
@@ -135,6 +136,8 @@ class SchedulerOutput:
     preempted_requests: list[Request] = field(default_factory=list)
     num_prefill_tokens: int = 0
     num_decode_tokens: int = 0
+    prefix_cache_queries: int = 0
+    prefix_cache_hits: int = 0
 
     @property
     def is_empty(self) -> bool:
@@ -356,6 +359,17 @@ class Scheduler:
                 request.num_computed_tokens = 0
                 remaining_waiting.append(request)
                 break
+
+            if self.config.enable_prefix_cache and not request.prefix_cache_metrics_recorded:
+                cacheable_tokens = (
+                    request.num_prompt_tokens // self.kv_cache_manager.block_size
+                ) * self.kv_cache_manager.block_size
+                output.prefix_cache_queries += cacheable_tokens
+                output.prefix_cache_hits += min(
+                    cacheable_tokens,
+                    len(cached_blocks) * self.kv_cache_manager.block_size,
+                )
+                request.prefix_cache_metrics_recorded = True
 
             request.status = RequestStatus.RUNNING
             self.running.append(request)

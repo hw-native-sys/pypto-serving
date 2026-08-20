@@ -131,6 +131,9 @@ class ServingServer:
         self.app.add_api_route("/v1/models", self._list_models, methods=["GET"])
         self.app.add_api_route("/v1/completions", self._completions, methods=["POST"], response_model=None)
         self.app.add_api_route("/v1/chat/completions", self._chat_completions, methods=["POST"], response_model=None)
+        if getattr(self.engine, "metrics", None) is not None:
+            self.app.add_api_route("/metrics", self._metrics, methods=["GET"])
+            self.app.add_api_route("/metrics/json", self._metrics_json, methods=["GET"])
         if get_profiler(initially_active=False).enabled:
             self.app.add_api_route("/start_profile", self._start_profile, methods=["POST"])
             self.app.add_api_route("/stop_profile", self._stop_profile, methods=["POST"])
@@ -143,6 +146,15 @@ class ServingServer:
             "object": "list",
             "data": [{"id": self.model_id, "object": "model", "owned_by": "pypto"}],
         })
+
+    async def _metrics(self) -> Response:
+        return Response(
+            content=self.engine.metrics.render_prometheus(),
+            media_type="text/plain; version=0.0.4",
+        )
+
+    async def _metrics_json(self) -> JSONResponse:
+        return JSONResponse(self.engine.metrics.snapshot())
 
     async def _start_profile(self) -> Response:
         async with self._profile_lock:

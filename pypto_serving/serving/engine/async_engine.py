@@ -21,6 +21,7 @@ from typing import Callable
 
 from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
+from pypto_serving.observability import InMemoryStatLogger, IterationStats, SchedulerStats
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.utils.env import (
     worker_init_timeout_seconds,
@@ -223,6 +224,17 @@ class ReplicaEngineCore:
         # construction rather than re-reading os.environ every pipelined step.
         self._init_timeout = worker_init_timeout_seconds()
         self._step_timeout = worker_step_timeout_seconds()
+        self._stat_logger: InMemoryStatLogger | None = None
+        self._engine_index = int(config.dp_rank)
+
+    def set_stat_logger(
+        self,
+        stat_logger: InMemoryStatLogger,
+        engine_index: int,
+    ) -> None:
+        """Attach the API-process metrics publisher for this replica."""
+        self._stat_logger = stat_logger
+        self._engine_index = engine_index
 
     async def start(self) -> None:
         """Start worker process and engine loop."""
@@ -415,6 +427,13 @@ class ReplicaEngineCore:
             if not finished_normally and request_id in self._request_contexts:
                 self._request_contexts.pop(request_id, None)
                 self.scheduler.abort_request(request_id)
+                stat_logger = getattr(self, "_stat_logger", None)
+                if stat_logger is not None:
+                    stat_logger.finish_request(
+                        getattr(self, "_engine_index", 0),
+                        request_id,
+                        "FINISHED_ABORTED",
+                    )
                 # Aborted/cancelled ids must ride the next StepCommand's
                 # finished_request_ids, otherwise they leak in _req_cache /
                 # _worker_known_req_ids and pin device resources.
@@ -427,6 +446,13 @@ class ReplicaEngineCore:
             # scheduler no longer tracks it. Avoid scheduling a duplicate free.
             return
         self.scheduler.abort_request(request_id)
+        stat_logger = getattr(self, "_stat_logger", None)
+        if stat_logger is not None:
+            stat_logger.finish_request(
+                getattr(self, "_engine_index", 0),
+                request_id,
+                "FINISHED_ABORTED",
+            )
         await ctx.queue.put(
             TokenOutput(finished=True, finish_reason="FINISHED_ABORTED")
         )
@@ -488,6 +514,19 @@ class ReplicaEngineCore:
         """
         with profile_span("scheduler.schedule", cat="scheduler"):
             scheduler_output = self.scheduler.schedule()
+        stat_logger = getattr(self, "_stat_logger", None)
+        if stat_logger is not None:
+            stat_logger.record_scheduler(
+                getattr(self, "_engine_index", 0),
+                SchedulerStats(
+                    num_running_reqs=len(self.scheduler.running),
+                    num_waiting_reqs=len(self.scheduler.waiting),
+                    kv_cache_usage=self.kv_cache_manager.usage,
+                    prefix_cache_queries=scheduler_output.prefix_cache_queries,
+                    prefix_cache_hits=scheduler_output.prefix_cache_hits,
+                    num_preemptions=len(scheduler_output.preempted_requests),
+                ),
+            )
         # Preempted requests must release their worker-side cache / device slots;
         # queue their ids so the next StepCommand frees them.
         for request in scheduler_output.preempted_requests:
@@ -762,6 +801,13 @@ class ReplicaEngineCore:
                     ctx.queue.put_nowait(
                         TokenOutput(finished=True, finish_reason="error")
                     )
+                stat_logger = getattr(self, "_stat_logger", None)
+                if stat_logger is not None:
+                    stat_logger.finish_request(
+                        getattr(self, "_engine_index", 0),
+                        request_id,
+                        "error",
+                    )
                 self._schedule_worker_free(request_id)
                 self.scheduler.abort_request(request_id)
 
@@ -772,6 +818,13 @@ class ReplicaEngineCore:
     ) -> None:
         """Process worker results: update scheduler state, push tokens to request queues."""
         request_outputs = self.scheduler.update_from_output(scheduler_output, new_tokens)
+        stat_logger = getattr(self, "_stat_logger", None)
+        engine_index = getattr(self, "_engine_index", 0)
+        if stat_logger is not None and scheduler_output.num_prefill_tokens:
+            stat_logger.record_iteration(
+                engine_index,
+                IterationStats(num_prefill_tokens=scheduler_output.num_prefill_tokens),
+            )
 
         for req_output in request_outputs:
             ctx = self._request_contexts.get(req_output.request_id)
@@ -790,6 +843,13 @@ class ReplicaEngineCore:
                         )
                         break
 
+            if stat_logger is not None and req_output.new_token_id is not None:
+                stat_logger.record_output(
+                    engine_index,
+                    req_output.request_id,
+                    completion_tokens=len(ctx.request.output_token_ids),
+                )
+
             if req_output.finished:
                 # Flush the authoritative full decode: if generation ends while a
                 # multi-token character is incomplete (or a token legitimately
@@ -798,6 +858,12 @@ class ReplicaEngineCore:
                 # text matches the offline baseline instead of being truncated.
                 text = self._finalize_detokenization(ctx)
                 self._schedule_worker_free(req_output.request_id)
+                if stat_logger is not None:
+                    stat_logger.finish_request(
+                        engine_index,
+                        req_output.request_id,
+                        req_output.finish_reason,
+                    )
 
             # Non-streaming requests only need the final output: suppress
             # intermediate ones to save a queue push and HTTP-coroutine wake-up
@@ -933,6 +999,10 @@ class AsyncLLMEngine:
         self._request_to_replica: dict[str, int] = {}
         self._route_extra_load = [0 for _ in parallel.replica_device_groups]
         self._cores: list[ReplicaEngineCore] = []
+        self.metrics = InMemoryStatLogger(
+            config.model_id,
+            list(range(len(parallel.replica_device_groups))),
+        )
 
         for dp_rank, device_group in enumerate(parallel.replica_device_groups):
             replica_parallel = parallel.for_replica(device_group)
@@ -942,12 +1012,13 @@ class AsyncLLMEngine:
                 parallel_config=replica_parallel,
                 dp_rank=dp_rank,
             )
-            self._cores.append(
-                core_factory(
-                    config=replica_config,
-                    tokenizer=tokenizer
-                )
+            core = core_factory(
+                config=replica_config,
+                tokenizer=tokenizer,
             )
+            if hasattr(core, "set_stat_logger"):
+                core.set_stat_logger(self.metrics, dp_rank)
+            self._cores.append(core)
 
     async def start(self) -> None:
         """Start all DP engine cores in parallel."""
@@ -1066,8 +1137,15 @@ class AsyncLLMEngine:
         prompt: str,
         config,
     ) -> AsyncGenerator[TokenOutput, None]:
+        arrival_monotonic = time.monotonic()
         replica_idx = self._select_replica()
         prompt_token_ids = self._tokenize_prompt(prompt)
+        self.metrics.start_request(
+            replica_idx,
+            request_id,
+            arrival_monotonic=arrival_monotonic,
+            num_prompt_tokens=len(prompt_token_ids),
+        )
         request_load = self._estimate_request_load(prompt_token_ids, config)
         self._route_extra_load[replica_idx] += request_load
         self._request_to_replica[request_id] = replica_idx
@@ -1083,6 +1161,7 @@ class AsyncLLMEngine:
             )
             route_extra_active = False
 
+        terminal_output_seen = False
         try:
             core = self._cores[replica_idx]
             async for output in core.add_request(
@@ -1092,7 +1171,31 @@ class AsyncLLMEngine:
                 on_queued=clear_route_extra_load,
                 prompt_token_ids=prompt_token_ids,
             ):
+                self.metrics.record_output(
+                    replica_idx,
+                    request_id,
+                    completion_tokens=output.completion_tokens,
+                )
+                if output.finished:
+                    terminal_output_seen = True
+                    self.metrics.finish_request(
+                        replica_idx,
+                        request_id,
+                        output.finish_reason,
+                    )
                 yield output
+        except asyncio.CancelledError:
+            if not terminal_output_seen:
+                self.metrics.finish_request(
+                    replica_idx,
+                    request_id,
+                    "FINISHED_ABORTED",
+                )
+            raise
+        except BaseException:
+            if not terminal_output_seen:
+                self.metrics.finish_request(replica_idx, request_id, "error")
+            raise
         finally:
             self._request_to_replica.pop(request_id, None)
             clear_route_extra_load()

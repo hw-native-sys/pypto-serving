@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PyPTO Monitor</title>
+  <link rel="stylesheet" href="/assets/dashboard.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-block">
+      <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+      <div>
+        <h1>PyPTO Monitor</h1>
+        <div class="model-name" id="model-name">Waiting for serving metrics</div>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <div class="status" id="connection-status"><span class="status-dot"></span><span>Connecting</span></div>
+      <button class="command-button" id="refresh-button" type="button">Refresh</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="metric-grid" aria-label="Current metrics">
+      <article class="metric"><span>Output throughput</span><strong id="output-tps">--</strong><small>tokens/s</small></article>
+      <article class="metric"><span>Prefill throughput</span><strong id="prefill-tps">--</strong><small>tokens/s</small></article>
+      <article class="metric"><span>TPOT P50</span><strong id="tpot-p50">--</strong><small>milliseconds</small></article>
+      <article class="metric"><span>TTFT P50</span><strong id="ttft-p50">--</strong><small>milliseconds</small></article>
+      <article class="metric"><span>Running</span><strong id="running">--</strong><small>requests</small></article>
+      <article class="metric"><span>Waiting</span><strong id="waiting">--</strong><small>requests</small></article>
+      <article class="metric"><span>KV cache</span><strong id="kv-usage">--</strong><small>used</small></article>
+      <article class="metric"><span>Prefix cache</span><strong id="cache-hit">--</strong><small>token hit rate</small></article>
+    </section>
+
+    <section class="toolbar" aria-label="Chart range">
+      <div class="range-control" id="range-control">
+        <button type="button" data-range="900">15m</button>
+        <button type="button" data-range="3600" class="active">1h</button>
+        <button type="button" data-range="21600">6h</button>
+        <button type="button" data-range="86400">24h</button>
+      </div>
+      <div class="last-updated" id="last-updated">No samples</div>
+    </section>
+
+    <section class="chart-grid">
+      <article class="panel">
+        <div class="panel-header">
+          <h2>Token throughput</h2>
+          <div class="legend"><span class="legend-output">Output</span><span class="legend-prefill">Prefill</span></div>
+        </div>
+        <div class="chart-frame"><canvas id="throughput-chart"></canvas></div>
+      </article>
+      <article class="panel">
+        <div class="panel-header">
+          <h2>Scheduler queues</h2>
+          <div class="legend"><span class="legend-running">Running</span><span class="legend-waiting">Waiting</span></div>
+        </div>
+        <div class="chart-frame"><canvas id="queue-chart"></canvas></div>
+      </article>
+    </section>
+
+    <section class="traffic-band">
+      <div class="traffic-summary">
+        <div class="section-title">
+          <h2>Today's traffic</h2>
+          <span id="today-date">--</span>
+        </div>
+        <div class="traffic-values">
+          <div><span>Requests</span><strong id="today-requests">--</strong></div>
+          <div><span>Prompt tokens</span><strong id="today-prompt">--</strong></div>
+          <div><span>Output tokens</span><strong id="today-output">--</strong></div>
+          <div><span>Errors</span><strong id="today-errors">--</strong></div>
+        </div>
+      </div>
+      <article class="daily-chart-panel">
+        <div class="panel-header"><h2>Daily token volume</h2><div class="legend"><span class="legend-prompt">Prompt</span><span class="legend-output">Output</span></div></div>
+        <div class="chart-frame daily"><canvas id="daily-chart"></canvas></div>
+      </article>
+    </section>
+
+    <section class="table-section">
+      <div class="section-title"><h2>Daily totals</h2><span>Last 30 days</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Date</th><th>Requests</th><th>Prompt tokens</th><th>Output tokens</th><th>Cache hit</th><th>Errors</th></tr></thead>
+          <tbody id="daily-table"><tr><td colspan="6" class="empty-cell">No daily data</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <div class="error-banner" id="error-banner" role="status" hidden></div>
+  </main>
+  <script src="/assets/dashboard.js"></script>
+</body>
+</html>
