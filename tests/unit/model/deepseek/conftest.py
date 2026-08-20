@@ -85,6 +85,18 @@ _SHAPES: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
     f"{_EXPERT_KEY}w2.scale": ((4,), torch.float32),
     f"{_EXPERT_KEY}w3.weight": ((2, 4), torch.int8),
     f"{_EXPERT_KEY}w3.scale": ((2,), torch.float32),
+    # MTP-only extras: the draft layer carries its own norms, the two projections that fold the
+    # embedding and hidden states together, and its own head constants.
+    "enorm.weight": ((4,), torch.bfloat16),
+    "hnorm.weight": ((4,), torch.bfloat16),
+    "e_proj.weight": ((2, 4), torch.int8),
+    "e_proj.scale": ((2,), torch.float32),
+    "h_proj.weight": ((2, 4), torch.int8),
+    "h_proj.scale": ((2,), torch.float32),
+    "hc_head_fn": ((1, 4), torch.float32),
+    "hc_head_scale": ((3,), torch.float32),
+    "hc_head_base": ((1,), torch.float32),
+    "norm.weight": ((4,), torch.bfloat16),
 }
 _EXPERT_ID = re.compile(r"ffn\.experts\.\d+\.")
 
@@ -214,6 +226,7 @@ def deepseek_checkpoint(tmp_path):
         num_hash_layers: int = 1,
         ranks: int = 2,
         layer_seeds: dict[int, int] | None = None,
+        include_mtp: bool = False,
     ) -> DeepSeekCheckpoint:
         from safetensors.torch import save_file
 
@@ -242,6 +255,41 @@ def deepseek_checkpoint(tmp_path):
             filename = f"layer-{layer_id:05d}.safetensors"
             save_file(tensors, str(model_dir / filename))
             weight_map.update({name: filename for name in tensors})
+
+        if include_mtp:
+            # The draft layer is a full layer under a different prefix, plus ten extras. Its
+            # names come from the same contract helper with `layers.0` rewritten, exactly as
+            # `load_mtp_weights` derives them, so the fixture cannot drift from the loader.
+            mtp: dict[str, torch.Tensor] = {}
+            layer_names = [
+                name.replace("layers.0", "mtp.0", 1)
+                for name in deepseek_v4_layer_weight_names(
+                    0,
+                    n_routed_experts=n_routed_experts,
+                    compress_ratio=0,
+                    include_gate_bias=True,
+                )
+            ]
+            extras = (
+                "enorm.weight",
+                "hnorm.weight",
+                "e_proj.weight",
+                "e_proj.scale",
+                "h_proj.weight",
+                "h_proj.scale",
+                "hc_head_fn",
+                "hc_head_scale",
+                "hc_head_base",
+                "norm.weight",
+            )
+            for index, name in enumerate(layer_names):
+                shape, dtype = _shape_for(name[len("mtp.0.") :], 0)
+                mtp[name] = _filled(shape, dtype, 90_000 + index)
+            for index, suffix in enumerate(extras):
+                shape, dtype = _shape_for(suffix, 0)
+                mtp[f"mtp.0.{suffix}"] = _filled(shape, dtype, 95_000 + index)
+            save_file(mtp, str(model_dir / "mtp.safetensors"))
+            weight_map.update({name: "mtp.safetensors" for name in mtp})
 
         return DeepSeekCheckpoint(
             model_dir=model_dir,

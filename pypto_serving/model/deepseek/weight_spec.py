@@ -238,7 +238,11 @@ def deepseek_v4_factories() -> dict[str, object]:
         deepseek_v4_hadamard_idx,
     )
 
-    return {"hadamard_idx": deepseek_v4_hadamard_idx}
+    return {
+        "hadamard_idx": deepseek_v4_hadamard_idx,
+        # One row; the rank policy replicates it to [ranks, hidden].
+        "hidden_ones": lambda: torch.ones((_HIDDEN,), dtype=torch.float32),
+    }
 
 
 DEEPSEEK_V4_RANK_ERROR = "packed DeepSeekV4 weight {name} must have rank >= 2, got {ndim}"
@@ -294,3 +298,30 @@ DEEPSEEK_V4_GLOBAL_RULES: tuple[GlobalWeightRule, ...] = (
     GlobalWeightRule("hc_head_scale", "hc_head_scale", torch.float32),
     GlobalWeightRule("hc_head_base", "hc_head_base", torch.float32),
 )
+
+
+# The MTP draft layer is a full layer under the `mtp.0` prefix — which `LayerContext` already
+# expresses, so the same 49 rules cover it — plus these twelve. Order is the order the packed
+# mapping is built in, as everywhere else.
+#
+# The two `_smooth` tensors are synthesized rather than read: they are all-ones, and the
+# quantized projections they scale have no per-channel smoothing in this checkpoint. The
+# factory returns one row and the rank policy replicates it, which is what produces the
+# `[ranks, hidden]` the kernel wants — a factory returning the rank-shaped tensor directly
+# would get a second rank axis bolted on.
+DEEPSEEK_V4_MTP_EXTRA_RULES: tuple[LayerRule, ...] = (
+    LayerWeightRule("enorm_w", "enorm.weight", torch.float32),
+    LayerWeightRule("hnorm_w", "hnorm.weight", torch.float32),
+    LayerWeightRule("e_proj_w", "e_proj.weight", torch.int8),
+    LayerWeightRule("e_proj_w_scale", "e_proj.scale", torch.float32),
+    SyntheticWeightRule("e_proj_smooth", torch.float32, "hidden_ones"),
+    LayerWeightRule("h_proj_w", "h_proj.weight", torch.int8),
+    LayerWeightRule("h_proj_w_scale", "h_proj.scale", torch.float32),
+    SyntheticWeightRule("h_proj_smooth", torch.float32, "hidden_ones"),
+    LayerWeightRule("mtp_hc_head_fn", "hc_head_fn", torch.float32),
+    LayerWeightRule("mtp_hc_head_scale", "hc_head_scale", torch.float32),
+    LayerWeightRule("mtp_hc_head_base", "hc_head_base", torch.float32),
+    LayerWeightRule("mtp_norm_w", "norm.weight", torch.bfloat16),
+)
+
+DEEPSEEK_V4_MTP_PREFIX = "mtp.0"

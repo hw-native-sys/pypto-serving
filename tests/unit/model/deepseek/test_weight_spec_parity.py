@@ -286,3 +286,141 @@ def test_public_entry_point_keeps_the_family_diagnostics(deepseek_checkpoint):
             include_tid2eid=True,
             include_gate_bias=False,
         )
+
+
+# --- MTP draft layer -------------------------------------------------------------------------
+#
+# The extras are twelve tensors the main layers do not have. Ten are replicated reads and two
+# are synthesized all-ones rows, and the whole set used to be a hand-written dict literal. This
+# reproduces that literal to compare against, since a table is only trustworthy if it lands on
+# the same bytes.
+
+
+def _mtp_extras_legacy(raw, *, prefix, ranks):
+    """The hand-written extras dict, exactly as `load_mtp_weights` built it."""
+    hidden = 4096
+
+    def replicated(name, dtype):
+        tensor = raw[f"{prefix}.{name}"].to(dtype=dtype).contiguous().cpu()
+        return tensor.unsqueeze(0).expand(ranks, *tensor.shape).contiguous()
+
+    return {
+        "enorm_w": replicated("enorm.weight", torch.float32),
+        "hnorm_w": replicated("hnorm.weight", torch.float32),
+        "e_proj_w": replicated("e_proj.weight", torch.int8),
+        "e_proj_w_scale": replicated("e_proj.scale", torch.float32),
+        "e_proj_smooth": torch.ones((ranks, hidden), dtype=torch.float32),
+        "h_proj_w": replicated("h_proj.weight", torch.int8),
+        "h_proj_w_scale": replicated("h_proj.scale", torch.float32),
+        "h_proj_smooth": torch.ones((ranks, hidden), dtype=torch.float32),
+        "mtp_hc_head_fn": replicated("hc_head_fn", torch.float32),
+        "mtp_hc_head_scale": replicated("hc_head_scale", torch.float32),
+        "mtp_hc_head_base": replicated("hc_head_base", torch.float32),
+        "mtp_norm_w": replicated("norm.weight", torch.bfloat16),
+    }
+
+
+def test_mtp_extras_match_the_hand_written_dict(deepseek_checkpoint, fingerprint_tensors):
+    """All twelve, including the two synthesized ones, byte for byte and in order."""
+    from pypto_serving.model.common.weights.packer import pack_layer
+    from pypto_serving.model.deepseek.weight_spec import (
+        DEEPSEEK_V4_MTP_EXTRA_RULES,
+        DEEPSEEK_V4_MTP_PREFIX,
+        deepseek_v4_factories,
+        deepseek_v4_replicate,
+    )
+
+    checkpoint = deepseek_checkpoint(n_routed_experts=_EXPERTS, include_mtp=True)
+    store = checkpoint.store()
+    prefix = DEEPSEEK_V4_MTP_PREFIX
+    extras = (
+        "enorm.weight",
+        "hnorm.weight",
+        "e_proj.weight",
+        "e_proj.scale",
+        "h_proj.weight",
+        "h_proj.scale",
+        "hc_head_fn",
+        "hc_head_scale",
+        "hc_head_base",
+        "norm.weight",
+    )
+    raw = store.load_many([f"{prefix}.{suffix}" for suffix in extras])
+
+    legacy = _mtp_extras_legacy(raw, prefix=prefix, ranks=_RANKS)
+    from_rules = pack_layer(
+        DEEPSEEK_V4_MTP_EXTRA_RULES,
+        raw,
+        LayerContext(layer_id=0, prefix=prefix, ranks=_RANKS),
+        policy=deepseek_v4_replicate(_RANKS),
+        factories=deepseek_v4_factories(),
+    )
+
+    assert list(legacy) == list(from_rules)
+    assert fingerprint_tensors(legacy) == fingerprint_tensors(from_rules)
+
+
+def test_the_synthesized_smooth_tensors_are_rank_shaped_ones(deepseek_checkpoint):
+    """The trap: a factory returning the rank-shaped tensor would gain a second rank axis.
+
+    The factory yields one row and the rank policy replicates it, so `[ranks, hidden]` is the
+    result rather than `[ranks, ranks, hidden]` — which would still be all ones, and so would
+    pass any value check while being the wrong shape for the kernel.
+    """
+    from pypto_serving.model.common.weights.packer import pack_layer
+    from pypto_serving.model.deepseek.weight_spec import (
+        DEEPSEEK_V4_MTP_EXTRA_RULES,
+        deepseek_v4_factories,
+        deepseek_v4_replicate,
+    )
+
+    checkpoint = deepseek_checkpoint(n_routed_experts=_EXPERTS, include_mtp=True)
+    rules = [rule for rule in DEEPSEEK_V4_MTP_EXTRA_RULES if rule.name.endswith("_smooth")]
+
+    packed = pack_layer(
+        rules,
+        {},
+        LayerContext(layer_id=0, prefix="mtp.0", ranks=checkpoint.ranks),
+        policy=deepseek_v4_replicate(checkpoint.ranks),
+        factories=deepseek_v4_factories(),
+    )
+
+    assert len(packed) == 2
+    for name, tensor in packed.items():
+        assert tensor.shape == (checkpoint.ranks, 4096), f"{name} has shape {tuple(tensor.shape)}"
+        assert tensor.dtype == torch.float32
+        assert torch.all(tensor == 1.0)
+
+
+def test_the_full_mtp_load_matches_the_hand_written_extras(deepseek_checkpoint, fingerprint_tensors):
+    """End to end through the store: the 49 layer weights plus the twelve extras."""
+    checkpoint = deepseek_checkpoint(n_routed_experts=_EXPERTS, include_mtp=True)
+    store = checkpoint.store()
+
+    loaded = store.load_mtp_weights(ranks=checkpoint.ranks, n_routed_experts=_EXPERTS)
+
+    from pypto_serving.model.deepseek.weight_spec import DEEPSEEK_V4_MTP_EXTRA_RULES
+
+    names = list(loaded.tensors)
+    expected_tail = [rule.name for rule in DEEPSEEK_V4_MTP_EXTRA_RULES]
+    assert names[-12:] == expected_tail, "extras come last, in rule order"
+    raw = store.load_many(
+        [
+            f"mtp.0.{suffix}"
+            for suffix in (
+                "enorm.weight",
+                "hnorm.weight",
+                "e_proj.weight",
+                "e_proj.scale",
+                "h_proj.weight",
+                "h_proj.scale",
+                "hc_head_fn",
+                "hc_head_scale",
+                "hc_head_base",
+                "norm.weight",
+            )
+        ]
+    )
+    expected = _mtp_extras_legacy(raw, prefix="mtp.0", ranks=checkpoint.ranks)
+    actual = {name: loaded.tensors[name] for name in expected}
+    assert fingerprint_tensors(expected) == fingerprint_tensors(actual)

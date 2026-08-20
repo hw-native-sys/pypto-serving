@@ -1018,28 +1018,27 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
             prefix=prefix,
         )
 
-        def replicated(name: str, dtype: torch.dtype) -> torch.Tensor:
-            tensor = raw[f"{prefix}.{name}"].to(dtype=dtype).contiguous().cpu()
-            return tensor.unsqueeze(0).expand(ranks, *tensor.shape).contiguous()
+        from pypto_serving.model.common.weights.packer import pack_layer  # noqa: PLC0415
+        from pypto_serving.model.common.weights.spec import LayerContext  # noqa: PLC0415
 
-        tensors = dict(packed_layer.tensors)
-        tensors.update(
-            {
-                "enorm_w": replicated("enorm.weight", torch.float32),
-                "hnorm_w": replicated("hnorm.weight", torch.float32),
-                "e_proj_w": replicated("e_proj.weight", torch.int8),
-                "e_proj_w_scale": replicated("e_proj.scale", torch.float32),
-                "e_proj_smooth": torch.ones((ranks, _DEEPSEEK_V4_HIDDEN_SIZE), dtype=torch.float32),
-                "h_proj_w": replicated("h_proj.weight", torch.int8),
-                "h_proj_w_scale": replicated("h_proj.scale", torch.float32),
-                "h_proj_smooth": torch.ones((ranks, _DEEPSEEK_V4_HIDDEN_SIZE), dtype=torch.float32),
-                "mtp_hc_head_fn": replicated("hc_head_fn", torch.float32),
-                "mtp_hc_head_scale": replicated("hc_head_scale", torch.float32),
-                "mtp_hc_head_base": replicated("hc_head_base", torch.float32),
-                "mtp_norm_w": replicated("norm.weight", torch.bfloat16),
-            }
+        from .weight_spec import (  # noqa: PLC0415
+            DEEPSEEK_V4_MTP_EXTRA_RULES,
+            DEEPSEEK_V4_SOURCE_MISSING_ERROR,
+            deepseek_v4_factories,
+            deepseek_v4_replicate,
         )
-        return DeepSeekV4MtpWeights(tensors=tensors)
+
+        # The draft layer's own weights, through the same evaluator: `LayerContext` already
+        # carries the prefix, so `mtp.0` needs no special case beyond this table.
+        extras = pack_layer(
+            DEEPSEEK_V4_MTP_EXTRA_RULES,
+            raw,
+            LayerContext(layer_id=0, prefix=prefix, ranks=int(ranks)),
+            policy=deepseek_v4_replicate(int(ranks)),
+            factories=deepseek_v4_factories(),
+            missing_source_error=DEEPSEEK_V4_SOURCE_MISSING_ERROR,
+        )
+        return DeepSeekV4MtpWeights(tensors={**packed_layer.tensors, **extras})
 
 
 def _allocate_stacked_layer_weights(
