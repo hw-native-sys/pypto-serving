@@ -3,6 +3,9 @@ target-version = "py310"
 
 exclude = [
     "*_build/",
+    "platform/extern/HiCR/",
+    "platform/extern/TaskR/",
+    "pypto-lib/",
 ]
 
 [lint]

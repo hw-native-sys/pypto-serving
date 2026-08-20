@@ -17,10 +17,14 @@ fake engine so the usage accounting is exercised without a model or NPU.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
+from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import TokenOutput
-from pypto_serving.serving.server.server import ServingServer
+from pypto_serving.serving.server.server import (
+    ServingServer,
+)
 
 # ---------------------------------------------------------------------------
 # Fake engine
@@ -32,20 +36,22 @@ class _FakeEngine:
 
     def __init__(self, outputs: list[TokenOutput]) -> None:
         self._outputs = outputs
+        self.requests = []
+        self.tokenizer = self._FakeTokenizer()
 
     class _FakeTokenizer:
-        class _Inner:
-            def apply_chat_template(self, messages, **kwargs):
-                return " ".join(m["content"] for m in messages)
-
-        tokenizer = _Inner()
+        def __init__(self) -> None:
+            self.chat_template_call = None
 
         def encode(self, text: str) -> list[int]:
             return [1] * max(1, len(text.split()))
 
-    tokenizer = _FakeTokenizer()
+        def apply_chat_template(self, messages, chat_template_kwargs=None):
+            self.chat_template_call = (messages, chat_template_kwargs)
+            return " ".join(m["content"] for m in messages)
 
     async def add_request(self, request_id, prompt, config, **kwargs):
+        self.requests.append((request_id, prompt, config))
         for out in self._outputs:
             yield out
 
@@ -73,6 +79,13 @@ def _parse_sse(raw: bytes) -> list[dict]:
     return chunks
 
 
+def _collect_stream(stream) -> bytes:
+    async def collect():
+        return [chunk async for chunk in stream]
+
+    return b"".join(chunk.encode() for chunk in asyncio.run(collect()))
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -94,18 +107,11 @@ def test_stream_completion_terminal_usage_chunk():
     ]
     server = _make_server(outputs)
 
-    from pypto_serving.config.types import GenerateConfig
-    import asyncio
-
-    async def collect():
-        chunks = []
-        async for data in server._stream_completion(
+    raw = _collect_stream(
+        server._stream_completion(
             "req-0", "hello prompt here go", GenerateConfig(max_new_tokens=3), "test-model"
-        ):
-            chunks.append(data)
-        return chunks
-
-    raw = b"".join(c.encode() for c in asyncio.run(collect()))
+        )
+    )
     parsed = _parse_sse(raw)
 
     # At least 3 delta chunks + 1 usage chunk

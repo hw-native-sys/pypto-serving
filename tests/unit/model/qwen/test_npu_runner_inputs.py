@@ -29,7 +29,6 @@ from pypto_serving.model.qwen.npu_runner import (
     QwenLayout,
 )
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
-from pypto_serving.worker.worker import WorkerTensor
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -468,7 +467,12 @@ class _FakeWorker:
 
     def alloc_tensor(self, shape, dtype, init=None):
         nbytes = torch.empty(tuple(shape), dtype=dtype).nbytes
-        tensor = WorkerTensor(self._next_ptr, tuple(shape), self._DTYPES[dtype])
+        tensor = SimpleNamespace(
+            ptr=self._next_ptr,
+            shape=tuple(shape),
+            dtype=self._DTYPES[dtype],
+            worker_id=0,
+        )
         self._next_ptr += nbytes
         return tensor
 

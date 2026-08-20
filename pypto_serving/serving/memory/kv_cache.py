@@ -40,21 +40,6 @@ class KVCacheBlock:
     next_free: "KVCacheBlock | None" = field(default=None, repr=False)
 
 
-@dataclass(frozen=True)
-class KVCacheBlocks:
-    """Scheduler-facing KV blocks grouped by cache group."""
-
-    blocks: tuple[list[KVCacheBlock], ...]
-
-    def get_block_ids(self) -> tuple[list[int], ...]:
-        return tuple([block.block_id for block in group] for group in self.blocks)
-
-    def get_unhashed_block_ids(self) -> list[int]:
-        if len(self.blocks) != 1:
-            raise ValueError("get_unhashed_block_ids requires one KV cache group")
-        return [block.block_id for block in self.blocks[0] if block.block_hash is None]
-
-
 class FreeKVCacheBlockQueue:
     """Doubly-linked free block queue in eviction order."""
 

@@ -435,10 +435,6 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
             "mem_get_info (may under-count simpler's rtMalloc pool).",
         )
 
-    def warmup(self, model: RuntimeModel) -> None:
-        """Dispatch a dummy prefill + decode through the L3 worker."""
-        self._warmup_dispatch(model.runtime)
-
     def _warmup_dispatch(self, runtime: RuntimeConfig) -> None:
         """Production-scale prefill + decode warm-up with slot_mapping=-1.
 

@@ -113,15 +113,6 @@ class ModelRunner(ABC):
         """Free one worker-resident KV cache tensor."""
         raise NotImplementedError
 
-    def warmup(self, model: RuntimeModel) -> None:
-        """Run a minimal prefill + decode to warm up device kernels.
-
-        The default implementation is a no-op.  NPU runners should override
-        this to dispatch one dummy prefill and one dummy decode so that all
-        device kernels are compiled and cached before the first real request.
-        """
-        del model  # unused in the default no-op
-
     @abstractmethod
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         """Run the compiled prefill path for one batch."""
