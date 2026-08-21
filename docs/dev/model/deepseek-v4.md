@@ -130,6 +130,18 @@ handles and address them with scheduler-owned group block IDs; there is no
 prefill CPU snapshot or cache handoff. Reassigned pages are cleared with
 targeted host-to-device copies before their new owner writes them.
 
+## Weight Staging
+
+The 49 per-layer weights are described declaratively in
+`model/deepseek/weight_spec.py` and evaluated by the shared pipeline in
+`model/common/weights/`; see [Weight staging](weight-staging.md) for the rule
+kinds, the slab geometry and the invariants. Two things specific to this model:
+staging is **serial** on purpose — packing one layer allocates ~8 GB of
+intermediates, so overlapping layers multiplies the peak rather than hiding
+latency — and the layers form three slab groups (`fwd` over all layers, `csa`
+over the `compress_ratio==4` ones, `hca` over the `==128` ones), each holding its
+layers contiguously in first-appearance order.
+
 ## Optional Prepacked Weights
 
 The 43 hidden layers can be converted once into the final rank-stacked Host
@@ -147,6 +159,13 @@ memory-mapped as the final layout instead of repacking every hidden layer. A
 cold, missing, or stale sidecar uses the original checkpoint path, avoiding a
 cold 323 GiB page-fault stream on the weight-upload path. Rebuild with `--force`
 after replacing checkpoint shards or changing the packed rank layout.
+
+The sidecar's layout is the order the rule table produces, and its metadata
+records a name-to-offset map built from that order — so reordering
+`DEEPSEEK_V4_LAYER_RULES` invalidates every sidecar already written. The
+fingerprint covers the config, the weight map and each source shard's size and
+mtime, which is what makes a stale sidecar detectable rather than silently
+wrong.
 
 ## Completion Check
 

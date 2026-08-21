@@ -314,7 +314,6 @@ def _runtime_model(tmp_path, weight_map, *, layers=_LAYERS):
         embed_tokens=torch.zeros(_VOCAB, _HIDDEN),
         final_norm_weight=torch.ones(_HIDDEN),
         lm_head=torch.zeros(_VOCAB, _HIDDEN),
-        layers=[],
         extra={"model_dir": str(tmp_path), "weight_map": weight_map},
     )
 

@@ -24,54 +24,11 @@ import struct
 
 import pytest
 
-from pypto_serving.model.deepseek import weight_loader
 from pypto_serving.model.deepseek.weight_loader import (
     DEEPSEEK_V4_PACKED_FORMAT,
     deepseek_v4_packed_weights_path,
 )
 _EXPERTS = 4
-
-
-def _legacy_stacked(checkpoint):
-    """Stack through the hand-written helpers, as `load_stacked_layer_weights` used to."""
-    store = checkpoint.store()
-    ratios = checkpoint.compress_ratios
-    first = store.load_packed_layer_weights(
-        0,
-        ranks=checkpoint.ranks,
-        n_routed_experts=checkpoint.n_routed_experts,
-        compress_ratio=int(ratios[0]),
-        include_tid2eid=checkpoint.num_hash_layers > 0,
-        include_gate_bias=checkpoint.num_hash_layers <= 0,
-    )
-    slabs, fwd_names = weight_loader._allocate_stacked_layer_weights(first, compress_ratios=ratios)
-    csa_order = 0
-    hca_order = 0
-    for layer_id, ratio in enumerate(ratios):
-        destinations = weight_loader._stacked_layer_destinations(
-            slabs,
-            first,
-            fwd_names=fwd_names,
-            layer_id=layer_id,
-            compress_ratio=int(ratio),
-            csa_order=csa_order,
-            hca_order=hca_order,
-        )
-        if layer_id == 0:
-            weight_loader._copy_packed_layer(first, destinations)
-        else:
-            store.load_packed_layer_weights(
-                layer_id,
-                ranks=checkpoint.ranks,
-                n_routed_experts=checkpoint.n_routed_experts,
-                compress_ratio=int(ratio),
-                include_tid2eid=layer_id < checkpoint.num_hash_layers,
-                include_gate_bias=layer_id >= checkpoint.num_hash_layers,
-                destinations=destinations,
-            )
-        csa_order += int(int(ratio) == 4)
-        hca_order += int(int(ratio) == 128)
-    return slabs
 
 
 def _write_sidecar(checkpoint, tensors, path):
@@ -107,54 +64,39 @@ def _payload(path):
         return handle.read()
 
 
-def test_the_written_sidecar_matches_the_legacy_one(deepseek_checkpoint, fingerprint_tensors, tmp_path):
-    """Same tensors, same offsets, same metadata values — so a rebuild is interchangeable.
+def test_a_written_sidecar_round_trips_through_the_reader(
+    deepseek_checkpoint, fingerprint_tensors, tmp_path
+):
+    """Write, read back, and match a fresh pack of the same checkpoint.
 
-    Compared as (header entries, metadata dict, payload bytes) rather than as whole files,
-    because whole-file equality is **not** a property safetensors provides: it serializes the
-    metadata map in nondeterministic order, so two writes of the same dict in one process can
-    differ in the header. Measured — eight writes of one dict produced two different orders — so
-    a byte-for-byte assertion here would be flaky for a reason that has nothing to do with this
-    refactor, and "fixing" it by touching the writer would be chasing a phantom.
+    The comparison against the pre-refactor packer lived in the PR that did the refactor and
+    went green there; once that code is gone the property worth guarding is this one — that the
+    artifact on disk and the shard path agree, so a stale or corrupt sidecar is the only way
+    they can diverge.
 
-    What does matter is asserted: every tensor's dtype, shape and data offsets, the metadata
-    values, and every payload byte.
+    Compared as (header entries, metadata dict, payload bytes) rather than as whole files:
+    safetensors serializes its metadata map in nondeterministic order — eight writes of one dict
+    in a single process gave two different key orders — so a byte-for-byte file assertion would
+    be flaky for a reason that has nothing to do with this code.
     """
     checkpoint = deepseek_checkpoint(n_routed_experts=_EXPERTS)
+    packed = checkpoint.load_stacked().tensors
 
-    legacy = _legacy_stacked(checkpoint)
-    current = checkpoint.load_stacked().tensors
+    first = tmp_path / "first.safetensors"
+    second = tmp_path / "second.safetensors"
+    _write_sidecar(checkpoint, packed, first)
+    _write_sidecar(checkpoint, checkpoint.load_stacked().tensors, second)
 
-    assert list(legacy) == list(current), "name order is what the sidecar's offset map follows"
-    assert fingerprint_tensors(legacy) == fingerprint_tensors(current)
-
-    legacy_path = tmp_path / "legacy.safetensors"
-    current_path = tmp_path / "current.safetensors"
-    _write_sidecar(checkpoint, legacy, legacy_path)
-    _write_sidecar(checkpoint, current, current_path)
-
-    legacy_header = _header(legacy_path)
-    current_header = _header(current_path)
-    assert legacy_header.pop("__metadata__") == current_header.pop("__metadata__")
+    first_header = _header(first)
+    second_header = _header(second)
+    assert first_header.pop("__metadata__") == second_header.pop("__metadata__")
     # dtype, shape and data_offsets for every tensor: the offsets a published sidecar records
     # must not move, or a reader would map the wrong bytes.
-    assert legacy_header == current_header
-    assert _payload(legacy_path) == _payload(current_path)
+    assert first_header == second_header
+    assert _payload(first) == _payload(second)
 
-
-def test_a_legacy_written_sidecar_loads_under_the_current_reader(
-    deepseek_checkpoint, fingerprint_tensors
-):
-    """The direction that protects artifacts already on disk.
-
-    Written from the hand-written stacker, read back through the untouched reader, and compared
-    against what the current stacker produces from the same checkpoint. A sidecar that took ~40
-    minutes to build must not become garbage because the packer was refactored.
-    """
-    checkpoint = deepseek_checkpoint(n_routed_experts=_EXPERTS)
     path = deepseek_v4_packed_weights_path(checkpoint.model_dir, ranks=checkpoint.ranks)
-    _write_sidecar(checkpoint, _legacy_stacked(checkpoint), path)
-
+    _write_sidecar(checkpoint, packed, path)
     loaded = checkpoint.store().load_prepacked_stacked_layer_weights(
         ranks=checkpoint.ranks,
         n_routed_experts=checkpoint.n_routed_experts,
@@ -162,8 +104,8 @@ def test_a_legacy_written_sidecar_loads_under_the_current_reader(
         num_hash_layers=checkpoint.num_hash_layers,
     )
 
-    assert loaded is not None, "the reader rejected a sidecar the current writer would accept"
-    assert fingerprint_tensors(loaded.tensors) == fingerprint_tensors(checkpoint.load_stacked().tensors)
+    assert loaded is not None, "the reader rejected a sidecar this writer produced"
+    assert fingerprint_tensors(loaded.tensors) == fingerprint_tensors(packed)
 
 
 def test_a_currently_written_sidecar_is_taken_in_preference_to_repacking(

@@ -77,7 +77,6 @@ def _model(
         embed_tokens=torch.zeros(config.vocab_size, config.hidden_size),
         final_norm_weight=torch.ones(config.hidden_size),
         lm_head=torch.zeros(config.vocab_size, config.hidden_size),
-        layers=[],
     )
 
 

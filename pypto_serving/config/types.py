@@ -141,29 +141,6 @@ class LayerSpec:
 
 
 @dataclass
-class LayerWeights:
-    """Loaded weights for one transformer layer in framework orientation.
-
-    Deprecated. Holding a whole model in this shape is what cost a second copy at the staging
-    peak; weights are now described declaratively per family (`model/*/weight_spec.py`) and read
-    one layer at a time into their stacked destination. Kept until the open PRs that reference
-    it have landed.
-    """
-
-    input_rms_weight: torch.Tensor
-    wq: torch.Tensor
-    wk: torch.Tensor
-    wv: torch.Tensor
-    q_norm_weight: torch.Tensor
-    k_norm_weight: torch.Tensor
-    wo: torch.Tensor
-    post_rms_weight: torch.Tensor
-    w_gate: torch.Tensor
-    w_up: torch.Tensor
-    w_down: torch.Tensor
-
-
-@dataclass
 class RuntimeModel:
     """Loaded model tensors plus runtime and architecture metadata."""
 
@@ -172,11 +149,6 @@ class RuntimeModel:
     embed_tokens: torch.Tensor
     final_norm_weight: torch.Tensor
     lm_head: torch.Tensor
-    # Deprecated, and empty for every loader in the tree: per-layer weights are read one layer
-    # at a time while they are staged, so nothing keeps them here. Defaulted rather than removed
-    # so the several open PRs that construct a RuntimeModel keep working; the field goes once
-    # they have landed. See `model/common/weights/` for the staging path that replaced it.
-    layers: list[LayerWeights] = field(default_factory=list)
     extra: dict[str, object] = field(default_factory=dict)
 
 

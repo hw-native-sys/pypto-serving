@@ -2689,7 +2689,6 @@ def _runtime_model_for_embeddings():
         embed_tokens=placeholder,
         final_norm_weight=torch.empty(0),
         lm_head=placeholder,
-        layers=[],
     )
 
 

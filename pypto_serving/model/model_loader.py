@@ -344,7 +344,6 @@ class DeepSeekV4W8A8DirectoryLoader:
             embed_tokens=placeholder,
             final_norm_weight=torch.empty(0, dtype=torch.bfloat16),
             lm_head=placeholder,
-            layers=[],
             extra={
                 "family": "deepseek_v4",
                 "checkpoint_format": "w8a8-compressed-tensors",
