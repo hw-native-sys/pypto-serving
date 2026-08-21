@@ -1395,11 +1395,13 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
             persistent,
             reset_persistent_windows,
             inherited_host_tensors,
+            immutable_host_tensors,
         ):
             captured["compiled"] = compiled
             captured["persistent"] = persistent
             captured["reset_persistent_windows"] = reset_persistent_windows
             captured["inherited"] = inherited_host_tensors
+            captured["immutable"] = immutable_host_tensors
 
     monkeypatch.setattr("pypto.runtime.DistributedWorker", FakeDistributedWorker)
     runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
@@ -1426,6 +1428,10 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
     assert captured["persistent"] is True
     assert captured["reset_persistent_windows"] is False
     assert captured["inherited"] == [main_weight, mtp_weight]
+    # Declared immutable too, which is what lets the runtime name these ranges in place instead
+    # of copying 346 GB through a staging buffer. If a mutable tensor is ever added to that
+    # helper, this is the assertion that should start looking wrong.
+    assert captured["immutable"] == [main_weight, mtp_weight]
 
 
 def test_deepseek_resident_upload_releases_inherited_host_references():

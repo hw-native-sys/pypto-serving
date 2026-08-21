@@ -3941,12 +3941,25 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                     persistent=True,
                     reset_persistent_windows=False,
                     inherited_host_tensors=self._inherited_host_weights(),
+                    # Declared immutable so the runtime names these ranges in place instead of
+                    # staging a full host copy of them. It cannot infer this: the prepacked
+                    # sidecar is mapped MAP_SHARED read-only, but through mmap + from_numpy, so
+                    # `torch.is_shared()` reports False and the 346 GB of resident weights take
+                    # the copying path. The promise is real — these are the resident weights,
+                    # written once before the worker forks and never again.
+                    immutable_host_tensors=self._inherited_host_weights(),
                 )
             self._l3_worker = worker
         return worker
 
     def _inherited_host_weights(self) -> list[torch.Tensor]:
-        """Return immutable main and MTP weights that must be visible at worker fork."""
+        """Return immutable main and MTP weights that must be visible at worker fork.
+
+        "Immutable" is load bearing rather than descriptive: the list is passed to the runtime
+        as ``immutable_host_tensors`` as well, which lets it name these ranges in place instead
+        of copying them through a staging buffer. Anything added here must therefore be written
+        before the worker forks and never after, or an upload would read stale bytes.
+        """
         tensors = list(self._stacked_host_weights.values()) if self._stacked_host_weights else []
         global_weights = getattr(self, "_global_weights", None)
         if global_weights is not None:
