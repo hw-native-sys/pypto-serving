@@ -917,8 +917,10 @@ class _DeepSeekV4PendingMtpDecode:
     dispatch: "PendingL3Dispatch"
     inputs: DeepSeekV4PreparedDecodeInputs
     sampled_ids: torch.Tensor
-    mtp_sampled_ids: torch.Tensor
     accepted_counts: torch.Tensor
+    mtp_sampled_ids: torch.Tensor
+    committed_input_ids: torch.Tensor
+    committed_position_ids: torch.Tensor
     states: tuple["_DeepSeekV4MtpRequestState", ...]
 
 
@@ -1076,17 +1078,14 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         self._static_freqs_cos: torch.Tensor | None = None
         self._static_freqs_sin: torch.Tensor | None = None
         self._prefill_task_args: DeepSeekPrefillTaskArgs | None = None
-        # Per ping-pong slot, decode buffers live on the decode TaskArgs. Fused
-        # K=1 write-only outputs and static metadata are device-resident;
-        # scheduler-visible dynamic inputs and sampled IDs remain shared on Host.
+        # Per ping-pong slot: the host-shared ``_DECODE_FWD_TENSOR_ORDER``
+        # buffers (metadata inputs, sampled_ids, hidden/logits outputs) live on
+        # the decode TaskArgs; the device-resident pre-HC output is a
+        # device-resident slot on the same TaskArgs.  ``_decode_input_slots``
+        # keeps only the MTP-specific reclaimed buffers until the MTP builders
+        # migrate (Step 5).
         self._decode_task_args: list[TaskArgs] = []
         self._decode_input_slots: list[dict[str, torch.Tensor]] = []
-        self._decode_metadata_sources: list[dict[str, torch.Tensor]] = []
-        self._decode_device_metadata: list[dict[str, StackedDeviceTensor]] = []
-        self._decode_metadata_host_keys: list[list[tuple[object, ...] | None]] = []
-        self._decode_metadata_device_keys: list[list[tuple[object, ...] | None]] = []
-        self._decode_metadata_control_lock = threading.Lock()
-        self._decode_metadata_predecessor: PendingL3Dispatch | None = None
         self._decode_static_metadata_keys: list[tuple[object, ...] | None] = [
             None
         ] * compiled.layout.ranks
@@ -1869,11 +1868,6 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         if not 0 <= buffer_slot < len(self._decode_task_args):
             raise ValueError(f"decode buffer_slot must be 0 or 1, got {buffer_slot}")
         staged = self._decode_task_args[buffer_slot].tensors
-        static_staged = (
-            self._decode_metadata_sources[buffer_slot]
-            if self._compiled.num_speculative_tokens == 1
-            else staged
-        )
         staged["num_tokens_per_owner"].zero_()
         staged["logit_row_indices"].fill_(-1)
         self._stage_decode_dynamic_inputs(
@@ -1887,23 +1881,11 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         for rank, request_indices in enumerate(assignment.indices_by_rank):
             if request_indices:
                 local_groups = [active_group_ids[index] for index in request_indices]
-                static_key = tuple(
-                    (name, tuple(groups[name] for groups in local_groups))
-                    for name in DEEPSEEK_V4_CACHE_GROUP_NAMES
-                )
             else:
                 # All ranks must enter the distributed program with the common
                 # scalar num_tokens. This rank contributes filler rows whose
                 # cache mappings cover otherwise-unowned scratch blocks.
                 local_groups = []
-                static_key = (("scratch",),)
-
-            if (
-                self._compiled.num_speculative_tokens == 1
-                and self._decode_metadata_host_keys[buffer_slot][rank] == static_key
-            ):
-                self._sync_decode_device_metadata_rank(buffer_slot, rank, static_key)
-                continue
 
             padded_group_ids = {}
             for name in DEEPSEEK_V4_CACHE_GROUP_NAMES:
@@ -1961,13 +1943,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             }
             for name, value in static_values.items():
                 copy_shared(
-                    static_staged[name][rank],
+                    staged[name][rank],
                     value,
                     name=f"decode_{name}_rank{rank}",
                 )
-            if self._compiled.num_speculative_tokens == 1:
-                self._decode_metadata_host_keys[buffer_slot][rank] = static_key
-                self._sync_decode_device_metadata_rank(buffer_slot, rank, static_key)
 
         for rank, count in enumerate(per_rank_counts):
             row_count = count * active_seq
@@ -1992,16 +1971,16 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             input_ids=staged["input_ids"],
             position_ids=staged["position_ids"],
             kv_seq_lens=staged["kv_seq_lens"],
-            block_table=static_staged["block_table"],
-            hca_cmp_block_table=static_staged["hca_cmp_block_table"],
-            csa_cmp_block_table=static_staged["csa_cmp_block_table"],
-            idx_block_table=static_staged["idx_block_table"],
-            hca_compress_state_block_table=static_staged["hca_compress_state_block_table"],
-            csa_compress_state_block_table=static_staged["csa_compress_state_block_table"],
-            csa_inner_compress_state_block_table=static_staged[
+            block_table=staged["block_table"],
+            hca_cmp_block_table=staged["hca_cmp_block_table"],
+            csa_cmp_block_table=staged["csa_cmp_block_table"],
+            idx_block_table=staged["idx_block_table"],
+            hca_compress_state_block_table=staged["hca_compress_state_block_table"],
+            csa_compress_state_block_table=staged["csa_compress_state_block_table"],
+            csa_inner_compress_state_block_table=staged[
                 "csa_inner_compress_state_block_table"
             ],
-            block_counts=static_staged["block_counts"],
+            block_counts=staged["block_counts"],
             block_ids_by_group=active_group_ids,
             num_tokens_per_owner=staged["num_tokens_per_owner"],
             logit_row_indices=staged["logit_row_indices"],
@@ -2611,12 +2590,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 cat="executor",
                 args={"actual_tokens": active_tokens, "fused_mtp": True},
             ):
-                with self._decode_metadata_control_lock:
-                    dispatch = self._submit_l3(
-                        self._require_decode_callable(),
-                        *inputs.dispatch_args,
-                    )
-                    self._decode_metadata_predecessor = dispatch
+                dispatch = self._submit_l3(
+                    self._require_decode_callable(),
+                    *inputs.dispatch_args,
+                )
         except RuntimeError as exc:
             raise RuntimeError(
                 "DeepSeekV4 fused main/MTP decode dispatch failed "
@@ -2629,8 +2606,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             dispatch=dispatch,
             inputs=inputs,
             sampled_ids=ta.tensors["sampled_ids"],
-            mtp_sampled_ids=mtp["sampled_ids"],
             accepted_counts=mtp["accepted_counts"],
+            mtp_sampled_ids=mtp["sampled_ids"],
+            committed_input_ids=mtp["input_ids"],
+            committed_position_ids=mtp["position_ids"],
             states=states,
         )
 
@@ -2656,12 +2635,9 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                     row_start : row_start + decode_seq,
                     0,
                 ].tolist()
-                accepted_count = int(pending.accepted_counts[rank, local_row].item())
-                if accepted_count not in (1, decode_seq):
-                    raise RuntimeError(
-                        "DeepSeekV4 MTP device state returned invalid accepted count "
-                        f"{accepted_count} for decode_seq={decode_seq}"
-                    )
+                accepted_count = int(
+                    pending.accepted_counts[rank, local_row].item()
+                )
                 accepted_counts_list.append(accepted_count)
                 accepted.append([int(token) for token in main_tokens[:accepted_count]])
             accepted_counts = tuple(accepted_counts_list)
@@ -2678,17 +2654,24 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                     self._mtp_proposed_tokens,
                     100.0 * self._mtp_accepted_tokens / self._mtp_proposed_tokens,
                 )
-        # Keep the next draft mirrored on Host for request statistics and
-        # diagnostics. Recurrent token state remains authoritative on device.
-        for state, rank, local_row in zip(
-            states,
-            inputs.ranks,
-            inputs.local_rows,
-            strict=True,
-        ):
-            state.draft_token_id = int(
-                pending.mtp_sampled_ids[rank, local_row, 0].item()
-            )
+        # The fused kernel has already committed draft/tail/position to the
+        # stable device-state slot.  Host mirrors are diagnostics for the
+        # legacy split-MTP path and must not delay the next steady dispatch.
+        if logger.isEnabledFor(logging.DEBUG):
+            for state, rank, local_row in zip(
+                states,
+                inputs.ranks,
+                inputs.local_rows,
+                strict=True,
+            ):
+                row_end = (local_row + 1) * decode_seq - 1
+                state.draft_token_id = int(
+                    pending.mtp_sampled_ids[rank, local_row, 0].item()
+                )
+                state.tail_token_id = int(pending.committed_input_ids[rank, row_end].item())
+                state.tail_position = int(
+                    pending.committed_position_ids[rank, row_end].item()
+                )
         return DecodeResult(
             hidden_states=None,
             logits=None,
@@ -3077,24 +3060,14 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
     def _decode_fwd_args(self, inputs: DeepSeekV4PreparedDecodeInputs) -> tuple[Any, ...]:
         """Build the single packed ``l3_decode_fwd`` argument tuple from the decode TaskArgs.
 
-        Static fused-MTP metadata is copied into this ping-pong slot's resident
-        shards only when block ownership changes. All resident allocations were
-        created on the init lane, so this hot path only copies and assembles.
+        The TaskArgs owns every ``_DECODE_FWD_TENSOR_ORDER`` buffer (host-shared
+        metadata/outputs as slots, device-resident pre-HC output as a slot,
+        weights/caches/embed as lazy sources).  Both the host-shared and the
+        device-resident slots are allocated before the L3 worker fork / at
+        resident-weight materialization, so this hot path only assembles the
+        tuple -- it must not touch the worker (the prepare lane runs concurrently
+        with an in-flight dispatch in the depth-2 pipeline).
         """
-        if self._compiled.num_speculative_tokens == 1:
-            for rank, static_key in enumerate(
-                self._decode_metadata_host_keys[inputs.buffer_slot]
-            ):
-                if static_key is None:
-                    raise RuntimeError(
-                        f"DeepSeekV4 decode metadata for slot {inputs.buffer_slot} "
-                        f"rank {rank} was not prepared"
-                    )
-                self._sync_decode_device_metadata_rank(
-                    inputs.buffer_slot,
-                    rank,
-                    static_key,
-                )
         return self._decode_task_args[inputs.buffer_slot].build()
 
     def _device_cache_values(self) -> dict[str, StackedDeviceTensor]:
@@ -3775,8 +3748,6 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         batch = layout.decode_batch
 
         from pypto_serving.model.deepseek.task_args import (  # noqa: PLC0415
-            _DECODE_STATIC_METADATA_FIELDS,
-            _decode_slot_specs,
             decode_task_args,
             mtp_decode_task_args,
         )
@@ -3789,34 +3760,9 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         # device-resident pre-HC output is a device slot on the same TaskArgs.
         self._decode_task_args = []
         for slot in (0, 1):
-            task_args = decode_task_args(
-                self,
-                int(hidden_size),
-                int(vocab_size),
-                buffer_slot=slot,
-            )
+            task_args = decode_task_args(self, int(hidden_size), int(vocab_size))
             task_args.allocate_host_shared(None)
             self._decode_task_args.append(task_args)
-
-        if self._compiled.num_speculative_tokens == 1:
-            specs = _decode_slot_specs(layout, int(hidden_size), int(vocab_size))
-            self._decode_metadata_sources = [
-                {
-                    name: shared_empty(
-                        specs[name][1],
-                        specs[name][0],
-                        name=f"decode_slot{slot}_{name}_source",
-                    )
-                    for name in _DECODE_STATIC_METADATA_FIELDS
-                }
-                for slot in (0, 1)
-            ]
-            self._decode_metadata_host_keys = [
-                [None] * ranks for _slot in (0, 1)
-            ]
-            self._decode_metadata_device_keys = [
-                [None] * ranks for _slot in (0, 1)
-            ]
 
         # MTP decode TaskArgs (one per ping-pong slot) own the
         # ``_MTP_DECODE_TENSOR_ORDER`` reclaimed + write-only outputs.  The fused
@@ -3829,11 +3775,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         if self._compiled.num_speculative_tokens or legacy_mtp:
             self._mtp_decode_task_args = []
             for slot in (0, 1):
-                mtp_ta = mtp_decode_task_args(
-                    self,
-                    int(hidden_size),
-                    buffer_slot=slot,
-                )
+                mtp_ta = mtp_decode_task_args(self, int(hidden_size))
                 mtp_ta.allocate_host_shared(None)
                 self._mtp_decode_task_args.append(mtp_ta)
 
@@ -4080,21 +4022,17 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
     def _materialize_resident_weights(self) -> None:
         """Upload inherited weights once and release their parent-process Host references."""
         worker = self._shared_l3_worker()
-        if getattr(self._compiled, "num_speculative_tokens", 0) == 1:
-            for buffer_slot in range(len(self._decode_metadata_sources)):
-                self._materialize_decode_device_metadata(buffer_slot)
         if self._global_weights is not None:
             hidden_size = int(self.load_packed_global_weights().embed_weight.shape[1])
             self._materialize_embedding_device_weight()
-            # Allocate TaskArgs device-resident slots once on the init lane.
-            # This must NOT happen lazily on the prepare lane: prepare runs
-            # concurrently with in-flight dispatches in the depth-2 pipeline,
-            # and a worker.alloc_tensor racing worker.run corrupts device state.
+            # Allocate the decode TaskArgs device-resident slots (the pre-HC
+            # output) once, here on the init lane.  This must NOT happen lazily
+            # on the prepare lane: prepare runs concurrently with in-flight
+            # dispatches in the depth-2 pipeline, and a worker.alloc_tensor
+            # racing worker.run corrupts the device state.
             for task_args in self._decode_task_args:
                 task_args.allocate_device(worker, None)
             if self._compiled.num_speculative_tokens:
-                for task_args in self._mtp_decode_task_args:
-                    task_args.allocate_device(worker, None)
                 self._materialize_mtp_tail_pre_hc_pool(hidden_size)
                 self._mtp_prefill_task_args.allocate_device(worker, None)
                 self._materialize_mtp_device_state_tokens()
@@ -4196,76 +4134,6 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 worker.free_tensor(shard, worker_id=worker_id)
             raise
         return StackedDeviceTensor(shards, full_shape, worker_ids)
-
-    def _materialize_decode_device_metadata(
-        self,
-        buffer_slot: int,
-    ) -> dict[str, StackedDeviceTensor]:
-        """Allocate one resident static-metadata set per decode ping-pong slot."""
-        if not 0 <= buffer_slot < len(self._decode_metadata_sources):
-            raise ValueError(f"decode buffer_slot must be 0 or 1, got {buffer_slot}")
-        if not self._decode_device_metadata:
-            self._decode_device_metadata = [
-                {} for _sources in self._decode_metadata_sources
-            ]
-        metadata = self._decode_device_metadata[buffer_slot]
-        if metadata:
-            return metadata
-
-        allocated: dict[str, StackedDeviceTensor] = {}
-        try:
-            for name, source in self._decode_metadata_sources[buffer_slot].items():
-                allocated[name] = self._alloc_empty_stacked_tensor(
-                    tuple(source.shape),
-                    source.dtype,
-                )
-        except Exception:
-            worker = self._shared_l3_worker()
-            for tensor in reversed(tuple(allocated.values())):
-                worker.free_stacked_tensor(tensor)
-            raise
-        metadata.update(allocated)
-        return metadata
-
-    def _sync_decode_device_metadata_rank(
-        self,
-        buffer_slot: int,
-        rank: int,
-        static_key: tuple[object, ...],
-    ) -> None:
-        """Upload a rank shard after that ping-pong slot's ownership changes."""
-        if not self._decode_device_metadata:
-            return
-        with self._decode_metadata_control_lock:
-            if self._decode_metadata_device_keys[buffer_slot][rank] == static_key:
-                return
-            predecessor = self._decode_metadata_predecessor
-            if predecessor is not None:
-                predecessor.wait()
-                self._decode_metadata_predecessor = None
-
-            worker = self._shared_l3_worker()
-            sources = self._decode_metadata_sources[buffer_slot]
-            metadata = self._decode_device_metadata[buffer_slot]
-            for name, source in sources.items():
-                source_shard = source[rank]
-                target = metadata[name]
-                target_shard = target.shards[rank]
-                if (
-                    tuple(source_shard.shape) != tuple(target_shard.shape)
-                    or source_shard.dtype != target_shard.dtype
-                ):
-                    raise ValueError(
-                        f"DeepSeekV4 decode metadata {name!r} slot {buffer_slot} "
-                        f"rank {rank} shape/dtype mismatch"
-                    )
-                worker.copy_to(
-                    target_shard.data_ptr,
-                    source_shard.data_ptr(),
-                    source_shard.numel() * source_shard.element_size(),
-                    worker_id=target.worker_ids[rank],
-                )
-            self._decode_metadata_device_keys[buffer_slot][rank] = static_key
 
     def _materialize_embedding_device_weight(self) -> StackedDeviceTensor:
         """Upload one full embedding table to every decode rank."""
@@ -4500,10 +4368,6 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         return cache
 
     def _free_device_caches(self) -> None:
-        self._decode_metadata_device_keys = [
-            [None] * self._compiled.layout.ranks
-            for _sources in self._decode_metadata_sources
-        ]
         worker = self._l3_worker
         if worker is None:
             self._decode_device_cache = None
@@ -4568,11 +4432,6 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 task_args.close()
             self._mtp_decode_task_args = []
             self._decode_input_slots = []
-            self._decode_metadata_sources = []
-            self._decode_device_metadata = []
-            self._decode_metadata_host_keys = []
-            self._decode_metadata_device_keys = []
-            self._decode_metadata_predecessor = None
             if self._prefill_task_args is not None:
                 self._prefill_task_args.close()
                 self._prefill_task_args = None

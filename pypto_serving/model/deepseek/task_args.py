@@ -556,17 +556,6 @@ def prefill_task_args(
 _DECODE_STATIC_WEIGHTS = _PREFILL_STATIC_WEIGHTS
 _DECODE_CACHE_POOLS = _PREFILL_CACHE_POOLS
 
-_DECODE_STATIC_METADATA_FIELDS = (
-    "block_table",
-    "hca_cmp_block_table",
-    "csa_cmp_block_table",
-    "idx_block_table",
-    "hca_compress_state_block_table",
-    "csa_compress_state_block_table",
-    "csa_inner_compress_state_block_table",
-    "block_counts",
-)
-
 
 def _decode_slot_specs(layout, hidden: int, vocab: int) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
     """Host-shared buffer name -> (dtype, full shape) owned by the decode TaskArgs.
@@ -599,18 +588,14 @@ def _decode_slot_specs(layout, hidden: int, vocab: int) -> dict[str, tuple[torch
     }
 
 
-def decode_task_args(
-    runner: DeepSeekV4ModelRunner,
-    hidden: int,
-    vocab: int,
-    *,
-    buffer_slot: int = 0,
-) -> TaskArgs:
+def decode_task_args(runner: DeepSeekV4ModelRunner, hidden: int, vocab: int) -> TaskArgs:
     """Build the ``TaskArgs`` for the single packed ``l3_decode_fwd`` dispatch.
 
-    Owns every per-dispatch buffer as a slot. Fused K=1 MTP keeps the write-only
-    hidden/logits outputs device-resident; other modes retain host outputs for
-    scheduler-visible decode results. The pre-HC output is always resident.
+    Owns every per-dispatch buffer as a slot -- the host metadata, sampled_ids,
+    the hidden/logits outputs (host), and the pre-HC output (device-resident) --
+    so none of these buffers live on the runner. Only true weights/caches
+    (embed, kv pools, stacked layer weights) and static markers stay as lazy
+    sources, resolved at ``build()``.
     """
     layout = runner._compiled.layout
     slot_specs = _decode_slot_specs(layout, hidden, vocab)
@@ -618,20 +603,9 @@ def decode_task_args(
     cache_pools = set(_DECODE_CACHE_POOLS)
     ta = TaskArgs(stacked=True)
     for name in _DECODE_FWD_TENSOR_ORDER:
-        if runner._compiled.num_speculative_tokens == 1 and name in _DECODE_STATIC_METADATA_FIELDS:
-            ta.add_arg(
-                name,
-                lambda n=name, slot=buffer_slot: runner._materialize_decode_device_metadata(slot)[n],
-            )
-        elif name in slot_specs:
+        if name in slot_specs:
             dtype, shape = slot_specs[name]
-            placement = (
-                Placement.DEVICE_RESIDENT
-                if runner._compiled.num_speculative_tokens == 1
-                and name in {"hidden_out", "logits"}
-                else Placement.HOST_SHARED
-            )
-            ta.add_slot(Slot(name, placement, dtype, lambda _, s=shape: s))
+            ta.add_slot(Slot(name, Placement.HOST_SHARED, dtype, lambda _, s=shape: s))
         elif name == "pre_hc_hidden_out":
             ta.add_slot(
                 Slot(
@@ -757,19 +731,15 @@ def _mtp_decode_slots(layout, hidden: int) -> dict[str, tuple[torch.dtype, tuple
     }
 
 
-def mtp_decode_task_args(
-    runner: DeepSeekV4ModelRunner,
-    hidden: int,
-    *,
-    buffer_slot: int = 0,
-) -> TaskArgs:
+def mtp_decode_task_args(runner: DeepSeekV4ModelRunner, hidden: int) -> TaskArgs:
     """Build the ``TaskArgs`` for the single packed ``l3_mtp_decode`` dispatch.
 
     One per ping-pong slot (the runner keeps a list of 2). K=1 registers the
-    fused raw-preamble ABI, keeps write-only outputs device-resident, and uses
-    persistent device state. K>1 registers the standalone body-only ABI and
-    retains host slots for recurrent readback. Static weights, cache pools, and
-    recurrent state are resolved lazily at ``build()``.
+    fused raw-preamble ABI and K>1 the standalone body-only ABI; both own the
+    per-slot reclaimed outputs and the write-only hidden/logits outputs as host
+    slots. Static weights become upload-once markers, the MTP kv_cache / tail
+    pool / recurrent state and the strip-shared main-decode handles are lazy
+    sources resolved at ``build()``.
     """
     layout = runner._compiled.layout
     slots = _mtp_decode_slots(layout, hidden)
@@ -784,20 +754,7 @@ def mtp_decode_task_args(
     for name in tensor_order:
         if name in slots:
             dtype, shape = slots[name]
-            resident_outputs = {
-                "input_ids",
-                "position_ids",
-                "hidden_out",
-                "next_pre_hc_hidden",
-                "logits",
-            }
-            placement = (
-                Placement.DEVICE_RESIDENT
-                if runner._compiled.num_speculative_tokens == 1
-                and name in resident_outputs
-                else Placement.HOST_SHARED
-            )
-            ta.add_slot(Slot(name, placement, dtype, lambda _, s=shape: s))
+            ta.add_slot(Slot(name, Placement.HOST_SHARED, dtype, lambda _, s=shape: s))
         elif name in static_weights:
             ta.add_arg(name, _static_weight_source(runner, name))
         elif name == "kv_cache":
@@ -813,18 +770,9 @@ def mtp_decode_task_args(
         elif name == "main_pre_hc_hidden":
             ta.add_arg(name, lambda: runner._materialize_main_pre_hc_device(hidden))
         elif name == "ori_block_table":
-            if runner._compiled.num_speculative_tokens == 1:
-                ta.add_arg(
-                    name,
-                    lambda slot=buffer_slot: runner._materialize_decode_device_metadata(slot)[
-                        "block_table"
-                    ],
-                )
-            else:
-                ta.add_arg(
-                    name,
-                    lambda slot=buffer_slot: runner._decode_task_args[slot].tensors["block_table"],
-                )
+            # Strip-shared with the main decode tuple; value is irrelevant on
+            # the fused path. Read slot 0's block_table as a valid stand-in.
+            ta.add_arg(name, lambda: runner._decode_task_args[0].tensors["block_table"])
         else:
             ta.add_arg(
                 name,
