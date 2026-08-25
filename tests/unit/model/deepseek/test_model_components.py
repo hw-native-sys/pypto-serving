@@ -28,6 +28,8 @@ import pypto_serving.cli.main as cli
 from pypto_serving.config.types import (
     PREFILL_CHUNK_SIZE_CHOICES,
     DecodeBatch,
+    KVCacheGroupSpec,
+    KVCacheSpec,
     PrefillBatch,
     RuntimeConfig,
     SamplingParams,
@@ -37,6 +39,7 @@ from pypto_serving.model import tokenizer as tokenizer_module
 from pypto_serving.model.deepseek import npu_executor, weight_loader
 from pypto_serving.model.deepseek import task_args as task_args_module
 from pypto_serving.model.deepseek.npu_runner import (
+    DEEPSEEK_V4_CSA_NUM_LAYERS,
     DEEPSEEK_V4_LM_HEAD_TP_SIZE,
     DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS,
     DeepSeekV4CacheLayout,
@@ -121,6 +124,111 @@ class _CountingPagedOriMetadata:
 
     def __getattr__(self, name):
         return getattr(self._delegate, name)
+
+
+def test_external_idx_page_layout_includes_data_and_scale_for_every_layer():
+    ranks = 2
+    scheduler_blocks = 3
+    physical_blocks = 4
+    storage_rows = 32
+    idx_row_bytes = storage_rows * 128
+    scale_row_bytes = storage_rows * torch.float32.itemsize
+
+    def stacked(base, tail_shape, dtype):
+        return StackedDeviceTensor(
+            [DeviceTensor(base + rank * 0x1000000, tail_shape, dtype) for rank in range(ranks)],
+            (ranks, *tail_shape),
+            tuple(range(ranks)),
+        )
+
+    runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
+    runner._compiled = SimpleNamespace(
+        layout=SimpleNamespace(ranks=ranks, decode_batch=1),
+        num_speculative_tokens=0,
+    )
+    runner._cache_group_num_blocks = {"idx": scheduler_blocks}
+    runner._cache_group_specs = (
+        KVCacheGroupSpec(
+            name="idx",
+            layer_indices=tuple(range(DEEPSEEK_V4_CSA_NUM_LAYERS)),
+            spec=KVCacheSpec(
+                block_size=128,
+                compress_ratio=4,
+                page_size_bytes=DEEPSEEK_V4_CSA_NUM_LAYERS
+                * (idx_row_bytes + scale_row_bytes),
+            ),
+            max_blocks_per_seq=128,
+            num_partitions=ranks,
+        ),
+    )
+    idx_base = 0x10000000
+    scale_base = 0x20000000
+    runner._decode_device_cache = SimpleNamespace(
+        idx_kv_cache=stacked(
+            idx_base,
+            (DEEPSEEK_V4_CSA_NUM_LAYERS * physical_blocks, storage_rows, 1, 128),
+            torch.int8,
+        ),
+        idx_kv_scale=stacked(
+            scale_base,
+            (DEEPSEEK_V4_CSA_NUM_LAYERS * physical_blocks, storage_rows, 1, 1),
+            torch.float32,
+        ),
+    )
+
+    ranges = runner.external_kv_page_buffers("idx", partition=1, block_id=2)
+
+    rank_offset = 0x1000000
+    assert len(ranges) == 2 * DEEPSEEK_V4_CSA_NUM_LAYERS
+    assert ranges[0] == (idx_base + rank_offset + 2 * idx_row_bytes, idx_row_bytes)
+    assert ranges[1] == (
+        idx_base + rank_offset + (physical_blocks + 2) * idx_row_bytes,
+        idx_row_bytes,
+    )
+    assert ranges[DEEPSEEK_V4_CSA_NUM_LAYERS] == (
+        scale_base + rank_offset + 2 * scale_row_bytes,
+        scale_row_bytes,
+    )
+    assert sum(size for _, size in ranges) == runner._cache_group_specs[0].spec.page_size_bytes
+
+
+def test_external_kv_registration_uses_full_rank_allocations():
+    ranks = 2
+
+    def stacked(base, size):
+        return StackedDeviceTensor(
+            [DeviceTensor(base + rank * 0x1000000, (size,), torch.uint8) for rank in range(ranks)],
+            (ranks, size),
+            tuple(range(ranks)),
+        )
+
+    names = (
+        "kv_cache",
+        "hca_cmp_kv",
+        "csa_cmp_kv",
+        "idx_kv_cache",
+        "idx_kv_scale",
+        "hca_compress_state",
+        "csa_compress_state",
+        "csa_inner_compress_state",
+    )
+    tensors = {
+        name: stacked(0x10000000 + index * 0x2000000, 64 + index)
+        for index, name in enumerate(names)
+    }
+    runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
+    runner._compiled = SimpleNamespace(
+        layout=SimpleNamespace(ranks=ranks),
+        num_speculative_tokens=0,
+    )
+    runner._decode_device_cache = SimpleNamespace(**tensors)
+
+    buffers = runner.external_kv_registration_buffers(partition=1)
+
+    assert buffers == tuple(
+        (tensor.shards[1].data_ptr, tensor.shards[1].nbytes)
+        for tensor in tensors.values()
+    )
 
 
 def test_deepseek_kernel_dir_uses_v4_flash_variant(tmp_path):
@@ -806,6 +914,64 @@ def test_cli_keeps_deepseek_autoregressive_decode_when_mtp_is_disabled(tmp_path)
         config.runtime_config.max_prefill_tokens_per_request
         == contract.max_prefill_tokens_per_request
     )
+
+
+def test_cli_configures_deepseek_external_prefix_cache(tmp_path):
+    model_dir = _write_deepseek_model_dir(tmp_path)
+    external_config = tmp_path / "external-cache.json"
+    external_config.write_text(
+        json.dumps(
+            {
+                "model_revision": "model-commit",
+                "tokenizer_revision": "tokenizer-commit",
+                "min_tokens": 512,
+                "mooncake": {
+                    "metadata_server": "127.0.0.1:2379",
+                    "master_server_address": "127.0.0.1:50051",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = cli.build_parser().parse_args(
+        [
+            "--model",
+            str(model_dir),
+            "--devices",
+            "0,1,2,3,4,5,6,7",
+            "--dp",
+            "8",
+            "--ep",
+            "8",
+            "--external-prefix-cache-config",
+            str(external_config),
+        ]
+    )
+
+    config = cli.build_serving_engine_config(args)
+
+    assert config.external_prefix_cache_config is not None
+    assert config.external_prefix_cache_config.backend == "mooncake"
+    assert config.external_prefix_cache_config.model_revision == "model-commit"
+    assert config.external_prefix_cache_config.min_tokens == 512
+
+
+def test_cli_rejects_external_cache_for_non_deepseek_model(tmp_path):
+    model_dir = tmp_path / "qwen"
+    model_dir.mkdir()
+    external_config = tmp_path / "external-cache.json"
+    external_config.write_text("{}", encoding="utf-8")
+    args = cli.build_parser().parse_args(
+        [
+            "--model",
+            str(model_dir),
+            "--external-prefix-cache-config",
+            str(external_config),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="only supported for DeepSeek V4"):
+        cli.build_serving_engine_config(args)
 
 
 @pytest.mark.parametrize(

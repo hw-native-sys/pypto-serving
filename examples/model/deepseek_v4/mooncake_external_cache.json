@@ -1,0 +1,22 @@
+{
+  "backend": "mooncake",
+  "model_revision": "replace-with-immutable-weight-revision",
+  "tokenizer_revision": "replace-with-immutable-tokenizer-revision",
+  "min_tokens": 1024,
+  "load_timeout_ms": 30000,
+  "transfer_concurrency": 2,
+  "failure_policy": "cold_miss",
+  "enable_save": true,
+  "mooncake": {
+    "metadata_server": "http://127.0.0.1:8080/metadata",
+    "master_server_address": "127.0.0.1:50051",
+    "protocol": "ascend",
+    "device_name": "",
+    "ascend_buffer_pool": "4:8",
+    "global_segment_size": "4GB",
+    "local_buffer_size": "512MB",
+    "enable_ssd_offload": true,
+    "ssd_offload_path": "/nvme/mooncake/pypto-serving",
+    "tenant_id": "default"
+  }
+}

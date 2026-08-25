@@ -27,6 +27,9 @@ from pypto_serving.serving.sched.scheduler import (
 from pypto_serving.serving.server import serving_worker
 from pypto_serving.serving.server.ipc import (
     DecodeRequest,
+    ExternalKVLoadCommand,
+    ExternalKVPageData,
+    ExternalKVSaveCommand,
     NewRequestData,
     PrefillRequest,
     StepCommand,
@@ -35,6 +38,11 @@ from pypto_serving.serving.server.ipc import (
     decode_command,
     decode_result,
     encode_command,
+)
+from pypto_serving.serving.external_cache.connector import (
+    ExternalKVLoadRequest,
+    ExternalKVPageAssignment,
+    ExternalKVSaveRequest,
 )
 from pypto_serving.config.types import DecodeResult
 from pypto_serving.serving.server.serving_worker import WorkerProcess
@@ -70,6 +78,175 @@ def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
         "state": [5],
     }
     assert decoded.prefill_requests[0].cache_partition == 2
+
+
+def test_step_command_preserves_external_cache_load_metadata():
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._worker_known_req_ids = set()
+    load = ExternalKVLoadRequest(
+        job_id="load:r:digest:0",
+        request_id="r",
+        manifest_key="manifest",
+        checkpoint_token_count=256,
+        source_partition=2,
+        destination_partition=0,
+        pages=(
+            ExternalKVPageAssignment("data", "idx", 1, 7, 128),
+        ),
+    )
+    output = SchedulerOutput(external_cache_loads=[load], poll_external_cache=True)
+
+    decoded = decode_command(encode_command(core._build_step_command(output, finished_ids=[])))
+
+    assert decoded.poll_external_cache
+    assert decoded.external_cache_loads == [
+        ExternalKVLoadCommand(
+            job_id="load:r:digest:0",
+            request_id="r",
+            manifest_key="manifest",
+            checkpoint_token_count=256,
+            source_partition=2,
+            destination_partition=0,
+            pages=[ExternalKVPageData("data", "idx", 1, 7, 128)],
+        )
+    ]
+
+
+def test_step_command_preserves_external_cache_save_metadata():
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._worker_known_req_ids = set()
+    save = ExternalKVSaveRequest(
+        job_id="save:r:digest:0:128",
+        request_id="r",
+        manifest_key="manifest",
+        manifest_payload=b"manifest-json",
+        checkpoint_token_count=128,
+        source_partition=3,
+        pages=(ExternalKVPageAssignment("data", "ori", 0, 5, 96),),
+    )
+    output = SchedulerOutput(external_cache_saves=[save], poll_external_cache=True)
+
+    decoded = decode_command(encode_command(core._build_step_command(output, finished_ids=[])))
+
+    assert decoded.external_cache_saves == [
+        ExternalKVSaveCommand(
+            job_id="save:r:digest:0:128",
+            request_id="r",
+            manifest_key="manifest",
+            manifest_payload=b"manifest-json",
+            checkpoint_token_count=128,
+            source_partition=3,
+            pages=[ExternalKVPageData("data", "ori", 0, 5, 96)],
+        )
+    ]
+
+
+def test_worker_expands_external_page_to_scatter_gather_transfer():
+    recorded = []
+
+    class Connector:
+        @staticmethod
+        def register_buffers(buffers):
+            pass
+
+        @staticmethod
+        def start_load(job_id, transfers, *, partition):
+            assert partition == 1
+            recorded.append((job_id, tuple(transfers)))
+
+        @staticmethod
+        def poll_completed():
+            return ()
+
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.external_cache_connector = Connector()
+    worker._external_cache_job_requests = {}
+    worker.executor = SimpleNamespace(
+        external_kv_page_buffers=lambda model_id, group, partition, block: (
+            (0x1000, 64),
+            (0x2000, 32),
+        )
+    )
+    worker.model_record = SimpleNamespace(config=SimpleNamespace(model_id="dsv4"))
+    command = StepCommand(
+        new_requests=[],
+        prefill_requests=[],
+        decode_requests=[],
+        finished_request_ids=[],
+        external_cache_loads=[
+            ExternalKVLoadCommand(
+                job_id="load-r",
+                request_id="r",
+                manifest_key="manifest",
+                checkpoint_token_count=128,
+                source_partition=3,
+                destination_partition=1,
+                pages=[ExternalKVPageData("data", "idx", 0, 5, 96)],
+            )
+        ],
+    )
+
+    assert worker._start_external_cache_jobs(command) == []
+
+    job_id, transfers = recorded[0]
+    assert job_id == "load-r"
+    assert transfers[0].key == "data"
+    assert [(item.address, item.size_bytes) for item in transfers[0].buffers] == [
+        (0x1000, 64),
+        (0x2000, 32),
+    ]
+
+
+def test_worker_starts_external_save_with_manifest_last():
+    recorded = []
+
+    class Connector:
+        @staticmethod
+        def register_buffers(buffers):
+            assert buffers
+
+        @staticmethod
+        def start_save(job_id, transfers, *, manifest_key, manifest_payload, partition):
+            assert manifest_key == "manifest"
+            assert manifest_payload == b"manifest-json"
+            assert partition == 2
+            recorded.append((job_id, tuple(transfers), manifest_key))
+
+        @staticmethod
+        def poll_completed():
+            return ()
+
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.external_cache_connector = Connector()
+    worker._external_cache_job_requests = {}
+    worker.executor = SimpleNamespace(
+        external_kv_page_buffers=lambda model_id, group, partition, block: ((0x3000, 96),)
+    )
+    worker.model_record = SimpleNamespace(config=SimpleNamespace(model_id="dsv4"))
+    command = StepCommand(
+        new_requests=[],
+        prefill_requests=[],
+        decode_requests=[],
+        finished_request_ids=[],
+        external_cache_saves=[
+            ExternalKVSaveCommand(
+                job_id="save-r",
+                request_id="r",
+                manifest_key="manifest",
+                manifest_payload=b"manifest-json",
+                checkpoint_token_count=128,
+                source_partition=2,
+                pages=[ExternalKVPageData("data", "ori", 0, 5, 96)],
+            )
+        ],
+    )
+
+    assert worker._start_external_cache_jobs(command) == []
+
+    job_id, transfers, manifest_key = recorded[0]
+    assert job_id == "save-r"
+    assert transfers[0].key == "data"
+    assert manifest_key == "manifest"
 
 
 def test_partitioned_prefill_chunks_keep_cache_partitions_unique():
@@ -380,6 +557,22 @@ def test_worker_does_not_prepare_host_embedding_decode_asynchronously():
     )
 
     assert worker._prepare_step_command(command) is None
+
+
+def test_worker_does_not_split_decode_with_external_cache_control():
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.executor = SimpleNamespace(supports_async_decode_reclaim=True)
+    prepared = SimpleNamespace(error=None, prepared=object(), batch=object())
+    command = StepCommand(
+        new_requests=[],
+        prefill_requests=[],
+        decode_requests=[DecodeRequest("req", -1, 2, [])],
+        finished_request_ids=[],
+        step_id=1,
+        poll_external_cache=True,
+    )
+
+    assert not worker._can_split_decode_output(command, prepared)
 
 
 def test_worker_routes_decode_failures_through_device_fifo():

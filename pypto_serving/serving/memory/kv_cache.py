@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import struct
 from dataclasses import dataclass, field
 
 import torch
@@ -17,7 +19,8 @@ import torch
 from pypto_serving.config.types import KVCacheGroupSpec, KvAllocation, ModelConfig, RuntimeConfig
 
 
-NONE_HASH = hash(("__none__",))
+_PREFIX_HASH_DOMAIN = b"pypto-prefix-cache-v1\0"
+NONE_HASH = int.from_bytes(hashlib.sha256(_PREFIX_HASH_DOMAIN + b"root").digest(), "big")
 
 
 class KVCacheCapacityError(RuntimeError):
@@ -25,8 +28,24 @@ class KVCacheCapacityError(RuntimeError):
 
 
 def hash_block_tokens(parent_hash: int, token_ids: tuple[int, ...]) -> int:
-    """Return a chained prefix-cache hash for one full token block."""
-    return hash((parent_hash, token_ids))
+    """Return a deterministic chained digest for one full token block.
+
+    Python's built-in ``hash`` is randomized per interpreter and cannot name
+    cache objects shared across workers or recovered after a restart. Keep the
+    integer representation used by the in-memory indexes while deriving it
+    from a stable, versioned byte encoding.
+    """
+    if parent_hash < 0 or parent_hash.bit_length() > 256:
+        raise ValueError("parent_hash must be an unsigned 256-bit integer")
+    digest = hashlib.sha256()
+    digest.update(_PREFIX_HASH_DOMAIN)
+    digest.update(parent_hash.to_bytes(32, "big"))
+    digest.update(struct.pack(">Q", len(token_ids)))
+    for token_id in token_ids:
+        if token_id < 0 or token_id > 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("token IDs must be unsigned 64-bit integers")
+        digest.update(struct.pack(">Q", token_id))
+    return int.from_bytes(digest.digest(), "big")
 
 
 @dataclass(slots=True)
@@ -548,6 +567,11 @@ class KvCacheManager:
     def group_names(self) -> tuple[str, ...]:
         """Return cache group names in stable allocation order."""
         return tuple(self._group_pools)
+
+    @property
+    def group_specs(self) -> tuple[KVCacheGroupSpec, ...]:
+        """Return grouped-cache layouts in stable allocation order."""
+        return tuple(pool.spec for pool in self._group_pools.values())
 
     def init_groups(
         self,
@@ -1325,6 +1349,127 @@ class KvCacheManager:
                 if block.ref_cnt == 0:
                     pool.free_queues[partition].append(block)
         self._group_request_partitions.pop(request_id, None)
+
+    def prepare_group_external_load(
+        self,
+        request_id: str,
+        manifest,
+    ) -> dict[tuple[str, int], int]:
+        """Invalidate destination pages and map external objects to local IDs."""
+        partition = self._group_request_partitions.get(request_id)
+        if partition is None:
+            raise ValueError(f"Request {request_id!r} has no grouped cache partition")
+        if manifest.token_count % self.group_prefix_cache_alignment:
+            raise ValueError("external checkpoint is not aligned to grouped cache pages")
+        targets = {}
+        for item in manifest.objects:
+            pool = self._group_pools.get(item.group_name)
+            if pool is None:
+                raise ValueError(f"Unknown external cache group {item.group_name!r}")
+            owned = pool.request_blocks.get(request_id, ())
+            slot = (
+                item.logical_block_index
+                if pool.spec.sliding_window is None
+                else item.logical_block_index % len(owned)
+            )
+            if slot >= len(owned) or owned[slot] is None:
+                raise ValueError(
+                    f"Request {request_id!r} has no destination for "
+                    f"{item.group_name}:{item.logical_block_index}"
+                )
+            block = owned[slot]
+            expected_hash = int(item.block_digest, 16)
+            if block.block_hash == expected_hash:
+                continue
+            if block.ref_cnt != 1:
+                raise RuntimeError(
+                    f"External load would overwrite shared block {item.group_name}:"
+                    f"{pool.local_block_id(block)}"
+                )
+            if block.block_hash is not None:
+                key = (partition, block.block_hash)
+                if pool.hash_to_block.get(key) is block:
+                    del pool.hash_to_block[key]
+            block.block_hash = None
+            targets[(item.group_name, item.logical_block_index)] = pool.local_block_id(block)
+        return targets
+
+    def prepare_group_external_save(
+        self,
+        manifest,
+        block_ids_by_group: dict[str, list[int]],
+        partition: int,
+    ) -> tuple[dict[tuple[str, int], int], dict[str, list[int]]]:
+        """Validate and pin the exact physical pages referenced by a checkpoint."""
+        if set(block_ids_by_group) != set(self._group_pools):
+            raise ValueError("Grouped external save snapshot does not match cache groups")
+        if not 0 <= partition < self.group_partition_count:
+            raise ValueError("Grouped external save partition is out of range")
+
+        physical_pages: dict[tuple[str, int], int] = {}
+        retained: dict[str, list[int]] = {name: [] for name in self._group_pools}
+        for item in manifest.objects:
+            pool = self._group_pools.get(item.group_name)
+            if pool is None:
+                raise ValueError(f"Unknown grouped external save cache {item.group_name!r}")
+            table = block_ids_by_group[item.group_name]
+            if not table:
+                raise RuntimeError(f"External save cache group {item.group_name!r} has no pages")
+            if pool.spec.sliding_window is None:
+                slot = item.logical_block_index
+            else:
+                slot = item.logical_block_index % len(table)
+            if slot >= len(table):
+                raise RuntimeError(
+                    f"External save cache group {item.group_name!r} cannot address "
+                    f"logical block {item.logical_block_index}"
+                )
+            block_id = table[slot]
+            block = pool.block_from_local_id(partition, block_id)
+            expected_hash = int(item.block_digest, 16)
+            if block.block_hash != expected_hash:
+                block = pool.hash_to_block.get((partition, expected_hash))
+                if block is None:
+                    raise RuntimeError(
+                        f"External save page {item.group_name}:{item.logical_block_index} "
+                        "does not contain the committed block hash"
+                    )
+                block_id = pool.local_block_id(block)
+            physical_pages[(item.group_name, item.logical_block_index)] = block_id
+            retained[item.group_name].append(block_id)
+
+        for name, block_ids in retained.items():
+            if len(block_ids) != len(set(block_ids)):
+                raise RuntimeError(f"External save cache group {name!r} aliases checkpoint pages")
+        for name, block_ids in retained.items():
+            pool = self._group_pools[name]
+            for block_id in block_ids:
+                block = pool.block_from_local_id(partition, block_id)
+                if block.ref_cnt == 0:
+                    pool.free_queues[partition].remove(block)
+                block.ref_cnt += 1
+        return physical_pages, retained
+
+    def commit_group_external_load(self, request_id: str, manifest) -> None:
+        """Atomically publish every page after a complete external load."""
+        partition = self._group_request_partitions.get(request_id)
+        if partition is None:
+            raise ValueError(f"Request {request_id!r} has no grouped cache partition")
+        for item in manifest.objects:
+            pool = self._group_pools[item.group_name]
+            owned = pool.request_blocks[request_id]
+            slot = (
+                item.logical_block_index
+                if pool.spec.sliding_window is None
+                else item.logical_block_index % len(owned)
+            )
+            block = owned[slot]
+            if block is None:
+                raise RuntimeError("external cache destination disappeared before commit")
+            expected_hash = int(item.block_digest, 16)
+            if block.block_hash not in (None, expected_hash):
+                raise RuntimeError("external cache destination changed before commit")
+            self._cache_group_block(pool, partition, block, expected_hash)
 
     def group_num_blocks(self, group_name: str) -> int:
         """Return the rank-local physical block capacity of one cache group."""
