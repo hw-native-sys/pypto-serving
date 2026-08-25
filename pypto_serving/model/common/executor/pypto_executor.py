@@ -225,6 +225,51 @@ class PyptoExecutor(ModelExecutor, ABC):
                 return bool(requires(prepared))
         return super().prepared_decode_requires_token(prepared)
 
+    def external_kv_page_buffers(
+        self,
+        model_id: str,
+        group_name: str,
+        partition: int,
+        block_id: int,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return worker-resident scatter-gather ranges for one cache page."""
+        runner = self._runners[model_id]
+        describe = getattr(runner, "external_kv_page_buffers", None)
+        if not callable(describe):
+            raise NotImplementedError(
+                f"model runner {type(runner).__name__} does not expose external KV pages"
+            )
+        return tuple(describe(group_name, partition, block_id))
+
+    def external_kv_registration_buffers(
+        self,
+        model_id: str,
+        partition: int,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return full device allocations that contain external KV pages."""
+        runner = self._runners[model_id]
+        describe = getattr(runner, "external_kv_registration_buffers", None)
+        if not callable(describe):
+            raise NotImplementedError(
+                f"model runner {type(runner).__name__} does not expose external KV allocations"
+            )
+        return tuple(describe(partition))
+
+    def external_cache_chip_control(
+        self,
+        model_id: str,
+        name: str,
+        payload: bytes,
+    ) -> None:
+        """Run an external-cache control in each model chip child."""
+        runner = self._runners[model_id]
+        control = getattr(runner, "external_cache_chip_control", None)
+        if not callable(control):
+            raise NotImplementedError(
+                f"model runner {type(runner).__name__} has no chip control bridge"
+            )
+        control(name, payload)
+
     def close(self) -> None:
         """Release runtime resources held by registered model runners."""
         for model_id, runner in self._runners.items():

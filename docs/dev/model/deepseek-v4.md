@@ -155,6 +155,109 @@ latency — and the layers form three slab groups (`fwd` over all layers, `csa`
 over the `compress_ratio==4` ones, `hca` over the `==128` ones), each holding its
 layers contiguously in first-appearance order.
 
+## Mooncake External Prefix Cache
+
+External prefix caching is DeepSeek V4-only and extends the local HBM prefix
+cache with Mooncake DRAM and optional SSD storage. PyPTO owns the seven-group
+checkpoint format, stable cache keys, scheduler state, and page lifetime
+fences. Mooncake owns object placement, transfer, DRAM eviction, and SSD
+restore. Transfers use the multi-buffer API directly from the Simpler chip
+children that own the NPU tensors; there is no host KV staging path.
+The scheduler binds a zero-memory Mooncake control client to the first configured
+NPU so it can query committed manifests. Only chip-child clients contribute
+segments, register KV allocations, and execute data transfers.
+
+Build and install Mooncake with Store, Ascend transport, and SSD offload support.
+For a single-host evaluation, start the master with its embedded HTTP metadata
+service and SSD control plane:
+
+```bash
+mooncake_master \
+  --rpc_port=50051 \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_host=0.0.0.0 \
+  --http_metadata_server_port=8080 \
+  --enable_offload=true \
+  --offload_on_evict=true
+```
+
+Create the SSD root before starting serving. Each chip child automatically uses
+`rank_<physical-device-id>` below this root, so no two embedded real clients
+write the same bucket files.
+
+```bash
+mkdir -p /nvme/mooncake/pypto-serving
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
+export MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT=1
+export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE=2199023255552
+export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=67108864
+```
+
+`bucket_storage_backend` scans existing SSD metadata when a real client starts,
+which permits a serving process restart to re-register valid disk objects with
+the still-running master. Setting the bucket key limit to one makes each
+immutable cache object durable without waiting for the default 500-key bucket
+to fill; use a larger value only when delayed persistence is acceptable. Do not
+use Mooncake's legacy `--root_fs_dir` together with this client-owned SSD path.
+Size the local SSD staging buffer for the largest single checkpoint object; the
+64 MiB example is sufficient for the current DeepSeek V4 layout. Mooncake keeps
+departed clients visible until their lease expires, so a controlled serving
+restart must wait for the old client to disappear from the master before
+restoring its SSD objects (approximately 45 seconds with the default settings).
+
+Copy and edit
+`examples/model/deepseek_v4/mooncake_external_cache.json`. The model and
+tokenizer revisions must be immutable identifiers for the exact checkpoint;
+they are part of the cache namespace. `global_segment_size` and
+`local_buffer_size` are per chip child, not totals across all eight devices.
+Use `protocol: "ascend"` for the direct NPU data path. Set
+`enable_ssd_offload` to `false` to use Mooncake DRAM only.
+The Mooncake Ascend transport must be able to read `/etc/hccn.conf` in every
+serving process and chip child.
+Mooncake 0.3.12 does not reconstruct tenant-prefixed bucket indexes correctly
+after a process restart, so use `tenant_id: "default"` when SSD offload is
+enabled with that release. PyPTO's stable object namespace still separates
+incompatible model and deployment revisions.
+
+External prefix caching supports autoregressive decode and the fused one-draft
+MTP path (`num_speculative_tokens=1`). Deeper MTP (`num_speculative_tokens>1`)
+still disables DeepSeek prefix caching and is rejected when external caching is
+configured.
+
+Add these options to the normal eight-device DeepSeek command:
+
+```bash
+--external-prefix-cache-backend mooncake \
+--external-prefix-cache-config examples/model/deepseek_v4/mooncake_external_cache.json \
+--external-prefix-cache-min-tokens 1024 \
+--external-prefix-cache-load-timeout-ms 30000 \
+--external-prefix-cache-transfer-concurrency 2
+```
+
+Local HBM lookup always runs first. A committed Mooncake manifest is considered
+only when it extends the local hit and meets the minimum-token threshold. During
+an external load, the request waits in `WAITING_FOR_REMOTE_KV` and its target
+pages remain pinned. A missing object, transfer error, cancellation, or timeout
+discards the entire checkpoint and schedules cold prefill. `failure_policy` is
+`cold_miss` by default; use `fail_startup` when an unavailable Mooncake client
+must prevent service startup.
+
+PyPTO logs lookup outcomes and load/save token counts, bytes, latency,
+throughput, fallbacks, waiting requests, and pinned HBM blocks. Mooncake's
+master metrics distinguish memory and SSD cache hits. Inspect the summary or
+Prometheus endpoint on the default admin port:
+
+```bash
+curl --noproxy "*" http://127.0.0.1:9003/metrics/summary
+curl --noproxy "*" http://127.0.0.1:9003/metrics
+```
+
+For an SSD-path correctness check, warm a long prefix, apply enough cache
+pressure for Mooncake to evict it from DRAM, then submit the same prefix again.
+Compare generated token IDs against a run with external caching disabled and
+confirm that Mooncake's SSD-hit counter increases while PyPTO reports an
+external load instead of full prefill.
+
 ## Optional Prepacked Weights
 
 The 43 hidden layers can be converted once into the final rank-stacked Host
