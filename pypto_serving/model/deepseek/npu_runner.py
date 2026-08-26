@@ -1087,6 +1087,14 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         self._decode_metadata_device_keys: list[list[tuple[object, ...] | None]] = []
         self._decode_metadata_control_lock = threading.Lock()
         self._decode_metadata_predecessor: PendingL3Dispatch | None = None
+        # Last dispatch per ping-pong slot, so a metadata refresh for slot S
+        # waits out slot S's own reader even when a newer dispatch on the other
+        # slot is the one the global predecessor tracks.
+        self._decode_metadata_slot_predecessors: list[PendingL3Dispatch | None] = [None, None]
+        # Pre-fork shared scratch the metadata refresh fence reads device
+        # shards back into (allocated in _ensure_decode_buffers; sized to the
+        # largest per-rank metadata shard).
+        self._decode_metadata_verify: torch.Tensor | None = None
         self._decode_static_metadata_keys: list[tuple[object, ...] | None] = [
             None
         ] * compiled.layout.ranks
@@ -2617,6 +2625,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                         *inputs.dispatch_args,
                     )
                     self._decode_metadata_predecessor = dispatch
+                    self._decode_metadata_slot_predecessors[inputs.buffer_slot] = dispatch
         except RuntimeError as exc:
             raise RuntimeError(
                 "DeepSeekV4 fused main/MTP decode dispatch failed "
@@ -3817,6 +3826,18 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._decode_metadata_device_keys = [
                 [None] * ranks for _slot in (0, 1)
             ]
+            # One readback scratch for the refresh fence: syncs are serialized
+            # by the control lock, so a single shared buffer sized to the
+            # largest per-rank shard serves every rank. Must be shared memory
+            # allocated here, pre-fork, like the sources it verifies.
+            self._decode_metadata_verify = torch.empty(
+                max(
+                    int(self._decode_metadata_sources[0][name][0].numel())
+                    * self._decode_metadata_sources[0][name][0].element_size()
+                    for name in _DECODE_STATIC_METADATA_FIELDS
+                ),
+                dtype=torch.uint8,
+            ).share_memory_()
 
         # MTP decode TaskArgs (one per ping-pong slot) own the
         # ``_MTP_DECODE_TENSOR_ORDER`` reclaimed + write-only outputs.  The fused
@@ -4233,7 +4254,18 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         rank: int,
         static_key: tuple[object, ...],
     ) -> None:
-        """Upload a rank shard after that ping-pong slot's ownership changes."""
+        """Upload a rank shard after that ping-pong slot's ownership changes.
+
+        The upload is fenced: each shard is read back (``copy_from``, which
+        blocks until the data is on Host) and compared against the staged
+        source, and the slot's device key is marked clean only once the new
+        content is verifiably resident. Without the fence, nothing orders an
+        enqueued H2D copy against the *next* dispatch that reads these shards
+        (the predecessor protocol below only orders it after the *previous*
+        one), so a losing race served the kernel the previous request's page
+        mappings for one step — a plausible-but-wrong token with no error
+        signal, which the prefix-cache accuracy guard caught intermittently.
+        """
         if not self._decode_device_metadata:
             return
         with self._decode_metadata_control_lock:
@@ -4243,10 +4275,19 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             if predecessor is not None:
                 predecessor.wait()
                 self._decode_metadata_predecessor = None
+            # The global predecessor tracks the newest dispatch; the shards
+            # being refreshed are read by this slot's OWN previous dispatch,
+            # which under concurrent dispatch frames may outlive the newer
+            # one. wait() is idempotent, so waiting it here is free.
+            slot_predecessor = self._decode_metadata_slot_predecessors[buffer_slot]
+            if slot_predecessor is not None:
+                slot_predecessor.wait()
 
             worker = self._shared_l3_worker()
             sources = self._decode_metadata_sources[buffer_slot]
             metadata = self._decode_device_metadata[buffer_slot]
+            verify = self._decode_metadata_verify
+            shards: dict[str, tuple[Any, Any, int]] = {}
             for name, source in sources.items():
                 source_shard = source[rank]
                 target = metadata[name]
@@ -4256,15 +4297,68 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                     or source_shard.dtype != target_shard.dtype
                 ):
                     raise ValueError(
-                        f"DeepSeekV4 decode metadata {name!r} slot {buffer_slot} "
+                        f"DeepSeek V4 decode metadata {name!r} slot {buffer_slot} "
                         f"rank {rank} shape/dtype mismatch"
                     )
+                shards[name] = (
+                    target_shard,
+                    source_shard,
+                    target.worker_ids[rank],
+                )
+
+            def _upload(name: str) -> None:
+                target_shard, source_shard, worker_id = shards[name]
                 worker.copy_to(
                     target_shard.data_ptr,
                     source_shard.data_ptr(),
                     source_shard.numel() * source_shard.element_size(),
-                    worker_id=target.worker_ids[rank],
+                    worker_id=worker_id,
                 )
+
+            for name in shards:
+                _upload(name)
+            # Verify the uploads landed before any dispatch may read them.
+            # copy_from blocks on data arrival; comparing bytes makes the
+            # check independent of how the device orders control copies
+            # against program execution. A mismatch (channel reordering)
+            # re-uploads; a device that keeps contradicting its own readback
+            # must stop the job rather than let it compute on stale page
+            # tables.
+            attempts = 0
+            while True:
+                stale = []
+                for name, (target_shard, source_shard, worker_id) in shards.items():
+                    nbytes = source_shard.numel() * source_shard.element_size()
+                    worker.copy_from(
+                        verify.data_ptr(),
+                        target_shard.data_ptr,
+                        nbytes,
+                        worker_id=worker_id,
+                    )
+                    if not torch.equal(
+                        verify[:nbytes],
+                        source_shard.contiguous().view(torch.uint8).flatten(),
+                    ):
+                        stale.append(name)
+                if not stale:
+                    break
+                attempts += 1
+                if attempts >= 3:
+                    raise RuntimeError(
+                        "DeepSeekV4 decode metadata slot "
+                        f"{buffer_slot} rank {rank} failed readback verification "
+                        f"after {attempts} attempts: {sorted(shards)}"
+                    )
+                logger.warning(
+                    "DeepSeekV4 decode metadata slot %d rank %d readback mismatch "
+                    "on %s (attempt %d); re-uploading",
+                    buffer_slot,
+                    rank,
+                    stale,
+                    attempts,
+                )
+                for name in stale:
+                    _upload(name)
             self._decode_metadata_device_keys[buffer_slot][rank] = static_key
 
     def _materialize_embedding_device_weight(self) -> StackedDeviceTensor:
@@ -4573,6 +4667,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._decode_metadata_host_keys = []
             self._decode_metadata_device_keys = []
             self._decode_metadata_predecessor = None
+            self._decode_metadata_slot_predecessors = [None, None]
+            self._decode_metadata_verify = None
             if self._prefill_task_args is not None:
                 self._prefill_task_args.close()
                 self._prefill_task_args = None

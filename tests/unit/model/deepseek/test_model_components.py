@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import ctypes
 import json
 import os
 import stat
@@ -3687,7 +3688,69 @@ def test_deepseek_fused_mtp_write_only_outputs_are_device_resident():
     )
 
 
-def test_deepseek_fused_metadata_is_resident_per_ping_pong_slot_and_dirty_rank():
+class _AsyncCopyWorker:
+    """Fake L3 worker whose H2D copies land only when a D2H reads them back.
+
+    Models the hazard the refresh fence exists for: ``copy_to`` enqueues bytes
+    without applying them, so device memory still holds the previous content
+    until a ``copy_from`` forces the queue to drain (per worker, FIFO).
+    ``lose_readbacks`` additionally makes that many early ``copy_from`` calls
+    read the not-yet-landed content, standing in for a device that reorders
+    the control copy behind the readback.
+    """
+
+    def __init__(self, *, lose_readbacks: int = 0):
+        self.next_ptr = 0x1000
+        self.copies = []
+        self.events = []
+        self.regions: dict[int, bytearray] = {}
+        self.pending: list[tuple[int, int, int, int]] = []
+        self.lose_readbacks = lose_readbacks
+
+    def alloc_tensor(self, shape, dtype, *, worker_id=0, init=None):
+        itemsize = torch.empty((), dtype=dtype).element_size()
+        size = int(torch.tensor(shape).prod().item()) * itemsize if shape else itemsize
+        self.regions[self.next_ptr] = bytearray(size)
+        tensor = DeviceTensor(self.next_ptr, tuple(shape), dtype)
+        self.next_ptr += 0x100000
+        return tensor
+
+    def copy_to(self, dst, src, nbytes, *, worker_id=0):
+        self.events.append("copy")
+        self.copies.append((dst, src, nbytes, worker_id))
+        self.pending.append((dst, src, nbytes, worker_id))
+
+    def _land_pending(self, worker_id: int) -> None:
+        remaining = []
+        for dst, src, nbytes, pending_worker in self.pending:
+            if pending_worker == worker_id:
+                self.regions[dst][:nbytes] = ctypes.string_at(src, nbytes)
+            else:
+                remaining.append((dst, src, nbytes, pending_worker))
+        self.pending = remaining
+
+    def copy_from(self, dst, src, nbytes, *, worker_id=0):
+        self.events.append("readback")
+        if self.lose_readbacks > 0:
+            self.lose_readbacks -= 1
+        else:
+            self._land_pending(worker_id)
+        ctypes.memmove(dst, bytes(self.regions[src][:nbytes]), nbytes)
+
+    @staticmethod
+    def free_tensor(_tensor, *, worker_id=0):
+        return None
+
+    @staticmethod
+    def free_stacked_tensor(_tensor):
+        return None
+
+    @staticmethod
+    def close():
+        return None
+
+
+def _metadata_fence_runner(worker) -> DeepSeekV4ModelRunner:
     runner = DeepSeekV4ModelRunner(
         compiled=DeepSeekV4CompiledKernels(
             layout=DeepSeekV4CacheLayout(ranks=2),
@@ -3701,45 +3764,30 @@ def test_deepseek_fused_metadata_is_resident_per_ping_pong_slot_and_dirty_rank()
         )
     )
     runner._decode_metadata_sources = [
-        {"block_table": torch.empty((2, 3), dtype=torch.int32).share_memory_()}
+        {"block_table": torch.arange(2 * 3, dtype=torch.int32).reshape(2, 3).share_memory_()}
         for _slot in (0, 1)
     ]
     runner._decode_metadata_device_keys = [[None, None], [None, None]]
-
-    class _Worker:
-        def __init__(self):
-            self.next_ptr = 0x1000
-            self.copies = []
-            self.events = []
-
-        def alloc_tensor(self, shape, dtype, *, worker_id=0, init=None):
-            tensor = DeviceTensor(self.next_ptr, tuple(shape), dtype)
-            self.next_ptr += 0x100000
-            return tensor
-
-        def copy_to(self, dst, src, nbytes, *, worker_id=0):
-            self.events.append("copy")
-            self.copies.append((dst, src, nbytes, worker_id))
-
-        @staticmethod
-        def free_tensor(_tensor, *, worker_id=0):
-            return None
-
-        @staticmethod
-        def free_stacked_tensor(_tensor):
-            return None
-
-        @staticmethod
-        def close():
-            return None
-
-    worker = _Worker()
+    runner._decode_metadata_verify = torch.empty(
+        2 * 3 * 4, dtype=torch.uint8
+    ).share_memory_()
     runner._l3_worker = worker
+    return runner
+
+
+def test_deepseek_fused_metadata_is_resident_per_ping_pong_slot_and_dirty_rank():
+    worker = _AsyncCopyWorker()
+    runner = _metadata_fence_runner(worker)
     slot0 = runner._materialize_decode_device_metadata(0)
     slot1 = runner._materialize_decode_device_metadata(1)
     runner._decode_metadata_predecessor = SimpleNamespace(
         wait=lambda: worker.events.append("wait")
     )
+    # A per-slot predecessor is waited out too: the shards being refreshed are
+    # read by this slot's own previous dispatch, which may outlive the newest
+    # dispatch the global predecessor tracks.
+    slot_one_predecessor = SimpleNamespace(wait=lambda: worker.events.append("slot-wait"))
+    runner._decode_metadata_slot_predecessors[1] = slot_one_predecessor
 
     assert slot0["block_table"].shards[0].data_ptr != slot1["block_table"].shards[0].data_ptr
 
@@ -3751,11 +3799,48 @@ def test_deepseek_fused_metadata_is_resident_per_ping_pong_slot_and_dirty_rank()
     runner._sync_decode_device_metadata_rank(0, 1, ("first",))
     runner._sync_decode_device_metadata_rank(1, 0, ("first",))
 
-    assert len(worker.copies) == 3
-    assert worker.events == ["wait", "copy", "wait", "copy", "copy"]
+    # Each dirty rank: wait the predecessors, copy, and verify the shard by
+    # reading it back — the fence that orders the upload against the next
+    # dispatch reading these shards.
+    assert worker.events == [
+        "wait", "copy", "readback",
+        "wait", "copy", "readback",
+        "slot-wait", "copy", "readback",
+    ]
     assert [copy[-1] for copy in worker.copies] == [0, 1, 0]
     assert runner._decode_metadata_predecessor is None
+    assert runner._decode_metadata_slot_predecessors[0] is None
     assert runner._decode_metadata_device_keys == [
         [("first",), ("first",)],
         [("first",), None],
     ]
+
+
+def test_deepseek_fused_metadata_refresh_marks_clean_only_after_verified_readback():
+    worker = _AsyncCopyWorker(lose_readbacks=1)
+    runner = _metadata_fence_runner(worker)
+    runner._materialize_decode_device_metadata(0)
+
+    runner._sync_decode_device_metadata_rank(0, 0, ("first",))
+
+    # The first readback lost the race with the enqueued copy, so the refresh
+    # detected the stale device content, re-uploaded, and only marked the
+    # device key clean once the readback matched the staged source.
+    assert worker.events == ["copy", "readback", "copy", "readback"]
+    assert runner._decode_metadata_device_keys[0][0] == ("first",)
+
+    # A second sync with the same key stays a no-op: the clean mark was earned
+    # by a verified readback, not by the copy's submission.
+    runner._sync_decode_device_metadata_rank(0, 0, ("first",))
+    assert worker.events == ["copy", "readback", "copy", "readback"]
+
+
+def test_deepseek_fused_metadata_refresh_fails_loudly_when_readback_never_lands():
+    worker = _AsyncCopyWorker(lose_readbacks=99)
+    runner = _metadata_fence_runner(worker)
+    runner._materialize_decode_device_metadata(0)
+
+    with pytest.raises(RuntimeError, match="failed readback verification"):
+        runner._sync_decode_device_metadata_rank(0, 0, ("first",))
+
+    assert runner._decode_metadata_device_keys[0][0] is None
