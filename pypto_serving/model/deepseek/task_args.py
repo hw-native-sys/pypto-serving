@@ -149,6 +149,7 @@ _PREFILL_FWD_TENSOR_ORDER = (
     "lm_head_weight",
     "hidden_out",
     "logits",
+    "moe_token_counts",
     "num_tokens_per_owner",
     "logit_row_indices",
 )
@@ -252,6 +253,7 @@ _DECODE_FWD_TENSOR_ORDER = (
     "hidden_out",
     "logits",
     "sampled_ids",
+    "moe_token_counts",
     "num_tokens_per_owner",
     "logit_row_indices",
 )
@@ -271,6 +273,7 @@ _MTP_PREFILL_TENSOR_ORDER = (
     "shared_w3", "shared_w3_scale", "shared_w2", "shared_w2_scale",
     "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
     "lm_head_weight", "hidden_out", "pre_hc_hidden_out", "logits", "logit_row_indices",
+    "moe_token_counts",
 )
 
 _FUSED_MTP_BASE_TENSOR_ORDER = (
@@ -289,7 +292,7 @@ _FUSED_MTP_BASE_TENSOR_ORDER = (
     "shared_w3", "shared_w3_scale", "shared_w2", "shared_w2_scale",
     "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
     "lm_head_weight", "hidden_out", "next_pre_hc_hidden", "logits", "sampled_ids",
-    "logit_row_indices",
+    "logit_row_indices", "moe_token_counts",
 )
 
 # PR985 body-only standalone MTP ABI. Embedding lookup, previous-hidden packing,
@@ -310,7 +313,7 @@ _MTP_DECODE_TENSOR_ORDER = (
     "shared_w3", "shared_w3_scale", "shared_w2", "shared_w2_scale",
     "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
     "lm_head_weight", "hidden_out", "next_pre_hc_hidden", "logits", "sampled_ids",
-    "logit_row_indices",
+    "logit_row_indices", "moe_token_counts",
 )
 
 # The K=1 fused entry kept the old raw-preamble MTP ABI and adds persistent
@@ -329,6 +332,7 @@ _FUSED_MTP_SHARED_TENSORS = frozenset(
         "freqs_sin",
         "ori_block_table",
         "lm_head_weight",
+        "moe_token_counts",
     }
 )
 
@@ -545,6 +549,8 @@ def prefill_task_args(
             ta.add_arg(name, _static_weight_source(runner, name))
         elif name in cache_pools:
             ta.add_arg(name, lambda n=name: runner._device_cache_values()[n])
+        elif name == "moe_token_counts":
+            ta.add_arg(name, lambda: runner._prepare_moe_stats(0))
         else:
             # stacked layer weight -- resolved lazily so construction does not
             # require the stacked weights to be loaded yet.
@@ -643,6 +649,8 @@ def decode_task_args(
             )
         elif name == "embed_weight":
             ta.add_arg(name, lambda: runner._materialize_embedding_device_weight())
+        elif name == "moe_token_counts":
+            ta.add_arg(name, lambda slot=buffer_slot: runner._prepare_moe_stats(slot + 1))
         elif name in static_weights:
             ta.add_arg(name, _static_weight_source(runner, name))
         elif name in cache_pools:
@@ -706,6 +714,8 @@ def mtp_prefill_task_args(runner: DeepSeekV4ModelRunner, hidden: int) -> TaskArg
             ta.add_slot(Slot(name, Placement.DEVICE_RESIDENT, dtype, lambda _, s=shape: s))
         elif name == "kv_cache":
             ta.add_arg(name, lambda: runner._materialize_mtp_device_kv_cache())
+        elif name == "moe_token_counts":
+            ta.add_arg(name, lambda: runner._prepare_moe_stats(0))
         elif name in static_weights:
             ta.add_arg(name, _static_weight_source(runner, name))
         else:
@@ -825,6 +835,8 @@ def mtp_decode_task_args(
                     name,
                     lambda slot=buffer_slot: runner._decode_task_args[slot].tensors["block_table"],
                 )
+        elif name == "moe_token_counts":
+            ta.add_arg(name, lambda slot=buffer_slot: runner._prepare_moe_stats(slot + 1))
         else:
             ta.add_arg(
                 name,

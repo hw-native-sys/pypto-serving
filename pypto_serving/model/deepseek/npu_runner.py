@@ -42,6 +42,7 @@ from pypto_serving.model.common.runner.buffer_set import (
 )
 from pypto_serving.model.common.runner.l3_dispatch import L3DispatchMixin, PendingL3Dispatch
 from pypto_serving.model.common.runner.model_runner import ModelRunner
+from pypto_serving.model.deepseek.moe_stats import MoeStatsWriter
 from pypto_serving.model.deepseek.weight_loader import (
     DeepSeekV4GlobalWeights,
     DeepSeekV4MtpWeights,
@@ -793,6 +794,7 @@ class DeepSeekV4CompiledKernels:
     num_hash_layers: int = 3
     embedding_weight: torch.Tensor | None = None
     num_speculative_tokens: int = 0
+    moe_stats_output: str | None = None
 
     def l3_callables(self) -> tuple[DeepSeekV4L3Callable, ...]:
         """Return every compiled L3 program that the shared worker may run."""
@@ -1110,6 +1112,21 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         self._main_pre_hc_host_mirror: torch.Tensor | None = None
         self._mtp_prefill_task_args: TaskArgs | None = None
         self._mtp_decode_task_args: list[TaskArgs] = []
+        self._moe_token_count_buffers: list[StackedDeviceTensor | None] = [None, None, None]
+        self._moe_stats_slot_enabled = [False, False, False]
+        moe_stats_shape = (
+            compiled.layout.ranks,
+            len(compiled.layer_plan) + 1,
+            compiled.n_routed_experts // compiled.layout.ranks,
+        )
+        self._moe_stats_zero = torch.zeros(moe_stats_shape, dtype=torch.int32).share_memory_()
+        self._moe_stats_host = [
+            torch.empty(moe_stats_shape, dtype=torch.int32).share_memory_()
+            for _ in self._moe_token_count_buffers
+        ]
+        self._moe_stats_writer = (
+            MoeStatsWriter(compiled.moe_stats_output) if compiled.moe_stats_output else None
+        )
         self._mtp_request_states: dict[str, _DeepSeekV4MtpRequestState] = {}
         self._mtp_state_lock = threading.RLock()
         self._mtp_free_tail_slots: list[list[int]] = [
@@ -2264,6 +2281,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 "DeepSeekV4 packed prefill dispatch failed "
                 f"(tokens={inputs.actual_tokens}, ranks={inputs.ranks})"
             ) from exc
+        self._dump_moe_stats("prefill", 0)
         self._prefill_completion(inputs, pre_hc_hidden_buffer)
 
         logits = torch.stack(
@@ -2638,6 +2656,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         """Convert one completed output slot into scheduler-visible tokens."""
         pending.dispatch.wait()
         inputs = pending.inputs
+        self._dump_moe_stats("decode_mtp", inputs.buffer_slot + 1)
         layout = self._compiled.layout
         decode_seq = layout.decode_seq
         with profile_span("DeepSeekV4ModelRunner.decode.mtp_reclaim", cat="executor"):
@@ -2801,6 +2820,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 "DeepSeekV4 packed decode dispatch failed "
                 f"(actual_batch={inputs.actual_batch}, ranks={inputs.ranks})"
             ) from exc
+        self._dump_moe_stats("decode", inputs.buffer_slot + 1)
         hidden_buffer = ta.tensors["hidden_out"]
 
         captured_pre_hc: torch.Tensor | StackedDeviceTensor = ta.tensors["pre_hc_hidden_out"]
@@ -2998,8 +3018,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._run_l3(
                 self._require_mtp_prefill_callable(),
                 *self._mtp_prefill_args(),
+                int(self._moe_stats_writer is not None),
                 self._int32_scalar(n),
             )
+        self._dump_moe_stats("mtp_prefill", 0)
         if not produce_draft:
             return None
         with profile_span(
@@ -3072,9 +3094,16 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         The kernel runs final RMSNorm and the device-side LM-head. Every positional
         arg is declared on ``_prefill_task_args`` (see ``deepseek/task_args.py``).
         """
-        return self._prefill_task_args.build_for_tokens(kernel_tokens)
+        return self._prefill_task_args.build_for_tokens(kernel_tokens) + (
+            int(self._moe_stats_writer is not None),
+        )
 
-    def _decode_fwd_args(self, inputs: DeepSeekV4PreparedDecodeInputs) -> tuple[Any, ...]:
+    def _decode_fwd_args(
+        self,
+        inputs: DeepSeekV4PreparedDecodeInputs,
+        *,
+        include_dump_scalar: bool = True,
+    ) -> tuple[Any, ...]:
         """Build the single packed ``l3_decode_fwd`` argument tuple from the decode TaskArgs.
 
         Static fused-MTP metadata is copied into this ping-pong slot's resident
@@ -3095,7 +3124,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                     rank,
                     static_key,
                 )
-        return self._decode_task_args[inputs.buffer_slot].build()
+        args = self._decode_task_args[inputs.buffer_slot].build()
+        if include_dump_scalar:
+            args += (int(self._moe_stats_writer is not None),)
+        return args
 
     def _device_cache_values(self) -> dict[str, StackedDeviceTensor]:
         """Return the unified worker-resident cache pools by kernel argument name."""
@@ -3154,6 +3186,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             staged["mtp_tail_token_ids"],
             staged["mtp_tail_positions"],
             *mtp_only,
+            int(self._moe_stats_writer is not None),
             self._int32_scalar(active_tokens),
         )
 
@@ -3164,7 +3197,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         vocab_size: int,
     ) -> DeepSeekV4PreparedDecodeInputs:
         """Bind all steady L3 arguments on the prepare lane."""
-        main_args = self._decode_fwd_args(inputs)
+        main_args = self._decode_fwd_args(inputs, include_dump_scalar=False)
         active_tokens = max(inputs.per_rank_counts) * self._compiled.layout.decode_seq
         return replace(
             inputs,
@@ -3441,8 +3474,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 self._run_l3(
                     self._require_mtp_decode_callable(),
                     *self._mtp_decode_args(),
+                    int(self._moe_stats_writer is not None),
                     self._int32_scalar(1),
                 )
+            self._dump_moe_stats("mtp_decode", 1)
 
             for rank, request_index in wave_items:
                 next_tokens[request_index] = int(
@@ -3634,12 +3669,14 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         staged.copy_(hidden.to(dtype=torch.float32, device="cpu"))
         pool = self._materialize_mtp_tail_pre_hc_pool(int(staged.shape[-1]))
         shard = pool.shards[rank]
-        row_nbytes = staged.numel() * staged.element_size()
-        dst = shard.data_ptr + slot * row_nbytes
+        # DistributedWorker copies require an allocation base. Publish the
+        # complete rank shard after updating one row instead of constructing an
+        # interior device pointer for the selected slot.
+        source = buffers.tail_init_hidden[rank]
         self._shared_l3_worker().copy_to(
-            dst,
-            staged.data_ptr(),
-            row_nbytes,
+            shard.data_ptr,
+            source.data_ptr(),
+            source.numel() * source.element_size(),
             worker_id=rank,
         )
 
@@ -3671,15 +3708,14 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         meta_row[_MTP_STATE_COMMITTED_COUNT] = state.committed_count
         worker = self._shared_l3_worker()
         for device_tensor, source in (
-            (self._materialize_mtp_device_state_tokens(), token_row),
-            (self._materialize_mtp_device_state_meta(), meta_row),
+            (self._materialize_mtp_device_state_tokens(), buffers.state_init_tokens[rank]),
+            (self._materialize_mtp_device_state_meta(), buffers.state_init_meta[rank]),
         ):
             shard = device_tensor.shards[rank]
-            row_nbytes = source.numel() * source.element_size()
             worker.copy_to(
-                shard.data_ptr + slot * row_nbytes,
+                shard.data_ptr,
                 source.data_ptr(),
-                row_nbytes,
+                source.numel() * source.element_size(),
                 worker_id=rank,
             )
         state.device_state_initialized = True
@@ -3923,6 +3959,9 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 name="mtp_prefill_pre_hc_mirror",
             ),
         )
+        self._mtp_buffers.state_init_tokens.zero_()
+        self._mtp_buffers.state_init_meta.zero_()
+        self._mtp_buffers.tail_init_hidden.zero_()
         # MTP prefill host inputs + device outputs live on the prefill TaskArgs.
         from pypto_serving.model.deepseek.task_args import mtp_prefill_task_args  # noqa: PLC0415
 
@@ -4267,6 +4306,63 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 )
             self._decode_metadata_device_keys[buffer_slot][rank] = static_key
 
+    def set_moe_stats_output(self, output_path: str | None) -> None:
+        """Enable, redirect, or disable MoE dump without recompiling kernels."""
+        self._moe_stats_writer = MoeStatsWriter(output_path) if output_path else None
+
+    def _prepare_moe_stats(self, slot: int) -> StackedDeviceTensor:
+        """Return a slot-safe resident ABI buffer and clear it only when enabled."""
+        if not 0 <= slot < len(self._moe_token_count_buffers):
+            raise ValueError(f"invalid MoE statistics buffer slot {slot}")
+        stacked = self._moe_token_count_buffers[slot]
+        ranks = self._compiled.layout.ranks
+        num_layers = len(self._compiled.layer_plan) + 1
+        local_experts = self._compiled.n_routed_experts // ranks
+        shape = (ranks, num_layers, local_experts)
+        if stacked is None:
+            stacked = self._alloc_empty_stacked_tensor(shape, torch.int32)
+            self._moe_token_count_buffers[slot] = stacked
+        enabled = self._moe_stats_writer is not None
+        self._moe_stats_slot_enabled[slot] = enabled
+        if enabled:
+            if tuple(self._moe_stats_zero.shape) != shape:
+                raise RuntimeError("MoE statistics host buffer shape changed after worker creation")
+            worker = self._shared_l3_worker()
+            for rank, (shard, worker_id) in enumerate(
+                zip(stacked.shards, stacked.worker_ids, strict=True)
+            ):
+                host = self._moe_stats_zero[rank]
+                worker.copy_to(
+                    shard.data_ptr,
+                    host.data_ptr(),
+                    host.numel() * host.element_size(),
+                    worker_id=worker_id,
+                )
+        return stacked
+
+    def _dump_moe_stats(self, phase: str, slot: int) -> None:
+        """Copy the fixed buffer to host only while dumping is enabled."""
+        writer = self._moe_stats_writer
+        if writer is None or not self._moe_stats_slot_enabled[slot]:
+            return
+        stacked = self._moe_token_count_buffers[slot]
+        if stacked is None:
+            raise RuntimeError("MoE statistics buffer was not prepared before dispatch")
+        host = self._moe_stats_host[slot]
+        worker = self._shared_l3_worker()
+        for rank, (shard, worker_id) in enumerate(
+            zip(stacked.shards, stacked.worker_ids, strict=True)
+        ):
+            target = host[rank]
+            worker.copy_from(
+                target.data_ptr(),
+                shard.data_ptr,
+                target.numel() * target.element_size(),
+                worker_id=worker_id,
+            )
+        writer.write(phase, host)
+        self._moe_stats_slot_enabled[slot] = False
+
     def _materialize_embedding_device_weight(self) -> StackedDeviceTensor:
         """Upload one full embedding table to every decode rank."""
         stacked = self._embedding_device_weight
@@ -4508,6 +4604,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         if worker is None:
             self._decode_device_cache = None
             self._mtp_device_kv_cache = None
+            self._moe_token_count_buffers = [None, None, None]
+            self._moe_stats_slot_enabled = [False, False, False]
             return
         cache = self._decode_device_cache
         if cache is not None:
@@ -4524,8 +4622,13 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 worker.free_stacked_tensor(tensor)
         if self._mtp_device_kv_cache is not None:
             worker.free_stacked_tensor(self._mtp_device_kv_cache)
+        for tensor in self._moe_token_count_buffers:
+            if tensor is not None:
+                worker.free_stacked_tensor(tensor)
         self._decode_device_cache = None
         self._mtp_device_kv_cache = None
+        self._moe_token_count_buffers = [None, None, None]
+        self._moe_stats_slot_enabled = [False, False, False]
 
     @staticmethod
     def _static_device_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -4559,6 +4662,9 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._decode_device_cache = None
             self._mtp_device_kv_cache = None
             self._main_pre_hc_host_mirror = None
+            self._moe_token_count_buffers = [None, None, None]
+            self._moe_stats_slot_enabled = [False, False, False]
+            self._moe_stats_host.clear()
             self._mtp_request_states.clear()
             self._l3_static_tensors.clear()
             for task_args in self._decode_task_args:

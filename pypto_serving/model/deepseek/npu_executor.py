@@ -181,6 +181,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         use_compile_cache: bool = False,
         compile_kernels: bool = False,
         num_speculative_tokens: int = 0,
+        moe_stats_output: str | None = None,
     ) -> None:
         worker_device_ids = tuple(device_ids) if device_ids is not None else (int(device_id),)
         super().__init__(
@@ -195,6 +196,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         self._num_speculative_tokens = int(num_speculative_tokens)
         if self._num_speculative_tokens < 0:
             raise ValueError("num_speculative_tokens must be non-negative")
+        self._moe_stats_output = str(moe_stats_output) if moe_stats_output else None
         self._embedding_cache: dict[str, torch.Tensor] = {}
         # Shared JIT-compile core; DeepSeek wraps each compile in a per-kernel
         # profile span (see _compile_l3_callable). With ``use_compile_cache`` the
@@ -265,6 +267,12 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             release = getattr(runner, "release_finished_requests", None)
             if callable(release):
                 release(request_ids)
+
+    def set_moe_stats_output(self, output_path: str | None) -> None:
+        """Enable, redirect, or disable MoE statistics on existing runners."""
+        self._moe_stats_output = str(output_path) if output_path else None
+        for runner in self._runners.values():
+            runner.set_moe_stats_output(self._moe_stats_output)
 
     def _create_runner(self, model_id: str, compiled: object) -> ModelRunner:
         """Create the DeepSeekV4 runtime runner."""
@@ -339,6 +347,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "deepseek_v4_prefill",
                 modules["prefill_fwd"].l3_prefill_fwd,
                 layout=layout,
+                runtime_scalar_names=frozenset({"dump_moe_stats"}),
             )
             use_fused_mtp = self._num_speculative_tokens == 1
             decode = self._compile_l3_callable(
@@ -350,7 +359,9 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 ),
                 layout=layout,
                 runtime_scalar_names=(
-                    frozenset({"mtp_num_tokens"}) if use_fused_mtp else None
+                    frozenset({"mtp_num_tokens", "dump_moe_stats"})
+                    if use_fused_mtp
+                    else frozenset({"dump_moe_stats"})
                 ),
             )
             if self._num_speculative_tokens:
@@ -358,14 +369,14 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                     "deepseek_v4_mtp_prefill",
                     modules["prefill_mtp"].l3_mtp_prefill_fwd,
                     layout=layout,
-                    runtime_scalar_names=frozenset({"num_tokens"}),
+                    runtime_scalar_names=frozenset({"num_tokens", "dump_moe_stats"}),
                 )
                 if not use_fused_mtp:
                     mtp_decode = self._compile_l3_callable(
                         "deepseek_v4_mtp_decode",
                         modules["decode_mtp"].l3_decode_mtp,
                         layout=layout,
-                        runtime_scalar_names=frozenset({"num_tokens"}),
+                        runtime_scalar_names=frozenset({"num_tokens", "dump_moe_stats"}),
                     )
             freqs_cos, freqs_sin = self._build_rope_tables(
                 modules["utils"],
@@ -394,6 +405,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             n_routed_experts=n_routed_experts,
             num_hash_layers=num_hash_layers,
             num_speculative_tokens=self._num_speculative_tokens,
+            moe_stats_output=self._moe_stats_output,
         )
 
     def _load_kernel_modules(self, layout: DeepSeekV4CacheLayout) -> dict[str, object]:

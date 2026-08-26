@@ -1,0 +1,4 @@
+interface:
+  display_name: "Enable MoE Stats Dump"
+  short_description: "Enable and verify DeepSeek V4 MoE load statistics"
+  default_prompt: "Use $enable-moe-stats-dump to enable MoE statistics and verify the JSONL output."

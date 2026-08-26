@@ -116,11 +116,14 @@ def _pypto_lib_l3_arg_names(module_name: str, function_name: str) -> tuple[str, 
     )
     return tuple(arg.arg for arg in function.args.args)
 
-
 def test_deepseek_decode_task_arg_orders_match_pypto_lib_abis():
-    assert _pypto_lib_l3_arg_names("decode_fwd", "l3_decode_fwd") == _DECODE_FWD_TENSOR_ORDER
+    assert _pypto_lib_l3_arg_names("decode_fwd", "l3_decode_fwd") == (
+        *_DECODE_FWD_TENSOR_ORDER,
+        "dump_moe_stats",
+    )
     assert _pypto_lib_l3_arg_names("decode_mtp", "l3_decode_mtp") == (
         *_MTP_DECODE_TENSOR_ORDER,
+        "dump_moe_stats",
         "num_tokens",
     )
 
@@ -134,6 +137,7 @@ def test_deepseek_decode_task_arg_orders_match_pypto_lib_abis():
         "mtp_tail_token_ids",
         "mtp_tail_positions",
         *fused_mtp_only,
+        "dump_moe_stats",
         "mtp_num_tokens",
     )
 
@@ -701,6 +705,28 @@ def test_cli_selects_deepseek_executor_and_configures_mtp_depth(tmp_path):
     assert config.executor_kwargs["use_compile_cache"] is True
 
 
+def test_cli_enables_moe_stats_dump_without_changing_compile_mode(tmp_path):
+    model_dir = _write_deepseek_model_dir(tmp_path)
+    output = tmp_path / "moe.jsonl"
+    args = cli.build_parser().parse_args(
+        [
+            "--model", str(model_dir),
+            "--devices", "0,1,2,3,4,5,6,7",
+            "--dp", "8",
+            "--ep", "8",
+            "--block-size", "128",
+            "--max-model-len", "260",
+            "--dtype", "int8",
+            "--moe-stats-output", str(output),
+        ]
+    )
+
+    config = cli.build_serving_engine_config(args)
+
+    assert config.executor_kwargs["compile_kernels"] is True
+    assert config.executor_kwargs["moe_stats_output"] == str(output)
+
+
 @pytest.mark.parametrize(
     ("num_speculative_tokens", "expected"),
     [(0, True), (1, True), (3, False)],
@@ -926,26 +952,44 @@ def test_deepseek_compile_selects_mtp_programs(
     compiled = executor._compile_model(loaded.runtime_model)
 
     expected_calls = [
-        ("deepseek_v4_prefill", prefill_fwd.l3_prefill_fwd, None),
+        (
+            "deepseek_v4_prefill",
+            prefill_fwd.l3_prefill_fwd,
+            frozenset({"dump_moe_stats"}),
+        ),
     ]
     if num_speculative_tokens == 1:
         expected_calls.append(
             (
                 "deepseek_v4_decode_mtp_fused",
                 decode_fwd_mtp.l3_decode_fwd_mtp,
-                frozenset({"mtp_num_tokens"}),
+                frozenset({"mtp_num_tokens", "dump_moe_stats"}),
             )
         )
     else:
-        expected_calls.append(("deepseek_v4_decode", decode_fwd.l3_decode_fwd, None))
+        expected_calls.append(
+            (
+                "deepseek_v4_decode",
+                decode_fwd.l3_decode_fwd,
+                frozenset({"dump_moe_stats"}),
+            )
+        )
     expected_calls.extend(
         [
-            ("deepseek_v4_mtp_prefill", prefill_mtp.l3_mtp_prefill_fwd, frozenset({"num_tokens"})),
+            (
+                "deepseek_v4_mtp_prefill",
+                prefill_mtp.l3_mtp_prefill_fwd,
+                frozenset({"num_tokens", "dump_moe_stats"}),
+            ),
         ]
     )
     if num_speculative_tokens > 1:
         expected_calls.append(
-            ("deepseek_v4_mtp_decode", decode_mtp.l3_decode_mtp, frozenset({"num_tokens"}))
+            (
+                "deepseek_v4_mtp_decode",
+                decode_mtp.l3_decode_mtp,
+                frozenset({"num_tokens", "dump_moe_stats"}),
+            )
         )
     assert compile_calls == expected_calls
     assert compiled.prefill is not None
@@ -3434,6 +3478,7 @@ class _TaskArgsStubRunner:
         self._cache = {n: object() for n in _PREFILL_CACHE_POOLS}
         self._embed_handle = object()
         self._pre_hc_handle = object()
+        self._moe_stats_handles = [object(), object(), object()]
         self._decode_metadata = {
             name: object()
             for name in (
@@ -3470,6 +3515,9 @@ class _TaskArgsStubRunner:
 
     def _materialize_decode_device_metadata(self, _buffer_slot):
         return self._decode_metadata
+
+    def _prepare_moe_stats(self, slot):
+        return self._moe_stats_handles[slot]
 
     def _static_freqs_cos_tensor(self):
         return torch.empty((2, 8, 4), dtype=torch.bfloat16).share_memory_()
@@ -3595,6 +3643,7 @@ def test_deepseek_mtp_task_args_classify_kinds():
             "_static_lm_head_weight_tensor",
             "_hc_head_tensors",
             "_decode_task_args",
+            "_prepare_moe_stats",
         ):
             base[attr] = getattr(stub, attr)
         base["_compiled"] = stub._compiled

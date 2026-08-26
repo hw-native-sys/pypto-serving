@@ -166,6 +166,15 @@ def build_parser() -> argparse.ArgumentParser:
             "method='mtp' and a positive num_speculative_tokens value."
         ),
     )
+    parser.add_argument(
+        "--moe-stats-output",
+        default=None,
+        metavar="JSONL",
+        help=(
+            "Dump per-layer DeepSeek V4 physical-expert token counts to JSONL. "
+            "Omit this option to disable device-to-host statistics transfer."
+        ),
+    )
 
     # Serving
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind the serving server (default: 0.0.0.0).")
@@ -236,11 +245,15 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     if model_family == "deepseek_v4":
         executor_kwargs["compile_kernels"] = True
         executor_kwargs["num_speculative_tokens"] = num_speculative_tokens
+        if args.moe_stats_output:
+            executor_kwargs["moe_stats_output"] = args.moe_stats_output
     elif num_speculative_tokens:
         raise ValueError(
             "--speculative-config/--num-speculative-tokens/--enable-mtp is only "
             "supported for DeepSeek V4"
         )
+    elif args.moe_stats_output:
+        raise ValueError("--moe-stats-output is only supported for DeepSeek V4")
     executor_kwargs["use_compile_cache"] = args.use_compile_cache
     parallel_config = ParallelConfig(
         data_parallel_size=args.data_parallel_size,
