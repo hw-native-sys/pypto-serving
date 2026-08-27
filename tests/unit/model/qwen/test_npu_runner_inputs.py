@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from pypto.runtime import DeviceTensor
 from simpler.task_interface import DataType
 
 from pypto_serving.config.types import (
@@ -237,12 +238,17 @@ def test_write_slot_mapping_fills_target_slice_across_physical_pages():
     assert target.tolist() == [-1, 14, 15, 6, 7, -1]
 
 
-def test_prepare_decode_inputs_writes_compiled_buffers_and_replicates_padding():
+def test_prepare_decode_inputs_writes_only_active_rows():
     model = _model(max_batch_size=2)
     manager = KvCacheManager()
     manager.register_model(model.config.model_id, model.config, model.runtime)
     compiled = _compiled_kernels(model)
     runner = ModelRunner(compiled=compiled)
+    decode = runner._decode_task_args.tensors
+    decode["token_ids"].fill_(-9)
+    decode["seq_lens"].fill_(-9)
+    decode["block_table"].fill_(-9)
+    decode["slot_mapping"].fill_(-9)
     alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 1)
     prepared = runner._prepare_decode_inputs(
         model,
@@ -255,18 +261,51 @@ def test_prepare_decode_inputs_writes_compiled_buffers_and_replicates_padding():
         ),
     )
 
-    decode = runner._decode_task_args.tensors
     assert prepared.actual_batch == 1
     assert prepared.logits is decode["logits"]
-    assert decode["token_ids"][:, :1].tolist() == [[7], [7]]
+    assert decode["token_ids"][:, :1].tolist() == [[7], [-9]]
     assert torch.count_nonzero(decode["token_ids"][:, 1:]).item() == 0
-    assert decode["seq_lens"].tolist() == [1, 1]
+    assert decode["seq_lens"].tolist() == [1, -9]
     assert decode["block_table"].reshape(2, 2).tolist() == [
         [alloc.page_ids[0], -1],
-        [alloc.page_ids[0], -1],
+        [-9, -9],
     ]
     expected_slot = manager.slot_mapping_for_request(alloc)
-    assert decode["slot_mapping"].tolist() == [expected_slot, expected_slot]
+    assert decode["slot_mapping"].tolist() == [expected_slot, -9]
+
+
+def test_decode_kernel_args_expose_only_the_actual_batch():
+    model = _model(max_batch_size=2)
+    manager = KvCacheManager()
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    runner = ModelRunner(compiled=_compiled_kernels(model))
+    alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 1)
+    runner._prepare_decode_inputs(
+        model,
+        DecodeBatch(
+            request_ids=[alloc.request_id],
+            token_ids=torch.tensor([[7]], dtype=torch.long),
+            hidden_states=None,
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            kv_allocations=[alloc],
+        ),
+    )
+    runner._kv_caches = {
+        model.config.model_id: SimpleNamespace(key_pages=object(), value_pages=object())
+    }
+
+    task_args = runner._decode_task_args
+    args = runner._decode_kernel_args(actual_batch=1)
+    by_name = dict(zip(task_args.names, args, strict=True))
+
+    assert by_name["seq_lens"].shape == (1,)
+    assert by_name["block_table"].shape == (2,)
+    assert by_name["slot_mapping"].shape == (1,)
+    assert by_name["logits"].shape == (1, model.config.vocab_size)
+    assert by_name["token_ids"].shape == (1, 8)
+    assert by_name["sampled_ids"].shape == (1, 8)
+    assert by_name["next_hidden"].shape == (1, model.config.hidden_size)
+    assert by_name["token_ids"].data_ptr() == task_args.tensors["token_ids"].data_ptr()
 
 
 def test_prepare_decode_inputs_caches_block_table_until_pages_change():
@@ -326,8 +365,12 @@ def test_decode_topk_selects_from_device_resident_logits(monkeypatch):
             value_pages=object(),
         )
     }
-    device_logits = object()
-    device_next_hidden = object()
+    device_logits = DeviceTensor(0x1000, host_logits.shape, host_logits.dtype)
+    device_next_hidden = DeviceTensor(
+        0x2000,
+        (1, model.config.hidden_size),
+        torch.bfloat16,
+    )
     monkeypatch.setattr(
         runner,
         "_prepare_decode_inputs",

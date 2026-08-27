@@ -517,7 +517,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         t0 = time.perf_counter()
         self._run_l3(
             compiled.decode,
-            *self._decode_kernel_args(device_sampling=False),
+            *self._decode_kernel_args(actual_batch=batch, device_sampling=False),
         )
         logger.info(f"[warmup] decode done ({time.perf_counter() - t0:.2f} s)")
 
@@ -633,12 +633,11 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         KV is already in place with no bridge. KV is keyed by block_table page id, not by
         kernel row, so a request may occupy any row each step (no stable-slot shim).
 
-        The kernel is FIXED-BATCH (it computes all max_batch_size rows and writes
-        each row's current-token KV). Pad the active batch up to the kernel batch by
-        REPLICATING active row 0's inputs into the padding rows: those rows then
-        recompute row 0's K/V and write row 0's own slot with byte-identical values
-        (an idempotent, safe write), and their logits are trimmed off below. This
-        avoids padded rows clobbering an unrelated request's physical page.
+        The compiled ABI has runtime-dynamic batch dimensions. Persistent host and
+        device buffers retain max-batch capacity, but each dispatch passes prefix
+        views containing only the active rows. In particular, inactive rows must
+        not replicate row 0: native paged attention appends K/V in parallel, so
+        duplicate rows would race while writing the same physical KV slot.
         """
         compiled = self._compiled
         model_id = model.config.model_id
@@ -655,7 +654,10 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         )
         self._run_l3(
             compiled.decode,
-            *self._decode_kernel_args(device_sampling=device_sampling),
+            *self._decode_kernel_args(
+                actual_batch=kernel_inputs.actual_batch,
+                device_sampling=device_sampling,
+            ),
         )
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
@@ -789,20 +791,66 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         args[task_args.names.index("slot_mapping")] = inputs.slot_mapping
         return tuple(args)
 
-    def _decode_kernel_args(self, *, device_sampling: bool = False) -> tuple[Any, ...]:
+    def _decode_kernel_args(
+        self,
+        *,
+        actual_batch: int,
+        device_sampling: bool = False,
+    ) -> tuple[Any, ...]:
         """Return arguments in ``qwen3_decode_host`` signature order.
 
-        Buffers and weights come from the decode TaskArgs (``build()``). Under
-        device sampling, ``logits`` and ``next_hidden`` swap from the host slots
-        to worker-resident device scratch (spliced in), so full-vocabulary
-        logits are never staged/copied-back per step.
+        Buffers and weights come from the decode TaskArgs (``build()``). The
+        storage has max-batch capacity, while all batch-shaped arguments are
+        narrowed to ``actual_batch`` so the dynamic kernel executes only live
+        rows. Under device sampling, ``logits`` and ``next_hidden`` swap from
+        the host slots to worker-resident device scratch before those logical
+        views are created, so full-vocabulary logits are never copied back.
         """
+        kernel_batch = self._compiled.layout.kernel_batch
+        if actual_batch <= 0 or actual_batch > kernel_batch:
+            raise ValueError(
+                f"decode actual batch must be in [1, {kernel_batch}], got {actual_batch}"
+            )
+
         task_args = self._decode_task_args
         args = list(task_args.build())
         if device_sampling:
             args[task_args.names.index("logits")] = self._decode_logits_device_arg()
             args[task_args.names.index("next_hidden")] = self._decode_next_hidden_device_arg()
+
+        for name in (
+            "seq_lens",
+            "slot_mapping",
+            "logits",
+            "token_ids",
+            "sampled_ids",
+            "next_hidden",
+        ):
+            index = task_args.names.index(name)
+            args[index] = self._batch_prefix_view(args[index], actual_batch)
+
+        block_table_index = task_args.names.index("block_table")
+        block_table_rows = actual_batch * self._compiled.layout.max_blocks_per_seq
+        args[block_table_index] = args[block_table_index][:block_table_rows]
         return tuple(args)
+
+    @staticmethod
+    def _batch_prefix_view(tensor: Any, actual_batch: int) -> Any:
+        """Return a zero-offset leading-batch view without reallocating storage."""
+        if isinstance(tensor, DeviceTensor):
+            if tensor.shape[0] < actual_batch:
+                raise ValueError(
+                    f"device tensor batch capacity {tensor.shape[0]} is smaller than {actual_batch}"
+                )
+            if tensor.shape[0] == actual_batch:
+                return tensor
+            return DeviceTensor(
+                tensor.data_ptr,
+                (actual_batch, *tensor.shape[1:]),
+                tensor.dtype,
+                buffer=tensor.buffer,
+            )
+        return tensor[:actual_batch]
 
     def _shared_l3_worker(self) -> Any:
         """Return the worker shared by the generation prefill/decode path."""
@@ -968,10 +1016,9 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
     ) -> _DecodeKernelInputs:
         """Write active decode metadata directly into persistent kernel buffers.
 
-        The fused kernel has a fixed batch size. Active rows are written first,
-        and inactive rows replicate row 0 so their KV writes remain idempotent.
-        Block-table rows persist across calls and are rewritten only when their
-        page IDs change.
+        Active rows are written into max-capacity storage; the dispatch path
+        exposes only those rows through dynamic prefix views. Block-table rows
+        persist across calls and are rewritten only when their page IDs change.
         """
         buffers = self._decode_task_args.tensors
         batch_count = len(batch.kv_allocations) if batch.kv_allocations else int(batch.seq_lens.shape[0])
@@ -1021,7 +1068,6 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         if len(self._decode_block_table_row_pages) != kernel_batch:
             self._decode_block_table_row_pages = [None] * kernel_batch
 
-        first_page_ids: list[int] | None = None
         for batch_idx in range(actual_batch):
             alloc = batch.kv_allocations[batch_idx] if batch_idx < len(batch.kv_allocations) else None
             seq_len = int(seq_len_values[batch_idx])
@@ -1039,8 +1085,6 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
             else:
                 page_ids = []
             self._write_cached_decode_block_table_row(block_table_rows, batch_idx, page_ids)
-            if batch_idx == 0:
-                first_page_ids = page_ids
 
             tokens_used = seq_len - 1
             page_idx = tokens_used // page_size
@@ -1051,16 +1095,6 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
                     f"need at least {page_idx + 1} pages"
                 )
             slot_mapping_flat[batch_idx] = page_ids[page_idx] * page_size + offset
-
-        if actual_batch < kernel_batch:
-            inactive_rows = kernel_batch - actual_batch
-            token_rows[actual_batch:, :1].copy_(token_rows[0:1, :1].expand(inactive_rows, 1))
-            seq_lens_flat[actual_batch:].copy_(seq_lens_flat[0:1].expand(inactive_rows))
-            slot_mapping_flat[actual_batch:].copy_(slot_mapping_flat[0:1].expand(inactive_rows))
-            if first_page_ids is None:
-                raise RuntimeError("decode batch is missing row-0 page IDs")
-            for batch_idx in range(actual_batch, kernel_batch):
-                self._write_cached_decode_block_table_row(block_table_rows, batch_idx, first_page_ids)
 
         return _DecodeKernelInputs(
             actual_batch=actual_batch,
