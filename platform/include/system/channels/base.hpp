@@ -123,7 +123,8 @@ class Base
   __INLINE__ void lock() { _lock.lock(); }
   __INLINE__ void unlock() { _lock.unlock(); }
 
-  __INLINE__ bool isReady() const { return _isReady; }
+  __INLINE__ bool                   isReady() const { return _isReady; }
+  __INLINE__ const channelConfig_t &getConfig() const { return _config; }
 
   protected:
 
