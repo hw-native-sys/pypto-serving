@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
@@ -67,6 +68,11 @@ DEEPSEEK_V4_PREFILL_BATCH = 1
 # extent and walks it in fixed 128-token tiles. The standalone MTP prefill
 # wrapper still accepts exactly one tile.
 DEEPSEEK_V4_PREFILL_SEQ = 128
+_DEEPSEEK_V4_RING_ENV_FIELDS = (
+    ("ring_task_window", "PTO2_RING_TASK_WINDOW"),
+    ("ring_heap", "PTO2_RING_HEAP"),
+    ("ring_dep_pool", "PTO2_RING_DEP_POOL"),
+)
 # Async serving pipelines at most two device steps. Rolling caches must retain
 # the history needed by the next token plus every token that can be in flight;
 # otherwise scheduling the second prefill chunk can recycle state pages before
@@ -1064,6 +1070,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
     ) -> None:
         super().__init__()
         self._compiled = compiled
+        self._dispatch_run_config: Any | None = None
         self.cache_metadata = DeepSeekV4CacheMetadataBuilder(layout=compiled.layout)
         self.input_builder: DeepSeekV4InputBuilder | None = None
         self._init_l3_dispatch(stacked=True)
@@ -1121,6 +1128,30 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         else:
             self._decode_flow = self._run_autoregressive_decode
             self._prefill_completion = self._ignore_prefill_context
+
+    def _l3_run_config(self, callable_spec: Any) -> Any | None:
+        """Translate the serving ring environment into a per-dispatch config."""
+        if getattr(self, "_dispatch_run_config", None) is None:
+            ring_overrides: dict[str, int] = {}
+            for field_name, env_name in _DEEPSEEK_V4_RING_ENV_FIELDS:
+                raw_value = os.environ.get(env_name)
+                if raw_value is None:
+                    continue
+                try:
+                    ring_overrides[field_name] = int(raw_value)
+                except ValueError as exc:
+                    raise ValueError(f"{env_name} must be an integer, got {raw_value!r}") from exc
+            if not ring_overrides:
+                return None
+
+            from pypto.runtime import RunConfig  # noqa: PLC0415
+
+            self._dispatch_run_config = RunConfig(
+                platform=self._compiled.platform,
+                device_id=self._compiled.device_id,
+                **ring_overrides,
+            )
+        return self._dispatch_run_config
 
     @property
     def supports_async_decode_reclaim(self) -> bool:
@@ -4072,8 +4103,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 cat="executor",
                 args={"callable_count": len(compiled)},
             ):
+                run_config = self._l3_run_config(compiled_callables[0])
                 worker = DistributedWorker(
                     compiled,
+                    config=run_config,
                     persistent=True,
                     reset_persistent_windows=False,
                     inherited_host_tensors=self._inherited_host_weights(),

@@ -100,6 +100,55 @@ def test_deepseek_kernel_dir_uses_v4_flash_variant(tmp_path):
     assert npu_executor._is_deepseek_v4_module_file(kernel_dir / "decode_fwd.py", kernel_dir)
 
 
+def test_deepseek_l3_dispatch_uses_explicit_ring_sizing(monkeypatch):
+    class FakeRunConfig(SimpleNamespace):
+        pass
+
+    monkeypatch.setattr("pypto.runtime.RunConfig", FakeRunConfig)
+    monkeypatch.setenv("PTO2_RING_TASK_WINDOW", "131072")
+    monkeypatch.setenv("PTO2_RING_HEAP", "2147483648")
+    monkeypatch.setenv("PTO2_RING_DEP_POOL", "131072")
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=DeepSeekV4CacheLayout(),
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=(),
+            layer_plan=(),
+            kernel_dir="",
+            platform="a2a3",
+            device_id=3,
+        )
+    )
+
+    config = runner._l3_run_config(object())
+
+    assert config.platform == "a2a3"
+    assert config.device_id == 3
+    assert config.ring_task_window == 131072
+    assert config.ring_heap == 2147483648
+    assert config.ring_dep_pool == 131072
+
+
+def test_deepseek_l3_dispatch_uses_runtime_defaults_without_ring_env(monkeypatch):
+    for env_name in ("PTO2_RING_TASK_WINDOW", "PTO2_RING_HEAP", "PTO2_RING_DEP_POOL"):
+        monkeypatch.delenv(env_name, raising=False)
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=DeepSeekV4CacheLayout(),
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=(),
+            layer_plan=(),
+            kernel_dir="",
+        )
+    )
+
+    assert runner._l3_run_config(object()) is None
+
+
 def _pypto_lib_l3_arg_names(module_name: str, function_name: str) -> tuple[str, ...]:
     kernel_file = (
         Path(__file__).resolve().parents[4]
@@ -1453,6 +1502,8 @@ def test_deepseek_stacked_weight_loader_packs_subsequent_layers_into_final_slice
 
 
 def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypatch):
+    for env_name in ("PTO2_RING_TASK_WINDOW", "PTO2_RING_HEAP", "PTO2_RING_DEP_POOL"):
+        monkeypatch.delenv(env_name, raising=False)
     main_weight = torch.zeros((1, 2), dtype=torch.float32)
     mtp_weight = torch.ones((1, 2), dtype=torch.float32)
     compiled_program = object()
@@ -1462,12 +1513,14 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
         def __init__(
             self,
             compiled,
+            config,
             *,
             persistent,
             reset_persistent_windows,
             inherited_host_tensors,
         ):
             captured["compiled"] = compiled
+            captured["config"] = config
             captured["persistent"] = persistent
             captured["reset_persistent_windows"] = reset_persistent_windows
             captured["inherited"] = inherited_host_tensors
@@ -1475,12 +1528,15 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
     monkeypatch.setattr("pypto.runtime.DistributedWorker", FakeDistributedWorker)
     runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
     runner._l3_worker = None
+    runner._dispatch_run_config = None
     runner._stacked_host_weights = {"main": main_weight}
     runner._mtp_buffers = type("MtpBuffers", (), {"weights": {"mtp": mtp_weight}})()
     runner._compiled = type(
         "Compiled",
         (),
         {
+            "platform": "a2a3",
+            "device_id": 0,
             "l3_callables": lambda _self: (
                 DeepSeekV4L3Callable(
                     compiled_program,
@@ -1494,6 +1550,7 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
 
     assert isinstance(worker, FakeDistributedWorker)
     assert captured["compiled"] == [compiled_program]
+    assert captured["config"] is None
     assert captured["persistent"] is True
     assert captured["reset_persistent_windows"] is False
     assert captured["inherited"] == [main_weight, mtp_weight]

@@ -96,6 +96,10 @@ class L3DispatchMixin:
         """Return the persistent ``DistributedWorker`` (runner-specific fork logic)."""
         raise NotImplementedError
 
+    def _l3_run_config(self, callable_spec: Any) -> Any | None:
+        """Return an optional per-dispatch PyPTO ``RunConfig``."""
+        return None
+
     def _run_l3(self, callable_spec: Any, *args: Any) -> None:
         """Dispatch one L3 program: resolve args, run, free per-dispatch uploads.
 
@@ -127,7 +131,11 @@ class L3DispatchMixin:
                     level="kernel",
                     args=dict(span_args),
                 ):
-                    worker.run(callable_spec.compiled, *l3_args)
+                    run_config = self._l3_run_config(callable_spec)
+                    if run_config is None:
+                        worker.run(callable_spec.compiled, *l3_args)
+                    else:
+                        worker.run(callable_spec.compiled, *l3_args, config=run_config)
             finally:
                 for tensor in uploaded:
                     worker.free_tensor(tensor)
@@ -162,7 +170,11 @@ class L3DispatchMixin:
                 level="kernel",
                 args=dict(span_args),
             ):
-                handle = worker.submit(callable_spec.compiled, *l3_args)
+                run_config = self._l3_run_config(callable_spec)
+                if run_config is None:
+                    handle = worker.submit(callable_spec.compiled, *l3_args)
+                else:
+                    handle = worker.submit(callable_spec.compiled, *l3_args, config=run_config)
         except BaseException:
             for tensor in uploaded:
                 worker.free_tensor(tensor)
