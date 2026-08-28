@@ -4075,6 +4075,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             ):
                 worker = DistributedWorker(
                     compiled,
+                    config=self._l3_run_config,
                     persistent=True,
                     reset_persistent_windows=False,
                     inherited_host_tensors=self._inherited_host_weights(),

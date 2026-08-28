@@ -1456,6 +1456,7 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
     main_weight = torch.zeros((1, 2), dtype=torch.float32)
     mtp_weight = torch.ones((1, 2), dtype=torch.float32)
     compiled_program = object()
+    run_config = object()
     captured = {}
 
     class FakeDistributedWorker:
@@ -1463,11 +1464,13 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
             self,
             compiled,
             *,
+            config,
             persistent,
             reset_persistent_windows,
             inherited_host_tensors,
         ):
             captured["compiled"] = compiled
+            captured["config"] = config
             captured["persistent"] = persistent
             captured["reset_persistent_windows"] = reset_persistent_windows
             captured["inherited"] = inherited_host_tensors
@@ -1475,6 +1478,7 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
     monkeypatch.setattr("pypto.runtime.DistributedWorker", FakeDistributedWorker)
     runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
     runner._l3_worker = None
+    runner._l3_run_config = run_config
     runner._stacked_host_weights = {"main": main_weight}
     runner._mtp_buffers = type("MtpBuffers", (), {"weights": {"mtp": mtp_weight}})()
     runner._compiled = type(
@@ -1494,6 +1498,7 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
 
     assert isinstance(worker, FakeDistributedWorker)
     assert captured["compiled"] == [compiled_program]
+    assert captured["config"] is run_config
     assert captured["persistent"] is True
     assert captured["reset_persistent_windows"] is False
     assert captured["inherited"] == [main_weight, mtp_weight]
