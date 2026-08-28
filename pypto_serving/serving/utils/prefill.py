@@ -30,6 +30,7 @@ def pack_prefill_batch(
     block_ids: Sequence[Sequence[int]] = (),
     block_ids_by_group: Sequence[dict[str, list[int]]] = (),
     cache_partitions: Sequence[int | None] = (),
+    next_prefill_token_ids: Sequence[int | None] = (),
 ) -> PrefillBatch:
     """Pack request chunks and optionally look up all host embeddings once."""
     chunk_lens = [len(chunk) for chunk in token_chunks]
@@ -61,4 +62,5 @@ def pack_prefill_batch(
         block_ids=[list(row) for row in block_ids],
         block_ids_by_group=list(block_ids_by_group),
         cache_partitions=list(cache_partitions),
+        next_prefill_token_ids=list(next_prefill_token_ids),
     )

@@ -114,6 +114,68 @@ class ExpertParallel:
 
 
 @dataclass(frozen=True)
+class TensorParallel:
+    """Shard one tensor axis across each TP group and repeat it across DP groups.
+
+    Physical rank ``r`` consumes shard ``r % tp_size``. This is the layout used
+    by model programs whose outer rank axis spans the full DP x TP world while
+    a dense projection is partitioned only inside each TP group.
+    """
+
+    ranks: int
+    tp_size: int
+    axis: int
+    mismatch_error: str = "packed destination {name} shape/dtype mismatch: expected={expected}, got={got}"
+
+    def apply(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        *,
+        dtype: torch.dtype | None,
+        destination: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Shard ``tensor`` into the rank-major DP x TP layout."""
+        if self.ranks <= 0 or self.tp_size <= 0 or self.ranks % self.tp_size != 0:
+            raise ValueError(
+                f"{name} requires positive ranks divisible by tp_size, "
+                f"got ranks={self.ranks}, tp_size={self.tp_size}"
+            )
+        source = tensor.cpu() if tensor.device.type != "cpu" else tensor
+        axis = self.axis if self.axis >= 0 else source.ndim + self.axis
+        if not 0 <= axis < source.ndim:
+            raise ValueError(f"{name} TP axis {self.axis} is invalid for shape={tuple(source.shape)}")
+        width = int(source.shape[axis])
+        if width % self.tp_size != 0:
+            raise ValueError(
+                f"{name} dimension {width} on axis {axis} must divide by tp_size={self.tp_size}"
+            )
+
+        output_dtype = source.dtype if dtype is None else dtype
+        shard_shape = list(source.shape)
+        shard_shape[axis] //= self.tp_size
+        expected_shape = (self.ranks, *shard_shape)
+        if destination is not None:
+            if tuple(destination.shape) != expected_shape or destination.dtype != output_dtype:
+                raise ValueError(
+                    self.mismatch_error.format(
+                        name=name,
+                        expected=f"{expected_shape}/{output_dtype}",
+                        got=f"{tuple(destination.shape)}/{destination.dtype}",
+                    )
+                )
+            shards = source.chunk(self.tp_size, dim=axis)
+            for rank in range(self.ranks):
+                destination[rank].copy_(shards[rank % self.tp_size])
+            return destination
+
+        if dtype is not None:
+            source = source.to(dtype=dtype)
+        shards = source.chunk(self.tp_size, dim=axis)
+        return torch.stack([shards[rank % self.tp_size] for rank in range(self.ranks)], dim=0).contiguous()
+
+
+@dataclass(frozen=True)
 class NoShard:
     """Keep the tensor as it is — no rank axis at all.
 

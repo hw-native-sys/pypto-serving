@@ -383,6 +383,7 @@ class ReplicaEngineCore:
                 temperature=config.temperature,
                 top_p=config.top_p,
                 top_k=config.top_k,
+                seed=config.seed,
             )
 
             ctx = _RequestContext(request=request, stream=getattr(config, "stream", True))
@@ -641,6 +642,7 @@ class ReplicaEngineCore:
                     temperature=req.temperature,
                     top_p=req.top_p,
                     top_k=req.top_k,
+                    seed=req.seed,
                 ))
                 self._worker_known_req_ids.add(req_id)
 

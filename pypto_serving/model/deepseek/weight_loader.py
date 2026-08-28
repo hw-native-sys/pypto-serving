@@ -401,6 +401,20 @@ class DeepSeekV4MtpWeights:
         return tuple(self.tensors[name] for name in names)
 
 
+@dataclass(frozen=True)
+class DeepSeekV4DSparkWeights:
+    """Rank-stacked weights consumed by the DSpark drafter and heads."""
+
+    tensors: Mapping[str, torch.Tensor]
+
+    def args(self, names: Sequence[str]) -> tuple[torch.Tensor, ...]:
+        """Return DSpark tensors in kernel host order."""
+        missing = [name for name in names if name not in self.tensors]
+        if missing:
+            raise KeyError(f"Packed DeepSeekV4 DSpark weights are missing tensors: {', '.join(missing)}")
+        return tuple(self.tensors[name] for name in names)
+
+
 def deepseek_v4_lm_head_layout(
     *,
     vocab_size: int,
@@ -608,6 +622,44 @@ def deepseek_v4_mtp_startup_weight_names(n_routed_experts: int) -> tuple[str, ..
     return tuple(dict.fromkeys((*layer_names, *projection_and_head)))
 
 
+def deepseek_v4_dspark_startup_weight_names(
+    n_routed_experts: int,
+    *,
+    stages: int = 3,
+) -> tuple[str, ...]:
+    """Return the metadata contract for the three-layer DSpark model."""
+    if stages <= 0:
+        raise ValueError("DSpark stages must be positive")
+    edge_experts = tuple(dict.fromkeys((0, n_routed_experts - 1)))
+    names: list[str] = []
+    for stage in range(stages):
+        names.extend(
+            name.replace("layers.0", f"mtp.{stage}", 1)
+            for name in deepseek_v4_layer_weight_names(
+                0,
+                n_routed_experts=n_routed_experts,
+                compress_ratio=0,
+                include_gate_bias=True,
+                expert_ids=edge_experts,
+            )
+        )
+    final_prefix = f"mtp.{stages - 1}"
+    names.extend(
+        (
+            "mtp.0.main_proj.weight",
+            "mtp.0.main_norm.weight",
+            f"{final_prefix}.norm.weight",
+            f"{final_prefix}.hc_head_fn",
+            f"{final_prefix}.hc_head_scale",
+            f"{final_prefix}.hc_head_base",
+            f"{final_prefix}.markov_head.markov_w1.weight",
+            f"{final_prefix}.markov_head.markov_w2.weight",
+            f"{final_prefix}.confidence_head.weight",
+        )
+    )
+    return tuple(dict.fromkeys(names))
+
+
 class DeepSeekV4WeightStore(LazySafetensorsStore):
     """Lazy name-based safetensors access for DeepSeekV4 W8A8 checkpoints.
 
@@ -647,6 +699,20 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
     def validate_mtp_startup_contract(self, *, n_routed_experts: int) -> None:
         """Validate MTP metadata without opening checkpoint shards."""
         self.require(deepseek_v4_mtp_startup_weight_names(n_routed_experts))
+
+    def validate_dspark_startup_contract(
+        self,
+        *,
+        n_routed_experts: int,
+        stages: int = 3,
+    ) -> None:
+        """Validate DSpark metadata without opening checkpoint shards."""
+        self.require(
+            deepseek_v4_dspark_startup_weight_names(
+                n_routed_experts,
+                stages=stages,
+            )
+        )
 
     def load_global_weights(self) -> dict[str, torch.Tensor]:
         """Load embedding, final norm, and LM head tensors."""
@@ -744,6 +810,7 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
         include_tid2eid: bool = False,
         include_gate_bias: bool = False,
         destinations: Mapping[str, torch.Tensor] | None = None,
+        o_projection_tp_size: int | None = None,
     ) -> DeepSeekV4PackedLayerWeights:
         """Load and pack one layer into the tensor names expected by pypto-lib kernels.
 
@@ -768,6 +835,7 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
             include_tid2eid=include_tid2eid,
             include_gate_bias=include_gate_bias,
             destinations=destinations,
+            o_projection_tp_size=o_projection_tp_size,
         )
 
     def packed_stacked_layer_weights_fingerprint(
@@ -897,6 +965,7 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
         compress_ratios: Sequence[int],
         num_hash_layers: int,
         use_prepacked: bool = True,
+        o_projection_tp_size: int | None = None,
     ) -> DeepSeekV4StackedLayerWeights:
         """Load every hidden layer once and stack weights on the layer axis.
 
@@ -916,7 +985,7 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
         num_hidden_layers = len(compress_ratios)
         if num_hidden_layers <= 0:
             raise ValueError("compress_ratios must include at least one entry per hidden layer")
-        if use_prepacked:
+        if use_prepacked and o_projection_tp_size is None:
             prepacked = self.load_prepacked_stacked_layer_weights(
                 ranks=ranks,
                 n_routed_experts=n_routed_experts,
@@ -932,6 +1001,7 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
             compress_ratio=int(compress_ratios[0]),
             include_tid2eid=num_hash_layers > 0,
             include_gate_bias=num_hash_layers <= 0,
+            o_projection_tp_size=o_projection_tp_size,
         )
         from pypto_serving.model.common.weights.stacker import stack_layers  # noqa: PLC0415
 
@@ -952,6 +1022,7 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
                 include_tid2eid=layer_id < num_hash_layers,
                 include_gate_bias=layer_id >= num_hash_layers,
                 destinations=destinations,
+                o_projection_tp_size=o_projection_tp_size,
             )
 
         def log_progress(layer_id: int) -> None:
@@ -1040,6 +1111,113 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
         )
         return DeepSeekV4MtpWeights(tensors={**packed_layer.tensors, **extras})
 
+    def load_dspark_weights(
+        self,
+        *,
+        ranks: int,
+        tp_size: int,
+        n_routed_experts: int,
+        stages: int = 3,
+    ) -> DeepSeekV4DSparkWeights:
+        """Load and pack the three DSpark draft layers and their shared heads."""
+        if stages <= 0:
+            raise ValueError("DSpark stages must be positive")
+
+        from pypto_serving.model.common.weights.packer import pack_layer  # noqa: PLC0415
+        from pypto_serving.model.common.weights.pipeline import StagingPolicy  # noqa: PLC0415
+        from pypto_serving.model.common.weights.spec import LayerContext  # noqa: PLC0415
+        from pypto_serving.model.common.weights.stacker import StackGroup, stack_layers  # noqa: PLC0415
+
+        from .weight_spec import (  # noqa: PLC0415
+            DEEPSEEK_V4_DSPARK_LAYER_RULES,
+            DEEPSEEK_V4_EXPERT_MISSING_ERROR,
+            DEEPSEEK_V4_SOURCE_MISSING_ERROR,
+            deepseek_v4_expert_parallel,
+            deepseek_v4_o_projection_tp_policies,
+            deepseek_v4_replicate,
+        )
+
+        replicate = deepseek_v4_replicate(int(ranks))
+        expert_policy = deepseek_v4_expert_parallel(int(ranks), int(n_routed_experts))
+        tp_policies = deepseek_v4_o_projection_tp_policies(int(ranks), int(tp_size))
+
+        def load_stage(
+            stage: int,
+            destinations: Mapping[str, torch.Tensor] | None = None,
+        ) -> Mapping[str, torch.Tensor]:
+            prefix = f"mtp.{stage}"
+            names = tuple(
+                name.replace("layers.0", prefix, 1)
+                for name in deepseek_v4_layer_weight_names(
+                    0,
+                    n_routed_experts=n_routed_experts,
+                    compress_ratio=0,
+                    include_gate_bias=True,
+                )
+            )
+            raw = self.load_many(names)
+            return pack_layer(
+                DEEPSEEK_V4_DSPARK_LAYER_RULES,
+                raw,
+                LayerContext(
+                    layer_id=stage,
+                    prefix=prefix,
+                    ranks=int(ranks),
+                    n_routed_experts=int(n_routed_experts),
+                    include_gate_bias=True,
+                ),
+                policy=replicate,
+                expert_policy=expert_policy,
+                policies=tp_policies,
+                destinations=destinations,
+                missing_source_error=DEEPSEEK_V4_SOURCE_MISSING_ERROR,
+                missing_expert_error=DEEPSEEK_V4_EXPERT_MISSING_ERROR,
+            )
+
+        first = load_stage(0)
+        stacked = stack_layers(
+            (StackGroup(id="dspark", members=None, layer_ids=tuple(range(stages))),),
+            first,
+            layer_ids=range(stages),
+            pack_into=lambda stage, destinations: load_stage(stage, destinations),
+            template_layer_id=0,
+            policy=StagingPolicy(workers=1),
+        )
+        stacked["ffn_norm_w"] = stacked.pop("norm_w")
+
+        final_prefix = f"mtp.{stages - 1}"
+        head_sources = {
+            "main_proj_weight": ("mtp.0.main_proj.weight", torch.bfloat16),
+            "main_norm_weight": ("mtp.0.main_norm.weight", torch.bfloat16),
+            "final_norm_weight": (f"{final_prefix}.norm.weight", torch.bfloat16),
+            "hc_head_fn": (f"{final_prefix}.hc_head_fn", torch.float32),
+            "hc_head_scale": (f"{final_prefix}.hc_head_scale", torch.float32),
+            "hc_head_base": (f"{final_prefix}.hc_head_base", torch.float32),
+            "markov_w1": (
+                f"{final_prefix}.markov_head.markov_w1.weight",
+                torch.bfloat16,
+            ),
+            "markov_w2": (
+                f"{final_prefix}.markov_head.markov_w2.weight",
+                torch.bfloat16,
+            ),
+            "confidence_head_weight": (
+                f"{final_prefix}.confidence_head.weight",
+                torch.float32,
+            ),
+        }
+        raw_heads = self.load_many(source for source, _ in head_sources.values())
+        heads = {
+            output: replicate.apply(
+                output,
+                raw_heads[source],
+                dtype=dtype,
+                destination=None,
+            )
+            for output, (source, dtype) in head_sources.items()
+        }
+        return DeepSeekV4DSparkWeights(tensors={**stacked, **heads})
+
 
 def pack_deepseek_v4_layer_weights(
     layer_id: int,
@@ -1052,6 +1230,7 @@ def pack_deepseek_v4_layer_weights(
     include_gate_bias: bool,
     destinations: Mapping[str, torch.Tensor] | None = None,
     prefix: str | None = None,
+    o_projection_tp_size: int | None = None,
 ) -> DeepSeekV4PackedLayerWeights:
     """Pack raw checkpoint tensors into new buffers or final-layout destinations.
 
@@ -1075,6 +1254,7 @@ def pack_deepseek_v4_layer_weights(
         DEEPSEEK_V4_SOURCE_MISSING_ERROR,
         deepseek_v4_expert_parallel,
         deepseek_v4_factories,
+        deepseek_v4_o_projection_tp_policies,
         deepseek_v4_replicate,
     )
 
@@ -1092,6 +1272,11 @@ def pack_deepseek_v4_layer_weights(
         raw,
         context,
         policy=deepseek_v4_replicate(int(ranks)),
+        policies=(
+            deepseek_v4_o_projection_tp_policies(int(ranks), int(o_projection_tp_size))
+            if o_projection_tp_size is not None
+            else None
+        ),
         expert_policy=deepseek_v4_expert_parallel(int(ranks), int(n_routed_experts)),
         factories=deepseek_v4_factories(),
         destinations=destinations,
@@ -1099,5 +1284,3 @@ def pack_deepseek_v4_layer_weights(
         missing_expert_error=DEEPSEEK_V4_EXPERT_MISSING_ERROR,
     )
     return DeepSeekV4PackedLayerWeights(layer_id=layer_id, tensors=tensors)
-
-

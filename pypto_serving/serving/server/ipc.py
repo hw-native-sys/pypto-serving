@@ -51,6 +51,7 @@ class NewRequestData(msgspec.Struct):
     temperature: float
     top_p: float
     top_k: int | None
+    seed: int | None = None
 
 
 class PrefillRequest(msgspec.Struct):

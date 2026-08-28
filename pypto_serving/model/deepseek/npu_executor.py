@@ -24,6 +24,7 @@ from pypto_serving.model.common.executor.pypto_executor import PyptoExecutor as 
 from pypto_serving.model.common.executor.utils import build_pypto_run_config
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.model.deepseek.npu_runner import (
+    DEEPSEEK_V4_DSPARK_TP_SIZE,
     DEEPSEEK_V4_FWD_NUM_LAYERS,
     DEEPSEEK_V4_LM_HEAD_TP_SIZE,
     DeepSeekV4CacheLayout,
@@ -32,6 +33,7 @@ from pypto_serving.model.deepseek.npu_runner import (
     DeepSeekV4ModelRunner,
     build_deepseek_v4_layer_plan,
     deepseek_v4_decode_layout,
+    deepseek_v4_dspark_decode_layout,
 )
 from pypto_serving.model.deepseek.weight_loader import (
     DeepSeekV4StackedLayerWeights,
@@ -39,7 +41,12 @@ from pypto_serving.model.deepseek.weight_loader import (
 )
 from pypto_serving.tools.profile import profile_span
 
-_DEEPSEEK_V4_KERNEL_DIRNAME = "deepseek_v4_flash_mtp"
+_DEEPSEEK_V4_KERNEL_DIRNAMES = {
+    None: "deepseek_v4_flash_mtp",
+    "mtp": "deepseek_v4_flash_mtp",
+    "dspark": "deepseek_v4_flash_dspark",
+}
+_DEEPSEEK_V4_KERNEL_DIRNAME_SET = frozenset(_DEEPSEEK_V4_KERNEL_DIRNAMES.values())
 _DEEPSEEK_V4_IMPORT_MODULES = (
     "config",
     "moe",
@@ -62,6 +69,11 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
     "decode_sparse_attn_csa",
     "decode_sparse_attn_hca",
     "decode_sparse_attn_swa",
+    "dspark_attention",
+    "dspark_drafter",
+    "dspark_layer",
+    "dspark_markov",
+    "dspark_proj",
     "dispatch",
     "expert_routed",
     "expert_shared",
@@ -79,17 +91,28 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
     "prefill_sparse_attn",
     "qkv_proj_rope",
     "rmsnorm",
+    "sample",
     "utils",
 )
 
 
-def _find_pypto_lib_deepseek_v4_dir(pypto_lib_root: str | None = None) -> Path:
+def _find_pypto_lib_deepseek_v4_dir(
+    pypto_lib_root: str | None = None,
+    *,
+    speculative_method: str | None = None,
+) -> Path:
     """Find the DeepSeekV4 kernel directory."""
+    try:
+        kernel_dirname = _DEEPSEEK_V4_KERNEL_DIRNAMES[speculative_method]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported DeepSeekV4 speculative method: {speculative_method!r}"
+        ) from exc
     if pypto_lib_root is None:
         pypto_lib_root = os.environ.get("PYPTO_LIB_ROOT")
     if pypto_lib_root:
         root = Path(pypto_lib_root)
-        candidate = root / "models" / _DEEPSEEK_V4_KERNEL_DIRNAME
+        candidate = root / "models" / kernel_dirname
         if candidate.is_dir():
             return candidate
         raise FileNotFoundError(f"DeepSeekV4 kernel directory not found under PYPTO_LIB_ROOT={pypto_lib_root!r}")
@@ -97,7 +120,7 @@ def _find_pypto_lib_deepseek_v4_dir(pypto_lib_root: str | None = None) -> Path:
     start_dir = Path(__file__).resolve().parent
     for directory in (start_dir, *start_dir.parents):
         pypto_lib_dir = directory / "pypto-lib"
-        candidate = pypto_lib_dir / "models" / _DEEPSEEK_V4_KERNEL_DIRNAME
+        candidate = pypto_lib_dir / "models" / kernel_dirname
         if candidate.is_dir():
             return candidate
 
@@ -108,14 +131,13 @@ def _find_pypto_lib_deepseek_v4_dir(pypto_lib_root: str | None = None) -> Path:
 
 
 def _is_deepseek_v4_module_file(path: Path, kernel_dir: Path) -> bool:
-    """Return whether ``path`` is one of the top-level DeepSeekV4 kernel modules."""
+    """Return whether ``path`` belongs to either DeepSeekV4 kernel variant."""
     resolved = path.resolve()
     if resolved.is_relative_to(kernel_dir):
         return True
-    parts = resolved.parts
-    return len(parts) >= 3 and parts[-3:-1] == (
-        "models",
-        _DEEPSEEK_V4_KERNEL_DIRNAME,
+    return (
+        resolved.parent.name in _DEEPSEEK_V4_KERNEL_DIRNAME_SET
+        and resolved.parent.parent.name == "models"
     )
 
 
@@ -181,6 +203,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         use_compile_cache: bool = False,
         compile_kernels: bool = False,
         num_speculative_tokens: int = 0,
+        speculative_method: str | None = None,
     ) -> None:
         worker_device_ids = tuple(device_ids) if device_ids is not None else (int(device_id),)
         super().__init__(
@@ -190,11 +213,22 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             pypto_build_dir=pypto_build_dir,
             use_compile_cache=use_compile_cache,
         )
-        self._kernel_dir = _find_pypto_lib_deepseek_v4_dir()
         self._compile_kernels = bool(compile_kernels)
         self._num_speculative_tokens = int(num_speculative_tokens)
         if self._num_speculative_tokens < 0:
             raise ValueError("num_speculative_tokens must be non-negative")
+        if speculative_method not in (None, "mtp", "dspark"):
+            raise ValueError(
+                f"unsupported DeepSeekV4 speculative method: {speculative_method!r}"
+            )
+        if speculative_method == "dspark" and self._num_speculative_tokens != 7:
+            raise ValueError("DeepSeekV4 DSpark requires exactly seven speculative tokens")
+        if speculative_method in (None, "mtp") and self._num_speculative_tokens > 0:
+            speculative_method = "mtp"
+        self._speculative_method = speculative_method
+        self._kernel_dir = _find_pypto_lib_deepseek_v4_dir(
+            speculative_method=self._speculative_method
+        )
         self._embedding_cache: dict[str, torch.Tensor] = {}
         # Shared JIT-compile core; DeepSeek wraps each compile in a per-kernel
         # profile span (see _compile_l3_callable). With ``use_compile_cache`` the
@@ -217,8 +251,13 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
 
     @property
     def supports_device_sampling(self) -> bool:
-        """Enable executor-provided greedy token acceptance for MTP only."""
-        return self._num_speculative_tokens > 0
+        """Use sampled IDs emitted by the integrated decode sampler."""
+        return True
+
+    @property
+    def supports_device_stochastic_sampling(self) -> bool:
+        """Use temperature/top-k sampling for AR and fused K=1 decode."""
+        return self._num_speculative_tokens <= 1
 
     @property
     def supports_device_decode_embedding(self) -> bool:
@@ -294,7 +333,11 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         # Autoregressive decode keeps the established eight-token tile. MTP uses
         # a 16-token specialization and the smallest power-of-two request-local
         # sequence that can cover one target-verification chunk.
-        layout = deepseek_v4_decode_layout(self._num_speculative_tokens)
+        layout = (
+            deepseek_v4_dspark_decode_layout()
+            if self._speculative_method == "dspark"
+            else deepseek_v4_decode_layout(self._num_speculative_tokens)
+        )
         layout.validate_runtime(model.config, model.runtime, self._device_ids)
         compress_ratios = tuple(int(ratio) for ratio in metadata["compress_ratios"])
         if len(compress_ratios) != model.config.num_hidden_layers + 1:
@@ -315,12 +358,16 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             compress_ratios=compress_ratios,
             num_hash_layers=num_hash_layers,
         )
-        if self._num_speculative_tokens:
+        if self._speculative_method == "dspark":
+            weight_store.validate_dspark_startup_contract(
+                n_routed_experts=n_routed_experts,
+            )
+        elif self._num_speculative_tokens:
             weight_store.validate_mtp_startup_contract(n_routed_experts=n_routed_experts)
 
         layer_compress_ratios = tuple(layer.compress_ratio for layer in layer_plan)
         prepacked_layer_weights: DeepSeekV4StackedLayerWeights | None = None
-        if self._compile_kernels:
+        if self._compile_kernels and self._speculative_method != "dspark":
             prepacked_layer_weights = weight_store.load_prepacked_stacked_layer_weights(
                 ranks=layout.ranks,
                 n_routed_experts=n_routed_experts,
@@ -332,6 +379,8 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         decode = None
         mtp_decode = None
         mtp_prefill = None
+        dspark_drafter = None
+        dspark_markov = None
         freqs_cos = freqs_sin = None
         if self._compile_kernels:
             modules = self._load_kernel_modules(layout)
@@ -340,7 +389,10 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 modules["prefill_fwd"].l3_prefill_fwd,
                 layout=layout,
             )
-            use_fused_mtp = self._num_speculative_tokens == 1
+            use_fused_mtp = (
+                self._speculative_method != "dspark"
+                and self._num_speculative_tokens == 1
+            )
             decode = self._compile_l3_callable(
                 "deepseek_v4_decode_mtp_fused" if use_fused_mtp else "deepseek_v4_decode",
                 (
@@ -353,7 +405,18 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                     frozenset({"mtp_num_tokens"}) if use_fused_mtp else None
                 ),
             )
-            if self._num_speculative_tokens:
+            if self._speculative_method == "dspark":
+                dspark_drafter = self._compile_l3_callable(
+                    "deepseek_v4_dspark_drafter",
+                    modules["dspark_drafter"].l3_dspark_drafter,
+                    layout=layout,
+                )
+                dspark_markov = self._compile_l3_callable(
+                    "deepseek_v4_dspark_markov",
+                    modules["dspark_markov"].l3_distributed_markov_sample,
+                    layout=layout,
+                )
+            elif self._num_speculative_tokens:
                 mtp_prefill = self._compile_l3_callable(
                     "deepseek_v4_mtp_prefill",
                     modules["prefill_mtp"].l3_mtp_prefill_fwd,
@@ -386,6 +449,8 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             decode=decode,
             mtp_prefill=mtp_prefill,
             mtp_decode=mtp_decode,
+            dspark_drafter=dspark_drafter,
+            dspark_markov=dspark_markov,
             freqs_cos=freqs_cos,
             freqs_sin=freqs_sin,
             platform=self._platform,
@@ -394,6 +459,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             n_routed_experts=n_routed_experts,
             num_hash_layers=num_hash_layers,
             num_speculative_tokens=self._num_speculative_tokens,
+            speculative_method=self._speculative_method,
         )
 
     def _load_kernel_modules(self, layout: DeepSeekV4CacheLayout) -> dict[str, object]:
@@ -411,7 +477,11 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         ):
             prefill_layer = importlib.import_module("prefill_layer")
             prefill_fwd = importlib.import_module("prefill_fwd")
-            prefill_mtp = importlib.import_module("prefill_mtp")
+            prefill_mtp = (
+                None
+                if self._speculative_method == "dspark"
+                else importlib.import_module("prefill_mtp")
+            )
         with _deepseek_v4_import_context(
             self._kernel_dir,
             pypto_lib_root=pypto_lib_root,
@@ -424,15 +494,29 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             # the deployment preset before importing any decode program while
             # specializing T with the selected layout while preserving physical
             # cache capacities.
-            config.DECODE_BATCH = layout.decode_batch
+            config.DECODE_BATCH = (
+                layout.decode_batch * DEEPSEEK_V4_DSPARK_TP_SIZE
+                if self._speculative_method == "dspark"
+                else layout.decode_batch
+            )
             config.DECODE_SEQ = layout.decode_seq
-            config.DECODE_TOKENS = layout.decode_tokens
+            config.DECODE_TOKENS = (
+                config.DECODE_BATCH * config.DECODE_SEQ
+                if self._speculative_method == "dspark"
+                else layout.decode_tokens
+            )
             config.MOE_TOKENS = layout.decode_tokens
-            config.DECODE_RECV_MAX = ranks * layout.decode_tokens
+            config.DECODE_RECV_MAX = (
+                config.DP * config.DECODE_TOKENS
+                if self._speculative_method == "dspark"
+                else ranks * layout.decode_tokens
+            )
             config.RECV_MAX = config.DECODE_RECV_MAX
             modules = {"config": config}
             decode_module_names = ["decode_layer", "decode_fwd", "lm_head", "utils"]
-            if self._num_speculative_tokens:
+            if self._speculative_method == "dspark":
+                decode_module_names.extend(("dspark_drafter", "dspark_markov"))
+            elif self._num_speculative_tokens:
                 decode_module_names.append("decode_mtp")
             if self._num_speculative_tokens == 1:
                 decode_module_names.append("decode_fwd_mtp")
@@ -444,7 +528,8 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             )
         modules["prefill_layer"] = prefill_layer
         modules["prefill_fwd"] = prefill_fwd
-        modules["prefill_mtp"] = prefill_mtp
+        if prefill_mtp is not None:
+            modules["prefill_mtp"] = prefill_mtp
         return modules
 
     def _compile_l3_callable(

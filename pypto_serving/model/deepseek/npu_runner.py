@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import zlib
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -34,6 +35,7 @@ from pypto_serving.config.types import (
     PrefillResult,
     RuntimeConfig,
     RuntimeModel,
+    SamplingParams,
 )
 from pypto_serving.model.common.runner.buffer_set import (
     copy_shared,
@@ -43,6 +45,7 @@ from pypto_serving.model.common.runner.buffer_set import (
 from pypto_serving.model.common.runner.l3_dispatch import L3DispatchMixin, PendingL3Dispatch
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.model.deepseek.weight_loader import (
+    DeepSeekV4DSparkWeights,
     DeepSeekV4GlobalWeights,
     DeepSeekV4MtpWeights,
     DeepSeekV4StackedLayerWeights,
@@ -108,6 +111,25 @@ DEEPSEEK_V4_HCA_NUM_LAYERS = 20
 DEEPSEEK_V4_LM_HEAD_TP_SIZE = 4
 DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS = 8
 DEEPSEEK_V4_SAMPLED_IDS_PAD = 8
+DEEPSEEK_V4_DSPARK_RANKS = 16
+DEEPSEEK_V4_DSPARK_TP_SIZE = 4
+DEEPSEEK_V4_DSPARK_BLOCK_SIZE = 32
+DEEPSEEK_V4_DSPARK_DECODE_BATCH_PER_RANK = 16
+DEEPSEEK_V4_DSPARK_DECODE_SEQ = 8
+DEEPSEEK_V4_DSPARK_DECODE_TOKENS_PER_RANK = (
+    DEEPSEEK_V4_DSPARK_DECODE_BATCH_PER_RANK * DEEPSEEK_V4_DSPARK_DECODE_SEQ
+)
+DEEPSEEK_V4_DSPARK_MAX_SEQ_LEN = 16_384
+DEEPSEEK_V4_DSPARK_PREFILL_LOCAL_TOKENS = 2048
+DEEPSEEK_V4_DSPARK_PREFILL_GROUP_TOKENS = (
+    DEEPSEEK_V4_DSPARK_TP_SIZE * DEEPSEEK_V4_DSPARK_PREFILL_LOCAL_TOKENS
+)
+DEEPSEEK_V4_DSPARK_PREFILL_WAVE_TOKENS = 128
+DEEPSEEK_V4_DSPARK_TARGET_HIDDEN_MULT = 3
+DEEPSEEK_V4_DSPARK_DRAFT_LAYERS = 3
+DEEPSEEK_V4_DSPARK_O_PROJ_GROUPS = 8
+DEEPSEEK_V4_DSPARK_O_PROJ_RANK = 1024
+DEEPSEEK_V4_DSPARK_O_PROJ_GROUP_INPUT = 4096
 
 
 def build_deepseek_v4_cache_group_specs(
@@ -117,6 +139,7 @@ def build_deepseek_v4_cache_group_specs(
     decode_batch: int = DEEPSEEK_V4_DECODE_TOKENS,
     enable_mtp: bool = False,
     max_seq_len: int = DEEPSEEK_V4_MAX_SEQ_LEN,
+    layout: DeepSeekV4CacheLayout | None = None,
 ) -> tuple[KVCacheGroupSpec, ...]:
     """Describe cache namespaces independently from their runtime pool sizes.
 
@@ -134,16 +157,69 @@ def build_deepseek_v4_cache_group_specs(
     max_seq_len = int(max_seq_len)
     if max_seq_len <= 0:
         raise ValueError("max_seq_len must be positive")
+    block_size = DEEPSEEK_V4_BLOCK_SIZE if layout is None else int(layout.block_size)
+    num_partitions = DEEPSEEK_V4_RANKS if layout is None else int(layout.cache_partitions)
+    sliding_window = DEEPSEEK_V4_SLIDING_WINDOW if layout is None else int(layout.sliding_window)
+    ori_table_max_blocks = (
+        DEEPSEEK_V4_DECODE_ORI_MAX_BLOCKS
+        if layout is None
+        else int(layout.decode_ori_max_blocks)
+    )
+    cmp_table_max_blocks = DEEPSEEK_V4_CMP_MAX_BLOCKS if layout is None else int(layout.cmp_max_blocks)
+    idx_table_max_blocks = DEEPSEEK_V4_IDX_MAX_BLOCKS if layout is None else int(layout.idx_max_blocks)
+    hca_state_table_max_blocks = (
+        DEEPSEEK_V4_HCA_STATE_MAX_BLOCKS
+        if layout is None
+        else int(layout.hca_state_max_blocks)
+    )
+    prefill_csa_state_table_max_blocks = (
+        DEEPSEEK_V4_PREFILL_CSA_STATE_MAX_BLOCKS
+        if layout is None
+        else int(layout.prefill_csa_state_max_blocks)
+    )
+    prefill_csa_inner_state_table_max_blocks = (
+        DEEPSEEK_V4_PREFILL_CSA_INNER_STATE_MAX_BLOCKS
+        if layout is None
+        else int(layout.prefill_csa_inner_state_max_blocks)
+    )
+    c128_state_block_size = (
+        DEEPSEEK_V4_C128_STATE_BLOCK_SIZE
+        if layout is None
+        else int(layout.c128_state_block_size)
+    )
+    c4_state_block_size = (
+        DEEPSEEK_V4_C4_STATE_BLOCK_SIZE
+        if layout is None
+        else int(layout.c4_state_block_size)
+    )
+    compressed_output_pages = bool(
+        layout is not None and layout.compressed_cache_uses_output_pages
+    )
+    max_in_flight_tokens = (
+        DEEPSEEK_V4_MAX_IN_FLIGHT_PREFILL_TOKENS
+        if layout is None
+        else int(layout.max_in_flight_prefill_tokens)
+    )
     all_layers = tuple(range(int(num_hidden_layers)))
     ori_layers = all_layers + ((int(num_hidden_layers),) if enable_mtp else ())
     ratios = tuple(int(ratio) for ratio in (compress_ratios or ()))[:num_hidden_layers]
     csa_layers = tuple(index for index, ratio in enumerate(ratios) if ratio == 4) or all_layers
     hca_layers = tuple(index for index, ratio in enumerate(ratios) if ratio == 128) or all_layers
-    full_history_blocks = math.ceil(max_seq_len / DEEPSEEK_V4_BLOCK_SIZE)
-    if full_history_blocks > min(DEEPSEEK_V4_CMP_MAX_BLOCKS, DEEPSEEK_V4_IDX_MAX_BLOCKS):
+    cmp_history_blocks = math.ceil(
+        max_seq_len / (block_size * (4 if compressed_output_pages else 1))
+    )
+    hca_history_blocks = math.ceil(
+        max_seq_len / (block_size * (128 if compressed_output_pages else 1))
+    )
+    if cmp_history_blocks > min(cmp_table_max_blocks, idx_table_max_blocks):
         raise ValueError(
-            f"DeepSeekV4 max_seq_len={max_seq_len} needs {full_history_blocks} source-token "
-            f"blocks, but the compiled block tables support {DEEPSEEK_V4_CMP_MAX_BLOCKS}"
+            f"DeepSeekV4 max_seq_len={max_seq_len} needs {cmp_history_blocks} source-token "
+            f"blocks, but the compiled block tables support {cmp_table_max_blocks}"
+        )
+    if hca_history_blocks > cmp_table_max_blocks:
+        raise ValueError(
+            f"DeepSeekV4 max_seq_len={max_seq_len} needs {hca_history_blocks} HCA compressed "
+            f"blocks, but the compiled block tables support {cmp_table_max_blocks}"
         )
 
     # SWA can start at an arbitrary offset inside a source-token block, so it
@@ -152,33 +228,37 @@ def build_deepseek_v4_cache_group_specs(
     ori_blocks_per_request = (
         math.ceil(
             (
-                DEEPSEEK_V4_SLIDING_WINDOW
+                sliding_window
                 - 1
-                + DEEPSEEK_V4_MAX_IN_FLIGHT_PREFILL_TOKENS
+                + max_in_flight_tokens
             )
-            / DEEPSEEK_V4_BLOCK_SIZE
+            / block_size
         )
         + 1
     )
     hca_state_blocks_per_request = math.ceil(
         (
-            DEEPSEEK_V4_SLIDING_WINDOW
-            + DEEPSEEK_V4_MAX_IN_FLIGHT_PREFILL_TOKENS
+            sliding_window
+            + max_in_flight_tokens
         )
-        / DEEPSEEK_V4_C128_STATE_BLOCK_SIZE
+        / c128_state_block_size
     )
     csa_state_blocks_per_request = math.ceil(
-        (4 + DEEPSEEK_V4_MAX_IN_FLIGHT_PREFILL_TOKENS)
-        / DEEPSEEK_V4_C4_STATE_BLOCK_SIZE
+        (4 + max_in_flight_tokens)
+        / c4_state_block_size
     )
     rolling_capacities = (
-        ("ori", ori_blocks_per_request, DEEPSEEK_V4_DECODE_ORI_MAX_BLOCKS),
-        ("hca_state", hca_state_blocks_per_request, DEEPSEEK_V4_HCA_STATE_MAX_BLOCKS),
-        ("csa_state", csa_state_blocks_per_request, DEEPSEEK_V4_CSA_STATE_MAX_BLOCKS),
+        ("ori", ori_blocks_per_request, ori_table_max_blocks),
+        ("hca_state", hca_state_blocks_per_request, hca_state_table_max_blocks),
+        (
+            "csa_state",
+            csa_state_blocks_per_request,
+            prefill_csa_state_table_max_blocks,
+        ),
         (
             "csa_inner_state",
             csa_state_blocks_per_request,
-            DEEPSEEK_V4_CSA_INNER_STATE_MAX_BLOCKS,
+            prefill_csa_inner_state_table_max_blocks,
         ),
     )
     for name, required, compiled_limit in rolling_capacities:
@@ -212,12 +292,21 @@ def build_deepseek_v4_cache_group_specs(
             if max_blocks_per_seq is not None
             else max(1, max_blocks // decode_batch)
         )
-        storage_rows = block_size // compress_ratio
+        storage_rows = (
+            block_size
+            if compressed_output_pages and compress_ratio > 1
+            else block_size // compress_ratio
+        )
+        source_block_size = (
+            block_size * compress_ratio
+            if compressed_output_pages and compress_ratio > 1
+            else block_size
+        )
         return KVCacheGroupSpec(
             name=name,
             layer_indices=layers,
             spec=KVCacheSpec(
-                block_size=block_size,
+                block_size=source_block_size,
                 # One scheduler-visible block owns a page in every layer of
                 # this cache family. Keep the complete physical footprint here
                 # so all heterogeneous pools share one accurate HBM budget.
@@ -231,7 +320,7 @@ def build_deepseek_v4_cache_group_specs(
             # Each request may address this many pages through its logical ring;
             # physical capacity across concurrent requests is runtime-sized.
             max_blocks_per_seq=blocks_per_request,
-            num_partitions=DEEPSEEK_V4_RANKS,
+            num_partitions=num_partitions,
             sliding_window=sliding_window,
             is_eagle_group=is_eagle_group,
         )
@@ -240,73 +329,73 @@ def build_deepseek_v4_cache_group_specs(
         group(
             "ori",
             ori_layers,
-            block_size=DEEPSEEK_V4_BLOCK_SIZE,
+            block_size=block_size,
             element_bytes=2,
             row_width=DEEPSEEK_V4_HEAD_DIM,
-            max_blocks=DEEPSEEK_V4_DECODE_ORI_MAX_BLOCKS,
+            max_blocks=ori_table_max_blocks,
             max_blocks_per_seq=ori_blocks_per_request,
-            sliding_window=DEEPSEEK_V4_SLIDING_WINDOW,
+            sliding_window=sliding_window,
             is_eagle_group=enable_mtp,
         ),
         group(
             "cmp_c128",
             hca_layers,
-            block_size=DEEPSEEK_V4_BLOCK_SIZE,
+            block_size=block_size,
             element_bytes=2,
             row_width=DEEPSEEK_V4_HEAD_DIM,
-            max_blocks=DEEPSEEK_V4_CMP_MAX_BLOCKS,
+            max_blocks=cmp_table_max_blocks,
             compress_ratio=128,
-            max_blocks_per_seq=full_history_blocks,
+            max_blocks_per_seq=hca_history_blocks,
         ),
         group(
             "cmp_c4",
             csa_layers,
-            block_size=DEEPSEEK_V4_BLOCK_SIZE,
+            block_size=block_size,
             element_bytes=2,
             row_width=DEEPSEEK_V4_HEAD_DIM,
-            max_blocks=DEEPSEEK_V4_CMP_MAX_BLOCKS,
+            max_blocks=cmp_table_max_blocks,
             compress_ratio=4,
-            max_blocks_per_seq=full_history_blocks,
+            max_blocks_per_seq=cmp_history_blocks,
         ),
         group(
             "idx",
             csa_layers,
-            block_size=DEEPSEEK_V4_BLOCK_SIZE,
+            block_size=block_size,
             element_bytes=1,
             row_width=DEEPSEEK_V4_IDX_HEAD_DIM,
-            max_blocks=DEEPSEEK_V4_IDX_MAX_BLOCKS,
+            max_blocks=idx_table_max_blocks,
             compress_ratio=4,
-            max_blocks_per_seq=full_history_blocks,
+            max_blocks_per_seq=cmp_history_blocks,
             # One float32 scale accompanies every int8 index-cache row.
             extra_row_bytes=4,
         ),
         group(
             "hca_state",
             hca_layers,
-            block_size=DEEPSEEK_V4_C128_STATE_BLOCK_SIZE,
+            block_size=c128_state_block_size,
             element_bytes=4,
             row_width=DEEPSEEK_V4_HCA_STATE_DIM,
-            max_blocks=DEEPSEEK_V4_HCA_STATE_MAX_BLOCKS,
+            max_blocks=hca_state_table_max_blocks,
             max_blocks_per_seq=hca_state_blocks_per_request,
-            sliding_window=DEEPSEEK_V4_SLIDING_WINDOW,
+            sliding_window=sliding_window,
         ),
         group(
             "csa_state",
             csa_layers,
-            block_size=DEEPSEEK_V4_C4_STATE_BLOCK_SIZE,
+            block_size=c4_state_block_size,
             element_bytes=4,
             row_width=DEEPSEEK_V4_CSA_STATE_DIM,
-            max_blocks=DEEPSEEK_V4_CSA_STATE_MAX_BLOCKS,
+            max_blocks=prefill_csa_state_table_max_blocks,
             max_blocks_per_seq=csa_state_blocks_per_request,
             sliding_window=4,
         ),
         group(
             "csa_inner_state",
             csa_layers,
-            block_size=DEEPSEEK_V4_C4_STATE_BLOCK_SIZE,
+            block_size=c4_state_block_size,
             element_bytes=4,
             row_width=DEEPSEEK_V4_CSA_INNER_STATE_DIM,
-            max_blocks=DEEPSEEK_V4_CSA_INNER_STATE_MAX_BLOCKS,
+            max_blocks=prefill_csa_inner_state_table_max_blocks,
             max_blocks_per_seq=csa_state_blocks_per_request,
             sliding_window=4,
         ),
@@ -361,11 +450,16 @@ def deepseek_v4_physical_cache_blocks(
 
 
 _MTP_DEVICE_STATE_TOKEN_WIDTH = 2
-_MTP_DEVICE_STATE_META_WIDTH = 4
+_MTP_DEVICE_STATE_META_WIDTH = 7
 _MTP_STATE_VALID = 0
 _MTP_STATE_GENERATION = 1
 _MTP_STATE_TAIL_POSITION = 2
 _MTP_STATE_COMMITTED_COUNT = 3
+_MTP_STATE_TEMPERATURE_MICROS = 4
+_MTP_STATE_TOP_K = 5
+_MTP_STATE_SEED = 6
+_MTP_TEMPERATURE_SCALE = 1_000_000
+_MTP_MAX_TEMPERATURE_MICROS = 2_147_483_647
 
 
 @dataclass(frozen=True)
@@ -378,6 +472,7 @@ class DeepSeekV4CacheLayout:
     """
 
     ranks: int = DEEPSEEK_V4_RANKS
+    cache_partitions: int = DEEPSEEK_V4_RANKS
     hc_mult: int = DEEPSEEK_V4_HC_MULT
     block_size: int = DEEPSEEK_V4_BLOCK_SIZE
     decode_batch: int = DEEPSEEK_V4_DECODE_BATCH
@@ -401,6 +496,9 @@ class DeepSeekV4CacheLayout:
     prefill_hca_state_max_blocks: int = DEEPSEEK_V4_PREFILL_HCA_STATE_MAX_BLOCKS
     prefill_csa_state_max_blocks: int = DEEPSEEK_V4_PREFILL_CSA_STATE_MAX_BLOCKS
     prefill_csa_inner_state_max_blocks: int = DEEPSEEK_V4_PREFILL_CSA_INNER_STATE_MAX_BLOCKS
+    max_seq_len: int = DEEPSEEK_V4_MAX_SEQ_LEN
+    max_in_flight_prefill_tokens: int = DEEPSEEK_V4_MAX_IN_FLIGHT_PREFILL_TOKENS
+    compressed_cache_uses_output_pages: bool = False
 
     def validate_runtime(self, config: ModelConfig, runtime: RuntimeConfig, device_ids: Sequence[int]) -> None:
         """Validate serving/runtime options against kernel-fixed dimensions."""
@@ -415,12 +513,10 @@ class DeepSeekV4CacheLayout:
                 f"({self.decode_batch} per rank x {self.ranks} ranks), "
                 f"got max_batch_size={runtime.max_batch_size}"
             )
-        decode_state_capacity = self.prefill_csa_state_max_blocks * self.c4_state_block_size
-        if runtime.max_seq_len > decode_state_capacity:
+        if runtime.max_seq_len > self.max_seq_len:
             raise ValueError(
-                "DeepSeekV4 pypto-lib decode CSA state tables currently support at most "
-                f"max_seq_len={decode_state_capacity}, got {runtime.max_seq_len}. "
-                "Increase the decode CSA state table depth in pypto-lib before serving longer contexts."
+                "DeepSeekV4 kernel metadata currently supports at most "
+                f"max_seq_len={self.max_seq_len}, got {runtime.max_seq_len}."
             )
         if self.decode_tokens != self.decode_batch * self.decode_seq:
             raise ValueError("DeepSeekV4 layout decode_tokens must equal decode_batch * decode_seq")
@@ -473,6 +569,42 @@ def deepseek_v4_decode_layout(num_speculative_tokens: int) -> DeepSeekV4CacheLay
         decode_batch=decode_tokens // decode_seq,
         decode_seq=decode_seq,
         decode_tokens=decode_tokens,
+    )
+
+
+def deepseek_v4_dspark_decode_layout() -> DeepSeekV4CacheLayout:
+    """Return the DP4 x TP4 DSpark target-model layout.
+
+    The 64-request batch of each DP group is split into 16 request owners on
+    each TP rank. Each local request verifies one sampled token plus seven
+    drafts, producing 128 token rows per physical rank.
+    """
+    return DeepSeekV4CacheLayout(
+        ranks=DEEPSEEK_V4_DSPARK_RANKS,
+        cache_partitions=DEEPSEEK_V4_DSPARK_RANKS // DEEPSEEK_V4_DSPARK_TP_SIZE,
+        block_size=DEEPSEEK_V4_DSPARK_BLOCK_SIZE,
+        decode_batch=DEEPSEEK_V4_DSPARK_DECODE_BATCH_PER_RANK,
+        decode_seq=DEEPSEEK_V4_DSPARK_DECODE_SEQ,
+        decode_tokens=DEEPSEEK_V4_DSPARK_DECODE_TOKENS_PER_RANK,
+        prefill_seq=DEEPSEEK_V4_DSPARK_PREFILL_LOCAL_TOKENS,
+        prefill_ori_max_blocks=512,
+        decode_ori_max_blocks=32_768,
+        ori_table_max_blocks=32_768,
+        cmp_max_blocks=8192,
+        idx_max_blocks=8192,
+        hca_state_max_blocks=131_072,
+        csa_state_max_blocks=4,
+        csa_inner_state_max_blocks=4,
+        c128_state_block_size=8,
+        c4_state_block_size=2,
+        prefill_cmp_max_blocks=128,
+        prefill_idx_max_blocks=128,
+        prefill_hca_state_max_blocks=2048,
+        prefill_csa_state_max_blocks=8192,
+        prefill_csa_inner_state_max_blocks=8192,
+        max_seq_len=DEEPSEEK_V4_DSPARK_MAX_SEQ_LEN,
+        max_in_flight_prefill_tokens=2 * DEEPSEEK_V4_DSPARK_PREFILL_LOCAL_TOKENS,
+        compressed_cache_uses_output_pages=True,
     )
 
 
@@ -638,6 +770,7 @@ class DeepSeekV4CacheMetadataBuilder:
         *,
         block_size: int,
         compress_ratio: int,
+        output_page_storage: bool = False,
     ) -> torch.Tensor:
         """Map compression-boundary positions through physical cache blocks."""
         if block_size <= 0 or compress_ratio <= 0:
@@ -653,19 +786,24 @@ class DeepSeekV4CacheMetadataBuilder:
                 position = int(position)
                 if (position + 1) % compress_ratio != 0:
                     continue
-                source_block, source_offset = divmod(position, block_size)
-                offset = source_offset // compress_ratio
                 if not block_ids:
                     raise ValueError(f"compressed slot-mapping row {row} has no allocated blocks")
-                if source_block >= len(block_ids):
+                if output_page_storage:
+                    cache_col = position // compress_ratio
+                    logical_block, offset = divmod(cache_col, block_size)
+                    storage_block_size = block_size
+                else:
+                    logical_block, source_offset = divmod(position, block_size)
+                    offset = source_offset // compress_ratio
+                    storage_block_size = block_size // compress_ratio
+                if logical_block >= len(block_ids):
                     raise ValueError(
                         f"compressed slot-mapping row {row} position {position} requires "
-                        f"source block {source_block}, but only {len(block_ids)} blocks "
+                        f"source block {logical_block}, but only {len(block_ids)} blocks "
                         "are allocated"
                     )
-                storage_block_size = block_size // compress_ratio
                 mapping[row, col] = (
-                    int(block_ids[source_block]) * storage_block_size + offset
+                    int(block_ids[logical_block]) * storage_block_size + offset
                 )
         return mapping
 
@@ -682,6 +820,41 @@ class DeepSeekV4CacheMetadataBuilder:
             positions,
             block_size=state_block_size,
         )
+
+    @staticmethod
+    def recurrent_state_block_table_from_ids(
+        per_request_block_ids: Sequence[Sequence[int]],
+        first_positions: Sequence[int],
+        *,
+        state_block_size: int,
+        max_blocks: int,
+    ) -> torch.Tensor:
+        """Map the recurrent window before each decode chunk into its ring ABI."""
+        if state_block_size <= 0 or max_blocks <= 0:
+            raise ValueError("state_block_size and max_blocks must be positive")
+        if len(per_request_block_ids) != len(first_positions):
+            raise ValueError("block IDs and first positions must have the same row count")
+        table = torch.full(
+            (len(per_request_block_ids), max_blocks),
+            -1,
+            dtype=torch.int32,
+        )
+        state_rows = state_block_size * max_blocks
+        for row, (block_ids, first_position) in enumerate(
+            zip(per_request_block_ids, first_positions, strict=True)
+        ):
+            ids = tuple(int(block_id) for block_id in block_ids)
+            if not ids:
+                raise ValueError(f"recurrent state row {row} has no allocated blocks")
+            first_position = int(first_position)
+            if first_position < 0:
+                raise ValueError("first positions must not be negative")
+            first_history_position = max(0, first_position - state_rows + 1)
+            first_block = first_history_position // state_block_size
+            last_block = (first_position - 1) // state_block_size
+            for logical_block in range(first_block, last_block + 1):
+                table[row, logical_block % max_blocks] = ids[logical_block % len(ids)]
+        return table
 
 
 class DeepSeekV4InputBuilder:
@@ -729,6 +902,40 @@ class DeepSeekV4InputBuilder:
             if not 0 <= rank < self.layout.ranks:
                 raise ValueError(f"prefill rank {rank} is out of range")
             rank_rows[rank].copy_(rows)
+        return self._expand_hc(rank_rows)
+
+    def dspark_prefill_x_hc(
+        self,
+        embeddings: Sequence[torch.Tensor],
+        *,
+        partitions: Sequence[int],
+        tp_size: int,
+        token_rows: int,
+    ) -> torch.Tensor:
+        """Replicate each DP request's full prompt across its TP group."""
+        if token_rows <= 0 or token_rows % tp_size != 0:
+            raise ValueError("DSpark prefill token rows must be divisible by TP size")
+        if not embeddings or len(embeddings) != len(partitions):
+            raise ValueError("DSpark prefill embeddings and partitions must be aligned")
+        if len(set(int(partition) for partition in partitions)) != len(partitions):
+            raise ValueError("DSpark prefill accepts at most one request per DP partition")
+
+        padded_rows = []
+        for rows in embeddings:
+            if rows.ndim != 2 or rows.shape[0] != token_rows or int(rows.shape[1]) != self.hidden_size:
+                raise ValueError(
+                    "DSpark group embeddings must have shape "
+                    f"[{token_rows}, {self.hidden_size}]"
+                )
+            padded_rows.append(rows.to(torch.float32))
+
+        rank_rows = padded_rows[0].unsqueeze(0).expand(self.layout.ranks, -1, -1).clone()
+        for partition, rows in zip(partitions, padded_rows, strict=True):
+            group_base = int(partition) * tp_size
+            group_end = group_base + tp_size
+            if group_base < 0 or group_end > self.layout.ranks:
+                raise ValueError(f"DSpark prefill partition {partition} is out of range")
+            rank_rows[group_base:group_end].copy_(rows.unsqueeze(0).expand(tp_size, -1, -1))
         return self._expand_hc(rank_rows)
 
     def _expand_hc(self, rank_rows: torch.Tensor) -> torch.Tensor:
@@ -784,6 +991,8 @@ class DeepSeekV4CompiledKernels:
     decode: DeepSeekV4L3Callable | None = None
     mtp_prefill: DeepSeekV4L3Callable | None = None
     mtp_decode: DeepSeekV4L3Callable | None = None
+    dspark_drafter: DeepSeekV4L3Callable | None = None
+    dspark_markov: DeepSeekV4L3Callable | None = None
     freqs_cos: torch.Tensor | None = None
     freqs_sin: torch.Tensor | None = None
     platform: str = "a2a3"
@@ -793,6 +1002,7 @@ class DeepSeekV4CompiledKernels:
     num_hash_layers: int = 3
     embedding_weight: torch.Tensor | None = None
     num_speculative_tokens: int = 0
+    speculative_method: str | None = None
 
     def l3_callables(self) -> tuple[DeepSeekV4L3Callable, ...]:
         """Return every compiled L3 program that the shared worker may run."""
@@ -805,6 +1015,10 @@ class DeepSeekV4CompiledKernels:
             callables.append(self.mtp_prefill)
         if self.mtp_decode is not None:
             callables.append(self.mtp_decode)
+        if self.dspark_drafter is not None:
+            callables.append(self.dspark_drafter)
+        if self.dspark_markov is not None:
+            callables.append(self.dspark_markov)
         return tuple(callables)
 
 
@@ -819,6 +1033,7 @@ class DeepSeekV4PreparedPrefillInputs:
     x_hc: torch.Tensor
     input_ids: torch.Tensor
     position_ids: torch.Tensor
+    position_ids_full: torch.Tensor
     ori_block_table: torch.Tensor
     ori_slot_mapping: torch.Tensor
     hca_cmp_block_table: torch.Tensor
@@ -835,6 +1050,7 @@ class DeepSeekV4PreparedPrefillInputs:
     csa_inner_state_slot_mapping: torch.Tensor
     num_tokens_per_owner: torch.Tensor
     logit_row_indices: torch.Tensor
+    next_prefill_token_ids: tuple[int | None, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -897,6 +1113,31 @@ class _DeepSeekV4DecodeAssignment:
     local_rows: tuple[int, ...]
     per_rank_counts: tuple[int, ...]
     indices_by_rank: tuple[tuple[int, ...], ...]
+
+
+@dataclass(frozen=True)
+class _DeepSeekV4DSparkOwner:
+    """Stable physical Query owner for one request inside its DP partition."""
+
+    partition: int
+    rank: int
+    local_row: int
+
+
+@dataclass(frozen=True)
+class _DeepSeekV4PendingDSparkPrefill:
+    """Main-prefill output retained until terminal tokens have been sampled."""
+
+    inputs: DeepSeekV4PreparedPrefillInputs
+    target_hidden: StackedDeviceTensor
+
+
+@dataclass
+class _DeepSeekV4DSparkRequestState:
+    """Committed sequence length and the next seven drafts for one request."""
+
+    committed_seq_len: int
+    draft_token_ids: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -1075,6 +1316,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         self._static_lm_head_weight: torch.Tensor | None = None
         self._static_freqs_cos: torch.Tensor | None = None
         self._static_freqs_sin: torch.Tensor | None = None
+        self._static_dspark_freqs_cos: torch.Tensor | None = None
+        self._static_dspark_freqs_sin: torch.Tensor | None = None
         self._prefill_task_args: DeepSeekPrefillTaskArgs | None = None
         # Per ping-pong slot, decode buffers live on the decode TaskArgs. Fused
         # K=1 write-only outputs are device-resident; scheduler-visible inputs,
@@ -1098,14 +1341,31 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         self._mtp_device_state_meta: StackedDeviceTensor | None = None
         self._l3_shared_buffers_ready = False
         self._mtp_device_weights: dict[str, StackedDeviceTensor] | None = None
+        self._dspark_host_weights: dict[str, torch.Tensor] | None = None
+        self._dspark_device_weights: dict[str, StackedDeviceTensor] | None = None
+        self._dspark_drafter_task_args: TaskArgs | None = None
+        self._dspark_markov_task_args: TaskArgs | None = None
+        self._dspark_target_hidden_arg: StackedDeviceTensor | None = None
+        self._dspark_compact_target_host: torch.Tensor | None = None
+        self._dspark_compact_target_device: StackedDeviceTensor | None = None
+        self._dspark_pending_prefill: _DeepSeekV4PendingDSparkPrefill | None = None
+        self._dspark_request_states: dict[str, _DeepSeekV4DSparkRequestState] = {}
         self._hc_head_buffers: dict[str, torch.Tensor] | None = None
         self._mtp_buffers: _DeepSeekV4MtpSharedBuffers | None = None
         self._mtp_device_kv_cache: StackedDeviceTensor | None = None
+        self._dspark_device_kv_cache: StackedDeviceTensor | None = None
         self._main_pre_hc_host_mirror: torch.Tensor | None = None
         self._mtp_prefill_task_args: TaskArgs | None = None
         self._mtp_decode_task_args: list[TaskArgs] = []
         self._mtp_request_states: dict[str, _DeepSeekV4MtpRequestState] = {}
         self._mtp_state_lock = threading.RLock()
+        self._dspark_owner_lock = threading.RLock()
+        self._dspark_request_owners: dict[str, _DeepSeekV4DSparkOwner] = {}
+        self._dspark_owner_counts = [0] * compiled.layout.ranks
+        self._dspark_free_rows: list[list[int]] = [
+            list(range(compiled.layout.decode_batch - 1, -1, -1))
+            for _ in range(compiled.layout.ranks)
+        ]
         self._mtp_free_tail_slots: list[list[int]] = [
             list(range(compiled.layout.decode_batch - 1, -1, -1))
             for _ in range(compiled.layout.ranks)
@@ -1115,7 +1375,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         ]
         self._mtp_proposed_tokens = 0
         self._mtp_accepted_tokens = 0
-        if compiled.num_speculative_tokens:
+        if compiled.speculative_method == "dspark":
+            self._decode_flow = self._run_dspark_decode
+            self._prefill_completion = self._ignore_prefill_context
+        elif compiled.num_speculative_tokens:
             self._decode_flow = self._run_mtp_decode
             self._prefill_completion = self._capture_mtp_prefill_context
         else:
@@ -1173,6 +1436,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             decode_batch=self._compiled.layout.decode_batch,
             enable_mtp=self._compiled.num_speculative_tokens == 1,
             max_seq_len=runtime.max_seq_len,
+            layout=self._compiled.layout,
         )
         names = tuple(spec.name for spec in specs)
         if names != DEEPSEEK_V4_CACHE_GROUP_NAMES:
@@ -1181,9 +1445,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 + ", ".join(DEEPSEEK_V4_CACHE_GROUP_NAMES)
                 + f"; got {names}"
             )
-        if any(spec.num_partitions != self._compiled.layout.ranks for spec in specs):
+        if any(spec.num_partitions != self._compiled.layout.cache_partitions for spec in specs):
             raise ValueError(
-                f"DeepSeekV4 KV cache groups must use {self._compiled.layout.ranks} partitions"
+                "DeepSeekV4 KV cache groups must use "
+                f"{self._compiled.layout.cache_partitions} partitions"
             )
         return tuple(specs)
 
@@ -1235,15 +1500,21 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         # EAGLE ``ori`` group.  Arbitrary-depth MTP is intentionally not adapted
         # to grouped prefix caching yet and still owns a separate one-layer pool,
         # so retain the latest serving baseline's explicit capacity charge.
-        multi_mtp_page_bytes = (
-            self._compiled.layout.block_size
-            * DEEPSEEK_V4_HEAD_DIM
-            * torch.bfloat16.itemsize
+        draft_cache_layers = (
+            DEEPSEEK_V4_DSPARK_DRAFT_LAYERS
+            if self._compiled.speculative_method == "dspark"
+            else 1
             if self._compiled.num_speculative_tokens > 1
             else 0
         )
-        bytes_per_slot += ori_spec.max_blocks_per_seq * multi_mtp_page_bytes
-        scratch_bytes += self._compiled.layout.decode_batch * multi_mtp_page_bytes
+        draft_page_bytes = (
+            draft_cache_layers
+            * self._compiled.layout.block_size
+            * DEEPSEEK_V4_HEAD_DIM
+            * torch.bfloat16.itemsize
+        )
+        bytes_per_slot += ori_spec.max_blocks_per_seq * draft_page_bytes
+        scratch_bytes += self._compiled.layout.decode_batch * draft_page_bytes
         kv_budget = min(budgets)
         minimum_bytes = scratch_bytes + bytes_per_slot
         if kv_budget < minimum_bytes:
@@ -1290,6 +1561,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             try:
                 self._materialize_decode_device_cache()
                 self._materialize_mtp_device_kv_cache()
+                self._materialize_dspark_device_kv_cache()
                 return capacity_slots
             except (RuntimeError, MemoryError) as exc:
                 self._free_device_caches()
@@ -1317,10 +1589,18 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._physical_cache_num_blocks(spec.name) * spec.spec.page_size_bytes
             for spec in self._cache_group_specs
         )
-        multi_mtp_bytes = 0
-        if self._compiled.num_speculative_tokens > 1:
-            multi_mtp_bytes = (
-                self._physical_cache_num_blocks("ori")
+        draft_cache_layers = (
+            DEEPSEEK_V4_DSPARK_DRAFT_LAYERS
+            if self._compiled.speculative_method == "dspark"
+            else 1
+            if self._compiled.num_speculative_tokens > 1
+            else 0
+        )
+        draft_cache_bytes = 0
+        if draft_cache_layers:
+            draft_cache_bytes = (
+                draft_cache_layers
+                * self._physical_cache_num_blocks("ori")
                 * self._compiled.layout.block_size
                 * DEEPSEEK_V4_HEAD_DIM
                 * torch.bfloat16.itemsize
@@ -1330,7 +1610,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             "per-rank=%.2f GB, ori_blocks=%d, max_seq_len=%d",
             allocated_slots,
             requested_slots,
-            (main_bytes + multi_mtp_bytes) / 1e9,
+            (main_bytes + draft_cache_bytes) / 1e9,
             self._cache_group_num_blocks["ori"],
             runtime.max_seq_len,
         )
@@ -1342,9 +1622,17 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             raise RuntimeError("DeepSeekV4 KV cache capacity is not initialized") from exc
 
     def release_finished_requests(self, request_ids: Iterable[str]) -> None:
-        """Discard request-local MTP state for finished or preempted requests."""
+        """Discard request-local speculative state for finished requests."""
         request_ids = tuple(request_ids)
         for request_id in request_ids:
+            with self._dspark_owner_lock:
+                owner = self._dspark_request_owners.pop(request_id, None)
+                if owner is not None:
+                    self._dspark_owner_counts[owner.rank] -= 1
+                    if self._dspark_owner_counts[owner.rank] < 0:
+                        raise RuntimeError("DeepSeekV4 DSpark owner count became negative")
+                    self._dspark_free_rows[owner.rank].append(owner.local_row)
+                self._dspark_request_states.pop(request_id, None)
             with self._mtp_state_lock:
                 state = self._mtp_request_states.pop(request_id, None)
                 if state is not None and state.tail_rank is not None and state.tail_slot_id is not None:
@@ -1369,6 +1657,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         self._ensure_l3_shared_buffers(record.runtime_model)
         self._materialize_decode_device_cache()
         self._materialize_mtp_device_kv_cache()
+        self._materialize_dspark_device_kv_cache()
 
     def load_packed_global_weights(self) -> DeepSeekV4GlobalWeights:
         """Load global tensors and shard the device LM head across its TP ranks."""
@@ -1400,6 +1689,11 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             compress_ratios=compress_ratios,
             num_hash_layers=self._compiled.num_hash_layers,
             use_prepacked=False,
+            o_projection_tp_size=(
+                DEEPSEEK_V4_DSPARK_TP_SIZE
+                if self._compiled.speculative_method == "dspark"
+                else None
+            ),
         )
 
     def load_mtp_weights(self) -> DeepSeekV4MtpWeights:
@@ -1409,23 +1703,47 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             n_routed_experts=self._compiled.n_routed_experts,
         )
 
+    def load_dspark_weights(self) -> DeepSeekV4DSparkWeights:
+        """Load the three-stage DSpark drafter and Markov/confidence heads."""
+        return self._compiled.weight_store.load_dspark_weights(
+            ranks=self._compiled.layout.ranks,
+            tp_size=DEEPSEEK_V4_DSPARK_TP_SIZE,
+            n_routed_experts=self._compiled.n_routed_experts,
+            stages=DEEPSEEK_V4_DSPARK_DRAFT_LAYERS,
+        )
+
     def prepare_prefill_inputs(self, model: RuntimeModel, batch: PrefillBatch) -> DeepSeekV4PreparedPrefillInputs:
         """Build DeepSeekV4 prefill host inputs for the current scheduler chunk."""
         builder = self._require_input_builder()
         layout = self._compiled.layout
+        dspark = self._compiled.speculative_method == "dspark"
         request_count = len(batch.request_ids)
-        if request_count <= 0 or request_count > layout.ranks * layout.prefill_batch:
+        max_requests = layout.cache_partitions if dspark else layout.ranks * layout.prefill_batch
+        if request_count <= 0 or request_count > max_requests:
             raise ValueError(
-                "DeepSeekV4 prefill supports one local request per rank and "
-                f"at most {layout.ranks} global requests, got {request_count}"
+                f"DeepSeekV4 prefill supports at most {max_requests} requests, "
+                f"got {request_count}"
             )
         if len(batch.cache_partitions) != request_count:
             raise ValueError("DeepSeekV4 prefill requires one cache partition per request")
-        ranks = tuple(int(rank) for rank in batch.cache_partitions)
-        if len(set(ranks)) != request_count:
-            raise ValueError("DeepSeekV4 prefill accepts at most one request per rank per dispatch")
-        if min(ranks) < 0 or max(ranks) >= layout.ranks:
-            raise ValueError(f"DeepSeekV4 prefill cache partitions must be in [0, {layout.ranks - 1}]")
+        if dspark and len(batch.next_prefill_token_ids) != request_count:
+            raise ValueError(
+                "DeepSeekV4 DSpark prefill requires one next-prompt lookahead per request"
+            )
+        partitions = tuple(int(partition) for partition in batch.cache_partitions)
+        if len(set(partitions)) != request_count:
+            raise ValueError("DeepSeekV4 prefill accepts at most one request per cache partition")
+        if min(partitions) < 0 or max(partitions) >= layout.cache_partitions:
+            raise ValueError(
+                "DeepSeekV4 prefill cache partitions must be in "
+                f"[0, {layout.cache_partitions - 1}]"
+            )
+        if dspark:
+            ranks = tuple(partition * DEEPSEEK_V4_DSPARK_TP_SIZE for partition in partitions)
+            for request_id, partition in zip(batch.request_ids, partitions, strict=True):
+                self._reserve_dspark_request_owner(request_id, partition)
+        else:
+            ranks = partitions
         group_rows = self._normalize_group_block_ids(
             batch.block_ids_by_group,
             actual_batch=request_count,
@@ -1452,9 +1770,11 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
 
         if batch.input_embeddings is None:
             raise ValueError("DeepSeek V4 prefill requires host input embeddings")
-        kernel_tokens = self._prefill_kernel_tokens(
-            max(int(tokens) for tokens in batch.chunk_lens),
-            runtime=model.runtime,
+        max_active_tokens = max(int(tokens) for tokens in batch.chunk_lens)
+        kernel_tokens = (
+            self._dspark_prefill_kernel_tokens(max_active_tokens, runtime=model.runtime)
+            if dspark
+            else self._prefill_kernel_tokens(max_active_tokens, runtime=model.runtime)
         )
 
         # Prefill writes directly into the scheduler-owned rank-local physical
@@ -1543,6 +1863,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                         (positions,),
                         block_size=layout.block_size,
                         compress_ratio=128,
+                        output_page_storage=dspark,
                     )[0],
                     kernel_tokens,
                 )
@@ -1564,6 +1885,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                         (positions,),
                         block_size=layout.block_size,
                         compress_ratio=4,
+                        output_page_storage=dspark,
                     )[0],
                     kernel_tokens,
                 )
@@ -1575,6 +1897,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                         (positions,),
                         block_size=layout.block_size,
                         compress_ratio=4,
+                        output_page_storage=dspark,
                     )[0],
                     kernel_tokens,
                 )
@@ -1610,37 +1933,84 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             num_tokens_per_owner[rank] = actual_tokens
             logit_row_indices[rank, 0] = actual_tokens - 1
 
+        if dspark:
+            tp_size = DEEPSEEK_V4_DSPARK_TP_SIZE
+            x_hc = builder.dspark_prefill_x_hc(
+                kernel_embeddings_by_request,
+                partitions=partitions,
+                tp_size=tp_size,
+                token_rows=kernel_tokens,
+            )
+            input_ids = self._tp_group_scatter_tokens(
+                input_ids_by_request,
+                partitions=partitions,
+                tp_size=tp_size,
+            )
+            position_ids = self._tp_group_scatter_tokens(
+                position_ids_by_request,
+                partitions=partitions,
+                tp_size=tp_size,
+            )
+            position_ids_full = self._tp_group_replicate(
+                position_ids_by_request,
+                partitions=partitions,
+                tp_size=tp_size,
+            )
+            def rank_stack(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
+                return self._tp_group_replicate(
+                    tensors,
+                    partitions=partitions,
+                    tp_size=tp_size,
+                )
+
+            def mapping_stack(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
+                return self._tp_group_replicate(
+                    tensors,
+                    partitions=partitions,
+                    tp_size=tp_size,
+                    inactive_fill=-1,
+                )
+        else:
+            x_hc = builder.prefill_x_hc(
+                kernel_embeddings_by_request,
+                ranks=ranks,
+                token_rows=kernel_tokens,
+            )
+            input_ids = self._rank_scatter(input_ids_by_request, ranks)
+            position_ids = self._rank_scatter(position_ids_by_request, ranks)
+            position_ids_full = position_ids
+            def rank_stack(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
+                return self._rank_scatter(tensors, ranks)
+
+            def mapping_stack(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
+                return self._rank_scatter_mappings(tensors, ranks)
+
         return DeepSeekV4PreparedPrefillInputs(
             request_ids=tuple(batch.request_ids),
             ranks=ranks,
             actual_tokens=tuple(actual_tokens_by_request),
             kernel_tokens=kernel_tokens,
-            x_hc=builder.prefill_x_hc(
-                kernel_embeddings_by_request,
-                ranks=ranks,
-                token_rows=kernel_tokens,
-            ),
-            input_ids=self._rank_scatter(input_ids_by_request, ranks),
-            position_ids=self._rank_scatter(position_ids_by_request, ranks),
-            ori_block_table=self._rank_scatter(ori_block_tables, ranks),
-            ori_slot_mapping=self._rank_scatter_mappings(ori_slot_mappings, ranks),
-            hca_cmp_block_table=self._rank_scatter(hca_cmp_block_tables, ranks),
-            csa_cmp_block_table=self._rank_scatter(csa_cmp_block_tables, ranks),
-            idx_block_table=self._rank_scatter(idx_block_tables, ranks),
-            hca_compress_state_block_table=self._rank_scatter(hca_state_block_tables, ranks),
-            csa_compress_state_block_table=self._rank_scatter(csa_state_block_tables, ranks),
-            csa_inner_compress_state_block_table=self._rank_scatter(csa_inner_state_block_tables, ranks),
-            hca_cmp_slot_mapping=self._rank_scatter_mappings(hca_cmp_slot_mappings, ranks),
-            hca_state_slot_mapping=self._rank_scatter_mappings(hca_state_slot_mappings, ranks),
-            csa_cmp_slot_mapping=self._rank_scatter_mappings(csa_cmp_slot_mappings, ranks),
-            csa_idx_slot_mapping=self._rank_scatter_mappings(csa_idx_slot_mappings, ranks),
-            csa_state_slot_mapping=self._rank_scatter_mappings(csa_state_slot_mappings, ranks),
-            csa_inner_state_slot_mapping=self._rank_scatter_mappings(
-                csa_inner_state_slot_mappings,
-                ranks,
-            ),
+            x_hc=x_hc,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            position_ids_full=position_ids_full,
+            ori_block_table=rank_stack(ori_block_tables),
+            ori_slot_mapping=mapping_stack(ori_slot_mappings),
+            hca_cmp_block_table=rank_stack(hca_cmp_block_tables),
+            csa_cmp_block_table=rank_stack(csa_cmp_block_tables),
+            idx_block_table=rank_stack(idx_block_tables),
+            hca_compress_state_block_table=rank_stack(hca_state_block_tables),
+            csa_compress_state_block_table=rank_stack(csa_state_block_tables),
+            csa_inner_compress_state_block_table=rank_stack(csa_inner_state_block_tables),
+            hca_cmp_slot_mapping=mapping_stack(hca_cmp_slot_mappings),
+            hca_state_slot_mapping=mapping_stack(hca_state_slot_mappings),
+            csa_cmp_slot_mapping=mapping_stack(csa_cmp_slot_mappings),
+            csa_idx_slot_mapping=mapping_stack(csa_idx_slot_mappings),
+            csa_state_slot_mapping=mapping_stack(csa_state_slot_mappings),
+            csa_inner_state_slot_mapping=mapping_stack(csa_inner_state_slot_mappings),
             num_tokens_per_owner=num_tokens_per_owner,
             logit_row_indices=logit_row_indices,
+            next_prefill_token_ids=tuple(batch.next_prefill_token_ids),
         )
 
     def prepare_decode(
@@ -1659,7 +2029,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         fused_mtp = self._compiled.num_speculative_tokens == 1
         if fused_mtp:
             if not batch.allow_device_greedy_sampling:
-                raise RuntimeError("DeepSeekV4 MTP decode currently requires greedy device sampling")
+                raise RuntimeError("DeepSeekV4 fused MTP decode requires device sampling")
             for request_id, rank in zip(batch.request_ids, assignment.ranks, strict=True):
                 self._reserve_mtp_request_state(request_id, rank)
         actual_batch = len(batch.request_ids)
@@ -1712,6 +2082,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             raise TypeError("DeepSeekV4 prepared decode has an unexpected type")
         if tuple(batch.request_ids) != prepared.request_ids:
             raise ValueError("prepared decode request order changed before execution")
+        if self._compiled.speculative_method == "dspark":
+            raise RuntimeError(
+                "DeepSeekV4 DSpark decode is a synchronous verify-and-propose flow"
+            )
         if tuple(int(rank) for rank in batch.cache_partitions) != prepared.ranks:
             raise ValueError("prepared decode cache partitions changed before execution")
         # Production preflight prepares every shared tensor before the L3
@@ -1864,7 +2238,9 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         if not 0 <= buffer_slot < len(self._decode_task_args):
             raise ValueError(f"decode buffer_slot must be 0 or 1, got {buffer_slot}")
         staged = self._decode_task_args[buffer_slot].tensors
-        staged["num_tokens_per_owner"].zero_()
+        dspark = self._compiled.speculative_method == "dspark"
+        if not dspark:
+            staged["num_tokens_per_owner"].zero_()
         staged["logit_row_indices"].fill_(-1)
         self._stage_decode_dynamic_inputs(
             staged,
@@ -1875,6 +2251,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         )
 
         for rank, request_indices in enumerate(assignment.indices_by_rank):
+            if dspark:
+                continue
             if request_indices:
                 local_groups = [active_group_ids[index] for index in request_indices]
             else:
@@ -1944,6 +2322,14 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                     name=f"decode_{name}_rank{rank}",
                 )
 
+        if dspark:
+            self._stage_decode_cache_metadata(
+                staged,
+                assignment=assignment,
+                positions=positions,
+                active_group_ids=active_group_ids,
+            )
+
         for rank, count in enumerate(per_rank_counts):
             row_count = count * active_seq
             if row_count > layout.decode_tokens:
@@ -1951,12 +2337,29 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                     f"rank {rank} requires {row_count} logit rows, "
                     f"capacity is {layout.decode_tokens}"
                 )
-            staged["num_tokens_per_owner"][rank] = row_count
+            if not dspark:
+                staged["num_tokens_per_owner"][rank] = row_count
             if row_count:
                 staged["logit_row_indices"][rank, :row_count].copy_(
                     torch.arange(row_count, dtype=torch.int32)
                 )
 
+        kv_seq_lens = staged["csa_kv_seq_lens"] if dspark else staged["kv_seq_lens"]
+        block_table = staged["csa_cmp_block_table"] if dspark else staged["block_table"]
+        idx_block_table = staged["csa_idx_block_table"] if dspark else staged["idx_block_table"]
+        block_counts = (
+            torch.zeros(
+                (layout.ranks, layout.decode_batch, len(DEEPSEEK_V4_CACHE_GROUP_NAMES)),
+                dtype=torch.int32,
+            )
+            if dspark
+            else staged["block_counts"]
+        )
+        num_tokens_per_owner = (
+            torch.tensor(per_rank_counts, dtype=torch.int32)
+            if dspark
+            else staged["num_tokens_per_owner"]
+        )
         return DeepSeekV4PreparedDecodeInputs(
             request_ids=tuple(batch.request_ids),
             ranks=ranks,
@@ -1966,19 +2369,19 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             x_hc=x_hc,
             input_ids=staged["input_ids"],
             position_ids=staged["position_ids"],
-            kv_seq_lens=staged["kv_seq_lens"],
-            block_table=staged["block_table"],
+            kv_seq_lens=kv_seq_lens,
+            block_table=block_table,
             hca_cmp_block_table=staged["hca_cmp_block_table"],
             csa_cmp_block_table=staged["csa_cmp_block_table"],
-            idx_block_table=staged["idx_block_table"],
+            idx_block_table=idx_block_table,
             hca_compress_state_block_table=staged["hca_compress_state_block_table"],
             csa_compress_state_block_table=staged["csa_compress_state_block_table"],
             csa_inner_compress_state_block_table=staged[
                 "csa_inner_compress_state_block_table"
             ],
-            block_counts=staged["block_counts"],
+            block_counts=block_counts,
             block_ids_by_group=active_group_ids,
-            num_tokens_per_owner=staged["num_tokens_per_owner"],
+            num_tokens_per_owner=num_tokens_per_owner,
             logit_row_indices=staged["logit_row_indices"],
             buffer_slot=buffer_slot,
         )
@@ -2012,7 +2415,13 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 layout.ranks, layout.decode_batch, layout.decode_seq
             )
         )
-        staged["kv_seq_lens"].fill_(int(batch.seq_lens[0].item()))
+        seq_len_names = (
+            ("csa_kv_seq_lens", "hca_kv_seq_lens")
+            if self._compiled.speculative_method == "dspark"
+            else ("kv_seq_lens",)
+        )
+        for name in seq_len_names:
+            staged[name].fill_(int(batch.seq_lens[0].item()))
         for rank, request_indices in enumerate(assignment.indices_by_rank):
             if not request_indices:
                 continue
@@ -2028,13 +2437,118 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                     layout.decode_batch, layout.decode_seq
                 )
             )
-            staged["kv_seq_lens"][rank].fill_(int(batch.seq_lens[first_request].item()))
+            for name in seq_len_names:
+                staged[name][rank].fill_(int(batch.seq_lens[first_request].item()))
             for local_row, request_index in enumerate(request_indices):
                 input_rows[rank, local_row].copy_(token_rows[request_index])
                 position_rows[rank, local_row].copy_(
                     torch.tensor(positions[request_index], dtype=torch.int32)
                 )
-                staged["kv_seq_lens"][rank, local_row] = batch.seq_lens[request_index]
+                for name in seq_len_names:
+                    staged[name][rank, local_row] = batch.seq_lens[request_index]
+        if self._compiled.speculative_method == "dspark":
+            self._stage_dspark_decode_rope(staged)
+        self._stage_sampling_inputs(
+            staged,
+            batch,
+            assignment=assignment,
+            positions=positions,
+        )
+
+    def _stage_dspark_decode_rope(self, staged: dict[str, torch.Tensor]) -> None:
+        """Materialize the documented SWA/CSA/HCA RoPE rows for one decode tile."""
+        if self._compiled.freqs_cos is None or self._compiled.freqs_sin is None:
+            raise RuntimeError("DeepSeekV4 DSpark RoPE tables are not initialized")
+        positions = staged["position_ids"].to(torch.long)
+        swa_cos = self._compiled.freqs_cos[0]
+        swa_sin = self._compiled.freqs_sin[0]
+        cmp_cos = self._compiled.freqs_cos[1]
+        cmp_sin = self._compiled.freqs_sin[1]
+        if int(positions.max().item()) >= swa_cos.shape[0]:
+            raise ValueError("DSpark decode positions exceed the materialized RoPE capacity")
+        staged["freqs_cos"].copy_(swa_cos.index_select(0, positions.reshape(-1)).view_as(staged["freqs_cos"]))
+        staged["freqs_sin"].copy_(swa_sin.index_select(0, positions.reshape(-1)).view_as(staged["freqs_sin"]))
+
+        csa_positions = torch.where(
+            (positions + 1).remainder(4) == 0,
+            positions - 3,
+            torch.zeros_like(positions),
+        )
+        staged["csa_cmp_freqs_cos"].copy_(
+            cmp_cos.index_select(0, csa_positions.reshape(-1)).view_as(
+                staged["csa_cmp_freqs_cos"]
+            )
+        )
+        staged["csa_cmp_freqs_sin"].copy_(
+            cmp_sin.index_select(0, csa_positions.reshape(-1)).view_as(
+                staged["csa_cmp_freqs_sin"]
+            )
+        )
+        starts = positions.view(
+            self._compiled.layout.ranks,
+            self._compiled.layout.decode_batch,
+            self._compiled.layout.decode_seq,
+        )[:, :, 0]
+        hca_positions = starts - starts.remainder(128)
+        staged["hca_cmp_freqs_cos"].copy_(
+            cmp_cos.index_select(0, hca_positions.reshape(-1))[:, :32]
+            .view_as(staged["hca_cmp_freqs_cos"])
+            .float()
+        )
+        staged["hca_cmp_freqs_sin"].copy_(
+            cmp_sin.index_select(0, hca_positions.reshape(-1))[:, :32]
+            .view_as(staged["hca_cmp_freqs_sin"])
+            .float()
+        )
+
+    def _stage_sampling_inputs(
+        self,
+        staged: dict[str, torch.Tensor],
+        batch: DecodeBatch,
+        *,
+        assignment: _DeepSeekV4DecodeAssignment,
+        positions: tuple[tuple[int, ...], ...],
+    ) -> None:
+        """Stage per-logit-row controls for the integrated DSV4 sampler."""
+        # DSpark's target entry retains its own fixed greedy sampler ABI. The
+        # controls below belong only to the main/MTP entries added by #1065.
+        if (
+            self._compiled.speculative_method == "dspark"
+            or self._compiled.num_speculative_tokens == 1
+        ):
+            return
+        layout = self._compiled.layout
+        params = batch.sampling_params
+        if params and len(params) != len(batch.request_ids):
+            raise ValueError("decode sampling params must align with request IDs")
+        default_params = SamplingParams(temperature=0.0, top_p=1.0, top_k=None)
+
+        staged["sampling_temperatures"].zero_()
+        staged["sampling_top_ks"].fill_(DEEPSEEK_V4_VOCAB_SIZE)
+        staged["sampling_seeds"].zero_()
+        staged["sampling_positions"].zero_()
+        for rank, request_indices in enumerate(assignment.indices_by_rank):
+            for local_row, request_index in enumerate(request_indices):
+                request_params = params[request_index] if params else default_params
+                top_k = request_params.top_k
+                if top_k is None or top_k <= 0:
+                    top_k = DEEPSEEK_V4_VOCAB_SIZE
+                seed = request_params.seed
+                if seed is None:
+                    seed = zlib.crc32(batch.request_ids[request_index].encode())
+                seed = int(seed) & 0x3FFFFFFF
+                row_start = local_row * layout.decode_seq
+                row_stop = row_start + layout.decode_seq
+                staged["sampling_temperatures"][rank, row_start:row_stop].fill_(
+                    float(request_params.temperature)
+                )
+                staged["sampling_top_ks"][rank, row_start:row_stop].fill_(
+                    min(int(top_k), DEEPSEEK_V4_VOCAB_SIZE)
+                )
+                staged["sampling_seeds"][rank, row_start:row_stop].fill_(seed)
+                staged["sampling_positions"][rank, row_start:row_stop].copy_(
+                    torch.tensor(positions[request_index], dtype=torch.int32) + 1
+                )
 
     def _stage_decode_cache_metadata(
         self,
@@ -2108,6 +2622,107 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 ],
                 dtype=torch.int32,
             )
+
+            if self._compiled.speculative_method == "dspark":
+                rank_positions = [positions[index] for index in request_indices]
+                if rank_positions:
+                    rank_positions.extend(
+                        [rank_positions[0]] * (layout.decode_batch - len(rank_positions))
+                    )
+                else:
+                    rank_positions = [positions[0]] * layout.decode_batch
+                first_positions = [row[0] for row in rank_positions]
+                values["csa_compress_state_block_table"] = (
+                    self.cache_metadata.recurrent_state_block_table_from_ids(
+                        padded_group_ids["csa_state"],
+                        first_positions,
+                        state_block_size=layout.c4_state_block_size,
+                        max_blocks=layout.csa_state_max_blocks,
+                    )
+                )
+                values["csa_inner_compress_state_block_table"] = (
+                    self.cache_metadata.recurrent_state_block_table_from_ids(
+                        padded_group_ids["csa_inner_state"],
+                        first_positions,
+                        state_block_size=layout.c4_state_block_size,
+                        max_blocks=layout.csa_inner_state_max_blocks,
+                    )
+                )
+                ori_slots = self.cache_metadata.paged_decode_slot_mapping_from_ids(
+                    padded_group_ids["ori"],
+                    rank_positions,
+                ).reshape(-1)
+                window_indices, window_lens = (
+                    self.cache_metadata.swa_window_indices_and_lens_from_ids(
+                        padded_group_ids["ori"],
+                        rank_positions,
+                    )
+                )
+                csa_cmp_slots = self.cache_metadata.compressed_slot_mapping_from_ids(
+                    padded_group_ids["cmp_c4"],
+                    rank_positions,
+                    block_size=layout.block_size,
+                    compress_ratio=4,
+                    output_page_storage=True,
+                ).reshape(-1)
+                csa_idx_slots = self.cache_metadata.compressed_slot_mapping_from_ids(
+                    padded_group_ids["idx"],
+                    rank_positions,
+                    block_size=layout.block_size,
+                    compress_ratio=4,
+                    output_page_storage=True,
+                ).reshape(-1)
+                hca_cmp_slots = self.cache_metadata.compressed_slot_mapping_from_ids(
+                    padded_group_ids["cmp_c128"],
+                    rank_positions,
+                    block_size=layout.block_size,
+                    compress_ratio=128,
+                    output_page_storage=True,
+                ).reshape(-1)
+                csa_state_slots = self.cache_metadata.state_slot_mapping_from_ids(
+                    padded_group_ids["csa_state"],
+                    rank_positions,
+                    state_block_size=layout.c4_state_block_size,
+                ).reshape(-1)
+                csa_inner_state_slots = self.cache_metadata.state_slot_mapping_from_ids(
+                    padded_group_ids["csa_inner_state"],
+                    rank_positions,
+                    state_block_size=layout.c4_state_block_size,
+                ).reshape(-1)
+                hca_state_slots = self.cache_metadata.state_slot_mapping_from_ids(
+                    padded_group_ids["hca_state"],
+                    rank_positions,
+                    state_block_size=layout.c128_state_block_size,
+                ).reshape(-1)
+                values = {
+                    "hca_cmp_block_table": values["hca_cmp_block_table"],
+                    "csa_cmp_block_table": values["csa_cmp_block_table"],
+                    "csa_idx_block_table": values["idx_block_table"],
+                    "hca_compress_state_block_table": values[
+                        "hca_compress_state_block_table"
+                    ],
+                    "csa_compress_state_block_table": values[
+                        "csa_compress_state_block_table"
+                    ],
+                    "csa_inner_compress_state_block_table": values[
+                        "csa_inner_compress_state_block_table"
+                    ],
+                    "swa_slot_mapping": ori_slots,
+                    "swa_indices": window_indices,
+                    "swa_lens": window_lens,
+                    "csa_ori_slot_mapping": ori_slots,
+                    "csa_window_swa_indices": window_indices,
+                    "csa_window_swa_lens": window_lens,
+                    "csa_cmp_slot_mapping": csa_cmp_slots,
+                    "csa_idx_slot_mapping": csa_idx_slots,
+                    "csa_state_slot_mapping": csa_state_slots,
+                    "csa_inner_state_slot_mapping": csa_inner_state_slots,
+                    "hca_ori_slot_mapping": ori_slots,
+                    "hca_window_swa_indices": window_indices,
+                    "hca_window_swa_lens": window_lens,
+                    "hca_cmp_slot_mapping": hca_cmp_slots,
+                    "hca_state_slot_mapping": hca_state_slots,
+                }
 
             for name, value in values.items():
                 copy_shared(
@@ -2209,6 +2824,14 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         """Run all DeepSeekV4 hidden layers for one prefill chunk in a single packed call."""
         if self._compiled.prefill is None:
             raise RuntimeError("DeepSeekV4 kernels were not compiled for this runner")
+        if (
+            self._compiled.speculative_method == "dspark"
+            and self._dspark_pending_prefill is not None
+        ):
+            raise RuntimeError(
+                "DeepSeekV4 DSpark terminal prefill must be finalized before "
+                "the shared target-hidden buffer is reused"
+            )
         with profile_span("DeepSeekV4ModelRunner.prefill.prepare", cat="executor"):
             with profile_span("DeepSeekV4ModelRunner.prefill.ensure_l3_shared_buffers", cat="executor"):
                 self._ensure_l3_shared_buffers(model)
@@ -2222,7 +2845,11 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._stage_prefill_fwd_inputs(inputs)
             self._prefill_task_args.clear_outputs()
             args = self._prefill_fwd_args(inputs.kernel_tokens)
-            pre_hc_hidden_buffer = self._prefill_task_args.tensors["pre_hc_hidden_out"]
+            context_buffer = self._prefill_task_args.tensors[
+                "target_hidden"
+                if self._compiled.speculative_method == "dspark"
+                else "pre_hc_hidden_out"
+            ]
             logits_buffer = self._prefill_task_args.tensors["logits"]
         try:
             with profile_span(
@@ -2239,32 +2866,215 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 "DeepSeekV4 packed prefill dispatch failed "
                 f"(tokens={inputs.actual_tokens}, ranks={inputs.ranks})"
             ) from exc
-        self._prefill_completion(inputs, pre_hc_hidden_buffer)
+        self._prefill_completion(inputs, context_buffer)
+
+        if self._compiled.speculative_method == "dspark":
+            target_hidden = self._prefill_task_args.token_view(
+                "target_hidden",
+                inputs.kernel_tokens,
+            )
+            if not isinstance(target_hidden, StackedDeviceTensor):
+                raise RuntimeError("DSpark prefill target_hidden must be device-resident")
+            pending = _DeepSeekV4PendingDSparkPrefill(inputs, target_hidden)
+            if any(token is None for token in inputs.next_prefill_token_ids):
+                self._dspark_pending_prefill = pending
+            else:
+                self._run_dspark_prefill_context(pending, {})
 
         logits = torch.stack(
             tuple(logits_buffer[rank, 0] for rank in inputs.ranks),
         ).float()
-        return PrefillResult(last_hidden=None, logits=logits)
+        sampled_token_ids = None
+        if self._compiled.speculative_method == "dspark":
+            sampled_ids = self._prefill_task_args.tensors["sampled_ids"]
+            sampled_token_ids = torch.stack(
+                tuple(sampled_ids[rank, 0, 0] for rank in inputs.ranks),
+            ).to(torch.long)
+        return PrefillResult(
+            last_hidden=None,
+            logits=logits,
+            sampled_token_ids=sampled_token_ids,
+        )
 
     def finalize_prefill(
         self,
         request_ids: Sequence[str],
         sampled_token_ids: Sequence[int],
+        sampling_params: Sequence[SamplingParams] | None = None,
     ) -> None:
-        """Run terminal MTP prefill and publish persistent decode state."""
+        """Publish speculative state after target-model prefill sampling."""
         if not self._compiled.num_speculative_tokens:
             return
         if len(request_ids) != len(sampled_token_ids):
-            raise ValueError("MTP prefill requires one sampled token per request")
+            raise ValueError("speculative prefill requires one sampled token per request")
+        if self._compiled.speculative_method == "dspark":
+            pending = self._dspark_pending_prefill
+            if pending is None:
+                raise RuntimeError("DeepSeekV4 DSpark has no terminal prefill to finalize")
+            sampled = {
+                request_id: int(token_id)
+                for request_id, token_id in zip(
+                    request_ids,
+                    sampled_token_ids,
+                    strict=True,
+                )
+            }
+            terminal = {
+                request_id
+                for request_id, token in zip(
+                    pending.inputs.request_ids,
+                    pending.inputs.next_prefill_token_ids,
+                    strict=True,
+                )
+                if token is None
+            }
+            if set(sampled) != terminal:
+                raise ValueError(
+                    "DeepSeekV4 DSpark finalize request IDs must match the terminal "
+                    "requests in the pending prefill batch"
+                )
+            try:
+                self._run_dspark_prefill_context(pending, sampled)
+            finally:
+                self._dspark_target_hidden_arg = None
+                self._dspark_pending_prefill = None
+            return
+        if sampling_params is None:
+            sampling_params = [
+                SamplingParams(temperature=0.0, top_p=1.0, top_k=None)
+                for _ in request_ids
+            ]
+        if len(request_ids) != len(sampling_params):
+            raise ValueError("MTP sampling params must align with request IDs")
         with profile_span(
             "DeepSeekV4ModelRunner.prefill.mtp_initialize",
             cat="executor",
             args={"batch_size": len(request_ids)},
         ):
-            for request_id, token_id in zip(request_ids, sampled_token_ids, strict=True):
+            for request_id, token_id, params in zip(
+                request_ids,
+                sampled_token_ids,
+                sampling_params,
+                strict=True,
+            ):
                 state = self._require_mtp_request_state(request_id)
                 if state.draft_token_id is None:
-                    self._initialize_mtp_draft(request_id, state, int(token_id))
+                    self._initialize_mtp_draft(request_id, state, int(token_id), params)
+
+    def _run_dspark_prefill_context(
+        self,
+        pending: _DeepSeekV4PendingDSparkPrefill,
+        sampled_token_ids: dict[str, int],
+    ) -> None:
+        """Insert one prompt chunk into drafter KV and optionally produce drafts."""
+        drafter = self._dspark_drafter_task_args
+        markov = self._dspark_markov_task_args
+        if drafter is None or markov is None:
+            raise RuntimeError("DeepSeekV4 DSpark TaskArgs are not staged")
+        inputs = pending.inputs
+        layout = self._compiled.layout
+        ranks = layout.ranks
+        batch = DEEPSEEK_V4_DSPARK_DECODE_BATCH_PER_RANK
+        num_sampled = torch.zeros((ranks, batch), dtype=torch.int32)
+        last_sampled = torch.zeros((ranks, batch), dtype=torch.int64)
+        next_prefill = torch.zeros((ranks, batch), dtype=torch.int64)
+        anchor_positions = torch.zeros((ranks, batch), dtype=torch.int32)
+        block_tables = torch.empty_like(drafter.tensors["block_tables"])
+        scratch_base = self._cache_group_num_blocks["ori"]
+        for rank in range(ranks):
+            for row in range(batch):
+                block_tables[rank, :, row].fill_(scratch_base + row)
+
+        request_by_partition = {
+            rank // DEEPSEEK_V4_DSPARK_TP_SIZE: index
+            for index, rank in enumerate(inputs.ranks)
+        }
+        terminal_requests: list[tuple[str, _DeepSeekV4DSparkOwner]] = []
+        for partition in range(layout.cache_partitions):
+            request_index = request_by_partition.get(partition)
+            if request_index is None:
+                continue
+            request_id = inputs.request_ids[request_index]
+            owner = self._dspark_request_owners[request_id]
+            actual_tokens = int(inputs.actual_tokens[request_index])
+            anchor = int(inputs.position_ids_full[owner.rank, actual_tokens - 1])
+            lookahead = inputs.next_prefill_token_ids[request_index]
+            sampled = sampled_token_ids.get(request_id)
+            if lookahead is None and sampled is None:
+                raise RuntimeError(
+                    f"terminal DSpark prefill request {request_id!r} has no sampled token"
+                )
+            anchor_positions[owner.rank, owner.local_row] = anchor
+            if sampled is not None:
+                num_sampled[owner.rank, owner.local_row] = 1
+                last_sampled[owner.rank, owner.local_row] = sampled
+            else:
+                next_prefill[owner.rank, owner.local_row] = int(lookahead)
+            source_table = inputs.ori_block_table[owner.rank]
+            block_tables[
+                owner.rank,
+                :,
+                owner.local_row,
+                : source_table.numel(),
+            ].copy_(
+                source_table.view(1, -1).expand(
+                    DEEPSEEK_V4_DSPARK_DRAFT_LAYERS,
+                    -1,
+                )
+            )
+            if sampled is not None:
+                terminal_requests.append((request_id, owner))
+
+        context_slots = inputs.ori_slot_mapping.unsqueeze(1).expand(
+            -1,
+            DEEPSEEK_V4_DSPARK_DRAFT_LAYERS,
+            -1,
+        ).contiguous()
+        drafter.stage_for_context_tokens(
+            {
+                "num_sampled": num_sampled,
+                "last_sampled": last_sampled,
+                "next_prefill_tokens": next_prefill,
+                "context_position_ids": inputs.position_ids_full,
+                "context_slot_mapping": context_slots,
+                "anchor_positions": anchor_positions,
+                "block_tables": block_tables,
+            },
+            inputs.kernel_tokens,
+        )
+        self._dspark_target_hidden_arg = pending.target_hidden
+        self._run_l3(
+            self._require_dspark_drafter_callable(),
+            *drafter.build_for_context_tokens(inputs.kernel_tokens),
+        )
+        if not terminal_requests:
+            self._dspark_target_hidden_arg = None
+            return
+
+        markov.clear_outputs()
+        logit_rows = markov.tensors["logit_row_indices"]
+        logit_rows.fill_(-1)
+        active_rows = batch * self._compiled.num_speculative_tokens
+        logit_rows[:, :active_rows] = torch.arange(active_rows, dtype=torch.int32)
+        markov.stage(
+            {
+                "num_sampled": num_sampled,
+                "last_sampled": last_sampled,
+                "next_prefill_tokens": next_prefill,
+            }
+        )
+        self._run_l3(
+            self._require_dspark_markov_callable(),
+            *markov.build(),
+        )
+        for request_id, owner in terminal_requests:
+            self._dspark_request_states[request_id] = _DeepSeekV4DSparkRequestState(
+                draft_token_ids=markov.tensors["draft_token_ids"][
+                    owner.rank,
+                    owner.local_row,
+                ].clone(),
+                committed_seq_len=int(anchor_positions[owner.rank, owner.local_row]) + 2,
+            )
 
     def run_decode(self, model, batch: DecodeBatch) -> DecodeResult:
         """Dispatch to the decode flow selected when the model was compiled."""
@@ -2314,6 +3124,22 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             inputs,
             active_seq=1,
         )
+        if batch.allow_device_greedy_sampling:
+            sampled_token_ids = torch.stack(
+                tuple(
+                    output.sampled_ids[rank, local_row, 0]
+                    for rank, local_row in zip(
+                        output.inputs.ranks,
+                        output.inputs.local_rows,
+                        strict=True,
+                    )
+                )
+            ).to(torch.int32)
+            return DecodeResult(
+                hidden_states=None,
+                logits=None,
+                sampled_token_ids=sampled_token_ids,
+            )
         logits = torch.stack(
             tuple(
                 output.logits[rank, local_row]
@@ -2325,6 +3151,416 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             )
         ).float()
         return DecodeResult(hidden_states=None, logits=logits)
+
+    def _run_dspark_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
+        """Run the DSpark target-verification and seven-token proposal flow."""
+        if not batch.allow_device_greedy_sampling:
+            raise RuntimeError("DeepSeekV4 DSpark currently requires greedy device sampling")
+        batch = replace(batch, seq_lens=self._correct_dspark_seq_lens(batch))
+        speculative_rows = []
+        target_only_rows = []
+        for row, request_id in enumerate(batch.request_ids):
+            state = self._dspark_request_states.get(request_id)
+            if state is None:
+                raise RuntimeError(
+                    f"DeepSeekV4 DSpark state is not initialized for {request_id!r}"
+                )
+            rows = speculative_rows if state.draft_token_ids is not None else target_only_rows
+            rows.append(row)
+
+        accepted: list[list[int] | None] = [None] * len(batch.request_ids)
+        if speculative_rows:
+            speculative = self._run_dspark_speculative_decode(
+                model,
+                self._select_decode_batch_rows(batch, speculative_rows),
+            )
+            for row, tokens in zip(speculative_rows, speculative, strict=True):
+                accepted[row] = tokens
+        if target_only_rows:
+            target_only = self._run_dspark_target_only_decode(
+                model,
+                self._select_decode_batch_rows(batch, target_only_rows),
+            )
+            for row, tokens in zip(target_only_rows, target_only, strict=True):
+                accepted[row] = tokens
+        if any(tokens is None for tokens in accepted):
+            raise RuntimeError("DeepSeekV4 DSpark decode left an incomplete request result")
+        committed = [tokens for tokens in accepted if tokens is not None]
+        for request_id, tokens in zip(batch.request_ids, committed, strict=True):
+            state = self._dspark_request_states[request_id]
+            state.committed_seq_len += len(tokens)
+        return DecodeResult(
+            hidden_states=None,
+            logits=None,
+            accepted_token_ids=committed,
+        )
+
+    def _correct_dspark_seq_lens(self, batch: DecodeBatch) -> torch.Tensor:
+        """Replace optimistic scheduler lengths with committed DSpark lengths."""
+        corrected = batch.seq_lens[: len(batch.request_ids)].detach().cpu().to(torch.int32).clone()
+        for index, request_id in enumerate(batch.request_ids):
+            state = self._dspark_request_states.get(request_id)
+            if state is not None:
+                corrected[index] = state.committed_seq_len
+        return corrected
+
+    def _run_dspark_speculative_decode(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+    ) -> list[list[int]]:
+        """Verify initialized DSpark drafts and advance eligible requests."""
+        actual_batch = len(batch.request_ids)
+        num_drafts = self._dspark_draft_count(model, batch)
+        if num_drafts < self._compiled.num_speculative_tokens:
+            waves = self._dspark_partial_decode_waves(batch)
+            if waves:
+                accepted: list[list[int] | None] = [None] * actual_batch
+                for wave in waves:
+                    wave_accepted = self._run_dspark_speculative_decode(
+                        model,
+                        self._select_decode_batch_rows(batch, wave),
+                    )
+                    for request_index, tokens in zip(wave, wave_accepted, strict=True):
+                        accepted[request_index] = tokens
+                if any(tokens is None for tokens in accepted):
+                    raise RuntimeError("DeepSeekV4 DSpark partial decode lost a request")
+                return [tokens for tokens in accepted if tokens is not None]
+
+        drafts = []
+        for request_id in batch.request_ids:
+            state = self._dspark_request_states.get(request_id)
+            if state is None or state.draft_token_ids is None:
+                raise RuntimeError(
+                    f"DeepSeekV4 DSpark drafts are not initialized for {request_id!r}"
+                )
+            drafts.append(state.draft_token_ids[:num_drafts].to(torch.long))
+        draft_rows = torch.stack(drafts)
+        current = batch.token_ids.detach().cpu().to(torch.long)
+        if current.ndim == 1:
+            current = current[:actual_batch].view(actual_batch, 1)
+        else:
+            current = current[:actual_batch, :1]
+        token_rows = torch.cat((current, draft_rows), dim=1)
+        active_width = token_rows.shape[1]
+        width = self._compiled.layout.decode_seq
+        if active_width > width:
+            raise RuntimeError("DSpark target verification exceeds the compiled decode width")
+        positions = tuple(
+            tuple(
+                int(batch.seq_lens[row].item()) - 1 + offset
+                for offset in range(active_width)
+            )
+            for row in range(actual_batch)
+        )
+        if active_width < width:
+            token_rows = torch.cat(
+                (token_rows, token_rows[:, -1:].expand(-1, width - active_width)),
+                dim=1,
+            )
+            positions = tuple(
+                row + (row[-1],) * (width - active_width)
+                for row in positions
+            )
+        prepared = self.prepare_mtp_target_inputs(
+            model,
+            batch,
+            token_rows=token_rows,
+            positions=positions,
+            active_width=active_width,
+        )
+        output = self._execute_main_decode(
+            model,
+            prepared,
+            active_seq=active_width,
+        )
+        main_rows = []
+        for rank, local_row in zip(
+            prepared.ranks,
+            prepared.local_rows,
+            strict=True,
+        ):
+            start = local_row * self._compiled.layout.decode_seq
+            main_rows.append(
+                output.sampled_ids[
+                    rank,
+                    start : start + active_width,
+                    0,
+                ].to(torch.long)
+            )
+        main_token_ids = torch.stack(main_rows)
+        if num_drafts:
+            accepted = accept_mtp_tokens(main_token_ids, draft_rows)
+        else:
+            accepted = [[int(token)] for token in main_token_ids[:, 0]]
+        for row, seq_len in enumerate(batch.seq_lens[:actual_batch]):
+            remaining_outputs = max(0, model.runtime.max_seq_len - int(seq_len))
+            accepted[row] = accepted[row][:remaining_outputs]
+            if not accepted[row]:
+                raise RuntimeError("DeepSeekV4 DSpark decode has no remaining output position")
+        self._advance_dspark_after_decode(
+            batch,
+            output,
+            accepted,
+            max_seq_len=model.runtime.max_seq_len,
+        )
+        return accepted
+
+    def _run_dspark_target_only_decode(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+    ) -> list[list[int]]:
+        """Run one target token after a request can no longer fit seven drafts."""
+        actual_batch = len(batch.request_ids)
+        waves = self._dspark_partial_decode_waves(batch)
+        if waves:
+            accepted: list[list[int] | None] = [None] * actual_batch
+            for wave in waves:
+                wave_accepted = self._run_dspark_target_only_decode(
+                    model,
+                    self._select_decode_batch_rows(batch, wave),
+                )
+                for request_index, tokens in zip(wave, wave_accepted, strict=True):
+                    accepted[request_index] = tokens
+            if any(tokens is None for tokens in accepted):
+                raise RuntimeError("DeepSeekV4 DSpark target-only decode lost a request")
+            return [tokens for tokens in accepted if tokens is not None]
+
+        current = batch.token_ids.detach().cpu().to(torch.long)
+        if current.ndim == 1:
+            current = current[:actual_batch].view(actual_batch, 1)
+        else:
+            current = current[:actual_batch, :1]
+        width = self._compiled.layout.decode_seq
+        current = current.expand(-1, width).contiguous()
+        positions = tuple(
+            (int(batch.seq_lens[row].item()) - 1,) * width
+            for row in range(actual_batch)
+        )
+        prepared = self.prepare_mtp_target_inputs(
+            model,
+            batch,
+            token_rows=current,
+            positions=positions,
+            active_width=1,
+        )
+        output = self._execute_main_decode(model, prepared, active_seq=1)
+        return [
+            [int(output.sampled_ids[rank, local_row * self._compiled.layout.decode_seq, 0])]
+            for rank, local_row in zip(
+                prepared.ranks,
+                prepared.local_rows,
+                strict=True,
+            )
+        ]
+
+    def _dspark_draft_count(self, model: RuntimeModel, batch: DecodeBatch) -> int:
+        """Cap DSpark verification at the shortest remaining KV context."""
+        remaining_context = min(
+            model.runtime.max_seq_len - int(seq_len)
+            for seq_len in batch.seq_lens[: len(batch.request_ids)]
+        )
+        return min(self._compiled.num_speculative_tokens, max(0, remaining_context))
+
+    def _dspark_partial_decode_waves(
+        self,
+        batch: DecodeBatch,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Serialize partial-width requests that share one physical Query rank."""
+        assignment = self._decode_assignment(batch)
+        wave_count = max(assignment.per_rank_counts)
+        if wave_count <= 1:
+            return ()
+        return tuple(
+            tuple(
+                request_indices[wave]
+                for request_indices in assignment.indices_by_rank
+                if wave < len(request_indices)
+            )
+            for wave in range(wave_count)
+        )
+
+    def _advance_dspark_after_decode(
+        self,
+        batch: DecodeBatch,
+        output: _DeepSeekV4MainDecodeOutput,
+        accepted_token_ids: Sequence[Sequence[int]],
+        *,
+        max_seq_len: int,
+    ) -> None:
+        """Compact accepted target context, then propose the next DSpark block."""
+        drafter = self._dspark_drafter_task_args
+        markov = self._dspark_markov_task_args
+        host_target = self._dspark_compact_target_host
+        if drafter is None or markov is None or host_target is None:
+            raise RuntimeError("DeepSeekV4 DSpark buffers are not staged")
+        source = output.hidden
+        if not isinstance(source, StackedDeviceTensor):
+            raise RuntimeError("DeepSeekV4 DSpark target hidden must remain device-resident")
+        layout = self._compiled.layout
+        ranks = layout.ranks
+        batch_per_rank = DEEPSEEK_V4_DSPARK_DECODE_BATCH_PER_RANK
+        width = int(host_target.shape[-1])
+        row_bytes = width * host_target.element_size()
+        advancing = []
+        for request_index, (rank, local_row, accepted) in enumerate(
+            zip(
+                output.inputs.ranks,
+                output.inputs.local_rows,
+                accepted_token_ids,
+                strict=True,
+            )
+        ):
+            owner = self._dspark_request_owners[batch.request_ids[request_index]]
+            if owner.rank != rank:
+                raise RuntimeError("DeepSeekV4 DSpark Query owner changed during decode")
+            next_context_len = int(batch.seq_lens[request_index]) + len(accepted)
+            if next_context_len + self._compiled.num_speculative_tokens <= max_seq_len:
+                advancing.append((request_index, rank, local_row, owner.local_row, accepted))
+            else:
+                state = self._dspark_request_states[batch.request_ids[request_index]]
+                state.draft_token_ids = None
+        if not advancing:
+            self._dspark_target_hidden_arg = None
+            return
+
+        cursors = [0] * ranks
+        worker = self._shared_l3_worker()
+        for request_index, rank, local_row, _, accepted in advancing:
+            count = len(accepted)
+            if count <= 0 or count > layout.decode_seq:
+                raise RuntimeError(f"invalid DSpark accepted count {count}")
+            cursor = cursors[rank]
+            source_row = int(local_row) * layout.decode_seq
+            worker.copy_from(
+                host_target[rank, cursor].data_ptr(),
+                source.shards[rank].data_ptr + source_row * row_bytes,
+                count * row_bytes,
+                worker_id=rank,
+            )
+            cursors[rank] += count
+        context_tokens = max(max(cursors), 1)
+        if context_tokens > layout.decode_tokens:
+            raise RuntimeError("DSpark compact target context exceeds the decode buffer")
+        for rank, used in enumerate(cursors):
+            if used < context_tokens:
+                host_target[rank, used:context_tokens].zero_()
+
+        compact_storage = self._materialize_dspark_compact_target_hidden()
+        compact_shards = []
+        for rank, shard in enumerate(compact_storage.shards):
+            source_rows = host_target[rank, :context_tokens]
+            worker.copy_to(
+                shard.data_ptr,
+                source_rows.data_ptr(),
+                source_rows.numel() * source_rows.element_size(),
+                worker_id=rank,
+            )
+            compact_shards.append(
+                DeviceTensor(
+                    shard.data_ptr,
+                    (context_tokens, width),
+                    shard.dtype,
+                )
+            )
+        self._dspark_target_hidden_arg = StackedDeviceTensor(
+            tuple(compact_shards),
+            (ranks, context_tokens, width),
+            compact_storage.worker_ids,
+        )
+
+        num_sampled = torch.zeros((ranks, batch_per_rank), dtype=torch.int32)
+        last_sampled = torch.zeros((ranks, batch_per_rank), dtype=torch.int64)
+        next_prefill = torch.zeros((ranks, batch_per_rank), dtype=torch.int64)
+        anchor_positions = torch.zeros((ranks, batch_per_rank), dtype=torch.int32)
+        context_positions = torch.zeros((ranks, context_tokens), dtype=torch.int32)
+        context_slots = torch.empty(
+            (ranks, DEEPSEEK_V4_DSPARK_DRAFT_LAYERS, context_tokens),
+            dtype=torch.int64,
+        )
+        block_tables = torch.empty_like(drafter.tensors["block_tables"])
+        scratch_base = self._cache_group_num_blocks["ori"]
+        for rank in range(ranks):
+            for row in range(batch_per_rank):
+                block_tables[rank, :, row].fill_(scratch_base + row)
+            context_slots[rank].fill_(scratch_base * layout.block_size)
+
+        active_groups = self._normalize_group_block_ids(
+            batch.block_ids_by_group,
+            len(batch.request_ids),
+        )
+        rank_cursors = [0] * ranks
+        for request_index, rank, _, draft_row, accepted in advancing:
+            count = len(accepted)
+            start_position = int(batch.seq_lens[request_index].item()) - 1
+            positions = tuple(start_position + offset for offset in range(count))
+            block_ids = active_groups[request_index]["ori"]
+            slots = self.cache_metadata.slot_mapping_from_ids(
+                (block_ids,),
+                (positions,),
+                block_size=layout.block_size,
+            )[0]
+            cursor = rank_cursors[rank]
+            context_positions[rank, cursor : cursor + count] = torch.tensor(
+                positions,
+                dtype=torch.int32,
+            )
+            context_slots[rank, :, cursor : cursor + count].copy_(
+                slots.view(1, -1).expand(DEEPSEEK_V4_DSPARK_DRAFT_LAYERS, -1)
+            )
+            rank_cursors[rank] += count
+            num_sampled[rank, draft_row] = count
+            last_sampled[rank, draft_row] = int(accepted[-1])
+            anchor_positions[rank, draft_row] = start_position + count
+            table = self.cache_metadata.ring_block_table_from_ids(
+                (block_ids,),
+                max_blocks=block_tables.shape[-1],
+            )[0]
+            block_tables[rank, :, draft_row].copy_(
+                table.view(1, -1).expand(DEEPSEEK_V4_DSPARK_DRAFT_LAYERS, -1)
+            )
+
+        drafter.stage_for_context_tokens(
+            {
+                "num_sampled": num_sampled,
+                "last_sampled": last_sampled,
+                "next_prefill_tokens": next_prefill,
+                "context_position_ids": context_positions,
+                "context_slot_mapping": context_slots,
+                "anchor_positions": anchor_positions,
+                "block_tables": block_tables,
+            },
+            context_tokens,
+        )
+        self._run_l3(
+            self._require_dspark_drafter_callable(),
+            *drafter.build_for_context_tokens(context_tokens),
+        )
+        markov.clear_outputs()
+        logit_rows = markov.tensors["logit_row_indices"]
+        logit_rows.fill_(-1)
+        active_rows = batch_per_rank * self._compiled.num_speculative_tokens
+        logit_rows[:, :active_rows] = torch.arange(active_rows, dtype=torch.int32)
+        markov.stage(
+            {
+                "num_sampled": num_sampled,
+                "last_sampled": last_sampled,
+                "next_prefill_tokens": next_prefill,
+            }
+        )
+        self._run_l3(
+            self._require_dspark_markov_callable(),
+            *markov.build(),
+        )
+        for request_index, rank, _, draft_row, _ in advancing:
+            request_id = batch.request_ids[request_index]
+            state = self._dspark_request_states[request_id]
+            state.draft_token_ids = markov.tensors["draft_token_ids"][
+                rank,
+                draft_row,
+            ].clone()
+        self._dspark_target_hidden_arg = None
 
     def _verify_mtp_drafts(
         self,
@@ -2540,7 +3776,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         if self._compiled.num_speculative_tokens != 1:
             raise RuntimeError("split decode dispatch requires fused DeepSeekV4 K=1 MTP")
         if not batch.allow_device_greedy_sampling:
-            raise RuntimeError("DeepSeekV4 MTP decode currently requires greedy device sampling")
+            raise RuntimeError("DeepSeekV4 fused MTP decode requires device sampling")
         if prepared is None:
             with profile_span(
                 "DeepSeekV4ModelRunner.decode.prepare_inputs_fallback",
@@ -2675,7 +3911,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
     ) -> DecodeResult:
         """Generate and verify the configured number of request-local MTP drafts."""
         if not batch.allow_device_greedy_sampling:
-            raise RuntimeError("DeepSeekV4 MTP decode currently requires greedy device sampling")
+            raise RuntimeError("DeepSeekV4 standalone MTP decode requires device sampling")
         batch = replace(batch, seq_lens=self._correct_mtp_seq_lens(batch))
         num_drafts = self._mtp_draft_count(model, batch)
         drafts = self._propose_mtp_tokens(model, batch, num_drafts=num_drafts)
@@ -2774,7 +4010,11 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 "DeepSeekV4 packed decode dispatch failed "
                 f"(actual_batch={inputs.actual_batch}, ranks={inputs.ranks})"
             ) from exc
-        hidden_buffer = ta.tensors["hidden_out"]
+        hidden_buffer = ta.tensors[
+            "target_hidden"
+            if self._compiled.speculative_method == "dspark"
+            else "hidden_out"
+        ]
 
         captured_pre_hc: torch.Tensor | StackedDeviceTensor = ta.tensors["pre_hc_hidden_out"]
         if self._compiled.mtp_decode is not None:
@@ -2801,7 +4041,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
     @staticmethod
     def _ignore_prefill_context(
         inputs: DeepSeekV4PreparedPrefillInputs,
-        pre_hc_hidden: torch.Tensor,
+        pre_hc_hidden: torch.Tensor | StackedDeviceTensor,
     ) -> None:
         """Ignore main-prefill intermediates in autoregressive mode."""
         return None
@@ -2993,6 +4233,16 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             raise RuntimeError("DeepSeekV4 decode kernel is not compiled")
         return self._compiled.decode
 
+    def _require_dspark_drafter_callable(self) -> DeepSeekV4L3Callable:
+        if self._compiled.dspark_drafter is None:
+            raise RuntimeError("DeepSeekV4 DSpark drafter kernel is not compiled")
+        return self._compiled.dspark_drafter
+
+    def _require_dspark_markov_callable(self) -> DeepSeekV4L3Callable:
+        if self._compiled.dspark_markov is None:
+            raise RuntimeError("DeepSeekV4 DSpark Markov kernel is not compiled")
+        return self._compiled.dspark_markov
+
     def _ensure_l3_shared_buffers(self, model: RuntimeModel) -> None:
         """Allocate every CPU tensor visible to the L3 worker before it forks.
 
@@ -3008,10 +4258,15 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         with profile_span("DeepSeekV4ModelRunner.prepare.prepare_rope_tables", cat="executor"):
             self._static_freqs_cos_tensor()
             self._static_freqs_sin_tensor()
+            if self._compiled.speculative_method == "dspark":
+                self._static_dspark_freqs_cos_tensor()
+                self._static_dspark_freqs_sin_tensor()
         with profile_span("DeepSeekV4ModelRunner.prepare.allocate_decode_buffers", cat="executor"):
             self._ensure_decode_buffers(model.config.hidden_size, model.config.vocab_size)
         with profile_span("DeepSeekV4ModelRunner.prepare.allocate_mtp_buffers", cat="executor"):
             self._ensure_mtp_buffers(model.config.hidden_size)
+        with profile_span("DeepSeekV4ModelRunner.prepare.allocate_dspark_buffers", cat="executor"):
+            self._ensure_dspark_buffers(model.config.hidden_size)
         with profile_span("DeepSeekV4ModelRunner.prepare.prepare_final_norm", cat="executor"):
             self._static_final_norm_weight_tensor()
         with profile_span("DeepSeekV4ModelRunner.prepare.prepare_lm_head", cat="executor"):
@@ -3058,7 +4313,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
     def _device_cache_values(self) -> dict[str, StackedDeviceTensor]:
         """Return the unified worker-resident cache pools by kernel argument name."""
         cache = self._materialize_decode_device_cache()
-        return {
+        values = {
             "kv_cache": cache.kv_cache,
             "hca_cmp_kv": cache.hca_cmp_kv,
             "csa_cmp_kv": cache.csa_cmp_kv,
@@ -3068,6 +4323,15 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             "csa_compress_state": cache.csa_compress_state,
             "csa_inner_compress_state": cache.csa_inner_compress_state,
         }
+        if self._compiled.speculative_method == "dspark":
+            values.update(
+                {
+                    "raw_kv_pool": cache.kv_cache,
+                    "csa_idx_kv_cache": cache.idx_kv_cache,
+                    "csa_idx_kv_scale": cache.idx_kv_scale,
+                }
+            )
+        return values
 
     def _mtp_prefill_args(self) -> tuple[Any, ...]:
         """Build the single packed ``l3_mtp_prefill`` argument tuple from the prefill TaskArgs."""
@@ -3373,6 +4637,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 )
             )
             mtp_slots["logit_row_indices"].fill_(-1)
+            mtp_slots["sampling_temperatures"].zero_()
+            mtp_slots["sampling_top_ks"].fill_(DEEPSEEK_V4_VOCAB_SIZE)
+            mtp_slots["sampling_seeds"].zero_()
+            mtp_slots["sampling_positions"].zero_()
             for rank, request_index in wave_items:
                 mtp_slots["input_ids"][rank, 0] = int(token_ids[request_index])
                 mtp_slots["position_ids"][rank, 0] = int(positions[request_index])
@@ -3380,6 +4648,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                     previous_hidden[request_index]
                 )
                 mtp_slots["logit_row_indices"][rank, 0] = 0
+                mtp_slots["sampling_positions"][rank, 0] = int(positions[request_index]) + 1
             mtp_slots["hidden_states"].copy_(
                 self._embedding_rows(
                     mtp_slots["input_ids"].reshape(-1),
@@ -3544,6 +4813,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         request_id: str,
         state: _DeepSeekV4MtpRequestState,
         first_token_id: int,
+        sampling_params: SamplingParams | None = None,
     ) -> None:
         context = state.prefill_context
         if context is None:
@@ -3573,7 +4843,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         )
         state.tail_position = context.position_id
         state.prompt_len = context.prompt_len
-        self._initialize_mtp_device_state(state)
+        self._initialize_mtp_device_state(state, request_id, sampling_params)
         state.prefill_context = None
 
     def _write_mtp_tail_hidden(
@@ -3601,7 +4871,12 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             worker_id=rank,
         )
 
-    def _initialize_mtp_device_state(self, state: _DeepSeekV4MtpRequestState) -> None:
+    def _initialize_mtp_device_state(
+        self,
+        state: _DeepSeekV4MtpRequestState,
+        request_id: str,
+        sampling_params: SamplingParams | None = None,
+    ) -> None:
         """Seed one stable device slot after the first MTP draft is available."""
         if state.device_state_initialized:
             return
@@ -3627,6 +4902,19 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         meta_row[_MTP_STATE_GENERATION] = state.generation
         meta_row[_MTP_STATE_TAIL_POSITION] = state.tail_position
         meta_row[_MTP_STATE_COMMITTED_COUNT] = state.committed_count
+        params = sampling_params or SamplingParams(temperature=0.0, top_p=1.0, top_k=None)
+        top_k = params.top_k
+        if top_k is None or top_k <= 0:
+            top_k = DEEPSEEK_V4_VOCAB_SIZE
+        meta_row[_MTP_STATE_TEMPERATURE_MICROS] = min(
+            round(max(float(params.temperature), 0.0) * _MTP_TEMPERATURE_SCALE),
+            _MTP_MAX_TEMPERATURE_MICROS,
+        )
+        meta_row[_MTP_STATE_TOP_K] = min(int(top_k), DEEPSEEK_V4_VOCAB_SIZE)
+        seed = params.seed
+        if seed is None:
+            seed = zlib.crc32(request_id.encode())
+        meta_row[_MTP_STATE_SEED] = int(seed) & 0x3FFFFFFF
         worker = self._shared_l3_worker()
         for device_tensor, source in (
             (self._materialize_mtp_device_state_tokens(), token_row),
@@ -3717,6 +5005,27 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             raise RuntimeError("DeepSeekV4 stacked decode weights are not available")
         return DeepSeekV4StackedLayerWeights(tensors=tensors)
 
+    def _require_dspark_weights(self) -> DeepSeekV4DSparkWeights:
+        tensors = self._dspark_device_weights or self._dspark_host_weights
+        if tensors is None:
+            raise RuntimeError("DeepSeekV4 DSpark weights are not available")
+        return DeepSeekV4DSparkWeights(tensors=tensors)
+
+    def _require_dspark_target_hidden(self) -> StackedDeviceTensor:
+        target_hidden = self._dspark_target_hidden_arg
+        if target_hidden is None:
+            raise RuntimeError("DeepSeekV4 DSpark target hidden is not bound")
+        return target_hidden
+
+    def _require_dspark_head_hidden(self) -> StackedDeviceTensor:
+        task_args = self._dspark_drafter_task_args
+        if task_args is None:
+            raise RuntimeError("DeepSeekV4 DSpark drafter TaskArgs are not staged")
+        head_hidden = task_args.tensors.get("head_hidden")
+        if not isinstance(head_hidden, StackedDeviceTensor):
+            raise RuntimeError("DeepSeekV4 DSpark head hidden is not device-resident")
+        return head_hidden
+
     def _ensure_decode_buffers(self, hidden_size: int, vocab_size: int = DEEPSEEK_V4_VOCAB_SIZE) -> None:
         """Allocate the decode TaskArgs (host-shared slots) and MTP reclaim slots.
 
@@ -3761,7 +5070,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._compiled.mtp_prefill is not None
             and self._compiled.mtp_decode is not None
         )
-        if self._compiled.num_speculative_tokens or legacy_mtp:
+        if (
+            self._compiled.speculative_method != "dspark"
+            and (self._compiled.num_speculative_tokens or legacy_mtp)
+        ):
             self._mtp_decode_task_args = []
             for slot in (0, 1):
                 mtp_ta = mtp_decode_task_args(
@@ -3792,11 +5104,12 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         # the host (``copy_stacked_from`` cannot target an offset device pointer),
         # so one ping-pong-independent shared buffer holds the D2H readback.  It is
         # not a kernel argument and therefore lives outside the decode TaskArgs.
-        self._main_pre_hc_host_mirror = shared_empty(
-            (ranks, layout.decode_tokens, layout.hc_mult, int(hidden_size)),
-            torch.float32,
-            name="decode_main_pre_hc_host_mirror",
-        )
+        if self._compiled.speculative_method != "dspark":
+            self._main_pre_hc_host_mirror = shared_empty(
+                (ranks, layout.decode_tokens, layout.hc_mult, int(hidden_size)),
+                torch.float32,
+                name="decode_main_pre_hc_host_mirror",
+            )
 
     def _require_main_pre_hc_host_mirror(self) -> torch.Tensor:
         """Return the host mirror used for the arbitrary-depth pre-HC readback."""
@@ -3806,6 +5119,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
 
     def _ensure_mtp_buffers(self, hidden_size: int) -> _DeepSeekV4MtpSharedBuffers | None:
         """Load immutable MTP weights and allocate mutable shared buffers before worker fork."""
+        if self._compiled.speculative_method == "dspark":
+            return None
         legacy_mtp = (
             self._compiled.mtp_prefill is not None
             and self._compiled.mtp_decode is not None
@@ -3866,6 +5181,40 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         self._mtp_buffers.prefill_kv_cache.zero_()
         return self._mtp_buffers
 
+    def _ensure_dspark_buffers(self, hidden_size: int) -> None:
+        """Load DSpark weights and allocate its host-visible dispatch slots."""
+        if self._compiled.speculative_method != "dspark":
+            return
+        if self._dspark_drafter_task_args is not None:
+            return
+        self._ensure_shared_host_allocation_before_worker("DSpark buffers")
+        loaded = self.load_dspark_weights()
+        self._dspark_host_weights = dict(loaded.tensors)
+        from pypto_serving.model.deepseek.task_args import (  # noqa: PLC0415
+            dspark_drafter_task_args,
+            dspark_markov_task_args,
+        )
+
+        self._dspark_drafter_task_args = dspark_drafter_task_args(
+            self,
+            int(hidden_size),
+        )
+        self._dspark_markov_task_args = dspark_markov_task_args(
+            self,
+            int(hidden_size),
+        )
+        self._dspark_drafter_task_args.allocate_host_shared(None)
+        self._dspark_markov_task_args.allocate_host_shared(None)
+        self._dspark_compact_target_host = shared_empty(
+            (
+                self._compiled.layout.ranks,
+                self._compiled.layout.decode_tokens,
+                DEEPSEEK_V4_DSPARK_TARGET_HIDDEN_MULT * int(hidden_size),
+            ),
+            torch.bfloat16,
+            name="dspark_compact_target_hidden",
+        )
+
     def _stage_prefill_fwd_inputs(self, inputs: DeepSeekV4PreparedPrefillInputs) -> None:
         """Copy one prefill chunk's mutable metadata into shared host buffers.
 
@@ -3880,24 +5229,43 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         values = {
             "x_hc": inputs.x_hc,
             "ori_block_table": inputs.ori_block_table,
-            "ori_slot_mapping": inputs.ori_slot_mapping,
             "hca_cmp_block_table": inputs.hca_cmp_block_table,
             "csa_cmp_block_table": inputs.csa_cmp_block_table,
             "idx_block_table": inputs.idx_block_table,
-            "position_ids": inputs.position_ids,
-            "hca_cmp_slot_mapping": inputs.hca_cmp_slot_mapping,
-            "hca_state_slot_mapping": inputs.hca_state_slot_mapping,
-            "csa_cmp_slot_mapping": inputs.csa_cmp_slot_mapping,
-            "csa_idx_slot_mapping": inputs.csa_idx_slot_mapping,
-            "csa_state_slot_mapping": inputs.csa_state_slot_mapping,
-            "csa_inner_state_slot_mapping": inputs.csa_inner_state_slot_mapping,
             "input_ids": inputs.input_ids,
             "hca_compress_state_block_table": inputs.hca_compress_state_block_table,
             "csa_compress_state_block_table": inputs.csa_compress_state_block_table,
             "csa_inner_compress_state_block_table": inputs.csa_inner_compress_state_block_table,
-            "num_tokens_per_owner": inputs.num_tokens_per_owner,
             "logit_row_indices": inputs.logit_row_indices,
         }
+        if self._compiled.speculative_method == "dspark":
+            values.update(
+                {
+                    "ori_slot_mapping_full": inputs.ori_slot_mapping,
+                    "position_ids_local": inputs.position_ids,
+                    "position_ids_full": inputs.position_ids_full,
+                    "hca_cmp_slot_mapping_full": inputs.hca_cmp_slot_mapping,
+                    "hca_state_slot_mapping_full": inputs.hca_state_slot_mapping,
+                    "csa_cmp_slot_mapping_full": inputs.csa_cmp_slot_mapping,
+                    "csa_idx_slot_mapping_full": inputs.csa_idx_slot_mapping,
+                    "csa_state_slot_mapping_full": inputs.csa_state_slot_mapping,
+                    "csa_inner_state_slot_mapping_full": inputs.csa_inner_state_slot_mapping,
+                }
+            )
+        else:
+            values.update(
+                {
+                    "ori_slot_mapping": inputs.ori_slot_mapping,
+                    "position_ids": inputs.position_ids,
+                    "hca_cmp_slot_mapping": inputs.hca_cmp_slot_mapping,
+                    "hca_state_slot_mapping": inputs.hca_state_slot_mapping,
+                    "csa_cmp_slot_mapping": inputs.csa_cmp_slot_mapping,
+                    "csa_idx_slot_mapping": inputs.csa_idx_slot_mapping,
+                    "csa_state_slot_mapping": inputs.csa_state_slot_mapping,
+                    "csa_inner_state_slot_mapping": inputs.csa_inner_state_slot_mapping,
+                    "num_tokens_per_owner": inputs.num_tokens_per_owner,
+                }
+            )
         ta.stage_for_tokens(values, inputs.kernel_tokens)
 
     def _retain_stacked_host_weights(
@@ -3986,6 +5354,34 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._static_freqs_sin = self._static_device_tensor(self._rank_stack(self._compiled.freqs_sin))
         return self._static_freqs_sin
 
+    def _static_dspark_freqs_cos_tensor(self) -> torch.Tensor:
+        """Return the DSpark drafter's profile-0 RoPE table per rank."""
+        if self._static_dspark_freqs_cos is None:
+            if self._compiled.freqs_cos is None:
+                raise RuntimeError("DeepSeekV4 RoPE cosine table is not initialized")
+            self._ensure_shared_host_allocation_before_worker("DSpark freqs_cos")
+            source = self._compiled.freqs_cos
+            if source.ndim == 3:
+                source = source[0]
+            self._static_dspark_freqs_cos = self._static_device_tensor(
+                self._rank_stack(source)
+            )
+        return self._static_dspark_freqs_cos
+
+    def _static_dspark_freqs_sin_tensor(self) -> torch.Tensor:
+        """Return the DSpark drafter's profile-0 sine table per rank."""
+        if self._static_dspark_freqs_sin is None:
+            if self._compiled.freqs_sin is None:
+                raise RuntimeError("DeepSeekV4 RoPE sine table is not initialized")
+            self._ensure_shared_host_allocation_before_worker("DSpark freqs_sin")
+            source = self._compiled.freqs_sin
+            if source.ndim == 3:
+                source = source[0]
+            self._static_dspark_freqs_sin = self._static_device_tensor(
+                self._rank_stack(source)
+            )
+        return self._static_dspark_freqs_sin
+
     @staticmethod
     def _int32_scalar(value: int) -> int:
         return int(value)
@@ -4024,13 +5420,24 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             # and a worker.alloc_tensor racing worker.run corrupts device state.
             for task_args in self._decode_task_args:
                 task_args.allocate_device(worker, None)
-            if self._compiled.num_speculative_tokens:
+            if self._prefill_task_args is not None:
+                self._prefill_task_args.allocate_device(worker, None)
+            if (
+                self._compiled.num_speculative_tokens
+                and self._compiled.speculative_method != "dspark"
+            ):
                 for task_args in self._mtp_decode_task_args:
                     task_args.allocate_device(worker, None)
                 self._materialize_mtp_tail_pre_hc_pool(hidden_size)
                 self._mtp_prefill_task_args.allocate_device(worker, None)
                 self._materialize_mtp_device_state_tokens()
                 self._materialize_mtp_device_state_meta()
+            if self._compiled.speculative_method == "dspark":
+                if self._dspark_drafter_task_args is None or self._dspark_markov_task_args is None:
+                    raise RuntimeError("DeepSeekV4 DSpark TaskArgs are not staged")
+                self._dspark_drafter_task_args.allocate_device(worker, None)
+                self._dspark_markov_task_args.allocate_device(worker, None)
+                self._materialize_dspark_compact_target_hidden()
         if self._stacked_device_weights is None:
             host_weights = self._stacked_host_weights
             if not host_weights:
@@ -4055,6 +5462,28 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             buffers.weights.clear()
             logger.info(
                 "DeepSeekV4 resident MTP weights uploaded; released_parent_host_bytes=%d",
+                parent_host_bytes,
+            )
+        dspark_host_weights = getattr(self, "_dspark_host_weights", None)
+        if (
+            dspark_host_weights is not None
+            and getattr(self, "_dspark_device_weights", None) is None
+        ):
+            parent_host_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in dspark_host_weights.values()
+            )
+            with profile_span(
+                "DeepSeekV4ModelRunner.upload_resident_dspark_weights",
+                cat="executor",
+            ):
+                self._dspark_device_weights = self._upload_weight_group(
+                    worker,
+                    dspark_host_weights,
+                )
+            self._dspark_host_weights = None
+            logger.info(
+                "DeepSeekV4 resident DSpark weights uploaded; released_parent_host_bytes=%d",
                 parent_host_bytes,
             )
         worker.release_inherited_host_tensor_refs()
@@ -4241,6 +5670,16 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         worker = self._shared_l3_worker()
         allocated: list[StackedDeviceTensor] = []
         layout = self._compiled.layout
+        hca_compressed_rows = (
+            layout.block_size
+            if layout.compressed_cache_uses_output_pages
+            else layout.block_size // 128
+        )
+        csa_compressed_rows = (
+            layout.block_size
+            if layout.compressed_cache_uses_output_pages
+            else layout.block_size // 4
+        )
 
         def resident(shape: tuple[int, ...], dtype: torch.dtype) -> StackedDeviceTensor:
             stacked = self._alloc_empty_stacked_tensor(shape, dtype)
@@ -4264,7 +5703,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                         layout.ranks,
                         DEEPSEEK_V4_HCA_NUM_LAYERS
                         * self._physical_cache_num_blocks("cmp_c128"),
-                        layout.block_size // 128,
+                        hca_compressed_rows,
                         1,
                         DEEPSEEK_V4_HEAD_DIM,
                     ),
@@ -4275,7 +5714,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                         layout.ranks,
                         DEEPSEEK_V4_CSA_NUM_LAYERS
                         * self._physical_cache_num_blocks("cmp_c4"),
-                        layout.block_size // 4,
+                        csa_compressed_rows,
                         1,
                         DEEPSEEK_V4_HEAD_DIM,
                     ),
@@ -4286,7 +5725,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                         layout.ranks,
                         DEEPSEEK_V4_CSA_NUM_LAYERS
                         * self._physical_cache_num_blocks("idx"),
-                        layout.block_size // 4,
+                        csa_compressed_rows,
                         1,
                         DEEPSEEK_V4_IDX_HEAD_DIM,
                     ),
@@ -4297,7 +5736,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                         layout.ranks,
                         DEEPSEEK_V4_CSA_NUM_LAYERS
                         * self._physical_cache_num_blocks("idx"),
-                        layout.block_size // 4,
+                        csa_compressed_rows,
                         1,
                         1,
                     ),
@@ -4341,6 +5780,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
 
     def _materialize_mtp_device_kv_cache(self) -> StackedDeviceTensor | None:
         """Materialize the optional MTP cache once for both MTP kernels."""
+        if self._compiled.speculative_method == "dspark":
+            return None
         cache = self._mtp_device_kv_cache
         if cache is not None:
             return cache
@@ -4361,11 +5802,46 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         self._mtp_device_kv_cache = cache
         return cache
 
+    def _materialize_dspark_device_kv_cache(self) -> StackedDeviceTensor | None:
+        """Materialize the three private DSpark drafter KV layers."""
+        if self._compiled.speculative_method != "dspark":
+            return None
+        cache = self._dspark_device_kv_cache
+        if cache is not None:
+            return cache
+        layout = self._compiled.layout
+        cache = self._alloc_empty_stacked_tensor(
+            (
+                layout.ranks,
+                DEEPSEEK_V4_DSPARK_DRAFT_LAYERS,
+                self._physical_cache_num_blocks("ori"),
+                layout.block_size,
+                1,
+                DEEPSEEK_V4_HEAD_DIM,
+            ),
+            torch.bfloat16,
+        )
+        self._dspark_device_kv_cache = cache
+        return cache
+
+    def _materialize_dspark_compact_target_hidden(self) -> StackedDeviceTensor:
+        """Allocate the serving-side compact context passed to the drafter."""
+        target = self._dspark_compact_target_device
+        if target is not None:
+            return target
+        host = self._dspark_compact_target_host
+        if host is None:
+            raise RuntimeError("DeepSeekV4 DSpark compact target Host storage is not staged")
+        target = self._alloc_empty_stacked_tensor(tuple(host.shape), host.dtype)
+        self._dspark_compact_target_device = target
+        return target
+
     def _free_device_caches(self) -> None:
         worker = self._l3_worker
         if worker is None:
             self._decode_device_cache = None
             self._mtp_device_kv_cache = None
+            self._dspark_device_kv_cache = None
             return
         cache = self._decode_device_cache
         if cache is not None:
@@ -4382,8 +5858,14 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 worker.free_stacked_tensor(tensor)
         if self._mtp_device_kv_cache is not None:
             worker.free_stacked_tensor(self._mtp_device_kv_cache)
+        if self._dspark_device_kv_cache is not None:
+            worker.free_stacked_tensor(self._dspark_device_kv_cache)
+        if self._dspark_compact_target_device is not None:
+            worker.free_stacked_tensor(self._dspark_compact_target_device)
         self._decode_device_cache = None
         self._mtp_device_kv_cache = None
+        self._dspark_device_kv_cache = None
+        self._dspark_compact_target_device = None
 
     @staticmethod
     def _static_device_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -4409,6 +5891,21 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._mtp_device_state_meta = None
             self._l3_shared_buffers_ready = False
             self._mtp_device_weights = None
+            self._dspark_host_weights = None
+            self._dspark_device_weights = None
+            self._dspark_target_hidden_arg = None
+            self._dspark_compact_target_host = None
+            self._dspark_compact_target_device = None
+            self._dspark_pending_prefill = None
+            self._dspark_request_states.clear()
+            self._dspark_request_owners.clear()
+            self._dspark_owner_counts = [0] * self._compiled.layout.ranks
+            self._dspark_free_rows = [
+                list(range(self._compiled.layout.decode_batch - 1, -1, -1))
+                for _ in range(self._compiled.layout.ranks)
+            ]
+            self._static_dspark_freqs_cos = None
+            self._static_dspark_freqs_sin = None
             if self._mtp_prefill_task_args is not None:
                 self._mtp_prefill_task_args.close()
                 self._mtp_prefill_task_args = None
@@ -4416,6 +5913,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._global_weights = None
             self._decode_device_cache = None
             self._mtp_device_kv_cache = None
+            self._dspark_device_kv_cache = None
             self._main_pre_hc_host_mirror = None
             self._mtp_request_states.clear()
             self._l3_static_tensors.clear()
@@ -4425,6 +5923,12 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             for task_args in self._mtp_decode_task_args:
                 task_args.close()
             self._mtp_decode_task_args = []
+            if self._dspark_drafter_task_args is not None:
+                self._dspark_drafter_task_args.close()
+                self._dspark_drafter_task_args = None
+            if self._dspark_markov_task_args is not None:
+                self._dspark_markov_task_args.close()
+                self._dspark_markov_task_args = None
             self._decode_input_slots = []
             if self._prefill_task_args is not None:
                 self._prefill_task_args.close()
@@ -4477,6 +5981,72 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             result[int(rank)].copy_(tensor)
         return result.contiguous()
 
+    def _tp_group_replicate(
+        self,
+        tensors: Sequence[torch.Tensor],
+        *,
+        partitions: Sequence[int],
+        tp_size: int,
+        inactive_fill: int | None = None,
+    ) -> torch.Tensor:
+        """Replicate one request tensor to all physical ranks in its TP group."""
+        if not tensors or len(tensors) != len(partitions):
+            raise ValueError("TP-group tensors and partitions must be non-empty and aligned")
+        reference = tensors[0]
+        if any(tensor.shape != reference.shape or tensor.dtype != reference.dtype for tensor in tensors):
+            raise ValueError("TP-group tensors must have identical shapes and dtypes")
+        if inactive_fill is None:
+            result = reference.unsqueeze(0).expand(
+                self._compiled.layout.ranks,
+                *reference.shape,
+            ).clone()
+        else:
+            result = torch.full(
+                (self._compiled.layout.ranks, *reference.shape),
+                inactive_fill,
+                dtype=reference.dtype,
+            )
+        for partition, tensor in zip(partitions, tensors, strict=True):
+            group_base = int(partition) * tp_size
+            group_end = group_base + tp_size
+            if group_base < 0 or group_end > self._compiled.layout.ranks:
+                raise ValueError(f"TP-group partition {partition} is out of range")
+            result[group_base:group_end].copy_(tensor.unsqueeze(0).expand(tp_size, *tensor.shape))
+        return result.contiguous()
+
+    def _tp_group_scatter_tokens(
+        self,
+        tensors: Sequence[torch.Tensor],
+        *,
+        partitions: Sequence[int],
+        tp_size: int,
+    ) -> torch.Tensor:
+        """Give every TP rank its contiguous quarter of a group-full token tensor."""
+        if not tensors or len(tensors) != len(partitions):
+            raise ValueError("TP token tensors and partitions must be non-empty and aligned")
+        reference = tensors[0]
+        if reference.ndim < 1 or reference.shape[0] % tp_size != 0:
+            raise ValueError("TP token tensor extent must be divisible by TP size")
+        if any(tensor.shape != reference.shape or tensor.dtype != reference.dtype for tensor in tensors):
+            raise ValueError("TP token tensors must have identical shapes and dtypes")
+        local_tokens = reference.shape[0] // tp_size
+        result = torch.empty(
+            (self._compiled.layout.ranks, local_tokens, *reference.shape[1:]),
+            dtype=reference.dtype,
+        )
+        filler = reference.reshape(tp_size, local_tokens, *reference.shape[1:])
+        for rank in range(self._compiled.layout.ranks):
+            result[rank].copy_(filler[rank % tp_size])
+        for partition, tensor in zip(partitions, tensors, strict=True):
+            group_base = int(partition) * tp_size
+            group_end = group_base + tp_size
+            if group_base < 0 or group_end > self._compiled.layout.ranks:
+                raise ValueError(f"TP token partition {partition} is out of range")
+            result[group_base:group_end].copy_(
+                tensor.reshape(tp_size, local_tokens, *tensor.shape[1:])
+            )
+        return result.contiguous()
+
     def _prefill_active_token_limit(self, runtime: RuntimeConfig | None) -> int:
         """Return the configured active-token limit for one main-prefill call."""
         limits = [DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS]
@@ -4522,6 +6092,27 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 f"{DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS} rows, got {kernel_tokens}"
             )
         return kernel_tokens
+
+    def _dspark_prefill_kernel_tokens(
+        self,
+        actual_tokens: int,
+        *,
+        runtime: RuntimeConfig | None = None,
+    ) -> int:
+        """Round one TP group's active prompt to the DSpark 128-row MoE wave."""
+        if actual_tokens <= 0:
+            raise ValueError("DSpark prefill actual_tokens must be positive")
+        active_limit = min(
+            self._prefill_active_token_limit(runtime),
+            DEEPSEEK_V4_DSPARK_PREFILL_GROUP_TOKENS,
+        )
+        if actual_tokens > active_limit:
+            raise ValueError(
+                f"DeepSeekV4 DSpark prefill received {actual_tokens} active tokens; "
+                f"the TP-group limit is {active_limit}"
+            )
+        wave = DEEPSEEK_V4_DSPARK_PREFILL_WAVE_TOKENS
+        return ((int(actual_tokens) + wave - 1) // wave) * wave
 
     @staticmethod
     def _prefill_kernel_positions(
@@ -4603,9 +6194,24 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             raise ValueError("DeepSeekV4 decode batch must not be empty")
         if len(batch.cache_partitions) != actual_batch:
             raise ValueError("DeepSeekV4 decode requires one cache partition per request")
-        ranks = tuple(int(rank) for rank in batch.cache_partitions)
-        if min(ranks) < 0 or max(ranks) >= layout.ranks:
-            raise ValueError(f"DeepSeekV4 decode cache partitions must be in [0, {layout.ranks - 1}]")
+        partitions = tuple(int(partition) for partition in batch.cache_partitions)
+        if min(partitions) < 0 or max(partitions) >= layout.cache_partitions:
+            raise ValueError(
+                "DeepSeekV4 decode cache partitions must be in "
+                f"[0, {layout.cache_partitions - 1}]"
+            )
+        ranks = (
+            tuple(
+                self._reserve_dspark_request_owner(request_id, partition).rank
+                for request_id, partition in zip(
+                    batch.request_ids,
+                    partitions,
+                    strict=True,
+                )
+            )
+            if self._compiled.speculative_method == "dspark"
+            else partitions
+        )
         indices_by_rank: list[list[int]] = [[] for _ in range(layout.ranks)]
         local_rows = [0] * actual_batch
         for request_index, rank in enumerate(ranks):
@@ -4622,6 +6228,58 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             per_rank_counts=tuple(len(indices) for indices in indices_by_rank),
             indices_by_rank=tuple(tuple(indices) for indices in indices_by_rank),
         )
+
+    def _reserve_dspark_request_owner(
+        self,
+        request_id: str,
+        partition: int,
+    ) -> _DeepSeekV4DSparkOwner:
+        """Assign one request to the least-loaded TP rank in its DP group."""
+        if self._compiled.speculative_method != "dspark":
+            raise RuntimeError("DSpark Query ownership is only defined for DSpark serving")
+        layout = self._compiled.layout
+        tp_size = DEEPSEEK_V4_DSPARK_TP_SIZE
+        if layout.ranks != layout.cache_partitions * tp_size:
+            raise ValueError(
+                "DSpark ownership requires ranks == cache_partitions * TP size"
+            )
+        partition = int(partition)
+        if not 0 <= partition < layout.cache_partitions:
+            raise ValueError(f"DSpark cache partition {partition} is out of range")
+
+        with self._dspark_owner_lock:
+            existing = self._dspark_request_owners.get(request_id)
+            if existing is not None:
+                if existing.partition != partition:
+                    raise ValueError(
+                        f"DSpark request {request_id!r} moved from cache partition "
+                        f"{existing.partition} to {partition}"
+                    )
+                return existing
+
+            group_base = partition * tp_size
+            group_ranks = tuple(range(group_base, group_base + tp_size))
+            available_ranks = tuple(
+                candidate for candidate in group_ranks if self._dspark_free_rows[candidate]
+            )
+            if not available_ranks:
+                raise ValueError(
+                    f"DSpark cache partition {partition} exceeds its "
+                    f"{tp_size * layout.decode_batch}-request decode capacity"
+                )
+            rank = min(
+                available_ranks,
+                key=lambda candidate: (self._dspark_owner_counts[candidate], candidate),
+            )
+            local_row = self._dspark_free_rows[rank].pop()
+            owner = _DeepSeekV4DSparkOwner(
+                partition=partition,
+                rank=rank,
+                local_row=local_row,
+            )
+            self._dspark_request_owners[request_id] = owner
+            self._dspark_owner_counts[rank] += 1
+            return owner
 
     def _indices_by_rank(self, ranks: Sequence[int]) -> tuple[tuple[int, ...], ...]:
         """Reconstruct scheduler-row ownership for an immutable prepared slot."""

@@ -143,6 +143,48 @@ handles and address them with scheduler-owned group block IDs; there is no
 prefill CPU snapshot or cache handoff. Reassigned pages are cleared with
 targeted host-to-device copies before their new owner writes them.
 
+## 16-Device DSpark Serving
+
+DSpark uses four data-parallel request partitions, four tensor-parallel ranks
+inside each partition, and all 16 ranks for MoE expert parallelism. Select the
+DSpark kernel family explicitly and keep its compiled block size and draft
+width unchanged. The checkpoint must be a DSpark W8A8 conversion containing
+all three ``mtp`` drafter layers together with the Markov and confidence-head
+weights; converting the base DeepSeek-V4-Flash checkpoint is not sufficient.
+
+```bash
+pypto-serving \
+  --model /data/models/dsv4-flash-dspark-w8a8 \
+  --backend npu \
+  --platform a2a3 \
+  --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
+  --dp 4 --tp 4 --ep 16 \
+  --block-size 32 \
+  --max-model-len 16384 \
+  --max-num-seqs 256 \
+  --max-num-batched-tokens 8192 \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":7}' \
+  --no-enable-prefix-caching
+```
+
+Each request has a stable Query rank and drafter KV row inside its TP4 group.
+Target-model Decode processes the owner's local Query, reuses the TP4 attention
+AllToAll/O-Projection ReduceScatter path, and returns output to the same owner.
+The three-layer drafter then consumes only the target hidden rows corresponding
+to tokens actually accepted by the target model, updates its three private KV
+caches, and produces the next seven-token Markov block plus seven confidence
+values. Requests in the same batch may accept different prefix lengths. Near
+the model-length boundary, Serving shortens target verification to the
+remaining KV positions and falls back to one-token target Decode when another
+complete seven-token proposal no longer fits.
+
+DSpark Prefill and Decode are separate programs. Prompt chunks are grouped so
+one dispatch contains at most one request from each DP cache partition; later
+waves handle additional requests assigned to the same partition. A terminal
+Prefill samples the first target token, initializes all three drafter KV layers,
+and publishes the first seven-token proposal before Decode begins. The current
+DSpark path is greedy-only and does not advertise prefix-cache compatibility.
+
 ## Weight Staging
 
 The 49 per-layer weights are described declaratively in

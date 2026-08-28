@@ -21,6 +21,7 @@ from pypto_serving.model.common.weights.pipeline import (
     stage_layers,
 )
 from pypto_serving.model.common.weights.spec import GlobalWeightRule
+from pypto_serving.model.common.weights.shard import TensorParallel
 
 
 class TestGlobalWeightRules:
@@ -115,6 +116,38 @@ class TestGlobalWeightRules:
         assert packed["norm"].shape == (1, 4)
         assert packed["norm"].dtype == torch.float32
         assert packed["norm"].is_contiguous()
+
+
+class TestTensorParallelPolicy:
+    """TP shards repeat across DP groups and preserve destination parity."""
+
+    def test_shards_one_axis_and_repeats_it_across_dp_groups(self):
+        source = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+        policy = TensorParallel(ranks=8, tp_size=4, axis=1)
+
+        packed = policy.apply("weight", source, dtype=torch.bfloat16, destination=None)
+
+        assert packed.shape == (8, 3, 2)
+        for rank in range(8):
+            expected = source[:, (rank % 4) * 2 : (rank % 4 + 1) * 2].to(torch.bfloat16)
+            assert torch.equal(packed[rank], expected)
+
+    def test_preallocated_destination_matches_direct_pack(self):
+        source = torch.arange(32, dtype=torch.float32).reshape(8, 2, 2)
+        policy = TensorParallel(ranks=8, tp_size=4, axis=0)
+        direct = policy.apply("weight", source, dtype=torch.float16, destination=None)
+        destination = torch.empty_like(direct)
+
+        result = policy.apply("weight", source, dtype=torch.float16, destination=destination)
+
+        assert result.data_ptr() == destination.data_ptr()
+        assert torch.equal(result, direct)
+
+    def test_refuses_a_non_divisible_tensor_axis(self):
+        policy = TensorParallel(ranks=8, tp_size=4, axis=0)
+
+        with pytest.raises(ValueError, match="must divide"):
+            policy.apply("weight", torch.ones(6, 2), dtype=None, destination=None)
 
 
 class TestStagingPolicy:

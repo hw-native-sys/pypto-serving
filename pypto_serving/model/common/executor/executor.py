@@ -23,6 +23,7 @@ from pypto_serving.config.types import (
     PrefillResult,
     RequestState,
     RuntimeModel,
+    SamplingParams,
 )
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 
@@ -37,6 +38,11 @@ class ModelExecutor(ABC):
     @property
     def supports_device_sampling(self) -> bool:
         """Return whether executor results may include already-sampled token IDs."""
+        return False
+
+    @property
+    def supports_device_stochastic_sampling(self) -> bool:
+        """Return whether sampled IDs may use per-request temperature and top-k."""
         return False
 
     @property
@@ -167,6 +173,7 @@ class ModelExecutor(ABC):
         model: RuntimeModel,
         request_ids: list[str],
         sampled_token_ids: list[int],
+        sampling_params: list[SamplingParams] | None = None,
     ) -> None:
         """Finalize model-specific state after terminal-prefill sampling.
 

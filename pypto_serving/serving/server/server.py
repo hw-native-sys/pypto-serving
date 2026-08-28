@@ -50,6 +50,7 @@ class CompletionRequest(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
+    seed: int | None = None
     stop: list[str] | None = None
     stream: bool = False
 
@@ -66,6 +67,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
+    seed: int | None = None
     stop: list[str] | None = None
     stream: bool = False
     chat_template_kwargs: dict | None = None
@@ -216,6 +218,7 @@ class ServingServer:
             else defaults.temperature,
             top_p=request.top_p if "top_p" in provided else defaults.top_p,
             top_k=request.top_k if "top_k" in provided else defaults.top_k,
+            seed=request.seed if "seed" in provided else defaults.seed,
             stop=stop,
             stream=request.stream if "stream" in provided else defaults.stream,
         )

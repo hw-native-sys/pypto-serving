@@ -66,18 +66,17 @@ class ParallelConfig:
                     "enable_expert_parallel must match expert_parallel_size > 1 "
                     "for overlapped placement"
                 )
-            world_size = self.worker_group_size
-            axes = {
-                "data_parallel_size": self.data_parallel_size,
-                "tensor_parallel_size": self.tensor_parallel_size,
-                "expert_parallel_size": self.expert_parallel_size,
-            }
-            invalid = {name: size for name, size in axes.items() if size not in (1, world_size)}
-            if invalid:
-                details = ", ".join(f"{name}={size}" for name, size in invalid.items())
+            dense_world = self.data_parallel_size * self.tensor_parallel_size
+            expert_world = self.expert_parallel_size
+            if dense_world != self.worker_group_size or expert_world not in (
+                1,
+                self.worker_group_size,
+            ):
                 raise ValueError(
-                    "overlapped parallel axes must be singleton or span the full worker group: "
-                    + details
+                    "overlapped placement requires DP * TP to span the worker group and "
+                    "EP to be either 1 or the full worker group: "
+                    f"DP={self.data_parallel_size}, TP={self.tensor_parallel_size}, "
+                    f"EP={self.expert_parallel_size}, world={self.worker_group_size}"
                 )
         if self.data_parallel_routing not in _SUPPORTED_ROUTING_POLICIES:
             supported = ", ".join(sorted(_SUPPORTED_ROUTING_POLICIES))
@@ -110,8 +109,7 @@ class ParallelConfig:
         """Return the number of devices owned by one serving worker."""
         if self.placement_mode == "overlapped":
             return max(
-                self.data_parallel_size,
-                self.tensor_parallel_size,
+                self.data_parallel_size * self.tensor_parallel_size,
                 self.expert_parallel_size,
             )
         return self.tensor_parallel_size

@@ -44,10 +44,15 @@ from pypto_serving.model.deepseek.npu_runner import (
     build_deepseek_v4_layer_plan,
     deepseek_v4_cache_blocks_for_slots,
     deepseek_v4_decode_layout,
+    deepseek_v4_dspark_decode_layout,
 )
 from pypto_serving.model.common.runner.buffer_set import StaticDeviceTensor
 from pypto_serving.model.deepseek.task_args import (
     _DECODE_FWD_TENSOR_ORDER,
+    _DSPARK_DECODE_FWD_TENSOR_ORDER,
+    _DSPARK_DRAFTER_TENSOR_ORDER,
+    _DSPARK_MARKOV_TENSOR_ORDER,
+    _DSPARK_PREFILL_FWD_TENSOR_ORDER,
     _FUSED_MTP_DECODE_TENSOR_ORDER,
     _MTP_DECODE_TENSOR_ORDER,
     _MTP_PREFILL_TENSOR_ORDER,
@@ -65,6 +70,7 @@ from pypto_serving.model.deepseek.weight_loader import (
     deepseek_v4_layer_core_weight_names,
     deepseek_v4_packed_weights_path,
     deepseek_v4_hadamard_idx,
+    deepseek_v4_dspark_startup_weight_names,
     deepseek_v4_local_expert_ids,
     deepseek_v4_routed_expert_weight_names,
     deepseek_v4_startup_weight_names,
@@ -100,12 +106,26 @@ def test_deepseek_kernel_dir_uses_v4_flash_variant(tmp_path):
     assert npu_executor._is_deepseek_v4_module_file(kernel_dir / "decode_fwd.py", kernel_dir)
 
 
-def _pypto_lib_l3_arg_names(module_name: str, function_name: str) -> tuple[str, ...]:
+def test_deepseek_kernel_dir_selects_dspark_variant(tmp_path):
+    kernel_dir = tmp_path / "models" / "deepseek_v4_flash_dspark"
+    kernel_dir.mkdir(parents=True)
+
+    assert npu_executor._find_pypto_lib_deepseek_v4_dir(
+        str(tmp_path), speculative_method="dspark"
+    ) == kernel_dir
+
+
+def _pypto_lib_l3_arg_names(
+    module_name: str,
+    function_name: str,
+    *,
+    variant: str = "deepseek_v4_flash_mtp",
+) -> tuple[str, ...]:
     kernel_file = (
         Path(__file__).resolve().parents[4]
         / "pypto-lib"
         / "models"
-        / "deepseek_v4_flash_mtp"
+        / variant
         / f"{module_name}.py"
     )
     module = ast.parse(kernel_file.read_text(encoding="utf-8"))
@@ -124,6 +144,22 @@ def test_deepseek_decode_task_arg_orders_match_pypto_lib_abis():
         "num_tokens",
     )
 
+
+def test_deepseek_dspark_prefill_task_arg_order_matches_pypto_lib_abi():
+    assert _pypto_lib_l3_arg_names(
+        "prefill_fwd",
+        "l3_prefill_fwd",
+        variant="deepseek_v4_flash_dspark",
+    ) == _DSPARK_PREFILL_FWD_TENSOR_ORDER
+
+
+def test_deepseek_dspark_decode_task_arg_order_matches_pypto_lib_abi():
+    assert _pypto_lib_l3_arg_names(
+        "decode_fwd",
+        "l3_decode_fwd",
+        variant="deepseek_v4_flash_dspark",
+    ) == _DSPARK_DECODE_FWD_TENSOR_ORDER
+
     fused_mtp_only = tuple(
         f"mtp_{name}"
         for name in _FUSED_MTP_DECODE_TENSOR_ORDER
@@ -137,6 +173,18 @@ def test_deepseek_decode_task_arg_orders_match_pypto_lib_abis():
         "mtp_num_tokens",
     )
 
+
+def test_deepseek_dspark_drafter_and_markov_arg_orders_match_pypto_lib_abis():
+    assert _pypto_lib_l3_arg_names(
+        "dspark_drafter",
+        "l3_dspark_drafter",
+        variant="deepseek_v4_flash_dspark",
+    ) == _DSPARK_DRAFTER_TENSOR_ORDER
+    assert _pypto_lib_l3_arg_names(
+        "dspark_markov",
+        "l3_distributed_markov_sample",
+        variant="deepseek_v4_flash_dspark",
+    ) == _DSPARK_MARKOV_TENSOR_ORDER
 
 def test_deepseek_decode_metadata_allows_shared_prefix_pages_across_requests():
     runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
@@ -292,6 +340,18 @@ def test_deepseek_mtp_token_step_runs_one_request_per_rank_wave(monkeypatch):
         "logit_row_indices": torch.empty(
             (layout.ranks, layout.decode_tokens),
             dtype=torch.int32,
+        ),
+        "sampling_temperatures": torch.empty(
+            (layout.ranks, layout.decode_tokens), dtype=torch.float32
+        ),
+        "sampling_top_ks": torch.empty(
+            (layout.ranks, layout.decode_tokens), dtype=torch.int32
+        ),
+        "sampling_seeds": torch.empty(
+            (layout.ranks, layout.decode_tokens), dtype=torch.int32
+        ),
+        "sampling_positions": torch.empty(
+            (layout.ranks, layout.decode_tokens), dtype=torch.int32
         ),
     }
     runner._mtp_buffers = SimpleNamespace()
@@ -694,6 +754,7 @@ def test_cli_selects_deepseek_executor_and_configures_mtp_depth(tmp_path):
     assert config.runtime_config.weight_dtype == "int8"
     assert config.enable_prefix_cache is False
     assert config.executor_kwargs["num_speculative_tokens"] == 4
+    assert config.executor_kwargs["speculative_method"] == "mtp"
     assert config.runtime_config.num_speculative_tokens == 4
     assert config.runtime_config.max_prefill_tokens_per_request == 8192
     assert config.runtime_config.supports_chunked_prefill_with_speculation is True
@@ -733,7 +794,64 @@ def test_cli_keeps_deepseek_autoregressive_decode_when_mtp_is_disabled(tmp_path)
     config = cli.build_serving_engine_config(args)
 
     assert config.executor_kwargs["num_speculative_tokens"] == 0
+    assert config.executor_kwargs["speculative_method"] is None
     assert config.runtime_config.max_prefill_tokens_per_request == DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS
+
+
+def test_cli_selects_deepseek_dspark_topology(tmp_path):
+    model_dir = _write_deepseek_model_dir(tmp_path)
+    devices = ",".join(str(device) for device in range(16))
+    args = cli.build_parser().parse_args(
+        [
+            "--model",
+            str(model_dir),
+            "--devices",
+            devices,
+            "--dp",
+            "4",
+            "--tp",
+            "4",
+            "--ep",
+            "16",
+            "--block-size",
+            "32",
+            "--speculative-config",
+            '{"method":"dspark","num_speculative_tokens":7}',
+        ]
+    )
+
+    config = cli.build_serving_engine_config(args)
+
+    assert config.device_ids == tuple(range(16))
+    assert config.parallel_config.worker_group_size == 16
+    assert config.executor_kwargs["num_speculative_tokens"] == 7
+    assert config.executor_kwargs["speculative_method"] == "dspark"
+    assert config.enable_prefix_cache is False
+
+
+def test_cli_rejects_dspark_with_mtp_topology(tmp_path):
+    model_dir = _write_deepseek_model_dir(tmp_path)
+    args = cli.build_parser().parse_args(
+        [
+            "--model",
+            str(model_dir),
+            "--devices",
+            "0,1,2,3,4,5,6,7",
+            "--dp",
+            "8",
+            "--tp",
+            "1",
+            "--ep",
+            "8",
+            "--block-size",
+            "128",
+            "--speculative-config",
+            '{"method":"dspark","num_speculative_tokens":7}',
+        ]
+    )
+
+    with pytest.raises(ValueError, match="--dp 4 --tp 4 --ep 16"):
+        cli.build_serving_engine_config(args)
 
 
 @pytest.mark.parametrize(
@@ -742,6 +860,18 @@ def test_cli_keeps_deepseek_autoregressive_decode_when_mtp_is_disabled(tmp_path)
         ({"method": "draft_model", "num_speculative_tokens": 3}, "method='mtp'"),
         ({"method": "mtp"}, "requires num_speculative_tokens"),
         ({"method": "mtp", "num_speculative_tokens": 0}, "must be positive"),
+        (
+            {"method": "dspark", "num_speculative_tokens": 6},
+            "requires num_speculative_tokens=7",
+        ),
+        (
+            {
+                "method": "dspark",
+                "num_speculative_tokens": 7,
+                "enable_adaptive_verification": True,
+            },
+            "adaptive verification requires runtime cost profiling",
+        ),
     ],
 )
 def test_cli_rejects_invalid_deepseek_speculative_config(config, message):
@@ -1402,6 +1532,182 @@ def test_deepseek_layer_packer_transposes_and_stacks_rank_local_experts():
         assert torch.equal(direct.tensors[name], expected), name
 
 
+def test_deepseek_dspark_packer_shards_o_projection_within_tp4_groups():
+    raw = _synthetic_layer_raw(layer_id=0, n_experts=4)
+    destinations = {
+        "wo_a": torch.empty((8, 2, 2, 4), dtype=torch.bfloat16),
+        "wo_b": torch.empty((8, 4, 4), dtype=torch.int8),
+    }
+
+    packed = pack_deepseek_v4_layer_weights(
+        0,
+        raw,
+        ranks=8,
+        n_routed_experts=4,
+        compress_ratio=0,
+        include_tid2eid=False,
+        include_gate_bias=True,
+        destinations=destinations,
+        o_projection_tp_size=4,
+    )
+
+    reshaped_wo_a = raw["layers.0.attn.wo_a.weight"].reshape(8, 2, 4)
+    raw_wo_b = raw["layers.0.attn.wo_b.weight"]
+    for rank in range(8):
+        tp_rank = rank % 4
+        assert torch.equal(packed.tensors["wo_a"][rank], reshaped_wo_a[tp_rank * 2 : (tp_rank + 1) * 2])
+        assert torch.equal(packed.tensors["wo_b"][rank], raw_wo_b[:, tp_rank * 4 : (tp_rank + 1) * 4])
+
+
+def test_deepseek_dspark_checkpoint_contract_uses_three_stages_and_final_head():
+    names = set(deepseek_v4_dspark_startup_weight_names(256))
+
+    assert "mtp.0.main_proj.weight" in names
+    assert "mtp.0.main_norm.weight" in names
+    for stage in range(3):
+        assert f"mtp.{stage}.attn.wq_a.weight" in names
+        assert f"mtp.{stage}.ffn.experts.0.w1.weight" in names
+        assert f"mtp.{stage}.ffn.experts.255.w3.scale" in names
+    assert "mtp.2.markov_head.markov_w1.weight" in names
+    assert "mtp.2.markov_head.markov_w2.weight" in names
+    assert "mtp.2.confidence_head.weight" in names
+
+
+def test_deepseek_dspark_layout_matches_dp4_tp4_kernel_contract():
+    layout = deepseek_v4_dspark_decode_layout()
+
+    assert layout.ranks == 16
+    assert layout.cache_partitions == 4
+    assert layout.block_size == 32
+    assert layout.decode_batch == 16
+    assert layout.decode_seq == 8
+    assert layout.decode_tokens == 128
+    assert layout.max_seq_len == 16_384
+
+
+def test_deepseek_dspark_cache_groups_use_dp4_partitions_and_compressed_pages():
+    layout = deepseek_v4_dspark_decode_layout()
+    specs = build_deepseek_v4_cache_group_specs(
+        43,
+        _DEEPSEEK_TEST_COMPRESS_RATIOS,
+        decode_batch=layout.decode_batch,
+        max_seq_len=layout.max_seq_len,
+        layout=layout,
+    )
+    by_name = {spec.name: spec for spec in specs}
+
+    assert all(spec.num_partitions == 4 for spec in specs)
+    assert by_name["ori"].spec.block_size == 32
+    assert by_name["cmp_c4"].max_blocks_per_seq == 128
+    assert by_name["cmp_c4"].spec.token_capacity == 128
+    assert by_name["cmp_c4"].spec.page_size_bytes == 21 * 32 * 512 * 2
+    assert by_name["cmp_c128"].max_blocks_per_seq == 4
+    assert by_name["cmp_c128"].spec.token_capacity == 4096
+
+
+def test_deepseek_dspark_decode_keeps_a_stable_tp_query_owner():
+    layout = deepseek_v4_dspark_decode_layout()
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=layout,
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=(),
+            layer_plan=(),
+            kernel_dir="",
+            num_speculative_tokens=7,
+            speculative_method="dspark",
+        )
+    )
+    first = DecodeBatch(
+        request_ids=["req-a", "req-b", "req-c", "req-d", "req-e"],
+        token_ids=torch.ones((5, 1), dtype=torch.long),
+        hidden_states=None,
+        seq_lens=torch.ones(5, dtype=torch.int32),
+        cache_partitions=[1, 1, 1, 1, 1],
+    )
+    reordered = DecodeBatch(
+        request_ids=["req-e", "req-c", "req-a", "req-d", "req-b"],
+        token_ids=torch.ones((5, 1), dtype=torch.long),
+        hidden_states=None,
+        seq_lens=torch.ones(5, dtype=torch.int32),
+        cache_partitions=[1, 1, 1, 1, 1],
+    )
+
+    first_assignment = runner._decode_assignment(first)
+    reordered_assignment = runner._decode_assignment(reordered)
+
+    owners = dict(zip(first.request_ids, first_assignment.ranks, strict=True))
+    assert owners == {"req-a": 4, "req-b": 5, "req-c": 6, "req-d": 7, "req-e": 4}
+    assert reordered_assignment.ranks == tuple(owners[request_id] for request_id in reordered.request_ids)
+    assert {
+        request_id: runner._dspark_request_owners[request_id].local_row
+        for request_id in first.request_ids
+    } == {"req-a": 0, "req-b": 0, "req-c": 0, "req-d": 0, "req-e": 1}
+    assert runner._dspark_partial_decode_waves(first) == ((0, 1, 2, 3), (4,))
+    sampling_slots = {}
+    runner._stage_sampling_inputs(
+        sampling_slots,
+        first,
+        assignment=first_assignment,
+        positions=((0,),) * len(first.request_ids),
+    )
+    assert sampling_slots == {}
+    for index, request_id in enumerate(first.request_ids):
+        runner._dspark_request_states[request_id] = SimpleNamespace(
+            committed_seq_len=10 + index
+        )
+    optimistic = replace(first, seq_lens=torch.full((5,), 18, dtype=torch.int32))
+    assert runner._correct_dspark_seq_lens(optimistic).tolist() == [10, 11, 12, 13, 14]
+
+    runner.release_finished_requests(["req-b"])
+    replacement = runner._reserve_dspark_request_owner("req-f", 1)
+    assert replacement.rank == 5
+    assert replacement.local_row == 0
+
+
+def test_deepseek_dspark_prefill_replicates_group_metadata_and_scatters_local_tokens():
+    layout = deepseek_v4_dspark_decode_layout()
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=layout,
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=(),
+            layer_plan=(),
+            kernel_dir="",
+            num_speculative_tokens=7,
+            speculative_method="dspark",
+        )
+    )
+    group_a = torch.arange(128, dtype=torch.int32)
+    group_b = 1000 + torch.arange(128, dtype=torch.int32)
+
+    replicated = runner._tp_group_replicate(
+        (group_a, group_b),
+        partitions=(0, 2),
+        tp_size=4,
+    )
+    scattered = runner._tp_group_scatter_tokens(
+        (group_a, group_b),
+        partitions=(0, 2),
+        tp_size=4,
+    )
+
+    assert replicated.shape == (16, 128)
+    assert all(torch.equal(replicated[rank], group_a) for rank in range(4))
+    assert all(torch.equal(replicated[rank], group_b) for rank in range(8, 12))
+    assert scattered.shape == (16, 32)
+    assert torch.equal(scattered[0], group_a[:32])
+    assert torch.equal(scattered[1], group_a[32:64])
+    assert torch.equal(scattered[8], group_b[:32])
+    assert torch.equal(scattered[11], group_b[96:])
+    assert runner._dspark_prefill_kernel_tokens(129) == 256
+    assert runner._dspark_prefill_kernel_tokens(8192) == 8192
+
+
 def test_deepseek_stacked_weight_loader_packs_subsequent_layers_into_final_slices(monkeypatch):
     def packed_layer(layer_id: int) -> weight_loader.DeepSeekV4PackedLayerWeights:
         tensors = {"fwd": torch.full((2, 2), layer_id, dtype=torch.int8)}
@@ -1576,6 +1882,20 @@ def test_deepseek_cache_metadata_maps_scheduler_block_ids():
     assert swa_lens.tolist() == [128, 128]
     assert swa_indices[0, -1].item() == 64 * 128 + 127
     assert swa_indices[1, -1].item() == 65 * 128
+
+
+def test_deepseek_cache_metadata_rotates_prefill_state_pages_for_decode():
+    metadata = DeepSeekV4CacheMetadataBuilder(layout=deepseek_v4_dspark_decode_layout())
+    state_blocks = list(range(100, 2150))
+
+    table = metadata.recurrent_state_block_table_from_ids(
+        [state_blocks],
+        [4100],
+        state_block_size=2,
+        max_blocks=4,
+    )
+
+    assert table.tolist() == [[2148, 2149, 2146, 2147]]
 
 
 _DEEPSEEK_TEST_COMPRESS_RATIOS = (0, 0, *([4] * 21), *([128] * 20))

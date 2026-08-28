@@ -82,8 +82,9 @@ class Request:
     stop_strings: tuple[str, ...] = ()
     eos_token_id: int | None = None
     temperature: float = 0.8
-    top_p: float = 0.95
+    top_p: float = 1.0
     top_k: int | None = None
+    seed: int | None = None
     cached_block_ids: list[int] = field(default_factory=list)
     allocated_block_ids: list[int] = field(default_factory=list)
     allocated_group_block_ids: dict[str, list[int]] = field(default_factory=dict)
@@ -281,10 +282,11 @@ class Scheduler:
                 continue
 
             is_prefill = request.is_prefill
-            speculative_tokens = (
-                self.config.num_speculative_tokens
-                if not is_prefill and request.temperature <= 0.0
-                else 0
+            speculative_tokens = self._speculative_tokens_for_step(
+                request,
+                is_prefill=is_prefill,
+                num_computed_tokens=request.num_computed_tokens,
+                num_new_tokens=num_new,
             )
             scheduled_tokens = num_new + speculative_tokens
             if scheduled_tokens > token_budget:
@@ -618,9 +620,27 @@ class Scheduler:
         Mirrors the accounting ``schedule()`` uses when allocating blocks: only
         greedy decode steps get speculative capacity.
         """
-        if scheduled.is_prefill or request.temperature > 0.0:
+        return self._speculative_tokens_for_step(
+            request,
+            is_prefill=scheduled.is_prefill,
+            num_computed_tokens=scheduled.num_computed_tokens,
+            num_new_tokens=scheduled.num_new_tokens,
+        )
+
+    def _speculative_tokens_for_step(
+        self,
+        request: "Request",
+        *,
+        is_prefill: bool,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+    ) -> int:
+        """Return draft positions that fit this request's remaining context."""
+        if is_prefill or request.temperature > 0.0:
             return 0
-        return self.config.num_speculative_tokens
+        step_context_len = num_computed_tokens + num_new_tokens
+        remaining_context = max(0, self.config.max_seq_len - step_context_len)
+        return min(self.config.num_speculative_tokens, remaining_context)
 
     def update_from_output(
         self,

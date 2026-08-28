@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 
 import torch
 
-from .shard import ExpertParallel, NoShard, Replicate
+from .shard import ExpertParallel, NoShard, Replicate, TensorParallel
 from .spec import (
     DefaultedWeightRule,
     ExpertWeightRule,
@@ -43,6 +43,7 @@ def pack_layer(
     *,
     policy: Replicate | NoShard,
     expert_policy: ExpertParallel | None = None,
+    policies: Mapping[str, Replicate | NoShard | TensorParallel] | None = None,
     factories: Mapping[str, Callable[[], torch.Tensor]] | None = None,
     destinations: Mapping[str, torch.Tensor] | None = None,
     missing_source_error: str = "missing raw layer tensor: {name}",
@@ -63,6 +64,7 @@ def pack_layer(
         if destinations is not None and rule.name not in destinations:
             continue
         destination = None if destinations is None else destinations[rule.name]
+        selected_policy = (policies or {}).get(rule.name, policy)
 
         if isinstance(rule, ExpertWeightRule):
             if expert_policy is None:
@@ -84,7 +86,7 @@ def pack_layer(
             factory = (factories or {}).get(rule.factory)
             if factory is None:
                 raise ValueError(f"{rule.name} needs the {rule.factory!r} factory but none was given")
-            packed[rule.name] = policy.apply(
+            packed[rule.name] = selected_policy.apply(
                 rule.name, factory(), dtype=rule.dtype, destination=destination
             )
             continue
@@ -100,14 +102,14 @@ def pack_layer(
                     rule.name,
                     resolve_shape(rule.absent_shape, context),
                     rule.dtype,
-                    ranks=policy.ranks,
+                    ranks=selected_policy.ranks,
                     destination=destination,
-                    mismatch_error=policy.mismatch_error,
+                    mismatch_error=selected_policy.mismatch_error,
                 )
                 continue
             if rule.transpose:
                 tensor = tensor.transpose(0, 1)
-            packed[rule.name] = policy.apply(
+            packed[rule.name] = selected_policy.apply(
                 rule.name, tensor, dtype=rule.dtype, destination=destination
             )
             continue
@@ -126,7 +128,7 @@ def pack_layer(
                     raise ValueError(f"{rule.name} has unsupported default fill {rule.default_fill!r}")
             if rule.flatten_to_row:
                 tensor = tensor.reshape(1, -1)
-            packed[rule.name] = policy.apply(
+            packed[rule.name] = selected_policy.apply(
                 rule.name, tensor, dtype=rule.dtype, destination=destination
             )
             continue
@@ -147,7 +149,7 @@ def pack_layer(
             # reshape, not view: a gamma is 1-D contiguous today, but reshape also handles a
             # non-contiguous source instead of raising.
             tensor = tensor.reshape(1, -1)
-        packed[rule.name] = policy.apply(
+        packed[rule.name] = selected_policy.apply(
             rule.name, tensor, dtype=rule.dtype, destination=destination
         )
     return packed

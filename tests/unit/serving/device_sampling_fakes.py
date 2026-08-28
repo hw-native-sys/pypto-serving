@@ -18,6 +18,7 @@ from pypto_serving.config.types import (
     RuntimeConfig,
     RuntimeModel,
     SamplingCandidates,
+    SamplingParams,
 )
 from pypto_serving.model.common.executor.executor import ModelExecutor
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
@@ -103,7 +104,9 @@ class _ImmediateEosExecutor(ModelExecutor):
         model: RuntimeModel,
         request_ids: list[str],
         sampled_token_ids: list[int],
+        sampling_params: list[SamplingParams] | None = None,
     ) -> None:
+        del sampling_params
         self.finalized_prefills.append((list(request_ids), list(sampled_token_ids)))
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:

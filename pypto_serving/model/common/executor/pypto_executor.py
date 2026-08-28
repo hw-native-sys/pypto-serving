@@ -22,6 +22,7 @@ from pypto_serving.config.types import (
     PrefillBatch,
     PrefillResult,
     RuntimeModel,
+    SamplingParams,
 )
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
@@ -104,6 +105,7 @@ class PyptoExecutor(ModelExecutor, ABC):
         model: RuntimeModel,
         request_ids: list[str],
         sampled_token_ids: list[int],
+        sampling_params: list[SamplingParams] | None = None,
     ) -> None:
         """Let a runner seed decode state while still in the prefill stage."""
         runner = self._runners[model.config.model_id]
@@ -114,7 +116,7 @@ class PyptoExecutor(ModelExecutor, ABC):
                 cat="executor",
                 args={"model_id": model.config.model_id, "batch_size": len(request_ids)},
             ):
-                finalize(request_ids, sampled_token_ids)
+                finalize(request_ids, sampled_token_ids, sampling_params)
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
         """Delegate decode execution to the registered model runner."""

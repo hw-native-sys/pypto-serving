@@ -24,7 +24,7 @@ from collections.abc import Sequence
 import torch
 
 from pypto_serving.model.common.weights.pipeline import StagingPolicy
-from pypto_serving.model.common.weights.shard import ExpertParallel, Replicate
+from pypto_serving.model.common.weights.shard import ExpertParallel, Replicate, TensorParallel
 from pypto_serving.model.common.weights.spec import (
     DefaultedWeightRule,
     ExpertWeightRule,
@@ -93,6 +93,32 @@ DEEPSEEK_V4_CORE_LAYER_RULES: tuple[LayerWeightRule, ...] = (
 def deepseek_v4_replicate(ranks: int) -> Replicate:
     """The rank policy for DeepSeekV4, carrying the diagnostics its users recognise."""
     return Replicate(ranks=ranks, mismatch_error=_MISMATCH_ERROR)
+
+
+def deepseek_v4_o_projection_tp_policies(
+    ranks: int,
+    tp_size: int,
+) -> dict[str, TensorParallel]:
+    """Return the TP4 O-projection layout used by the DSpark kernels.
+
+    ``wo_a`` is reshaped to ``[o_groups, o_lora, group_input]`` before the
+    policy runs, so it shards on group axis 0. ``wo_b`` retains checkpoint
+    shape ``[hidden, attention_out]`` and shards its output columns on axis 1.
+    """
+    return {
+        "wo_a": TensorParallel(
+            ranks=ranks,
+            tp_size=tp_size,
+            axis=0,
+            mismatch_error=_MISMATCH_ERROR,
+        ),
+        "wo_b": TensorParallel(
+            ranks=ranks,
+            tp_size=tp_size,
+            axis=1,
+            mismatch_error=_MISMATCH_ERROR,
+        ),
+    }
 
 
 # Compressor and indexer weights: present for one attention kind, zeros for the others. Order
@@ -228,6 +254,16 @@ DEEPSEEK_V4_EXPERT_LAYER_RULES: tuple[LayerRule, ...] = (
 DEEPSEEK_V4_LAYER_RULES: tuple[LayerRule, ...] = (
     *DEEPSEEK_V4_CORE_LAYER_RULES,
     *DEEPSEEK_V4_OPTIONAL_LAYER_RULES,
+    *DEEPSEEK_V4_ROUTER_LAYER_RULES,
+    *DEEPSEEK_V4_EXPERT_LAYER_RULES,
+)
+
+# DSpark draft layers are sliding-window decoder blocks. They do not consume
+# target-model CSA/HCA compressor or indexer weights, so retaining those
+# optional placeholders would allocate large tensors that no DSpark kernel
+# argument can observe.
+DEEPSEEK_V4_DSPARK_LAYER_RULES: tuple[LayerRule, ...] = (
+    *DEEPSEEK_V4_CORE_LAYER_RULES,
     *DEEPSEEK_V4_ROUTER_LAYER_RULES,
     *DEEPSEEK_V4_EXPERT_LAYER_RULES,
 )

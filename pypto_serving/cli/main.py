@@ -202,7 +202,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="JSON",
         help=(
             "Speculative decoding configuration as JSON. DeepSeek V4 supports "
-            "method='mtp' and a positive num_speculative_tokens value."
+            "method='mtp' with a positive draft depth or method='dspark' with "
+            "num_speculative_tokens=7."
         ),
     )
 
@@ -272,9 +273,11 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     model_config_data = _read_model_config(Path(model_dir))
     model_family = _detect_model_family(Path(model_dir), config_data=model_config_data)
     num_speculative_tokens = _resolve_num_speculative_tokens(args)
+    speculative_method = _resolve_speculative_method(args)
     if model_family == "deepseek_v4":
         executor_kwargs["compile_kernels"] = True
         executor_kwargs["num_speculative_tokens"] = num_speculative_tokens
+        executor_kwargs["speculative_method"] = speculative_method
     elif num_speculative_tokens:
         raise ValueError(
             "--speculative-config/--num-speculative-tokens/--enable-mtp is only "
@@ -302,7 +305,9 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     # one-token MTP path.  Keep the newer arbitrary-depth MTP implementation
     # available, but do not advertise prefix-cache compatibility for it yet.
     enable_prefix_cache = args.enable_prefix_caching
-    if model_family == "deepseek_v4" and num_speculative_tokens > 1:
+    if model_family == "deepseek_v4" and (
+        num_speculative_tokens > 1 or speculative_method == "dspark"
+    ):
         enable_prefix_cache = False
     return EngineConfig(
         model_id=args.served_model_name or Path(args.model).name,
@@ -346,6 +351,7 @@ def _build_runtime_config(
             DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS,
             build_deepseek_v4_cache_group_specs,
             deepseek_v4_decode_layout,
+            deepseek_v4_dspark_decode_layout,
         )
 
         config_data = config_data or {}
@@ -353,13 +359,18 @@ def _build_runtime_config(
         if not isinstance(compress_ratios, list):
             compress_ratios = None
         num_hidden_layers = int(config_data.get("num_hidden_layers", 43))
-        layout = deepseek_v4_decode_layout(num_speculative_tokens)
+        layout = (
+            deepseek_v4_dspark_decode_layout()
+            if _resolve_speculative_method(args) == "dspark"
+            else deepseek_v4_decode_layout(num_speculative_tokens)
+        )
         kv_cache_groups = build_deepseek_v4_cache_group_specs(
             num_hidden_layers,
             compress_ratios,
             decode_batch=layout.decode_batch,
             enable_mtp=num_speculative_tokens == 1,
             max_seq_len=args.max_model_len,
+            layout=layout,
         )
         max_prefill_tokens_per_request = DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS
 
@@ -393,8 +404,12 @@ def _resolve_num_speculative_tokens(args: argparse.Namespace) -> int:
                 "--speculative-config cannot be combined with --num-speculative-tokens "
                 "or --enable-mtp/--no-enable-mtp"
             )
-        if speculative_config.get("method") != "mtp":
-            raise ValueError("DeepSeek V4 --speculative-config requires method='mtp'")
+        method = speculative_config.get("method")
+        if method not in {"mtp", "dspark"}:
+            raise ValueError(
+                "DeepSeek V4 --speculative-config requires "
+                "method='mtp' or method='dspark'"
+            )
         if "num_speculative_tokens" not in speculative_config:
             raise ValueError(
                 "DeepSeek V4 --speculative-config requires num_speculative_tokens"
@@ -404,6 +419,15 @@ def _resolve_num_speculative_tokens(args: argparse.Namespace) -> int:
             raise ValueError("num_speculative_tokens must be an integer")
         if configured <= 0:
             raise ValueError("num_speculative_tokens must be positive")
+        if method == "dspark" and configured != 7:
+            raise ValueError("DeepSeek V4 DSpark requires num_speculative_tokens=7")
+        if method == "dspark" and speculative_config.get(
+            "enable_adaptive_verification", False
+        ):
+            raise ValueError(
+                "DeepSeek V4 DSpark adaptive verification requires runtime cost "
+                "profiling and is not supported yet"
+            )
         return configured
 
     legacy_enabled = bool(legacy_value)
@@ -439,6 +463,15 @@ def _parse_ring_value(value: str) -> int | list[int]:
     if any(size < 0 for size in sizes):
         raise argparse.ArgumentTypeError(f"ring sizes must be non-negative, got {value!r}")
     return sizes[0] if len(sizes) == 1 else sizes
+
+
+def _resolve_speculative_method(args: argparse.Namespace) -> str | None:
+    """Return the selected DeepSeek speculative implementation."""
+    speculative_config = getattr(args, "speculative_config", None)
+    if speculative_config is not None:
+        _resolve_num_speculative_tokens(args)
+        return str(speculative_config["method"])
+    return "mtp" if _resolve_num_speculative_tokens(args) > 0 else None
 
 
 def _parse_speculative_config(value: str) -> dict[str, object]:
@@ -506,6 +539,11 @@ def _validate_generate_config_options(options: dict[str, object]) -> None:
         "temperature": ("a non-negative number", lambda v: is_number(v) and v >= 0),
         "top_p": ("a number in (0, 1]", lambda v: is_number(v) and 0 < v <= 1),
         "top_k": ("a positive int or null", lambda v: v is None or is_positive_int(v)),
+        "seed": (
+            "a non-negative int or null",
+            lambda v: v is None
+            or (isinstance(v, int) and not isinstance(v, bool) and v >= 0),
+        ),
         "stop": ("a list of strings", lambda v: isinstance(v, list) and all(isinstance(item, str) for item in v)),
         "stream": ("a boolean", lambda v: isinstance(v, bool)),
         "ignore_eos": ("a boolean", lambda v: isinstance(v, bool)),
@@ -594,32 +632,62 @@ def _validate_model_topology(
     if quantization.get("quant_method") != "compressed-tensors":
         raise ValueError(
             "DeepSeekV4 serving requires the quantized W8A8 compressed-tensors checkpoint "
-            "such as /data/models/dsv4-flash-w8a8; the original checkpoint is too large for 8 NPUs."
+            "such as /data/models/dsv4-flash-w8a8."
         )
+    speculative_method = _resolve_speculative_method(args)
+    if speculative_method == "dspark":
+        expected_topology = (4, 4, 16)
+        expected_devices = 16
+        expected_block_size = 32
+    else:
+        expected_topology = (8, 1, 8)
+        expected_devices = 8
+        expected_block_size = 128
+
+    actual_topology = (
+        parallel_config.data_parallel_size,
+        parallel_config.tensor_parallel_size,
+        parallel_config.expert_parallel_size,
+    )
     if (
         parallel_config.placement_mode != "overlapped"
-        or parallel_config.data_parallel_size != 8
-        or parallel_config.expert_parallel_size != 8
-        or parallel_config.tensor_parallel_size != 1
+        or actual_topology != expected_topology
     ):
-        raise ValueError("DeepSeekV4 serving requires --dp 8 --ep 8 with --tp 1 (the default)")
-    if len(parallel_config.devices) != 8:
-        raise ValueError("DeepSeekV4 serving requires exactly 8 NPU device ids")
-    if args.block_size != 128:
-        raise ValueError("DeepSeekV4 kernels require --block-size 128")
-    from pypto_serving.model.deepseek.npu_runner import deepseek_v4_decode_layout
+        dp, tp, ep = expected_topology
+        method = speculative_method or "autoregressive/MTP"
+        raise ValueError(
+            f"DeepSeekV4 {method} serving requires --dp {dp} --tp {tp} --ep {ep}"
+        )
+    if len(parallel_config.devices) != expected_devices:
+        raise ValueError(
+            f"DeepSeekV4 {speculative_method or 'autoregressive/MTP'} serving requires "
+            f"exactly {expected_devices} NPU device ids"
+        )
+    if args.block_size != expected_block_size:
+        raise ValueError(
+            f"DeepSeekV4 {speculative_method or 'autoregressive/MTP'} kernels require "
+            f"--block-size {expected_block_size}"
+        )
+    if speculative_method == "dspark":
+        # pypto-lib DSpark fixes 64 requests per DP group and four DP groups.
+        from pypto_serving.model.deepseek.npu_runner import deepseek_v4_dspark_decode_layout
 
-    layout = deepseek_v4_decode_layout(_resolve_num_speculative_tokens(args))
-    max_global_batch = layout.ranks * layout.decode_batch
+        max_global_batch = 4 * 64
+        max_model_len = deepseek_v4_dspark_decode_layout().max_seq_len
+    else:
+        from pypto_serving.model.deepseek.npu_runner import deepseek_v4_decode_layout
+
+        layout = deepseek_v4_decode_layout(_resolve_num_speculative_tokens(args))
+        max_global_batch = layout.ranks * layout.decode_batch
+        max_model_len = layout.prefill_csa_state_max_blocks * layout.c4_state_block_size
     if args.max_num_seqs > max_global_batch:
         raise ValueError(
             "DeepSeekV4 decode kernels support at most "
-            f"--max-num-seqs {max_global_batch} ({layout.decode_batch} per rank)"
+            f"--max-num-seqs {max_global_batch}"
         )
-    max_model_len = layout.prefill_csa_state_max_blocks * layout.c4_state_block_size
     if args.max_model_len > max_model_len:
         raise ValueError(
-            "DeepSeekV4 pypto-lib decode CSA state tables currently support at most "
+            "DeepSeekV4 pypto-lib kernels currently support at most "
             f"--max-model-len {max_model_len}. Increase the decode CSA state table depth "
             "in pypto-lib before serving longer contexts."
         )

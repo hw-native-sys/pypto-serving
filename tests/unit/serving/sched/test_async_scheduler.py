@@ -320,7 +320,12 @@ def test_async_reconciliation_matches_sync_end_state():
     assert async_tokens == sync_tokens == [10, 11, 12]
 
 
-def _mtp_scheduler(async_mode: bool, *, num_speculative_tokens: int = 1):
+def _mtp_scheduler(
+    async_mode: bool,
+    *,
+    num_speculative_tokens: int = 1,
+    max_seq_len: int = 4096,
+):
     """Scheduler configured like an MTP (speculative) decoder."""
     manager = KvCacheManager(num_blocks=32, block_size=2, enable_prefix_cache=False)
     return Scheduler(
@@ -328,6 +333,7 @@ def _mtp_scheduler(async_mode: bool, *, num_speculative_tokens: int = 1):
             enable_prefix_cache=False,
             async_scheduling=async_mode,
             num_speculative_tokens=num_speculative_tokens,
+            max_seq_len=max_seq_len,
         ),
         manager,
     )
@@ -356,6 +362,22 @@ def test_async_mtp_reserves_max_tokens_per_step():
     assert request.num_output_placeholders == 2
     # computed advanced by num_new_tokens (1) + the extra speculative slot (1).
     assert request.num_computed_tokens == 4
+
+    boundary_scheduler = _mtp_scheduler(
+        async_mode=True,
+        num_speculative_tokens=7,
+        max_seq_len=4,
+    )
+    boundary_request = _mtp_request()
+    boundary_scheduler.running.append(boundary_request)
+    boundary_scheduler.requests[boundary_request.request_id] = boundary_request
+
+    boundary_out = boundary_scheduler.schedule()
+    boundary_scheduler.advance_after_schedule(boundary_out)
+
+    # Only one extra target-input position remains after the current token.
+    assert boundary_request.num_output_placeholders == 2
+    assert boundary_request.num_computed_tokens == 4
 
 
 def test_async_mtp_matches_sync_when_all_tokens_accepted():

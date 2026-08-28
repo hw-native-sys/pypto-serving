@@ -23,8 +23,9 @@ class GenerateConfig:
 
     max_new_tokens: int = 256
     temperature: float = 0.8
-    top_p: float = 0.95
+    top_p: float = 1.0
     top_k: int | None = None
+    seed: int | None = None
     stop: tuple[str, ...] = ()
     stream: bool = False
     ignore_eos: bool = False
@@ -225,6 +226,7 @@ class SamplingParams:
     temperature: float
     top_p: float
     top_k: int | None = None
+    seed: int | None = None
 
 
 @dataclass
@@ -283,6 +285,10 @@ class PrefillBatch:
     block_ids: list[list[int]] = field(default_factory=list)
     block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
     cache_partitions: list[int | None] = field(default_factory=list)
+    # Optional prompt lookahead used by parallel block drafters during chunked
+    # prefill. ``None`` marks a chunk that reaches the end of the prompt; its
+    # anchor becomes the target model's sampled token in ``finalize_prefill``.
+    next_prefill_token_ids: list[int | None] = field(default_factory=list)
 
 
 @dataclass
@@ -309,6 +315,7 @@ class DecodeBatch:
     seq_lens: torch.Tensor
     allow_device_greedy_sampling: bool = False
     allow_device_topk_sampling: bool = False
+    sampling_params: list[SamplingParams] = field(default_factory=list)
     kv_allocations: list[KvAllocation] = field(default_factory=list)
     block_ids: list[list[int]] = field(default_factory=list)
     block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
@@ -326,7 +333,7 @@ class DecodeResult:
     """Outputs from one decode step."""
 
     hidden_states: torch.Tensor | None
-    # None on the device-greedy decode path: the host consumes sampled_token_ids and
+    # None on an integrated device-sampling path: the host consumes sampled_token_ids and
     # the logits buffer stays device-resident (never copied back).
     logits: torch.Tensor | None
     sampled_token_ids: torch.Tensor | None = None

@@ -38,6 +38,33 @@ def test_parallel_config_rejects_unsupported_modes():
         ParallelConfig(data_parallel_size=1, tensor_parallel_size=2, devices=(0, 0))
 
 
+def test_parallel_config_supports_overlapped_dp4_tp4_ep16():
+    config = ParallelConfig(
+        data_parallel_size=4,
+        tensor_parallel_size=4,
+        expert_parallel_size=16,
+        enable_expert_parallel=True,
+        placement_mode="overlapped",
+        devices=tuple(range(16)),
+    )
+
+    assert config.worker_group_size == 16
+    assert config.num_replicas == 1
+    assert config.replica_device_groups == (tuple(range(16)),)
+
+
+def test_parallel_config_rejects_incomplete_overlapped_rank_grid():
+    with pytest.raises(ValueError, match=r"DP \* TP"):
+        ParallelConfig(
+            data_parallel_size=4,
+            tensor_parallel_size=2,
+            expert_parallel_size=16,
+            enable_expert_parallel=True,
+            placement_mode="overlapped",
+            devices=tuple(range(16)),
+        )
+
+
 def test_parse_device_ids_uses_default_device():
     assert parse_device_ids(None, default_device=3) == (3,)
     assert parse_device_ids("0, 2,4", default_device=3) == (0, 2, 4)

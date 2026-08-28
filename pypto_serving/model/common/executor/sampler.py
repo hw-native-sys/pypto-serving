@@ -51,7 +51,11 @@ class Sampler:
             if not self._is_valid_distribution(probs):
                 return self._greedy_token(logits)
 
-        token = torch.multinomial(probs, num_samples=1)
+        token = torch.multinomial(
+            probs,
+            num_samples=1,
+            generator=self._generator(probs, params),
+        )
         return int(token.item())
 
     def sample_from_candidates(
@@ -101,8 +105,21 @@ class Sampler:
             if not self._is_valid_distribution(probs):
                 return int(token_ids[self._greedy_token(values)].item())
 
-        sampled_pos = torch.multinomial(probs, num_samples=1)
+        sampled_pos = torch.multinomial(
+            probs,
+            num_samples=1,
+            generator=self._generator(probs, params),
+        )
         return int(token_ids[int(sampled_pos.item())].item())
+
+    @staticmethod
+    def _generator(values: torch.Tensor, params: SamplingParams) -> torch.Generator | None:
+        """Build the deterministic request generator when a seed was supplied."""
+        if params.seed is None:
+            return None
+        generator = torch.Generator(device=values.device)
+        generator.manual_seed(int(params.seed) & 0x3FFFFFFF)
+        return generator
 
     @staticmethod
     def from_generate_config(config: GenerateConfig) -> SamplingParams:
@@ -111,6 +128,7 @@ class Sampler:
             temperature=config.temperature,
             top_p=config.top_p,
             top_k=config.top_k,
+            seed=config.seed,
         )
 
     @staticmethod
