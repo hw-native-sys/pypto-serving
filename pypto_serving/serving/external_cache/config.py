@@ -63,6 +63,23 @@ def _positive_int(data: Mapping[str, Any], name: str, *, default: int) -> int:
     return value
 
 
+def _ascend_buffer_pool(value: object) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("Mooncake ascend_buffer_pool must use 'buffer_count:size_mb' format")
+    value = value.strip()
+    if not value:
+        return ""
+    parts = value.split(":")
+    if len(parts) != 2 or any(not part.isdigit() for part in parts):
+        raise ValueError("Mooncake ascend_buffer_pool must use 'buffer_count:size_mb' format")
+    buffer_count, size_mb = (int(part) for part in parts)
+    if (buffer_count == 0) != (size_mb == 0):
+        raise ValueError("Mooncake ascend_buffer_pool values must both be zero or both be positive")
+    return f"{buffer_count}:{size_mb}"
+
+
 @dataclass(frozen=True, slots=True)
 class MooncakeClientConfig:
     """Serializable Mooncake Store requester configuration."""
@@ -77,8 +94,11 @@ class MooncakeClientConfig:
     enable_ssd_offload: bool = False
     ssd_offload_path: str = ""
     tenant_id: str = "default"
+    ascend_buffer_pool: str = ""
 
     def __post_init__(self) -> None:
+        normalized_buffer_pool = _ascend_buffer_pool(self.ascend_buffer_pool)
+        object.__setattr__(self, "ascend_buffer_pool", normalized_buffer_pool)
         if not self.metadata_server or not self.master_server_address:
             raise ValueError("Mooncake metadata and master server addresses must not be empty")
         if not self.protocol:
@@ -100,6 +120,7 @@ class MooncakeClientConfig:
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "MooncakeClientConfig":
         allowed = {
+            "ascend_buffer_pool",
             "device_name",
             "enable_ssd_offload",
             "global_segment_size",
@@ -132,6 +153,7 @@ class MooncakeClientConfig:
             enable_ssd_offload=enable_ssd_offload,
             ssd_offload_path=str(data.get("ssd_offload_path", "")).strip(),
             tenant_id=_require_string(data, "tenant_id", default="default"),
+            ascend_buffer_pool=_ascend_buffer_pool(data.get("ascend_buffer_pool")),
         )
 
 

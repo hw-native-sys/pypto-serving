@@ -12,6 +12,7 @@
     "master_server_address": "127.0.0.1:50051",
     "protocol": "ascend",
     "device_name": "",
+    "ascend_buffer_pool": "4:8",
     "global_segment_size": "4GB",
     "local_buffer_size": "512MB",
     "enable_ssd_offload": true,

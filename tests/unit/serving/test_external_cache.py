@@ -132,6 +132,7 @@ def test_external_cache_config_parses_sizes_and_policy(tmp_path):
                     "metadata_server": "127.0.0.1:2379",
                     "master_server_address": "127.0.0.1:50051",
                     "protocol": "ascend",
+                    "ascend_buffer_pool": "4:8",
                     "global_segment_size": "2GB",
                     "local_buffer_size": "32MB",
                     "enable_ssd_offload": True,
@@ -152,6 +153,7 @@ def test_external_cache_config_parses_sizes_and_policy(tmp_path):
     assert config.failure_policy == "fail_startup"
     assert config.mooncake.global_segment_size == 2 * 1024**3
     assert config.mooncake.local_buffer_size == 32 * 1024**2
+    assert config.mooncake.ascend_buffer_pool == "4:8"
     assert config.mooncake.enable_ssd_offload
     assert config.mooncake.ssd_offload_path == "/var/lib/mooncake"
     assert config.mooncake.tenant_id == "serving-test"
@@ -183,6 +185,18 @@ def test_mooncake_config_rejects_relative_ssd_path():
                 "master_server_address": "127.0.0.1:50051",
                 "enable_ssd_offload": True,
                 "ssd_offload_path": "relative/cache",
+            }
+        )
+
+
+@pytest.mark.parametrize("value", ["4", "4:8:16", "four:8", "0:8", 8])
+def test_mooncake_config_rejects_invalid_ascend_buffer_pool(value):
+    with pytest.raises(ValueError, match="ascend_buffer_pool"):
+        MooncakeClientConfig.from_mapping(
+            {
+                "metadata_server": "127.0.0.1:2379",
+                "master_server_address": "127.0.0.1:50051",
+                "ascend_buffer_pool": value,
             }
         )
 
@@ -298,6 +312,8 @@ def test_create_mooncake_backend_enables_rank_local_ssd_path(monkeypatch, tmp_pa
     setup_calls = []
     put_calls = []
     engines = []
+    initialize_buffer_pools = []
+    monkeypatch.delenv("ASCEND_BUFFER_POOL", raising=False)
 
     class FakeReplicateConfig:
         preferred_segment = ""
@@ -312,6 +328,7 @@ def test_create_mooncake_backend_enables_rank_local_ssd_path(monkeypatch, tmp_pa
 
         def initialize(self, *args):
             self.initialize_args = args
+            initialize_buffer_pools.append(os.environ.get("ASCEND_BUFFER_POOL"))
             return 0
 
         @staticmethod
@@ -364,6 +381,7 @@ def test_create_mooncake_backend_enables_rank_local_ssd_path(monkeypatch, tmp_pa
         metadata_server="127.0.0.1:2379",
         master_server_address="127.0.0.1:50051",
         local_hostname="127.0.0.1",
+        ascend_buffer_pool="4:8",
         enable_ssd_offload=True,
         ssd_offload_path=str(ssd_root),
         tenant_id="serving-test",
@@ -381,6 +399,7 @@ def test_create_mooncake_backend_enables_rank_local_ssd_path(monkeypatch, tmp_pa
     assert tenant == "serving-test"
     assert engine is engines[0]
     assert engines[0].initialize_args == ("127.0.0.1", "P2PHANDSHAKE", "ascend", "")
+    assert initialize_buffer_pools == ["4:8"]
     assert (ssd_root / "rank_3").is_dir()
 
     buffers = (ExternalKVBuffer(0x200000, 0x400000),)

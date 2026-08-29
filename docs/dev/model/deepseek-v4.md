@@ -212,6 +212,10 @@ they are part of the cache namespace. `global_segment_size` and
 `local_buffer_size` are per chip child, not totals across all eight devices.
 Use `protocol: "ascend"` for the direct NPU data path. Set
 `enable_ssd_offload` to `false` to use Mooncake DRAM only.
+Set `ascend_buffer_pool: "4:8"` when the NPU environment cannot export
+cross-process shareable memory, including VBS virtual devices. This enables
+Mooncake's intermediate-buffer transfer mode; use `"0:0"` or omit the option
+on systems where Ascend direct transfer is supported and preferred.
 The Mooncake Ascend transport must be able to read `/etc/hccn.conf` in every
 serving process and chip child.
 Mooncake 0.3.12 does not reconstruct tenant-prefixed bucket indexes correctly

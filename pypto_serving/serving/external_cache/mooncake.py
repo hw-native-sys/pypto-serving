@@ -161,6 +161,9 @@ def create_mooncake_backend(
     setup_kwargs: dict[str, object] = {}
     transfer_engine = None
     if config.protocol == "ascend":
+        if config.ascend_buffer_pool:
+            # Mooncake reads this process-wide ADXL option during engine initialization.
+            os.environ["ASCEND_BUFFER_POOL"] = config.ascend_buffer_pool
         try:
             from mooncake.engine import TransferEngine
         except ImportError as exc:
