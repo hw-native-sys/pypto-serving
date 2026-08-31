@@ -875,12 +875,8 @@ def test_cli_configures_deepseek_external_prefix_cache(tmp_path):
             "8",
             "--ep",
             "8",
-            "--external-prefix-cache-backend",
-            "mooncake",
             "--external-prefix-cache-config",
             str(external_config),
-            "--external-prefix-cache-min-tokens",
-            "256",
         ]
     )
 
@@ -889,7 +885,7 @@ def test_cli_configures_deepseek_external_prefix_cache(tmp_path):
     assert config.external_prefix_cache_config is not None
     assert config.external_prefix_cache_config.backend == "mooncake"
     assert config.external_prefix_cache_config.model_revision == "model-commit"
-    assert config.external_prefix_cache_config.min_tokens == 256
+    assert config.external_prefix_cache_config.min_tokens == 512
 
 
 def test_cli_rejects_external_cache_for_non_deepseek_model(tmp_path):

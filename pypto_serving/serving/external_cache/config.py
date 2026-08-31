@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -226,24 +226,4 @@ class ExternalPrefixCacheConfig:
             transfer_concurrency=_positive_int(data, "transfer_concurrency", default=2),
             failure_policy=_require_string(data, "failure_policy", default="cold_miss"),
             enable_save=enable_save,
-        )
-
-    def with_cli_overrides(
-        self,
-        *,
-        min_tokens: int | None = None,
-        load_timeout_ms: int | None = None,
-        transfer_concurrency: int | None = None,
-    ) -> "ExternalPrefixCacheConfig":
-        return replace(
-            self,
-            min_tokens=self.min_tokens if min_tokens is None else int(min_tokens),
-            load_timeout_ms=(
-                self.load_timeout_ms if load_timeout_ms is None else int(load_timeout_ms)
-            ),
-            transfer_concurrency=(
-                self.transfer_concurrency
-                if transfer_concurrency is None
-                else int(transfer_concurrency)
-            ),
         )

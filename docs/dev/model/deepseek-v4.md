@@ -228,14 +228,10 @@ MTP path (`num_speculative_tokens=1`). Deeper MTP (`num_speculative_tokens>1`)
 still disables DeepSeek prefix caching and is rejected when external caching is
 configured.
 
-Add these options to the normal eight-device DeepSeek command:
+Add this option to the normal eight-device DeepSeek command:
 
 ```bash
---external-prefix-cache-backend mooncake \
---external-prefix-cache-config examples/model/deepseek_v4/mooncake_external_cache.json \
---external-prefix-cache-min-tokens 1024 \
---external-prefix-cache-load-timeout-ms 30000 \
---external-prefix-cache-transfer-concurrency 2
+--external-prefix-cache-config examples/model/deepseek_v4/mooncake_external_cache.json
 ```
 
 Local HBM lookup always runs first. A committed Mooncake manifest is considered
