@@ -155,8 +155,8 @@ def _server_command(
 ) -> list[str]:
     # Keep these serving options aligned with docs/dev/model/deepseek-v4.md.
     # CI substitutes only the checkpoint, task-submit devices, and free port.
-    # The ring sizing (per-dispatch RunConfig) is what this matrix was tuned
-    # for under the old PTO2_RING_* envs.
+    # Use the four-ring sizing validated by the EP8 gate. Explicit vectors let
+    # worker startup prewarm the same 4 GiB arena used by later dispatches.
     return [
         sys.executable,
         "-m",
@@ -189,11 +189,11 @@ def _server_command(
         str(num_speculative_tokens),
         "--enable-prefix-caching" if enable_prefix_caching else "--no-enable-prefix-caching",
         "--ring-dep-pool",
-        "131072",
+        "16384,16384,16384,16384",
         "--ring-task-window",
-        "131072",
+        "16384,16384,16384,16384",
         "--ring-heap",
-        "2147483648",
+        "1073741824,1073741824,1073741824,1073741824",
         "--port",
         str(port),
         "--show-startup-logs",
@@ -497,6 +497,9 @@ def test_server_command_uses_explicit_mtp_depth_and_serving_capacity(tmp_path) -
     assert "--enable-mtp" not in command
     assert command[command.index("--num-speculative-tokens") + 1] == "3"
     assert command[command.index("--max-num-seqs") + 1] == "8"
+    assert command[command.index("--ring-dep-pool") + 1] == "16384,16384,16384,16384"
+    assert command[command.index("--ring-task-window") + 1] == "16384,16384,16384,16384"
+    assert command[command.index("--ring-heap") + 1] == "1073741824,1073741824,1073741824,1073741824"
 
 
 def test_mtp_matrix_covers_fused_and_standalone_shapes() -> None:
