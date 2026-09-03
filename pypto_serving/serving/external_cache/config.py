@@ -166,7 +166,10 @@ class ExternalPrefixCacheConfig:
     tokenizer_revision: str
     min_tokens: int = 1024
     load_timeout_ms: int = 30_000
+    save_timeout_ms: int = 30_000
     transfer_concurrency: int = 2
+    max_pending_saves: int = 2
+    max_pending_save_blocks: int = 256
     failure_policy: str = "cold_miss"
     enable_save: bool = True
     backend: str = "mooncake"
@@ -182,8 +185,14 @@ class ExternalPrefixCacheConfig:
             raise ValueError("external cache min_tokens must be positive")
         if self.load_timeout_ms <= 0:
             raise ValueError("external cache load_timeout_ms must be positive")
+        if self.save_timeout_ms <= 0:
+            raise ValueError("external cache save_timeout_ms must be positive")
         if self.transfer_concurrency <= 0:
             raise ValueError("external cache transfer_concurrency must be positive")
+        if self.max_pending_saves <= 0:
+            raise ValueError("external cache max_pending_saves must be positive")
+        if self.max_pending_save_blocks <= 0:
+            raise ValueError("external cache max_pending_save_blocks must be positive")
         if self.failure_policy not in ("cold_miss", "fail_startup"):
             raise ValueError("external cache failure_policy must be 'cold_miss' or 'fail_startup'")
 
@@ -201,6 +210,9 @@ class ExternalPrefixCacheConfig:
             "enable_save",
             "failure_policy",
             "load_timeout_ms",
+            "save_timeout_ms",
+            "max_pending_saves",
+            "max_pending_save_blocks",
             "min_tokens",
             "model_revision",
             "mooncake",
@@ -223,7 +235,12 @@ class ExternalPrefixCacheConfig:
             tokenizer_revision=_require_string(data, "tokenizer_revision"),
             min_tokens=_positive_int(data, "min_tokens", default=1024),
             load_timeout_ms=_positive_int(data, "load_timeout_ms", default=30_000),
+            save_timeout_ms=_positive_int(data, "save_timeout_ms", default=30_000),
             transfer_concurrency=_positive_int(data, "transfer_concurrency", default=2),
+            max_pending_saves=_positive_int(data, "max_pending_saves", default=2),
+            max_pending_save_blocks=_positive_int(
+                data, "max_pending_save_blocks", default=256
+            ),
             failure_policy=_require_string(data, "failure_policy", default="cold_miss"),
             enable_save=enable_save,
         )

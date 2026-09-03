@@ -184,7 +184,17 @@ Local HBM lookup always runs first. A committed Mooncake manifest is considered
 only when it extends the local hit and meets the minimum-token threshold. During
 an external load, the request waits in `WAITING_FOR_REMOTE_KV` and its target
 pages remain pinned. A missing object, transfer error, cancellation, or timeout
-discards the entire checkpoint and schedules cold prefill. `failure_policy` is
+discards the entire checkpoint and schedules cold prefill. Because Mooncake
+0.3.12 cannot cancel an in-flight Store operation, pages touched by a timed-out
+DMA remain quarantined until its terminal result arrives; cold prefill uses
+different pages. A transfer timeout also disables new external-cache operations
+for that serving process so repeated backend failures cannot consume more HBM.
+
+`save_timeout_ms` bounds a save before cancellation is requested.
+`max_pending_saves` and `max_pending_save_blocks` bound the number and total
+rank-local pages pinned by queued or active saves. A newer checkpoint replaces
+an older save from the same request if the older save has not reached the
+worker; checkpoints are dropped while either bound is full. `failure_policy` is
 `cold_miss` by default; use `fail_startup` when an unavailable Mooncake client
 must prevent service startup.
 

@@ -137,6 +137,9 @@ class Request:
     external_cache_transfer_bytes: int = 0
     external_cache_pinned_blocks: int = 0
     external_cache_manifest: object | None = field(default=None, repr=False)
+    external_cache_pages: tuple[ExternalKVPageAssignment, ...] = field(
+        default=(), repr=False
+    )
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -222,6 +225,8 @@ class ExternalCacheStats:
     load_seconds: float = 0.0
     save_successes: int = 0
     save_failures: int = 0
+    save_timeouts: int = 0
+    save_dropped: int = 0
     save_bytes: int = 0
     save_seconds: float = 0.0
     pinned_hbm_blocks: int = 0
@@ -230,9 +235,20 @@ class ExternalCacheStats:
 
 @dataclass(slots=True)
 class _ExternalSaveSnapshot:
+    request_id: str
     block_ids_by_group: dict[str, list[int]]
     partition: int
     started_at: float
+    size_bytes: int
+    pinned_blocks: int
+    dispatched_at: float | None = None
+    cancel_requested: bool = False
+
+
+@dataclass(slots=True)
+class _ExternalLoadQuarantine:
+    block_ids_by_group: dict[str, list[int]]
+    partition: int
     size_bytes: int
     pinned_blocks: int
 
@@ -273,6 +289,8 @@ class Scheduler:
         self._pending_external_cache_cancellations: set[str] = set()
         self._pending_external_cache_saves: deque[ExternalKVSaveRequest] = deque()
         self._external_cache_save_snapshots: dict[str, _ExternalSaveSnapshot] = {}
+        self._external_cache_load_quarantines: dict[str, _ExternalLoadQuarantine] = {}
+        self._external_cache_disabled = False
 
     def set_external_cache_index(self, index: ExternalPrefixCacheIndex | None) -> None:
         """Install lookup after grouped KV metadata is initialized."""
@@ -360,6 +378,7 @@ class Scheduler:
             or self.waiting_for_remote_kv
             or self._pending_external_cache_saves
             or self._external_cache_save_snapshots
+            or self._external_cache_load_quarantines
         )
 
     def schedule(self) -> SchedulerOutput:
@@ -370,8 +389,14 @@ class Scheduler:
             )
             self._pending_external_cache_cancellations.clear()
         while self._pending_external_cache_saves:
-            output.external_cache_saves.append(self._pending_external_cache_saves.popleft())
+            save = self._pending_external_cache_saves.popleft()
+            snapshot = self._external_cache_save_snapshots.get(save.job_id)
+            if snapshot is None:
+                continue
+            snapshot.dispatched_at = time.monotonic()
+            output.external_cache_saves.append(save)
         self._expire_external_cache_loads(output)
+        self._expire_external_cache_saves(output)
         token_budget = self.config.max_num_scheduled_tokens
         grouped_phase = self._grouped_cache_phase()
 
@@ -606,7 +631,11 @@ class Scheduler:
         remaining_waiting.extend(self.waiting)
         self.waiting = remaining_waiting
 
-        if self.waiting_for_remote_kv or self._external_cache_save_snapshots:
+        if (
+            self.waiting_for_remote_kv
+            or self._external_cache_save_snapshots
+            or self._external_cache_load_quarantines
+        ):
             output.poll_external_cache = True
 
         return output
@@ -619,6 +648,7 @@ class Scheduler:
         index = self.external_cache_index
         if (
             index is None
+            or self._external_cache_disabled
             or not self.kv_cache_manager.has_groups
             or request.external_cache_lookup_attempted
         ):
@@ -705,6 +735,7 @@ class Scheduler:
         request.external_cache_load_started_at = time.monotonic()
         request.external_cache_cancel_requested = False
         request.external_cache_manifest = manifest
+        request.external_cache_pages = pages
         self.waiting_for_remote_kv[request.request_id] = request
         return load
 
@@ -716,6 +747,21 @@ class Scheduler:
         succeeded: bool,
     ) -> None:
         """Apply one worker transfer completion or roll back to cold prefill."""
+        quarantine = self._external_cache_load_quarantines.pop(job_id, None)
+        if quarantine is not None:
+            self.kv_cache_manager.release_group_block_snapshot(
+                quarantine.block_ids_by_group,
+                quarantine.partition,
+            )
+            self._change_external_pinned_blocks(-quarantine.pinned_blocks)
+            logger.info(
+                "external_prefix_cache_quarantine_released job_id=%s bytes=%d "
+                "pinned_hbm_blocks=%d",
+                job_id,
+                quarantine.size_bytes,
+                self.external_cache_stats.pinned_hbm_blocks,
+            )
+            return
         request = self.waiting_for_remote_kv.get(request_id)
         if request is None or request.external_cache_load_job_id != job_id:
             return
@@ -771,6 +817,7 @@ class Scheduler:
         request.external_cache_transfer_bytes = 0
         request.external_cache_pinned_blocks = 0
         request.external_cache_manifest = None
+        request.external_cache_pages = ()
         if aborted:
             self._free_request_blocks(request)
             self.requests.pop(request_id, None)
@@ -820,7 +867,13 @@ class Scheduler:
         partition: int | None,
     ) -> None:
         index = self.external_cache_index
-        if index is None or not index.enable_save or partition is None or not block_ids_by_group:
+        if (
+            index is None
+            or self._external_cache_disabled
+            or not index.enable_save
+            or partition is None
+            or not block_ids_by_group
+        ):
             return
         token_count = latest_checkpoint_token_count(
             self.kv_cache_manager.group_specs,
@@ -841,6 +894,27 @@ class Scheduler:
             group_specs=self.kv_cache_manager.group_specs,
             group_block_hashes=request.group_block_hashes,
         )
+        self._drop_pending_save_for_request(request.request_id)
+        estimated_blocks = len(manifest.objects)
+        pending_blocks = sum(
+            snapshot.pinned_blocks
+            for snapshot in self._external_cache_save_snapshots.values()
+        )
+        if (
+            len(self._external_cache_save_snapshots) >= index.max_pending_saves
+            or pending_blocks + estimated_blocks > index.max_pending_save_blocks
+        ):
+            request.external_cache_checkpoint_tokens = token_count
+            self.external_cache_stats.save_dropped += 1
+            logger.warning(
+                "external_prefix_cache_save_dropped request_id=%s token_count=%d "
+                "pending_saves=%d pending_blocks=%d",
+                request.request_id,
+                token_count,
+                len(self._external_cache_save_snapshots),
+                pending_blocks,
+            )
+            return
         physical_pages, retained = self.kv_cache_manager.prepare_group_external_save(
             manifest,
             block_ids_by_group,
@@ -860,6 +934,7 @@ class Scheduler:
         pinned_blocks = sum(len(block_ids) for block_ids in retained.values())
         size_bytes = sum(page.size_bytes for page in pages) + len(manifest.to_bytes())
         self._external_cache_save_snapshots[job_id] = _ExternalSaveSnapshot(
+            request_id=request.request_id,
             block_ids_by_group=retained,
             partition=partition,
             started_at=time.monotonic(),
@@ -880,6 +955,29 @@ class Scheduler:
         )
         request.external_cache_checkpoint_tokens = token_count
 
+    def _drop_pending_save_for_request(self, request_id: str) -> None:
+        """Replace a save that has not crossed the scheduler-to-worker boundary."""
+        retained = deque()
+        for save in self._pending_external_cache_saves:
+            if save.request_id != request_id:
+                retained.append(save)
+                continue
+            snapshot = self._external_cache_save_snapshots.pop(save.job_id, None)
+            if snapshot is None:
+                continue
+            self.kv_cache_manager.release_group_block_snapshot(
+                snapshot.block_ids_by_group,
+                snapshot.partition,
+            )
+            self._change_external_pinned_blocks(-snapshot.pinned_blocks)
+            self.external_cache_stats.save_dropped += 1
+            logger.debug(
+                "external_prefix_cache_save_coalesced request_id=%s job_id=%s",
+                request_id,
+                save.job_id,
+            )
+        self._pending_external_cache_saves = retained
+
     def _expire_external_cache_loads(self, output: SchedulerOutput) -> None:
         index = self.external_cache_index
         if index is None:
@@ -887,8 +985,6 @@ class Scheduler:
         now = time.monotonic()
         expired = []
         for request in tuple(self.waiting_for_remote_kv.values()):
-            if request.external_cache_cancel_requested:
-                continue
             started_at = request.external_cache_load_started_at
             if started_at is None or now - started_at < index.load_timeout_seconds:
                 continue
@@ -897,14 +993,87 @@ class Scheduler:
                 continue
             expired.append((request.request_id, job_id))
         for request_id, job_id in expired:
-            output.external_cache_cancellations.append(job_id)
-            self.waiting_for_remote_kv[request_id].external_cache_cancel_requested = True
+            request = self.waiting_for_remote_kv[request_id]
+            if not request.external_cache_cancel_requested:
+                output.external_cache_cancellations.append(job_id)
             self.external_cache_stats.load_timeouts += 1
+            self._external_cache_disabled = True
+            self._fallback_timed_out_external_load(request_id, job_id)
             logger.warning(
-                "external_prefix_cache_load_timeout request_id=%s job_id=%s",
+                "external_prefix_cache_load_timeout request_id=%s job_id=%s; "
+                "external cache disabled",
                 request_id,
                 job_id,
             )
+
+    def _expire_external_cache_saves(self, output: SchedulerOutput) -> None:
+        index = self.external_cache_index
+        if index is None:
+            return
+        now = time.monotonic()
+        expired = []
+        for job_id, snapshot in self._external_cache_save_snapshots.items():
+            if (
+                snapshot.dispatched_at is None
+                or snapshot.cancel_requested
+                or now - snapshot.dispatched_at < index.save_timeout_seconds
+            ):
+                continue
+            expired.append((job_id, snapshot))
+        for job_id, snapshot in expired:
+            snapshot.cancel_requested = True
+            output.external_cache_cancellations.append(job_id)
+            self.external_cache_stats.save_timeouts += 1
+            self._external_cache_disabled = True
+            logger.warning(
+                "external_prefix_cache_save_timeout request_id=%s job_id=%s; "
+                "external cache disabled",
+                snapshot.request_id,
+                job_id,
+            )
+
+    def _fallback_timed_out_external_load(self, request_id: str, job_id: str) -> None:
+        """Resume cold prefill while quarantining pages that DMA may still touch."""
+        request = self.waiting_for_remote_kv.pop(request_id, None)
+        if request is None or request.external_cache_load_job_id != job_id:
+            return
+        partition = request.cache_partition
+        if partition is None:
+            raise RuntimeError("Timed-out external load has no destination partition")
+        quarantined = {spec.name: [] for spec in self.kv_cache_manager.group_specs}
+        for page in request.external_cache_pages:
+            block_ids = quarantined[page.group_name]
+            if page.physical_block_id not in block_ids:
+                block_ids.append(page.physical_block_id)
+        self.kv_cache_manager.retain_group_block_snapshot(quarantined, partition)
+        self._external_cache_load_quarantines[job_id] = _ExternalLoadQuarantine(
+            block_ids_by_group=quarantined,
+            partition=partition,
+            size_bytes=request.external_cache_transfer_bytes,
+            pinned_blocks=request.external_cache_pinned_blocks,
+        )
+
+        elapsed = max(0.0, time.monotonic() - (request.external_cache_load_started_at or 0.0))
+        self.external_cache_stats.load_seconds += elapsed
+        self.external_cache_stats.load_failures += 1
+        aborted = request.status is RequestStatus.FINISHED_ABORTED
+        if not aborted:
+            self.external_cache_stats.load_fallbacks += 1
+        self._release_waiting_prefix_blocks(request)
+        request.external_cache_hit_tokens = 0
+        request.external_cache_load_job_id = None
+        request.external_cache_load_started_at = None
+        request.external_cache_cancel_requested = False
+        request.external_cache_local_hit_tokens = 0
+        request.external_cache_transfer_bytes = 0
+        request.external_cache_pinned_blocks = 0
+        request.external_cache_manifest = None
+        request.external_cache_pages = ()
+        if aborted:
+            self.requests.pop(request_id, None)
+            return
+        request.status = RequestStatus.WAITING
+        self.waiting.appendleft(request)
 
     def _change_external_pinned_blocks(self, delta: int) -> None:
         stats = self.external_cache_stats

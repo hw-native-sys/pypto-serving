@@ -4,7 +4,10 @@
   "tokenizer_revision": "replace-with-immutable-tokenizer-revision",
   "min_tokens": 1024,
   "load_timeout_ms": 30000,
+  "save_timeout_ms": 30000,
   "transfer_concurrency": 2,
+  "max_pending_saves": 2,
+  "max_pending_save_blocks": 256,
   "failure_policy": "cold_miss",
   "enable_save": true,
   "mooncake": {

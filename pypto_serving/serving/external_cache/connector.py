@@ -105,6 +105,9 @@ class ExternalPrefixCacheIndex:
         num_partitions: int,
         min_tokens: int,
         load_timeout_ms: int = 30_000,
+        save_timeout_ms: int = 30_000,
+        max_pending_saves: int = 2,
+        max_pending_save_blocks: int = 256,
         enable_save: bool = True,
     ) -> None:
         if alignment <= 0:
@@ -115,12 +118,19 @@ class ExternalPrefixCacheIndex:
             raise ValueError("external cache minimum token count must be positive")
         if load_timeout_ms <= 0:
             raise ValueError("external cache load timeout must be positive")
+        if save_timeout_ms <= 0:
+            raise ValueError("external cache save timeout must be positive")
+        if max_pending_saves <= 0 or max_pending_save_blocks <= 0:
+            raise ValueError("external cache save limits must be positive")
         self._backend = backend
         self._namespace = namespace
         self._alignment = alignment
         self._num_partitions = num_partitions
         self._min_tokens = min_tokens
         self._load_timeout_seconds = load_timeout_ms / 1000
+        self._save_timeout_seconds = save_timeout_ms / 1000
+        self._max_pending_saves = int(max_pending_saves)
+        self._max_pending_save_blocks = int(max_pending_save_blocks)
         self._enable_save = bool(enable_save)
 
     @property
@@ -130,6 +140,18 @@ class ExternalPrefixCacheIndex:
     @property
     def load_timeout_seconds(self) -> float:
         return self._load_timeout_seconds
+
+    @property
+    def save_timeout_seconds(self) -> float:
+        return self._save_timeout_seconds
+
+    @property
+    def max_pending_saves(self) -> int:
+        return self._max_pending_saves
+
+    @property
+    def max_pending_save_blocks(self) -> int:
+        return self._max_pending_save_blocks
 
     @property
     def min_tokens(self) -> int:

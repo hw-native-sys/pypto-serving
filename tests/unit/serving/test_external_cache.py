@@ -126,7 +126,10 @@ def test_external_cache_config_parses_sizes_and_policy(tmp_path):
                 "tokenizer_revision": "tokenizer-commit",
                 "min_tokens": 256,
                 "load_timeout_ms": 4000,
+                "save_timeout_ms": 5000,
                 "transfer_concurrency": 3,
+                "max_pending_saves": 4,
+                "max_pending_save_blocks": 512,
                 "failure_policy": "fail_startup",
                 "mooncake": {
                     "metadata_server": "127.0.0.1:2379",
@@ -149,7 +152,10 @@ def test_external_cache_config_parses_sizes_and_policy(tmp_path):
     assert config.model_revision == "model-commit"
     assert config.min_tokens == 256
     assert config.load_timeout_ms == 4000
+    assert config.save_timeout_ms == 5000
     assert config.transfer_concurrency == 3
+    assert config.max_pending_saves == 4
+    assert config.max_pending_save_blocks == 512
     assert config.failure_policy == "fail_startup"
     assert config.mooncake.global_segment_size == 2 * 1024**3
     assert config.mooncake.local_buffer_size == 32 * 1024**2
@@ -159,7 +165,17 @@ def test_external_cache_config_parses_sizes_and_policy(tmp_path):
     assert config.mooncake.tenant_id == "serving-test"
 
 
-@pytest.mark.parametrize("field", ["min_tokens", "load_timeout_ms", "transfer_concurrency"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "min_tokens",
+        "load_timeout_ms",
+        "save_timeout_ms",
+        "transfer_concurrency",
+        "max_pending_saves",
+        "max_pending_save_blocks",
+    ],
+)
 def test_external_cache_config_rejects_boolean_numeric_fields(tmp_path, field):
     path = tmp_path / "external-cache.json"
     data = {
@@ -878,7 +894,7 @@ def test_scheduler_treats_external_lookup_error_as_one_cold_miss():
     assert output.scheduled_requests[0].num_new_tokens == 128
 
 
-def test_scheduler_cancels_timed_out_load_before_reusing_pages():
+def test_scheduler_falls_back_on_load_timeout_and_quarantines_dma_pages():
     backend = _FakeExternalBackend(present_suffix="/p2/t256")
     scheduler, manager = _external_scheduler(backend)
     scheduler.external_cache_index._load_timeout_seconds = 0.001
@@ -890,19 +906,86 @@ def test_scheduler_cancels_timed_out_load_before_reusing_pages():
     timeout_output = scheduler.schedule()
 
     assert timeout_output.external_cache_cancellations == [load.job_id]
-    assert request.request_id in scheduler.waiting_for_remote_kv
+    assert request.request_id not in scheduler.waiting_for_remote_kv
+    assert load.job_id in scheduler._external_cache_load_quarantines
     assert manager.group_request_partition(request.request_id) is not None
+    assert timeout_output.scheduled_requests[0].num_computed_tokens == 0
     assert scheduler.external_cache_stats.load_timeouts == 1
+    assert scheduler.external_cache_stats.load_fallbacks == 1
+    assert scheduler.external_cache_stats.pinned_hbm_blocks > 0
 
     scheduler.finish_external_cache_load(
         request.request_id,
         job_id=load.job_id,
-        succeeded=False,
+        succeeded=True,
     )
-    cold_output = scheduler.schedule()
 
-    assert request.request_id not in scheduler.waiting_for_remote_kv
-    assert cold_output.scheduled_requests[0].num_computed_tokens == 0
+    assert load.job_id not in scheduler._external_cache_load_quarantines
+    assert request.status is RequestStatus.RUNNING
+    assert scheduler.external_cache_stats.pinned_hbm_blocks == 0
+
+
+def test_scheduler_save_timeout_cancels_without_unpinning_dma_pages():
+    backend = _FakeExternalBackend()
+    scheduler, _manager = _external_scheduler(backend)
+    scheduler.external_cache_index._save_timeout_seconds = 0.001
+    request = Request("external-save-timeout", list(range(257)), max_new_tokens=1)
+    scheduler.add_request(request)
+    first_chunk = scheduler.schedule()
+    scheduler.update_from_output(first_chunk, {})
+    save = scheduler.schedule().external_cache_saves[0]
+    snapshot = scheduler._external_cache_save_snapshots[save.job_id]
+    snapshot.dispatched_at = time.monotonic() - 1
+    pinned = scheduler.external_cache_stats.pinned_hbm_blocks
+
+    timeout_output = scheduler.schedule()
+
+    assert timeout_output.external_cache_cancellations == [save.job_id]
+    assert scheduler.external_cache_stats.save_timeouts == 1
+    assert scheduler.external_cache_stats.pinned_hbm_blocks == pinned
+    assert scheduler._external_cache_disabled
+
+    scheduler.finish_external_cache_save(save.job_id, succeeded=False)
+    assert scheduler.external_cache_stats.pinned_hbm_blocks == 0
+
+
+def test_scheduler_limits_pending_save_snapshots_and_pinned_pages():
+    backend = _FakeExternalBackend()
+    scheduler, _manager = _external_scheduler(backend)
+    scheduler.external_cache_index._max_pending_saves = 1
+    request = Request("external-save-backpressure", list(range(385)), max_new_tokens=1)
+    scheduler.add_request(request)
+
+    first_chunk = scheduler.schedule()
+    scheduler.update_from_output(first_chunk, {})
+    second_chunk = scheduler.schedule()
+    first_save = second_chunk.external_cache_saves[0]
+    pinned = scheduler.external_cache_stats.pinned_hbm_blocks
+    scheduler.update_from_output(second_chunk, {})
+
+    assert len(scheduler._external_cache_save_snapshots) == 1
+    assert not scheduler._pending_external_cache_saves
+    assert scheduler.external_cache_stats.pinned_hbm_blocks == pinned
+    assert scheduler.external_cache_stats.save_dropped == 1
+
+    scheduler.finish_external_cache_save(first_save.job_id, succeeded=True)
+    assert scheduler.external_cache_stats.pinned_hbm_blocks == 0
+
+
+def test_scheduler_rejects_save_that_exceeds_pinned_page_budget():
+    backend = _FakeExternalBackend()
+    scheduler, _manager = _external_scheduler(backend)
+    scheduler.external_cache_index._max_pending_save_blocks = 1
+    request = Request("external-save-page-budget", list(range(257)), max_new_tokens=1)
+    scheduler.add_request(request)
+
+    first_chunk = scheduler.schedule()
+    scheduler.update_from_output(first_chunk, {})
+
+    assert not scheduler._external_cache_save_snapshots
+    assert not scheduler._pending_external_cache_saves
+    assert scheduler.external_cache_stats.pinned_hbm_blocks == 0
+    assert scheduler.external_cache_stats.save_dropped == 1
 
 
 def test_scheduler_abort_waits_for_external_write_fence():

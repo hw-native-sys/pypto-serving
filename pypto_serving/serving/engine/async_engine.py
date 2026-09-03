@@ -380,10 +380,6 @@ class ReplicaEngineCore:
             group_specs=groups,
         )
         try:
-            import torch
-
-            first_device = self.config.worker_device_ids()[0]
-            torch.npu.set_device(first_device)
             backend = create_mooncake_backend(
                 config.mooncake,
                 contribute_memory=False,
@@ -408,6 +404,9 @@ class ReplicaEngineCore:
                 num_partitions=num_partitions,
                 min_tokens=config.min_tokens,
                 load_timeout_ms=config.load_timeout_ms,
+                save_timeout_ms=config.save_timeout_ms,
+                max_pending_saves=config.max_pending_saves,
+                max_pending_save_blocks=config.max_pending_save_blocks,
                 enable_save=config.enable_save,
             )
         )
