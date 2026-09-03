@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import functools
 import math
 import threading
 import zlib
@@ -61,6 +62,13 @@ DEEPSEEK_V4_HC_MULT = 4
 DEEPSEEK_V4_VOCAB_SIZE = 129280
 DEEPSEEK_V4_BLOCK_SIZE = 128
 DEEPSEEK_V4_DECODE_BATCH = 4
+
+
+@functools.lru_cache(maxsize=64)
+def _ring_tile_index(width: int, period: int) -> torch.Tensor:
+    """Positions of a length-`period` cycle tiled across `width` slots."""
+    return torch.arange(width, dtype=torch.long) % period
+
 DEEPSEEK_V4_DECODE_SEQ = 2
 DEEPSEEK_V4_DECODE_TOKENS = DEEPSEEK_V4_DECODE_BATCH * DEEPSEEK_V4_DECODE_SEQ
 DEEPSEEK_V4_MTP_DECODE_TOKENS = 16
@@ -502,10 +510,19 @@ class DeepSeekV4CacheMetadataBuilder:
         for row, block_ids in enumerate(per_request_block_ids):
             if len(block_ids) > max_blocks:
                 raise ValueError(f"row {row} has {len(block_ids)} blocks, maximum is {max_blocks}")
-            if any(int(block_id) < 0 for block_id in block_ids):
-                raise ValueError("block IDs must not be negative")
-            if block_ids:
-                table[row, : len(block_ids)] = torch.tensor(block_ids, dtype=torch.int32)
+        # One tensor for the whole call rather than one per row: the rows hold a handful of
+        # ids each, so the allocation dominated the copy.
+        flat = [int(block_id) for block_ids in per_request_block_ids for block_id in block_ids]
+        if any(block_id < 0 for block_id in flat):
+            raise ValueError("block IDs must not be negative")
+        if flat:
+            flat_ids = torch.tensor(flat, dtype=torch.int32)
+            offset = 0
+            for row, block_ids in enumerate(per_request_block_ids):
+                width = len(block_ids)
+                if width:
+                    table[row, :width] = flat_ids[offset : offset + width]
+                offset += width
         return table
 
     @staticmethod
@@ -524,8 +541,16 @@ class DeepSeekV4CacheMetadataBuilder:
                 raise ValueError(f"ring block-table row {row} has no allocated blocks")
             if any(block_id < 0 for block_id in ids):
                 raise ValueError("block IDs must not be negative")
-            repeated = torch.tensor(ids, dtype=torch.int32).repeat(math.ceil(max_blocks / len(ids)))
-            table[row].copy_(repeated[:max_blocks])
+            # The row is `ids` tiled to max_blocks. Gathering through a cached tiling index
+            # writes it in place; repeat() + slice allocated a max_blocks-sized temporary per
+            # row and discarded most of it, which at max_blocks 2048-4096 dominated the
+            # host-side decode prepare.
+            torch.index_select(
+                torch.tensor(ids, dtype=torch.int32),
+                0,
+                _ring_tile_index(max_blocks, len(ids)),
+                out=table[row],
+            )
         return table
 
     @staticmethod
