@@ -79,10 +79,10 @@ DEEPSEEK_V4_DECODE_BATCH = 4
 DEEPSEEK_V4_DECODE_SEQ = 2
 DEEPSEEK_V4_DECODE_TOKENS = DEEPSEEK_V4_DECODE_BATCH * DEEPSEEK_V4_DECODE_SEQ
 DEEPSEEK_V4_MTP_DECODE_TOKENS = 16
-DEEPSEEK_V4_PREFILL_BATCH = 1
-# The main prefill wrapper added by pypto-lib #893 accepts a dynamic request
-# extent and walks it in fixed 128-token tiles. The standalone MTP prefill
-# wrapper still accepts exactly one tile.
+DEEPSEEK_V4_PREFILL_BATCH = 4
+# The main prefill wrapper accepts four rank-local requests, gives each a
+# dynamic extent, and walks it in fixed 128-token tiles. The standalone MTP
+# prefill wrapper still accepts exactly one tile.
 DEEPSEEK_V4_PREFILL_SEQ = 128
 # Async serving pipelines at most two device steps. Rolling caches must retain
 # the history needed by the next token plus every token that can be in flight;
@@ -821,15 +821,18 @@ class DeepSeekV4InputBuilder:
         embeddings: Sequence[torch.Tensor],
         *,
         ranks: Sequence[int],
+        local_rows: Sequence[int],
         token_rows: int,
     ) -> torch.Tensor:
-        """Build distinct rank-local prefill token streams for one EP dispatch."""
+        """Build distinct rank/slot-local prefill streams for one EP dispatch."""
         if token_rows <= 0:
             raise ValueError("prefill token rows must be positive")
-        if not embeddings or len(embeddings) != len(ranks):
-            raise ValueError("prefill embeddings and ranks must be non-empty and aligned")
-        if len(set(int(rank) for rank in ranks)) != len(ranks):
-            raise ValueError("one prefill dispatch can contain at most one request per rank")
+        if (
+            not embeddings
+            or len(embeddings) != len(ranks)
+            or len(embeddings) != len(local_rows)
+        ):
+            raise ValueError("prefill embeddings, ranks, and local rows must be aligned")
 
         padded_rows = []
         for rows in embeddings:
@@ -845,30 +848,31 @@ class DeepSeekV4InputBuilder:
                 padded[rows.shape[0] :].copy_(rows.index_select(0, pad_indices))
             padded_rows.append(padded)
 
-        # The scalar num_tokens contract is common to every rank. Inactive ranks
-        # therefore run a harmless filler stream whose outputs and cache writes
-        # are discarded; active ranks are overwritten below with their own data.
-        rank_rows = padded_rows[0].unsqueeze(0).expand(self.layout.ranks, -1, -1).clone()
-        for rank, rows in zip(ranks, padded_rows, strict=True):
+        # Each request slot has a rank-wide token extent. Inactive rank/slot
+        # pairs carry harmless filler rows while their token count stays zero.
+        rank_rows = padded_rows[0].reshape(1, 1, token_rows, self.hidden_size).expand(
+            self.layout.ranks,
+            self.layout.prefill_batch,
+            -1,
+            -1,
+        ).clone()
+        for rank, local_row, rows in zip(ranks, local_rows, padded_rows, strict=True):
             rank = int(rank)
+            local_row = int(local_row)
             if not 0 <= rank < self.layout.ranks:
                 raise ValueError(f"prefill rank {rank} is out of range")
-            rank_rows[rank].copy_(rows)
-        return self._expand_hc(rank_rows)
-
-    def _expand_hc(self, rank_rows: torch.Tensor) -> torch.Tensor:
-        if (
-            rank_rows.ndim != 3
-            or rank_rows.shape[0] != self.layout.ranks
-            or rank_rows.shape[2] != self.hidden_size
-        ):
-            raise ValueError(
-                "rank rows must have shape "
-                f"[{self.layout.ranks}, tokens, {self.hidden_size}], got {tuple(rank_rows.shape)}"
-            )
+            if not 0 <= local_row < self.layout.prefill_batch:
+                raise ValueError(f"prefill local row {local_row} is out of range")
+            rank_rows[rank, local_row].copy_(rows)
         return (
-            rank_rows.unsqueeze(2)
-            .expand(self.layout.ranks, rank_rows.shape[1], self.layout.hc_mult, self.hidden_size)
+            rank_rows.unsqueeze(3)
+            .expand(
+                self.layout.ranks,
+                self.layout.prefill_batch,
+                token_rows,
+                self.layout.hc_mult,
+                self.hidden_size,
+            )
             .contiguous()
         )
 
@@ -940,6 +944,7 @@ class DeepSeekV4PreparedPrefillInputs:
 
     request_ids: tuple[str, ...]
     ranks: tuple[int, ...]
+    local_rows: tuple[int, ...]
     actual_tokens: tuple[int, ...]
     kernel_tokens: int
     x_hc: torch.Tensor
@@ -1620,18 +1625,18 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         request_count = len(batch.request_ids)
         if request_count <= 0 or request_count > layout.ranks * layout.prefill_batch:
             raise ValueError(
-                "DeepSeekV4 prefill supports one local request per rank and "
-                f"at most {layout.ranks} global requests, got {request_count}"
+                "DeepSeekV4 prefill exceeds the fixed global capacity "
+                f"{layout.ranks * layout.prefill_batch}, got {request_count}"
             )
         self._validate_prefill_batch_metadata(batch, request_count)
         builder = self._require_input_builder()
         if len(batch.cache_partitions) != request_count:
             raise ValueError("DeepSeekV4 prefill requires one cache partition per request")
         ranks = tuple(int(rank) for rank in batch.cache_partitions)
-        if len(set(ranks)) != request_count:
-            raise ValueError("DeepSeekV4 prefill accepts at most one request per rank per dispatch")
         if min(ranks) < 0 or max(ranks) >= layout.ranks:
             raise ValueError(f"DeepSeekV4 prefill cache partitions must be in [0, {layout.ranks - 1}]")
+        assignment = self._prefill_assignment(ranks)
+        local_rows = assignment.local_rows
         group_rows = self._normalize_group_block_ids(
             batch.block_ids_by_group,
             actual_batch=request_count,
@@ -1768,44 +1773,99 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             kernel_tokens,
         )
 
-        num_tokens_per_owner = torch.zeros(layout.ranks, dtype=torch.int32)
+        num_tokens_per_owner = torch.zeros(
+            (layout.prefill_batch, layout.ranks),
+            dtype=torch.int32,
+        )
         logit_row_indices = torch.full(
-            (layout.ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS),
+            (layout.ranks, layout.prefill_batch, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS),
             -1,
             dtype=torch.int32,
         )
-        for rank, actual_tokens in zip(ranks, actual_tokens_by_request, strict=True):
-            num_tokens_per_owner[rank] = actual_tokens
-            logit_row_indices[rank, 0] = actual_tokens - 1
+        for rank, local_row, actual_tokens in zip(
+            ranks,
+            local_rows,
+            actual_tokens_by_request,
+            strict=True,
+        ):
+            num_tokens_per_owner[local_row, rank] = actual_tokens
+            logit_row_indices[rank, local_row, 0] = actual_tokens - 1
 
         return DeepSeekV4PreparedPrefillInputs(
             request_ids=tuple(batch.request_ids),
             ranks=ranks,
+            local_rows=local_rows,
             actual_tokens=tuple(actual_tokens_by_request),
             kernel_tokens=kernel_tokens,
             x_hc=builder.prefill_x_hc(
                 kernel_embeddings_by_request,
                 ranks=ranks,
+                local_rows=local_rows,
                 token_rows=kernel_tokens,
             ),
-            input_ids=self._rank_scatter(input_ids_by_request, ranks),
-            position_ids=self._rank_scatter(position_ids_by_request, ranks),
-            ori_block_table=self._rank_scatter(ori_block_tables, ranks),
-            ori_slot_mapping=self._rank_scatter_mappings(ori_slot_mappings, ranks),
-            hca_cmp_block_table=self._rank_scatter(hca_cmp_block_tables, ranks),
-            csa_cmp_block_table=self._rank_scatter(csa_cmp_block_tables, ranks),
-            idx_block_table=self._rank_scatter(idx_block_tables, ranks),
-            hca_compress_state_block_table=self._rank_scatter(hca_state_block_tables, ranks),
-            csa_compress_state_block_table=self._rank_scatter(csa_state_block_tables, ranks),
-            csa_inner_compress_state_block_table=self._rank_scatter(csa_inner_state_block_tables, ranks),
-            hca_cmp_slot_mapping=self._rank_scatter_mappings(hca_cmp_slot_mappings, ranks),
-            hca_state_slot_mapping=self._rank_scatter_mappings(hca_state_slot_mappings, ranks),
-            csa_cmp_slot_mapping=self._rank_scatter_mappings(csa_cmp_slot_mappings, ranks),
-            csa_idx_slot_mapping=self._rank_scatter_mappings(csa_idx_slot_mappings, ranks),
-            csa_state_slot_mapping=self._rank_scatter_mappings(csa_state_slot_mappings, ranks),
-            csa_inner_state_slot_mapping=self._rank_scatter_mappings(
+            input_ids=self._rank_slot_scatter(input_ids_by_request, ranks, local_rows),
+            position_ids=self._rank_slot_scatter(position_ids_by_request, ranks, local_rows),
+            ori_block_table=self._rank_slot_scatter(ori_block_tables, ranks, local_rows),
+            ori_slot_mapping=self._rank_slot_scatter_mappings(
+                ori_slot_mappings,
+                ranks,
+                local_rows,
+            ),
+            hca_cmp_block_table=self._rank_slot_scatter(
+                hca_cmp_block_tables,
+                ranks,
+                local_rows,
+            ),
+            csa_cmp_block_table=self._rank_slot_scatter(
+                csa_cmp_block_tables,
+                ranks,
+                local_rows,
+            ),
+            idx_block_table=self._rank_slot_scatter(idx_block_tables, ranks, local_rows),
+            hca_compress_state_block_table=self._rank_slot_scatter(
+                hca_state_block_tables,
+                ranks,
+                local_rows,
+            ),
+            csa_compress_state_block_table=self._rank_slot_scatter(
+                csa_state_block_tables,
+                ranks,
+                local_rows,
+            ),
+            csa_inner_compress_state_block_table=self._rank_slot_scatter(
+                csa_inner_state_block_tables,
+                ranks,
+                local_rows,
+            ),
+            hca_cmp_slot_mapping=self._rank_slot_scatter_mappings(
+                hca_cmp_slot_mappings,
+                ranks,
+                local_rows,
+            ),
+            hca_state_slot_mapping=self._rank_slot_scatter_mappings(
+                hca_state_slot_mappings,
+                ranks,
+                local_rows,
+            ),
+            csa_cmp_slot_mapping=self._rank_slot_scatter_mappings(
+                csa_cmp_slot_mappings,
+                ranks,
+                local_rows,
+            ),
+            csa_idx_slot_mapping=self._rank_slot_scatter_mappings(
+                csa_idx_slot_mappings,
+                ranks,
+                local_rows,
+            ),
+            csa_state_slot_mapping=self._rank_slot_scatter_mappings(
+                csa_state_slot_mappings,
+                ranks,
+                local_rows,
+            ),
+            csa_inner_state_slot_mapping=self._rank_slot_scatter_mappings(
                 csa_inner_state_slot_mappings,
                 ranks,
+                local_rows,
             ),
             num_tokens_per_owner=num_tokens_per_owner,
             logit_row_indices=logit_row_indices,
@@ -2496,7 +2556,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             raise first_error
 
     def run_prefill(self, model, batch: PrefillBatch) -> PrefillResult:
-        """Run all DeepSeekV4 hidden layers for one prefill chunk in a single packed call."""
+        """Run one B4 prefill dispatch across all active rank-local slots."""
         if self._compiled.prefill is None:
             raise RuntimeError("DeepSeekV4 kernels were not compiled for this runner")
         self._wait_for_pending_mtp_dispatches()
@@ -2508,7 +2568,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         with profile_span(
             "DeepSeekV4ModelRunner.prefill.prepare_fwd_args",
             cat="executor",
-            args={"actual_tokens": max(inputs.actual_tokens)},
+            args={
+                "actual_tokens": max(inputs.actual_tokens),
+                "active_slots": max(inputs.local_rows) + 1,
+            },
         ):
             self._stage_prefill_fwd_inputs(inputs)
             self._prefill_task_args.clear_outputs()
@@ -2519,7 +2582,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             with profile_span(
                 "DeepSeekV4ModelRunner.prefill.l3_dispatch",
                 cat="executor",
-                args={"actual_tokens": max(inputs.actual_tokens)},
+                args={
+                    "actual_tokens": max(inputs.actual_tokens),
+                    "active_slots": max(inputs.local_rows) + 1,
+                },
             ):
                 self._run_l3(
                     self._require_prefill_callable(),
@@ -2533,7 +2599,14 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         self._prefill_completion(inputs, pre_hc_hidden_buffer)
 
         logits = torch.stack(
-            tuple(logits_buffer[rank, 0] for rank in inputs.ranks),
+            tuple(
+                logits_buffer[rank, local_row, 0]
+                for rank, local_row in zip(
+                    inputs.ranks,
+                    inputs.local_rows,
+                    strict=True,
+                )
+            ),
         ).float()
         return PrefillResult(last_hidden=None, logits=logits)
 
@@ -3140,9 +3213,10 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
     ) -> None:
         """Rebuild the MTP sliding window from the main-model prefill tail."""
         layout = self._compiled.layout
-        for request_id, rank, actual_tokens in zip(
+        for request_id, rank, local_row, actual_tokens in zip(
             inputs.request_ids,
             inputs.ranks,
+            inputs.local_rows,
             inputs.actual_tokens,
             strict=True,
         ):
@@ -3151,14 +3225,21 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 raise ValueError("DeepSeekV4 MTP prefill chunks must not be empty")
             rank = int(rank)
             state = self._reserve_mtp_request_state(request_id, rank)
-            embeddings = inputs.x_hc[rank, :n, 0].detach().cpu()
-            input_ids = inputs.input_ids[rank, :n].detach().cpu().to(torch.long)
-            position_ids = inputs.position_ids[rank, :n].detach().cpu().to(torch.int32)
-            slot_mapping = inputs.ori_slot_mapping[rank, :n].detach().cpu().to(torch.long)
-            block_table = inputs.ori_block_table[rank].detach().cpu().clone()
+            embeddings = inputs.x_hc[rank, local_row, :n, 0].detach().cpu()
+            input_ids = inputs.input_ids[rank, local_row, :n].detach().cpu().to(torch.long)
+            position_ids = (
+                inputs.position_ids[rank, local_row, :n].detach().cpu().to(torch.int32)
+            )
+            slot_mapping = (
+                inputs.ori_slot_mapping[rank, local_row, :n]
+                .detach()
+                .cpu()
+                .to(torch.long)
+            )
+            block_table = inputs.ori_block_table[rank, local_row].detach().cpu().clone()
             tail_tokens = min(n, int(layout.prefill_seq))
             tail_start = n - tail_tokens
-            current_pre_hc = pre_hc_hidden[rank, :tail_tokens].detach().cpu()
+            current_pre_hc = pre_hc_hidden[rank, local_row, :tail_tokens].detach().cpu()
             if current_pre_hc.shape[0] != tail_tokens:
                 raise ValueError(
                     f"DeepSeekV4 main prefill returned {current_pre_hc.shape[0]} pre-HC rows "
@@ -4223,10 +4304,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
     def _stage_prefill_fwd_inputs(self, inputs: DeepSeekV4PreparedPrefillInputs) -> None:
         """Copy one prefill chunk's mutable metadata into shared host buffers.
 
-        The per-request metadata (slot mappings, block tables, position/input
-        ids), the RoPE tables and the compressor-state block tables
-        are shared single per-rank copies (the kernel slices them per layer
-        internally). Cache pools are worker-resident and are not staged here.
+        Request metadata is packed by rank and local B4 slot. The RoPE tables
+        and cache pools remain worker-resident and are not staged here.
         """
         ta = self._prefill_task_args
         if ta is None:
@@ -4799,44 +4878,80 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
     def _rank_stack(self, tensor: torch.Tensor) -> torch.Tensor:
         return tensor.unsqueeze(0).expand(self._compiled.layout.ranks, *tensor.shape).contiguous()
 
-    def _rank_scatter(
+    def _rank_slot_scatter(
         self,
         tensors: Sequence[torch.Tensor],
         ranks: Sequence[int],
+        local_rows: Sequence[int],
     ) -> torch.Tensor:
-        """Place distinct local tensors on their owning ranks, filling inactive ranks."""
-        if len(tensors) == 0 or len(tensors) != len(ranks):
-            raise ValueError("rank-scattered tensors and ranks must be non-empty and aligned")
+        """Place distinct tensors in fixed rank-local prefill slots."""
+        if (
+            len(tensors) == 0
+            or len(tensors) != len(ranks)
+            or len(tensors) != len(local_rows)
+        ):
+            raise ValueError("rank/slot-scattered tensors and coordinates must be aligned")
         reference = tensors[0]
         if any(tensor.shape != reference.shape or tensor.dtype != reference.dtype for tensor in tensors):
-            raise ValueError("rank-scattered tensors must have identical shapes and dtypes")
-        result = reference.unsqueeze(0).expand(
+            raise ValueError("rank/slot-scattered tensors must have identical shapes and dtypes")
+        result = reference.reshape(1, 1, *reference.shape).expand(
             self._compiled.layout.ranks,
+            self._compiled.layout.prefill_batch,
             *reference.shape,
         ).clone()
-        for rank, tensor in zip(ranks, tensors, strict=True):
-            result[int(rank)].copy_(tensor)
+        for rank, local_row, tensor in zip(ranks, local_rows, tensors, strict=True):
+            result[int(rank), int(local_row)].copy_(tensor)
         return result.contiguous()
 
-    def _rank_scatter_mappings(
+    def _rank_slot_scatter_mappings(
         self,
         tensors: Sequence[torch.Tensor],
         ranks: Sequence[int],
+        local_rows: Sequence[int],
     ) -> torch.Tensor:
-        """Scatter cache-write mappings and disable every inactive rank."""
-        if len(tensors) == 0 or len(tensors) != len(ranks):
-            raise ValueError("rank-scattered mappings and ranks must be non-empty and aligned")
+        """Scatter cache-write mappings and disable every inactive slot."""
+        if (
+            len(tensors) == 0
+            or len(tensors) != len(ranks)
+            or len(tensors) != len(local_rows)
+        ):
+            raise ValueError("rank/slot-scattered mappings and coordinates must be aligned")
         reference = tensors[0]
         if any(tensor.shape != reference.shape or tensor.dtype != reference.dtype for tensor in tensors):
-            raise ValueError("rank-scattered mappings must have identical shapes and dtypes")
+            raise ValueError("rank/slot-scattered mappings must have identical shapes and dtypes")
         result = torch.full(
-            (self._compiled.layout.ranks, *reference.shape),
+            (
+                self._compiled.layout.ranks,
+                self._compiled.layout.prefill_batch,
+                *reference.shape,
+            ),
             -1,
             dtype=reference.dtype,
         )
-        for rank, tensor in zip(ranks, tensors, strict=True):
-            result[int(rank)].copy_(tensor)
+        for rank, local_row, tensor in zip(ranks, local_rows, tensors, strict=True):
+            result[int(rank), int(local_row)].copy_(tensor)
         return result.contiguous()
+
+    def _prefill_assignment(self, ranks: Sequence[int]) -> _DeepSeekV4DecodeAssignment:
+        """Assign scheduler requests to the fixed rank-local B4 prefill rows."""
+        layout = self._compiled.layout
+        indices_by_rank: list[list[int]] = [[] for _ in range(layout.ranks)]
+        local_rows = [0] * len(ranks)
+        for request_index, rank in enumerate(ranks):
+            local_row = len(indices_by_rank[int(rank)])
+            if local_row >= layout.prefill_batch:
+                raise ValueError(
+                    f"DeepSeekV4 rank {rank} prefill batch exceeds local capacity "
+                    f"{layout.prefill_batch}"
+                )
+            local_rows[request_index] = local_row
+            indices_by_rank[int(rank)].append(request_index)
+        return _DeepSeekV4DecodeAssignment(
+            ranks=tuple(int(rank) for rank in ranks),
+            local_rows=tuple(local_rows),
+            per_rank_counts=tuple(len(indices) for indices in indices_by_rank),
+            indices_by_rank=tuple(tuple(indices) for indices in indices_by_rank),
+        )
 
     def _prefill_active_token_limit(self, runtime: RuntimeConfig | None) -> int:
         """Return the configured active-token limit for one main-prefill call."""
