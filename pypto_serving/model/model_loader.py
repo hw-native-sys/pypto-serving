@@ -426,9 +426,14 @@ def _validate_deepseek_v4_weight_index(weight_map: dict[str, str], config_data: 
     if missing:
         raise KeyError(f"DeepSeekV4 W8A8 checkpoint is missing required tensors: {', '.join(missing)}")
     ratios = config_data.get("compress_ratios")
-    if not isinstance(ratios, list) or len(ratios) != int(config_data["num_hidden_layers"]) + 1:
+    # One entry per hidden layer plus one per MTP/DSpark draft layer.  The MTP
+    # release ships a single extra entry, the DSpark release three; serving
+    # consumes only the hidden-layer prefix, so anything at least that long
+    # with the final entry present is valid.
+    if not isinstance(ratios, list) or len(ratios) < int(config_data["num_hidden_layers"]) + 1:
         raise ValueError(
-            "DeepSeekV4 config compress_ratios must include one entry per hidden layer plus MTP/final entry"
+            "DeepSeekV4 config compress_ratios must include one entry per hidden layer "
+            "plus the draft/final entries"
         )
 
 
