@@ -372,8 +372,10 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             )
         layout.validate_runtime(model.config, model.runtime, self._device_ids)
         compress_ratios = tuple(int(ratio) for ratio in metadata["compress_ratios"])
-        if len(compress_ratios) != model.config.num_hidden_layers + 1:
-            raise ValueError("DeepSeekV4 compress_ratios must include hidden layers plus MTP/final entry")
+        if len(compress_ratios) < model.config.num_hidden_layers + 1:
+            raise ValueError(
+                "DeepSeekV4 compress_ratios must include hidden layers plus a draft/final entry"
+            )
         config_data = metadata.get("config_data", {})
         n_routed_experts = int(config_data.get("n_routed_experts", 256)) if isinstance(config_data, dict) else 256
         num_hash_layers = int(config_data.get("num_hash_layers", 3)) if isinstance(config_data, dict) else 3
