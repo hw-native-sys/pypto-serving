@@ -252,9 +252,10 @@ def _request_completion(
     *,
     prompt: str,
     max_new_tokens: int,
-    temperature: float,
-    top_k: int | None,
-    seed: int | None,
+    temperature: float = 0.0,
+    top_k: int | None = None,
+    seed: int | None = None,
+    model: str = MODEL_ID,
 ) -> dict:
     return _request_json(
         process,
@@ -263,7 +264,7 @@ def _request_completion(
         endpoint="/v1/completions",
         request_kind="completion",
         payload={
-            "model": MODEL_ID,
+            "model": model,
             "prompt": prompt,
             "max_tokens": max_new_tokens,
             "temperature": temperature,

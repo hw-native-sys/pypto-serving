@@ -134,3 +134,4 @@ nav:
       - Model Integration: developer-guide/model-integration.md
       - Weight Staging: developer-guide/weight-staging.md
       - DeepSeek V4 Runtime: developer-guide/deepseek-v4-runtime.md
+      - DeepSeek V4 DSpark: developer-guide/deepseek-v4-dspark.md

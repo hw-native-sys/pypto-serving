@@ -64,7 +64,10 @@ jobs:
         run: |
           set -uo pipefail
           bad=0
-          for key in PYPTO_QWEN3_MODEL_DIR PYPTO_DSV4_MODEL_DIR; do
+          for key in \
+            PYPTO_QWEN3_MODEL_DIR \
+            PYPTO_DSV4_MODEL_DIR \
+            PYPTO_DSV4_DSPARK_MODEL_DIR; do
             value="${!key:-}"
             if [ -z "$value" ]; then
               echo "::error::$key is not set — add it to this runner's .env"
@@ -133,6 +136,22 @@ jobs:
           run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
           run_cmd="$run_cmd python -m pytest tests/test_deepseek_v4_accuracy.py -q -s"
           task-submit --device auto --device-num 8 --ignore-whitelist \
+            --timeout 2400 --max-time 3600 \
+            --run "$run_cmd"
+
+      - name: Run DSpark target HTTP guard
+        env:
+          PYPTO_RUNTIME_LOG: error
+        run: |
+          source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
+          run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
+          run_cmd="$run_cmd && source activate.sh"
+          run_cmd="$run_cmd && TASK_DEVICE=\$TASK_DEVICE"
+          run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout"
+          run_cmd="$run_cmd PYPTO_DSV4_DSPARK_MODEL_DIR=$PYPTO_DSV4_DSPARK_MODEL_DIR"
+          run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
+          run_cmd="$run_cmd python -m pytest tests/test_deepseek_dspark_accuracy.py -q -s"
+          task-submit --device auto --device-num 16 --ignore-whitelist \
             --timeout 2400 --max-time 3600 \
             --run "$run_cmd"
 
