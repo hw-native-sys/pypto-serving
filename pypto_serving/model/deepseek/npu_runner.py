@@ -3396,6 +3396,133 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             "csa_inner_compress_state": cache.csa_inner_compress_state,
         }
 
+    @staticmethod
+    def _external_page_ranges(
+        tensor: StackedDeviceTensor,
+        *,
+        partition: int,
+        block_id: int,
+        num_layers: int,
+        physical_blocks: int,
+    ) -> tuple[tuple[int, int], ...]:
+        shard = tensor.shards[partition]
+        row_bytes = shard.nbytes // shard.shape[0]
+        return tuple(
+            (
+                shard.data_ptr + (layer * physical_blocks + block_id) * row_bytes,
+                row_bytes,
+            )
+            for layer in range(num_layers)
+        )
+
+    def external_kv_page_buffers(
+        self,
+        group_name: str,
+        partition: int,
+        block_id: int,
+    ) -> tuple[tuple[int, int], ...]:
+        """Expand one scheduler page into its layer-major device ranges."""
+        if not 0 <= partition < self._compiled.layout.ranks:
+            raise ValueError(f"external cache partition {partition} is out of range")
+        num_blocks = self._cache_group_num_blocks.get(group_name)
+        if num_blocks is None:
+            raise ValueError(f"unknown DeepSeekV4 cache group: {group_name}")
+        if not 0 <= block_id < num_blocks:
+            raise ValueError(
+                f"external cache block {block_id} is outside group {group_name!r} capacity"
+            )
+        physical_blocks = self._physical_cache_num_blocks(group_name)
+        cache = self._materialize_decode_device_cache()
+        layouts = {
+            "ori": ("kv_cache", DEEPSEEK_V4_FWD_NUM_LAYERS),
+            "cmp_c128": ("hca_cmp_kv", DEEPSEEK_V4_HCA_NUM_LAYERS),
+            "cmp_c4": ("csa_cmp_kv", DEEPSEEK_V4_CSA_NUM_LAYERS),
+            "hca_state": ("hca_compress_state", DEEPSEEK_V4_HCA_NUM_LAYERS),
+            "csa_state": ("csa_compress_state", DEEPSEEK_V4_CSA_NUM_LAYERS),
+            "csa_inner_state": (
+                "csa_inner_compress_state",
+                DEEPSEEK_V4_CSA_NUM_LAYERS,
+            ),
+        }
+        if group_name == "idx":
+            ranges = self._external_page_ranges(
+                cache.idx_kv_cache,
+                partition=partition,
+                block_id=block_id,
+                num_layers=DEEPSEEK_V4_CSA_NUM_LAYERS,
+                physical_blocks=physical_blocks,
+            ) + self._external_page_ranges(
+                cache.idx_kv_scale,
+                partition=partition,
+                block_id=block_id,
+                num_layers=DEEPSEEK_V4_CSA_NUM_LAYERS,
+                physical_blocks=physical_blocks,
+            )
+        else:
+            tensor_name, num_layers = layouts[group_name]
+            ranges = self._external_page_ranges(
+                getattr(cache, tensor_name),
+                partition=partition,
+                block_id=block_id,
+                num_layers=num_layers,
+                physical_blocks=physical_blocks,
+            )
+            if group_name == "ori" and self._compiled.num_speculative_tokens:
+                mtp_cache = self._materialize_mtp_device_kv_cache()
+                if mtp_cache is None:
+                    raise RuntimeError("MTP external cache page has no MTP device tensor")
+                ranges += self._external_page_ranges(
+                    mtp_cache,
+                    partition=partition,
+                    block_id=block_id,
+                    num_layers=1,
+                    physical_blocks=physical_blocks,
+                )
+        spec = next(spec for spec in self._cache_group_specs if spec.name == group_name)
+        actual_bytes = sum(size for _, size in ranges)
+        if actual_bytes != spec.spec.page_size_bytes:
+            raise RuntimeError(
+                f"external cache page layout mismatch for {group_name}: "
+                f"described={actual_bytes}, expected={spec.spec.page_size_bytes}"
+            )
+        return ranges
+
+    def external_kv_registration_buffers(
+        self,
+        partition: int,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return aligned, long-lived allocations containing one rank's pages."""
+        if not 0 <= partition < self._compiled.layout.ranks:
+            raise ValueError(f"external cache partition {partition} is out of range")
+        cache = self._materialize_decode_device_cache()
+        tensors = (
+            cache.kv_cache,
+            cache.hca_cmp_kv,
+            cache.csa_cmp_kv,
+            cache.idx_kv_cache,
+            cache.idx_kv_scale,
+            cache.hca_compress_state,
+            cache.csa_compress_state,
+            cache.csa_inner_compress_state,
+        )
+        buffers = [
+            (tensor.shards[partition].data_ptr, tensor.shards[partition].nbytes)
+            for tensor in tensors
+        ]
+        if self._compiled.num_speculative_tokens:
+            mtp_cache = self._materialize_mtp_device_kv_cache()
+            if mtp_cache is None:
+                raise RuntimeError("MTP external cache registration has no MTP device tensor")
+            shard = mtp_cache.shards[partition]
+            buffers.append((shard.data_ptr, shard.nbytes))
+        if len({address for address, _size in buffers}) != len(buffers):
+            raise RuntimeError("DeepSeek external KV allocations contain duplicate base addresses")
+        return tuple(buffers)
+
+    def external_cache_chip_control(self, name: str, payload: bytes) -> None:
+        """Dispatch one short control to every persistent Simpler chip child."""
+        self._shared_l3_worker().run_chip_control_extension(name, payload)
+
     def _mtp_prefill_args(self) -> tuple[Any, ...]:
         """Build the single packed ``l3_mtp_prefill`` argument tuple from the prefill TaskArgs."""
         return self._mtp_prefill_task_args.build()

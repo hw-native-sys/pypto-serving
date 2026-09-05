@@ -26,10 +26,12 @@ from pypto_serving.config.types import (
     DecodeResult,
     SamplingParams,
 )
+from pypto_serving.serving.external_cache.protocol import ExternalKVBuffer, ExternalKVTransfer
 from pypto_serving.serving.utils.gc_utils import freeze_gc_heap
 from pypto_serving.serving.server.ipc import (
     PLACEHOLDER_TOKEN,
     DecodeRequest,
+    ExternalKVTransferResult,
     NewRequestData,
     PrefillRequest,
     ProfileCommand,
@@ -126,12 +128,21 @@ class WorkerProcess:
         # PLACEHOLDER_TOKEN for a decode input it hasn't sampled yet; the worker
         # substitutes from here. Entries cleared when a request is released.
         self._last_tokens: dict[str, list[int]] = {}
+        self.external_cache_connector = None
+        self._external_cache_job_requests: dict[str, tuple[str, str]] = {}
 
     def init_device_and_model(self) -> int:
         from pypto_serving.config.types import ModelRecord
         from pypto_serving.model.common.executor.sampler import Sampler
         from pypto_serving.model.model_loader import ModelLoader
 
+        external_config = self.config.external_prefix_cache_config
+        if external_config is not None:
+            from pypto_serving.serving.external_cache.chip_bridge import (
+                install_mooncake_chip_extension,
+            )
+
+            install_mooncake_chip_extension()
         device_ids = self.config.worker_device_ids()
         device_label = ",".join(str(device_id) for device_id in device_ids)
         pypto_build_dir = self._configure_pypto_build_dir(device_ids)
@@ -189,8 +200,53 @@ class WorkerProcess:
             else:
                 raise RuntimeError("Executor has no register_model method")
 
+            if external_config is not None:
+                self._initialize_external_cache_connector(external_config)
+
             logger.info("Worker model loaded and ready")
             return num_pages
+
+    def _initialize_external_cache_connector(self, config) -> None:
+        connector = None
+        try:
+            from pypto_serving.serving.external_cache.chip_bridge import (
+                SimplerMooncakeConnector,
+            )
+
+            connector = SimplerMooncakeConnector(
+                lambda name, payload: self.executor.external_cache_chip_control(
+                    self.model_record.config.model_id,
+                    name,
+                    payload,
+                ),
+                config,
+                self.config.worker_device_ids(),
+            )
+            for partition, _device_id in enumerate(self.config.worker_device_ids()):
+                ranges = self.executor.external_kv_registration_buffers(
+                    self.model_record.config.model_id,
+                    partition,
+                )
+                connector.register_buffers(
+                    tuple(
+                        ExternalKVBuffer(address=address, size_bytes=size_bytes)
+                        for address, size_bytes in ranges
+                    ),
+                    partition=partition,
+                )
+            self.external_cache_connector = connector
+        except Exception:
+            if connector is not None:
+                try:
+                    connector.close()
+                except Exception:
+                    logger.exception("Failed to close partially initialized external cache connector")
+            if config.failure_policy == "fail_startup":
+                raise
+            logger.exception(
+                "External prefix cache chip clients failed to initialize; loads will cold-miss"
+            )
+            self.external_cache_connector = None
 
     def _resolve_executor_cls(self):
         if self.config.executor_cls == "PyptoQwen14BExecutor":
@@ -458,6 +514,10 @@ class WorkerProcess:
             and cmd.decode_requests
             and not cmd.prefill_requests
             and not cmd.new_requests
+            and not cmd.external_cache_loads
+            and not cmd.external_cache_saves
+            and not cmd.external_cache_cancellations
+            and not cmd.poll_external_cache
             and bool(getattr(self.executor, "supports_async_decode_reclaim", False))
         )
 
@@ -577,7 +637,7 @@ class WorkerProcess:
                     continue
             self._req_cache.pop(req_id, None)
             self._last_tokens.pop(req_id, None)
-            release_sampler = getattr(self.sampler, "release_requests", None)
+            release_sampler = getattr(getattr(self, "sampler", None), "release_requests", None)
             if callable(release_sampler):
                 release_sampler([req_id])
 
@@ -589,6 +649,8 @@ class WorkerProcess:
         """Execute one step using the lightweight IPC protocol."""
         runtime_model = self.model_record.runtime_model
         new_tokens: dict[str, list[int]] = {}
+        self._cancel_external_cache_jobs(cmd)
+        external_cache_completions = self._start_external_cache_jobs(cmd)
 
         with profile_span(
             "WorkerProcess.execute_step",
@@ -621,7 +683,156 @@ class WorkerProcess:
             if tokens:
                 self._record_last_tokens(req_id, tokens)
 
-        return StepResult(new_tokens=new_tokens, step_id=cmd.step_id)
+        external_cache_completions.extend(self._poll_external_cache_completions())
+
+        return StepResult(
+            new_tokens=new_tokens,
+            step_id=cmd.step_id,
+            external_cache_completions=external_cache_completions,
+        )
+
+    def _start_external_cache_jobs(self, cmd: StepCommand) -> list[ExternalKVTransferResult]:
+        immediate = []
+        for load in cmd.external_cache_loads:
+            try:
+                connector = getattr(self, "external_cache_connector", None)
+                if connector is None:
+                    raise RuntimeError("external cache worker connector is not configured")
+                transfers = []
+                for page in load.pages:
+                    ranges = self.executor.external_kv_page_buffers(
+                        self.model_record.config.model_id,
+                        page.group_name,
+                        load.destination_partition,
+                        page.physical_block_id,
+                    )
+                    buffers = tuple(
+                        ExternalKVBuffer(address=address, size_bytes=size_bytes)
+                        for address, size_bytes in ranges
+                    )
+                    transfer = ExternalKVTransfer(page.key, buffers)
+                    if transfer.size_bytes != page.size_bytes:
+                        raise RuntimeError(
+                            f"external cache page {page.group_name}:"
+                            f"{page.logical_block_index} describes {transfer.size_bytes} bytes, "
+                            f"expected {page.size_bytes}"
+                        )
+                    transfers.append(transfer)
+                connector.start_load(
+                    load.job_id,
+                    transfers,
+                    partition=load.destination_partition,
+                )
+                jobs = getattr(self, "_external_cache_job_requests", None)
+                if jobs is None:
+                    jobs = {}
+                    self._external_cache_job_requests = jobs
+                jobs.setdefault(load.job_id, (load.request_id, "load"))
+            except Exception as exc:
+                logger.error(
+                    "Failed to start external cache load %s: %s",
+                    load.job_id,
+                    exc,
+                    exc_info=True,
+                )
+                immediate.append(
+                    ExternalKVTransferResult(
+                        job_id=load.job_id,
+                        request_id=load.request_id,
+                        operation="load",
+                        succeeded=False,
+                        error=str(exc),
+                    )
+                )
+        for save in cmd.external_cache_saves:
+            try:
+                connector = getattr(self, "external_cache_connector", None)
+                if connector is None:
+                    raise RuntimeError("external cache worker connector is not configured")
+                transfers = []
+                for page in save.pages:
+                    ranges = self.executor.external_kv_page_buffers(
+                        self.model_record.config.model_id,
+                        page.group_name,
+                        save.source_partition,
+                        page.physical_block_id,
+                    )
+                    buffers = tuple(
+                        ExternalKVBuffer(address=address, size_bytes=size_bytes)
+                        for address, size_bytes in ranges
+                    )
+                    transfer = ExternalKVTransfer(page.key, buffers)
+                    if transfer.size_bytes != page.size_bytes:
+                        raise RuntimeError(
+                            f"external cache page {page.group_name}:"
+                            f"{page.logical_block_index} describes {transfer.size_bytes} bytes, "
+                            f"expected {page.size_bytes}"
+                        )
+                    transfers.append(transfer)
+                connector.start_save(
+                    save.job_id,
+                    transfers,
+                    manifest_key=save.manifest_key,
+                    manifest_payload=save.manifest_payload,
+                    partition=save.source_partition,
+                )
+                jobs = getattr(self, "_external_cache_job_requests", None)
+                if jobs is None:
+                    jobs = {}
+                    self._external_cache_job_requests = jobs
+                jobs.setdefault(save.job_id, (save.request_id, "save"))
+            except Exception as exc:
+                logger.error(
+                    "Failed to start external cache save %s: %s",
+                    save.job_id,
+                    exc,
+                    exc_info=True,
+                )
+                immediate.append(
+                    ExternalKVTransferResult(
+                        job_id=save.job_id,
+                        request_id=save.request_id,
+                        operation="save",
+                        succeeded=False,
+                        error=str(exc),
+                    )
+                )
+        return immediate
+
+    def _cancel_external_cache_jobs(self, cmd: StepCommand) -> None:
+        connector = getattr(self, "external_cache_connector", None)
+        if connector is None:
+            return
+        for job_id in cmd.external_cache_cancellations:
+            connector.cancel(job_id)
+
+    def _poll_external_cache_completions(self) -> list[ExternalKVTransferResult]:
+        connector = getattr(self, "external_cache_connector", None)
+        if connector is None:
+            return []
+        results = []
+        for completion in connector.poll_completed():
+            job = getattr(self, "_external_cache_job_requests", {}).pop(
+                completion.job_id,
+                None,
+            )
+            if job is None:
+                logger.warning(
+                    "Ignoring completion for unknown external cache job %s",
+                    completion.job_id,
+                )
+                continue
+            request_id, operation = job
+            results.append(
+                ExternalKVTransferResult(
+                    job_id=completion.job_id,
+                    request_id=request_id,
+                    operation=operation,
+                    succeeded=completion.succeeded,
+                    error=completion.error,
+                )
+            )
+        return results
 
     def _record_last_tokens(self, request_id: str, tokens: list[int]) -> None:
         """Remember the latest sampled token for async placeholder resolution."""
@@ -916,6 +1127,10 @@ class WorkerProcess:
 
     def close(self) -> None:
         """Release executor-owned runtime and device resources."""
+        connector = getattr(self, "external_cache_connector", None)
+        self.external_cache_connector = None
+        if connector is not None:
+            connector.close()
         executor = self.executor
         self.executor = None
         if executor is None:

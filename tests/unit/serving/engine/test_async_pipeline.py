@@ -22,6 +22,7 @@ from pypto_serving.serving.sched.scheduler import (
     SchedulerConfig,
 )
 from pypto_serving.serving.server.ipc import (
+    ExternalKVTransferResult,
     PLACEHOLDER_TOKEN,
     StepResult,
     decode_command,
@@ -274,6 +275,10 @@ def test_async_pipeline_drains_stale_result_after_error(monkeypatch):
 
     monkeypatch.setattr(asyncio, "to_thread", run_inline)
     core, _dispatched = _async_pipeline_core()
+    external_completions = []
+    core.scheduler.finish_external_cache_save = (
+        lambda job_id, *, succeeded: external_completions.append((job_id, succeeded))
+    )
     req = _running_decode_request(prompt=(1, 2), first_output=50)
     core.scheduler.running.append(req)
     core.scheduler.requests[req.request_id] = req
@@ -291,7 +296,20 @@ def test_async_pipeline_drains_stale_result_after_error(monkeypatch):
     outq = deque(
         [
             encode_result(StepResult(new_tokens={}, error="boom", step_id=first_step_id)),
-            encode_result(StepResult(new_tokens={"r": [51]}, step_id=second_step_id)),
+            encode_result(
+                StepResult(
+                    new_tokens={"r": [51]},
+                    step_id=second_step_id,
+                    external_cache_completions=[
+                        ExternalKVTransferResult(
+                            job_id="save-1",
+                            request_id="r",
+                            operation="save",
+                            succeeded=True,
+                        )
+                    ],
+                )
+            ),
             encode_result(StepResult(new_tokens={"r": [77]}, step_id=99)),
         ]
     )
@@ -310,3 +328,4 @@ def test_async_pipeline_drains_stale_result_after_error(monkeypatch):
     got = decode_result(asyncio.run(core._get_live_result()))
     assert got.step_id == 99
     assert core._discard_result_step_ids == set()
+    assert external_completions == [("save-1", True)]

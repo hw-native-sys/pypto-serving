@@ -232,6 +232,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Enable chunked prefill (default: True). Use --no-enable-chunked-prefill to disable.",
     )
+    parser.add_argument(
+        "--external-prefix-cache-config",
+        default=None,
+        metavar="PATH",
+        help="JSON configuration for the external DeepSeek prefix cache.",
+    )
 
     # Profiling
     parser.add_argument(
@@ -310,6 +316,11 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     enable_prefix_cache = args.enable_prefix_caching
     if model_family == "deepseek_v4" and num_speculative_tokens > 1:
         enable_prefix_cache = False
+    external_prefix_cache_config = _build_external_prefix_cache_config(
+        args,
+        model_family=model_family,
+        enable_prefix_cache=enable_prefix_cache,
+    )
     return EngineConfig(
         model_id=args.served_model_name or Path(args.model).name,
         model_dir=model_dir,
@@ -330,7 +341,27 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         long_prefill_token_threshold=args.long_prefill_token_threshold,
         enable_prefix_cache=enable_prefix_cache,
         enable_chunk_prefill=args.enable_chunked_prefill,
+        external_prefix_cache_config=external_prefix_cache_config,
     )
+
+
+def _build_external_prefix_cache_config(
+    args: argparse.Namespace,
+    *,
+    model_family: str,
+    enable_prefix_cache: bool,
+):
+    config_path = args.external_prefix_cache_config
+    if config_path is None:
+        return None
+    if model_family != "deepseek_v4":
+        raise ValueError("external prefix caching is only supported for DeepSeek V4")
+    if not enable_prefix_cache:
+        raise ValueError("external prefix caching requires local prefix caching to be enabled")
+
+    from pypto_serving.serving.external_cache.config import ExternalPrefixCacheConfig
+
+    return ExternalPrefixCacheConfig.from_file(config_path)
 
 
 def _build_runtime_config(
