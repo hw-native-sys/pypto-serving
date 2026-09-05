@@ -133,16 +133,20 @@ class L3DispatchMixin:
         """Return the persistent ``DistributedWorker`` (runner-specific fork logic)."""
         raise NotImplementedError
 
-    def _run_l3(self, callable_spec: Any, *args: Any) -> None:
+    def _run_l3(self, callable_spec: Any, *args: Any, config: Any = None) -> None:
         """Dispatch one L3 program: resolve args, run, free per-dispatch uploads.
 
         ``callable_spec`` is an :class:`~pypto_serving.model.common.compiler.l3_callable.L3Callable`
         (``compiled``, ``name``, ``aicpu_thread_num``, optional ``block_dim``,
-        optional ``dispatch_args`` prefix).
+        optional ``dispatch_args`` prefix).  ``config`` overrides the runner's
+        default ``RunConfig`` for this dispatch alone -- a runner that hosts
+        programs with different ring requirements passes each program's config
+        here instead of resizing process-wide state.
         """
         span_args: dict[str, Any] = {"aicpu_thread_num": callable_spec.aicpu_thread_num}
         if callable_spec.block_dim is not None:
             span_args["block_dim"] = callable_spec.block_dim
+        run_config = self._l3_run_config if config is None else config
         with profile_span(callable_spec.name, cat="kernel", level="kernel", args=span_args):
             worker = self._shared_l3_worker()
             uploaded: list[Any] = []
@@ -165,7 +169,7 @@ class L3DispatchMixin:
                     args=dict(span_args),
                 ):
                     worker.run(
-                        callable_spec.compiled, *l3_args, config=self._l3_run_config,
+                        callable_spec.compiled, *l3_args, config=run_config,
                     )
             finally:
                 for tensor in uploaded:
