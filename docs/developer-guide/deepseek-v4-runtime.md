@@ -4,7 +4,7 @@ DeepSeek V4 uses a model-local eight-rank runtime path. Attention data paralleli
 
 ## Dynamic Prefill Extent
 
-The main prefill kernel supports a dynamic request extent up to 8192 tokens and walks it internally in 128-token tiles. AR and MTP use the same main-prefill request limit; the effective dispatch extent is the minimum of 8192, `--max-num-batched-tokens`, `--long-prefill-token-threshold`, and `--max-model-len`.
+The main prefill wrapper supports four requests per DP partition, each with a dynamic extent up to 8192 tokens, and walks every request internally in 128-token tiles. DP=8 therefore exposes 32 prefill request slots per dispatch. The leaf attention and MoE programs remain B1/S128 and reuse their bounded workspace across request slots. AR and MTP use the same per-request limit; the effective extent is the minimum of 8192, `--max-num-batched-tokens`, `--long-prefill-token-threshold`, and `--max-model-len`.
 
 AR and MTP submit each main-prefill chunk once, with its backing extent padded to the next 128-token tile. An 8191-token prompt therefore uses one 8192-row main-prefill dispatch when those configured limits permit it, rather than 64 separate serving dispatches. The 128-token width is an internal kernel tile, not a serving chunk restriction.
 

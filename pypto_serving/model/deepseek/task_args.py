@@ -369,35 +369,44 @@ _PREFILL_CACHE_POOLS = (
 class DeepSeekPrefillTaskArgs(TaskArgs):
     """Task arguments whose token-shaped slots use the active prefill extent."""
 
-    def __init__(self, ranks: int) -> None:
+    def __init__(self, ranks: int, batch: int) -> None:
         super().__init__(stacked=True)
         self._ranks = int(ranks)
+        self._batch = int(batch)
         if self._ranks <= 0:
             raise ValueError("DeepSeekV4 prefill ranks must be positive")
+        if self._batch <= 0:
+            raise ValueError("DeepSeekV4 prefill batch must be positive")
 
     def token_view(self, name: str, kernel_tokens: int) -> torch.Tensor:
         """Return a packed active-token view over one full-capacity shared slot."""
         storage = self.tensors[name]
         if not isinstance(storage, torch.Tensor):
             raise TypeError(f"DeepSeekV4 prefill slot {name!r} is not a Host tensor")
-        if storage.ndim < 2 or int(storage.shape[0]) != self._ranks:
+        if (
+            storage.ndim < 3
+            or int(storage.shape[0]) != self._ranks
+            or int(storage.shape[1]) != self._batch
+        ):
             raise ValueError(
                 "DeepSeekV4 prefill storage must start with "
-                f"[{self._ranks}, capacity], got {name} shape={tuple(storage.shape)}"
+                f"[{self._ranks}, {self._batch}, capacity], "
+                f"got {name} shape={tuple(storage.shape)}"
             )
         if not storage.is_contiguous():
             raise ValueError(f"DeepSeekV4 prefill storage {name!r} must be contiguous")
 
         kernel_tokens = int(kernel_tokens)
-        capacity = int(storage.shape[1])
+        capacity = int(storage.shape[2])
         if kernel_tokens <= 0 or kernel_tokens > capacity:
             raise ValueError(
                 f"DeepSeekV4 prefill extent {kernel_tokens} exceeds shared capacity {capacity}"
             )
-        tail_shape = tuple(int(dim) for dim in storage.shape[2:])
-        used_elements = self._ranks * kernel_tokens * math.prod(tail_shape)
+        tail_shape = tuple(int(dim) for dim in storage.shape[3:])
+        used_elements = self._ranks * self._batch * kernel_tokens * math.prod(tail_shape)
         return storage.reshape(-1)[:used_elements].view(
             self._ranks,
+            self._batch,
             kernel_tokens,
             *tail_shape,
         )
@@ -464,58 +473,91 @@ def _prefill_slot_specs(
 ) -> dict[str, tuple[torch.dtype, tuple[int, ...], ClearPolicy]]:
     """Host-shared slot name -> (dtype, full shape, clear policy) for the packed prefill dispatch."""
     ranks = layout.ranks
+    batch = layout.prefill_batch
     seq = layout.prefill_seq if token_capacity is None else int(token_capacity)
     if seq <= 0:
         raise ValueError("DeepSeekV4 prefill token capacity must be positive")
     hc_mult = layout.hc_mult
     zero = ClearPolicy.ZERO
     return {
-        "x_hc": (torch.float32, (ranks, seq, hc_mult, hidden), ClearPolicy.NONE),
-        "hca_compress_state_block_table": (torch.int32, (ranks, layout.prefill_hca_state_max_blocks), ClearPolicy.NONE),
-        "csa_compress_state_block_table": (torch.int32, (ranks, layout.prefill_csa_state_max_blocks), ClearPolicy.NONE),
-        "csa_inner_compress_state_block_table": (
-            torch.int32,
-            (ranks, layout.prefill_csa_inner_state_max_blocks),
+        "x_hc": (
+            torch.float32,
+            (ranks, batch, seq, hc_mult, hidden),
             ClearPolicy.NONE,
         ),
-        "ori_block_table": (torch.int32, (ranks, layout.prefill_ori_max_blocks), ClearPolicy.NONE),
+        "hca_compress_state_block_table": (
+            torch.int32,
+            (ranks, batch, layout.prefill_hca_state_max_blocks),
+            ClearPolicy.NONE,
+        ),
+        "csa_compress_state_block_table": (
+            torch.int32,
+            (ranks, batch, layout.prefill_csa_state_max_blocks),
+            ClearPolicy.NONE,
+        ),
+        "csa_inner_compress_state_block_table": (
+            torch.int32,
+            (ranks, batch, layout.prefill_csa_inner_state_max_blocks),
+            ClearPolicy.NONE,
+        ),
+        "ori_block_table": (
+            torch.int32,
+            (ranks, batch, layout.prefill_ori_max_blocks),
+            ClearPolicy.NONE,
+        ),
         "hca_cmp_block_table": (
             torch.int32,
-            (ranks, layout.prefill_cmp_max_blocks),
+            (ranks, batch, layout.prefill_cmp_max_blocks),
             ClearPolicy.NONE,
         ),
         "csa_cmp_block_table": (
             torch.int32,
-            (ranks, layout.prefill_cmp_max_blocks),
+            (ranks, batch, layout.prefill_cmp_max_blocks),
             ClearPolicy.NONE,
         ),
-        "idx_block_table": (torch.int32, (ranks, layout.prefill_idx_max_blocks), ClearPolicy.NONE),
-        "ori_slot_mapping": (torch.int64, (ranks, seq), ClearPolicy.NONE),
-        "position_ids": (torch.int32, (ranks, seq), ClearPolicy.NONE),
-        "input_ids": (torch.int64, (ranks, seq), ClearPolicy.NONE),
-        "hca_cmp_slot_mapping": (torch.int64, (ranks, seq), ClearPolicy.NONE),
-        "hca_state_slot_mapping": (torch.int64, (ranks, seq), ClearPolicy.NONE),
-        "csa_cmp_slot_mapping": (torch.int64, (ranks, seq), ClearPolicy.NONE),
-        "csa_idx_slot_mapping": (torch.int64, (ranks, seq), ClearPolicy.NONE),
-        "csa_state_slot_mapping": (torch.int64, (ranks, seq), ClearPolicy.NONE),
-        "csa_inner_state_slot_mapping": (torch.int64, (ranks, seq), ClearPolicy.NONE),
-        "num_tokens_per_owner": (torch.int32, (ranks,), ClearPolicy.NONE),
-        "logit_row_indices": (torch.int32, (ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS), ClearPolicy.NONE),
+        "idx_block_table": (
+            torch.int32,
+            (ranks, batch, layout.prefill_idx_max_blocks),
+            ClearPolicy.NONE,
+        ),
+        "ori_slot_mapping": (torch.int64, (ranks, batch, seq), ClearPolicy.NONE),
+        "position_ids": (torch.int32, (ranks, batch, seq), ClearPolicy.NONE),
+        "input_ids": (torch.int64, (ranks, batch, seq), ClearPolicy.NONE),
+        "hca_cmp_slot_mapping": (torch.int64, (ranks, batch, seq), ClearPolicy.NONE),
+        "hca_state_slot_mapping": (torch.int64, (ranks, batch, seq), ClearPolicy.NONE),
+        "csa_cmp_slot_mapping": (torch.int64, (ranks, batch, seq), ClearPolicy.NONE),
+        "csa_idx_slot_mapping": (torch.int64, (ranks, batch, seq), ClearPolicy.NONE),
+        "csa_state_slot_mapping": (torch.int64, (ranks, batch, seq), ClearPolicy.NONE),
+        "csa_inner_state_slot_mapping": (
+            torch.int64,
+            (ranks, batch, seq),
+            ClearPolicy.NONE,
+        ),
+        "num_tokens_per_owner": (torch.int32, (batch, ranks), ClearPolicy.NONE),
+        "logit_row_indices": (
+            torch.int32,
+            (ranks, batch, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS),
+            ClearPolicy.NONE,
+        ),
         # Outputs read back by the host are zeroed before each dispatch. The
         # kernel overwrites the active hidden_out extent, so clearing its full
         # max-sequence backing would add a large, unnecessary host memset.
         # The main kernel exposes the final 128 valid pre-HC rows per owner.
         "pre_hc_hidden_out": (
             torch.float32,
-            (ranks, layout.prefill_seq, hc_mult, hidden),
+            (ranks, batch, layout.prefill_seq, hc_mult, hidden),
             zero,
         ),
         "hidden_out": (
             torch.bfloat16,
-            (ranks, seq, hidden),
+            (ranks, batch, seq, hidden),
             ClearPolicy.NONE,
         ),
-        "logits": (torch.float32, (ranks, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS, vocab), zero),
+        "logits": (
+            torch.float32,
+            (ranks, batch, DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS, vocab),
+            zero,
+        ),
     }
 
 
@@ -542,7 +584,7 @@ def prefill_task_args(
     static_weights = set(_PREFILL_STATIC_WEIGHTS)
     cache_pools = set(_PREFILL_CACHE_POOLS)
 
-    ta = DeepSeekPrefillTaskArgs(layout.ranks)
+    ta = DeepSeekPrefillTaskArgs(layout.ranks, layout.prefill_batch)
     for name in _PREFILL_FWD_TENSOR_ORDER:
         if name in slot_specs:
             dtype, shape, clear = slot_specs[name]

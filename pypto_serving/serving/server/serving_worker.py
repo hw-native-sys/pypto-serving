@@ -605,6 +605,7 @@ class WorkerProcess:
                     for chunk in self._partitioned_prefill_chunks(
                         cmd.prefill_requests,
                         max_prefill_batch,
+                        self.executor.max_prefill_batch_size_per_partition,
                     ):
                         self._batch_prefill(chunk, runtime_model, new_tokens)
             if cmd.decode_requests:
@@ -630,23 +631,32 @@ class WorkerProcess:
         self._last_tokens[request_id] = recent[-1:]
 
     @staticmethod
-    def _partitioned_prefill_chunks(scheduled: list, max_batch: int) -> list[list]:
-        """Pack at most one local-prefill request from each cache partition."""
+    def _partitioned_prefill_chunks(
+        scheduled: list,
+        max_batch: int,
+        max_per_partition: int = 1,
+    ) -> list[list]:
+        """Pack requests within global and per-cache-partition limits."""
+        if max_batch <= 0:
+            raise ValueError("prefill max_batch must be positive")
+        if max_per_partition <= 0:
+            raise ValueError("prefill max_per_partition must be positive")
         pending = list(scheduled)
         chunks: list[list] = []
         while pending:
             chunk = []
             deferred = []
-            used_partitions: set[int] = set()
+            partition_counts: dict[int, int] = {}
             for item in pending:
                 partition = item.cache_partition
                 can_add = len(chunk) < max_batch and (
-                    partition is None or partition not in used_partitions
+                    partition is None
+                    or partition_counts.get(partition, 0) < max_per_partition
                 )
                 if can_add:
                     chunk.append(item)
                     if partition is not None:
-                        used_partitions.add(partition)
+                        partition_counts[partition] = partition_counts.get(partition, 0) + 1
                 else:
                     deferred.append(item)
             if not chunk:

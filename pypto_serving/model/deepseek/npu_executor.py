@@ -264,11 +264,16 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
 
     @property
     def max_prefill_batch_size(self) -> int:
-        """Return the global DP width: one local prefill request per EP rank."""
+        """Return the global DP width across all fixed rank-local slots."""
         return (
             DeepSeekV4CacheLayout().ranks
             * self._kernel_contract.max_prefill_requests_per_partition
         )
+
+    @property
+    def max_prefill_batch_size_per_partition(self) -> int:
+        """Return the fixed request-slot width on each EP partition."""
+        return self._kernel_contract.max_prefill_requests_per_partition
 
     @property
     def supports_device_sampling(self) -> bool:
