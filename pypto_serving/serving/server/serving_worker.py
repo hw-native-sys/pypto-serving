@@ -201,6 +201,12 @@ class WorkerProcess:
             from pypto_serving.model.deepseek.npu_executor import DeepSeekV4PyptoExecutor
 
             return DeepSeekV4PyptoExecutor
+        if self.config.executor_cls == "PyptoDeepSeekV4DSparkExecutor":
+            from pypto_serving.model.deepseek_dspark.npu_executor import (
+                DeepSeekV4DSparkPyptoExecutor,
+            )
+
+            return DeepSeekV4DSparkPyptoExecutor
         from pypto_serving.model.common.executor.executor import ModelExecutor
 
         return ModelExecutor

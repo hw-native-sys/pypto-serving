@@ -28,6 +28,19 @@ def test_cli_keeps_generic_model_chunk_sizes_unrestricted():
     assert args.long_prefill_token_threshold == 128
 
 
+def test_cli_keeps_dspark_chunk_sizes_under_its_kernel_contract():
+    args = _parse_cli_args(
+        ["--model", "model", "--long-prefill-token-threshold", "128"]
+    )
+
+    cli._validate_prefill_chunk_size(
+        "deepseek_v4",
+        args.long_prefill_token_threshold,
+        variant="dspark",
+    )
+    assert args.long_prefill_token_threshold == 128
+
+
 def test_build_serving_engine_config_rejects_unsupported_deepseek_chunk_size(
     tmp_path,
 ):

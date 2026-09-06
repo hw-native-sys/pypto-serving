@@ -201,7 +201,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="JSON",
         help=(
             "Speculative decoding configuration as JSON. DeepSeek V4 supports "
-            "method='mtp' and a positive num_speculative_tokens value."
+            "method='mtp' with a positive num_speculative_tokens, and "
+            "method='dspark' with num_speculative_tokens 0 (target-only serving)."
         ),
     )
 
@@ -274,22 +275,29 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
+    model_variant = _resolve_model_variant(args)
     _validate_prefill_chunk_size(
         model_family,
         args.long_prefill_token_threshold,
+        variant=model_variant,
     )
     num_speculative_tokens = _resolve_num_speculative_tokens(args)
     if model_family == "deepseek_v4":
         executor_kwargs["compile_kernels"] = True
         executor_kwargs["num_speculative_tokens"] = num_speculative_tokens
-    elif num_speculative_tokens:
+    elif num_speculative_tokens or model_variant:
         raise ValueError(
             "--speculative-config/--num-speculative-tokens is only supported for DeepSeek V4"
         )
     executor_kwargs["use_compile_cache"] = args.use_compile_cache
+    # The DSpark TP4/DP4 axes are internal to the kernels (TP groups hold
+    # replicated caches; DP groups are the four scheduler cache partitions).
+    # The serving contract is one overlapped worker group of 16 ranks with
+    # expert parallelism spanning it, so the config collapses dp/tp to one.
+    dspark_variant = model_family == "deepseek_v4" and model_variant == "dspark"
     parallel_config = ParallelConfig(
-        data_parallel_size=args.data_parallel_size,
-        tensor_parallel_size=args.tensor_parallel_size,
+        data_parallel_size=1 if dspark_variant else args.data_parallel_size,
+        tensor_parallel_size=1 if dspark_variant else args.tensor_parallel_size,
         expert_parallel_size=args.expert_parallel_size,
         enable_expert_parallel=args.expert_parallel_size > 1,
         devices=devices,
@@ -301,6 +309,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         args,
         parallel_config,
         config_data=model_config_data,
+        variant=model_variant,
     )
     first_group = parallel_config.replica_device_groups[0]
     worker_device_ids = first_group if parallel_config.num_replicas == 1 else ()
@@ -308,7 +317,9 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     # one-token MTP path.  Keep the newer arbitrary-depth MTP implementation
     # available, but do not advertise prefix-cache compatibility for it yet.
     enable_prefix_cache = args.enable_prefix_caching
-    if model_family == "deepseek_v4" and num_speculative_tokens > 1:
+    if model_family == "deepseek_v4" and (
+        num_speculative_tokens > 1 or model_variant == "dspark"
+    ):
         enable_prefix_cache = False
     return EngineConfig(
         model_id=args.served_model_name or Path(args.model).name,
@@ -317,7 +328,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         device_id=first_group[0],
         device_ids=worker_device_ids,
         parallel_config=parallel_config,
-        executor_cls=_executor_cls_for_model_family(model_family),
+        executor_cls=_executor_cls_for_model_family(model_family, variant=model_variant),
         executor_kwargs=executor_kwargs,
         runtime_config=_build_runtime_config(
             args,
@@ -349,7 +360,24 @@ def _build_runtime_config(
     prefill_chunk_size_choices = ()
     supports_chunked_prefill_with_speculation = True
     requires_homogeneous_prefill_decode = False
-    if model_family == "deepseek_v4":
+    if model_family == "deepseek_v4" and _resolve_model_variant(args) == "dspark":
+        from pypto_serving.model.deepseek_dspark.npu_runner import (
+            DSPARK_PREFILL_MAX_TOKENS,
+            build_dspark_cache_group_specs,
+        )
+
+        config_data = config_data or {}
+        compress_ratios = config_data.get("compress_ratios")
+        if not isinstance(compress_ratios, list):
+            compress_ratios = None
+        num_hidden_layers = int(config_data.get("num_hidden_layers", 43))
+        kv_cache_groups = build_dspark_cache_group_specs(
+            num_hidden_layers,
+            compress_ratios,
+            max_seq_len=args.max_model_len,
+        )
+        max_prefill_tokens_per_request = DSPARK_PREFILL_MAX_TOKENS
+    elif model_family == "deepseek_v4":
         from pypto_serving.model.deepseek.npu_executor import (
             load_deepseek_v4_serving_contract,
         )
@@ -401,6 +429,19 @@ def _build_runtime_config(
     )
 
 
+def _resolve_model_variant(args: argparse.Namespace) -> str:
+    """Return the DeepSeek V4 serving variant selected by the speculative config."""
+    speculative_config = getattr(args, "speculative_config", None)
+    if speculative_config is None:
+        return ""
+    method = speculative_config.get("method")
+    if method in ("mtp", "dspark"):
+        return str(method)
+    raise ValueError(
+        "DeepSeek V4 --speculative-config requires method='mtp' or method='dspark'"
+    )
+
+
 def _resolve_num_speculative_tokens(args: argparse.Namespace) -> int:
     """Resolve the vLLM-style config and deprecated standalone alias."""
     speculative_config = getattr(args, "speculative_config", None)
@@ -408,7 +449,16 @@ def _resolve_num_speculative_tokens(args: argparse.Namespace) -> int:
     if speculative_config is not None:
         if configured is not None:
             raise ValueError("--speculative-config cannot be combined with --num-speculative-tokens")
-        if speculative_config.get("method") != "mtp":
+        method = speculative_config.get("method")
+        if method == "dspark":
+            dspark_tokens = speculative_config.get("num_speculative_tokens", 0)
+            if dspark_tokens:
+                raise ValueError(
+                    "DeepSeek V4 method='dspark' serves the target model without "
+                    "speculation; use num_speculative_tokens 0"
+                )
+            return 0
+        if method != "mtp":
             raise ValueError("DeepSeek V4 --speculative-config requires method='mtp'")
         if "num_speculative_tokens" not in speculative_config:
             raise ValueError(
@@ -562,16 +612,23 @@ def _warn_deprecated_serving_profile_env(args: argparse.Namespace) -> None:
     )
 
 
-def _executor_cls_for_model_family(model_family: str) -> str:
+def _executor_cls_for_model_family(model_family: str, *, variant: str = "") -> str:
     """Map model family metadata to the worker executor class id."""
     if model_family == "deepseek_v4":
+        if variant == "dspark":
+            return "PyptoDeepSeekV4DSparkExecutor"
         return "PyptoDeepSeekV4Executor"
     return "PyptoQwen14BExecutor"
 
 
-def _validate_prefill_chunk_size(model_family: str, chunk_size: object) -> None:
+def _validate_prefill_chunk_size(
+    model_family: str,
+    chunk_size: object,
+    *,
+    variant: str = "",
+) -> None:
     """Reject unsupported user-configured DeepSeek prefill chunk sizes."""
-    if model_family != "deepseek_v4":
+    if model_family != "deepseek_v4" or variant == "dspark":
         return
     if (
         not isinstance(chunk_size, int)
@@ -591,9 +648,13 @@ def _validate_model_topology(
     parallel_config,
     *,
     config_data: dict[str, object] | None = None,
+    variant: str = "",
 ) -> None:
     """Validate model-specific serving topology constraints."""
     if model_family != "deepseek_v4":
+        return
+    if variant == "dspark":
+        _validate_dspark_topology(args)
         return
     if config_data is None:
         config_data = read_model_config(Path(args.model).resolve())
@@ -629,6 +690,43 @@ def _validate_model_topology(
             "DeepSeekV4 pypto-lib decode CSA state tables currently support at most "
             f"--max-model-len {max_model_len}. Increase the decode CSA state table depth "
             "in pypto-lib before serving longer contexts."
+        )
+
+
+def _validate_dspark_topology(args: argparse.Namespace) -> None:
+    """Validate the configured TP4 DSpark serving topology from the flags."""
+    from pypto_serving.model.deepseek_dspark.npu_runner import (
+        DSPARK_CACHE_PARTITIONS,
+        DSPARK_DECODE_BATCH,
+        DSPARK_MAX_SEQ_LEN,
+        DSPARK_TP_SIZE,
+    )
+
+    ranks = DSPARK_CACHE_PARTITIONS * DSPARK_TP_SIZE
+    if (
+        args.data_parallel_size != DSPARK_CACHE_PARTITIONS
+        or args.expert_parallel_size != ranks
+        or args.tensor_parallel_size != DSPARK_TP_SIZE
+    ):
+        raise ValueError(
+            "DSpark serving requires "
+            f"--dp {DSPARK_CACHE_PARTITIONS} --ep {ranks} --tp {DSPARK_TP_SIZE}"
+        )
+    if len(parse_device_ids(args.devices, default_device=args.device)) != ranks:
+        raise ValueError(f"DSpark serving requires exactly {ranks} NPU device ids")
+    if args.block_size != 32:
+        raise ValueError("DSpark kernels require --block-size 32")
+    max_global_batch = DSPARK_CACHE_PARTITIONS * DSPARK_DECODE_BATCH
+    if args.max_num_seqs > max_global_batch:
+        raise ValueError(
+            "DSpark decode kernels support at most "
+            f"--max-num-seqs {max_global_batch} ({DSPARK_DECODE_BATCH} per TP group)"
+        )
+    if args.max_model_len > DSPARK_MAX_SEQ_LEN:
+        raise ValueError(
+            "DSpark decode cache tables currently support at most "
+            f"--max-model-len {DSPARK_MAX_SEQ_LEN}. Extending the decode tables is "
+            "tracked by pypto-lib#905."
         )
 
 

@@ -863,8 +863,17 @@ def test_tokenizer_falls_back_when_deepseek_config_fails_strict_validation(tmp_p
     assert adapter.tokenizer is sentinel
 
 
-def test_deepseek_compile_attaches_lazy_weight_store_without_opening_shards(tmp_path, monkeypatch):
+@pytest.mark.parametrize("extra_draft_ratios", [(), (0, 0)])
+def test_deepseek_compile_attaches_lazy_weight_store_without_opening_shards(
+    tmp_path,
+    monkeypatch,
+    extra_draft_ratios,
+):
     model_dir = _write_deepseek_model_dir(tmp_path)
+    config_path = model_dir / "config.json"
+    config = json.loads(config_path.read_text())
+    config["compress_ratios"].extend(extra_draft_ratios)
+    config_path.write_text(json.dumps(config))
     kernel_dir = _write_deepseek_kernel_dir(tmp_path, lm_head_tp_size=8)
     monkeypatch.setattr(
         model_loader,
