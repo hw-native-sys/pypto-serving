@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -61,6 +62,7 @@ class QwenLayout:
     hidden_size: int
     sampled_ids_width: int
     topk_width: int
+    sampling_control_fields: int
 
 
 @dataclass
@@ -72,6 +74,7 @@ class _CompiledKernels:
     programs, the static weights, and the shape layout live here.
     """
 
+    contract: Any
     prefill: _L3Callable
     decode: _L3Callable
     topk_select: _L3Callable
@@ -87,11 +90,10 @@ class _CompiledKernels:
 
 @dataclass
 class _PrefillInputs:
-    """Per-call prefill dispatch inputs spliced into the built TaskArgs tuple.
+    """Per-call slices passed to the Contract's prefill runtime builder.
 
-    The fixed-shape buffers (seq_lens / chunk_lens / block_table / ...) are read
-    from the prefill TaskArgs slots by ``build()``; only the length-
-    ``total_tokens`` ``input_ids`` / ``slot_mapping`` slices vary per call.
+    Fixed-shape metadata lives in the prefill TaskArgs slots; only the
+    length-``total_tokens`` ``input_ids`` / ``slot_mapping`` slices vary.
     """
 
     actual_batch: int
@@ -147,7 +149,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         self._prefill_metadata_arrays: tuple = ()
         self._prefill_slot_mapping_array: np.ndarray | None = None
         # Per-call length-total_tokens slices over the full prefill input_ids /
-        # slot_mapping slots, spliced into the built prefill tuple at dispatch.
+        # slot_mapping slots, passed to the Contract runtime builder.
         self._active_prefill_token_ids: torch.Tensor | None = None
         self._active_prefill_slot_mapping: torch.Tensor | None = None
         # Per-dispatch TaskArgs owning the host-shared I/O buffers.
@@ -191,7 +193,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
 
     @property
     def _active_kv_cache(self) -> Any:
-        """The single materialized paged KV cache (read by the TaskArgs lazy sources)."""
+        """Return the single paged KV cache used by Contract runtime builders."""
         if not self._kv_caches:
             raise RuntimeError("KV cache is not initialized")
         return next(iter(self._kv_caches.values()))
@@ -478,8 +480,8 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
             f"max_seq={max_seq}, per_req={per_req}, total_tokens={total_tokens}, slot=-1)",
         )
         compiled = self._compiled
-        # The scratch KV cache is materialized before warmup; the TaskArgs lazy
-        # sources read it via _active_kv_cache at build() time.
+        # The scratch KV cache is materialized before the Contract builds
+        # the warmup dispatch arguments.
         prefill = self._prefill_task_args.tensors
 
         # -- prefill ---------------------------------------------------------
@@ -602,8 +604,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
 
         logits_padded = self._prefill_task_args.tensors["logits"]
 
-        # Materialize the KV cache so the TaskArgs lazy sources resolve it via
-        # _active_kv_cache at build() time.
+        # Materialize the KV cache before the Contract builds dispatch args.
         self._materialize_kv_cache(model)
 
         self._run_l3(compiled.prefill, *self._prefill_kernel_args(prefill_inputs))
@@ -771,45 +772,60 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         *,
         selection_k: int,
     ) -> None:
-        """Run the shared greedy/top-k selector without adding another worker program."""
+        """Run the Contract-owned greedy/top-k selector stage."""
         control = self._topk_select_task_args.tensors["sampling_control"]
         control[0] = int(actual_batch)
         control[1] = int(selection_k)
-        self._run_l3(
-            self._compiled.topk_select,
-            logits,
-            control,
-            values_buffer,
-            indices_buffer,
+        stage = self._compiled.contract.kernels["topk_select"]
+        args = stage.runtime_args_builder(
+            SimpleNamespace(logits=logits, sampling_control=control),
+            None,
+            topk_values_buffer=values_buffer,
+            topk_indices_buffer=indices_buffer,
         )
+        self._run_l3(self._compiled.topk_select, *args)
 
     def _prefill_kernel_args(self, inputs: _PrefillInputs) -> tuple[Any, ...]:
-        """Return arguments in ``qwen3_prefill_host`` signature order.
-
-        Fixed-shape buffers and weights come from the prefill TaskArgs
-        (``build()``); the per-call ``input_ids`` / ``slot_mapping`` are
-        length-``total_tokens`` slices over the full slots, spliced in.
-        """
-        task_args = self._prefill_task_args
-        args = list(task_args.build())
-        args[task_args.names.index("input_ids")] = inputs.token_ids
-        args[task_args.names.index("slot_mapping")] = inputs.slot_mapping
-        return tuple(args)
+        """Build the prefill ABI tuple through the pypto-lib Contract."""
+        buffers = self._prefill_task_args.tensors
+        cache = self._active_kv_cache
+        stage_inputs = SimpleNamespace(
+            token_ids=inputs.token_ids,
+            seq_lens=buffers["seq_lens"],
+            chunk_lens=buffers["chunk_lens"],
+            chunk_offsets=buffers["chunk_offsets"],
+            block_table=buffers["block_table"],
+            slot_mapping=inputs.slot_mapping,
+        )
+        return self._compiled.contract.kernels["prefill"].runtime_args_builder(
+            stage_inputs,
+            self._require_static_args(),
+            k_cache=cache.key_pages,
+            v_cache=cache.value_pages,
+            logits=buffers["logits"],
+        )
 
     def _decode_kernel_args(self, *, device_sampling: bool = False) -> tuple[Any, ...]:
-        """Return arguments in ``qwen3_decode_host`` signature order.
-
-        Buffers and weights come from the decode TaskArgs (``build()``). Under
-        device sampling, ``logits`` and ``next_hidden`` swap from the host slots
-        to worker-resident device scratch (spliced in), so full-vocabulary
-        logits are never staged/copied-back per step.
-        """
-        task_args = self._decode_task_args
-        args = list(task_args.build())
-        if device_sampling:
-            args[task_args.names.index("logits")] = self._decode_logits_device_arg()
-            args[task_args.names.index("next_hidden")] = self._decode_next_hidden_device_arg()
-        return tuple(args)
+        """Build the decode ABI tuple through the pypto-lib Contract."""
+        buffers = self._decode_task_args.tensors
+        cache = self._active_kv_cache
+        logits = self._decode_logits_device_arg() if device_sampling else buffers["logits"]
+        next_hidden = self._decode_next_hidden_device_arg() if device_sampling else buffers["next_hidden"]
+        stage_inputs = SimpleNamespace(
+            seq_lens=buffers["seq_lens"],
+            block_table=buffers["block_table"],
+            slot_mapping=buffers["slot_mapping"],
+            logits=logits,
+            token_ids=buffers["token_ids"],
+        )
+        return self._compiled.contract.kernels["decode"].runtime_args_builder(
+            stage_inputs,
+            self._require_static_args(),
+            k_cache=cache.key_pages,
+            v_cache=cache.value_pages,
+            sampled_ids_buffer=buffers["sampled_ids"],
+            next_hidden_buffer=next_hidden,
+        )
 
     def _shared_l3_worker(self) -> Any:
         """Return the worker shared by the generation prefill/decode path."""

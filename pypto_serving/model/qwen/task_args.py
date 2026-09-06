@@ -8,26 +8,16 @@
 # -----------------------------------------------------------------------------------------------------------
 """Qwen3-14B per-dispatch-class :class:`TaskArgs` builders.
 
-Each builder registers, **in kernel-positional order**, every argument one L3
-callable takes -- host-shared I/O slots (allocated/staged here), static weights
-(uploaded once via ``StaticDeviceTensor``), and the worker-resident KV-cache
-handles (lazy sources resolved at ``build()`` time). There is no separate
-kernel-order tuple: the order is the ``add_slot`` / ``add_arg`` registration
-sequence, and each arg declares its kind at registration. This file is the
-single source of truth for each kernel's positional contract.
+Each builder owns only the host-shared buffers used by one dispatch class.
+The pypto-lib Contract owns the kernel's positional ABI; the runner passes
+these buffers, static weights, and KV-cache handles through the corresponding
+Contract ``runtime_args_builder``.
 
 Qwen is single-rank, so every ``TaskArgs`` uses ``stacked=False``.
 
-Two per-call wrinkles are handled by the runner *after* ``build()`` rather than
-in the builder:
-
-* ``qwen3_prefill_host`` takes ``input_ids`` / ``slot_mapping`` as
-  length-``total_tokens`` *slices* over the full kernel-batch slots. The slots
-  own the full buffers; the runner splices the per-call slices into the built
-  tuple.
-* ``qwen3_decode_host`` writes ``logits`` / ``next_hidden`` to device-resident
-  scratch under device sampling instead of the host slots. The runner splices
-  the device scratch into the built tuple when device sampling is active.
+Prefill dispatches use per-call slices of the full ``input_ids`` and
+``slot_mapping`` buffers. Decode dispatches may replace host ``logits`` and
+``next_hidden`` buffers with device-resident scratch for device sampling.
 """
 
 from __future__ import annotations
@@ -49,42 +39,6 @@ __all__ = [
 ]
 
 
-# Static-weight arg names -- each resolves to an already-built
-# ``StaticDeviceTensor`` marker on ``runner._require_static_args()`` (uploaded
-# once and cached by the resolver).
-_STATIC_WEIGHT_ACCESSORS = {
-    "rope_cos": lambda s: s.rope_cos,
-    "rope_sin": lambda s: s.rope_sin,
-    "final_norm_weight": lambda s: s.final_norm_weight,
-    "padded_lm_head_weight": lambda s: s.padded_lm_head_weight,
-    "padded_embed_weight": lambda s: s.padded_embed_weight,
-}
-
-
-def _static_weight(runner: Qwen314BModelRunner, name: str):
-    """Eager ``StaticDeviceTensor`` marker for one static weight.
-
-    The markers are built once in ``__init__`` and are stable, so they are
-    captured at builder time (no lazy indirection needed).
-    """
-    return _STATIC_WEIGHT_ACCESSORS[name](runner._require_static_args())
-
-
-def _decode_weight(runner: Qwen314BModelRunner, name: str):
-    """Eager ``StaticDeviceTensor`` marker for one stacked decode weight."""
-    return runner._require_static_args().decode_weights[name]
-
-
-def _kv_key_pages(runner: Qwen314BModelRunner):
-    """Lazy source: the active paged KV-cache key pages (resolved at build)."""
-    return runner._active_kv_cache.key_pages
-
-
-def _kv_value_pages(runner: Qwen314BModelRunner):
-    """Lazy source: the active paged KV-cache value pages (resolved at build)."""
-    return runner._active_kv_cache.value_pages
-
-
 def _prefill_slot_specs(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
     """Host-shared slot name -> (dtype, full shape) for the prefill dispatch.
 
@@ -104,45 +58,19 @@ def _prefill_slot_specs(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]
     }
 
 
-# ``qwen3_prefill_host`` positional order (the contract this builder encodes).
-_PREFILL_ORDER = (
-    "input_ids", "seq_lens", "chunk_lens", "chunk_offsets",
-    "decode_input_rms_weight", "decode_wq", "decode_wk", "decode_wv",
-    "decode_q_norm_weight", "decode_k_norm_weight",
-    "rope_cos", "rope_sin",
-    "block_table", "slot_mapping",
-    "k_cache", "v_cache",
-    "decode_wo", "decode_w_gate", "decode_w_up", "decode_w_down", "decode_post_rms_weight",
-    "final_norm_weight", "padded_lm_head_weight", "padded_embed_weight",
-    "logits",
-)
+def _task_args_for_slots(
+    slot_specs: dict[str, tuple[torch.dtype, tuple[int, ...]]],
+) -> TaskArgs:
+    """Allocate a single-rank TaskArgs containing only host-shared slots."""
+    task_args = TaskArgs(stacked=False)
+    for name, (dtype, shape) in slot_specs.items():
+        task_args.add_slot(Slot(name, Placement.HOST_SHARED, dtype, lambda _, value=shape: value))
+    return task_args
 
 
 def prefill_task_args(runner: Qwen314BModelRunner) -> TaskArgs:
-    """Build the ``TaskArgs`` for the single ``qwen3_prefill_host`` dispatch.
-
-    Host-shared I/O buffers are slots (allocated here); static weights are eager
-    ``StaticDeviceTensor`` markers; the KV-cache handles are lazy sources
-    resolved at ``build()``. The caller splices per-call ``input_ids`` /
-    ``slot_mapping`` slices into the built tuple.
-    """
-    slot_specs = _prefill_slot_specs(runner._compiled.layout)
-    static_weights = set(_STATIC_WEIGHT_ACCESSORS)
-
-    ta = TaskArgs(stacked=False)
-    for name in _PREFILL_ORDER:
-        if name in slot_specs:
-            dtype, shape = slot_specs[name]
-            ta.add_slot(Slot(name, Placement.HOST_SHARED, dtype, lambda _, s=shape: s))
-        elif name == "k_cache":
-            ta.add_arg(name, lambda: _kv_key_pages(runner))
-        elif name == "v_cache":
-            ta.add_arg(name, lambda: _kv_value_pages(runner))
-        elif name in static_weights:
-            ta.add_arg(name, _static_weight(runner, name))
-        else:  # stacked decode weight
-            ta.add_arg(name, _decode_weight(runner, name))
-    return ta
+    """Build the host-shared buffers used by the prefill Contract stage."""
+    return _task_args_for_slots(_prefill_slot_specs(runner._compiled.layout))
 
 
 def _decode_slot_specs(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
@@ -163,46 +91,9 @@ def _decode_slot_specs(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]
     }
 
 
-# ``qwen3_decode_host`` positional order (the contract this builder encodes).
-_DECODE_ORDER = (
-    "decode_input_rms_weight", "decode_wq", "decode_wk", "decode_wv",
-    "decode_q_norm_weight", "decode_k_norm_weight",
-    "seq_lens", "block_table", "slot_mapping",
-    "rope_cos", "rope_sin",
-    "k_cache", "v_cache",
-    "decode_wo", "decode_w_gate", "decode_w_up", "decode_w_down", "decode_post_rms_weight",
-    "final_norm_weight", "padded_lm_head_weight",
-    "logits",
-    "padded_embed_weight",
-    "token_ids", "sampled_ids", "next_hidden",
-)
-
-
 def decode_task_args(runner: Qwen314BModelRunner) -> TaskArgs:
-    """Build the ``TaskArgs`` for the single ``qwen3_decode_host`` dispatch.
-
-    Host-shared I/O buffers are slots; static weights are eager markers; the
-    KV-cache handles are lazy sources. The caller splices device-resident
-    ``logits`` / ``next_hidden`` scratch into the built tuple when device
-    sampling is active.
-    """
-    slot_specs = _decode_slot_specs(runner._compiled.layout)
-    static_weights = set(_STATIC_WEIGHT_ACCESSORS)
-
-    ta = TaskArgs(stacked=False)
-    for name in _DECODE_ORDER:
-        if name in slot_specs:
-            dtype, shape = slot_specs[name]
-            ta.add_slot(Slot(name, Placement.HOST_SHARED, dtype, lambda _, s=shape: s))
-        elif name == "k_cache":
-            ta.add_arg(name, lambda: _kv_key_pages(runner))
-        elif name == "v_cache":
-            ta.add_arg(name, lambda: _kv_value_pages(runner))
-        elif name in static_weights:
-            ta.add_arg(name, _static_weight(runner, name))
-        else:  # stacked decode weight
-            ta.add_arg(name, _decode_weight(runner, name))
-    return ta
+    """Build the host-shared buffers used by the decode Contract stage."""
+    return _task_args_for_slots(_decode_slot_specs(runner._compiled.layout))
 
 
 def _topk_slot_specs(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
@@ -216,7 +107,7 @@ def _topk_slot_specs(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
     batch = layout.kernel_batch
     width = layout.topk_width
     return {
-        "sampling_control": (torch.int32, (2,)),
+        "sampling_control": (torch.int32, (layout.sampling_control_fields,)),
         "prefill_topk_values": (torch.float32, (batch, width)),
         "prefill_topk_indices": (torch.int32, (batch, width)),
         "decode_topk_values": (torch.float32, (batch, width)),
@@ -229,13 +120,7 @@ def topk_select_task_args(runner: Qwen314BModelRunner) -> TaskArgs:
 
     The ``topk_select`` callable takes ``(logits, control, values, indices)``
     where ``logits`` is an external input and ``values`` / ``indices`` differ
-    between the prefill-side and decode-side calls, so the runner reads the
-    slot tensors directly (``.tensors[...]``) and assembles the dispatch tuple
-    inline rather than calling ``build()``.
+    between the prefill-side and decode-side calls. The runner passes the
+    selected slot tensors to the Contract's ``runtime_args_builder``.
     """
-    slot_specs = _topk_slot_specs(runner._compiled.layout)
-
-    ta = TaskArgs(stacked=False)
-    for name, (dtype, shape) in slot_specs.items():
-        ta.add_slot(Slot(name, Placement.HOST_SHARED, dtype, lambda _, s=shape: s))
-    return ta
+    return _task_args_for_slots(_topk_slot_specs(runner._compiled.layout))

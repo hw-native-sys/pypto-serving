@@ -9,13 +9,15 @@
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
+from pypto import passes
 
 from pypto_serving.config.types import RuntimeModel
 from pypto_serving.model.common.compiler.compiler import KernelCompiler
@@ -23,7 +25,6 @@ from pypto_serving.model.common.executor.pypto_executor import PyptoExecutor as 
 from pypto_serving.model.common.executor.utils import (
     build_pypto_run_config,
     rope_tables,
-    round_up,
 )
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.model.qwen.npu_runner import (
@@ -34,88 +35,78 @@ from pypto_serving.model.qwen.npu_runner import (
 )
 
 
-_VOCAB_PAD_MULTIPLE = 512  # must be a multiple of lm_head.VOCAB_CHUNK (64)
-_QWEN14B_PAGE_SIZE = 128
-_QWEN14B_TOPK_SELECT_K = 32
+_REQUIRED_QWEN_CAPABILITIES = frozenset(
+    {
+        "paged_kv",
+        "chunked_prefill",
+        "device_greedy_sampling",
+        "device_topk_sampling",
+        "device_embedding",
+    }
+)
 
 
-def _kernel_batch_pad(kernel_module: object) -> tuple[int, bool]:
-    """Return ``(padded row count, module predates the BATCH_PAD rename)``.
-
-    pypto-lib renamed this constant ``BATCH`` -> ``BATCH_PAD`` when decode's
-    public batch became dynamic, because the two meanings had been conflated:
-    ``BATCH_PAD`` is the padded pipeline width (the M of every matmul), while
-    the public batch is a runtime value read from the ``seq_lens`` descriptor.
-    Accept either spelling so this file works against a pypto-lib from before
-    or after that rename.
-
-    The second element reports only which pypto-lib generation the module came
-    from -- NOT that the stage itself takes a dynamic batch. Decode does;
-    greedy_sample carries the new spelling but is still fixed-batch. Callers
-    must apply their own stage's rule. The distinction matters because a
-    pre-rename decode writes exactly ``BATCH`` rows whatever the runtime batch,
-    while topk_select remains fixed-batch. Pointing either stage at undersized
-    buffers would overrun them.
-    """
-    value = getattr(kernel_module, "BATCH_PAD", None)
-    if value is not None:
-        return int(value), True
-    value = getattr(kernel_module, "BATCH", None)
-    if value is not None:
-        return int(value), False
-    raise AttributeError(
-        f"{getattr(kernel_module, '__name__', kernel_module)!r} exposes neither "
-        "BATCH_PAD nor BATCH; cannot determine the kernel's padded batch width"
-    )
-
-
-def _find_pypto_lib_qwen14b_dir(pypto_lib_root: str | None = None) -> Path:
-    """Find the Qwen3-14B kernel directory from configuration or a checkout."""
+def _find_pypto_lib_root(pypto_lib_root: str | None = None) -> Path:
+    """Find the pypto-lib root containing the external Contract registry."""
     if pypto_lib_root is None:
         pypto_lib_root = os.environ.get("PYPTO_LIB_ROOT")
     if pypto_lib_root:
-        candidate = Path(pypto_lib_root) / "models" / "qwen3_14b"
-        if candidate.is_dir():
+        candidate = Path(pypto_lib_root)
+        if (candidate / "contract" / "registry.py").is_file():
             return candidate
-        raise FileNotFoundError(f"Qwen3-14B kernel directory not found under PYPTO_LIB_ROOT={pypto_lib_root!r}")
+        raise FileNotFoundError(
+            f"pypto-lib Contract registry not found under PYPTO_LIB_ROOT={pypto_lib_root!r}"
+        )
 
     start_dir = Path(__file__).resolve().parent
     for directory in (start_dir, *start_dir.parents):
-        candidate = directory / "pypto-lib" / "models" / "qwen3_14b"
-        if candidate.is_dir():
+        candidate = directory / "pypto-lib"
+        if (candidate / "contract" / "registry.py").is_file():
             return candidate
     raise FileNotFoundError(
-        "Cannot locate Qwen3-14B kernels. Run from a checkout with pypto-lib available "
+        "Cannot locate pypto-lib Contract registry. Run from a checkout with pypto-lib available "
         "or set PYPTO_LIB_ROOT to a pypto-lib checkout."
     )
 
 
-def _load_pypto_lib_qwen14b_module(module_name: str, kernel_dir: Path) -> object:
-    """Load a Qwen3-14B kernel module from the pypto-lib submodule."""
-    module_path = kernel_dir / f"qwen3_14b_{module_name}.py"
-    if not module_path.is_file():
-        module_path = kernel_dir / f"{module_name}.py"
-    if not module_path.is_file():
-        raise FileNotFoundError(
-            f"Missing pypto-lib Qwen3-14B kernel module: {module_path}. "
-            "Run `git submodule update --init --recursive`."
-        )
-    spec = importlib.util.spec_from_file_location(
-        f"_pypto_lib_qwen3_14b_{module_name}",
-        module_path,
-    )
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load pypto-lib kernel module from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.path.insert(0, str(kernel_dir))
+def _load_pypto_lib_contract_registry(pypto_lib_root: str | None = None) -> object:
+    """Import the registry from the selected pypto-lib checkout."""
+    root = _find_pypto_lib_root(pypto_lib_root).resolve()
+    sys.path.insert(0, str(root))
     try:
-        spec.loader.exec_module(module)
+        registry = importlib.import_module("contract.registry")
     finally:
         try:
-            sys.path.remove(str(kernel_dir))
+            sys.path.remove(str(root))
         except ValueError:
             pass
-    return module
+    actual = Path(registry.__file__).resolve()
+    expected = (root / "contract" / "registry.py").resolve()
+    if actual != expected:
+        raise ImportError(
+            f"contract.registry is already loaded from {actual}, "
+            f"expected the selected pypto-lib at {expected}"
+        )
+    return registry
+
+
+def _load_qwen3_14b_contract(pypto_lib_root: str | None = None) -> object:
+    """Resolve the Qwen3-14B Contract through pypto-lib's public registry."""
+    return _load_pypto_lib_contract_registry(pypto_lib_root).get_contract("qwen3", "14b")
+
+
+def _validate_qwen_contract_surface(contract: object) -> None:
+    """Fail fast when pypto-lib lacks a serving capability or stage."""
+    missing = _REQUIRED_QWEN_CAPABILITIES.difference(contract.capabilities)
+    if missing:
+        raise ValueError(f"Qwen3-14B Contract lacks required capabilities: {sorted(missing)}")
+    for flow in ("prefill", "decode", "topk_select"):
+        stages = tuple(contract.execution.get(flow, ()))
+        if len(stages) != 1 or stages[0] not in contract.kernels:
+            raise ValueError(
+                f"Qwen3-14B Contract flow {flow!r} must resolve to exactly one "
+                f"registered kernel; got {stages}"
+            )
 
 
 class Qwen314BPyptoExecutor(CorePyptoExecutor):
@@ -151,21 +142,24 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             ),
             cache_dir=self._pypto_build_dir,
         )
+        self._contract_registry = _load_pypto_lib_contract_registry()
+        self._contract = self._contract_registry.get_contract("qwen3", "14b")
+        _validate_qwen_contract_surface(self._contract)
 
     @property
     def supports_device_sampling(self) -> bool:
         """Qwen3 NPU runner can return greedy sampled token ids."""
-        return True
+        return "device_greedy_sampling" in self._contract.capabilities
 
     @property
     def device_topk_sampling_k(self) -> int:
         """Qwen3 NPU runner can return top-k sampling candidates."""
-        return _QWEN14B_TOPK_SELECT_K
+        return int(self._contract.limits["topk"])
 
     @property
     def supports_device_embedding(self) -> bool:
         """Qwen3 NPU prefill and decode embed token ids inside device kernels."""
-        return True
+        return "device_embedding" in self._contract.capabilities
 
     def _create_runner(self, model_id: str, compiled: object) -> ModelRunner:
         """Create the Qwen3-14B runtime runner for compiled kernels."""
@@ -178,101 +172,52 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
         """Compile Qwen3-14B PyPTO kernels and pack runtime artifacts."""
-        kernel_dir = _find_pypto_lib_qwen14b_dir()
-        qwen3_prefill_fwd = _load_pypto_lib_qwen14b_module("prefill_fwd", kernel_dir)
-        # The fused all-layer decode lives in decode_fwd.decode_fwd. It is
-        # PAGED: it consumes block_table + slot_mapping and reads/writes the SAME
-        # device-resident paged KV pool prefill writes (self._kv_caches), so no
-        # contiguous bridge / MAX_SEQ env is needed.
-        qwen3_decode_fwd = _load_pypto_lib_qwen14b_module("decode_fwd", kernel_dir)
-        qwen3_topk_select = _load_pypto_lib_qwen14b_module("topk_select", kernel_dir)
+        contract = self._contract_registry.find_contract_for_model_config(model.config)
+        _validate_qwen_contract_surface(contract)
+        self._contract = contract
 
-        self._validate_supported_shape(model)
-        kernel_batch = model.runtime.max_batch_size
+        kernel_batch = int(contract.limits["batch"])
+        runtime_batch = int(model.runtime.max_batch_size)
+        if runtime_batch > kernel_batch:
+            raise ValueError(
+                f"Qwen3-14B Contract supports max_batch_size <= {kernel_batch}, got {runtime_batch}."
+            )
+        self._validate_total_kv_pages(model, runtime_batch)
 
-        kernel_max_seq = int(getattr(qwen3_decode_fwd, "MAX_SEQ", 4096))
-        if model.runtime.max_seq_len > kernel_max_seq:
-            raise ValueError(
-                f"max_model_len {model.runtime.max_seq_len} exceeds the kernel's "
-                f"compile-time MAX_SEQ {kernel_max_seq} (config.py). The decode/prefill "
-                "kernels precompute MAX_CTX_BLOCKS, NUM_PAGES, and rope table sizes from "
-                "MAX_SEQ; a larger runtime value silently produces wrong attention and "
-                "out-of-bounds rope reads. Rebuild the kernel with a larger MAX_SEQ."
-            )
-
-        decode_batch_pad, decode_batch_is_dynamic = _kernel_batch_pad(qwen3_decode_fwd)
-        if decode_batch_is_dynamic:
-            if kernel_batch > decode_batch_pad:
-                raise ValueError(
-                    "decode_fwd.decode_fwd pads its pipeline to "
-                    f"{decode_batch_pad} rows, but runtime max_batch_size is "
-                    f"{kernel_batch}; the runtime batch must not exceed the "
-                    "padded width."
-                )
-        elif decode_batch_pad != kernel_batch:
-            raise ValueError(
-                "decode_fwd.decode_fwd is compiled for a fixed kernel BATCH of "
-                f"{decode_batch_pad}, but runtime max_batch_size is "
-                f"{kernel_batch}; they must match (this pypto-lib predates the "
-                "dynamic public batch, so decode statically writes BATCH rows / "
-                "BATCH logit rows and would overrun smaller buffers)."
-            )
-        if int(model.config.num_hidden_layers) != int(qwen3_decode_fwd.NUM_LAYERS):
-            raise ValueError(
-                "decode_fwd.decode_fwd fuses a FIXED "
-                f"NUM_LAYERS={int(qwen3_decode_fwd.NUM_LAYERS)} loop (the layer count "
-                "is a kernel constant, not derived from the weight tensors), but the "
-                f"model has {model.config.num_hidden_layers} layers. The fused decode "
-                "does not support --num-layers-override; run the full model."
-            )
-        self._validate_total_kv_pages(model, kernel_batch)
-
-        padded_vocab = round_up(model.config.vocab_size, _VOCAB_PAD_MULTIPLE)
-        if padded_vocab != int(qwen3_decode_fwd.VOCAB):
-            raise ValueError(
-                f"decode_fwd.decode_fwd hard-codes VOCAB={int(qwen3_decode_fwd.VOCAB)} "
-                f"(config.VOCAB) for its fused LM head, but the runtime padded vocab is "
-                f"{padded_vocab} (round_up({model.config.vocab_size}, {_VOCAB_PAD_MULTIPLE})); "
-                "they must match for the decode logits buffer / lm_head weight to line up."
-            )
-        if model.config.vocab_size != int(qwen3_decode_fwd.REAL_VOCAB):
-            raise ValueError(
-                "decode_fwd.decode_fwd hard-codes REAL_VOCAB for padded-token masking, "
-                f"but the runtime model vocab_size is {model.config.vocab_size}; expected "
-                f"{int(qwen3_decode_fwd.REAL_VOCAB)}."
-            )
-        # topk_select_fwd remains a fixed-batch stage, so require an exact
-        # match while accepting either pypto-lib batch constant spelling.
-        topk_select_batch, _ = _kernel_batch_pad(qwen3_topk_select)
-        if topk_select_batch != kernel_batch:
-            raise ValueError(
-                "topk_select_fwd is compiled for a fixed kernel BATCH of "
-                f"{topk_select_batch}, but runtime max_batch_size is {kernel_batch}."
-            )
-        if int(qwen3_topk_select.VOCAB) != padded_vocab:
-            raise ValueError(
-                "topk_select_fwd VOCAB must match the padded logits vocab: "
-                f"{int(qwen3_topk_select.VOCAB)} != {padded_vocab}."
-            )
-        if model.config.vocab_size != int(qwen3_topk_select.REAL_VOCAB):
-            raise ValueError(
-                "topk_select_fwd REAL_VOCAB must match model vocab_size: "
-                f"{int(qwen3_topk_select.REAL_VOCAB)} != {model.config.vocab_size}."
-            )
-        topk_width = int(qwen3_topk_select.TOPK)
-        if topk_width != _QWEN14B_TOPK_SELECT_K:
-            raise ValueError(
-                "topk_select_fwd TOPK must match executor capability: "
-                f"{topk_width} != {_QWEN14B_TOPK_SELECT_K}."
-            )
-        sampled_ids_width = int(getattr(qwen3_decode_fwd, "SAMPLED_IDS_PAD", 1))
-        page_size = model.runtime.page_size
-        max_blocks_per_seq = (model.runtime.max_seq_len + page_size - 1) // page_size
-        prefill = self._compile_jit_fwd_callable("prefill_fwd", qwen3_prefill_fwd.qwen3_prefill_host)
-        decode = self._compile_jit_fwd_callable("decode_fwd", qwen3_decode_fwd.qwen3_decode_host)
-        topk_select = self._compile_jit_fwd_callable(
-            "topk_select_fwd", qwen3_topk_select.qwen3_topk_select_host
+        runtime_values = vars(model.runtime).copy()
+        runtime_values.update(
+            max_batch_size=kernel_batch,
+            vocab_pad_multiple=int(contract.limits["vocab_pad_multiple"]),
         )
+        contract_runtime = SimpleNamespace(**runtime_values)
+        loaded_kernels = contract.load_kernels()
+        contract.kernel_binder(**loaded_kernels.functions)
+        contract.validate_kernels(
+            contract,
+            loaded_kernels,
+            SimpleNamespace(config=model.config, runtime=contract_runtime),
+        )
+
+        def compile_flow(flow: str) -> _L3Callable:
+            stage_name = contract.execution[flow][0]
+            stage = contract.kernels[stage_name]
+            compile_args = stage.compile_args_builder(model.config, contract_runtime)
+            return self._compile_jit_fwd_callable(
+                f"{stage.name}_fwd",
+                stage.host_jit_fn,
+                *compile_args,
+                memory_planner=(passes.MemoryPlanner.PTOAS if flow == "topk_select" else None),
+            )
+
+        prefill = compile_flow("prefill")
+        decode = compile_flow("decode")
+        topk_select = compile_flow("topk_select")
+        padded_vocab = int(contract.limits["vocab"])
+        sampled_ids_width = int(contract.limits["sampled_ids_pad"])
+        topk_width = int(contract.limits["topk"])
+        sampling_control_fields = int(contract.limits["sampling_control_fields"])
+        page_size = int(contract.limits["page_size"])
+        max_blocks_per_seq = (model.runtime.max_seq_len + page_size - 1) // page_size
         rope_cos_raw, rope_sin_raw = rope_tables(
             model.runtime.max_seq_len,
             model.config.head_dim,
@@ -298,6 +243,9 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             embed_weight = torch.cat([embed_weight, padding], dim=0)
         padded_embed_weight = self._shared_tensor(embed_weight.to(torch.bfloat16).contiguous().cpu())
         final_norm_weight = self._shared_tensor(model.final_norm_weight.view(1, -1).float().cpu())
+        # The Contract hook consumes already-materialized ``runtime_model.layers``.
+        # Serving intentionally keeps checkpoints lazy and stages one layer at
+        # a time to cap startup host memory, while preserving the Contract ABI.
         decode_weights = self._stage_stacked_decode_weights(model)
         # The per-dispatch I/O host buffers are owned by the runner's TaskArgs;
         # only the shape-defining constants are passed through here so the
@@ -311,8 +259,10 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             hidden_size=model.config.hidden_size,
             sampled_ids_width=sampled_ids_width,
             topk_width=topk_width,
+            sampling_control_fields=sampling_control_fields,
         )
         return _CompiledKernels(
+            contract=contract,
             prefill=prefill,
             decode=decode,
             topk_select=topk_select,
@@ -330,15 +280,23 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         self,
         name: str,
         jit_fn: object,
+        *compile_args: object,
+        memory_planner: passes.MemoryPlanner | None = None,
     ) -> _L3Callable:
         """Compile a HOST wrapper into a PyPTO DistributedCompiledProgram.
 
-        Signature mode: tensor shapes/dtypes are read from the wrapper's
-        annotations, so no positional sample tensors are passed. The on-disk
-        cache fast-path and the JIT compile are both handled by the shared
-        :class:`KernelCompiler`.
+        Contract stages pass positional sample tensors for generic HOST
+        annotations; direct callers may omit them to retain signature mode. The
+        shared :class:`KernelCompiler` owns both compilation and cache reload.
         """
-        return self._compiler.compile(name, jit_fn, use_cache=self._use_compile_cache)
+        run_config_overrides = {"memory_planner": memory_planner} if memory_planner is not None else None
+        return self._compiler.compile(
+            name,
+            jit_fn,
+            *compile_args,
+            use_cache=self._use_compile_cache,
+            run_config_overrides=run_config_overrides,
+        )
 
     @classmethod
     def _stage_stacked_decode_weights(cls, model: RuntimeModel) -> dict[str, torch.Tensor]:
@@ -455,32 +413,3 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         if tensor.device.type == "cpu" and not tensor.is_shared():
             return tensor.share_memory_()
         return tensor
-
-    @staticmethod
-    def _validate_supported_shape(model: RuntimeModel) -> None:
-        """Ensure the loaded model matches the bundled Qwen3-14B kernels."""
-        config = model.config
-        expected = {
-            "hidden_size": 5120,
-            "intermediate_size": 17408,
-            "num_attention_heads": 40,
-            "num_key_value_heads": 8,
-            "head_dim": 128,
-        }
-        actual = {
-            "hidden_size": config.hidden_size,
-            "intermediate_size": config.intermediate_size,
-            "num_attention_heads": config.num_attention_heads,
-            "num_key_value_heads": config.num_key_value_heads,
-            "head_dim": config.head_dim,
-        }
-        if actual != expected:
-            mismatch = ", ".join(f"{k}={actual[k]} (expected {v})" for k, v in expected.items() if actual[k] != v)
-            raise ValueError(
-                "Bundled kernels under model/ currently support Qwen3-14B layer shapes only: " + mismatch
-            )
-        if model.runtime.page_size != _QWEN14B_PAGE_SIZE:
-            raise ValueError(
-                "PyPTO Qwen3-14B kernels require runtime page_size "
-                f"{_QWEN14B_PAGE_SIZE}, got {model.runtime.page_size}."
-            )

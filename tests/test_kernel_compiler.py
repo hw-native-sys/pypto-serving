@@ -39,10 +39,12 @@ class _FakeJitFn:
     def __init__(self, program: object) -> None:
         self._program = program
         self.last_config: RunConfig | None = None
+        self.last_args: tuple[object, ...] = ()
         self.compile_calls = 0
 
-    def compile(self, *, config: RunConfig, **compile_kwargs: object) -> object:
+    def compile(self, *args: object, config: RunConfig, **compile_kwargs: object) -> object:
         self.last_config = config
+        self.last_args = args
         self.compile_calls += 1
         return self._program
 
@@ -105,6 +107,33 @@ def test_compile_forwards_runtime_scalar_kwargs_to_jit_fn() -> None:
     compiler.compile("mtp_prefill", jit_fn, num_tokens=RUNTIME)
 
     assert jit_fn.compile_calls == 1
+
+
+def test_compile_forwards_contract_sample_args_to_jit_fn() -> None:
+    """External Contract sample tensors reach the generic HOST wrapper."""
+    jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
+    compiler = _make_compiler()
+    sample_args = (object(), object())
+
+    compiler.compile("contract-stage", jit_fn, *sample_args)
+
+    assert jit_fn.last_args == sample_args
+
+
+def test_compile_applies_per_stage_run_config_overrides() -> None:
+    """A stage can select its required memory planner without changing siblings."""
+    from pypto import passes
+
+    jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
+    compiler = _make_compiler()
+
+    compiler.compile(
+        "topk-select",
+        jit_fn,
+        run_config_overrides={"memory_planner": passes.MemoryPlanner.PTOAS},
+    )
+
+    assert jit_fn.last_config.memory_planner is passes.MemoryPlanner.PTOAS
 
 
 def test_compile_raises_on_non_distributed_compiled_program() -> None:

@@ -21,6 +21,7 @@ from pypto_serving.config.types import (
     RuntimeConfig,
     RuntimeModel,
 )
+from pypto_serving.model.qwen.npu_executor import _load_qwen3_14b_contract
 from pypto_serving.model.qwen.npu_runner import (
     _CompiledKernels,
     _DecodeKernelInputs,
@@ -112,6 +113,7 @@ def _compiled_kernels(
             "decode_w_down": torch.zeros(intermediate_size, hidden_size),
         }
     return _CompiledKernels(
+        contract=_load_qwen3_14b_contract(),
         prefill=callable_,
         decode=callable_,
         topk_select=callable_,
@@ -131,6 +133,7 @@ def _compiled_kernels(
             hidden_size=hidden_size,
             sampled_ids_width=sampled_ids_width,
             topk_width=4,
+            sampling_control_fields=2,
         ),
     )
 
@@ -314,6 +317,20 @@ def test_decode_topk_selects_from_device_resident_logits(monkeypatch):
         name="topk_select",
         aicpu_thread_num=1,
     )
+    contract_calls: list[tuple[object, ...]] = []
+    topk_stage = compiled.contract.kernels["topk_select"]
+    real_topk_builder = topk_stage.runtime_args_builder
+
+    def record_topk_builder(*args, **kwargs):
+        contract_calls.append(args)
+        return real_topk_builder(*args, **kwargs)
+
+    compiled.contract = SimpleNamespace(
+        kernels={
+            **compiled.contract.kernels,
+            "topk_select": SimpleNamespace(runtime_args_builder=record_topk_builder),
+        }
+    )
     runner = ModelRunner(compiled=compiled)
     host_logits = torch.zeros(1, model.config.vocab_size)
     kernel_inputs = _DecodeKernelInputs(
@@ -365,6 +382,7 @@ def test_decode_topk_selects_from_device_resident_logits(monkeypatch):
     assert dispatches[0][1][-1] is device_next_hidden
     assert dispatches[1][0] is compiled.topk_select
     assert dispatches[1][1][0] is device_logits
+    assert len(contract_calls) == 1
 
 
 def test_decode_kernel_inputs_reject_multi_token_rows():
