@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -68,8 +69,9 @@ class KernelCompiler:
         self,
         name: str,
         jit_fn: object,
-        *,
+        *compile_args: object,
         use_cache: bool = False,
+        run_config_overrides: Mapping[str, Any] | None = None,
         **compile_kwargs: Any,
     ) -> L3Callable:
         """Compile a HOST wrapper into a PyPTO ``DistributedCompiledProgram``.
@@ -77,15 +79,18 @@ class KernelCompiler:
         With a ``cache_dir``, a populated ``cache_dir/<name>`` slot is reloaded
         (skipping the JIT); otherwise the kernel compiles straight into that slot.
 
-        Compiles in annotation-driven signature mode: tensor shapes/dtypes are
-        read from the wrapper's ``pl.Tensor[[...], dtype]`` annotations, so no
-        positional sample tensors are passed. ``compile_kwargs`` are forwarded to
+        Positional ``compile_args`` support generic HOST wrappers whose shapes
+        and dtypes come from Contract-provided sample tensors. Annotation-driven
+        wrappers may omit them. ``run_config_overrides`` applies stage-local
+        compiler policy, while ``compile_kwargs`` are forwarded to
         ``jit_fn.compile`` (e.g. ``name=pl.RUNTIME`` for runtime scalars).
         """
         from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
 
         aicpu_thread_num = self._run_config.distributed_config.aicpu_thread_num
         configs = {**self._extra_configs, "codegen_only": True}
+        if run_config_overrides is not None:
+            configs.update(run_config_overrides)
         if self._cache_dir is not None:
             slot = self._cache_dir / name
             cached = self._load_cached(slot, self._run_config) if use_cache else None
@@ -111,11 +116,10 @@ class KernelCompiler:
         # ``DistributedConfig`` and any new pypto RunConfig fields are forwarded
         # automatically) and re-runs ``__post_init__``.
         run_config = dataclasses.replace(self._run_config, **configs)
-        compiled = jit_fn.compile(config=run_config, **compile_kwargs)
+        compiled = jit_fn.compile(*compile_args, config=run_config, **compile_kwargs)
         if not isinstance(compiled, DistributedCompiledProgram):
             raise TypeError(
-                f"{name} did not compile to DistributedCompiledProgram; "
-                f"got {type(compiled).__name__}"
+                f"{name} did not compile to DistributedCompiledProgram; got {type(compiled).__name__}"
             )
         return L3Callable(compiled=compiled, name=name, aicpu_thread_num=aicpu_thread_num)
 
