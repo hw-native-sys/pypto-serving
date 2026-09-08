@@ -9,8 +9,8 @@
 """DSpark per-dispatch-class :class:`TaskArgs` builders.
 
 The ``_PREFILL_TENSOR_ORDER`` / ``_DECODE_TENSOR_ORDER`` tuples below ARE the
-positional contracts of ``l3_prefill_fwd`` (100 args) and ``l3_decode_fwd``
-(107 args) -- register them in exactly this order.  Every argument declares its
+positional contracts of ``l3_prefill_fwd`` (101 args) and ``l3_decode_fwd``
+(109 args) -- register them in exactly this order.  Every argument declares its
 kind at registration: host-shared slots (per-step metadata), static weights
 (upload-once), worker-resident cache pools and scratch (runner materializers),
 and the stacked layer-weight banks.
@@ -41,6 +41,7 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_DECODE_TOKENS,
     DSPARK_HC_MULT,
     DSPARK_HIDDEN_SIZE,
+    DSPARK_MAIN_HIDDEN_DIM,
     DSPARK_MAX_LOGIT_ROWS,
     DSPARK_MOE_TOKENS,
     DSPARK_PREFILL_CSA_CMP_TABLE_BLOCKS,
@@ -170,7 +171,11 @@ def _prefill_scratch_sources(runner: DSparkModelRunner) -> dict[str, Any]:
         "post_ffn": ((ranks, tokens, DSPARK_HC_MULT), torch.float32),
         "comb_ffn": ((ranks, tokens, DSPARK_HC_MULT * DSPARK_HC_MULT), torch.float32),
         "ffn_out": ((ranks, local_tokens, hidden), torch.bfloat16),
-        "hidden_workspace": ((ranks, tokens, hidden), torch.bfloat16),
+        # Rank-owned rows of the layers-40/41/42 hidden tap (pypto-lib#1084):
+        # [3*D] per row, on the same local axis as input_ids/ffn_out.
+        "dspark_target_hidden": (
+            (ranks, local_tokens, DSPARK_MAIN_HIDDEN_DIM), torch.bfloat16,
+        ),
         "x_out": ((ranks, tokens, hidden), torch.bfloat16),
         "logits": (
             (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_VOCAB_SIZE), torch.float32,
@@ -222,18 +227,13 @@ def _decode_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
     rope = (DSPARK_ROPE_HEAD_DIM,)
     window = (DSPARK_SLIDING_WINDOW,)
     slot_specs = {
-        "freqs_cos_local": (torch.bfloat16, (ranks, local_tokens, *rope)),
-        "freqs_sin_local": (torch.bfloat16, (ranks, local_tokens, *rope)),
-        "freqs_cos": (torch.bfloat16, (ranks, group_tokens, *rope)),
-        "freqs_sin": (torch.bfloat16, (ranks, group_tokens, *rope)),
-        "compressed_freqs_cos_local": (
-            torch.bfloat16, (ranks, local_tokens, *rope),
-        ),
-        "compressed_freqs_sin_local": (
-            torch.bfloat16, (ranks, local_tokens, *rope),
-        ),
-        "compressed_freqs_cos": (torch.bfloat16, (ranks, group_tokens, *rope)),
-        "compressed_freqs_sin": (torch.bfloat16, (ranks, group_tokens, *rope)),
+        # The four RoPE tables ride the owner-token T_DYN axis since
+        # pypto-lib#1182 (they absorbed the dropped *_local tables): each
+        # rank carries its own decode_seq * local_batch rows.
+        "freqs_cos": (torch.bfloat16, (ranks, local_tokens, *rope)),
+        "freqs_sin": (torch.bfloat16, (ranks, local_tokens, *rope)),
+        "compressed_freqs_cos": (torch.bfloat16, (ranks, local_tokens, *rope)),
+        "compressed_freqs_sin": (torch.bfloat16, (ranks, local_tokens, *rope)),
         "swa_slot_mapping": (torch.int64, (ranks, group_tokens)),
         "swa_indices": (torch.int32, (ranks, local_tokens, *window)),
         "swa_lens": (torch.int32, (ranks, local_tokens)),
@@ -322,6 +322,12 @@ def decode_task_args(runner: DSparkModelRunner) -> TaskArgs:
             (ranks, DSPARK_DECODE_LOCAL_TOKENS, DSPARK_HC_MULT, DSPARK_HIDDEN_SIZE),
             torch.float32,
         ),
+        # Decode's layers-40/41/42 hidden tap: one [3*D] row per decode token
+        # row of the fixed 16x8 local tile (pypto-lib#1084).
+        "dspark_target_hidden": (
+            (ranks, DSPARK_DECODE_LOCAL_TOKENS, DSPARK_MAIN_HIDDEN_DIM),
+            torch.bfloat16,
+        ),
         "x_out": (
             (ranks, DSPARK_DECODE_LOCAL_TOKENS, DSPARK_HIDDEN_SIZE), torch.bfloat16,
         ),
@@ -398,7 +404,7 @@ _PREFILL_TENSOR_ORDER = (
     "attn_stage", "x_mixed", "post_ffn", "comb_ffn", "ffn_out",
     "hc_head_fn", "hc_head_scale", "hc_head_base",
     "final_norm_w", "lm_head_weight", "logit_row_indices",
-    "hidden_workspace", "x_out", "logits", "sampled_ids",
+    "dspark_target_hidden", "x_out", "logits", "sampled_ids",
 )
 
 # Argument order for the packed ``l3_decode_fwd`` kernel (pypto-lib
@@ -411,8 +417,7 @@ _DECODE_TENSOR_ORDER = (
     "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
     "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
     "raw_kv_pool",
-    "freqs_cos_local", "freqs_sin_local", "freqs_cos", "freqs_sin",
-    "compressed_freqs_cos_local", "compressed_freqs_sin_local",
+    "freqs_cos", "freqs_sin",
     "compressed_freqs_cos", "compressed_freqs_sin",
     "swa_slot_mapping", "swa_indices", "swa_lens",
     "position_ids_local", "position_ids",
@@ -446,5 +451,5 @@ _DECODE_TENSOR_ORDER = (
     "shared_w2", "shared_w2_scale",
     "hidden_workspace", "x_ping", "x_pong",
     "x_attn_active", "x_moe_next",
-    "pre_hc_hidden_out", "x_out", "logits", "sampled_ids",
+    "pre_hc_hidden_out", "dspark_target_hidden", "x_out", "logits", "sampled_ids",
 )

@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Main host-side functional guard for the DSpark serving adaptation."""
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +18,8 @@ import torch
 from pypto_serving.config.types import DecodeBatch, PrefillBatch
 from pypto_serving.model.deepseek_dspark import task_args as task_args_module
 from pypto_serving.model.deepseek_dspark.npu_runner import (
+    _PREFILL_GROUP_DYNAMIC_NAMES,
+    _PREFILL_LOCAL_DYNAMIC_NAMES,
     DSPARK_CACHE_GROUP_NAMES,
     DSparkCacheLayout,
     DSparkCompiledKernels,
@@ -112,20 +116,23 @@ def test_prefill_to_decode_staging_contract() -> None:
     torch.testing.assert_close(x_hc[8, :tokens], expected_2)
     assert bool(torch.count_nonzero(x_hc[:, tokens:]) == 0)
 
-    # Group 1 is idle and mirrors group 0, while group 2 keeps its own request
-    # positions and RoPE. Only active group leaders publish logits.
-    torch.testing.assert_close(x_hc[4], x_hc[0])
-    assert staged_prefill["query_start_loc"][:, -1].tolist() == [tokens] * layout.ranks
+    # Groups 1 and 3 are idle: the kernel skips their attention and sampling
+    # tails natively (pypto-lib#1161), so their staging stays zero-initialized
+    # (query_start_loc terminal 0) instead of mirroring an active group.
+    assert bool(torch.count_nonzero(x_hc[4]) == 0)
+    terminals = staged_prefill["query_start_loc"][:, -1].tolist()
+    assert terminals == [tokens] * 4 + [0] * 4 + [tokens] * 4 + [0] * 4
     assert staged_prefill["logit_row_indices"][0, 0].item() == tokens - 1
     assert staged_prefill["logit_row_indices"][8, 0].item() == tokens - 1
     assert bool((staged_prefill["logit_row_indices"][4] == -1).all())
     prefill_cos = runner._packed_host_prefix(staged_prefill["swa_freqs_cos"], 96)
-    torch.testing.assert_close(prefill_cos[4], prefill_cos[0])
+    assert bool(torch.count_nonzero(prefill_cos[4]) == 0)
     assert not torch.equal(prefill_cos[0], prefill_cos[8])
     for name in ("ori_slot_mapping_full", "csa_cmp_slot_mapping_full"):
         mapping = runner._packed_host_prefix(staged_prefill[name], 96)
         assert bool((mapping[0, tokens:] == -1).all())
         assert bool((mapping[8, tokens:] == -1).all())
+        assert bool((mapping[4] == -1).all())
 
     decode = DecodeBatch(
         request_ids=["group-0", "group-2", "group-0-second"],
@@ -165,14 +172,17 @@ def test_prefill_to_decode_staging_contract() -> None:
             "csa_inner_state_slot_mapping",
         ):
             assert int((staged_decode[name][rank] >= 0).sum()) == active_requests
-    positions = staged_decode["position_ids"][0].to(torch.long)
+    # Since pypto-lib#1182 the decode RoPE tables ride the owner-token
+    # T_DYN axis: each rank carries RoPE for its own local rows only.
+    local_positions = staged_decode["position_ids_local"][0].to(torch.long)
+    assert staged_decode["freqs_cos"][0].shape == (layout.decode_local_tokens, 64)
     torch.testing.assert_close(
         staged_decode["freqs_cos"][0],
-        runner._compiled.rope.swa_cos[positions].to(torch.bfloat16),
+        runner._compiled.rope.swa_cos[local_positions].to(torch.bfloat16),
     )
     torch.testing.assert_close(
         staged_decode["compressed_freqs_cos"][0],
-        runner._compiled.rope.ratio128_cos[positions].to(torch.bfloat16),
+        runner._compiled.rope.ratio128_cos[local_positions].to(torch.bfloat16),
     )
     assert not torch.equal(
         staged_decode["freqs_cos"][0], staged_decode["compressed_freqs_cos"][0]
@@ -213,3 +223,70 @@ def test_prefill_context_bound_uses_each_requests_own_length() -> None:
 
     with pytest.raises(ValueError, match="exceed max_seq_len=512"):
         runner.prepare_prefill_inputs(model, _batch(505))
+
+
+def _pypto_lib_function(module_name: str, function_name: str) -> ast.FunctionDef:
+    """Parse one l3 entry point from the pinned pypto-lib dspark kernels."""
+    kernel_file = (
+        Path(__file__).resolve().parents[4]
+        / "pypto-lib"
+        / "models"
+        / "deepseek_v4_flash_dspark"
+        / f"{module_name}.py"
+    )
+    module = ast.parse(kernel_file.read_text(encoding="utf-8"))
+    return next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    )
+
+
+def test_dspark_task_arg_orders_match_pypto_lib_abis() -> None:
+    """The pinned tuples are the exact positional l3_prefill/decode contracts."""
+    prefill = _pypto_lib_function("prefill_fwd", "l3_prefill_fwd")
+    decode = _pypto_lib_function("decode_fwd", "l3_decode_fwd")
+    assert tuple(arg.arg for arg in prefill.args.args) == (
+        task_args_module._PREFILL_TENSOR_ORDER
+    )
+    assert tuple(arg.arg for arg in decode.args.args) == (
+        task_args_module._DECODE_TENSOR_ORDER
+    )
+    assert len(task_args_module._PREFILL_TENSOR_ORDER) == 101
+    assert len(task_args_module._DECODE_TENSOR_ORDER) == 109
+
+
+def test_dspark_target_hidden_axis_binding_matches_kernel() -> None:
+    """dspark_target_hidden is a rank-local BF16 output on both programs.
+
+    Prefill binds it to FWD_TOKENS_DYN (each rank's OWNED prompt rows, the same
+    axis as input_ids) while x_out keeps the gathered FWD_GROUP_TOKENS_DYN
+    axis; decode binds it to the fixed local decode tile. Serving must slice
+    the prefill slot at the local extent and keep the decode scratch at the
+    full 16x8 tile, which the dynamic-name sets encode.
+    """
+    prefill_args = {
+        arg.arg: ast.unparse(arg.annotation)
+        for arg in _pypto_lib_function("prefill_fwd", "l3_prefill_fwd").args.args
+    }
+    decode_args = {
+        arg.arg: ast.unparse(arg.annotation)
+        for arg in _pypto_lib_function("decode_fwd", "l3_decode_fwd").args.args
+    }
+
+    prefill_hidden = prefill_args["dspark_target_hidden"]
+    assert "pl.Out" in prefill_hidden
+    assert "FWD_TOKENS_DYN" in prefill_hidden
+    assert "MAIN_HIDDEN_DIM" in prefill_hidden
+    assert "pl.BF16" in prefill_hidden
+    assert "FWD_GROUP_TOKENS_DYN" in prefill_args["x_out"]
+
+    decode_hidden = decode_args["dspark_target_hidden"]
+    assert "pl.Out" in decode_hidden
+    assert "T_DYN" in decode_hidden
+    assert "MAIN_HIDDEN_DIM" in decode_hidden
+    assert "pl.BF16" in decode_hidden
+
+    assert "dspark_target_hidden" in _PREFILL_LOCAL_DYNAMIC_NAMES
+    assert "dspark_target_hidden" not in _PREFILL_GROUP_DYNAMIC_NAMES
+    assert "hidden_workspace" in task_args_module._DECODE_TENSOR_ORDER

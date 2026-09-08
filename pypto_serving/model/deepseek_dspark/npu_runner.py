@@ -71,6 +71,9 @@ DSPARK_CACHE_PARTITIONS = DSPARK_RANKS // DSPARK_TP_SIZE
 
 # ---- model dims (DeepSeek-V4-Flash) ----
 DSPARK_HIDDEN_SIZE = 4096
+# The target forwards tap layers 40/41/42 through one hc_head projection each
+# and concatenate the three rows: dspark_target_hidden is [rows, 3*D] BF16.
+DSPARK_MAIN_HIDDEN_DIM = 3 * DSPARK_HIDDEN_SIZE
 DSPARK_HC_MULT = 4
 DSPARK_VOCAB_SIZE = 129280
 DSPARK_HEAD_DIM = 512
@@ -114,7 +117,11 @@ DSPARK_DECODE_LOCAL_BATCH = DSPARK_DECODE_BATCH // DSPARK_TP_SIZE
 DSPARK_DECODE_TOKENS = DSPARK_DECODE_BATCH * DSPARK_DECODE_SEQ
 DSPARK_DECODE_LOCAL_TOKENS = DSPARK_DECODE_LOCAL_BATCH * DSPARK_DECODE_SEQ
 DSPARK_MOE_TOKENS = 128
-DSPARK_MAX_LOGIT_ROWS = DSPARK_DECODE_TOKENS
+# The LM-head / greedy-sampling windows cover one owner's rows per rank
+# (pypto-lib#1182 right-sized them from the whole step's DECODE_TOKENS to
+# MOE_TOKENS): decode packs at most local_batch * decode_seq = 128 logit
+# rows per rank, prefill selects one, and markov at most 16 * 7.
+DSPARK_MAX_LOGIT_ROWS = DSPARK_MOE_TOKENS
 DSPARK_SAMPLED_IDS_PAD = 8
 DSPARK_MAX_SEQ_LEN = 16384
 
@@ -187,12 +194,14 @@ _PREFILL_GROUP_DYNAMIC_NAMES = frozenset(
         "x_mixed",
         "post_ffn",
         "comb_ffn",
-        "hidden_workspace",
         "x_out",
     }
 )
+# dspark_target_hidden shares the kernel's FWD_TOKENS_DYN axis with
+# position_ids_local/input_ids/ffn_out: it holds each rank's OWNED prompt rows
+# (pypto-lib#1084), not the gathered group stream that x_out carries.
 _PREFILL_LOCAL_DYNAMIC_NAMES = frozenset(
-    {"position_ids_local", "input_ids", "ffn_out"}
+    {"position_ids_local", "input_ids", "ffn_out", "dspark_target_hidden"}
 )
 
 # ---- per-request ring sizes (scheduler-visible blocks per sequence) ----
@@ -1813,48 +1822,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 )
             copy_shared(destination, value, name=f"dspark_prefill_{name}")
 
-        self._mirror_inactive_prefill_groups(inputs, values)
-
-    def _mirror_inactive_prefill_groups(
-        self,
-        inputs: DSparkPreparedPrefillInputs,
-        values: dict[str, torch.Tensor],
-    ) -> None:
-        """Replay one real prefill into every otherwise idle TP partition.
-
-        Block IDs are partition-local. Copying the active group's complete
-        prefill metadata therefore populates the corresponding cache pages in
-        each inactive partition, ready for the matching decode replay.
-        """
-        layout = self._compiled.layout
-        active_groups = set(inputs.groups)
-        if len(active_groups) == layout.partitions:
-            return
-        source_group = inputs.groups[0]
-        tensors = self._prefill_task_args.tensors
-        mirrored_groups = [
-            group for group in range(layout.partitions) if group not in active_groups
-        ]
-        for name in ("x_hc", *values):
-            if name == "logit_row_indices":
-                continue
-            tensor = tensors[name]
-            if name in _PREFILL_GROUP_DYNAMIC_NAMES:
-                tensor = self._packed_host_prefix(tensor, inputs.physical_tokens)
-            elif name in _PREFILL_LOCAL_DYNAMIC_NAMES:
-                tensor = self._packed_host_prefix(
-                    tensor, inputs.physical_tokens // layout.tp_size
-                )
-            for group in mirrored_groups:
-                for tp_rank in range(layout.tp_size):
-                    source_rank = source_group * layout.tp_size + tp_rank
-                    target_rank = group * layout.tp_size + tp_rank
-                    tensor[target_rank].copy_(tensor[source_rank])
-        logger.warning(
-            "DSpark mirrored prefill TP group %d into inactive groups %s",
-            source_group,
-            mirrored_groups,
-        )
+        # Idle TP groups keep their zero-initialized staging (query_start_loc
+        # terminal 0, -1 logit rows and cache mappings): the kernel skips their
+        # attention and sampling tails natively while staying in the EP MoE
+        # waves (pypto-lib#1161), so no mirror replay is staged.
 
     # ------------------------------------------------------------------
     # decode
@@ -2227,20 +2198,17 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 for name, value in mappings.items():
                     staged[name][rank] = value.to(staged[name].dtype)
                 staged["position_ids"][rank] = positions_flat.to(torch.int32)
-                staged["freqs_cos"][rank] = group_cos
-                staged["freqs_sin"][rank] = group_sin
-                staged["compressed_freqs_cos"][rank] = compressed_group_cos
-                staged["compressed_freqs_sin"][rank] = compressed_group_sin
-                # The rank's query rows are its contiguous slice of the group
-                # stream, so the local RoPE tables are the same slice.
-                staged["freqs_cos_local"][rank] = group_cos[local_tokens_slice].contiguous()
-                staged["freqs_sin_local"][rank] = group_sin[local_tokens_slice].contiguous()
-                staged["compressed_freqs_cos_local"][rank] = compressed_group_cos[
+                # The RoPE tables ride the owner-token T_DYN axis since
+                # pypto-lib#1182: stage the rank's own slice of the group
+                # stream (the rank's query rows are its contiguous slice).
+                staged["freqs_cos"][rank] = group_cos[local_tokens_slice]
+                staged["freqs_sin"][rank] = group_sin[local_tokens_slice]
+                staged["compressed_freqs_cos"][rank] = compressed_group_cos[
                     local_tokens_slice
-                ].contiguous()
-                staged["compressed_freqs_sin_local"][rank] = compressed_group_sin[
+                ]
+                staged["compressed_freqs_sin"][rank] = compressed_group_sin[
                     local_tokens_slice
-                ].contiguous()
+                ]
                 staged["position_ids_local"][rank] = positions_flat[local_tokens_slice].to(
                     torch.int32
                 )
