@@ -44,6 +44,9 @@ from pypto_serving.model.deepseek.weight_spec import (
 )
 
 __all__ = [
+    "DSPARK_DRAFT_LAYERS",
+    "DSPARK_DRAFTER_LAYERS",
+    "DSPARK_DRAFTER_REPLICATED_WEIGHT_NAMES",
     "DSPARK_HC_FN_STORAGE_ROWS",
     "DSPARK_LAYER_RULES",
     "DSPARK_MIX_HC",
@@ -53,6 +56,7 @@ __all__ = [
     "DSPARK_PADDED_ROW_WEIGHT_NAMES",
     "DSPARK_TP_SIZE",
     "DSParkShardPolicy",
+    "dspark_drafter_required_weight_names",
     "dspark_expert_parallel",
     "dspark_factories",
     "dspark_stack_groups",
@@ -276,3 +280,88 @@ DSPARK_CORE_LAYER_RULES = DEEPSEEK_V4_CORE_LAYER_RULES
 DSPARK_OPTIONAL_LAYER_RULES = DEEPSEEK_V4_OPTIONAL_LAYER_RULES
 DSPARK_ROUTER_LAYER_RULES = DEEPSEEK_V4_ROUTER_LAYER_RULES
 DSPARK_EXPERT_LAYER_RULES = DEEPSEEK_V4_EXPERT_LAYER_RULES
+
+# ---- DSpark drafter (milestone 2) ----
+# The speculative drafter consumes the checkpoint's ``mtp.0/1/2`` modules plus
+# three replicated heads, flattened into 3-layer banks along the leading
+# rank-local axis exactly as ``l3_dspark_drafter`` declares them
+# (``DSPARK_DRAFT_LAYERS * D`` rows etc.; no decode-bank row padding -- the
+# drafter keeps the natural ``MIX_HC`` layout).
+DSPARK_DRAFT_LAYERS = 3
+# ``tid2eid`` lives only on the target's hash layers; the drafter's router reads
+# the same per-token routing tables stacked in draft-layer order.
+DSPARK_DRAFTER_HASH_LAYERS = (0, 1, 2)
+DSPARK_DRAFTER_LAYERS = (0, 1, 2)
+
+# Kernel names that replicate one checkpoint tensor to every rank unchanged.
+DSPARK_DRAFTER_REPLICATED_WEIGHT_NAMES = (
+    "main_proj_weight",
+    "main_norm_weight",
+    "hc_head_fn",
+    "hc_head_scale",
+    "hc_head_base",
+    "final_norm_weight",
+    "markov_w1",
+    "markov_w2",
+    "confidence_head_weight",
+)
+
+
+def dspark_drafter_required_weight_names(n_routed_experts: int) -> tuple[str, ...]:
+    """Every checkpoint tensor the drafter + markov programs consume.
+
+    Startup validation for K=7 rejects a checkpoint missing any of these before
+    any device work; the K=0 path never loads them.
+    """
+    names: list[str] = [
+        "mtp.0.main_proj.weight",
+        "mtp.0.main_norm.weight",
+        "mtp.2.norm.weight",
+        "mtp.2.markov_head.markov_w1.weight",
+        "mtp.2.markov_head.markov_w2.weight",
+        "mtp.2.confidence_head.proj.weight",
+        "mtp.2.hc_head_fn",
+        "mtp.2.hc_head_scale",
+        "mtp.2.hc_head_base",
+    ]
+    for layer in DSPARK_DRAFTER_LAYERS:
+        names.extend(
+            [
+                f"mtp.{layer}.attn_norm.weight",
+                f"mtp.{layer}.ffn_norm.weight",
+                f"mtp.{layer}.attn.wq_a.weight",
+                f"mtp.{layer}.attn.wq_b.weight",
+                f"mtp.{layer}.attn.wq_b.scale",
+                f"mtp.{layer}.attn.wkv.weight",
+                f"mtp.{layer}.attn.q_norm.weight",
+                f"mtp.{layer}.attn.kv_norm.weight",
+                f"mtp.{layer}.attn.attn_sink",
+                f"mtp.{layer}.attn.wo_a.weight",
+                f"mtp.{layer}.attn.wo_b.weight",
+                f"mtp.{layer}.attn.wo_b.scale",
+                f"mtp.{layer}.hc_attn_fn",
+                f"mtp.{layer}.hc_attn_scale",
+                f"mtp.{layer}.hc_attn_base",
+                f"mtp.{layer}.hc_ffn_fn",
+                f"mtp.{layer}.hc_ffn_scale",
+                f"mtp.{layer}.hc_ffn_base",
+                f"mtp.{layer}.ffn.gate.weight",
+                f"mtp.{layer}.ffn.gate.bias",
+                f"mtp.{layer}.ffn.shared_experts.w1.weight",
+                f"mtp.{layer}.ffn.shared_experts.w1.scale",
+                f"mtp.{layer}.ffn.shared_experts.w2.weight",
+                f"mtp.{layer}.ffn.shared_experts.w2.scale",
+                f"mtp.{layer}.ffn.shared_experts.w3.weight",
+                f"mtp.{layer}.ffn.shared_experts.w3.scale",
+            ]
+        )
+        names.extend(
+            f"mtp.{layer}.ffn.experts.{expert}.{name}"
+            for expert in range(int(n_routed_experts))
+            for name in ("w1.weight", "w1.scale", "w2.weight", "w2.scale",
+                         "w3.weight", "w3.scale")
+        )
+    names.extend(
+        f"layers.{layer}.ffn.gate.tid2eid" for layer in DSPARK_DRAFTER_HASH_LAYERS
+    )
+    return tuple(names)

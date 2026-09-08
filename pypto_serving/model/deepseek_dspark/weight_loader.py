@@ -13,6 +13,11 @@
 rebinds only the layer packing: the DSpark shard policy (TP-sharded o-proj,
 bank-padded HC function rows) and the extra unpadded prefill HC slabs.
 
+``load_drafter_weights`` additionally packs the milestone-2 speculative
+drafter: the checkpoint's ``mtp.0/1/2`` modules, three replicated heads, and
+the hash layers' ``tid2eid`` tables, flattened into the exact bank shapes
+``l3_dspark_drafter`` / ``l3_distributed_markov_sample`` declare.
+
 There is deliberately no prepacked-sidecar path here: the DSpark slabs are
 packed from the shards on every start through the standard lazy store.
 """
@@ -28,15 +33,40 @@ import torch
 from pypto_serving.model.deepseek.weight_loader import (
     DeepSeekV4PackedLayerWeights,
     DeepSeekV4WeightStore,
+    deepseek_v4_local_expert_ids,
 )
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DSparkDrafterWeights",
     "DSparkStackedLayerWeights",
     "DSparkWeightStore",
     "dspark_prefill_hc_slab",
 ]
+
+
+@dataclass(frozen=True)
+class DSparkDrafterWeights:
+    """Drafter + markov banks, each already ``[ranks, ...]``-stacked on host.
+
+    Every tensor matches the per-rank annotation of ``l3_dspark_drafter`` or
+    ``l3_distributed_markov_sample`` with a leading rank axis: the 3-layer
+    banks flatten the draft layers along their first rank-local axis (no
+    decode-bank row padding -- the drafter keeps the natural ``MIX_HC``
+    layout), the o-projection is TP group/column sharded per rank, and the
+    routed experts are EP sharded.  ``embedding_weight`` / ``lm_head_weight``
+    are reused from the target banks and deliberately absent here.
+    """
+
+    tensors: Mapping[str, torch.Tensor]
+
+    def args(self, names: Sequence[str]) -> tuple[torch.Tensor, ...]:
+        """Return stacked tensors in a kernel host order."""
+        missing = [name for name in names if name not in self.tensors]
+        if missing:
+            raise KeyError(f"Stacked DSpark drafter weights are missing: {', '.join(missing)}")
+        return tuple(self.tensors[name] for name in names)
 
 
 @dataclass(frozen=True)
@@ -236,3 +266,436 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
             for name in ("hc_attn_fn", "hc_ffn_fn")
         }
         return DSparkStackedLayerWeights(tensors=stacked, prefill_tensors=prefill_tensors)
+
+    def validate_drafter_startup_contract(self, *, n_routed_experts: int) -> None:
+        """Reject a checkpoint without the full drafter module set (K=7 only)."""
+        from pypto_serving.model.deepseek_dspark.weight_spec import (  # noqa: PLC0415
+            dspark_drafter_required_weight_names,
+        )
+
+        self.require(dspark_drafter_required_weight_names(n_routed_experts))
+
+    def load_drafter_weights(
+        self,
+        *,
+        ranks: int,
+        n_routed_experts: int,
+    ) -> DSparkDrafterWeights:
+        """Pack the ``mtp.0/1/2`` drafter into the kernel's stacked banks.
+
+        The banks flatten the three draft layers along each tensor's first
+        rank-local axis exactly as ``l3_dspark_drafter`` declares them, with
+        per-name transforms the target banks do not need: the checkpoint's
+        ``[out, in]`` projections transpose into the kernel's ``[in, out]``
+        matmul orientation (``wq_a``/``wq_b``/``wkv``), the router gate and
+        confidence head cast to FP32, ``tid2eid`` stacks from the target's
+        hash layers as INT32, and the o-projection / routed experts are
+        TP- / EP-sharded per rank.  Model dims are inferred from the loaded
+        tensors and cross-checked so a mismatched checkpoint fails here, not
+        on device.
+        """
+        from pypto_serving.model.deepseek_dspark.weight_spec import (  # noqa: PLC0415
+            DSPARK_DRAFT_LAYERS,
+            DSPARK_DRAFTER_HASH_LAYERS,
+            DSPARK_DRAFTER_LAYERS,
+            DSPARK_TP_SIZE,
+        )
+
+        if ranks <= 0 or ranks % DSPARK_TP_SIZE:
+            raise ValueError(
+                f"DSpark drafter packing needs a rank count divisible by TP={DSPARK_TP_SIZE}, "
+                f"got {ranks}"
+            )
+        if n_routed_experts % ranks:
+            raise ValueError(
+                f"DSpark drafter needs experts divisible by ranks={ranks}, "
+                f"got {n_routed_experts}"
+            )
+        self.validate_drafter_startup_contract(n_routed_experts=n_routed_experts)
+
+        # ---- replicated heads; these also fix the reference dims ----
+        heads = self.load_many(
+            [
+                "mtp.0.main_proj.weight",
+                "mtp.0.main_norm.weight",
+                "mtp.2.norm.weight",
+                "mtp.2.markov_head.markov_w1.weight",
+                "mtp.2.markov_head.markov_w2.weight",
+                "mtp.2.confidence_head.proj.weight",
+                "mtp.2.hc_head_fn",
+                "mtp.2.hc_head_scale",
+                "mtp.2.hc_head_base",
+            ]
+        )
+        main_proj = heads["mtp.0.main_proj.weight"]
+        main_norm = heads["mtp.0.main_norm.weight"]
+        markov_w1 = heads["mtp.2.markov_head.markov_w1.weight"]
+        markov_w2 = heads["mtp.2.markov_head.markov_w2.weight"]
+        confidence = heads["mtp.2.confidence_head.proj.weight"]
+        if main_proj.ndim != 2 or main_norm.ndim != 1:
+            raise ValueError("DSpark main projection must be rank-2 and its norm rank-1")
+        hidden = int(main_norm.shape[0])
+        if tuple(main_proj.shape) != (hidden, DSPARK_DRAFT_LAYERS * hidden):
+            raise ValueError(
+                f"DSpark main_proj must be [D, 3*D] with D={hidden}, got {tuple(main_proj.shape)}"
+            )
+        if markov_w1.ndim != 2 or tuple(markov_w1.shape) != tuple(markov_w2.shape):
+            raise ValueError(
+                "DSpark markov tables must be matching rank-2, got "
+                f"{tuple(markov_w1.shape)} / {tuple(markov_w2.shape)}"
+            )
+        vocab, markov_rank = (int(dim) for dim in markov_w1.shape)
+        if tuple(confidence.shape) != (1, hidden + markov_rank):
+            raise ValueError(
+                f"DSpark confidence head must be [1, {hidden + markov_rank}], "
+                f"got {tuple(confidence.shape)}"
+            )
+
+        # ---- per-layer tensors, one shard-grouped read per draft layer ----
+        raw_layers = [
+            self.load_many(
+                [
+                    f"mtp.{layer}.{suffix}"
+                    for suffix in (
+                        "attn_norm.weight",
+                        "ffn_norm.weight",
+                        "attn.wq_a.weight",
+                        "attn.wq_b.weight",
+                        "attn.wq_b.scale",
+                        "attn.wkv.weight",
+                        "attn.q_norm.weight",
+                        "attn.kv_norm.weight",
+                        "attn.attn_sink",
+                        "attn.wo_a.weight",
+                        "attn.wo_b.weight",
+                        "attn.wo_b.scale",
+                        "hc_attn_fn",
+                        "hc_attn_scale",
+                        "hc_attn_base",
+                        "hc_ffn_fn",
+                        "hc_ffn_scale",
+                        "hc_ffn_base",
+                        "ffn.gate.weight",
+                        "ffn.gate.bias",
+                        "ffn.shared_experts.w1.weight",
+                        "ffn.shared_experts.w1.scale",
+                        "ffn.shared_experts.w2.weight",
+                        "ffn.shared_experts.w2.scale",
+                        "ffn.shared_experts.w3.weight",
+                        "ffn.shared_experts.w3.scale",
+                    )
+                ]
+            )
+            for layer in DSPARK_DRAFTER_LAYERS
+        ]
+
+        def tensor(layer: int, suffix: str) -> torch.Tensor:
+            return raw_layers[layer][f"mtp.{DSPARK_DRAFTER_LAYERS[layer]}.{suffix}"]
+
+        # ---- infer and cross-check the per-layer dims from layer zero ----
+        wq_a0 = tensor(0, "attn.wq_a.weight")
+        wq_b0 = tensor(0, "attn.wq_b.weight")
+        wkv0 = tensor(0, "attn.wkv.weight")
+        sink0 = tensor(0, "attn.attn_sink")
+        wo_a0 = tensor(0, "attn.wo_a.weight")
+        wo_b0 = tensor(0, "attn.wo_b.weight")
+        gate0 = tensor(0, "ffn.gate.weight")
+        shared_w1_0 = tensor(0, "ffn.shared_experts.w1.weight")
+        shared_w2_0 = tensor(0, "ffn.shared_experts.w2.weight")
+        hc_attn0 = tensor(0, "hc_attn_fn")
+        if wq_a0.ndim != 2 or wq_b0.ndim != 2 or wkv0.ndim != 2:
+            raise ValueError("DSpark drafter projections must be rank-2")
+        q_lora = int(wq_a0.shape[0])
+        q_width = int(wq_b0.shape[0])
+        head_dim = int(wkv0.shape[0])
+        n_heads = int(sink0.shape[0])
+        if q_width != n_heads * head_dim:
+            raise ValueError(
+                f"DSpark wq_b width {q_width} != heads*head_dim {n_heads * head_dim}"
+            )
+        if int(tensor(0, "attn.q_norm.weight").shape[0]) != q_lora:
+            raise ValueError("DSpark q_norm length disagrees with the q-lora dim")
+        if int(tensor(0, "attn.kv_norm.weight").shape[0]) != head_dim:
+            raise ValueError("DSpark kv_norm length disagrees with the head dim")
+        if wq_a0.shape[1] != hidden or wkv0.shape[1] != hidden:
+            raise ValueError("DSpark projection inputs disagree with the model dim")
+        o_lora = q_lora
+        o_groups = int(wo_a0.shape[0]) // o_lora
+        if int(wo_a0.shape[0]) % o_lora or o_groups <= 0:
+            raise ValueError(
+                f"DSpark wo_a shape {tuple(wo_a0.shape)} disagrees with the o-lora dim {o_lora}"
+            )
+        # wo_a is block-diagonal: each of its O_GROUPS row groups reads its own
+        # q_width/O_GROUPS-wide input slice, so the column count is the per-group
+        # input, not the full projection width.
+        o_group_in = q_width // o_groups
+        if int(wo_a0.shape[1]) != o_group_in or o_group_in * o_groups != q_width:
+            raise ValueError(
+                f"DSpark wo_a columns {int(wo_a0.shape[1])} disagree with the per-group "
+                f"input width {o_group_in}"
+            )
+        if tuple(wo_b0.shape) != (hidden, o_groups * o_lora):
+            raise ValueError(
+                f"DSpark wo_b must be [D, O_GROUPS*O_LORA]={(hidden, o_groups * o_lora)}, "
+                f"got {tuple(wo_b0.shape)}"
+            )
+        if o_groups % DSPARK_TP_SIZE:
+            raise ValueError(
+                f"DSpark o-groups {o_groups} must divide by TP={DSPARK_TP_SIZE}"
+            )
+        local_o_groups = o_groups // DSPARK_TP_SIZE
+        local_o_width = local_o_groups * o_lora
+        if int(gate0.shape[0]) != n_routed_experts or gate0.shape[1] != hidden:
+            raise ValueError(
+                f"DSpark gate must be [{n_routed_experts}, {hidden}], got {tuple(gate0.shape)}"
+            )
+        moe_inter = int(shared_w1_0.shape[0])
+        if tuple(shared_w2_0.shape) != (hidden, moe_inter):
+            raise ValueError(
+                "DSpark shared expert shapes disagree: "
+                f"w1={tuple(shared_w1_0.shape)}, w2={tuple(shared_w2_0.shape)}"
+            )
+        if hc_attn0.ndim != 2:
+            raise ValueError("DSpark HC function matrices must be rank-2")
+        mix_hc = int(hc_attn0.shape[0])
+        hc_dim = int(hc_attn0.shape[1])
+        n_local = n_routed_experts // ranks
+
+        tensors: dict[str, torch.Tensor] = {}
+
+        def bank(
+            name: str, per_layer_shape: tuple[int, ...], dtype: torch.dtype
+        ) -> torch.Tensor:
+            rows = per_layer_shape[0]
+            destination = torch.empty(
+                (ranks, DSPARK_DRAFT_LAYERS * rows, *per_layer_shape[1:]), dtype=dtype
+            )
+            tensors[name] = destination
+            return destination
+
+        def fill_flat(name: str, destination: torch.Tensor, rows: int, layer: int) -> torch.Tensor:
+            return destination[:, layer * rows : (layer + 1) * rows]
+
+        def transpose2d(source: torch.Tensor) -> torch.Tensor:
+            return source.t().contiguous()
+
+        # (name, suffix, dtype, per-layer shape, transform); transform maps a
+        # checkpoint tensor into the kernel's matmul orientation, never dtype.
+        flat_specs: list[tuple[str, str, torch.dtype, tuple[int, ...], object]] = [
+            ("attn_norm_w", "attn_norm.weight", torch.bfloat16, (hidden,), None),
+            ("ffn_norm_w", "ffn_norm.weight", torch.bfloat16, (hidden,), None),
+            ("wq_a", "attn.wq_a.weight", torch.bfloat16, (hidden, q_lora), transpose2d),
+            ("wq_b", "attn.wq_b.weight", torch.int8, (q_lora, q_width), transpose2d),
+            ("wq_b_scale", "attn.wq_b.scale", torch.float32, (q_width,), None),
+            ("wkv", "attn.wkv.weight", torch.bfloat16, (hidden, head_dim), transpose2d),
+            ("gamma_cq", "attn.q_norm.weight", torch.bfloat16, (q_lora,), None),
+            ("gamma_ckv", "attn.kv_norm.weight", torch.bfloat16, (head_dim,), None),
+            ("attn_sink", "attn.attn_sink", torch.float32, (n_heads,), None),
+            ("wo_b_scale", "attn.wo_b.scale", torch.float32, (hidden,), None),
+            ("hc_attn_fn", "hc_attn_fn", torch.float32, (mix_hc, hc_dim), None),
+            ("hc_attn_scale", "hc_attn_scale", torch.float32, (3,), None),
+            ("hc_attn_base", "hc_attn_base", torch.float32, (mix_hc,), None),
+            ("hc_ffn_fn", "hc_ffn_fn", torch.float32, (mix_hc, hc_dim), None),
+            ("hc_ffn_scale", "hc_ffn_scale", torch.float32, (3,), None),
+            ("hc_ffn_base", "hc_ffn_base", torch.float32, (mix_hc,), None),
+            (
+                "shared_w1",
+                "ffn.shared_experts.w1.weight",
+                torch.int8,
+                (moe_inter, hidden),
+                None,
+            ),
+            (
+                "shared_w1_scale",
+                "ffn.shared_experts.w1.scale",
+                torch.float32,
+                (moe_inter,),
+                None,
+            ),
+            (
+                "shared_w3",
+                "ffn.shared_experts.w3.weight",
+                torch.int8,
+                (moe_inter, hidden),
+                None,
+            ),
+            (
+                "shared_w3_scale",
+                "ffn.shared_experts.w3.scale",
+                torch.float32,
+                (moe_inter,),
+                None,
+            ),
+            (
+                "shared_w2",
+                "ffn.shared_experts.w2.weight",
+                torch.int8,
+                (hidden, moe_inter),
+                None,
+            ),
+            (
+                "shared_w2_scale",
+                "ffn.shared_experts.w2.scale",
+                torch.float32,
+                (hidden,),
+                None,
+            ),
+        ]
+        banks: dict[str, torch.Tensor] = {}
+        for name, _, dtype, shape, _ in flat_specs:
+            banks[name] = bank(name, shape, dtype)
+        for layer in range(DSPARK_DRAFT_LAYERS):
+            for name, suffix, dtype, shape, transform in flat_specs:
+                source = tensor(layer, suffix)
+                prepared = transform(source) if transform is not None else source
+                if tuple(prepared.shape) != shape:
+                    raise ValueError(
+                        f"DSpark drafter {name} layer {layer} must be {shape}, "
+                        f"got {tuple(prepared.shape)}"
+                    )
+                if prepared.dtype is not dtype:
+                    raise ValueError(
+                        f"DSpark drafter {name} layer {layer} must be {dtype}, "
+                        f"got {prepared.dtype}"
+                    )
+                fill_flat(name, banks[name], shape[0], layer).copy_(prepared)
+        del banks
+
+        # Router gate: the checkpoint stores BF16 weights; the bank is FP32.
+        gate_w = bank("gate_w", (n_routed_experts, hidden), torch.float32)
+        gate_bias = bank("gate_bias", (n_routed_experts,), torch.float32)
+        for layer in range(DSPARK_DRAFT_LAYERS):
+            fill_flat("gate_w", gate_w, n_routed_experts, layer).copy_(
+                tensor(layer, "ffn.gate.weight").to(torch.float32)
+            )
+            fill_flat("gate_bias", gate_bias, n_routed_experts, layer).copy_(
+                tensor(layer, "ffn.gate.bias")
+            )
+
+        # tid2eid: the target hash layers' routing tables, INT32, every rank.
+        tid2eid = torch.cat(
+            [
+                self.load_tensor(f"layers.{layer}.ffn.gate.tid2eid").to(torch.int32)
+                for layer in DSPARK_DRAFTER_HASH_LAYERS
+            ],
+            dim=0,
+        ).contiguous()
+        if int(tid2eid.shape[0]) != DSPARK_DRAFT_LAYERS * vocab:
+            raise ValueError(
+                f"DSpark tid2eid covers {int(tid2eid.shape[0])} rows, "
+                f"expected {DSPARK_DRAFT_LAYERS * vocab}"
+            )
+        tensors["tid2eid"] = (
+            tid2eid.unsqueeze(0).expand(ranks, *tid2eid.shape).contiguous()
+        )
+        del tid2eid
+
+        # O-projection: TP group shard of wo_a, column slice of wo_b.
+        wo_a = bank(
+            "wo_a",
+            (local_o_groups, o_lora, int(wo_a0.shape[1])),
+            torch.bfloat16,
+        )
+        wo_b = bank(
+            "wo_b",
+            (hidden, local_o_width),
+            torch.int8,
+        )
+        wo_a_sources = [
+            self.load_tensor(f"mtp.{layer}.attn.wo_a.weight")
+            .reshape(o_groups, o_lora, int(wo_a0.shape[1]))
+            .contiguous()
+            for layer in DSPARK_DRAFTER_LAYERS
+        ]
+        wo_b_sources = [
+            self.load_tensor(f"mtp.{layer}.attn.wo_b.weight")
+            for layer in DSPARK_DRAFTER_LAYERS
+        ]
+        for rank in range(ranks):
+            tp_rank = rank % DSPARK_TP_SIZE
+            for layer in range(DSPARK_DRAFT_LAYERS):
+                wo_a[rank, layer * local_o_groups : (layer + 1) * local_o_groups].copy_(
+                    wo_a_sources[layer][
+                        tp_rank * local_o_groups : (tp_rank + 1) * local_o_groups
+                    ]
+                )
+                wo_b[rank, layer * hidden : (layer + 1) * hidden].copy_(
+                    wo_b_sources[layer][
+                        :, tp_rank * local_o_width : (tp_rank + 1) * local_o_width
+                    ]
+                )
+        del wo_a_sources, wo_b_sources
+
+        # Routed experts: EP sharded per rank, flattened along (layer, local);
+        # each bank row is one expert, so the tail (not the leading axis) is
+        # the expert's own shape.
+        routed_specs = (
+            ("routed_w1", "w1.weight", (moe_inter, hidden), torch.int8),
+            ("routed_w1_scale", "w1.scale", (moe_inter,), torch.float32),
+            ("routed_w3", "w3.weight", (moe_inter, hidden), torch.int8),
+            ("routed_w3_scale", "w3.scale", (moe_inter,), torch.float32),
+            ("routed_w2", "w2.weight", (hidden, moe_inter), torch.int8),
+            ("routed_w2_scale", "w2.scale", (hidden,), torch.float32),
+        )
+        expert_banks: dict[str, torch.Tensor] = {}
+        for name, _, tail, dtype in routed_specs:
+            destination = torch.empty(
+                (ranks, DSPARK_DRAFT_LAYERS * n_local, *tail), dtype=dtype
+            )
+            tensors[name] = destination
+            expert_banks[name] = destination
+        for layer in range(DSPARK_DRAFT_LAYERS):
+            prefix_layer = DSPARK_DRAFTER_LAYERS[layer]
+            raw = self.load_many(
+                [
+                    f"mtp.{prefix_layer}.ffn.experts.{expert}.{suffix}"
+                    for expert in range(n_routed_experts)
+                    for _, suffix, _, _ in routed_specs
+                ]
+            )
+            for rank in range(ranks):
+                local_ids = deepseek_v4_local_expert_ids(
+                    rank=rank, ranks=ranks, n_routed_experts=n_routed_experts
+                )
+                for local_index, expert in enumerate(local_ids):
+                    row = layer * n_local + local_index
+                    prefix = f"mtp.{prefix_layer}.ffn.experts.{expert}"
+                    for name, suffix, shape, _ in routed_specs:
+                        source = raw[f"{prefix}.{suffix}"]
+                        if tuple(source.shape) != shape:
+                            raise ValueError(
+                                f"DSpark drafter expert {expert} {name} must be {shape}, "
+                                f"got {tuple(source.shape)}"
+                            )
+                        expert_banks[name][rank, row].copy_(source)
+            del raw
+        del expert_banks
+
+        # Replicated heads.
+        def replicate(name: str, source: torch.Tensor, dtype: torch.dtype) -> None:
+            if source.dtype is not dtype:
+                source = source.to(dtype=dtype)
+            tensors[name] = (
+                source.contiguous().unsqueeze(0).expand(ranks, *source.shape).contiguous()
+            )
+
+        replicate("main_proj_weight", main_proj, torch.bfloat16)
+        replicate("main_norm_weight", main_norm, torch.bfloat16)
+        replicate("hc_head_fn", heads["mtp.2.hc_head_fn"], torch.float32)
+        replicate("hc_head_scale", heads["mtp.2.hc_head_scale"], torch.float32)
+        replicate("hc_head_base", heads["mtp.2.hc_head_base"], torch.float32)
+        replicate("final_norm_weight", heads["mtp.2.norm.weight"], torch.bfloat16)
+        replicate("markov_w1", markov_w1, torch.bfloat16)
+        replicate("markov_w2", markov_w2, torch.bfloat16)
+        # The confidence head ships BF16 but the kernel consumes it as FP32.
+        replicate("confidence_head_weight", confidence, torch.float32)
+        del heads
+
+        total_bytes = sum(t.numel() * t.element_size() for t in tensors.values())
+        logger.info(
+            "DSpark drafter weights loaded: %d banks, %.2f GiB host across %d ranks",
+            len(tensors),
+            total_bytes / (1 << 30),
+            ranks,
+        )
+        return DSparkDrafterWeights(tensors=tensors)
