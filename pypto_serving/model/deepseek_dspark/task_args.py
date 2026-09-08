@@ -39,6 +39,13 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_DECODE_LOCAL_TOKENS,
     DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS,
     DSPARK_DECODE_TOKENS,
+    DSPARK_BLOCK_SIZE,
+    DSPARK_DRAFTER_CONTEXT_ROWS,
+    DSPARK_DRAFTER_KV_BLOCKS,
+    DSPARK_DRAFTER_MAX_BATCH,
+    DSPARK_DRAFTER_QUERY_WIDTH,
+    DSPARK_DRAFT_LAYERS,
+    DSPARK_HEAD_DIM,
     DSPARK_HC_MULT,
     DSPARK_HIDDEN_SIZE,
     DSPARK_MAIN_HIDDEN_DIM,
@@ -65,7 +72,13 @@ from pypto_serving.model.deepseek_dspark.weight_spec import (  # noqa: PLC0415 -
 if TYPE_CHECKING:
     from pypto_serving.model.deepseek_dspark.npu_runner import DSparkModelRunner
 
-__all__ = ["decode_task_args", "prefill_task_args"]
+__all__ = [
+    "decode_task_args",
+    "drafter_scratch_specs",
+    "drafter_task_args",
+    "markov_task_args",
+    "prefill_task_args",
+]
 
 # ---- shared source name sets ----
 # Stacked layer-weight bank names shared by prefill and decode.
@@ -453,3 +466,275 @@ _DECODE_TENSOR_ORDER = (
     "x_attn_active", "x_moe_next",
     "pre_hc_hidden_out", "dspark_target_hidden", "x_out", "logits", "sampled_ids",
 )
+
+# Argument order for the speculative drafter (pypto-lib dspark_drafter.py,
+# ``l3_dspark_drafter``): the backbone hidden tap and its projection, the
+# per-request state selectors, the group context/query metadata, the six
+# per-use rope row tables, the three-layer weight banks, the drafter-private
+# SWA pools, and the head outputs.
+_DRAFTER_TENSOR_ORDER = (
+    "target_hidden", "initial_hidden", "intermediate_hidden",
+    "main_proj_weight", "main_norm_weight",
+    "num_sampled", "last_sampled", "next_prefill_tokens",
+    "embedding_weight",
+    "context_group_position_ids", "context_group_slot_mapping",
+    "anchor_positions", "block_tables",
+    "query_group_position_ids", "query_group_slot_mapping",
+    "context_group_freqs_cos", "context_group_freqs_sin",
+    "query_freqs_cos", "query_freqs_sin",
+    "query_group_freqs_cos", "query_group_freqs_sin",
+    "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
+    "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
+    "kv_caches", "attn_sink", "wo_a", "wo_b", "wo_b_scale",
+    "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "ffn_norm_w",
+    "gate_w", "gate_bias", "tid2eid",
+    "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
+    "routed_w2", "routed_w2_scale",
+    "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
+    "shared_w2", "shared_w2_scale",
+    "hc_head_fn", "hc_head_scale", "hc_head_base",
+    "head_hidden",
+)
+
+# Per-dispatch dynamic extents: B_DYN over the uniform padded batch and
+# T_MAIN_DYN over each rank's backbone hidden rows are bound by prefix views
+# over max-backed slots.  The group-context tensors and the block tables
+# cannot be sliced that way (their dynamic axis is not the per-rank storage
+# prefix), so they stage through the runner's per-extent shared buffers and
+# the dispatch substitutes them by name.
+_DRAFTER_B_DYNAMIC_NAMES = frozenset(
+    {
+        "num_sampled",
+        "last_sampled",
+        "next_prefill_tokens",
+        "anchor_positions",
+        "head_hidden",
+    }
+)
+_DRAFTER_T_MAIN_DYNAMIC_NAMES = frozenset({"target_hidden"})
+_DRAFTER_STAGED_BUFFER_NAMES = frozenset(
+    {
+        "context_group_position_ids",
+        "context_group_slot_mapping",
+        "context_group_freqs_cos",
+        "context_group_freqs_sin",
+        "block_tables",
+    }
+)
+
+
+def _drafter_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
+    """Host-shared drafter slot name -> (dtype, full shape)."""
+    ranks = layout.ranks
+    batch = DSPARK_DRAFTER_MAX_BATCH
+    context = DSPARK_DRAFTER_CONTEXT_ROWS
+    query = batch * DSPARK_DRAFTER_QUERY_WIDTH
+    group_query = 4 * query
+    rope = (DSPARK_ROPE_HEAD_DIM,)
+    return {
+        "target_hidden": (
+            torch.bfloat16, (ranks, context, DSPARK_MAIN_HIDDEN_DIM),
+        ),
+        "num_sampled": (torch.int32, (ranks, batch)),
+        "last_sampled": (torch.int64, (ranks, batch)),
+        "next_prefill_tokens": (torch.int64, (ranks, batch)),
+        "anchor_positions": (torch.int32, (ranks, batch)),
+        "query_group_position_ids": (torch.int32, (ranks, group_query)),
+        "query_group_slot_mapping": (
+            torch.int64, (ranks, DSPARK_DRAFT_LAYERS, group_query),
+        ),
+        "query_freqs_cos": (torch.bfloat16, (ranks, query, *rope)),
+        "query_freqs_sin": (torch.bfloat16, (ranks, query, *rope)),
+        "query_group_freqs_cos": (torch.bfloat16, (ranks, group_query, *rope)),
+        "query_group_freqs_sin": (torch.bfloat16, (ranks, group_query, *rope)),
+    }
+
+
+def drafter_scratch_specs(ranks: int) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    """The drafter's persistent device buffers (private KV pools + outputs).
+
+    Exposed so the runner can materialize them before the KV-capacity
+    snapshot: they are runner-resident for the worker's whole lifetime, and
+    sizing the target pools without them lets startup succeed but OOM at the
+    first draft, outside the cache-allocation retry path.
+    """
+    return {
+        "kv_caches": (
+            (
+                ranks,
+                DSPARK_DRAFT_LAYERS,
+                DSPARK_DRAFTER_KV_BLOCKS,
+                DSPARK_BLOCK_SIZE,
+                1,
+                DSPARK_HEAD_DIM,
+            ),
+            torch.bfloat16,
+        ),
+        "initial_hidden": (
+            (ranks, DSPARK_MOE_TOKENS, DSPARK_HC_MULT, DSPARK_HIDDEN_SIZE),
+            torch.float32,
+        ),
+        "intermediate_hidden": (
+            (
+                ranks,
+                DSPARK_DRAFT_LAYERS,
+                DSPARK_MOE_TOKENS,
+                DSPARK_HC_MULT,
+                DSPARK_HIDDEN_SIZE,
+            ),
+            torch.float32,
+        ),
+        "head_hidden": (
+            (
+                ranks,
+                DSPARK_DRAFTER_MAX_BATCH,
+                DSPARK_DRAFTER_QUERY_WIDTH,
+                DSPARK_HIDDEN_SIZE,
+            ),
+            torch.bfloat16,
+        ),
+    }
+
+
+def drafter_task_args(runner: DSparkModelRunner) -> TaskArgs:
+    """Build the ``TaskArgs`` for the ``l3_dspark_drafter`` dispatch."""
+    layout = runner._compiled.layout
+    slot_specs = _drafter_slots(layout)
+    ranks = layout.ranks
+    scratch = {
+        "kv_caches": (
+            (
+                ranks,
+                DSPARK_DRAFT_LAYERS,
+                DSPARK_DRAFTER_KV_BLOCKS,
+                DSPARK_BLOCK_SIZE,
+                1,
+                DSPARK_HEAD_DIM,
+            ),
+            torch.bfloat16,
+        ),
+        "initial_hidden": (
+            (ranks, DSPARK_MOE_TOKENS, DSPARK_HC_MULT, DSPARK_HIDDEN_SIZE),
+            torch.float32,
+        ),
+        "intermediate_hidden": (
+            (
+                ranks,
+                DSPARK_DRAFT_LAYERS,
+                DSPARK_MOE_TOKENS,
+                DSPARK_HC_MULT,
+                DSPARK_HIDDEN_SIZE,
+            ),
+            torch.float32,
+        ),
+        "head_hidden": (
+            (
+                ranks,
+                DSPARK_DRAFTER_MAX_BATCH,
+                DSPARK_DRAFTER_QUERY_WIDTH,
+                DSPARK_HIDDEN_SIZE,
+            ),
+            torch.bfloat16,
+        ),
+    }
+
+    ta = TaskArgs(stacked=True)
+    for name in _DRAFTER_TENSOR_ORDER:
+        if name in slot_specs:
+            dtype, shape = slot_specs[name]
+            ta.add_slot(Slot(name, Placement.HOST_SHARED, dtype, lambda _, s=shape: s))
+        elif name == "embedding_weight":
+            ta.add_arg(name, lambda: runner._materialize_embedding_device_weight())
+        elif name in _DRAFTER_STAGED_BUFFER_NAMES:
+            # Registered as a placeholder: the runner substitutes its
+            # per-extent shared staging buffer at dispatch-args time.
+            ta.add_arg(name, _STAGED_BUFFER_PLACEHOLDER)
+        elif name in scratch:
+            ta.add_arg(
+                name,
+                lambda n=name, s=scratch[name]: runner._alloc_zeroed_stacked_tensor(
+                    n, s[0], s[1], scope="drafter"
+                ),
+            )
+        else:
+            ta.add_arg(name, lambda n=name: runner._require_drafter_weights()[n])
+    return ta
+
+
+# Sentinel for the runner-substituted shared staging buffers (see
+# ``_DRAFTER_STAGED_BUFFER_NAMES``); never crosses the wire itself.
+_STAGED_BUFFER_PLACEHOLDER = object()
+
+
+# Argument order for the distributed markov sampler (pypto-lib
+# dspark_markov.py, ``l3_distributed_markov_sample``): the drafter head rows,
+# the drafter-final norm, the TP-sharded LM head with its logit rows, the
+# per-request state selectors, the two markov tables and the confidence head,
+# and the sampled draft outputs.
+_MARKOV_TENSOR_ORDER = (
+    "head_hidden",
+    "final_norm_weight",
+    "lm_head_weight",
+    "logit_row_indices",
+    "num_sampled",
+    "last_sampled",
+    "next_prefill_tokens",
+    "markov_w1",
+    "markov_w2",
+    "confidence_head_weight",
+    "draft_token_ids",
+    "confidence_probs",
+)
+
+
+def _markov_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
+    """Host-shared markov slot name -> (dtype, full shape)."""
+    ranks = layout.ranks
+    return {
+        "num_sampled": (torch.int32, (ranks, DSPARK_DRAFTER_MAX_BATCH)),
+        "last_sampled": (torch.int64, (ranks, DSPARK_DRAFTER_MAX_BATCH)),
+        "next_prefill_tokens": (torch.int64, (ranks, DSPARK_DRAFTER_MAX_BATCH)),
+        "logit_row_indices": (torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS)),
+        "draft_token_ids": (
+            torch.int32,
+            (ranks, DSPARK_DRAFTER_MAX_BATCH, DSPARK_DRAFTER_QUERY_WIDTH),
+        ),
+        "confidence_probs": (
+            torch.float32,
+            (ranks, DSPARK_DRAFTER_MAX_BATCH, DSPARK_DRAFTER_QUERY_WIDTH),
+        ),
+    }
+
+
+def markov_task_args(runner: DSparkModelRunner) -> TaskArgs:
+    """Build the ``TaskArgs`` for the ``l3_distributed_markov_sample`` dispatch."""
+    layout = runner._compiled.layout
+    slot_specs = _markov_slots(layout)
+    ranks = layout.ranks
+    head_hidden_shape = (
+        ranks,
+        DSPARK_DRAFTER_MAX_BATCH,
+        DSPARK_DRAFTER_QUERY_WIDTH,
+        DSPARK_HIDDEN_SIZE,
+    )
+
+    ta = TaskArgs(stacked=True)
+    for name in _MARKOV_TENSOR_ORDER:
+        if name in slot_specs:
+            dtype, shape = slot_specs[name]
+            ta.add_slot(Slot(name, Placement.HOST_SHARED, dtype, lambda _, s=shape: s))
+        elif name == "head_hidden":
+            # The same device buffer the drafter program wrote: the zeroed
+            # scratch materializer is keyed by (scope, name), so requesting it
+            # under the drafter scope returns the identical StackedDeviceTensor.
+            ta.add_arg(
+                name,
+                lambda: runner._alloc_zeroed_stacked_tensor(
+                    "head_hidden", head_hidden_shape, torch.bfloat16, scope="drafter"
+                ),
+            )
+        elif name == "lm_head_weight":
+            ta.add_arg(name, lambda: runner._static_lm_head_weight_tensor())
+        else:
+            ta.add_arg(name, lambda n=name: runner._require_drafter_weights()[n])
+    return ta
