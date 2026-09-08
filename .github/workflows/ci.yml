@@ -139,7 +139,7 @@ jobs:
             --timeout 2400 --max-time 3600 \
             --run "$run_cmd"
 
-      - name: Run DSpark target HTTP guard
+      - name: Run DSpark HTTP guard (target K=0 and speculation K=7)
         env:
           PYPTO_RUNTIME_LOG: error
         run: |
@@ -152,7 +152,7 @@ jobs:
           run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
           run_cmd="$run_cmd python -m pytest tests/test_deepseek_dspark_accuracy.py -q -s"
           task-submit --device auto --device-num 16 --ignore-whitelist \
-            --timeout 2400 --max-time 3600 \
+            --timeout 4800 --max-time 7200 \
             --run "$run_cmd"
 
       - name: Kill orphaned task-submit tasks
