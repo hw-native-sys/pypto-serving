@@ -70,6 +70,11 @@ class ModelExecutor(ABC):
         return None
 
     @property
+    def max_prefill_batch_size_per_partition(self) -> int:
+        """Return the per-cache-partition prefill width for one dispatch."""
+        return 1
+
+    @property
     def supports_async_decode_prepare(self) -> bool:
         """Return whether decode metadata can be prepared ahead of execution.
 
