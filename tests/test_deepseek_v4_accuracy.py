@@ -210,7 +210,7 @@ def _server_command(
         "--ring-task-window",
         "16384",
         "--ring-heap",
-        "1073741824",
+        "2147483648",
         "--port",
         str(port),
         "--show-startup-logs",
@@ -604,7 +604,7 @@ def test_server_command_uses_explicit_mtp_depth_and_serving_capacity(tmp_path) -
     assert command[command.index("--long-prefill-token-threshold") + 1] == "1024"
     assert command[command.index("--ring-dep-pool") + 1] == "16384"
     assert command[command.index("--ring-task-window") + 1] == "16384"
-    assert command[command.index("--ring-heap") + 1] == "1073741824"
+    assert command[command.index("--ring-heap") + 1] == "2147483648"
 
 
 def test_mtp_matrix_covers_fused_and_standalone_shapes() -> None:
