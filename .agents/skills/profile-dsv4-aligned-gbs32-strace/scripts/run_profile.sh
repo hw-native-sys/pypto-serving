@@ -17,8 +17,9 @@ Options:
   --run-id ID              Optional scheduler/task identifier
   -h, --help               Show this help
 
-The workload is fixed: GBS32, DP8, per-rank batch4, 64 prompt tokens,
-256 output tokens, MTP k=1, temperature=0, top_p=1, top_k=0, ignore_eos=1.
+The workload is fixed: GBS32, DP8, per-rank batch4, 32 distinct attraction prompts,
+64 tokens per prompt, 256 output tokens, MTP k=1,
+temperature=0, top_p=1, top_k=0, ignore_eos=1.
 EOF
 }
 

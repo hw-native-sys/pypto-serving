@@ -19,6 +19,8 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from aligned_prompts import validate_prompt_manifest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 REQUEST_COUNT = 32
@@ -123,6 +125,8 @@ def main() -> None:
     serving_payload = json.loads(serving_trace_path.read_text(encoding="utf-8"))
     performance = json.loads(performance_path.read_text(encoding="utf-8"))
     responses = json.loads(responses_path.read_text(encoding="utf-8"))
+    prompt_manifest = json.loads((artifact_dir / "prompt_manifest.json").read_text(encoding="utf-8"))
+    prompt_digest = validate_prompt_manifest(prompt_manifest)
 
     if len(responses) != REQUEST_COUNT:
         raise RuntimeError(f"expected {REQUEST_COUNT} responses, got {len(responses)}")
@@ -249,6 +253,8 @@ def main() -> None:
             "dp": 8,
             "per_rank_batch": 4,
             "prompt_tokens": 64,
+            "unique_prompts": len(prompt_manifest),
+            "prompt_token_matrix_sha256": prompt_digest,
             "output_tokens": OUTPUT_TOKENS,
             "mtp_k": 1,
             "temperature": 0,
@@ -279,6 +285,7 @@ def main() -> None:
 
 - Run: `{args.run_id}`
 - Workload: `GBS32 / DP8 / per-rank batch4 / Seq64 / Output256 / MTP k=1 / temperature=0`
+- Inputs: 32 distinct attraction prompts; token matrix SHA256 `{prompt_digest}`
 - Serving categories: `{dict(sorted(categories.items()))}`
 - Host STRACE invocations: `{len(selected)}` (`{len(selected) // 8}` per rank)
 - Decode steps: `{decode_step_count}`
