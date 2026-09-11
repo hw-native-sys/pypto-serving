@@ -93,7 +93,13 @@ Pass `"reasoning_effort":"high"` or `"chat_template_kwargs":{"enable_thinking":t
 
 The main prefill kernel accepts a dynamic request extent up to 8192 tokens and walks it internally in 128-token tiles. The effective dispatch extent is the minimum of 8192, `--max-num-batched-tokens`, `--long-prefill-token-threshold`, and `--max-model-len`. An 8191-token prompt can therefore use one 8192-row main-prefill dispatch when those configured limits permit it, instead of 64 serving dispatches.
 
-For repeated launches, set `PYPTO_PROG_BUILD_DIR` to a persistent directory and add `--use-compile-cache`. The first launch populates a device-specific worker subdirectory after executable assembly. Later launches reuse the compiled programs without fingerprint validation, so use the same model configuration, assigned devices, and kernel sources, and clear the directory after any change.
+For repeated launches, set `PYPTO_CACHE_DIR` to a shared artifact directory and
+add `--use-compile-cache`, or set `PYPTO_CACHE=1`. PyPTO validates source,
+specialization and toolchain identities before reusing generated code and
+binaries. Leave `PYPTO_PROG_BUILD_DIR` unset for reuse: explicitly requesting
+build output bypasses caching. The old named build slots are not reused. See the
+[compile cache reference](../cli-reference/pypto-serving.md) for read-only mode,
+configuration precedence and cold-start costs.
 
 For MTP K greater than 1, prefix caching is disabled automatically. For routine DeepSeek V4 serving, pass `--no-enable-prefix-caching` unless you are explicitly validating prefix-cache behavior.
 

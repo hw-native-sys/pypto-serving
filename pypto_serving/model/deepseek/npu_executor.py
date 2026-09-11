@@ -228,8 +228,8 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         platform: str = "a2a3sim",
         device_id: int = 0,
         device_ids: Sequence[int] | None = None,
-        pypto_build_dir: str = "build_output",
-        use_compile_cache: bool = False,
+        pypto_build_dir: str | None = None,
+        use_compile_cache: bool | None = None,
         compile_kernels: bool = False,
         num_speculative_tokens: int = 0,
     ) -> None:
@@ -248,18 +248,12 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         if self._num_speculative_tokens < 0:
             raise ValueError("num_speculative_tokens must be non-negative")
         self._embedding_cache: dict[str, torch.Tensor] = {}
-        # Shared JIT-compile core; DeepSeek wraps each compile in a per-kernel
-        # profile span (see _compile_l3_callable). With ``use_compile_cache`` the
-        # build dir doubles as the on-disk kernel cache (load-or-compile, slotted
-        # by kernel name); otherwise pypto uses its default per-kernel build dirs.
-        compile_cache_dir = self._pypto_build_dir if self._use_compile_cache else None
         self._compiler = KernelCompiler(
             run_config=build_pypto_run_config(
                 platform=self._platform,
                 device_ids=self._device_ids,
-                pypto_build_dir=compile_cache_dir,
+                pypto_build_dir=self._pypto_build_dir,
             ),
-            cache_dir=compile_cache_dir,
         )
 
     @property

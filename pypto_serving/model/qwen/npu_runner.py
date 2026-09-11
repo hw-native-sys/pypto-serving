@@ -221,9 +221,8 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         logger.info("[init_kv_cache] creating L3 worker …")
         with profile_span("Qwen314BModelRunner.prepare_l3_worker", cat="executor"):
             self._shared_l3_worker()
-        # The L3 worker assembles the device binaries into each program's
-        # output_dir, which (via the compiler's save_kernels_dir) already is the
-        # kernel-cache slot -- so the cache is populated directly, no store step.
+        # PyPTO prepares every chip binary here and publishes READY artifacts
+        # when caching is enabled. Serving owns no artifact load/store step.
 
         logger.info("[init_kv_cache] uploading static tensors …")
         with profile_span("Qwen314BModelRunner.upload_static_tensors", cat="executor"):

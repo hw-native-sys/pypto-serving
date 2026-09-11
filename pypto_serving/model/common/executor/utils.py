@@ -42,9 +42,10 @@ def build_pypto_run_config(
     :class:`KernelCompiler` (which only layers on per-model knobs via
     ``dataclasses.replace``). ``device_id`` is the first of ``device_ids``.
 
-    ``pypto_build_dir`` is the per-worker build/cache directory: when set it
-    becomes the pypto ``RunConfig.save_kernels_dir`` (artifacts retained there)
-    and the :class:`KernelCompiler` slots each kernel under ``<dir>/<name>``.
+    ``pypto_build_dir`` is an explicit diagnostic/output request and bypasses
+    PyPTO's JIT cache. Ordinary serving leaves it unset; private builds then use
+    PyPTO's unique directories. KernelCompiler adds the kernel name to an
+    explicitly requested base directory.
     """
     from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
     from pypto.runtime import RunConfig  # noqa: PLC0415
