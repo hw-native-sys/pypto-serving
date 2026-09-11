@@ -62,13 +62,16 @@ jobs:
           } > "$DIAGNOSTIC_DIR/revisions.txt"
 
       - name: Run only K1 prefix-cache diagnostic
+        shell: bash
         run: |
+          set -euo pipefail
           printf -v run_cmd 'bash %q %q' \
             "$GITHUB_WORKSPACE/dist-checkout/.github/scripts/diagnose-prefix-cache.sh" \
             "$DIAGNOSTIC_DIR"
           task-submit --device auto --device-num 8 --ignore-whitelist \
             --env PYPTO_DSV4_MODEL_DIR --timeout 4800 --max-time 3600 \
             --run "$run_cmd" 2>&1 | tee "$DIAGNOSTIC_DIR/task-submit.log"
+          test "$(cat "$DIAGNOSTIC_DIR/pytest-exit-code.txt")" = 0
 
       - name: Kill orphaned task-submit tasks
         if: always()
