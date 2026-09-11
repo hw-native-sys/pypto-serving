@@ -37,9 +37,6 @@ jobs:
       - name: Prepare diagnostic output
         run: mkdir -p "$DIAGNOSTIC_DIR"
 
-      - name: Resolve model directory
-        run: test -n "${PYPTO_DSV4_MODEL_DIR:-}" && test -d "$PYPTO_DSV4_MODEL_DIR"
-
       - name: Setup CI job
         uses: ./.github/actions/setup-ci-job
         with:
@@ -61,7 +58,7 @@ jobs:
             echo "host=$(hostname)"
           } > "$DIAGNOSTIC_DIR/revisions.txt"
 
-      - name: Run only K1 prefix-cache diagnostic
+      - name: Run isolated SDMA initialization probes
         shell: bash
         run: |
           set -euo pipefail
@@ -69,9 +66,9 @@ jobs:
             "$GITHUB_WORKSPACE/dist-checkout/.github/scripts/diagnose-prefix-cache.sh" \
             "$DIAGNOSTIC_DIR"
           task-submit --device auto --device-num 8 --ignore-whitelist \
-            --env PYPTO_DSV4_MODEL_DIR --timeout 4800 --max-time 3600 \
+            --timeout 4800 --max-time 4500 \
             --run "$run_cmd" 2>&1 | tee "$DIAGNOSTIC_DIR/task-submit.log"
-          test "$(cat "$DIAGNOSTIC_DIR/pytest-exit-code.txt")" = 0
+          test "$(cat "$DIAGNOSTIC_DIR/diagnostic-exit-code.txt")" = 0
 
       - name: Kill orphaned task-submit tasks
         if: always()
