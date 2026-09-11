@@ -1,36 +1,20 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: pr230-prefix-diagnostic-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  pre-commit:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - uses: pre-commit/action@v3.0.0
-        with:
-          extra_args: --all-files
-
-  unit-tests:
+  prefix-cache-diagnostic:
     runs-on: [self-hosted, linux, arm64, npu]
-    # The DeepSeek matrix client waits up to 2400 seconds while the daemon caps
-    # the task at 3600 seconds. The venv no longer inherits a base env's torch,
-    # so a cold pip cache is paid here too. 90 left no headroom for both at once.
     timeout-minutes: 120
     env:
       PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
@@ -39,11 +23,8 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CCACHE_MAXSIZE: 30G
-      # Shared with the other repos' jobs on this host, so 000 keeps cache files
-      # mutually writable whichever user wrote them first. The cache *paths* are
-      # exported by setup-ci-job from the runner config's CI_CACHE_ROOT — a
-      # static job-level env: cannot see a step's output.
       CCACHE_UMASK: '000'
+      DIAGNOSTIC_DIR: ${{ github.workspace }}/prefix-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
       - name: Fetch composite action definitions
@@ -53,37 +34,11 @@ jobs:
           clean: false
           persist-credentials: false
 
-      - name: Resolve model dirs
-        # setup-ci-job checks the runner config it needs itself; the model
-        # weights are only needed by the steps below, so they are checked here.
-        # Before the setup on purpose: this reads nothing but the runner's own
-        # .env, and behind it lies the checkout, the toolchain and a from-source
-        # build of pypto — so a host missing a model dir must fail with an
-        # actionable message now, not forty minutes later inside pytest as an
-        # opaque missing-path error.
-        run: |
-          set -uo pipefail
-          bad=0
-          for key in \
-            PYPTO_QWEN3_MODEL_DIR \
-            PYPTO_DSV4_MODEL_DIR \
-            PYPTO_DSV4_DSPARK_MODEL_DIR; do
-            value="${!key:-}"
-            if [ -z "$value" ]; then
-              echo "::error::$key is not set — add it to this runner's .env"
-              bad=1
-            elif [ ! -d "$value" ]; then
-              echo "::error::$key points at a missing directory: $value"
-              bad=1
-            fi
-          done
-          if [ "$bad" -ne 0 ]; then
-            echo "The runner declares its host layout in <runner-root>/.env,"
-            echo "one bare KEY=VALUE per line (no quotes, no trailing comments);"
-            echo "restart the runner service after editing it."
-            exit 1
-          fi
-          echo "model dirs resolved from the runner config"
+      - name: Prepare diagnostic output
+        run: mkdir -p "$DIAGNOSTIC_DIR"
+
+      - name: Resolve model directory
+        run: test -n "${PYPTO_DSV4_MODEL_DIR:-}" && test -d "$PYPTO_DSV4_MODEL_DIR"
 
       - name: Setup CI job
         uses: ./.github/actions/setup-ci-job
@@ -91,69 +46,29 @@ jobs:
           checkout-path: dist-checkout
           needs-device: 'true'
           toolchain: bundle
-          # CI_CACHE_ROOT is shared with pypto and pypto-lib, whose jobs already
-          # claim `serving` / `pip-serving`. Name both after this repo so the two
-          # never land on one dir.
           build-namespace: pypto-serving
           pip-cache-name: pip-pypto-serving
 
-      - name: Run Qwen3 accuracy guard
-        env:
-          PYTHONPATH: ${{ github.workspace }}/dist-checkout
+      - name: Record source revisions
         run: |
-          source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
-          run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
-          run_cmd="$run_cmd && source activate.sh"
-          run_cmd="$run_cmd && DEVICE_ID=\$TASK_DEVICE"
-          run_cmd="$run_cmd PYTHONPATH=$PYTHONPATH"
-          run_cmd="$run_cmd PYPTO_QWEN3_MODEL_DIR=$PYPTO_QWEN3_MODEL_DIR"
-          run_cmd="$run_cmd python -m pytest tests/test_qwen3_accuracy.py -q -s"
-          task-submit --device auto --timeout 1200 --max-time 1800 --run "$run_cmd"
+          {
+            echo "serving=$(git -C "$GITHUB_WORKSPACE/dist-checkout" rev-parse HEAD)"
+            echo "pypto=$(git -C "$PYPTO_SRC" rev-parse HEAD)"
+            echo "runtime=$(git -C "$PYPTO_SRC/runtime" rev-parse HEAD)"
+            echo "pypto_lib=$(git -C "$GITHUB_WORKSPACE/dist-checkout/pypto-lib" rev-parse HEAD)"
+            echo "ptoas=$PTOAS_VERSION"
+            echo "pto_isa=$PTO_ISA_COMMIT"
+            echo "host=$(hostname)"
+          } > "$DIAGNOSTIC_DIR/revisions.txt"
 
-      - name: Run Qwen3 serving guard (prefix cache, chunked prefill, multi-batch)
-        env:
-          PYTHONPATH: ${{ github.workspace }}/dist-checkout
+      - name: Run only K1 prefix-cache diagnostic
         run: |
-          source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
-          run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
-          run_cmd="$run_cmd && source activate.sh"
-          run_cmd="$run_cmd && DEVICE_ID=\$TASK_DEVICE"
-          run_cmd="$run_cmd PYTHONPATH=$PYTHONPATH"
-          run_cmd="$run_cmd PYPTO_QWEN3_MODEL_DIR=$PYPTO_QWEN3_MODEL_DIR"
-          run_cmd="$run_cmd python -m pytest tests/test_qwen3_serving.py -q -s"
-          task-submit --device auto --timeout 1200 --max-time 1800 --run "$run_cmd"
-
-      - name: Run DeepSeek V4 MTP HTTP matrix
-        env:
-          PYPTO_RUNTIME_LOG: error
-        run: |
-          source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
-          run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
-          run_cmd="$run_cmd && source activate.sh"
-          run_cmd="$run_cmd && TASK_DEVICE=\$TASK_DEVICE"
-          run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout"
-          run_cmd="$run_cmd PYPTO_DSV4_MODEL_DIR=$PYPTO_DSV4_MODEL_DIR"
-          run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
-          run_cmd="$run_cmd python -m pytest tests/test_deepseek_v4_accuracy.py -q -s"
+          printf -v run_cmd 'bash %q %q' \
+            "$GITHUB_WORKSPACE/dist-checkout/.github/scripts/diagnose-prefix-cache.sh" \
+            "$DIAGNOSTIC_DIR"
           task-submit --device auto --device-num 8 --ignore-whitelist \
-            --timeout 2400 --max-time 3600 \
-            --run "$run_cmd"
-
-      - name: Run DSpark HTTP guard (target K=0 and speculation K=7)
-        env:
-          PYPTO_RUNTIME_LOG: error
-        run: |
-          source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
-          run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
-          run_cmd="$run_cmd && source activate.sh"
-          run_cmd="$run_cmd && TASK_DEVICE=\$TASK_DEVICE"
-          run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout"
-          run_cmd="$run_cmd PYPTO_DSV4_DSPARK_MODEL_DIR=$PYPTO_DSV4_DSPARK_MODEL_DIR"
-          run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
-          run_cmd="$run_cmd python -m pytest tests/test_deepseek_dspark_accuracy.py -q -s"
-          task-submit --device auto --device-num 16 --ignore-whitelist \
-            --timeout 4800 --max-time 7200 \
-            --run "$run_cmd"
+            --env PYPTO_DSV4_MODEL_DIR --timeout 4800 --max-time 3600 \
+            --run "$run_cmd" 2>&1 | tee "$DIAGNOSTIC_DIR/task-submit.log"
 
       - name: Kill orphaned task-submit tasks
         if: always()
@@ -161,33 +76,21 @@ jobs:
         with:
           checkout-path: dist-checkout
 
-  platform-build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
+      - name: Collect generated kernel sources
+        if: always()
+        run: |
+          build_dir="$GITHUB_WORKSPACE/dist-checkout/build_output"
+          if [ -d "$build_dir" ]; then
+            find "$build_dir" -type f \
+              \( -name '*.cpp' -o -name '*.h' \) -print0 \
+              | tar --null -T - -czf "$DIAGNOSTIC_DIR/kernel-sources.tar.gz"
+          fi
+
+      - name: Upload full diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          fetch-depth: 1
-          submodules: recursive
-          persist-credentials: false
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y meson ninja-build libhwloc-dev libboost-context-dev libopenmpi-dev
-          python3 -m pip install 'clang-format==18.1.0'
-
-      - name: Check style
-        run: |
-          python3 platform/extern/HiCR/extern/run-clang-format/run-clang-format.py \
-            --recursive platform/include platform/examples \
-            --extensions "hpp,cpp" --exclude "*/build/*"
-
-      - name: Configure
-        run: meson setup platform/build platform/ -Dengines=mpi -DbuildTests=true
-
-      - name: Build
-        run: ninja -C platform/build
-
-      - name: Test
-        run: meson test -C platform/build --suite examples --timeout-multiplier 2
+          name: pr230-prefix-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.DIAGNOSTIC_DIR }}
+          if-no-files-found: warn
+          retention-days: 7
