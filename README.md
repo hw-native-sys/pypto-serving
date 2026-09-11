@@ -121,6 +121,20 @@ Requests that omit sampling fields use the server-wide `GenerateConfig`
 defaults for every model: `temperature=0.0` (greedy decoding) and `top_p=1.0`.
 Override them per request or with `--generate-config` when starting the server.
 
+## Local Docs Build
+
+The MkDocs site uses a shared theme checked out into `.site-theme/`. CI prepares this directory automatically; local builds need the same checkout before running `mkdocs build --strict`.
+
+Use the commit pinned in `docs/theme-revision.txt`:
+
+```bash
+theme_revision=$(cat docs/theme-revision.txt)
+git clone https://github.com/hw-native-sys/hw-native-sys.github.io .site-theme
+git -C .site-theme checkout "$theme_revision"
+python -m pip install -r docs/requirements.txt
+mkdocs build --strict
+```
+
 ## Notes
 
 - All model/device/runtime options are passed via CLI arguments. Run `pypto-serving --help` for the exact arguments available in the installed package. See `docs/cli-reference/pypto-serving.md` for the documented reference.
