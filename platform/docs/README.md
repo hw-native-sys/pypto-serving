@@ -22,21 +22,27 @@ platform/
   build/                            generated build output; not documented here
 ```
 
-## Module Areas
+## Documentation
 
+- [Architecture](architecture.md): instance roles, module system, channel model, and scope.
+- [Simpler Integration](simpler-integration.md): how replica ranks launch Simpler, the `processFc` interface, and the path to in-device tensor channels.
+- [Model Support Interface](model-support-interface.md): what Model Support owns, provides, and will consume from the platform.
 - [System](system/README.md): engine lifecycle and cross-instance start/stop control.
 - [Channels](system/channels.md): payload, coordination, metadata, input, output, and message primitives.
-
-Configuration types, the service module, channel controller, and broadcast deployment are tracked in issue #32 and are not part of this initial PR.
+- [Modules](modules/README.md): configuration, service, channel controller, and broadcast deployment.
 
 ## Runtime Shape
 
 The current platform runtime is built around `serving::system::Engine`. The engine owns a set of `serving::modules::Module` instances, initializes them, starts them across instances through RPC, waits for termination, and finalizes them.
 
-This initial PR covers the following building blocks:
+This PR covers the following building blocks:
 
 - Engine lifecycle: cross-instance start/stop over RPC (`serving::system::Engine`).
 - Module base interface: initialize/run/terminate/await/finalize lifecycle with optional `taskr::Service` (`serving::modules::Module`).
 - Channel primitives: `Input`, `Output`, `Message`, and `MessageTypeRegistry` for host-side control traffic.
+- Configuration types: `Deployment`, `Partition`, `Task`, `Edge`, `Replica`, `RequestManager` with JSON serialization and verification.
+- `broadcastDeployment`: deployer-to-worker deployment config distribution over RPC.
+- `channelController`: desired-vs-actual reconciliation loop for host-side SPSC channels.
+- `service`: wraps `taskr::Runtime` for cooperative background services.
 
-Deployment graph representation, deployment broadcast, desired-state channel creation, dynamic scaling, topology-aware replacement, fault recovery, and Python bindings are not implemented in this PR.
+Dynamic scaling, fault recovery, `channelDispatcher`, `taskScheduler`, executor roles, heartbeat, `RuntimePlan` update protocol, in-device tensor channels, and Python bindings are deferred to follow-up PRs.
