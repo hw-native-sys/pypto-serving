@@ -31,7 +31,7 @@ import logging
 import math
 import os
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -51,6 +51,7 @@ from pypto_serving.config.types import (
     PrefillResult,
     RuntimeConfig,
     RuntimeModel,
+    SamplingParams,
 )
 from pypto_serving.model.common.runner.buffer_set import copy_shared
 from pypto_serving.model.common.runner.l3_dispatch import L3DispatchMixin
@@ -71,6 +72,9 @@ DSPARK_CACHE_PARTITIONS = DSPARK_RANKS // DSPARK_TP_SIZE
 
 # ---- model dims (DeepSeek-V4-Flash) ----
 DSPARK_HIDDEN_SIZE = 4096
+# The target forwards tap layers 40/41/42 through one hc_head projection each
+# and concatenate the three rows: dspark_target_hidden is [rows, 3*D] BF16.
+DSPARK_MAIN_HIDDEN_DIM = 3 * DSPARK_HIDDEN_SIZE
 DSPARK_HC_MULT = 4
 DSPARK_VOCAB_SIZE = 129280
 DSPARK_HEAD_DIM = 512
@@ -100,6 +104,41 @@ DSPARK_PREFILL_RING_HEAP = (
     4 * 1024 * 1024 * 1024,
     8 * 1024 * 1024 * 1024,
 )
+# dspark_drafter.py pins (4 GiB,)*4 for its own scope depths.
+DSPARK_DRAFTER_RING_HEAP = (4 << 30,) * 4
+
+# ---- speculative drafter (milestone 2) ----
+# Kernel-fixed speculation constants (dspark_drafter.py / dspark_markov.py):
+# K is DSPARK_QUERY_WIDTH, the per-rank drafter batch must be one of the
+# supported paddings, and the decode tile already equals 1 + K rows.
+DSPARK_SPECULATIVE_TOKENS = 7
+DSPARK_DRAFTER_QUERY_WIDTH = 7
+DSPARK_DRAFTER_BATCHES = (4, 8, 12, 16)
+DSPARK_DRAFTER_MAX_BATCH = 16
+DSPARK_DRAFT_LAYERS = 3
+# Per-lease ring: a 128-deep sliding window plus the seven query rows fits in
+# ceil((31 + 128 + 7) / 32) = 6 blocks for any window alignment.
+DSPARK_DRAFTER_RING_BLOCKS = 6
+DSPARK_DRAFTER_LEASES_PER_GROUP = 64
+# 64 leases * 6 blocks per layer; the trailing shared range is a read-only,
+# zero-initialized filler history that no live lease can reach.
+DSPARK_DRAFTER_FILLER_BLOCK_BASE = (
+    DSPARK_DRAFTER_LEASES_PER_GROUP * DSPARK_DRAFTER_RING_BLOCKS
+)
+# Block tables are [ranks, layers, batch, ORI_MAX_BLOCKS] with ORI_MAX_BLOCKS
+# covering the 1M-position ceiling at 32-token pages.
+DSPARK_DRAFTER_TABLE_BLOCKS = 32768
+# Drafter-private SWA pools: KV_ORI_BLOCK_NUM = 512 blocks of 32 tokens per
+# draft layer per rank (each rank holds a full group replica).
+DSPARK_DRAFTER_KV_BLOCKS = 512
+# Max per-rank context rows the drafter accepts: max(decode 16*8, prefill
+# 512/4) -- both land on the same 128-row extent.
+DSPARK_DRAFTER_CONTEXT_ROWS = 128
+# The group-context tensors and block tables stage through one shared buffer
+# per extent (their dynamic axis is not a per-rank storage prefix, so a view
+# cannot cross the L3 wire).  Decode lands on batch*8 naturally; prefill
+# seeding rounds its tail up to the next bucket.
+DSPARK_DRAFTER_CONTEXT_BUCKETS = (32, 64, 96, 128)
 
 # ---- paging ----
 DSPARK_BLOCK_SIZE = 32
@@ -114,7 +153,11 @@ DSPARK_DECODE_LOCAL_BATCH = DSPARK_DECODE_BATCH // DSPARK_TP_SIZE
 DSPARK_DECODE_TOKENS = DSPARK_DECODE_BATCH * DSPARK_DECODE_SEQ
 DSPARK_DECODE_LOCAL_TOKENS = DSPARK_DECODE_LOCAL_BATCH * DSPARK_DECODE_SEQ
 DSPARK_MOE_TOKENS = 128
-DSPARK_MAX_LOGIT_ROWS = DSPARK_DECODE_TOKENS
+# The LM-head / greedy-sampling windows cover one owner's rows per rank
+# (pypto-lib#1182 right-sized them from the whole step's DECODE_TOKENS to
+# MOE_TOKENS): decode packs at most local_batch * decode_seq = 128 logit
+# rows per rank, prefill selects one, and markov at most 16 * 7.
+DSPARK_MAX_LOGIT_ROWS = DSPARK_MOE_TOKENS
 DSPARK_SAMPLED_IDS_PAD = 8
 DSPARK_MAX_SEQ_LEN = 16384
 
@@ -187,12 +230,14 @@ _PREFILL_GROUP_DYNAMIC_NAMES = frozenset(
         "x_mixed",
         "post_ffn",
         "comb_ffn",
-        "hidden_workspace",
         "x_out",
     }
 )
+# dspark_target_hidden shares the kernel's FWD_TOKENS_DYN axis with
+# position_ids_local/input_ids/ffn_out: it holds each rank's OWNED prompt rows
+# (pypto-lib#1084), not the gathered group stream that x_out carries.
 _PREFILL_LOCAL_DYNAMIC_NAMES = frozenset(
-    {"position_ids_local", "input_ids", "ffn_out"}
+    {"position_ids_local", "input_ids", "ffn_out", "dspark_target_hidden"}
 )
 
 # ---- per-request ring sizes (scheduler-visible blocks per sequence) ----
@@ -579,13 +624,17 @@ class DSparkCacheMetadataBuilder:
 
         With ``commit_tokens`` set, boundary writes past the committed prefix of
         each request's row window are masked to -1 so uncommitted (noise) rows
-        cannot publish compressed-cache entries.
+        cannot publish compressed-cache entries.  ``commit_tokens`` may be a
+        per-request tensor over the batch axis.
         """
         positions_i64 = positions.to(torch.int64)
         boundary = (positions_i64 + 1) % compress_ratio == 0
         if commit_tokens is not None:
             columns = torch.arange(positions.shape[-1], device=positions.device).unsqueeze(0)
-            boundary = boundary & (columns < int(commit_tokens))
+            if isinstance(commit_tokens, torch.Tensor):
+                boundary = boundary & (columns < commit_tokens.reshape(-1, 1))
+            else:
+                boundary = boundary & (columns < int(commit_tokens))
         cache_col = positions_i64 // compress_ratio
         logical = cache_col // self.layout.block_size
         depth = table.shape[-1]
@@ -697,8 +746,16 @@ class DSparkPreparedDecodeInputs:
     position_ids_local: torch.Tensor
     position_ids: torch.Tensor
     logit_row_indices: torch.Tensor
-    # (rank, logit entry row) per batch row, reading sampled_ids[rank, row, 0].
+    # (rank, packed sampled row) per batch row, reading sampled_ids[rank,
+    # row, 0]; the speculative readback extends to row+7.
     sampled_slots: tuple[tuple[int, int], ...]
+    # Per batch row: whether the eight-row verify window carried drafts (the
+    # readback then covers all eight rows and acceptance runs on-device greedy
+    # samples; fallback rows keep the single-anchor milestone-1 contract).
+    speculative_flags: tuple[bool, ...] = ()
+    # Per batch row: the decode hidden-row base (local_index * decode_seq)
+    # where this request's tap rows live in the backbone mirror.
+    verify_hidden_rows: tuple[int, ...] = ()
     buffer_slot: int = 0
 
 
@@ -712,6 +769,50 @@ class _DSparkGroupAssignment:
     # stream slot is the rank-major request index every group-row tensor and
     # the rank-local tables slice through.
     active_by_group: tuple[tuple[tuple[int, int], ...], ...]
+
+
+@dataclass(frozen=True)
+class DSparkDrafterRequestRow:
+    """One dense drafter batch row, decoupled from persistent leases.
+
+    ``hidden_row`` is the row offset in the rank-local backbone tap mirror
+    where this request's ``valid_count`` context rows start; ``token_source``
+    is the query row-0 token (the committed token in decode mode, the next
+    prompt token when seeding).
+    """
+
+    request_id: str
+    group: int
+    lease: int
+    anchor: int
+    valid_count: int
+    token_source: int
+    hidden_row: int
+    decode_mode: bool = True
+
+
+@dataclass
+class _DSparkDraftRequestState:
+    """Per-request speculative state, keyed by a stable group-local lease."""
+
+    group: int
+    lease: int
+    prompt_len: int = 0
+    committed_count: int = 0
+    # The seven proposals staged for the next target verify (empty between
+    # prefill completion and the first drafter dispatch).
+    pending_draft_tokens: list[int] = field(default_factory=list)
+    pending_confidence: list[float] = field(default_factory=list)
+    # Rolling prompt-tail capture for prefill seeding: rows are the rank-owned
+    # backbone tap rows with their absolute positions and owning ranks.
+    prefill_tail_rows: torch.Tensor | None = None
+    prefill_tail_positions: torch.Tensor | None = None
+    prefill_tail_ranks: torch.Tensor | None = None
+    proposed_tokens: int = 0
+    accepted_tokens: int = 0
+    verify_steps: int = 0
+    matched_drafts: int = 0
+    fallback_steps: int = 0
 
 
 @dataclass
@@ -728,6 +829,11 @@ class DSparkCompiledKernels:
     runtime_model: RuntimeModel | None = None
     prefill: Any | None = None
     decode: Any | None = None
+    drafter: Any | None = None
+    markov: Any | None = None
+    # K of the speculative chain: 0 keeps the milestone-1 target-only path
+    # (no drafter weights, programs, or state are materialized), 7 enables it.
+    num_speculative_tokens: int = 0
     rope: DSparkRopeTables | None = None
     platform: str = "a2a3"
     device_id: int = 0
@@ -738,7 +844,38 @@ class DSparkCompiledKernels:
 
     def l3_callables(self) -> tuple[Any, ...]:
         """Return every compiled L3 program the shared worker may run."""
-        return tuple(program for program in (self.prefill, self.decode) if program is not None)
+        return tuple(
+            program
+            for program in (self.prefill, self.decode, self.drafter, self.markov)
+            if program is not None
+        )
+
+
+def _accept_dspark_tokens(
+    main: Sequence[int], draft: Sequence[int]
+) -> tuple[list[int], int]:
+    """Linear-chain acceptance: longest matching prefix plus the bonus token.
+
+    ``main`` holds the target's greedy prediction for each verify row
+    (``main[i]`` is the token following row ``i``); ``draft`` holds the K
+    proposals staged into rows 1..K.  Acceptance stops at the first
+    mismatch and always appends the target's own prediction at that point,
+    so the result carries ``matched + 1`` tokens (1..K+1).
+    """
+    matched = 0
+    for token in draft:
+        if matched >= len(main):
+            break
+        if int(main[matched]) == int(token):
+            matched += 1
+        else:
+            break
+    if matched >= len(main):
+        raise ValueError(
+            "DSpark acceptance ran past the verify window: every row matched "
+            "but a bonus prediction must remain"
+        )
+    return [int(token) for token in main[: matched + 1]], matched
 
 
 class DSparkModelRunner(L3DispatchMixin, ModelRunner):
@@ -761,10 +898,28 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._stacked_prefill_host_weights: dict[str, torch.Tensor] | None = None
         self._stacked_device_weights: dict[str, StackedDeviceTensor] | None = None
         self._stacked_prefill_device_weights: dict[str, StackedDeviceTensor] | None = None
+        self._drafter_host_weights: dict[str, torch.Tensor] | None = None
+        self._drafter_device_weights: dict[str, StackedDeviceTensor] | None = None
         self._embedding_device_weight: StackedDeviceTensor | None = None
         self._device_scratch: dict[str, StackedDeviceTensor] = {}
         self._prefill_task_args: TaskArgs | None = None
         self._decode_task_args: list[TaskArgs] = []
+        # Speculative drafter state (milestone 2): per-request leases, the
+        # drafter/markov TaskArgs, their RunConfigs, and the D2H mirror for
+        # the decode backbone tap.
+        self._drafter_states: dict[str, _DSparkDraftRequestState] = {}
+        self._drafter_free_leases: dict[int, list[int]] = {
+            group: list(range(DSPARK_DRAFTER_LEASES_PER_GROUP))
+            for group in range(compiled.layout.partitions)
+        }
+        self._drafter_task_args: TaskArgs | None = None
+        self._markov_task_args: TaskArgs | None = None
+        self._drafter_context_staging: dict[int, dict[str, torch.Tensor]] = {}
+        self._drafter_block_table_staging: dict[int, torch.Tensor] = {}
+        self._drafter_run_config: Any = None
+        self._markov_run_config: Any = None
+        self._drafter_hidden_mirror: torch.Tensor | None = None
+        self._acceptance_log_steps = 0
         self._l3_shared_buffers_ready = False
 
     # ------------------------------------------------------------------
@@ -779,6 +934,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         # Decode always runs at the kernel's own 1 GiB heap; the runtime /
         # CLI heap sizes prefill (the two profiles are mutually fatal).
         self._decode_run_config = RunConfig(ring_heap=DSPARK_DECODE_RING_HEAP)
+        if self.speculative:
+            # The drafter pins (4 GiB,)*4 for its own scope depths; markov's
+            # windows fit the same 1 GiB profile decode uses (the shared
+            # lm_head module), verified on the first device run.
+            self._drafter_run_config = RunConfig(ring_heap=DSPARK_DRAFTER_RING_HEAP)
+            self._markov_run_config = RunConfig(ring_heap=DSPARK_DECODE_RING_HEAP)
         record = self._compiled.runtime_model
         if record is None or not self._compiled.l3_callables():
             self._cache_group_num_blocks = dspark_cache_blocks_for_slots(
@@ -948,6 +1109,27 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             num_hash_layers=self._compiled.num_hash_layers,
         )
 
+    @property
+    def speculative(self) -> bool:
+        """Whether the K=7 drafter chain is enabled for this runner."""
+        return self._compiled.num_speculative_tokens > 0
+
+    def load_drafter_weights(self):
+        """Load and pack the mtp.0/1/2 drafter banks (speculation only)."""
+        return self._compiled.weight_store.load_drafter_weights(
+            ranks=self._compiled.layout.ranks,
+            n_routed_experts=self._compiled.n_routed_experts,
+        )
+
+    def _require_drafter_weights(self):
+        tensors = self._drafter_device_weights or self._drafter_host_weights
+        if tensors is None:
+            raise RuntimeError(
+                "DSpark drafter weights are not available (speculation requires "
+                "num_speculative_tokens=7)"
+            )
+        return tensors
+
     def _retain_stacked_host_weights(self, weights: DSparkStackedLayerWeights) -> None:
         self._ensure_shared_host_allocation_before_worker("stacked layer weights")
         self._stacked_host_weights = dict(weights.tensors)
@@ -984,6 +1166,15 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             stacked = self.load_stacked_layer_weights()
             self._retain_stacked_host_weights(stacked)
             del stacked
+        if self.speculative:
+            # The drafter banks must be resident before the KV-capacity
+            # snapshot below, so speculation's extra weights shrink the
+            # measured free budget instead of silently overcommitting HBM.
+            with profile_span("DSparkModelRunner.prepare.load_drafter_weights", cat="executor"):
+                drafter = self.load_drafter_weights()
+                self._ensure_shared_host_allocation_before_worker("drafter weights")
+                self._drafter_host_weights = dict(drafter.tensors)
+                del drafter
         with profile_span("DSparkModelRunner.prepare.final_norm", cat="executor"):
             self._static_final_norm_weight_tensor()
         with profile_span("DSparkModelRunner.prepare.lm_head", cat="executor"):
@@ -1010,8 +1201,93 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 task_args = decode_task_args(self)
                 task_args.allocate_host_shared(None)
                 self._decode_task_args.append(task_args)
+        if self.speculative:
+            from pypto_serving.model.common.runner.buffer_set import (  # noqa: PLC0415
+                shared_empty,
+            )
+            from pypto_serving.model.deepseek_dspark.task_args import (  # noqa: PLC0415
+                drafter_task_args,
+                markov_task_args,
+            )
+
+            with profile_span("DSparkModelRunner.prepare.drafter_task_args", cat="executor"):
+                self._drafter_task_args = drafter_task_args(self)
+                self._drafter_task_args.allocate_host_shared(None)
+                self._markov_task_args = markov_task_args(self)
+                self._markov_task_args.allocate_host_shared(None)
+                # The mirror and staging buffers below must exist before the
+                # L3 worker forks: _shared_l3_worker() creates it lazily at
+                # the first device-side call, and host-shared tensors
+                # allocated after that point never map into the children.
+                self._ensure_shared_host_allocation_before_worker("drafter staging buffers")
+                self._drafter_hidden_mirror = shared_empty(
+                    (
+                        self._compiled.layout.ranks,
+                        DSPARK_DRAFTER_CONTEXT_ROWS,
+                        DSPARK_MAIN_HIDDEN_DIM,
+                    ),
+                    torch.bfloat16,
+                    name="dspark_target_hidden_mirror",
+                )
+                ranks = self._compiled.layout.ranks
+                # One shared buffer per dynamic extent, allocated before the
+                # worker fork like every other host-shared tensor.
+                for extent in DSPARK_DRAFTER_CONTEXT_BUCKETS:
+                    group_extent = 4 * extent
+                    self._drafter_context_staging[extent] = {
+                        "context_group_position_ids": shared_empty(
+                            (ranks, group_extent),
+                            torch.int32,
+                            name=f"dspark_ctx_positions_{extent}",
+                        ),
+                        "context_group_slot_mapping": shared_empty(
+                            (ranks, DSPARK_DRAFT_LAYERS, group_extent),
+                            torch.int64,
+                            name=f"dspark_ctx_slots_{extent}",
+                        ),
+                        "context_group_freqs_cos": shared_empty(
+                            (ranks, group_extent, DSPARK_ROPE_HEAD_DIM),
+                            torch.bfloat16,
+                            name=f"dspark_ctx_cos_{extent}",
+                        ),
+                        "context_group_freqs_sin": shared_empty(
+                            (ranks, group_extent, DSPARK_ROPE_HEAD_DIM),
+                            torch.bfloat16,
+                            name=f"dspark_ctx_sin_{extent}",
+                        ),
+                    }
+                for padded_batch in DSPARK_DRAFTER_BATCHES:
+                    self._drafter_block_table_staging[padded_batch] = shared_empty(
+                        (
+                            ranks,
+                            DSPARK_DRAFT_LAYERS,
+                            padded_batch,
+                            DSPARK_DRAFTER_TABLE_BLOCKS,
+                        ),
+                        torch.int32,
+                        name=f"dspark_block_tables_{padded_batch}",
+                    )
         with profile_span("DSparkModelRunner.upload_resident_weights", cat="executor"):
             self._materialize_resident_weights()
+        if self.speculative:
+            # Materialize the persistent drafter device buffers before the
+            # KV-capacity free-memory snapshot: they are resident for the
+            # worker's whole lifetime, so lazy first-draft allocation would
+            # OOM outside the cache-allocation retry path.  This must run
+            # after every host-shared allocation above: the first device
+            # access creates and forks the L3 worker, and a staging buffer
+            # allocated past that point is shm-backed yet unmapped in the
+            # children -- the first drafter dispatch then SMMU-faults
+            # reading it.
+            from pypto_serving.model.deepseek_dspark.task_args import (  # noqa: PLC0415
+                drafter_scratch_specs,
+            )
+
+            with profile_span("DSparkModelRunner.prepare.drafter_scratch", cat="executor"):
+                for name, (shape, dtype) in drafter_scratch_specs(
+                    self._compiled.layout.ranks
+                ).items():
+                    self._alloc_zeroed_stacked_tensor(name, shape, dtype, scope="drafter")
         self._l3_shared_buffers_ready = True
 
     def _ensure_shared_host_allocation_before_worker(self, name: str) -> None:
@@ -1118,6 +1394,13 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     worker, host_weights
                 )
             self._stacked_prefill_host_weights = None
+        if self.speculative and self._drafter_device_weights is None:
+            host_weights = self._drafter_host_weights
+            if not host_weights:
+                raise RuntimeError("DSpark drafter host weights are not retained")
+            with profile_span("DSparkModelRunner.upload_drafter_weights", cat="executor"):
+                self._drafter_device_weights = self._upload_weight_group(worker, host_weights)
+            self._drafter_host_weights = None
         self._materialize_embedding_device_weight()
         for task_args in (self._prefill_task_args, *self._decode_task_args):
             if task_args is not None:
@@ -1146,6 +1429,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             tensors.extend(self._stacked_host_weights.values())
         if self._stacked_prefill_host_weights:
             tensors.extend(self._stacked_prefill_host_weights.values())
+        if self._drafter_host_weights:
+            tensors.extend(self._drafter_host_weights.values())
         global_weights = getattr(self, "_global_weights", None)
         if global_weights is not None:
             tensors.append(global_weights.embed_weight)
@@ -1406,6 +1691,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     "DSpark packed prefill dispatch failed "
                     f"(tokens={inputs.actual_tokens}, groups={inputs.groups})"
                 ) from exc
+            if self.speculative:
+                self._capture_prefill_tails(batch, inputs)
             sampled = self._prefill_task_args.tensors["sampled_ids"]
             tokens = [
                 int(sampled[leader_rank, 0, 0].item())
@@ -1813,48 +2100,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 )
             copy_shared(destination, value, name=f"dspark_prefill_{name}")
 
-        self._mirror_inactive_prefill_groups(inputs, values)
-
-    def _mirror_inactive_prefill_groups(
-        self,
-        inputs: DSparkPreparedPrefillInputs,
-        values: dict[str, torch.Tensor],
-    ) -> None:
-        """Replay one real prefill into every otherwise idle TP partition.
-
-        Block IDs are partition-local. Copying the active group's complete
-        prefill metadata therefore populates the corresponding cache pages in
-        each inactive partition, ready for the matching decode replay.
-        """
-        layout = self._compiled.layout
-        active_groups = set(inputs.groups)
-        if len(active_groups) == layout.partitions:
-            return
-        source_group = inputs.groups[0]
-        tensors = self._prefill_task_args.tensors
-        mirrored_groups = [
-            group for group in range(layout.partitions) if group not in active_groups
-        ]
-        for name in ("x_hc", *values):
-            if name == "logit_row_indices":
-                continue
-            tensor = tensors[name]
-            if name in _PREFILL_GROUP_DYNAMIC_NAMES:
-                tensor = self._packed_host_prefix(tensor, inputs.physical_tokens)
-            elif name in _PREFILL_LOCAL_DYNAMIC_NAMES:
-                tensor = self._packed_host_prefix(
-                    tensor, inputs.physical_tokens // layout.tp_size
-                )
-            for group in mirrored_groups:
-                for tp_rank in range(layout.tp_size):
-                    source_rank = source_group * layout.tp_size + tp_rank
-                    target_rank = group * layout.tp_size + tp_rank
-                    tensor[target_rank].copy_(tensor[source_rank])
-        logger.warning(
-            "DSpark mirrored prefill TP group %d into inactive groups %s",
-            source_group,
-            mirrored_groups,
-        )
+        # Idle TP groups keep their zero-initialized staging (query_start_loc
+        # terminal 0, -1 logit rows and cache mappings): the kernel skips their
+        # attention and sampling tails natively while staying in the EP MoE
+        # waves (pypto-lib#1161), so no mirror replay is staged.
 
     # ------------------------------------------------------------------
     # decode
@@ -1889,14 +2138,184 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     f"(actual_batch={len(batch.request_ids)})"
                 ) from exc
             sampled = task_args.tensors["sampled_ids"]
-            accepted = [
-                [int(sampled[rank, row, 0].item())] for rank, row in inputs.sampled_slots
-            ]
+            accepted: list[list[int]] = []
+            rows_by_rank: list[list[DSparkDrafterRequestRow]] = [[] for _ in range(self._compiled.layout.ranks)]
+            for index, (rank, row) in enumerate(inputs.sampled_slots):
+                request_id = inputs.request_ids[index]
+                state = self._drafter_states.get(request_id) if self.speculative else None
+                if state is not None and inputs.speculative_flags[index]:
+                    main = [
+                        int(sampled[rank, row + offset, 0].item())
+                        for offset in range(self._compiled.layout.decode_seq)
+                    ]
+                    tokens, matched = _accept_dspark_tokens(
+                        main, state.pending_draft_tokens
+                    )
+                    state.verify_steps += 1
+                    state.proposed_tokens += DSPARK_DRAFTER_QUERY_WIDTH
+                    state.matched_drafts += matched
+                    state.accepted_tokens += len(tokens)
+                    state.committed_count += len(tokens)
+                    accepted.append(tokens)
+                    # The committed inputs span positions p..p+m (m+1 tokens),
+                    # so the drafter's next anchor -- the last committed input
+                    # position and the end of its context window -- is p+m,
+                    # one before the next verify's anchor.
+                    anchor = inputs.anchor_positions[index]
+                    rows_by_rank[rank].append(
+                        DSparkDrafterRequestRow(
+                            request_id=request_id,
+                            group=state.group,
+                            lease=state.lease,
+                            anchor=anchor + len(tokens) - 1,
+                            valid_count=len(tokens),
+                            token_source=tokens[-1],
+                            hidden_row=inputs.verify_hidden_rows[index],
+                            decode_mode=True,
+                        )
+                    )
+                else:
+                    accepted.append([int(sampled[rank, row, 0].item())])
+                    if state is not None:
+                        state.verify_steps += 1
+                        state.accepted_tokens += 1
+                        state.committed_count += 1
+            self._maybe_log_acceptance()
+            if any(rows_by_rank):
+                self._run_decode_drafter(rows_by_rank)
             return DecodeResult(
                 hidden_states=None,
                 logits=None,
                 accepted_token_ids=accepted,
             )
+
+    def _run_decode_drafter(
+        self,
+        rows_by_rank: list[list[DSparkDrafterRequestRow]],
+    ) -> None:
+        """Redraft from the just-committed rows of every speculative request."""
+        layout = self._compiled.layout
+        # A request whose seven query positions would cross the position
+        # ceiling simply gets no next draft: its state empties and the next
+        # verify falls back to the single-anchor path instead of raising.
+        max_position = self._require_rope_tables().max_position
+        kept: list[list[DSparkDrafterRequestRow]] = [[] for _ in rows_by_rank]
+        for rank, rows in enumerate(rows_by_rank):
+            for row in rows:
+                if row.anchor + DSPARK_DRAFTER_QUERY_WIDTH < max_position:
+                    kept[rank].append(row)
+                else:
+                    state = self._drafter_state(row.request_id)
+                    state.pending_draft_tokens = []
+                    state.pending_confidence = []
+        if not any(kept):
+            return
+        rows_by_rank = kept
+        batch = next(
+            size
+            for size in DSPARK_DRAFTER_BATCHES
+            if max(len(rows) for rows in rows_by_rank) <= size
+        )
+        context_rows = batch * layout.decode_seq
+        # D2H readback of this dispatch's backbone tap, then scatter each
+        # request's committed rows into its dense drafter context slot.  The
+        # read covers the whole local tile: a request's tap rows sit at its
+        # dense decode row, which can lie far beyond the drafter's context
+        # extent.
+        mirror = self._read_drafter_hidden(
+            self._drafter_hidden_mirror, rows=DSPARK_DRAFTER_CONTEXT_ROWS
+        )
+        hidden = torch.zeros(
+            (layout.ranks, context_rows, DSPARK_MAIN_HIDDEN_DIM), dtype=torch.bfloat16
+        )
+        for rank, rows in enumerate(rows_by_rank):
+            for index, row in enumerate(rows):
+                source = mirror[rank, row.hidden_row : row.hidden_row + row.valid_count]
+                hidden[rank, index * layout.decode_seq : index * layout.decode_seq + row.valid_count] = (
+                    source
+                )
+        self._prepare_drafter_inputs(
+            rows_by_rank, hidden=hidden, context_rows=context_rows
+        )
+        self._run_drafter_and_markov(batch, context_rows)
+        drafts = self._packed_host_prefix(
+            self._markov_task_args.tensors["draft_token_ids"], batch
+        )
+        confidence = self._packed_host_prefix(
+            self._markov_task_args.tensors["confidence_probs"], batch
+        )
+        for rank, rows in enumerate(rows_by_rank):
+            for index, row in enumerate(rows):
+                state = self._drafter_state(row.request_id)
+                state.pending_draft_tokens = [int(v) for v in drafts[rank, index]]
+                state.pending_confidence = [float(v) for v in confidence[rank, index]]
+
+    def _maybe_log_acceptance(self) -> None:
+        """Periodically report acceptance progress across live requests."""
+        states = list(self._drafter_states.values())
+        if not states:
+            return
+        self._acceptance_log_steps += 1
+        # The first line is unconditional: a completion-time summary races
+        # the worker shutdown after the last response, but every speculative
+        # run emits this line at its first verify step.
+        if self._acceptance_log_steps > 1 and self._acceptance_log_steps % 10:
+            return
+        proposed = sum(state.proposed_tokens for state in states)
+        matched = sum(state.matched_drafts for state in states)
+        accepted = sum(state.accepted_tokens for state in states)
+        verifies = sum(state.verify_steps for state in states)
+        fallbacks = sum(state.fallback_steps for state in states)
+        logger.info(
+            "DSpark speculation progress: requests=%d verifies=%d matched=%d "
+            "proposed=%d accepted=%d mean_len=%.2f fallbacks=%d",
+            len(states),
+            verifies,
+            matched,
+            proposed,
+            accepted,
+            (accepted / verifies) if verifies else 0.0,
+            fallbacks,
+        )
+
+    def dspark_speculation_summary(self) -> dict[str, float]:
+        """Aggregate speculation counters before scheduler truncation."""
+        states = list(self._drafter_states.values())
+        verifies = sum(state.verify_steps for state in states)
+        return {
+            "requests": float(len(states)),
+            "verify_steps": float(verifies),
+            "proposed_drafts": float(sum(state.proposed_tokens for state in states)),
+            "matched_drafts": float(sum(state.matched_drafts for state in states)),
+            "accepted_tokens": float(sum(state.accepted_tokens for state in states)),
+            "fallback_steps": float(sum(state.fallback_steps for state in states)),
+            "mean_accepted_length": (
+                sum(state.accepted_tokens for state in states) / verifies
+            )
+            if verifies
+            else 0.0,
+        }
+
+    def _correct_dspark_seq_lens(self, batch: DecodeBatch) -> torch.Tensor:
+        """Return request lengths corrected from the committed token stream.
+
+        Async scheduling reserves the full speculative width when it queues
+        the next decode command, before acceptance is known: after a verify
+        at anchor 64 accepts one token, the queued command's ``seq_lens``
+        already counts all seven reserved rows (73) instead of 65.  Once a
+        request is seeded, the runner's committed count -- prompt plus every
+        accepted token -- is the authoritative length, mirroring the MTP
+        runner's ``_correct_mtp_seq_lens``.
+        """
+        actual_batch = len(batch.request_ids)
+        corrected = batch.seq_lens[:actual_batch].detach().cpu().to(torch.int64).clone()
+        if not self.speculative:
+            return corrected
+        for index, request_id in enumerate(batch.request_ids):
+            state = self._drafter_states.get(request_id)
+            if state is not None and state.prompt_len > 0:
+                corrected[index] = state.committed_count + 1
+        return corrected
 
     def _decode_assignment(self, batch: DecodeBatch) -> _DSparkGroupAssignment:
         """Assign batch rows to TP groups and rank-local request slots."""
@@ -1967,8 +2386,37 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         actual_batch = len(batch.request_ids)
 
         anchors = [
-            max(int(batch.seq_lens[index].item()) - 1, 0) for index in range(actual_batch)
+            max(int(length) - 1, 0)
+            for length in self._correct_dspark_seq_lens(batch).tolist()
         ]
+        # Speculative rows stage pending drafts into verify rows 1..7 and
+        # publish all eight.  A row falls back to the single-anchor contract
+        # when its window cannot fit under the position ceiling (clamped
+        # duplicate positions must never carry real publication slots) or at
+        # a legitimate terminal transition without drafts.
+        speculative_flags: list[bool] = []
+        pending_drafts: list[list[int]] = []
+        if self.speculative:
+            for index in range(actual_batch):
+                request_id = batch.request_ids[index]
+                state = self._drafter_states.get(request_id)
+                if state is None:
+                    raise RuntimeError(
+                        f"DSpark speculation is active but request {request_id!r} has "
+                        "no drafter state (seeded before its first decode?)"
+                    )
+                drafts = state.pending_draft_tokens
+                window_fits = anchors[index] + layout.decode_seq <= max_position
+                if len(drafts) == DSPARK_DRAFTER_QUERY_WIDTH and window_fits:
+                    speculative_flags.append(True)
+                    pending_drafts.append(list(drafts))
+                else:
+                    speculative_flags.append(False)
+                    pending_drafts.append([])
+                    state.fallback_steps += 1
+        else:
+            speculative_flags = [False] * actual_batch
+            pending_drafts = [[] for _ in range(actual_batch)]
         token_rows = (
             batch.token_ids[:actual_batch]
             .detach()
@@ -2000,6 +2448,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 positions = positions.clamp(max=max_position - 1)
                 group_positions[group, stream_slot] = positions
                 group_tokens[group, stream_slot, 0] = int(token_rows[request_index])
+                if speculative_flags[request_index]:
+                    # Verify rows 1..7 carry the pending draft chain; the
+                    # target computes all eight rows and the device greedy
+                    # sampler emits one sample per logit row.
+                    for offset, draft in enumerate(pending_drafts[request_index]):
+                        group_tokens[group, stream_slot, 1 + offset] = int(draft)
                 group_anchor_flags[group, stream_slot] = True
                 request_slot_of_group[(group, stream_slot)] = request_index
 
@@ -2016,6 +2470,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         owner_token_counts = staged["num_tokens_per_owner"]
         owner_token_counts.zero_()
         sampled_slots: list[tuple[int, int]] = [(-1, -1)] * actual_batch
+        verify_hidden_rows: list[int] = [-1] * actual_batch
         scratch = self._scratch_blocks()
 
         for group in range(layout.partitions):
@@ -2081,11 +2536,20 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     for row in range(group_batch)
                 ]
             )
+            # The CSA state rings are addressed by absolute position modulo
+            # the 16-token transaction ring, so every page this window writes
+            # (anchor..anchor+7) must resolve to its own absolute page id.
+            # Building the trailing table at the anchor leaves the pages past
+            # anchor//2 on stale ids, so a speculative write at anchor+2 lands
+            # where the next step's rebuilt table never reads it back.  Build
+            # at the window's end instead: window and recent-history pages all
+            # keep their absolute ids, and the anchor-only milestone-1 write
+            # resolves to the same slot either way.
             csa_state_tables = torch.stack(
                 [
                     builder.trailing_ring_table(
                         request_blocks[request_slot_of_group[(group, row)]]["csa_state"],
-                        position=int(starts[row].item()),
+                        position=int(starts[row].item()) + layout.decode_seq - 1,
                         page_tokens=DSPARK_C4_STATE_PAGE_TOKENS,
                         depth=DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS,
                     )
@@ -2101,7 +2565,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 [
                     builder.trailing_ring_table(
                         request_blocks[request_slot_of_group[(group, row)]]["csa_inner_state"],
-                        position=int(starts[row].item()),
+                        position=int(starts[row].item()) + layout.decode_seq - 1,
                         page_tokens=DSPARK_C4_STATE_PAGE_TOKENS,
                         depth=DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS,
                     )
@@ -2113,9 +2577,23 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     for row in range(group_batch)
                 ]
             )
-            commit = 1
+            # Speculative rows eagerly publish the full eight-row window:
+            # every stale position a truncated acceptance leaves behind falls
+            # inside the next dispatch's window and is rewritten with correct
+            # tokens before any read (reads stay bounded by kv_seq_lens).
+            row_flags = [
+                speculative_flags[request_slot_of_group[(group, row)]]
+                if anchor_flags[row]
+                else False
+                for row in range(group_batch)
+            ]
+            commit = torch.where(
+                torch.tensor(row_flags, dtype=torch.bool),
+                torch.full((group_batch,), layout.decode_seq, dtype=torch.int64),
+                torch.ones((group_batch,), dtype=torch.int64),
+            )
             committed_rows = anchor_flags.unsqueeze(-1) & (
-                torch.arange(positions.shape[-1]).unsqueeze(0) < commit
+                torch.arange(positions.shape[-1]).unsqueeze(0) < commit.unsqueeze(-1)
             )
             # The decode kernel addresses a 16-row transaction ring: eight historical
             # rows followed by the eager S=8 projection writes.
@@ -2227,20 +2705,17 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 for name, value in mappings.items():
                     staged[name][rank] = value.to(staged[name].dtype)
                 staged["position_ids"][rank] = positions_flat.to(torch.int32)
-                staged["freqs_cos"][rank] = group_cos
-                staged["freqs_sin"][rank] = group_sin
-                staged["compressed_freqs_cos"][rank] = compressed_group_cos
-                staged["compressed_freqs_sin"][rank] = compressed_group_sin
-                # The rank's query rows are its contiguous slice of the group
-                # stream, so the local RoPE tables are the same slice.
-                staged["freqs_cos_local"][rank] = group_cos[local_tokens_slice].contiguous()
-                staged["freqs_sin_local"][rank] = group_sin[local_tokens_slice].contiguous()
-                staged["compressed_freqs_cos_local"][rank] = compressed_group_cos[
+                # The RoPE tables ride the owner-token T_DYN axis since
+                # pypto-lib#1182: stage the rank's own slice of the group
+                # stream (the rank's query rows are its contiguous slice).
+                staged["freqs_cos"][rank] = group_cos[local_tokens_slice]
+                staged["freqs_sin"][rank] = group_sin[local_tokens_slice]
+                staged["compressed_freqs_cos"][rank] = compressed_group_cos[
                     local_tokens_slice
-                ].contiguous()
-                staged["compressed_freqs_sin_local"][rank] = compressed_group_sin[
+                ]
+                staged["compressed_freqs_sin"][rank] = compressed_group_sin[
                     local_tokens_slice
-                ].contiguous()
+                ]
                 staged["position_ids_local"][rank] = positions_flat[local_tokens_slice].to(
                     torch.int32
                 )
@@ -2275,16 +2750,29 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 staged["hca_compress_state_block_table"][rank] = hca_state_tables
                 staged["csa_compress_state_block_table"][rank] = csa_state_tables
                 staged["csa_inner_compress_state_block_table"][rank] = csa_inner_tables
-                # Logit rows: one anchor entry per active request on this rank.
+                # Logit rows: one anchor entry per active request on this
+                # rank; speculative rows enumerate all eight window rows so
+                # the device greedy sampler emits one prediction per row.
+                # ``entry`` is the packed output row the sampler writes and
+                # the readback consumes; ``anchor_entry`` is the hidden-row
+                # base the drafter's context scatters from.
                 entry = 0
                 for local_index in range(local_batch):
                     stream_row = tp_rank * local_batch + local_index
                     if not bool(anchor_flags[stream_row]):
                         continue
-                    logit_rows[rank, entry] = local_index * layout.decode_seq
                     request_index = request_slot_of_group[(group, stream_row)]
+                    anchor_entry = local_index * layout.decode_seq
+                    width = (
+                        layout.decode_seq
+                        if speculative_flags[request_index]
+                        else 1
+                    )
+                    for offset in range(width):
+                        logit_rows[rank, entry + offset] = anchor_entry + offset
                     sampled_slots[request_index] = (rank, entry)
-                    entry += 1
+                    verify_hidden_rows[request_index] = anchor_entry
+                    entry += width
 
         return DSparkPreparedDecodeInputs(
             request_ids=tuple(batch.request_ids),
@@ -2296,6 +2784,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             position_ids=staged["position_ids"],
             logit_row_indices=logit_rows,
             sampled_slots=tuple(sampled_slots),
+            speculative_flags=tuple(speculative_flags),
+            verify_hidden_rows=tuple(verify_hidden_rows),
             buffer_slot=buffer_slot,
         )
 
@@ -2346,9 +2836,648 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             raise RuntimeError("DSpark RoPE tables are not initialized")
         return self._compiled.rope
 
+    # ------------------------------------------------------------------
+    # speculative drafter: leases, block rings, and staging (milestone 2)
+    # ------------------------------------------------------------------
+    def _reserve_drafter_state(
+        self, request_id: str, *, group: int, prompt_len: int
+    ) -> _DSparkDraftRequestState:
+        """Take a stable group-local lease for one newly prefilled request.
+
+        The lease is independent of the request's current compute rank or dense
+        batch row: ``_decode_assignment`` recomputes those every dispatch, so
+        keying drafter storage to them would corrupt a surviving request
+        whenever admission or removal reshuffles a batch.
+        """
+        existing = self._drafter_states.get(request_id)
+        if existing is not None:
+            raise RuntimeError(
+                f"DSpark drafter state already exists for request {request_id!r}"
+            )
+        free = self._drafter_free_leases.get(group)
+        if not free:
+            raise RuntimeError(
+                f"DSpark drafter leases exhausted for TP group {group} "
+                f"({DSPARK_DRAFTER_LEASES_PER_GROUP} live requests per group)"
+            )
+        lease = free.pop()
+        state = _DSparkDraftRequestState(group=group, lease=lease, prompt_len=prompt_len)
+        self._drafter_states[request_id] = state
+        return state
+
+    def _drafter_state(self, request_id: str) -> _DSparkDraftRequestState:
+        state = self._drafter_states.get(request_id)
+        if state is None:
+            raise KeyError(f"DSpark drafter state is missing for request {request_id!r}")
+        return state
+
+    def _drafter_ring_rows(self, base_block: int) -> torch.Tensor:
+        """Rotated ring block ids ``[DSPARK_DRAFT_LAYERS, TABLE_BLOCKS]``.
+
+        Each logical block maps to ``base + (L + 7*layer) % RING`` so the three
+        draft layers rotate over the same six-block private range and a
+        128-deep window plus the seven query rows never aliases itself.
+        """
+        logical = torch.arange(DSPARK_DRAFTER_TABLE_BLOCKS, dtype=torch.int64)
+        rows = torch.empty(
+            (DSPARK_DRAFT_LAYERS, DSPARK_DRAFTER_TABLE_BLOCKS), dtype=torch.int64
+        )
+        for layer in range(DSPARK_DRAFT_LAYERS):
+            rows[layer] = base_block + (
+                logical + 7 * layer
+            ) % DSPARK_DRAFTER_RING_BLOCKS
+        return rows
+
+    def _drafter_block_tables(
+        self, rows_by_rank: list[list[DSparkDrafterRequestRow]], batch: int
+    ) -> None:
+        """Stage dense lease rings into the batch's shared block-table buffer."""
+        tables = self._drafter_block_table_staging.get(batch)
+        if tables is None:
+            raise RuntimeError(
+                f"DSpark drafter block-table staging for batch {batch} is not allocated"
+            )
+        filler = self._drafter_ring_rows(DSPARK_DRAFTER_FILLER_BLOCK_BASE)
+        for rank, rows in enumerate(rows_by_rank):
+            for index in range(batch):
+                if index < len(rows):
+                    base = rows[index].lease * DSPARK_DRAFTER_RING_BLOCKS
+                    ring = self._drafter_ring_rows(base)
+                else:
+                    ring = filler
+                tables[rank, :, index] = ring.to(torch.int32)
+
+    @staticmethod
+    def _drafter_slots_for_positions(
+        ring_rows: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Map absolute positions through one lease ring; ``-1`` where unmapped."""
+        valid = positions >= 0
+        safe = positions.clamp(min=0)
+        logical = safe // DSPARK_BLOCK_SIZE
+        index = (
+            logical.clamp(max=DSPARK_DRAFTER_TABLE_BLOCKS - 1)
+            .unsqueeze(0)
+            .expand(ring_rows.shape[0], -1)
+        )
+        block = ring_rows.gather(1, index)
+        slot = block * DSPARK_BLOCK_SIZE + safe % DSPARK_BLOCK_SIZE
+        return torch.where(valid, slot, torch.full_like(slot, -1))
+
+    def _prepare_drafter_inputs(
+        self,
+        rows_by_rank: list[list[DSparkDrafterRequestRow]],
+        *,
+        hidden: torch.Tensor,
+        context_rows: int,
+        seed_contexts: dict[int, tuple[int, torch.Tensor]] | None = None,
+    ) -> tuple[int, int]:
+        """Stage one world-wide drafter (+ markov) dispatch.
+
+        ``rows_by_rank`` holds each rank's dense real rows; ``hidden`` is the
+        already-read ``[ranks, context_rows, MAIN_HIDDEN_DIM]`` backbone tap
+        (zero rows for padding and fillers); every rank's real row count must
+        stay within the uniform padded batch.  Context rows end at each
+        request's anchor; the group assembly replicates every group row's slot
+        on all four ranks of the group (the drafter's KV-replica contract).
+        Returns ``(batch, context_rows)`` for the dispatch-args slicing.
+        """
+        if self._drafter_task_args is None or self._markov_task_args is None:
+            raise RuntimeError("DSpark drafter TaskArgs are not staged")
+        layout = self._compiled.layout
+        ranks = layout.ranks
+        tp = layout.tp_size
+        real_counts = [len(rows) for rows in rows_by_rank]
+        batch = next(
+            (size for size in DSPARK_DRAFTER_BATCHES if max(real_counts) <= size),
+            None,
+        )
+        if batch is None or max(real_counts) > DSPARK_DRAFTER_MAX_BATCH:
+            raise ValueError(
+                f"DSpark drafter batch must be one of {DSPARK_DRAFTER_BATCHES}, "
+                f"got up to {max(real_counts)} real rows"
+            )
+        # The group-context tensors dispatch through fixed shared extents, so
+        # callers stage a bucket extent and pad padding rows with position
+        # zero / -1 slots themselves.
+        if context_rows not in DSPARK_DRAFTER_CONTEXT_BUCKETS:
+            raise ValueError(
+                f"DSpark drafter context rows {context_rows} must be one of "
+                f"{DSPARK_DRAFTER_CONTEXT_BUCKETS}"
+            )
+        context_staging = self._drafter_context_staging[context_rows]
+        group_context = tp * context_rows
+        query_rows = DSPARK_DRAFTER_MAX_BATCH * DSPARK_DRAFTER_QUERY_WIDTH
+        group_query = tp * query_rows
+        rope = self._require_rope_tables()
+        max_position = rope.max_position
+
+        task_args = self._drafter_task_args
+        tensors = task_args.tensors
+        # Dim-1 dynamic names dispatch as packed prefixes (contiguous-from-
+        # front), so every stage and readback must go through the same packed
+        # view: writing the max-sized slot directly would land at rank stride
+        # and the dispatch would read another rank's rows.
+        selectors = {
+            name: self._packed_host_prefix(tensors[name], batch)
+            for name in (
+                "num_sampled",
+                "last_sampled",
+                "next_prefill_tokens",
+                "anchor_positions",
+            )
+        }
+        for view in selectors.values():
+            view.zero_()
+        self._packed_host_prefix(tensors["target_hidden"], context_rows).copy_(hidden)
+        self._drafter_block_tables(rows_by_rank, batch)
+        tensors["query_group_position_ids"].zero_()
+        tensors["query_group_slot_mapping"].fill_(-1)
+        context_staging["context_group_position_ids"].zero_()
+        context_staging["context_group_slot_mapping"].fill_(-1)
+
+        # Per-rank local staging, then rank-major group assembly.  ``local``
+        # arrays are indexed [rank, ...]; group arrays concatenate the four
+        # CP ranks of each group so every rank carries the group's rows.
+        context_positions_local = torch.zeros(
+            (ranks, context_rows), dtype=torch.int64
+        )
+        context_valid_local = torch.zeros(
+            (ranks, context_rows, DSPARK_DRAFT_LAYERS), dtype=torch.bool
+        )
+        context_slots_local = torch.full(
+            (ranks, DSPARK_DRAFT_LAYERS, context_rows), -1, dtype=torch.int64
+        )
+        query_positions_local = torch.zeros((ranks, query_rows), dtype=torch.int64)
+        query_valid_local = torch.zeros(
+            (ranks, query_rows, DSPARK_DRAFT_LAYERS), dtype=torch.bool
+        )
+        # Prefill seeding stages the prompt tail as the group context: every
+        # rank of the group carries its rank-major band of the tail (padded
+        # with -1 positions to the uniform extent), and the seed request's
+        # batch row (on its group leader) selects its token through
+        # ``next_prefill_tokens`` instead of ``last_sampled``.
+        if seed_contexts:
+            for group, (lease, tail_positions) in seed_contexts.items():
+                ring = self._drafter_ring_rows(lease * DSPARK_DRAFTER_RING_BLOCKS)
+                for member in range(tp):
+                    rank = group * tp + member
+                    start = member * context_rows
+                    positions = tail_positions[start : start + context_rows]
+                    rows_here = int((positions >= 0).sum())
+                    if rows_here:
+                        context_positions_local[rank, :rows_here] = positions[:rows_here]
+                        context_valid_local[rank, :rows_here, :] = True
+                        context_slots_local[rank, :, :rows_here] = (
+                            self._drafter_slots_for_positions(ring, positions[:rows_here])
+                        )
+        for rank, rows in enumerate(rows_by_rank):
+            for index, row in enumerate(rows):
+                selectors["num_sampled"][rank, index] = 1 if row.decode_mode else 0
+                if row.decode_mode:
+                    selectors["last_sampled"][rank, index] = row.token_source
+                else:
+                    selectors["next_prefill_tokens"][rank, index] = row.token_source
+                selectors["anchor_positions"][rank, index] = row.anchor
+                base = row.lease * DSPARK_DRAFTER_RING_BLOCKS
+                ring = self._drafter_ring_rows(base)
+                # Context: the request's ``valid_count`` committed rows ending
+                # at the anchor, at dense row offsets index*DECODE_SEQ.
+                start = index * layout.decode_seq
+                for offset in range(row.valid_count):
+                    position = row.anchor - row.valid_count + 1 + offset
+                    if position < 0 or position >= max_position:
+                        raise ValueError(
+                            f"DSpark drafter context position {position} outside "
+                            f"[0, {max_position}) for request {row.request_id!r}"
+                        )
+                    context_positions_local[rank, start + offset] = position
+                    context_valid_local[rank, start + offset, :] = True
+                # Query: seven fresh positions after the anchor.
+                for offset in range(DSPARK_DRAFTER_QUERY_WIDTH):
+                    position = row.anchor + 1 + offset
+                    if position >= max_position:
+                        raise ValueError(
+                            f"DSpark drafter query position {position} exceeds the "
+                            f"rope table for request {row.request_id!r}"
+                        )
+                    token = index * DSPARK_DRAFTER_QUERY_WIDTH + offset
+                    query_positions_local[rank, token] = position
+                    query_valid_local[rank, token, :] = True
+                # Slot mappings are computed per rank from the OWNER's lease
+                # ring; the group assembly below replicates them so all four
+                # ranks of the group write their pool replicas.
+        query_slots_local = torch.full(
+            (ranks, DSPARK_DRAFT_LAYERS, query_rows), -1, dtype=torch.int64
+        )
+        for rank, rows in enumerate(rows_by_rank):
+            for index, row in enumerate(rows):
+                ring = self._drafter_ring_rows(row.lease * DSPARK_DRAFTER_RING_BLOCKS)
+                start = index * layout.decode_seq
+                for offset in range(row.valid_count):
+                    local_row = start + offset
+                    if context_valid_local[rank, local_row, 0]:
+                        slots = self._drafter_slots_for_positions(
+                            ring,
+                            context_positions_local[rank, local_row : local_row + 1],
+                        )
+                        context_slots_local[rank, :, local_row] = slots.reshape(-1)
+                for offset in range(DSPARK_DRAFTER_QUERY_WIDTH):
+                    token = index * DSPARK_DRAFTER_QUERY_WIDTH + offset
+                    if query_valid_local[rank, token, 0]:
+                        slots = self._drafter_slots_for_positions(
+                            ring,
+                            query_positions_local[rank, token : token + 1],
+                        )
+                        query_slots_local[rank, :, token] = slots.reshape(-1)
+
+        for rank in range(ranks):
+            group_base = rank // tp * tp
+            group_slice = slice(group_base, group_base + tp)
+            group_positions = (
+                context_positions_local[group_slice].reshape(-1).to(torch.int64)
+            )
+            group_slots = (
+                context_slots_local[group_slice]
+                .permute(1, 0, 2)
+                .reshape(DSPARK_DRAFT_LAYERS, -1)
+            )
+            context_staging["context_group_position_ids"][rank, :group_context] = (
+                group_positions.to(torch.int32)
+            )
+            tensors["query_group_position_ids"][rank] = (
+                query_positions_local[group_slice].reshape(-1).to(torch.int32)
+            )
+            # Group slots keep the layer axis first: [layers, 4 * rows].
+            context_staging["context_group_slot_mapping"][rank, :, :group_context] = (
+                group_slots
+            )
+            tensors["query_group_slot_mapping"][rank] = (
+                query_slots_local[group_slice]
+                .permute(1, 0, 2)
+                .reshape(DSPARK_DRAFT_LAYERS, -1)
+            )
+            gather_positions = torch.where(
+                group_slots[0] >= 0, group_positions, torch.zeros_like(group_positions)
+            )
+            context_staging["context_group_freqs_cos"][rank, :group_context] = (
+                rope.gather(rope.swa_cos, gather_positions).to(torch.bfloat16)
+            )
+            context_staging["context_group_freqs_sin"][rank, :group_context] = (
+                rope.gather(rope.swa_sin, gather_positions).to(torch.bfloat16)
+            )
+            local_query = query_positions_local[rank]
+            local_query_mask = query_valid_local[rank, :, 0]
+            gather_query = torch.where(
+                local_query_mask, local_query, torch.zeros_like(local_query)
+            )
+            tensors["query_freqs_cos"][rank] = rope.gather(
+                rope.swa_cos, gather_query
+            ).to(torch.bfloat16)
+            tensors["query_freqs_sin"][rank] = rope.gather(
+                rope.swa_sin, gather_query
+            ).to(torch.bfloat16)
+            group_query_positions = tensors["query_group_position_ids"][rank].to(
+                torch.int64
+            )
+            group_query_mask = query_valid_local[group_slice][:, :, 0].reshape(-1)
+            gather_group_query = torch.where(
+                group_query_mask, group_query_positions, torch.zeros_like(group_query_positions)
+            )
+            tensors["query_group_freqs_cos"][rank] = rope.gather(
+                rope.swa_cos, gather_group_query
+            ).to(torch.bfloat16)
+            tensors["query_group_freqs_sin"][rank] = rope.gather(
+                rope.swa_sin, gather_group_query
+            ).to(torch.bfloat16)
+
+        # Markov consumes the same request-state tensors plus its own logit
+        # rows: one row per (request, step) over the dense padded batch.  Its
+        # selectors also dispatch packed, so stage through the packed views.
+        markov_tensors = self._markov_task_args.tensors
+        for name in ("num_sampled", "last_sampled", "next_prefill_tokens"):
+            self._packed_host_prefix(markov_tensors[name], batch).copy_(selectors[name])
+        markov_tensors["logit_row_indices"].fill_(-1)
+        for rank, rows in enumerate(rows_by_rank):
+            real = len(rows)
+            if real:
+                markov_tensors["logit_row_indices"][rank, : real * DSPARK_DRAFTER_QUERY_WIDTH] = (
+                    torch.arange(real * DSPARK_DRAFTER_QUERY_WIDTH, dtype=torch.int32)
+                )
+        return batch, context_rows
+
+    def _capture_prefill_tails(self, batch: PrefillBatch, inputs) -> None:
+        """Roll this chunk's backbone tap rows into each request's seed tail.
+
+        The tap is read back immediately, before the next prefill dispatch can
+        reuse the scratch; only rows inside the chunk's logical extent join
+        the tail (synthetic padding positions never become drafter context).
+        """
+        layout = self._compiled.layout
+        tp = layout.tp_size
+        # The tap is a device scratch, not a host slot; the materializer's
+        # (scope, name) cache returns the identical buffer the dispatch used.
+        device = self._alloc_zeroed_stacked_tensor(
+            "dspark_target_hidden",
+            (layout.ranks, layout.prefill_local_tokens, DSPARK_MAIN_HIDDEN_DIM),
+            torch.bfloat16,
+            scope="prefill",
+        )
+        worker = self._shared_l3_worker()
+        local_tokens = inputs.physical_tokens // tp
+        row_bytes = DSPARK_MAIN_HIDDEN_DIM * 2
+        for index, (group, request_id) in enumerate(
+            zip(inputs.groups, batch.request_ids, strict=True)
+        ):
+            state = self._drafter_states.get(request_id)
+            if state is None:
+                state = self._reserve_drafter_state(request_id, group=group, prompt_len=0)
+            actual = int(inputs.actual_tokens[index])
+            chunk_start = int(inputs.chunk_starts[index])
+            rows = torch.empty(
+                (tp, local_tokens, DSPARK_MAIN_HIDDEN_DIM), dtype=torch.bfloat16
+            )
+            for member in range(tp):
+                rank = group * tp + member
+                worker.copy_from(
+                    rows[member].data_ptr(),
+                    device.shards[rank].data_ptr,
+                    local_tokens * row_bytes,
+                    worker_id=device.worker_ids[rank],
+                )
+            # Rank-major logical order: each rank owns a contiguous band of
+            # the packed chunk, truncated at the chunk's logical end.
+            chunk_rows = self._prefill_chunk_bands(rows, local_tokens, actual)
+            if chunk_rows is None:
+                continue
+            self._append_prefill_tail(state, chunk_rows, chunk_start)
+
+    @staticmethod
+    def _prefill_chunk_bands(
+        rows: torch.Tensor, local_tokens: int, actual: int
+    ) -> torch.Tensor | None:
+        """Concatenate the rank bands' logically valid tap rows, rank-major."""
+        keep = []
+        for member in range(rows.shape[0]):
+            valid = min(local_tokens, max(0, actual - member * local_tokens))
+            if valid > 0:
+                keep.append(rows[member, :valid])
+        if not keep:
+            return None
+        return torch.cat(keep, dim=0)
+
+    @staticmethod
+    def _append_prefill_tail(
+        state: _DSparkDraftRequestState, chunk_rows: torch.Tensor, chunk_start: int
+    ) -> None:
+        """Append one chunk's rows and keep a window-deep tail."""
+        chunk_positions = torch.arange(
+            chunk_start, chunk_start + int(chunk_rows.shape[0]), dtype=torch.int64
+        )
+        if state.prefill_tail_rows is None:
+            state.prefill_tail_rows = chunk_rows
+            state.prefill_tail_positions = chunk_positions
+        else:
+            state.prefill_tail_rows = torch.cat([state.prefill_tail_rows, chunk_rows], dim=0)
+            state.prefill_tail_positions = torch.cat(
+                [state.prefill_tail_positions, chunk_positions], dim=0
+            )
+        if state.prefill_tail_rows.shape[0] > DSPARK_SLIDING_WINDOW:
+            state.prefill_tail_rows = (
+                state.prefill_tail_rows[-DSPARK_SLIDING_WINDOW:].clone().contiguous()
+            )
+            state.prefill_tail_positions = (
+                state.prefill_tail_positions[-DSPARK_SLIDING_WINDOW:]
+                .clone()
+                .contiguous()
+            )
+
+    def finalize_prefill(
+        self,
+        request_ids: Sequence[str],
+        sampled_token_ids: Sequence[int],
+        sampling_params: Sequence[SamplingParams] | None = None,
+    ) -> None:
+        """Seed the first draft chain for each terminal-prefill request.
+
+        Called by the worker with exactly the completed subset, after the
+        terminal chunk sampled its first generated token.  The prompt tail
+        captured across chunks becomes the group context; the sampled token
+        becomes ``next_prefill_tokens`` (the query row-0 token and the anchor
+        of the first target verify).
+        """
+        if not self.speculative:
+            return
+        del sampling_params  # greedy-only serving; nothing to select
+        if len(request_ids) != len(sampled_token_ids):
+            raise ValueError("DSpark seeding requires one sampled token per request")
+        layout = self._compiled.layout
+        tp = layout.tp_size
+        rows_by_rank: list[list[DSparkDrafterRequestRow]] = [[] for _ in range(layout.ranks)]
+        seed_contexts: dict[int, tuple[int, torch.Tensor]] = {}
+        tails: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        max_position = self._require_rope_tables().max_position
+        for request_id, token in zip(request_ids, sampled_token_ids, strict=True):
+            state = self._drafter_state(request_id)
+            if state.prefill_tail_rows is None or state.prefill_tail_positions is None:
+                raise RuntimeError(
+                    f"DSpark seeding requires a captured prompt tail for {request_id!r}"
+                )
+            anchor = int(state.prefill_tail_positions[-1].item())
+            state.prompt_len = anchor + 1
+            state.committed_count = state.prompt_len
+            if anchor + DSPARK_DRAFTER_QUERY_WIDTH >= max_position:
+                # No room for a draft chain under the ceiling: seed nothing
+                # and let the first verify fall back to the anchor-only path.
+                state.pending_draft_tokens = []
+                state.pending_confidence = []
+                continue
+            rows_by_rank[state.group * tp].append(
+                DSparkDrafterRequestRow(
+                    request_id=request_id,
+                    group=state.group,
+                    lease=state.lease,
+                    anchor=anchor,
+                    valid_count=0,
+                    token_source=int(token),
+                    hidden_row=0,
+                    decode_mode=False,
+                )
+            )
+            seed_contexts[state.group] = (state.lease, state.prefill_tail_positions)
+            tails[state.group] = (state.prefill_tail_rows, state.prefill_tail_positions)
+        if not seed_contexts:
+            return
+        context_rows = max(
+            -(-int(positions.shape[0]) // tp) for _, positions in seed_contexts.values()
+        )
+        # Group-context buffers dispatch at fixed extents: round the seed's
+        # tail up to the next shared bucket.
+        context_rows = next(
+            size for size in DSPARK_DRAFTER_CONTEXT_BUCKETS if context_rows <= size
+        )
+        hidden = torch.zeros(
+            (layout.ranks, context_rows, DSPARK_MAIN_HIDDEN_DIM), dtype=torch.bfloat16
+        )
+        for group, (tail_rows, tail_positions) in tails.items():
+            total = int(tail_positions.shape[0])
+            padded = context_rows * tp
+            positions = torch.full((padded,), -1, dtype=torch.int64)
+            positions[:total] = tail_positions
+            row_buffer = torch.zeros(
+                (padded, DSPARK_MAIN_HIDDEN_DIM), dtype=torch.bfloat16
+            )
+            row_buffer[:total] = tail_rows
+            seed_contexts[group] = (seed_contexts[group][0], positions)
+            for member in range(tp):
+                rank = group * tp + member
+                hidden[rank] = row_buffer[
+                    member * context_rows : (member + 1) * context_rows
+                ]
+        batch, _ = self._prepare_drafter_inputs(
+            rows_by_rank,
+            hidden=hidden,
+            context_rows=context_rows,
+            seed_contexts=seed_contexts,
+        )
+        self._run_drafter_and_markov(batch, context_rows)
+        drafts = self._packed_host_prefix(
+            self._markov_task_args.tensors["draft_token_ids"], batch
+        )
+        confidence = self._packed_host_prefix(
+            self._markov_task_args.tensors["confidence_probs"], batch
+        )
+        for request_id in request_ids:
+            state = self._drafter_state(request_id)
+            leader = state.group * tp
+            row_of = next(
+                (
+                    i
+                    for i, row in enumerate(rows_by_rank[leader])
+                    if row.request_id == request_id
+                ),
+                None,
+            )
+            if row_of is None:
+                continue  # capacity-skipped above; decode falls back
+            state.pending_draft_tokens = [int(v) for v in drafts[leader, row_of]]
+            state.pending_confidence = [float(v) for v in confidence[leader, row_of]]
+            if len(state.pending_draft_tokens) != DSPARK_DRAFTER_QUERY_WIDTH:
+                raise RuntimeError(
+                    f"DSpark seeding produced {len(state.pending_draft_tokens)} drafts "
+                    f"for {request_id!r}"
+                )
+            state.proposed_tokens += DSPARK_DRAFTER_QUERY_WIDTH
+
+    def _run_drafter_and_markov(self, batch: int, context_rows: int) -> None:
+        """Dispatch the staged drafter + markov pair under their profiles."""
+        if self._compiled.drafter is None or self._compiled.markov is None:
+            raise RuntimeError("DSpark speculation requires the drafter and markov programs")
+        drafter_args = self._drafter_dispatch_args(batch, context_rows)
+        self._run_l3(self._compiled.drafter, *drafter_args, config=self._drafter_run_config)
+        markov_args = self._markov_dispatch_args(batch)
+        self._run_l3(self._compiled.markov, *markov_args, config=self._markov_run_config)
+
+    def _drafter_dispatch_args(self, batch: int, context_rows: int) -> tuple[Any, ...]:
+        """Bind the drafter's dynamic extents over the staged slots."""
+        from pypto_serving.model.deepseek_dspark.task_args import (  # noqa: PLC0415
+            _DRAFTER_B_DYNAMIC_NAMES,
+            _DRAFTER_T_MAIN_DYNAMIC_NAMES,
+        )
+
+        task_args = self._drafter_task_args
+        context_staging = self._drafter_context_staging[context_rows]
+        bounded: list[Any] = []
+        for name, arg in zip(task_args.names, task_args.build(), strict=True):
+            if name == "block_tables":
+                bounded.append(self._drafter_block_table_staging[batch])
+            elif name in context_staging:
+                bounded.append(context_staging[name])
+            elif name in _DRAFTER_B_DYNAMIC_NAMES:
+                bounded.append(
+                    self._packed_host_prefix(arg, batch)
+                    if isinstance(arg, torch.Tensor)
+                    else self._stacked_device_prefix(arg, batch)
+                )
+            elif name in _DRAFTER_T_MAIN_DYNAMIC_NAMES:
+                bounded.append(
+                    self._packed_host_prefix(arg, context_rows)
+                    if isinstance(arg, torch.Tensor)
+                    else self._stacked_device_prefix(arg, context_rows)
+                )
+            else:
+                bounded.append(arg)
+        return tuple(bounded)
+
+    def _markov_dispatch_args(self, batch: int) -> tuple[Any, ...]:
+        """Bind the markov sampler's B_DYN extent over the staged slots."""
+        task_args = self._markov_task_args
+        bounded: list[Any] = []
+        for name, arg in zip(task_args.names, task_args.build(), strict=True):
+            if name in ("num_sampled", "last_sampled", "next_prefill_tokens"):
+                bounded.append(self._packed_host_prefix(arg, batch))
+            elif name == "head_hidden":
+                bounded.append(
+                    self._stacked_device_prefix(arg, batch)
+                    if not isinstance(arg, torch.Tensor)
+                    else self._packed_host_prefix(arg, batch)
+                )
+            elif name in ("draft_token_ids", "confidence_probs"):
+                bounded.append(self._packed_host_prefix(arg, batch))
+            else:
+                bounded.append(arg)
+        return tuple(bounded)
+
+    def _read_drafter_hidden(
+        self, host_mirror: torch.Tensor, *, rows: int
+    ) -> torch.Tensor:
+        """D2H readback of the decode tap's first ``rows`` rows per rank."""
+        device = self._alloc_zeroed_stacked_tensor(
+            "dspark_target_hidden",
+            (
+                self._compiled.layout.ranks,
+                DSPARK_DECODE_LOCAL_TOKENS,
+                DSPARK_MAIN_HIDDEN_DIM,
+            ),
+            torch.bfloat16,
+            scope="decode",
+        )
+        worker = self._shared_l3_worker()
+        row_bytes = DSPARK_MAIN_HIDDEN_DIM * 2
+        for index, shard in enumerate(device.shards):
+            worker.copy_from(
+                host_mirror[index].data_ptr(),
+                shard.data_ptr,
+                rows * row_bytes,
+                worker_id=device.worker_ids[index],
+            )
+        return host_mirror[:, :rows]
+
     def release_finished_requests(self, request_ids: Iterable[str]) -> None:
-        """No request-local runner state in the target-only milestone."""
-        del request_ids
+        """Free each finished request's drafter lease and pending state.
+
+        Idempotent and safe for requests this runner never saw: completion,
+        abort, and preemption all funnel through here, and a re-admitted
+        re-prefill starts a fresh state incarnation with a new lease.
+        """
+        for request_id in request_ids:
+            state = self._drafter_states.pop(request_id, None)
+            if state is not None:
+                if state.verify_steps:
+                    logger.info(
+                        "DSpark speculation finished: request=%s verifies=%d "
+                        "matched=%d proposed=%d accepted=%d mean_len=%.2f "
+                        "fallbacks=%d",
+                        request_id,
+                        state.verify_steps,
+                        state.matched_drafts,
+                        state.proposed_tokens,
+                        state.accepted_tokens,
+                        state.accepted_tokens / state.verify_steps,
+                        state.fallback_steps,
+                    )
+                free = self._drafter_free_leases.setdefault(state.group, [])
+                free.append(state.lease)
 
     def close(self) -> None:
         worker = self._l3_worker
@@ -2375,3 +3504,20 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             for task_args in self._decode_task_args:
                 task_args.close()
             self._decode_task_args = []
+            # Speculative resources: the executor retains its runners, so
+            # every drafter-era reference must drop here or staging buffers,
+            # weights, and per-request states outlive the model.
+            self._drafter_states.clear()
+            for leases in self._drafter_free_leases.values():
+                leases.clear()
+            self._drafter_context_staging.clear()
+            self._drafter_block_table_staging.clear()
+            self._drafter_hidden_mirror = None
+            self._drafter_host_weights = None
+            self._drafter_device_weights = None
+            if self._drafter_task_args is not None:
+                self._drafter_task_args.close()
+                self._drafter_task_args = None
+            if self._markov_task_args is not None:
+                self._markov_task_args.close()
+                self._markov_task_args = None

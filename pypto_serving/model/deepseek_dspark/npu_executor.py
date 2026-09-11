@@ -37,6 +37,8 @@ from pypto_serving.model.common.executor.utils import build_pypto_run_config
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_FWD_NUM_LAYERS,
+    DSPARK_NOISE_TOKEN_ID,
+    DSPARK_SPECULATIVE_TOKENS,
     DSparkCacheLayout,
     DSparkCompiledKernels,
     DSparkRopeTables,
@@ -142,6 +144,7 @@ def _dspark_import_context(
     tp: int,
     ep: int,
     weight_bank_size: int,
+    dp: int = 1,
 ):
     """Import DSpark kernels with the canonical 16-card shape arguments."""
     old_argv = list(sys.argv)
@@ -160,6 +163,11 @@ def _dspark_import_context(
         "pypto-serving-dspark",
         "--tp", str(int(tp)),
         "--ep", str(int(ep)),
+        # lm_head.WORLD_SIZE = TP * DP scopes the markov sampler's stacked
+        # tensors; only lm_head/dspark_markov parse --dp (the target programs
+        # ignore it), so passing the DP group count makes the markov program
+        # cover the full 16-rank world in one dispatch.
+        "--dp", str(int(dp)),
         "--weight-bank-size", str(int(weight_bank_size)),
     ]
     sys.path.insert(0, str(kernel_dir))
@@ -202,10 +210,12 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         self._kernel_dir = _find_pypto_lib_dspark_dir()
         self._compile_kernels = bool(compile_kernels)
         self._num_speculative_tokens = int(num_speculative_tokens)
-        if self._num_speculative_tokens != 0:
+        if self._num_speculative_tokens not in (0, DSPARK_SPECULATIVE_TOKENS):
             raise ValueError(
-                "DSpark serving runs the target model without speculation in this "
-                "milestone; the drafter chain is tracked by pypto-lib#1078"
+                "DSpark speculation is fixed at K="
+                f"{DSPARK_SPECULATIVE_TOKENS} (DSPARK_QUERY_WIDTH); got "
+                f"{self._num_speculative_tokens}. Use 0 to serve the target "
+                "model without speculation."
             )
         self._embedding_cache: dict[str, torch.Tensor] = {}
         compile_cache_dir = self._pypto_build_dir if self._use_compile_cache else None
@@ -316,14 +326,30 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             compress_ratios=compress_ratios,
             num_hash_layers=num_hash_layers,
         )
+        speculative = self._num_speculative_tokens > 0
+        drafter = None
+        markov = None
+        if speculative:
+            self._validate_drafter_config(model, config_data)
+            # The drafter weights are required (and loaded) only at K=7.
+            weight_store.validate_drafter_startup_contract(
+                n_routed_experts=n_routed_experts
+            )
 
         prefill = None
         decode = None
         rope: DSparkRopeTables | None = None
         if self._compile_kernels:
-            modules = self._load_kernel_modules(layout)
+            modules = self._load_kernel_modules(layout, speculative=speculative)
             prefill = self._compile_l3_callable("dspark_prefill", modules["prefill_fwd"].l3_prefill_fwd)
             decode = self._compile_l3_callable("dspark_decode", modules["decode_fwd"].l3_decode_fwd)
+            if speculative:
+                drafter = self._compile_l3_callable(
+                    "dspark_drafter", modules["dspark_drafter"].l3_dspark_drafter
+                )
+                markov = self._compile_l3_callable(
+                    "dspark_markov", modules["dspark_markov"].l3_distributed_markov_sample
+                )
             rope = self._build_rope_tables(
                 modules["utils"],
                 modules["config"],
@@ -341,6 +367,9 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             runtime_model=model,
             prefill=prefill,
             decode=decode,
+            drafter=drafter,
+            markov=markov,
+            num_speculative_tokens=self._num_speculative_tokens,
             rope=rope,
             platform=self._platform,
             device_id=self._device_ids[0],
@@ -349,7 +378,30 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             num_hash_layers=num_hash_layers,
         )
 
-    def _load_kernel_modules(self, layout: DSparkCacheLayout) -> dict[str, object]:
+    def _validate_drafter_config(self, model: RuntimeModel, config_data: object) -> None:
+        """Reject checkpoints whose drafter metadata contradicts the kernels."""
+        if not isinstance(config_data, dict):
+            raise ValueError("DSpark speculation requires the checkpoint config data")
+        hidden_layers = int(model.config.num_hidden_layers)
+        expected_layers = (hidden_layers - 3, hidden_layers - 2, hidden_layers - 1)
+        target_layers = tuple(int(layer) for layer in config_data.get("dspark_target_layer_ids", ()))
+        if target_layers != expected_layers:
+            raise ValueError(
+                "DSpark speculation taps the model's final three layers "
+                f"{expected_layers}; the checkpoint declares {target_layers}"
+            )
+        noise_token = int(config_data.get("dspark_noise_token_id", -1))
+        if noise_token != DSPARK_NOISE_TOKEN_ID:
+            raise ValueError(
+                f"DSpark noise token {noise_token} does not match the serving "
+                f"staging constant {DSPARK_NOISE_TOKEN_ID}"
+            )
+        if int(config_data.get("dspark_markov_rank", -1)) <= 0:
+            raise ValueError("DSpark speculation requires a positive dspark_markov_rank")
+
+    def _load_kernel_modules(
+        self, layout: DSparkCacheLayout, *, speculative: bool = False
+    ) -> dict[str, object]:
         """Import the DSpark pypto-lib modules with the canonical shapes frozen."""
         pypto_lib_root = self._kernel_dir.parents[1]
         with _dspark_import_context(
@@ -358,12 +410,22 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             tp=layout.tp_size,
             ep=layout.ranks,
             weight_bank_size=DSPARK_FWD_NUM_LAYERS,
+            dp=layout.partitions,
         ):
             config = importlib.import_module("config")
             utils = importlib.import_module("utils")
             decode_fwd = importlib.import_module("decode_fwd")
             prefill_fwd = importlib.import_module("prefill_fwd")
-        return {"config": config, "utils": utils, "decode_fwd": decode_fwd, "prefill_fwd": prefill_fwd}
+            modules: dict[str, object] = {
+                "config": config,
+                "utils": utils,
+                "decode_fwd": decode_fwd,
+                "prefill_fwd": prefill_fwd,
+            }
+            if speculative:
+                modules["dspark_drafter"] = importlib.import_module("dspark_drafter")
+                modules["dspark_markov"] = importlib.import_module("dspark_markov")
+        return modules
 
     def _compile_l3_callable(self, name: str, jit_fn: object):
         """Compile one fully annotated DSpark HOST wrapper."""

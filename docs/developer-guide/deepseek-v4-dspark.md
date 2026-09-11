@@ -95,30 +95,83 @@ python -m pytest tests/test_deepseek_dspark_accuracy.py -q
 ```
 
 `tests/test_deepseek_dspark_accuracy.py` starts the HTTP server on 16 borrowed
-devices, then checks greedy generation with one case mirroring the MTP guard's
+devices, then checks greedy generation with two cases mirroring the MTP guard's
 64-token prompt / 128-token gate (the same Palace Museum prompt, so both
-variants gate the same request shape). Greedy is the only
-sampling mode in this milestone -- the kernels expose device greedy sampling
-with no temperature ABI, so requests with `temperature > 0` fail with an
-explicit error.
+variants gate the same request shape): the target-only `K=0` contract and the
+`K=7` speculative chain. Greedy is the only sampling mode -- the kernels expose
+device greedy sampling with no temperature ABI, so requests with
+`temperature > 0` fail with an explicit error.
 
 Unit guards (no devices needed): `tests/unit/model/deepseek_dspark/` covers
 the cache topology contract, the ABI order parity against the pypto-lib
-signatures, the import-context isolation, host metadata lowering parity
-against the pypto-lib reference helpers, prefill/decode staging assembly, and
-the weight shard policy.
+signatures (prefill/decode/drafter/markov), the import-context isolation, host
+metadata lowering parity against the pypto-lib reference helpers,
+prefill/decode staging assembly, the drafter lease and staging contracts,
+linear-chain acceptance semantics, and the weight shard policy (synthetic
+checkpoints; the production checkpoint validates opt-in through
+`PYPTO_DSV4_DSPARK_MODEL_DIR`).
 
-## Drafter roadmap
+## Speculative decoding (K=7)
 
-The subsequent milestone adds the DSpark speculative chain:
+Select with `--speculative-config '{"method": "dspark",
+"num_speculative_tokens": 7}'`; `0` keeps the target-only path. K is fixed at
+`DSPARK_QUERY_WIDTH = 7` -- the decode tile is exactly one committed row plus
+seven draft rows.
 
-1. pypto-lib#1078 lands the `dspark_target_hidden` output tap on the target
-   programs (layers 40/41/42); bump the submodule pin.
-2. Compile `l3_dspark_drafter` (53 args) and `l3_distributed_markov_sample`
-   (12 args); drafter weights ship in the checkpoint under `mtp.0/1/2`.
-3. Runner: drafter-private rank-local SWA pools, prefill-completion seeding,
-   per-step verify -> accept -> draft -> markov chain, K=7 scheduler
-   reservations with per-rank batch padding to `(4, 8, 12, 16)`.
-4. Acceptance changes speed, never text: the e2e guard keeps asserting
-   equality with this milestone's greedy output plus a mean accepted length
-   above one.
+**Programs.** `l3_dspark_drafter` (59 args at the pinned pypto-lib) and
+`l3_distributed_markov_sample` (12 args) compile alongside the target
+programs only when `num_speculative_tokens > 0`; the K=0 path loads, requires,
+allocates, and compiles nothing drafter-related. The drafter dispatches under
+its own `(4 GiB,)*4` ring profile, markov under the 1 GiB decode profile.
+
+**Weights.** `DSparkWeightStore.load_drafter_weights` packs the checkpoint's
+`mtp.0/1/2` modules plus three replicated heads (`mtp.0.main_proj/main_norm`,
+`mtp.2.norm`, `mtp.2.markov_head.markov_w1/w2`, `mtp.2.confidence_head`) and
+the target hash layers' `tid2eid` (INT32) into the kernel's flattened
+three-layer banks: the checkpoint's `[out, in]` projections transpose
+(`wq_a`/`wq_b`/`wkv`), the router gate and confidence head cast to FP32, the
+o-projection TP-shards (`wo_a` groups / `wo_b` columns), and the routed
+experts EP-shard per rank. All banks upload inside `_ensure_l3_shared_buffers`,
+so the KV-capacity free-memory snapshot sees them.
+
+**Drafter caches.** The drafter's SWA pools are runner-private
+(`[16, 3, 512, 32, 1, 512]` BF16, one full group replica per rank) and never
+scheduler-visible. Each live request holds a stable group-local lease in
+`[0, 64)`: six ring blocks per draft layer
+(`lease*6 + (logical + 7*layer) % 6`), sized so a 128-deep window plus the
+seven query rows never aliases itself at any alignment. Blocks 384-389 hold a
+shared read-only zero-initialized filler history; filler batch rows publish
+nothing (`-1` slots, token 0, `num_sampled = 0`). Leases free on completion,
+abort, and preemption; a re-admitted re-prefill starts a fresh incarnation.
+
+**Verify staging (eager publish).** Speculative decode stages the pending
+drafts into verify rows 1..7 and publishes all eight rows of the window (raw
+KV, recurrent states, and compression boundaries; `kv_seq_lens = start + 8`).
+Rejection self-heals without rollback: every stale position a truncated
+acceptance leaves behind falls inside the next dispatch's eight-row window
+and is rewritten with correct tokens before any read, because reads stay
+bounded by the committed lengths. When the window cannot fit under the
+position ceiling the request falls back per-step to the single-anchor K=0
+publication path (no clamped duplicate positions ever carry real slots), and
+its next drafter query is skipped. Terminal truncation (EOS, stop, max
+tokens) remains scheduler-authoritative, including a fully accepted step
+ending mid-list.
+
+**Acceptance.** The device greedy sampler emits one prediction per logit row;
+the host runs linear-chain acceptance (longest matching draft prefix plus the
+target's own prediction at the stop, 1..8 tokens per step) and returns
+variable-length `accepted_token_ids`, which the scheduler already consumes.
+Acceptance changes speed, never the served contract: the e2e guard asserts
+token accounting only, plus the runner's `DSpark speculation progress` log
+line as proof the chain really dispatched. Per-request counters (verify
+steps, proposed/matched drafts, accepted tokens, fallback steps, mean
+accepted length before scheduler truncation) are exposed through
+`DSparkModelRunner.dspark_speculation_summary()`; mean accepted length is a
+bring-up effectiveness goal, not a coherence or latency claim.
+
+**Seeding.** `run_prefill` captures a rolling 128-row prompt tail from the
+prefill tap's rank-owned rows on every chunk; the worker's terminal-prefill
+hook (`finalize_prefill`, which knows prompt completion from its cached
+length) validates the completed subset and dispatches the drafter in prefill
+mode (`num_sampled = 0`, the first sampled token as `next_prefill_tokens`,
+anchor at the prompt end) followed by markov, before the first decode step.

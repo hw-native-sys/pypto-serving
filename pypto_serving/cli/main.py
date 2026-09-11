@@ -451,13 +451,18 @@ def _resolve_num_speculative_tokens(args: argparse.Namespace) -> int:
             raise ValueError("--speculative-config cannot be combined with --num-speculative-tokens")
         method = speculative_config.get("method")
         if method == "dspark":
+            from pypto_serving.model.deepseek_dspark.npu_runner import (  # noqa: PLC0415
+                DSPARK_SPECULATIVE_TOKENS,
+            )
+
             dspark_tokens = speculative_config.get("num_speculative_tokens", 0)
-            if dspark_tokens:
+            if dspark_tokens not in (0, DSPARK_SPECULATIVE_TOKENS):
                 raise ValueError(
-                    "DeepSeek V4 method='dspark' serves the target model without "
-                    "speculation; use num_speculative_tokens 0"
+                    "DeepSeek V4 method='dspark' speculation is fixed at "
+                    f"num_speculative_tokens {DSPARK_SPECULATIVE_TOKENS} "
+                    "(DSPARK_QUERY_WIDTH); use 0 to serve the target model only"
                 )
-            return 0
+            return int(dspark_tokens)
         if method != "mtp":
             raise ValueError("DeepSeek V4 --speculative-config requires method='mtp'")
         if "num_speculative_tokens" not in speculative_config:

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -64,6 +65,68 @@ class DSparkCase:
     prompt: str
     prompt_tokens: int
     max_new_tokens: int
+    num_speculative_tokens: int = 0
+
+
+# One DSpark server parks tens of GiB of pooled arenas per card, and the
+# driver reclaims a torn-down server's HBM asynchronously -- process exit is
+# not the boundary.  A clean card idles around 3 GiB used (driver baseline),
+# while any real residual is tens of GiB, so 8 GiB separates them cleanly.
+DEVICE_RECLAIMED_HBM_MIB = 8192
+_DEVICE_HBM_ROW = re.compile(
+    r"^\|\s*\d+\s+(\d+)\s+\|\s*[0-9A-F]{4}:[0-9A-F]{2}:[0-9A-F]{2}\.[0-9A-F]\s+\|"
+    r"\s*[\d.]+\s+\d+\s*/\s*\d+\s+(\d+)\s*/\s*\d+\s+\|$",
+    re.MULTILINE,
+)
+
+
+def _device_hbm_used_mib() -> dict[int, int]:
+    """Per-device used HBM in MiB from ``npu-smi info``; empty when unusable."""
+    try:
+        completed = subprocess.run(
+            ["npu-smi", "info"], capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return {
+        int(device_id): int(used_mib)
+        for device_id, used_mib in _DEVICE_HBM_ROW.findall(completed.stdout)
+    }
+
+
+def _wait_for_device_reclaim(devices: tuple[int, ...], *, timeout_s: int = 900) -> None:
+    """Block until the previous server's HBM is back near the driver baseline.
+
+    The next case boots a fresh 16-card server that needs nearly the whole
+    card (the K=7 boot measured 37 KV slots of headroom on a clean device);
+    starting it while any device still holds the previous server's residual
+    HBM fails its weight upload with a device OOM long before an assertion
+    could name the cause.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        used = _device_hbm_used_mib()
+        residual = {
+            device: used[device]
+            for device in devices
+            if device in used and used[device] > DEVICE_RECLAIMED_HBM_MIB
+        }
+        if not residual:
+            if len(used) < len(devices):
+                # npu-smi is present but unparseable/unavailable: proceed on
+                # the raw teardown timing rather than failing the guard.
+                print(
+                    "WARNING: could not read per-device HBM usage; skipping "
+                    "the post-teardown reclaim wait",
+                    flush=True,
+                )
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"devices still hold the previous server's HBM after {timeout_s}s: "
+                f"{residual} MiB used"
+            )
+        time.sleep(15)
 
 
 # Mirror the MTP guard's prompt_tokens=64 / max_new_tokens=128 gate (its K=1
@@ -76,6 +139,16 @@ GREEDY_CASES = (
         prompt=_MTP_64_128.prompt,
         prompt_tokens=_MTP_64_128.prompt_tokens,
         max_new_tokens=_MTP_64_128.max_new_tokens,
+    ),
+    # Milestone 2: the same prompt at K=7.  Assertions stay contract-only
+    # (token accounting plus proof the speculative path really dispatched);
+    # acceptance changes speed, never the served contract.
+    DSparkCase(
+        case_id="palace-64-128-k7",
+        prompt=_MTP_64_128.prompt,
+        prompt_tokens=_MTP_64_128.prompt_tokens,
+        max_new_tokens=_MTP_64_128.max_new_tokens,
+        num_speculative_tokens=7,
     ),
 )
 
@@ -100,7 +173,13 @@ def _task_devices() -> tuple[int, ...]:
     return devices
 
 
-def _server_command(model_dir: Path, devices: tuple[int, ...], port: int) -> list[str]:
+def _server_command(
+    model_dir: Path,
+    devices: tuple[int, ...],
+    port: int,
+    *,
+    num_speculative_tokens: int = 0,
+) -> list[str]:
     # Keep these serving options aligned with docs/dev/model/deepseek-v4-dspark.md.
     return [
         sys.executable,
@@ -133,7 +212,9 @@ def _server_command(model_dir: Path, devices: tuple[int, ...], port: int) -> lis
         "--long-prefill-token-threshold",
         "128",
         "--speculative-config",
-        json.dumps({"method": "dspark", "num_speculative_tokens": 0}),
+        json.dumps(
+            {"method": "dspark", "num_speculative_tokens": num_speculative_tokens}
+        ),
         "--no-enable-prefix-caching",
         "--ring-heap",
         DSPARK_RING_HEAP,
@@ -160,7 +241,12 @@ def test_dspark_http_greedy_generation(tmp_path: Path, case: DSparkCase) -> None
     try:
         with log_path.open("w", encoding="utf-8") as server_log:
             process = subprocess.Popen(
-                _server_command(model_dir, devices, port),
+                _server_command(
+                    model_dir,
+                    devices,
+                    port,
+                    num_speculative_tokens=case.num_speculative_tokens,
+                ),
                 cwd=ROOT,
                 stdout=server_log,
                 stderr=subprocess.STDOUT,
@@ -187,6 +273,18 @@ def test_dspark_http_greedy_generation(tmp_path: Path, case: DSparkCase) -> None
                 assert usage.get("completion_tokens") == case.max_new_tokens
             finally:
                 _stop_process_group(process)
+        # A following case boots a fresh 16-card server that needs nearly
+        # the whole card; wait out the previous server's async HBM reclaim.
+        _wait_for_device_reclaim(devices)
+        if case.num_speculative_tokens:
+            # The K=7 run must really have dispatched the drafter/markov
+            # chain: the runner logs acceptance progress unconditionally at
+            # its first verify step, so the line exists however few (or many)
+            # steps a fast or slow run takes.
+            log_text = log_path.read_text(encoding="utf-8")
+            assert "DSpark speculation progress" in log_text, (
+                "no acceptance progress line in the server log"
+            )
     except BaseException:
         _print_server_log(log_path)
         raise
@@ -205,3 +303,11 @@ def test_server_command_pins_the_dspark_contract(tmp_path) -> None:
     }
     assert "--no-enable-prefix-caching" in command
     assert command[command.index("--ring-heap") + 1] == DSPARK_RING_HEAP
+
+    k7 = _server_command(
+        tmp_path, tuple(range(DSPARK_EP_SIZE)), 12345, num_speculative_tokens=7
+    )
+    assert json.loads(k7[k7.index("--speculative-config") + 1]) == {
+        "method": "dspark",
+        "num_speculative_tokens": 7,
+    }

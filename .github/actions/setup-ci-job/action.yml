@@ -286,9 +286,11 @@ runs:
             sleep $((attempt * 10))
           done
         }
+        # Keep CI on the pypto revision used by the validated lx312 stack.
+        PYPTO_PIN=747e1e4ba99f13dea1a609d893ac7512e85a5897
         if [ -d "$PYPTO_SRC/.git" ]; then
           echo "Cache hit — updating pypto"
-          retry git -C "$PYPTO_SRC" fetch --depth=1 origin HEAD || exit 1
+          retry git -C "$PYPTO_SRC" fetch --depth=1 origin "$PYPTO_PIN" || exit 1
           git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
           git -C "$PYPTO_SRC" clean -ffdx
           git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
@@ -298,6 +300,8 @@ runs:
           # rm before each attempt so a retried clone never hits a partial dir.
           clone_pypto() { rm -rf "$PYPTO_SRC"; git clone --depth=1 https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"; }
           retry clone_pypto || exit 1
+          retry git -C "$PYPTO_SRC" fetch --depth=1 origin "$PYPTO_PIN" || exit 1
+          git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
         fi
         retry git -C "$PYPTO_SRC" submodule update --init --recursive --depth=1 || exit 1
         rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
