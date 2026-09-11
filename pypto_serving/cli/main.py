@@ -63,14 +63,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--platform", default="a2a3", help="NPU platform (default: a2a3).")
     parser.add_argument(
         "--use-compile-cache",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
-            "Reuse compiled kernels across launches. Each kernel is written to "
-            "<pypto_build_dir>/<name> and reloaded on the next launch, skipping the JIT "
-            "and the device-binary assembly. Off by default. NOTE: there is no "
-            "fingerprinting, so reuse the same build dir only for the same config and "
-            "kernel sources; clear it on a config/kernel change to avoid stale binaries."
+            "Enable PyPTO's persistent JIT cache (disable with --no-use-compile-cache). "
+            "Without either flag, inherit PyPTO configuration; caching defaults to off. "
+            "PYPTO_CACHE_DIR selects the shared artifact root (default ~/.cache/pypto/jit); "
+            "PYPTO_CACHE_READONLY=1 enables read-only lookup with private compilation on a miss. "
+            "Source, specialization and toolchain changes invalidate cached artifacts automatically."
         ),
     )
     parser.add_argument("--device", type=int, default=0, help="NPU device ID (default: 0).")

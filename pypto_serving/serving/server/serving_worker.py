@@ -163,7 +163,7 @@ class WorkerProcess:
             self.executor = executor_cls(
                 platform=self.config.platform,
                 device_ids=device_ids,
-                pypto_build_dir=str(pypto_build_dir),
+                pypto_build_dir=str(pypto_build_dir) if pypto_build_dir is not None else None,
                 **self.config.executor_kwargs,
             )
 
@@ -211,11 +211,16 @@ class WorkerProcess:
 
         return ModelExecutor
 
-    def _configure_pypto_build_dir(self, device_ids: tuple[int, ...]) -> Path:
-        """Give each worker process an isolated PyPTO build base."""
-        base = Path(os.environ.get("PYPTO_PROG_BUILD_DIR") or "build_output")
+    def _configure_pypto_build_dir(self, device_ids: tuple[int, ...]) -> Path | None:
+        """Namespace explicitly requested output without disabling JIT reuse by default."""
+        requested = os.environ.get("PYPTO_PROG_BUILD_DIR")
+        if not requested:
+            return None
+        base = Path(requested)
         device_label = "_".join(str(device_id) for device_id in device_ids)
         worker_dir = base / f"serving_dp{self.config.dp_rank}_d{device_label}"
+        # PyPTO treats this variable as an explicit output/rebuild request.
+        # Injecting a default would silently bypass both JIT cache levels.
         os.environ["PYPTO_PROG_BUILD_DIR"] = str(worker_dir)
         return worker_dir
 

@@ -127,15 +127,9 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         *,
         platform: str = "a2a3sim",
         device_ids: Sequence[int] = (0,),
-        pypto_build_dir: str = "build_output",
-        use_compile_cache: bool = False,
+        pypto_build_dir: str | None = None,
+        use_compile_cache: bool | None = None,
     ) -> None:
-        # ``pypto_build_dir`` is the per-worker build dir (set by the serving
-        # worker). When ``use_compile_cache`` is set, the compiler writes each
-        # kernel straight to ``<pypto_build_dir>/<name>`` and reloads it on a
-        # later launch, so it doubles as the on-disk kernel cache. No
-        # fingerprinting -- the caller must keep this dir config/kernel-source
-        # appropriate. When off, pypto uses its default per-kernel build dirs.
         super().__init__(
             kv_cache_manager,
             platform=platform,
@@ -149,7 +143,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 device_ids=self._device_ids,
                 pypto_build_dir=self._pypto_build_dir,
             ),
-            cache_dir=self._pypto_build_dir,
         )
 
     @property
@@ -334,8 +327,8 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         """Compile a HOST wrapper into a PyPTO DistributedCompiledProgram.
 
         Signature mode: tensor shapes/dtypes are read from the wrapper's
-        annotations, so no positional sample tensors are passed. The on-disk
-        cache fast-path and the JIT compile are both handled by the shared
+        annotations, so no positional sample tensors are passed. PyPTO cache
+        policy and JIT compilation are forwarded by the shared
         :class:`KernelCompiler`.
         """
         return self._compiler.compile(name, jit_fn, use_cache=self._use_compile_cache)

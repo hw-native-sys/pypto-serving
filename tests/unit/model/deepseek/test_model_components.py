@@ -914,8 +914,8 @@ def test_deepseek_compile_attaches_lazy_weight_store_without_opening_shards(
 
 
 @pytest.mark.parametrize("use_compile_cache", [False, True])
-def test_deepseek_compiler_only_sets_cache_dir_when_enabled(tmp_path, monkeypatch, use_compile_cache):
-    """Disabled caching keeps PyPTO's fresh per-kernel build directories."""
+def test_deepseek_explicit_output_is_diagnostic(tmp_path, monkeypatch, use_compile_cache):
+    """Explicit output remains a diagnostic request even if caching is enabled."""
     kernel_dir = _write_deepseek_kernel_dir(tmp_path, lm_head_tp_size=8)
     captured: dict[str, object] = {}
 
@@ -933,9 +933,9 @@ def test_deepseek_compiler_only_sets_cache_dir_when_enabled(tmp_path, monkeypatc
         use_compile_cache=use_compile_cache,
     )
 
-    expected = executor._pypto_build_dir if use_compile_cache else None
-    assert captured["cache_dir"] == expected
-    assert getattr(captured["run_config"], "save_kernels_dir") == expected
+    assert "cache_dir" not in captured
+    assert getattr(captured["run_config"], "save_kernels_dir") == str(tmp_path / "build")
+    assert getattr(captured["run_config"], "save_kernels")
 
 
 @pytest.mark.parametrize("num_speculative_tokens", [1, 3])
@@ -3103,8 +3103,8 @@ def test_deepseek_mtp_prefill_reads_only_selected_owner_outputs():
         def free_tensor(_tensor, *, worker_id=0):
             pass
 
-        def copy_from(self, dst, src, nbytes, *, worker_id=0):
-            self.copies.append((dst, src, nbytes, worker_id))
+        def copy_from(self, dst, src, nbytes, *, worker_id=0, src_offset=0):
+            self.copies.append((dst, src, nbytes, worker_id, src_offset))
 
     worker = FakeWorker()
     runner._l3_worker = worker
@@ -3136,12 +3136,14 @@ def test_deepseek_mtp_prefill_reads_only_selected_owner_outputs():
             ta.tensors["logits"].shards[1].data_ptr,
             129280 * torch.float32.itemsize,
             1,
+            0,
         ),
         (
             runner._mtp_buffers.prefill_pre_hc_mirror[1, 0].data_ptr(),
             ta.tensors["pre_hc_hidden_out"].shards[1].data_ptr,
             4 * 5 * torch.float32.itemsize,
             1,
+            0,
         ),
     ]
 
