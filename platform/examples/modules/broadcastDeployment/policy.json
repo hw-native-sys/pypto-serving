@@ -1,0 +1,42 @@
+{
+  "Name": "Basic Deployment",
+  "Settings": {
+    "Heartbeat": {
+      "Enabled": true,
+      "Visible": false,
+      "Interval": 500,
+      "Tolerance": 1000
+    },
+    "Control Buffer": {
+      "Capacity": 32,
+      "Size": 16384
+    }
+  },
+  "Request Manager": {
+    "Input": "input",
+    "Output": "output"
+  },
+  "Partitions": [
+    {
+      "Name": "P0",
+      "Tasks": []
+    },
+    {
+      "Name": "P1",
+      "Tasks": []
+    },
+    {
+      "Name": "P2",
+      "Tasks": []
+    },
+    {
+      "Name": "P3",
+      "Tasks": []
+    },
+    {
+      "Name": "P4",
+      "Tasks": []
+    }
+  ],
+  "Edges": []
+}

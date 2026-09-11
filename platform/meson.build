@@ -74,5 +74,6 @@ if meson.is_subproject() == false
   if get_option('buildTests')
     subdir('examples')
   endif
+  subdir('python')
 endif
 
