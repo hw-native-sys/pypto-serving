@@ -1,0 +1,53 @@
+{
+  "Name": "Coordinator-Replica Ring",
+  "Settings": {
+    "Heartbeat": {
+      "Enabled": false,
+      "Visible": false,
+      "Interval": 500,
+      "Tolerance": 1000
+    },
+    "Control Buffer": {
+      "Capacity": 32,
+      "Size": 16384
+    }
+  },
+  "Request Manager": {
+    "Input": "",
+    "Output": ""
+  },
+  "Partitions": [
+    {
+      "Name": "P0",
+      "Tasks": [
+        {
+          "Function Name": "T0",
+          "Inputs": ["Channel1"],
+          "Outputs": ["Channel0"],
+          "Dependencies": []
+        }
+      ]
+    },
+    {
+      "Name": "P1",
+      "Tasks": [
+        {
+          "Function Name": "T1",
+          "Inputs": ["Channel0"],
+          "Outputs": ["Channel1"],
+          "Dependencies": []
+        }
+      ]
+    }
+  ],
+  "Edges": [
+    {
+      "Name": "Channel0",
+      "Buffer Size": 4096
+    },
+    {
+      "Name": "Channel1",
+      "Buffer Size": 4096
+    }
+  ]
+}
