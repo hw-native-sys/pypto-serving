@@ -15,6 +15,8 @@ import json
 from collections import Counter
 from pathlib import Path
 
+from aligned_prompts import validate_prompt_manifest
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -24,6 +26,7 @@ def main() -> None:
     required_files = (
         "responses.json",
         "performance_summary.json",
+        "prompt_manifest.json",
         "server.log",
         "serving-trace/trace.json",
         "simpler-swimlane.json",
@@ -34,6 +37,16 @@ def main() -> None:
     missing = [name for name in required_files if not (root / name).is_file()]
     if missing:
         raise RuntimeError(f"missing profile artifacts: {missing}")
+
+    manifest = json.loads((root / "prompt_manifest.json").read_text(encoding="utf-8"))
+    prompt_digest = validate_prompt_manifest(manifest)
+    performance = json.loads((root / "performance_summary.json").read_text(encoding="utf-8"))
+    if (
+        performance.get("unique_prompts") != 32
+        or performance.get("prompt_tokens_per_request") != 64
+        or performance.get("prompt_token_matrix_sha256") != prompt_digest
+    ):
+        raise RuntimeError("performance summary does not match the 32-prompt alignment set")
 
     payload = json.loads((root / "serving-strace-swimlane.json").read_text())
     events = payload["traceEvents"]
@@ -68,6 +81,8 @@ def main() -> None:
 
     validation = {
         "valid": True,
+        "unique_prompts": len(manifest),
+        "prompt_token_matrix_sha256": prompt_digest,
         "workload": "GBS32/DP8/per-rank-batch4/Seq64/Output256/MTP1/temperature0",
         "categories": dict(sorted(categories.items())),
         "host_devices": devices,

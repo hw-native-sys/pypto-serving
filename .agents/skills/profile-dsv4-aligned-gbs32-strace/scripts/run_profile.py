@@ -16,6 +16,8 @@ import json
 import time
 from pathlib import Path
 
+from aligned_prompts import PROMPT_MATRIX_SHA256, PROMPT_TOKENS, REQUEST_COUNT, build_prompt_manifest
+
 from pypto_serving import GenerateConfig
 from pypto_serving.cli.main import build_parser, build_serving_engine_config
 from pypto_serving.model.tokenizer import load_tokenizer
@@ -23,23 +25,7 @@ from pypto_serving.serving.engine.async_engine import AsyncLLMEngine
 from pypto_serving.tools.profile import configure_profiler, merge_profile, start_profile, stop_profile
 
 
-REQUEST_COUNT = 32
 OUTPUT_TOKENS = 256
-ALIGNED_PROMPT = (
-    "<｜begin▁of▁sentence｜><｜User｜>"
-    "请用中文详细介绍北京故宫，分为历史沿革、整体布局、主要宫殿、建筑特色、重要馆藏、"
-    "文化价值和参观建议七节，每节至少一百字，内容准确连贯，不要省略。请使用清晰的小标题，"
-    "并说明关键年代、人物与用途。"
-    "<｜Assistant｜></think>"
-)
-EXPECTED_PROMPT_IDS = [
-    0, 128803, 2788, 642, 21134, 87336, 6127, 74437, 303, 9969, 5163,
-    8689, 4155, 410, 10319, 17996, 410, 2897, 64474, 410, 6786, 10716,
-    410, 3036, 6071, 5376, 410, 3415, 87482, 23177, 7383, 3958, 2045,
-    303, 1833, 2045, 11732, 21080, 2024, 303, 3975, 12963, 95512, 303,
-    4916, 62186, 320, 2788, 2541, 17165, 5968, 24153, 303, 1380, 6977,
-    7511, 10776, 410, 13320, 947, 27917, 320, 128804, 128822,
-]
 
 
 def parse_args() -> argparse.Namespace:
@@ -140,9 +126,11 @@ async def run(args: argparse.Namespace) -> None:
     )
 
     tokenizer = load_tokenizer(model_dir)
-    prompt_ids = tokenizer.encode(ALIGNED_PROMPT)
-    if prompt_ids != EXPECTED_PROMPT_IDS:
-        raise RuntimeError(f"aligned prompt token mismatch: {prompt_ids}")
+    prompt_manifest = build_prompt_manifest(tokenizer)
+    prompts = [row["rendered_prompt"] for row in prompt_manifest]
+    (artifact_dir / "prompt_manifest.json").write_text(
+        json.dumps(prompt_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
     generate_config = GenerateConfig(
         max_new_tokens=OUTPUT_TOKENS,
         temperature=0.0,
@@ -151,7 +139,6 @@ async def run(args: argparse.Namespace) -> None:
         stream=False,
         ignore_eos=True,
     )
-    prompts = [ALIGNED_PROMPT] * REQUEST_COUNT
     engine = AsyncLLMEngine(config=engine_config, tokenizer=tokenizer)
 
     started = False
@@ -197,7 +184,9 @@ async def run(args: argparse.Namespace) -> None:
         summary = {
             "batch_elapsed_seconds": elapsed,
             "request_count": REQUEST_COUNT,
-            "prompt_tokens_per_request": len(prompt_ids),
+            "prompt_tokens_per_request": PROMPT_TOKENS,
+            "unique_prompts": len(set(prompts)),
+            "prompt_token_matrix_sha256": PROMPT_MATRIX_SHA256,
             "tokens_per_request": lengths,
             "total_output_tokens": total_tokens,
             "throughput_tokens_per_second": total_tokens / elapsed,
