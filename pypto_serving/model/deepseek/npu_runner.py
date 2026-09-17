@@ -2523,7 +2523,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._stage_prefill_fwd_inputs(inputs)
             self._prefill_task_args.clear_outputs()
             args = self._prefill_fwd_args(inputs.kernel_tokens)
-            pre_hc_hidden_buffer = self._prefill_task_args.tensors["pre_hc_hidden_out"]
+            pre_hc_hidden_buffer = self._prefill_task_args.token_view("pre_hc_hidden_out", inputs.kernel_tokens)
             logits_buffer = self._prefill_task_args.tensors["logits"]
         try:
             with profile_span(
@@ -3148,7 +3148,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         inputs: DeepSeekV4PreparedPrefillInputs,
         pre_hc_hidden: torch.Tensor,
     ) -> None:
-        """Rebuild the MTP sliding window from the main-model prefill tail."""
+        """Persist shifted MTP KV for every row of the main-model chunk."""
         layout = self._compiled.layout
         for request_id, rank, actual_tokens in zip(
             inputs.request_ids,
@@ -3166,13 +3166,11 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             position_ids = inputs.position_ids[rank, :n].detach().cpu().to(torch.int32)
             slot_mapping = inputs.ori_slot_mapping[rank, :n].detach().cpu().to(torch.long)
             block_table = inputs.ori_block_table[rank].detach().cpu().clone()
-            tail_tokens = min(n, int(layout.prefill_seq))
-            tail_start = n - tail_tokens
-            current_pre_hc = pre_hc_hidden[rank, :tail_tokens].detach().cpu()
-            if current_pre_hc.shape[0] != tail_tokens:
+            current_pre_hc = pre_hc_hidden[rank, :n].detach().cpu()
+            if current_pre_hc.shape[0] != n:
                 raise ValueError(
                     f"DeepSeekV4 main prefill returned {current_pre_hc.shape[0]} pre-HC rows "
-                    f"for a {tail_tokens}-row MTP tail"
+                    f"for a {n}-row MTP chunk"
                 )
             pending = state.prefill_context
 
@@ -3193,36 +3191,43 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                         f"DeepSeekV4 MTP prefill for {request_id!r} is not contiguous: "
                         f"pending={pending.position_id}, next={first_position}"
                     )
-            if pending is not None and n < layout.prefill_seq:
+            if pending is not None:
                 hidden_parts.append(embeddings[:1])
                 prev_hidden_parts.append(pending.prev_hidden_state.unsqueeze(0))
                 id_parts.append(input_ids[:1])
                 position_parts.append(torch.tensor((pending.position_id,), dtype=torch.int32))
                 slot_parts.append(torch.tensor((pending.slot_mapping,), dtype=torch.long))
 
-            if tail_tokens > 1:
-                hidden_parts.append(embeddings[tail_start + 1 : n])
-                prev_hidden_parts.append(current_pre_hc[: tail_tokens - 1])
-                id_parts.append(input_ids[tail_start + 1 : n])
-                position_parts.append(position_ids[tail_start : n - 1])
-                slot_parts.append(slot_mapping[tail_start : n - 1])
+            if n > 1:
+                hidden_parts.append(embeddings[1:n])
+                prev_hidden_parts.append(current_pre_hc[:n - 1])
+                id_parts.append(input_ids[1:n])
+                position_parts.append(position_ids[:n - 1])
+                slot_parts.append(slot_mapping[:n - 1])
 
             if hidden_parts:
-                self._run_mtp_prefill_rows(
-                    rank=rank,
-                    hidden_states=torch.cat(hidden_parts),
-                    prev_hidden_states=torch.cat(prev_hidden_parts),
-                    input_ids=torch.cat(id_parts),
-                    position_ids=torch.cat(position_parts),
-                    block_table=block_table,
-                    slot_mapping=torch.cat(slot_parts),
-                    produce_draft=False,
-                )
+                hidden_rows = torch.cat(hidden_parts)
+                previous_rows = torch.cat(prev_hidden_parts)
+                ids = torch.cat(id_parts)
+                positions = torch.cat(position_parts)
+                slots = torch.cat(slot_parts)
+                for begin in range(0, int(ids.numel()), int(layout.prefill_seq)):
+                    end = begin + int(layout.prefill_seq)
+                    self._run_mtp_prefill_rows(
+                        rank=rank,
+                        hidden_states=hidden_rows[begin:end],
+                        prev_hidden_states=previous_rows[begin:end],
+                        input_ids=ids[begin:end],
+                        position_ids=positions[begin:end],
+                        block_table=block_table,
+                        slot_mapping=slots[begin:end],
+                        produce_draft=False,
+                    )
 
             last_position = int(position_ids[n - 1].item())
             state.prefill_context = _DeepSeekV4MtpPrefillContext(
                 rank=rank,
-                prev_hidden_state=current_pre_hc[tail_tokens - 1].clone(),
+                prev_hidden_state=current_pre_hc[n - 1].clone(),
                 position_id=last_position,
                 block_table=block_table,
                 slot_mapping=int(slot_mapping[n - 1].item()),
