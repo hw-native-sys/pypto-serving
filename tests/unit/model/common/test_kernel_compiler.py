@@ -16,10 +16,10 @@ returns a ``spec``-typed stand-in for ``DistributedCompiledProgram``.
 
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from pypto import CacheConfig
 
 from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
 from pypto.runtime import RunConfig
@@ -40,8 +40,10 @@ class _FakeJitFn:
         self._program = program
         self.last_config: RunConfig | None = None
         self.compile_calls = 0
+        self.compile_kwargs = {}
 
     def compile(self, *, config: RunConfig, **compile_kwargs: object) -> object:
+        self.compile_kwargs = compile_kwargs
         self.last_config = config
         self.compile_calls += 1
         return self._program
@@ -80,9 +82,7 @@ def test_compile_defaults_disable_scope_stats() -> None:
 
 def test_compile_carries_aicpu_thread_num_from_run_config_to_callable() -> None:
     """``aicpu_thread_num`` from the base RunConfig reaches the L3Callable."""
-    run_config = build_pypto_run_config(
-        platform="a2a3sim", device_ids=(0, 1), aicpu_thread_num=8
-    )
+    run_config = build_pypto_run_config(platform="a2a3sim", device_ids=(0, 1), aicpu_thread_num=8)
     jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
     compiler = KernelCompiler(run_config=run_config)
 
@@ -104,7 +104,7 @@ def test_compile_forwards_runtime_scalar_kwargs_to_jit_fn() -> None:
 
     compiler.compile("mtp_prefill", jit_fn, num_tokens=RUNTIME)
 
-    assert jit_fn.compile_calls == 1
+    assert jit_fn.compile_kwargs == {"num_tokens": RUNTIME}
 
 
 def test_compile_raises_on_non_distributed_compiled_program() -> None:
@@ -116,68 +116,103 @@ def test_compile_raises_on_non_distributed_compiled_program() -> None:
         compiler.compile("prefill", jit_fn)
 
 
-# --- on-disk cache (load) ----------------------------------------------------
+@pytest.mark.parametrize("use_cache", [None, False, True])
+def test_cache_policy_does_not_request_diagnostic_output(tmp_path, monkeypatch, use_cache):
+    monkeypatch.setenv("PYPTO_CACHE_DIR", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("PYPTO_CACHE_READONLY", "1")
+    jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
+    compiler = _make_compiler()
+    compiler.compile("prefill", jit_fn, use_cache=use_cache)
+    config = jit_fn.last_config
+    assert not config.save_kernels
+    assert config.save_kernels_dir is None
+    if use_cache is None:
+        assert config.cache_config is None
+    else:
+        assert config.cache_config.enabled is use_cache
+        assert config.cache_config.root == tmp_path / "artifacts"
+        assert config.cache_config.readonly is use_cache
 
 
-def _seed_slot(cache_dir: Path, name: str) -> Path:
-    """Create a cache slot that looks like it holds an assembled program."""
-    slot = cache_dir / name
-    slot.mkdir(parents=True)
+def test_old_named_slot_never_short_circuits_jit(tmp_path, monkeypatch):
+    slot = tmp_path / "prefill"
+    slot.mkdir()
     (slot / "distributed_meta.json").write_text("{}")
-    return slot
 
+    def unexpected_load(*args, **kwargs):
+        raise AssertionError("serving must never restore an unvalidated named slot")
 
-def test_cache_miss_compiles_into_per_kernel_slot(tmp_path: Path) -> None:
-    """An empty slot falls through to JIT, writing straight into cache_dir/<name>."""
+    monkeypatch.setattr(DistributedCompiledProgram, "from_dir", unexpected_load)
     jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
-    compiler = _make_compiler(cache_dir=str(tmp_path))
-
-    result = compiler.compile("prefill", jit_fn, use_cache=True)
-
+    compiler = _make_compiler(cache_dir=tmp_path)
+    compiler.compile("prefill", jit_fn, use_cache=True)
     assert jit_fn.compile_calls == 1
-    assert result.compiled is jit_fn._program
-    # pypto is pointed straight at the per-kernel slot (no separate copy step).
+    assert jit_fn.last_config.cache_config == CacheConfig(enabled=True, root=tmp_path)
+    assert (slot / "distributed_meta.json").read_text() == "{}"
+
+
+def test_explicit_policy_preserves_extra_sources_and_readonly(tmp_path):
+    from dataclasses import replace
+
+    policy = CacheConfig(
+        enabled=True,
+        root=tmp_path,
+        readonly=True,
+        extra_source_paths=(tmp_path / "kernels",),
+        extra_fingerprint="model-v1",
+    )
+    config = replace(_base_run_config(), cache_config=policy)
+    jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
+    compiler = _make_compiler(run_config=config)
+    compiler.compile("prefill", jit_fn, use_cache=False)
+    assert jit_fn.last_config.cache_config == replace(policy, enabled=False)
+    assert config.cache_config is policy
+    compiler.compile("prefill", jit_fn)
+    assert jit_fn.last_config.cache_config is policy
+
+
+def test_explicit_output_keeps_pypto_bypass_contract(tmp_path):
+    jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
+    compiler = _make_compiler(save_kernels=True, save_kernels_dir=str(tmp_path))
+    compiler.compile("prefill", jit_fn, use_cache=True)
     assert jit_fn.last_config.save_kernels is True
-    assert jit_fn.last_config.save_kernels_dir == str(tmp_path / "prefill")
+    assert jit_fn.last_config.save_kernels_dir == str(tmp_path)
+    assert jit_fn.last_config.cache_config.enabled is True
 
 
-def test_cache_hit_reloads_program_and_skips_jit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A populated slot is reloaded via from_dir and JIT is skipped."""
-    _seed_slot(tmp_path, "prefill")
-    cached = MagicMock(spec=DistributedCompiledProgram)
-    monkeypatch.setattr(
-        DistributedCompiledProgram,
-        "from_dir",
-        lambda slot, **kw: cached,
-    )
+def test_callable_uses_effective_distributed_config():
+    from pypto.ir.distributed_compiled_program import DistributedConfig
 
+    config = DistributedConfig(device_ids=[2], aicpu_thread_num=8)
     jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
-    compiler = _make_compiler(cache_dir=str(tmp_path))
+    result = _make_compiler(distributed_config=config).compile("prefill", jit_fn)
+    assert result.aicpu_thread_num == 8
+    assert jit_fn.last_config.distributed_config is config
 
-    result = compiler.compile("prefill", jit_fn, use_cache=True)
 
+@pytest.mark.parametrize("value", ["yes", 1, object()])
+def test_invalid_cache_override_fails_before_compilation(value):
+    jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
+    with pytest.raises(TypeError, match="use_cache"):
+        _make_compiler().compile("prefill", jit_fn, use_cache=value)
     assert jit_fn.compile_calls == 0
-    assert result.compiled is cached
-    assert result.name == "prefill"
-    assert result.aicpu_thread_num == 4
 
 
-def test_cache_disabled_recompiles_even_when_slot_populated(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``use_cache=False`` ignores a populated slot and recompiles."""
-    _seed_slot(tmp_path, "prefill")
-    monkeypatch.setattr(
-        DistributedCompiledProgram,
-        "from_dir",
-        lambda slot, **kw: MagicMock(spec=DistributedCompiledProgram),
-    )
+def test_invalid_readonly_environment_fails_before_compilation(monkeypatch):
+    monkeypatch.setenv("PYPTO_CACHE_READONLY", "yes")
     jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
-    compiler = _make_compiler(cache_dir=str(tmp_path))
+    with pytest.raises(ValueError, match="PYPTO_CACHE_READONLY"):
+        _make_compiler().compile("prefill", jit_fn, use_cache=True)
+    assert jit_fn.compile_calls == 0
 
-    result = compiler.compile("prefill", jit_fn, use_cache=False)
 
-    assert jit_fn.compile_calls == 1
-    assert result.compiled is jit_fn._program
+def test_explicit_output_base_keeps_programs_separate(tmp_path):
+    config = build_pypto_run_config(
+        platform="a2a3sim", device_ids=[0], pypto_build_dir=str(tmp_path),
+    )
+    compiler = _make_compiler(run_config=config)
+    jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
+    for name in ("prefill", "decode"):
+        compiler.compile(name, jit_fn, use_cache=True)
+        assert jit_fn.last_config.save_kernels_dir == str(tmp_path / name)
+    assert config.save_kernels_dir == str(tmp_path)

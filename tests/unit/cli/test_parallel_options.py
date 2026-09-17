@@ -151,3 +151,30 @@ def test_generate_config_defaults_to_greedy(options):
     config = cli._build_generate_config(options)
 
     assert config.temperature == 0.0
+
+
+@pytest.mark.parametrize("flag, expected", [(None, None), ("--use-compile-cache", True), ("--no-use-compile-cache", False)])
+def test_compile_cache_flag_preserves_inherited_or_explicit_policy(tmp_path, flag, expected):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    args = _parse_cli_args(["--model", str(model_dir)] + ([flag] if flag else []))
+    config = cli.build_serving_engine_config(args)
+    assert config.executor_kwargs["use_compile_cache"] is expected
+
+
+@pytest.mark.parametrize("requested", [None, "", "diagnostic-output"])
+def test_worker_only_exports_explicit_build_directory(monkeypatch, requested):
+    import os
+    from types import SimpleNamespace
+    from pathlib import Path
+    from pypto_serving.serving.server.serving_worker import WorkerProcess
+
+    if requested is None:
+        monkeypatch.delenv("PYPTO_PROG_BUILD_DIR", raising=False)
+    else:
+        monkeypatch.setenv("PYPTO_PROG_BUILD_DIR", requested)
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.config = SimpleNamespace(dp_rank=2)
+    directory = worker._configure_pypto_build_dir((3, 4))
+    assert directory == (Path(requested) / "serving_dp2_d3_4" if requested else None)
+    assert os.environ.get("PYPTO_PROG_BUILD_DIR") == (str(directory) if requested else requested)

@@ -40,14 +40,59 @@ pypto-serving \
 | `--devices LIST` | unset | Comma-separated device IDs for multi-device placement. |
 | `--dtype DTYPE` | `bfloat16` | Weight data type. |
 | `--kv-cache-dtype DTYPE` | `bfloat16` | KV cache data type. `auto` follows `--dtype`. |
-| `--use-compile-cache` | off | Reuse compiled kernels from `PYPTO_PROG_BUILD_DIR`. |
+| `--use-compile-cache` / `--no-use-compile-cache` | inherit PyPTO policy (off by default) | Enable/disable validated persistent JIT reuse. |
 | `--show-startup-logs` | off | Show model loading and kernel compilation logs. |
 
 ### Startup and Build Cache
 
-The first NPU run may compile kernels and assemble device binaries. Set `PYPTO_PROG_BUILD_DIR` to choose a persistent build directory, then pass `--use-compile-cache` to reuse compiled programs on later launches.
+The first NPU run may compile kernels and assemble device binaries. Serving uses
+PyPTO's persistent JIT cache for Qwen, DeepSeek V4 MTP and DSpark. Install a PyPTO
+revision containing [#2723](https://github.com/hw-native-sys/pypto/pull/2723).
 
-The compile cache does not perform fingerprint validation. Reuse it only with the same model configuration, platform, assigned devices, and kernel sources. Clear the build directory after any of those inputs changes. Use `--show-startup-logs` when startup progress or cache behavior needs to be visible in the server logs.
+```bash
+PYPTO_CACHE_DIR=/path/to/shared-jit-cache pypto-serving \
+  --model /path/to/Qwen3-14B --platform a2a3 --use-compile-cache
+```
+
+With neither flag, PyPTO resolves `RunConfig.cache_config`, process defaults from
+`pypto.configure_cache()`, then `PYPTO_CACHE`, `PYPTO_CACHE_DIR` and
+`PYPTO_CACHE_READONLY`. Process defaults must be configured in the worker process;
+environment variables reach spawned workers. `PYPTO_CACHE=1` enables reuse without
+a CLI flag. The default artifact root is `~/.cache/pypto/jit`.
+`--no-use-compile-cache` explicitly disables persistence. An explicit enable flag
+uses the configured root and read-only environment settings unless a Python
+caller supplied a complete `RunConfig.cache_config` policy.
+
+Leave `PYPTO_PROG_BUILD_DIR` unset for cache reuse. PyPTO treats it as an explicit
+output/rebuild request, so setting it intentionally bypasses caching; serving
+only adds a per-worker suffix when the user explicitly sets it. Private cache
+misses/runtime output use PyPTO's own unique build directories, separate from
+`PYPTO_CACHE_DIR`. Existing named build slots are not imported or trusted; they
+can remain on disk while the new cache is populated. Serving no longer
+needs manual cache clearing after source, specialization, platform or toolchain
+changes: PyPTO checks those inputs before reuse. Toolchain installations must
+remain unchanged for the lifetime of a worker; restart workers after upgrades.
+
+Ordinary worker initialization publishes GENERATED and then READY artifacts as
+it prepares the binaries. No serving `load()`/`store()` or separate warmup call
+is required. `compile()` alone does not promise READY; use a JIT function's
+`warmup()` API when preparing complete binaries without launching a worker.
+Explicit diagnostic/output requests retain PyPTO's cache bypass behavior.
+
+`PYPTO_CACHE_READONLY=1` allows reuse without cache writes. A miss, invalid entry,
+unsupported input or unavailable storage falls back to private compilation.
+For a known artifact key, storage fallback coalesces concurrent requests within
+one process. Private compilation results are not shared across processes.
+Cache writers must be trusted. Different device placements/configurations can
+produce different keys, so sharing a directory does not guarantee hits across ranks.
+
+Cache hits still pay toolchain discovery/content-inventory costs in each new
+process; the measured PyPTO baseline was about 12 seconds on one installation.
+Cross-process amortization is tracked in
+[#2732](https://github.com/hw-native-sys/pypto/issues/2732). In the worker process,
+`pypto.cache_stats()` reports stage hits/builds and `last_bypass_reason`;
+`python -m pypto.jit stat --root /path/to/shared-jit-cache` inspects disk entries.
+Use `--show-startup-logs` to see compilation progress.
 
 ## Parallelism Arguments
 

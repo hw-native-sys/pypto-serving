@@ -95,8 +95,10 @@ def test_partitioned_prefill_chunks_keep_cache_partitions_unique():
 def test_worker_releases_preempted_state_before_same_command_reregistration():
     released: list[str] = []
     results: list[bytes] = []
+    sampler_released: list[str] = []
     worker = WorkerProcess.__new__(WorkerProcess)
     worker.executor = SimpleNamespace(release_finished_requests=released.extend)
+    worker.sampler = SimpleNamespace(release_requests=sampler_released.extend)
     worker._req_cache = {
         "req": NewRequestData("req", [0], 0.0, 1.0, None),
     }
@@ -114,6 +116,7 @@ def test_worker_releases_preempted_state_before_same_command_reregistration():
     worker._handle_step_command(command)
 
     assert released == ["req"]
+    assert sampler_released == ["req"]
     assert worker._req_cache["req"] == replacement
     assert len(results) == 1
 

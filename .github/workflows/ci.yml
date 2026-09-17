@@ -97,7 +97,25 @@ jobs:
           build-namespace: pypto-serving
           pip-cache-name: pip-pypto-serving
 
-      - name: Run Qwen3 accuracy guard
+      - name: Run serving unit tests
+        run: |
+          cd "$GITHUB_WORKSPACE/dist-checkout"
+          source activate.sh
+          python -m pytest tests/unit -q
+
+      - name: Run shared compiler cache acceptance
+        env:
+          PYTHONPATH: ${{ github.workspace }}/dist-checkout
+        run: |
+          source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
+          run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
+          run_cmd="$run_cmd && source activate.sh"
+          run_cmd="$run_cmd && DEVICE_ID=\$TASK_DEVICE"
+          run_cmd="$run_cmd PYTHONPATH=$PYTHONPATH"
+          run_cmd="$run_cmd python -m pytest tests/test_jit_cache.py -q -s"
+          task-submit --device auto --timeout 1200 --max-time 1800 --run "$run_cmd"
+
+      - name: Run Qwen3 cold and READY accuracy guard
         env:
           PYTHONPATH: ${{ github.workspace }}/dist-checkout
         run: |
@@ -107,7 +125,7 @@ jobs:
           run_cmd="$run_cmd && DEVICE_ID=\$TASK_DEVICE"
           run_cmd="$run_cmd PYTHONPATH=$PYTHONPATH"
           run_cmd="$run_cmd PYPTO_QWEN3_MODEL_DIR=$PYPTO_QWEN3_MODEL_DIR"
-          run_cmd="$run_cmd python -m pytest tests/test_qwen3_accuracy.py -q -s"
+          run_cmd="$run_cmd python -m pytest tests/test_qwen3_jit_cache.py -q -s"
           task-submit --device auto --timeout 1200 --max-time 1800 --run "$run_cmd"
 
       - name: Run Qwen3 serving guard (prefix cache, chunked prefill, multi-batch)
