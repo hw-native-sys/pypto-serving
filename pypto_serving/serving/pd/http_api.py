@@ -19,7 +19,6 @@ from .protocol import CapabilityWire, ContinuationMetadata, DecodeOutputWire, Ha
 
 
 MAX_INTERNAL_BODY_BYTES = 4 << 20
-INTERNAL_AUTH_HEADER = "x-pypto-pd-auth"
 
 
 class NodeDescriptor(msgspec.Struct, frozen=True):
@@ -94,7 +93,11 @@ class AuthorizeRouteHTTP(msgspec.Struct, frozen=True):
     prepared_digest: str
     reservation_id: str
     reservation_capability: str
-    route_ticket: str
+    compatibility_digest: str
+    prefill_node_id: str
+    prefill_endpoint_generation: int
+    decode_node_id: str
+    decode_endpoint_generation: int
 
 
 class ExecutePrefillHTTP(msgspec.Struct, frozen=True):
@@ -105,7 +108,9 @@ class ExecutePrefillHTTP(msgspec.Struct, frozen=True):
     partition: int
     block_ids_by_group: dict[str, tuple[int, ...]]
     reservation_capability: str
-    route_ticket: str
+    compatibility_digest: str
+    prefill_node_id: str
+    prefill_endpoint_generation: int
     decode_node_id: str
     decode_control_host: str
     decode_control_port: int

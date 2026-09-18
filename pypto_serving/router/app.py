@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from pypto_serving.serving.pd.admission import PDBackpressureError
 from pypto_serving.serving.pd.metrics import token_ids_sha256
+from pypto_serving.serving.pd.observability import write_startup_record
 
 from .client import NodeClient
 from .config import RouterConfig
@@ -59,10 +60,8 @@ class ChatCompletionRequest(BaseModel):
 
 
 def create_router_app(config: RouterConfig) -> FastAPI:
-    auth_secret = config.auth_secret()
-    config.route_secret()
-    p_client = NodeClient(config.prefill_url, auth_secret, config.request_timeout_seconds)
-    d_client = NodeClient(config.decode_url, auth_secret, config.request_timeout_seconds)
+    p_client = NodeClient(config.prefill_url, config.request_timeout_seconds)
+    d_client = NodeClient(config.decode_url, config.request_timeout_seconds)
     directory = FixedWorkerDirectory(
         p_client,
         d_client,
@@ -101,6 +100,16 @@ def create_router_app(config: RouterConfig) -> FastAPI:
 
     @app.on_event("startup")
     async def startup() -> None:
+        write_startup_record(
+            config.log_dir,
+            enabled=config.observability_enabled,
+            values={
+                "process": "router",
+                "run_id": config.run_id,
+                "provider": config.provider,
+                "policy": config.policy,
+            },
+        )
         await coordinator.reconcile_startup()
 
     @app.get("/health")
@@ -139,7 +148,7 @@ def create_router_app(config: RouterConfig) -> FastAPI:
     @app.get("/v1/models")
     async def list_models() -> JSONResponse:
         pair = await directory.select()
-        model = config.model_id or pair.prefill.capabilities.model_revision
+        model = pair.prefill.capabilities.model_revision
         return JSONResponse(
             {
                 "object": "list",
@@ -152,7 +161,7 @@ def create_router_app(config: RouterConfig) -> FastAPI:
         raw = await _bounded_body(request, config.max_request_bytes)
         public = CompletionRequest.model_validate_json(raw)
         request_id = f"cmpl-{uuid.uuid4().hex[:8]}"
-        model = public.model or config.model_id
+        model = public.model
         if public.stream:
             return StreamingResponse(
                 _stream_completion(coordinator, raw, request_id, model),
@@ -190,7 +199,7 @@ def create_router_app(config: RouterConfig) -> FastAPI:
         raw = await _bounded_body(request, config.max_request_bytes)
         public = ChatCompletionRequest.model_validate_json(raw)
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-        model = public.model or config.model_id
+        model = public.model
         if public.stream:
             return StreamingResponse(
                 _stream_chat(coordinator, raw, request_id, model),

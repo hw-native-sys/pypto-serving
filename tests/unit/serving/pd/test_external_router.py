@@ -184,13 +184,14 @@ class _ReserveFailureDecodeClient(_DecodeClient):
 
 
 def _coordinator(monkeypatch, tmp_path, p_client, d_client):
-    monkeypatch.setenv("TEST_ROUTE_SECRET", "0123456789abcdef0123456789abcdef")
     config = RouterConfig(
         prefill_url="http://prefill",
         decode_url="http://decode",
         run_id="run",
-        route_secret_env="TEST_ROUTE_SECRET",
+        policy="round_robin",
+        provider="mooncake",
         journal_path=str(tmp_path / "router.jsonl"),
+        log_dir=str(tmp_path / "logs"),
     )
     journal = RouterJournal(config.journal_path, config.run_id)
     coordinator = RouterCoordinator(

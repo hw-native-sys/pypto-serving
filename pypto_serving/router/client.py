@@ -10,7 +10,6 @@ import urllib.error
 import urllib.request
 
 from pypto_serving.serving.pd.http_api import (
-    INTERNAL_AUTH_HEADER,
     MAX_INTERNAL_BODY_BYTES,
     DecodeStreamFrame,
     decode_json,
@@ -19,9 +18,8 @@ from pypto_serving.serving.pd.http_api import (
 
 
 class NodeClient:
-    def __init__(self, base_url: str, auth_secret: str, timeout_seconds: float) -> None:
+    def __init__(self, base_url: str, timeout_seconds: float) -> None:
         self.base_url = base_url.rstrip("/")
-        self.auth_secret = auth_secret
         self.timeout_seconds = timeout_seconds
 
     async def get(self, path: str, response_type):
@@ -73,7 +71,6 @@ class NodeClient:
             data=body,
             method=method,
             headers={
-                INTERNAL_AUTH_HEADER: self.auth_secret,
                 "content-type": "application/json",
             },
         )

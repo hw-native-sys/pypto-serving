@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Authenticated PD Host sessions, including external-router lazy peers."""
+"""PD Host sessions for external-router lazy peers."""
 
 from __future__ import annotations
 
@@ -18,9 +18,9 @@ from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from .config import PDConfig, PDCapabilities, PD_PHYSICAL_REGIONS, PDRole
+from .config import PDConfig, PDCapabilities, PDRole
 from .protocol import (
-    AuthenticatedFramedChannel,
+    FramedChannel,
     ControlMessage,
     Hello,
     RegistryAdvertisement,
@@ -36,7 +36,7 @@ class PDControlSession:
     def __init__(
         self,
         sock: socket.socket,
-        channel: AuthenticatedFramedChannel,
+        channel: FramedChannel,
         peer_hello: Hello,
     ) -> None:
         self._socket = sock
@@ -62,7 +62,11 @@ class PDControlSession:
         self,
         local: RegistryAdvertisement,
     ) -> RegistryAdvertisement:
-        validate_rank_registrations(local.ranks, expected_count=local.topology[0])
+        validate_rank_registrations(
+            local.ranks,
+            expected_count=local.topology[0],
+            expected_components=self.peer_hello.capabilities.physical_regions,
+        )
         await self.send(local)
         peer = await self.receive()
         if not isinstance(peer, RegistryAdvertisement):
@@ -77,7 +81,11 @@ class PDControlSession:
             raise ValueError("PD peer registry differs from its authenticated hello")
         if len(peer.ranks) != peer.topology[0]:
             raise ValueError("PD peer registry rank count differs from its topology")
-        validate_rank_registrations(peer.ranks, expected_count=peer.topology[0])
+        validate_rank_registrations(
+            peer.ranks,
+            expected_count=peer.topology[0],
+            expected_components=capabilities.physical_regions,
+        )
         return peer
 
     async def close(self) -> None:
@@ -260,18 +268,9 @@ class PDControlAcceptor:
         loop = asyncio.get_running_loop()
         sock, address = await loop.sock_accept(self._listener)
         try:
-            if self.config.peer_host:
-                allowed = _resolved_addresses(
-                    self.config.peer_host,
-                    self.config.control_port,
-                )
-                if address[0] not in allowed:
-                    raise PermissionError(
-                        "PD control connection came from a non-allowlisted peer"
-                    )
             sock.setblocking(True)
             sock.settimeout(self.config.request_timeout_seconds)
-            return await _authenticate_socket(
+            return await _open_pd_socket(
                 sock,
                 self.config,
                 capabilities,
@@ -287,31 +286,6 @@ class PDControlAcceptor:
             return
         self._closed = True
         self._listener.close()
-
-
-async def open_control_session(
-    config: PDConfig,
-    capabilities: PDCapabilities,
-) -> PDControlSession:
-    """Open, authenticate and capability-check the configured fixed peer."""
-    if not config.enabled:
-        raise ValueError("PD control session requires an enabled configuration")
-    if config.role is PDRole.DECODE:
-        acceptor = PDControlAcceptor(config)
-        try:
-            return await acceptor.accept(
-                capabilities,
-                expected_peer_node_id=config.peer_node_id,
-            )
-        finally:
-            acceptor.close()
-    return await connect_control_session(
-        config,
-        capabilities,
-        peer_node_id=config.peer_node_id,
-        peer_host=config.peer_host,
-        peer_port=config.control_port,
-    )
 
 
 async def connect_control_session(
@@ -332,7 +306,7 @@ async def connect_control_session(
         config.connect_timeout_seconds,
     )
     sock.settimeout(config.request_timeout_seconds)
-    return await _authenticate_socket(
+    return await _open_pd_socket(
         sock,
         config,
         capabilities,
@@ -341,7 +315,7 @@ async def connect_control_session(
     )
 
 
-async def _authenticate_socket(
+async def _open_pd_socket(
     sock: socket.socket,
     config: PDConfig,
     capabilities: PDCapabilities,
@@ -349,10 +323,8 @@ async def _authenticate_socket(
     expected_peer_node_id: str,
     expected_peer_role: PDRole,
 ) -> PDControlSession:
-    channel = AuthenticatedFramedChannel(
+    channel = FramedChannel(
         sock,
-        secret=config.auth_secret(),
-        context=f"pypto-pd:{config.run_id}",
         local_node_id=config.node_id,
         peer_node_id=expected_peer_node_id,
     )
@@ -381,37 +353,6 @@ async def _authenticate_socket(
     return PDControlSession(sock, channel, peer)
 
 
-def _open_socket(config: PDConfig) -> socket.socket:
-    if config.role is PDRole.DECODE:
-        return _accept_fixed_peer(config)
-    return _connect_fixed_peer(config)
-
-
-def _accept_fixed_peer(config: PDConfig) -> socket.socket:
-    allowed = _resolved_addresses(config.peer_host, config.control_port)
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.settimeout(config.connect_timeout_seconds)
-    try:
-        listener.bind((config.control_host, config.control_port))
-        listener.listen(1)
-        channel, address = listener.accept()
-        if address[0] not in allowed:
-            channel.close()
-            raise PermissionError("PD control connection came from a non-allowlisted peer")
-        return channel
-    finally:
-        listener.close()
-
-
-def _connect_fixed_peer(config: PDConfig) -> socket.socket:
-    return _connect_endpoint(
-        config.peer_host,
-        config.control_port,
-        config.connect_timeout_seconds,
-    )
-
-
 def _connect_endpoint(host: str, port: int, timeout_seconds: float) -> socket.socket:
     deadline = time.monotonic() + timeout_seconds
     last_error: OSError | None = None
@@ -428,17 +369,11 @@ def _connect_endpoint(host: str, port: int, timeout_seconds: float) -> socket.so
     raise TimeoutError("PD fixed peer did not accept the control connection") from last_error
 
 
-def _resolved_addresses(host: str, port: int) -> set[str]:
-    return {
-        address[4][0]
-        for address in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    }
-
-
 def validate_rank_registrations(
     registrations: Iterable,
     *,
     expected_count: int,
+    expected_components: tuple[str, ...],
 ) -> None:
     """Shared structural validation used before envelopes reach a worker."""
     ranks = tuple(registrations)
@@ -452,8 +387,8 @@ def validate_rank_registrations(
         if not registration.worker_id:
             raise ValueError("PD registry worker identity must not be empty")
         regions = {region.component_id: region for region in registration.regions}
-        if set(regions) != set(PD_PHYSICAL_REGIONS):
-            raise ValueError("PD registry owner must expose all eight physical regions")
+        if set(regions) != set(expected_components):
+            raise ValueError("PD registry owner components differ from capabilities")
         if len(regions) != len(registration.regions):
             raise ValueError("PD registry owner contains duplicate physical regions")
         for region in regions.values():
