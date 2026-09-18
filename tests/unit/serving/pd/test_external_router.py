@@ -7,6 +7,7 @@ import time
 
 import pytest
 
+from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
 from pypto_serving.router.config import RouterConfig
 from pypto_serving.router.coordinator import RouterCoordinator
 from pypto_serving.router.directory import FixedWorkerDirectory
@@ -29,10 +30,16 @@ from pypto_serving.serving.pd.protocol import (
 
 def _descriptor(role: PDRole) -> NodeDescriptor:
     capabilities = PDCapabilities(
+        adapter_id=DSV4_DSPARK_K7_CONTRACT.adapter_id,
+        contract_version=DSV4_DSPARK_K7_CONTRACT.version,
+        contract_digest=DSV4_DSPARK_K7_CONTRACT.digest,
+        continuation_schema=DSV4_DSPARK_K7_CONTRACT.continuation_schema,
         model_revision="model",
         registry_fingerprint=("a" if role is PDRole.PREFILL else "b") * 64,
         layout_fingerprint="c" * 64,
         topology=(16, 4),
+        logical_groups=DSV4_DSPARK_K7_CONTRACT.logical_groups,
+        physical_regions=DSV4_DSPARK_K7_CONTRACT.physical_regions,
     )
     return NodeDescriptor(
         node_id=role.value,

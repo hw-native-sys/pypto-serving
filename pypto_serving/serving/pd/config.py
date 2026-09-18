@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from .contracts import ModelPDContract, RuntimeLayoutDescriptor
+
 
 PD_SCHEMA_VERSION = 4
 PD_DSPARK_SPECULATIVE_TOKENS = 7
@@ -198,6 +200,7 @@ class PDConfig:
     control_advertise_host: str
     transfer_hostname: str
     model_revision: str
+    model_contract: ModelPDContract
     provider: str = "mooncake"
     generation: int = 1
     route_epoch: int = 1
@@ -226,6 +229,8 @@ class PDConfig:
             "transfer_hostname", "model_revision", "provider",
         ):
             _identifier(getattr(self, name), name)
+        if self.model_contract.model_family == "" or self.model_contract.version < 1:
+            raise ValueError("PD model contract is invalid")
         if type(self.control_port) is not int or not 1 <= self.control_port <= 65535:
             raise ValueError("PD control_port must be in [1, 65535]")
         if self.max_active_handoffs > self.max_pending_handoffs:
@@ -254,6 +259,7 @@ def resolve_pd_config(
     *,
     role: PDRole,
     model_revision: str,
+    model_contract: ModelPDContract,
     node_id: str = "",
 ) -> PDConfig:
     endpoint = document.endpoint(role, node_id)
@@ -278,6 +284,7 @@ def resolve_pd_config(
         control_advertise_host=endpoint.control_host or endpoint.host,
         transfer_hostname=endpoint.transfer_hostname or endpoint.host,
         model_revision=model_revision,
+        model_contract=model_contract,
         provider=document.runtime.provider,
         journal_path=str(state_dir / "journal.jsonl"),
         log_dir=str(role_dir),
@@ -300,25 +307,40 @@ class PDWorkerConfig:
 
 @dataclass(frozen=True)
 class PDCapabilities:
-    """Temporary DSV4 capability shape; generalized in F2."""
-
+    adapter_id: str
+    contract_version: int
+    contract_digest: str
+    continuation_schema: str
     model_revision: str
     registry_fingerprint: str
     layout_fingerprint: str
     topology: tuple[int, ...]
     provider: str = "mooncake"
     schema_version: int = PD_SCHEMA_VERSION
-    logical_groups: tuple[str, ...] = PD_LOGICAL_GROUPS
-    physical_regions: tuple[str, ...] = PD_PHYSICAL_REGIONS
-    chunk_transfer: bool = True
-    target_cache_only: bool = True
-    decode_speculative_tokens: int = PD_DSPARK_SPECULATIVE_TOKENS
+    logical_groups: tuple[str, ...] = ()
+    physical_regions: tuple[str, ...] = ()
+
+    @classmethod
+    def from_layout(cls, layout: RuntimeLayoutDescriptor) -> "PDCapabilities":
+        return cls(
+            adapter_id=layout.adapter_id,
+            contract_version=layout.contract_version,
+            contract_digest=layout.contract_digest,
+            continuation_schema=layout.continuation_schema,
+            model_revision=layout.model_revision,
+            registry_fingerprint=layout.registry_fingerprint,
+            layout_fingerprint=layout.layout_fingerprint,
+            topology=layout.topology,
+            provider=layout.provider,
+            logical_groups=layout.logical_groups,
+            physical_regions=layout.physical_regions,
+        )
 
     def compatibility_error(self, peer: "PDCapabilities") -> str | None:
         for name in (
-            "schema_version", "model_revision", "layout_fingerprint", "topology",
-            "provider", "logical_groups", "physical_regions", "chunk_transfer",
-            "target_cache_only", "decode_speculative_tokens",
+            "schema_version", "adapter_id", "contract_version", "contract_digest",
+            "continuation_schema", "model_revision", "layout_fingerprint", "topology",
+            "provider", "logical_groups", "physical_regions",
         ):
             if getattr(self, name) != getattr(peer, name):
                 return f"PD capability mismatch: {name}"

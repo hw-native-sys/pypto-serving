@@ -387,12 +387,9 @@ def _build_pd_config(
     model_family: str,
     model_variant: str | None,
 ):
-    from pypto_serving.serving.pd.config import (
-        PD_DSPARK_SPECULATIVE_TOKENS,
-        PDRole,
-        load_pd_document,
-        resolve_pd_config,
-    )
+    from pypto_serving.model.pd_adapters import builtin_pd_adapter_registry
+    from pypto_serving.serving.pd.adapter import ModelRuntimeFacts
+    from pypto_serving.serving.pd.config import PDRole, load_pd_document, resolve_pd_config
 
     role = PDRole(args.pd_role)
     if role is PDRole.DISABLED:
@@ -401,18 +398,19 @@ def _build_pd_config(
         return None
     if not args.pd_config:
         raise ValueError("--pd-role requires --pd-config")
-    if model_family != "deepseek_v4" or model_variant != "dspark":
-        raise ValueError("--pd-role currently requires the DeepSeek V4 DSpark model variant")
-    if _resolve_num_speculative_tokens(args) != PD_DSPARK_SPECULATIVE_TOKENS:
-        raise ValueError(
-            "--pd-role requires DeepSeek V4 DSpark K7 "
-            f"(num_speculative_tokens={PD_DSPARK_SPECULATIVE_TOKENS})"
+    adapter = builtin_pd_adapter_registry().select(
+        ModelRuntimeFacts(
+            model_family=model_family,
+            model_variant=model_variant or "",
+            num_speculative_tokens=_resolve_num_speculative_tokens(args),
         )
+    )
     return resolve_pd_config(
         load_pd_document(args.pd_config),
         role=role,
         node_id=args.pd_node_id,
         model_revision=args.served_model_name or Path(args.model).name,
+        model_contract=adapter.contract,
     )
 
 

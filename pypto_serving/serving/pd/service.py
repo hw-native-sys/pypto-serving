@@ -27,6 +27,7 @@ from pypto_serving.transfer.types import CompletionCertainty
 
 from .admission import FairByteBudget, FairHandoffAdmission
 from .config import PDCapabilities, PDConfig, PDRole
+from .contracts import RuntimeLayoutDescriptor
 from .connector import DecodeConnector
 from .coordinator import HandoffCoordinator
 from .journal import DurablePDJournal
@@ -190,13 +191,12 @@ class PDServingService:
             raise RuntimeError("worker registry fingerprint is not self-consistent")
         if registry.layout_fingerprint != bundle.layout_fingerprint:
             raise RuntimeError("worker layout fingerprint is not self-consistent")
-        capabilities = PDCapabilities(
-            model_revision=bundle.model_revision,
-            registry_fingerprint=bundle.registry_fingerprint,
-            layout_fingerprint=bundle.layout_fingerprint,
-            topology=bundle.topology,
-            provider=self.config.provider,
-            decode_speculative_tokens=self.config.decode_speculative_tokens,
+        capabilities = PDCapabilities.from_layout(
+            RuntimeLayoutDescriptor.from_runtime_bundle(
+                self.config.model_contract,
+                bundle,
+                provider=self.config.provider,
+            )
         )
         local_advertisement = RegistryAdvertisement(
             model_revision=bundle.model_revision,

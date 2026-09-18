@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 
 from pypto_serving.model.deepseek.transfer_layout import ComponentLayout, DSV4Registry
+from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
 from pypto_serving.model.deepseek_dspark.npu_runner import build_dspark_cache_group_specs
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.pd.config import PDCapabilities
@@ -66,10 +67,16 @@ def make_registry(manager: KvCacheManager) -> DSV4Registry:
 
 def make_capabilities(registry: DSV4Registry) -> PDCapabilities:
     return PDCapabilities(
+        adapter_id=DSV4_DSPARK_K7_CONTRACT.adapter_id,
+        contract_version=DSV4_DSPARK_K7_CONTRACT.version,
+        contract_digest=DSV4_DSPARK_K7_CONTRACT.digest,
+        continuation_schema=DSV4_DSPARK_K7_CONTRACT.continuation_schema,
         model_revision=registry.model_revision,
         registry_fingerprint=registry.fingerprint,
         layout_fingerprint=registry.layout_fingerprint,
         topology=registry.topology,
+        logical_groups=DSV4_DSPARK_K7_CONTRACT.logical_groups,
+        physical_regions=DSV4_DSPARK_K7_CONTRACT.physical_regions,
     )
 
 
