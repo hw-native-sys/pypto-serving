@@ -50,7 +50,6 @@ from .protocol import (
     AbortHandoff,
     ChunkManifest,
     CommitRequest,
-    ContinuationMetadata,
     ControlAck,
     ControlError,
     DecodeOutputWire,
@@ -336,10 +335,14 @@ class PDServingService:
     ) -> PreparedRequest:
         """Normalize once on P and retain the immutable execution input."""
         self._require_external_role(PDRole.PREFILL)
-        self._validate_sampling(config)
+        self.config.model_adapter.validate_generate_config(config)
         now_ns = time.time_ns()
         self._expire_prepared(now_ns)
-        continuation = self._continuation(config, prompt_token_ids)
+        continuation = self.config.model_adapter.build_continuation(
+            config=config,
+            prompt_token_ids=prompt_token_ids,
+            eos_token_id=self.engine.eos_token_id,
+        )
         digest = continuation_metadata_hash(continuation)
         existing_id = self._prepared_by_request.get(request_id)
         if existing_id is not None:
@@ -746,7 +749,7 @@ class PDServingService:
             raise RuntimeError(
                 f"PD serving is fail-closed and requires restart: {self._health_error}"
             )
-        self._validate_sampling(config)
+        self.config.model_adapter.validate_generate_config(config)
         if self.planner is None or self.source_lifecycle is None:
             raise RuntimeError("PD Prefill service has not started")
 
@@ -852,26 +855,19 @@ class PDServingService:
                         chunk.block_ids_by_group,
                         chunk.cache_partition,
                     )
-                    continuation = self._continuation(
-                        config,
-                        prompt_token_ids,
-                    ) if chunk.final else None
-                    metadata_hash = (
-                        continuation_metadata_hash(continuation)
-                        if continuation is not None
-                        else ""
+                    continuation = (
+                        self.config.model_adapter.build_continuation(
+                            config=config,
+                            prompt_token_ids=prompt_token_ids,
+                            eos_token_id=self.engine.eos_token_id,
+                        )
+                        if chunk.final
+                        else None
                     )
-                    manifest = ChunkManifest(
+                    manifest = self.config.model_adapter.build_manifest(
                         key=record.key,
-                        chunk_id=chunk.chunk_id,
-                        start_token=chunk.start_token,
-                        end_token=chunk.end_token,
-                        final=chunk.final,
-                        manifest_hash=plan.manifest_hash,
-                        expected_units=plan.expected_units,
-                        copies_by_rank=plan.copies_by_rank,
-                        first_token=chunk.first_token,
-                        metadata_hash=metadata_hash,
+                        plan=plan,
+                        chunk=chunk,
                         continuation=continuation,
                         prepared_digest=external_request.prepared_digest,
                     )
@@ -962,7 +958,7 @@ class PDServingService:
                         key=record.key,
                         manifest_hash=manifest.manifest_hash,
                         first_token=chunk.first_token,
-                        metadata_hash=metadata_hash,
+                        metadata_hash=manifest.metadata_hash,
                     )
                     await self._send_control(commit)
                     ready = await self._receive_control(record.key)
@@ -1519,6 +1515,7 @@ class PDServingService:
         continuation = manifest.continuation
         if continuation is None or manifest.first_token is None:
             raise RuntimeError("committed handoff has no continuation metadata")
+        self.config.model_adapter.validate_continuation(continuation)
         if not self.decode_connector.claim_decode_admission(key):
             raise RuntimeError("committed handoff was admitted more than once")
         status = self.decode_connector.query(key)
@@ -1532,19 +1529,12 @@ class PDServingService:
         admitted = True
         output_sequence = 0
         try:
-            async for output in self.core.add_adopted_handoff(
+            async for output in self.config.model_adapter.adopt_decode(
+                self.core,
                 reservation_id=self.decode_connector.query(key).reservation_id,
                 request_id=key.request_id,
-                prompt_token_ids=continuation.prompt_token_ids,
                 first_token=manifest.first_token,
-                max_new_tokens=continuation.max_new_tokens,
-                temperature=continuation.temperature,
-                top_p=continuation.top_p,
-                top_k=continuation.top_k,
-                seed=continuation.seed,
-                stop_strings=continuation.stop_strings,
-                eos_token_id=continuation.eos_token_id,
-                stream=continuation.stream,
+                continuation=continuation,
             ):
                 output_sequence += 1
                 wire = DecodeOutputWire(
@@ -1630,21 +1620,3 @@ class PDServingService:
         self._reservation_bindings.pop(key, None)
         self._decode_waiter_claimed.discard(key)
         self._decode_queues.pop(key, None)
-
-    def _continuation(self, config, prompt_token_ids: Sequence[int]) -> ContinuationMetadata:
-        return ContinuationMetadata(
-            prompt_token_ids=tuple(int(token) for token in prompt_token_ids),
-            max_new_tokens=int(config.max_new_tokens),
-            temperature=float(config.temperature),
-            top_p=float(config.top_p),
-            top_k=config.top_k,
-            seed=config.seed,
-            stop_strings=tuple(config.stop) if config.stop else (),
-            eos_token_id=None if config.ignore_eos else self.engine.eos_token_id,
-            stream=bool(getattr(config, "stream", True)),
-        )
-
-    @staticmethod
-    def _validate_sampling(config) -> None:
-        if config.temperature != 0.0 or config.top_p != 1.0 or config.top_k is not None:
-            raise ValueError("the first PD version supports greedy sampling only")

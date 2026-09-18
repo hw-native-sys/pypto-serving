@@ -30,6 +30,34 @@ class ModelPDAdapter(Protocol):
         self, cache_manager, capabilities, registry, destination_ranks
     ): ...
 
+    def validate_generate_config(self, config) -> None: ...
+
+    def build_continuation(
+        self, *, config, prompt_token_ids, eos_token_id: int | None
+    ): ...
+
+    def build_manifest(
+        self,
+        *,
+        key,
+        plan,
+        chunk,
+        continuation,
+        prepared_digest: str,
+    ): ...
+
+    def validate_continuation(self, continuation) -> None: ...
+
+    def adopt_decode(
+        self,
+        core,
+        *,
+        reservation_id: str,
+        request_id: str,
+        first_token: int,
+        continuation,
+    ): ...
+
 
 class ModelPDAdapterRegistry:
     def __init__(self, adapters: tuple[ModelPDAdapter, ...]) -> None:
