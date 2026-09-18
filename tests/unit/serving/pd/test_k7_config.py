@@ -12,7 +12,10 @@ import json
 import pytest
 
 import pypto_serving.cli.main as cli
-from pypto_serving.serving.pd.config import PD_DSPARK_SPECULATIVE_TOKENS
+from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
+
+
+K7 = DSV4_DSPARK_K7_CONTRACT.decode_speculative_tokens
 
 
 def _pd_args(tmp_path, *, role: str, speculative_tokens: int):
@@ -81,7 +84,7 @@ def _pd_args(tmp_path, *, role: str, speculative_tokens: int):
 
 @pytest.mark.parametrize(
     ("role", "expected_local_tokens"),
-    [("prefill", 0), ("decode", PD_DSPARK_SPECULATIVE_TOKENS)],
+    [("prefill", 0), ("decode", K7)],
 )
 def test_pd_k7_uses_target_only_prefill_and_k7_decode(
     tmp_path,
@@ -92,11 +95,11 @@ def test_pd_k7_uses_target_only_prefill_and_k7_decode(
         _pd_args(
             tmp_path,
             role=role,
-            speculative_tokens=PD_DSPARK_SPECULATIVE_TOKENS,
+            speculative_tokens=K7,
         )
     )
 
-    assert config.pd_config.decode_speculative_tokens == PD_DSPARK_SPECULATIVE_TOKENS
+    assert config.pd_config.model_contract.decode_speculative_tokens == K7
     assert config.pd_config.model_contract.adapter_id == "deepseek-v4-dspark-k7"
     assert config.executor_kwargs["num_speculative_tokens"] == expected_local_tokens
     assert config.runtime_config.num_speculative_tokens == expected_local_tokens
@@ -121,7 +124,7 @@ def test_external_router_config_is_derived_from_shared_document(tmp_path, role) 
     args = _pd_args(
         tmp_path,
         role=role,
-        speculative_tokens=PD_DSPARK_SPECULATIVE_TOKENS,
+        speculative_tokens=K7,
     )
     config = cli.build_serving_engine_config(args)
     assert config.pd_config.run_id == "run-k7"

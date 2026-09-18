@@ -6,7 +6,7 @@ import asyncio
 import pytest
 
 from pypto_serving.config.types import GenerateConfig
-from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
+from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_ADAPTER
 from pypto_serving.serving.pd.config import PDConfig, PDRole
 from pypto_serving.serving.pd.http_api import (
     AuthorizeRouteHTTP,
@@ -30,7 +30,7 @@ def _external_config(role: PDRole, port: int) -> PDConfig:
         control_port=port,
         transfer_hostname="127.0.0.1",
         model_revision="ds-v4-test",
-        model_contract=DSV4_DSPARK_K7_CONTRACT,
+        model_adapter=DSV4_DSPARK_K7_ADAPTER,
         connect_timeout_seconds=3,
         prepared_request_ttl_seconds=30,
     )

@@ -10,32 +10,21 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
+from typing import Any
 
 from pypto_serving.config.types import KVCacheGroupSpec
-from pypto_serving.model.deepseek.transfer_layout import BlockCopy, DSV4Registry
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.transfer.types import CompletionCertainty
 
+from .contracts import ModelPDContract
 from .protocol import HandoffKey, PageCopy, TransferUnit, chunk_payload_hash
-
-
-GROUP_COMPONENTS = {
-    "ori": ("ori",),
-    "cmp_c128": ("hca_cmp",),
-    "cmp_c4": ("csa_cmp",),
-    "idx": ("idx_k", "idx_scale"),
-    "hca_state": ("hca_state",),
-    "csa_state": ("csa_state",),
-    "csa_inner_state": ("csa_inner_state",),
-}
-FINAL_ONLY_GROUPS = {"hca_state", "csa_state", "csa_inner_state"}
 
 
 @dataclass(frozen=True)
 class RankChunkPlan:
     rank_id: int
-    copies: tuple[BlockCopy, ...]
+    copies: tuple[PageCopy, ...]
     expected_units: tuple[TransferUnit, ...]
 
 
@@ -51,10 +40,7 @@ class ChunkPlan:
 
     @property
     def copies_by_rank(self) -> dict[int, tuple[PageCopy, ...]]:
-        return {
-            rank.rank_id: tuple(PageCopy(**asdict(copy)) for copy in rank.copies)
-            for rank in self.ranks
-        }
+        return {rank.rank_id: rank.copies for rank in self.ranks}
 
     @property
     def expected_units(self) -> tuple[TransferUnit, ...]:
@@ -66,14 +52,18 @@ class ChunkTransferPlanner:
 
     def __init__(
         self,
-        registry: DSV4Registry,
+        registry: Any,
         group_specs: tuple[KVCacheGroupSpec, ...],
+        contract: ModelPDContract,
     ) -> None:
         self.registry = registry
+        self.contract = contract
+        self.group_components = contract.group_components
+        self.final_only_groups = contract.final_only_groups
         self.group_specs = {spec.name: spec for spec in group_specs}
-        if tuple(self.group_specs) != tuple(GROUP_COMPONENTS):
+        if tuple(self.group_specs) != contract.logical_groups:
             raise ValueError("cache group order does not match the PD transfer contract")
-        for group_name, component_names in GROUP_COMPONENTS.items():
+        for group_name, component_names in self.group_components.items():
             spec = self.group_specs[group_name].spec
             for component_name in component_names:
                 entry = registry.entry(component_name)
@@ -111,10 +101,10 @@ class ChunkTransferPlanner:
             source = source_blocks_by_rank[rank_id]
             destination = destination_blocks_by_rank[rank_id]
             self._validate_group_tables(source, destination)
-            copies: list[BlockCopy] = []
+            copies: list[PageCopy] = []
             expected_units: list[TransferUnit] = []
-            for group_name, component_names in GROUP_COMPONENTS.items():
-                if group_name in FINAL_ONLY_GROUPS and not final:
+            for group_name, component_names in self.group_components.items():
+                if group_name in self.final_only_groups and not final:
                     continue
                 group_copies = self._group_copies(
                     group_name,
@@ -127,7 +117,7 @@ class ChunkTransferPlanner:
                 for component_name in component_names:
                     entry = self.registry.entry(component_name)
                     component_copies = tuple(
-                        BlockCopy(
+                        PageCopy(
                             component_id=component_name,
                             layer=layer,
                             source_block=source_block,
@@ -151,10 +141,7 @@ class ChunkTransferPlanner:
         expected_units = tuple(
             unit for rank in rank_plans for unit in rank.expected_units
         )
-        copies_by_rank = {
-            rank.rank_id: tuple(PageCopy(**asdict(copy)) for copy in rank.copies)
-            for rank in rank_plans
-        }
+        copies_by_rank = {rank.rank_id: rank.copies for rank in rank_plans}
         manifest_hash = chunk_payload_hash(
             key,
             chunk_id=chunk_id,
@@ -190,7 +177,7 @@ class ChunkTransferPlanner:
         ratio = group.spec.compress_ratio
         logical_end = (end_token + capacity - 1) // capacity
 
-        if group_name in FINAL_ONLY_GROUPS:
+        if group_name in self.final_only_groups:
             first = max(0, logical_end - len(source_blocks))
             logical_indices = range(first, logical_end)
         else:
@@ -202,11 +189,11 @@ class ChunkTransferPlanner:
             logical: physical_rows for logical in logical_indices
         }
         remainder = end_token % capacity
-        if final and remainder and group_name not in FINAL_ONLY_GROUPS:
+        if final and remainder and group_name not in self.final_only_groups:
             valid_rows = remainder // ratio
             if valid_rows:
                 rows_by_index[end_token // capacity] = valid_rows
-        if final and group_name in FINAL_ONLY_GROUPS and logical_end:
+        if final and group_name in self.final_only_groups and logical_end:
             last = logical_end - 1
             if remainder:
                 rows_by_index[last] = remainder // ratio
@@ -247,7 +234,7 @@ class ChunkTransferPlanner:
     ) -> None:
         expected = set(self.group_specs)
         if set(source) != expected or set(destination) != expected:
-            raise ValueError("rank block tables do not match the seven cache groups")
+            raise ValueError("rank block tables do not match the model contract")
         for group_name in expected:
             for table in (source[group_name], destination[group_name]):
                 if len(table) != len(set(table)) or any(

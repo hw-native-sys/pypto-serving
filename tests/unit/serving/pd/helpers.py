@@ -12,7 +12,6 @@ from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRA
 from pypto_serving.model.deepseek_dspark.npu_runner import build_dspark_cache_group_specs
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.pd.config import PDCapabilities
-from pypto_serving.serving.pd.planner import GROUP_COMPONENTS
 from pypto_serving.serving.pd.protocol import (
     RankRegistration,
     RegionRegistration,
@@ -34,7 +33,7 @@ def make_cache_manager(*, capacity_slots: int = 2) -> KvCacheManager:
 def make_registry(manager: KvCacheManager) -> DSV4Registry:
     group_by_component = {
         component: group
-        for group, components in GROUP_COMPONENTS.items()
+        for group, components in DSV4_DSPARK_K7_CONTRACT.group_components.items()
         for component in components
     }
     specs = {spec.name: spec for spec in manager.group_specs}

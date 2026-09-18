@@ -13,15 +13,15 @@ from __future__ import annotations
 from collections import OrderedDict
 import uuid
 
-from pypto_serving.model.deepseek.transfer_layout import DSV4Registry
 from pypto_serving.serving.memory.kv_cache import (
     GroupReservationState,
     KvCacheManager,
 )
 
 from .completion import CompletionState, CompletionTracker
-from .config import PDCapabilities, PD_PHYSICAL_REGIONS
-from .planner import ChunkTransferPlanner, FINAL_ONLY_GROUPS, GROUP_COMPONENTS
+from .config import PDCapabilities
+from .contracts import ModelPDContract
+from .planner import ChunkTransferPlanner
 from .protocol import (
     AbortHandoff,
     ChunkManifest,
@@ -44,14 +44,16 @@ class DecodeConnector:
         self,
         cache_manager: KvCacheManager,
         capabilities: PDCapabilities,
-        registry: DSV4Registry,
+        registry,
         destination_ranks: tuple[RankRegistration, ...],
         *,
+        contract: ModelPDContract,
         terminal_history_limit: int = 1024,
     ) -> None:
         self.cache_manager = cache_manager
         self.capabilities = capabilities
         self.registry = registry
+        self.contract = contract
         self.destination_ranks = destination_ranks
         self._trackers: dict[HandoffKey, CompletionTracker] = {}
         self._reservation_by_key: dict[HandoffKey, str] = {}
@@ -66,7 +68,7 @@ class DecodeConnector:
             raise ValueError("D layout differs from the advertised capability")
         if registry.topology != capabilities.topology:
             raise ValueError("D registry topology differs from the advertised capability")
-        self._planner = ChunkTransferPlanner(registry, cache_manager.group_specs)
+        self._planner = ChunkTransferPlanner(registry, cache_manager.group_specs, contract)
         self._validate_destination_ranks()
 
     def reserve(self, request: ReserveRequest) -> ReserveAccepted | ReserveRejected:
@@ -237,8 +239,8 @@ class DecodeConnector:
             if rank.rank_id != rank_id:
                 raise ValueError("destination owners must be in rank order")
             regions = {region.component_id for region in rank.regions}
-            if regions != set(PD_PHYSICAL_REGIONS):
-                raise ValueError("each destination owner must register all eight regions")
+            if regions != set(self.contract.physical_regions):
+                raise ValueError("destination owner regions differ from the model contract")
             for region in rank.regions:
                 if region.extent != self.registry.entry(region.component_id).extent:
                     raise ValueError("destination owner extent differs from the D registry")
@@ -274,8 +276,8 @@ class DecodeConnector:
             raise ValueError("chunk copies do not cover exactly the reserved TP group")
         required_components = {
             component
-            for group, components in GROUP_COMPONENTS.items()
-            if manifest.final or group not in FINAL_ONLY_GROUPS
+            for group, components in self.contract.group_components.items()
+            if manifest.final or group not in self.contract.final_only_groups
             for component in components
         }
         expected_unit_keys = {

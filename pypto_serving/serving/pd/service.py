@@ -182,7 +182,7 @@ class PDServingService:
         self._record("SERVICE_STARTING")
         raw_bundle = await self.core.call_pd_worker(OP_PREPARE_REGISTRY)
         bundle = decode_worker_payload(raw_bundle, WorkerRegistryBundle)
-        registry = bundle.registry()
+        registry = self.config.model_adapter.build_registry(bundle)
         if bundle.model_revision != self.config.model_revision:
             raise RuntimeError(
                 "worker registry model revision differs from the PD configuration"
@@ -208,13 +208,13 @@ class PDServingService:
         self.local_bundle = bundle
         self.capabilities = capabilities
         if self.config.role is PDRole.PREFILL:
-            self.planner = ChunkTransferPlanner(
+            self.planner = self.config.model_adapter.make_planner(
                 registry,
                 self.core.kv_cache_manager.group_specs,
             )
             self.source_lifecycle = PChunkLifecycle(self.core.kv_cache_manager)
         else:
-            self.decode_connector = DecodeConnector(
+            self.decode_connector = self.config.model_adapter.make_decode_connector(
                 self.core.kv_cache_manager,
                 capabilities,
                 registry,
@@ -315,7 +315,7 @@ class PDServingService:
         )
 
     async def metrics_snapshot(self) -> dict[str, object]:
-        """Return Host metrics plus worker-resident K7/transfer counters."""
+        """Return Host metrics plus worker-resident model/transfer counters."""
         snapshot = self.metrics.snapshot()
         try:
             raw = await self.core.call_pd_worker(OP_INSPECT_RUNTIME_METRICS)
@@ -1267,7 +1267,7 @@ class PDServingService:
                     self.peer_registry = None
 
     async def _serve_external_session(self, session: PDControlSession) -> None:
-        """Dispatch one authenticated P connection by complete handoff key."""
+        """Dispatch one P connection by complete handoff key."""
         assert self.decode_connector is not None
         queues: dict[HandoffKey, asyncio.Queue] = {}
         tasks: dict[HandoffKey, asyncio.Task] = {}

@@ -26,6 +26,11 @@ class ModelPDContract:
     transfer_granularity: str
     continuation_schema: str
     components: tuple[TransferComponent, ...]
+    executor_cls: str
+    prefill_speculative_tokens: int
+    decode_speculative_tokens: int
+    requires_prefix_cache: bool = False
+    requires_async_scheduling: bool = False
 
     @property
     def digest(self) -> str:
@@ -56,6 +61,13 @@ class ModelPDContract:
         return frozenset(
             component.cache_group for component in self.components if component.final_only
         )
+
+    def local_speculative_tokens(self, role: str) -> int:
+        if role == "prefill":
+            return self.prefill_speculative_tokens
+        if role == "decode":
+            return self.decode_speculative_tokens
+        raise ValueError(f"unknown PD role {role!r}")
 
 
 @dataclass(frozen=True)
@@ -93,4 +105,3 @@ class RuntimeLayoutDescriptor:
             physical_regions=contract.physical_regions,
             continuation_schema=contract.continuation_schema,
         )
-

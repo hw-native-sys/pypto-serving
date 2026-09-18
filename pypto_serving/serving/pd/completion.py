@@ -15,7 +15,6 @@ from enum import Enum
 
 from pypto_serving.transfer.types import CompletionCertainty
 
-from .config import PD_PHYSICAL_REGIONS
 from .protocol import (
     ChunkManifest,
     CommitRequest,
@@ -120,8 +119,8 @@ class CompletionTracker:
         for unit in manifest.expected_units:
             if type(unit.rank_id) is not int or unit.rank_id < 0:
                 raise ValueError("completion rank_id must be a non-negative integer")
-            if unit.component_id not in PD_PHYSICAL_REGIONS:
-                raise ValueError(f"unknown physical region {unit.component_id!r}")
+            if not unit.component_id or len(unit.component_id.encode()) > 256:
+                raise ValueError("completion component_id must be a bounded identifier")
             if type(unit.nbytes) is not int or unit.nbytes < 0:
                 raise ValueError("completion unit nbytes must be non-negative")
             identity = (unit.rank_id, unit.component_id)
