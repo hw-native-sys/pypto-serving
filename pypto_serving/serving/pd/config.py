@@ -1,47 +1,40 @@
 # Copyright (c) PyPTO Contributors.
-# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
-# CANN Open Software License Agreement Version 2.0 (the "License").
-# Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
-# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
-# See LICENSE in the root of the software repository for the full text of the License.
-# -----------------------------------------------------------------------------------------------------------
-"""Validated, pickle-safe configuration for embedded and external-router PD."""
+# Licensed under CANN Open Software License Agreement Version 2.0.
+"""Strict product configuration for the external-router PD engine."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
+import json
 import os
+from pathlib import Path
+from typing import Any
 
 
 PD_SCHEMA_VERSION = 4
 PD_DSPARK_SPECULATIVE_TOKENS = 7
 PD_PHYSICAL_REGIONS = (
-    "ori",
-    "hca_cmp",
-    "csa_cmp",
-    "idx_k",
-    "idx_scale",
-    "hca_state",
-    "csa_state",
-    "csa_inner_state",
+    "ori", "hca_cmp", "csa_cmp", "idx_k", "idx_scale",
+    "hca_state", "csa_state", "csa_inner_state",
 )
 PD_LOGICAL_GROUPS = (
-    "ori",
-    "cmp_c128",
-    "cmp_c4",
-    "idx",
-    "hca_state",
-    "csa_state",
-    "csa_inner_state",
+    "ori", "cmp_c128", "cmp_c4", "idx",
+    "hca_state", "csa_state", "csa_inner_state",
 )
 
 
 def _identifier(value: str, name: str) -> str:
-    if not isinstance(value, str) or not value or len(value) > 256:
-        raise ValueError(f"{name} must be a nonempty string of at most 256 characters")
+    if not isinstance(value, str) or not value or len(value.encode()) > 256:
+        raise ValueError(f"{name} must be a nonempty string of at most 256 bytes")
     return value
+
+
+def _strict_keys(value: dict[str, Any], allowed: set[str], name: str) -> None:
+    extra = set(value) - allowed
+    if extra:
+        raise ValueError(f"unknown {name} fields: {sorted(extra)}")
 
 
 class PDRole(str, Enum):
@@ -58,35 +51,160 @@ class PDRole(str, Enum):
         return PDRole.DISABLED
 
 
-class PDDeploymentMode(str, Enum):
-    EMBEDDED_FIXED_PEER = "embedded-fixed-peer"
-    EXTERNAL_ROUTER = "external-router"
+@dataclass(frozen=True)
+class PDEndpoint:
+    host: str
+    port: int
+    node_id: str = ""
+    control_host: str = ""
+    control_port: int = 29831
+    transfer_hostname: str = ""
+
+    def __post_init__(self) -> None:
+        _identifier(self.host, "endpoint.host")
+        for name in ("port", "control_port"):
+            value = getattr(self, name)
+            if type(value) is not int or not 1 <= value <= 65535:
+                raise ValueError(f"endpoint.{name} must be in [1, 65535]")
+        for name in ("node_id", "control_host", "transfer_hostname"):
+            value = getattr(self, name)
+            if value:
+                _identifier(value, f"endpoint.{name}")
+
+    @property
+    def url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+
+@dataclass(frozen=True)
+class PDRuntimeConfig:
+    prefill: tuple[PDEndpoint, ...]
+    decode: tuple[PDEndpoint, ...]
+    provider: str = "mooncake"
+    policy: str = "round_robin"
+    run_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.prefill or not self.decode:
+            raise ValueError("runtime requires at least one prefill and one decode endpoint")
+        _identifier(self.provider, "runtime.provider")
+        _identifier(self.policy, "runtime.policy")
+        if self.run_id:
+            _identifier(self.run_id, "runtime.run_id")
+
+
+@dataclass(frozen=True)
+class PDObservabilityConfig:
+    enabled: bool = True
+    root: str = ""
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ValueError("observability.enabled must be boolean")
+        if not isinstance(self.root, str) or len(os.fsencode(self.root)) > 4096:
+            raise ValueError("observability.root must be a bounded path")
+
+
+@dataclass(frozen=True)
+class PDDocument:
+    runtime: PDRuntimeConfig
+    observability: PDObservabilityConfig
+
+    @property
+    def run_id(self) -> str:
+        if self.runtime.run_id:
+            return self.runtime.run_id
+        canonical = {
+            "prefill": [(item.host, item.port) for item in self.runtime.prefill],
+            "decode": [(item.host, item.port) for item in self.runtime.decode],
+            "provider": self.runtime.provider,
+            "policy": self.runtime.policy,
+        }
+        digest = hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:16]
+        return f"pd-{digest}"
+
+    def endpoint(self, role: PDRole, node_id: str = "") -> PDEndpoint:
+        endpoints = self.runtime.prefill if role is PDRole.PREFILL else self.runtime.decode
+        if node_id:
+            matches = tuple(item for item in endpoints if item.node_id == node_id)
+            if len(matches) != 1:
+                raise ValueError(f"node_id {node_id!r} must select exactly one {role.value} endpoint")
+            return matches[0]
+        if len(endpoints) != 1:
+            raise ValueError(f"--pd-node-id is required when {role.value} has multiple endpoints")
+        return endpoints[0]
+
+
+def _endpoint(value: Any, name: str) -> PDEndpoint:
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} endpoint must be an object")
+    _strict_keys(
+        value,
+        {"host", "port", "node_id", "control_host", "control_port", "transfer_hostname"},
+        name,
+    )
+    return PDEndpoint(**value)
+
+
+def load_pd_document(path: str | os.PathLike[str]) -> PDDocument:
+    """Load one strict JSON document shared by Router, P and D."""
+    source = Path(path)
+    try:
+        raw = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot load PD config {source}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("PD config root must be an object")
+    _strict_keys(raw, {"runtime", "observability"}, "PD config")
+    runtime = raw.get("runtime")
+    if not isinstance(runtime, dict):
+        raise ValueError("PD config requires a runtime object")
+    _strict_keys(runtime, {"prefill", "decode", "provider", "policy", "run_id"}, "runtime")
+    prefill = runtime.get("prefill")
+    decode = runtime.get("decode")
+    if not isinstance(prefill, list) or not isinstance(decode, list):
+        raise ValueError("runtime.prefill and runtime.decode must be arrays")
+    runtime_config = PDRuntimeConfig(
+        prefill=tuple(_endpoint(value, "prefill") for value in prefill),
+        decode=tuple(_endpoint(value, "decode") for value in decode),
+        provider=runtime.get("provider", "mooncake"),
+        policy=runtime.get("policy", "round_robin"),
+        run_id=runtime.get("run_id", ""),
+    )
+    observability = raw.get("observability", {})
+    if not isinstance(observability, dict):
+        raise ValueError("observability must be an object")
+    _strict_keys(observability, {"enabled", "root"}, "observability")
+    return PDDocument(
+        runtime=runtime_config,
+        observability=PDObservabilityConfig(
+            enabled=observability.get("enabled", True),
+            root=observability.get("root", ""),
+        ),
+    )
 
 
 @dataclass(frozen=True)
 class PDConfig:
-    """Host configuration; secrets stay in the named environment variable."""
+    """Resolved node config; values absent from JSON are Serving defaults."""
 
-    role: PDRole = PDRole.DISABLED
-    deployment_mode: PDDeploymentMode = PDDeploymentMode.EMBEDDED_FIXED_PEER
-    node_id: str = ""
-    peer_node_id: str = ""
-    run_id: str = ""
-    control_host: str = "127.0.0.1"
-    control_port: int = 29831
-    control_advertise_host: str = ""
-    peer_host: str = ""
-    auth_secret_env: str = "PYPTO_PD_AUTH_SECRET"
-    router_auth_secret_env: str = "PYPTO_PD_ROUTER_SECRET"
-    transfer_hostname: str = ""
-    model_revision: str = ""
+    role: PDRole
+    node_id: str
+    run_id: str
+    control_host: str
+    control_port: int
+    control_advertise_host: str
+    transfer_hostname: str
+    model_revision: str
+    provider: str = "mooncake"
     generation: int = 1
     route_epoch: int = 1
     control_incarnation: int = 1
-    provider: str = "mooncake"
     decode_speculative_tokens: int = PD_DSPARK_SPECULATIVE_TOKENS
     connect_timeout_seconds: float = 30.0
-    request_timeout_seconds: float = 60.0
+    request_timeout_seconds: float = 600.0
     transfer_poll_interval_seconds: float = 0.005
     max_active_handoffs: int = 4
     max_pending_handoffs: int = 8
@@ -95,113 +213,29 @@ class PDConfig:
     enable_chunk_overlap: bool = False
     prepared_request_ttl_seconds: float = 300.0
     journal_path: str = ""
+    log_dir: str = ""
+    observability_enabled: bool = True
 
     def __post_init__(self) -> None:
         role = self.role if isinstance(self.role, PDRole) else PDRole(self.role)
         object.__setattr__(self, "role", role)
-        mode = (
-            self.deployment_mode
-            if isinstance(self.deployment_mode, PDDeploymentMode)
-            else PDDeploymentMode(self.deployment_mode)
-        )
-        object.__setattr__(self, "deployment_mode", mode)
         if role is PDRole.DISABLED:
-            return
+            raise ValueError("PDConfig cannot use the disabled role")
         for name in (
-            "node_id",
-            "run_id",
-            "control_host",
-            "auth_secret_env",
-            "router_auth_secret_env",
-            "transfer_hostname",
-            "model_revision",
-            "provider",
+            "node_id", "run_id", "control_host", "control_advertise_host",
+            "transfer_hostname", "model_revision", "provider",
         ):
             _identifier(getattr(self, name), name)
-        if mode is PDDeploymentMode.EMBEDDED_FIXED_PEER:
-            _identifier(self.peer_node_id, "peer_node_id")
-            _identifier(self.peer_host, "peer_host")
-            if self.node_id == self.peer_node_id:
-                raise ValueError("PD node_id and peer_node_id must differ")
-        else:
-            _identifier(self.control_advertise_host, "control_advertise_host")
-            if self.peer_node_id:
-                _identifier(self.peer_node_id, "peer_node_id")
-                if self.node_id == self.peer_node_id:
-                    raise ValueError("PD node_id and peer_node_id must differ")
-            if self.peer_host:
-                _identifier(self.peer_host, "peer_host")
         if type(self.control_port) is not int or not 1 <= self.control_port <= 65535:
             raise ValueError("PD control_port must be in [1, 65535]")
-        if self.decode_speculative_tokens != PD_DSPARK_SPECULATIVE_TOKENS:
-            raise ValueError(
-                "the first PD version requires DeepSeek V4 DSpark K7 Decode"
-            )
-        for name in ("generation", "route_epoch", "control_incarnation"):
-            value = getattr(self, name)
-            if type(value) is not int or value < 1:
-                raise ValueError(f"PD {name} must be a positive integer")
-        for name in (
-            "connect_timeout_seconds",
-            "request_timeout_seconds",
-            "transfer_poll_interval_seconds",
-            "prepared_request_ttl_seconds",
-        ):
-            value = getattr(self, name)
-            if not isinstance(value, (int, float)) or value <= 0:
-                raise ValueError(f"PD {name} must be positive")
-        for name in (
-            "max_active_handoffs",
-            "max_pending_handoffs",
-            "max_inflight_transfer_bytes",
-            "max_transfer_attempts",
-        ):
-            value = getattr(self, name)
-            if type(value) is not int or value < 1:
-                raise ValueError(f"PD {name} must be a positive integer")
         if self.max_active_handoffs > self.max_pending_handoffs:
-            raise ValueError("PD active handoffs must not exceed total pending handoffs")
-        if self.max_transfer_attempts > 8:
-            raise ValueError("PD max_transfer_attempts must not exceed 8")
-        if type(self.enable_chunk_overlap) is not bool:
-            raise ValueError("PD enable_chunk_overlap must be a boolean")
-        if not isinstance(self.journal_path, str) or len(os.fsencode(self.journal_path)) > 4096:
-            raise ValueError("PD journal_path must be a string of at most 4096 bytes")
+            raise ValueError("PD active handoffs must not exceed pending handoffs")
 
     @property
     def enabled(self) -> bool:
-        return self.role is not PDRole.DISABLED
+        return True
 
-    @property
-    def external_router(self) -> bool:
-        return self.deployment_mode is PDDeploymentMode.EXTERNAL_ROUTER
-
-    def auth_secret(self) -> bytes:
-        """Resolve the pre-shared secret without storing it in logs/config dumps."""
-        if not self.enabled:
-            raise RuntimeError("PD authentication is unavailable when PD is disabled")
-        value = os.environ.get(self.auth_secret_env, "")
-        if len(value.encode()) < 16:
-            raise RuntimeError(
-                f"{self.auth_secret_env} must contain at least 16 bytes for PD authentication"
-            )
-        return value.encode()
-
-    def router_auth_secret(self) -> bytes:
-        """Resolve the Router signing secret used only by Router and D."""
-        if not self.enabled or self.role is not PDRole.DECODE:
-            raise RuntimeError("PD Router ticket verification is available only on D")
-        value = os.environ.get(self.router_auth_secret_env, "")
-        if len(value.encode()) < 16:
-            raise RuntimeError(
-                f"{self.router_auth_secret_env} must contain at least 16 bytes "
-                "for PD route-ticket verification"
-            )
-        return value.encode()
-
-    def worker_config(self) -> "PDWorkerConfig | None":
-        if not self.enabled:
-            return None
+    def worker_config(self) -> "PDWorkerConfig":
         return PDWorkerConfig(
             role=self.role,
             run_id=self.run_id,
@@ -215,10 +249,44 @@ class PDConfig:
         )
 
 
+def resolve_pd_config(
+    document: PDDocument,
+    *,
+    role: PDRole,
+    model_revision: str,
+    node_id: str = "",
+) -> PDConfig:
+    endpoint = document.endpoint(role, node_id)
+    resolved_node_id = endpoint.node_id or (
+        f"{role.value}-{hashlib.sha256(f'{endpoint.host}:{endpoint.port}'.encode()).hexdigest()[:8]}"
+    )
+    root = (
+        Path(document.observability.root)
+        if document.observability.root
+        else Path.cwd() / "serving_log" / "pd_disag"
+    )
+    role_dir = root / document.run_id / role.value / resolved_node_id
+    state_dir = role_dir / "state"
+    # Correctness state remains durable when optional trace/log output is disabled.
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return PDConfig(
+        role=role,
+        node_id=resolved_node_id,
+        run_id=document.run_id,
+        control_host=endpoint.control_host or endpoint.host,
+        control_port=endpoint.control_port,
+        control_advertise_host=endpoint.control_host or endpoint.host,
+        transfer_hostname=endpoint.transfer_hostname or endpoint.host,
+        model_revision=model_revision,
+        provider=document.runtime.provider,
+        journal_path=str(state_dir / "journal.jsonl"),
+        log_dir=str(role_dir),
+        observability_enabled=document.observability.enabled,
+    )
+
+
 @dataclass(frozen=True)
 class PDWorkerConfig:
-    """Minimal address-free config copied into the spawned serving worker."""
-
     role: PDRole
     run_id: str
     worker_id: str
@@ -229,26 +297,10 @@ class PDWorkerConfig:
     max_active_handoffs: int = 1
     max_inflight_transfer_bytes: int = 1 << 30
 
-    def __post_init__(self) -> None:
-        role = self.role if isinstance(self.role, PDRole) else PDRole(self.role)
-        object.__setattr__(self, "role", role)
-        if role is PDRole.DISABLED:
-            raise ValueError("PDWorkerConfig cannot use the disabled role")
-        for name in ("run_id", "worker_id", "transfer_hostname", "model_revision"):
-            _identifier(getattr(self, name), name)
-        for name in ("generation", "endpoint_generation"):
-            value = getattr(self, name)
-            if type(value) is not int or value < 1:
-                raise ValueError(f"{name} must be a positive integer")
-        for name in ("max_active_handoffs", "max_inflight_transfer_bytes"):
-            value = getattr(self, name)
-            if type(value) is not int or value < 1:
-                raise ValueError(f"{name} must be a positive integer")
-
 
 @dataclass(frozen=True)
 class PDCapabilities:
-    """Host-visible compatibility contract; it intentionally contains no address."""
+    """Temporary DSV4 capability shape; generalized in F2."""
 
     model_revision: str
     registry_fingerprint: str
@@ -262,43 +314,11 @@ class PDCapabilities:
     target_cache_only: bool = True
     decode_speculative_tokens: int = PD_DSPARK_SPECULATIVE_TOKENS
 
-    def __post_init__(self) -> None:
-        for name in (
-            "model_revision",
-            "registry_fingerprint",
-            "layout_fingerprint",
-            "provider",
-        ):
-            _identifier(getattr(self, name), name)
-        if self.schema_version != PD_SCHEMA_VERSION:
-            raise ValueError(f"unsupported PD schema version {self.schema_version}")
-        if not self.topology or any(type(value) is not int or value <= 0 for value in self.topology):
-            raise ValueError("PD topology must contain positive integer dimensions")
-        if self.logical_groups != PD_LOGICAL_GROUPS:
-            raise ValueError("PD logical cache groups do not match the first-version contract")
-        if self.physical_regions != PD_PHYSICAL_REGIONS:
-            raise ValueError("PD physical regions do not match the first-version contract")
-        if not self.chunk_transfer or not self.target_cache_only:
-            raise ValueError(
-                "the first PD version requires chunk transfer of target cache only"
-            )
-        if self.decode_speculative_tokens != PD_DSPARK_SPECULATIVE_TOKENS:
-            raise ValueError(
-                "the first PD version requires DeepSeek V4 DSpark K7 Decode"
-            )
-
     def compatibility_error(self, peer: "PDCapabilities") -> str | None:
         for name in (
-            "schema_version",
-            "model_revision",
-            "layout_fingerprint",
-            "topology",
-            "provider",
-            "logical_groups",
-            "physical_regions",
-            "chunk_transfer",
-            "target_cache_only",
-            "decode_speculative_tokens",
+            "schema_version", "model_revision", "layout_fingerprint", "topology",
+            "provider", "logical_groups", "physical_regions", "chunk_transfer",
+            "target_cache_only", "decode_speculative_tokens",
         ):
             if getattr(self, name) != getattr(peer, name):
                 return f"PD capability mismatch: {name}"

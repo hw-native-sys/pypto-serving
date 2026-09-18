@@ -19,8 +19,11 @@ from pypto_serving.serving.pd.protocol import (
     RegionRegistration,
     RegistryAdvertisement,
 )
-from pypto_serving.serving.pd.session import open_control_session
-from pypto_serving.serving.pd.session import MultiplexedPDControlSession
+from pypto_serving.serving.pd.session import (
+    MultiplexedPDControlSession,
+    PDControlAcceptor,
+    connect_control_session,
+)
 
 
 def _free_port() -> int:
@@ -33,16 +36,13 @@ def _free_port() -> int:
 
 def _config(role: PDRole, port: int) -> PDConfig:
     local = "p" if role is PDRole.PREFILL else "d"
-    peer = "d" if role is PDRole.PREFILL else "p"
     return PDConfig(
         role=role,
         node_id=local,
-        peer_node_id=peer,
         run_id="run",
         control_host="127.0.0.1",
         control_port=port,
-        peer_host="127.0.0.1",
-        auth_secret_env="TEST_PD_SECRET",
+        control_advertise_host="127.0.0.1",
         transfer_hostname="127.0.0.1",
         model_revision="model",
         connect_timeout_seconds=3,
@@ -79,19 +79,29 @@ def _advertisement() -> RegistryAdvertisement:
     )
 
 
-def test_loopback_tcp_session_authenticates_and_exchanges_registry(monkeypatch) -> None:
-    monkeypatch.setenv("TEST_PD_SECRET", "0123456789abcdef0123456789abcdef")
+async def _open_pair(port: int):
+    decode_config = _config(PDRole.DECODE, port)
+    acceptor = PDControlAcceptor(decode_config)
+    decode_task = asyncio.create_task(
+        acceptor.accept(_capabilities(), expected_peer_node_id="p")
+    )
+    prefill = await connect_control_session(
+        _config(PDRole.PREFILL, port),
+        _capabilities(),
+        peer_node_id="d",
+        peer_host="127.0.0.1",
+        peer_port=port,
+    )
+    decode = await decode_task
+    acceptor.close()
+    return decode, prefill
+
+
+def test_loopback_tcp_session_exchanges_registry() -> None:
     port = _free_port()
 
     async def exercise() -> None:
-        decode_task = asyncio.create_task(
-            open_control_session(_config(PDRole.DECODE, port), _capabilities())
-        )
-        await asyncio.sleep(0.05)
-        prefill_task = asyncio.create_task(
-            open_control_session(_config(PDRole.PREFILL, port), _capabilities())
-        )
-        decode, prefill = await asyncio.gather(decode_task, prefill_task)
+        decode, prefill = await _open_pair(port)
         d_registry, p_registry = await asyncio.gather(
             decode.exchange_registry(_advertisement()),
             prefill.exchange_registry(_advertisement()),
@@ -108,19 +118,11 @@ def test_loopback_tcp_session_authenticates_and_exchanges_registry(monkeypatch) 
     asyncio.run(exercise())
 
 
-def test_multiplexed_session_dispatches_interleaved_handoffs(monkeypatch) -> None:
-    monkeypatch.setenv("TEST_PD_SECRET", "0123456789abcdef0123456789abcdef")
+def test_multiplexed_session_dispatches_interleaved_handoffs() -> None:
     port = _free_port()
 
     async def exercise() -> None:
-        decode_task = asyncio.create_task(
-            open_control_session(_config(PDRole.DECODE, port), _capabilities())
-        )
-        await asyncio.sleep(0.05)
-        prefill_task = asyncio.create_task(
-            open_control_session(_config(PDRole.PREFILL, port), _capabilities())
-        )
-        decode, prefill = await asyncio.gather(decode_task, prefill_task)
+        decode, prefill = await _open_pair(port)
         await asyncio.gather(
             decode.exchange_registry(_advertisement()),
             prefill.exchange_registry(_advertisement()),
@@ -147,19 +149,11 @@ def test_multiplexed_session_dispatches_interleaved_handoffs(monkeypatch) -> Non
     asyncio.run(exercise())
 
 
-def test_multiplexed_session_fails_every_open_route_on_peer_eof(monkeypatch) -> None:
-    monkeypatch.setenv("TEST_PD_SECRET", "0123456789abcdef0123456789abcdef")
+def test_multiplexed_session_fails_every_open_route_on_peer_eof() -> None:
     port = _free_port()
 
     async def exercise() -> None:
-        decode_task = asyncio.create_task(
-            open_control_session(_config(PDRole.DECODE, port), _capabilities())
-        )
-        await asyncio.sleep(0.05)
-        prefill_task = asyncio.create_task(
-            open_control_session(_config(PDRole.PREFILL, port), _capabilities())
-        )
-        decode, prefill = await asyncio.gather(decode_task, prefill_task)
+        decode, prefill = await _open_pair(port)
         await asyncio.gather(
             decode.exchange_registry(_advertisement()),
             prefill.exchange_registry(_advertisement()),

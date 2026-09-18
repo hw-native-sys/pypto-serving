@@ -2,24 +2,18 @@
 # Licensed under CANN Open Software License Agreement Version 2.0.
 
 import asyncio
-import os
-import time
 
 import pytest
 
 from pypto_serving.config.types import GenerateConfig
-from pypto_serving.serving.pd.config import PDConfig, PDDeploymentMode, PDRole
+from pypto_serving.serving.pd.config import PDConfig, PDRole
 from pypto_serving.serving.pd.http_api import (
     AuthorizeRouteHTTP,
     ExecutePrefillHTTP,
     ReservePlacementHTTP,
     capability_compatibility_digest,
 )
-from pypto_serving.serving.pd.protocol import (
-    HandoffKey,
-    RouteTicketClaims,
-    sign_route_ticket,
-)
+from pypto_serving.serving.pd.protocol import HandoffKey
 from pypto_serving.serving.pd.service import PDServingService
 
 from .test_service import _FakeCore, _FakeEngine, _free_port
@@ -28,14 +22,11 @@ from .test_service import _FakeCore, _FakeEngine, _free_port
 def _external_config(role: PDRole, port: int) -> PDConfig:
     return PDConfig(
         role=role,
-        deployment_mode=PDDeploymentMode.EXTERNAL_ROUTER,
         node_id="p" if role is PDRole.PREFILL else "d",
         run_id="external-run",
         control_host="127.0.0.1",
         control_advertise_host="127.0.0.1",
         control_port=port,
-        auth_secret_env="TEST_PD_SECRET",
-        router_auth_secret_env="TEST_PD_ROUTER_SECRET",
         transfer_hostname="127.0.0.1",
         model_revision="ds-v4-test",
         connect_timeout_seconds=3,
@@ -43,12 +34,7 @@ def _external_config(role: PDRole, port: int) -> PDConfig:
     )
 
 
-def test_external_nodes_start_independently_and_d_streams_directly(monkeypatch) -> None:
-    monkeypatch.setenv("TEST_PD_SECRET", "0123456789abcdef0123456789abcdef")
-    monkeypatch.setenv(
-        "TEST_PD_ROUTER_SECRET",
-        "abcdef0123456789abcdef0123456789",
-    )
+def test_external_nodes_start_independently_and_d_streams_directly() -> None:
     port = _free_port()
 
     async def exercise() -> None:
@@ -113,24 +99,8 @@ def test_external_nodes_start_independently_and_d_streams_directly(monkeypatch) 
                     prefill_endpoint_generation=1,
                 )
             )
-        ticket = sign_route_ticket(
-            RouteTicketClaims(
-                key=key,
-                prepared_request_id=prepared.prepared_request_id,
-                prepared_digest=prepared.prepared_digest,
-                compatibility_digest=capability_compatibility_digest(
-                    prefill.descriptor().capabilities
-                ),
-                prefill_node_id="p",
-                decode_node_id="d",
-                prefill_endpoint_generation=1,
-                decode_endpoint_generation=1,
-                reservation_id=placement.reservation_id,
-                issued_at_ns=time.time_ns(),
-                expires_at_ns=time.time_ns() + 10_000_000_000,
-                nonce=os.urandom(16),
-            ),
-            b"abcdef0123456789abcdef0123456789",
+        compatibility_digest = capability_compatibility_digest(
+            prefill.descriptor().capabilities
         )
         decode.authorize_route(
             AuthorizeRouteHTTP(
@@ -139,7 +109,11 @@ def test_external_nodes_start_independently_and_d_streams_directly(monkeypatch) 
                 prepared_digest=prepared.prepared_digest,
                 reservation_id=placement.reservation_id,
                 reservation_capability=placement.reservation_capability,
-                route_ticket=ticket,
+                compatibility_digest=compatibility_digest,
+                prefill_node_id="p",
+                prefill_endpoint_generation=1,
+                decode_node_id="d",
+                decode_endpoint_generation=1,
             )
         )
         stream = decode.open_decode_stream(key)
@@ -155,7 +129,9 @@ def test_external_nodes_start_independently_and_d_streams_directly(monkeypatch) 
                     partition=placement.partition,
                     block_ids_by_group=placement.block_ids_by_group,
                     reservation_capability=placement.reservation_capability,
-                    route_ticket=ticket,
+                    compatibility_digest=compatibility_digest,
+                    prefill_node_id="p",
+                    prefill_endpoint_generation=1,
                     decode_node_id="d",
                     decode_control_host="127.0.0.1",
                     decode_control_port=port,
@@ -175,15 +151,10 @@ def test_external_nodes_start_independently_and_d_streams_directly(monkeypatch) 
         assert p_core.source_released
         await asyncio.gather(prefill.close(), decode.close())
 
-    asyncio.run(exercise())
+    asyncio.run(asyncio.wait_for(exercise(), 15))
 
 
-def test_external_control_session_multiplexes_two_handoffs(monkeypatch) -> None:
-    monkeypatch.setenv("TEST_PD_SECRET", "0123456789abcdef0123456789abcdef")
-    monkeypatch.setenv(
-        "TEST_PD_ROUTER_SECRET",
-        "abcdef0123456789abcdef0123456789",
-    )
+def test_external_control_session_multiplexes_two_handoffs() -> None:
     port = _free_port()
 
     async def exercise() -> None:
@@ -222,25 +193,8 @@ def test_external_control_session_multiplexes_two_handoffs(monkeypatch) -> None:
                     prefill_endpoint_generation=1,
                 )
             )
-            now = time.time_ns()
-            ticket = sign_route_ticket(
-                RouteTicketClaims(
-                    key=key,
-                    prepared_request_id=prepared.prepared_request_id,
-                    prepared_digest=prepared.prepared_digest,
-                    compatibility_digest=capability_compatibility_digest(
-                        prefill.descriptor().capabilities
-                    ),
-                    prefill_node_id="p",
-                    decode_node_id="d",
-                    prefill_endpoint_generation=1,
-                    decode_endpoint_generation=1,
-                    reservation_id=placement.reservation_id,
-                    issued_at_ns=now,
-                    expires_at_ns=now + 10_000_000_000,
-                    nonce=os.urandom(16),
-                ),
-                b"abcdef0123456789abcdef0123456789",
+            compatibility_digest = capability_compatibility_digest(
+                prefill.descriptor().capabilities
             )
             decode.authorize_route(
                 AuthorizeRouteHTTP(
@@ -249,7 +203,11 @@ def test_external_control_session_multiplexes_two_handoffs(monkeypatch) -> None:
                     prepared.prepared_digest,
                     placement.reservation_id,
                     placement.reservation_capability,
-                    ticket,
+                    compatibility_digest,
+                    "p",
+                    1,
+                    "d",
+                    1,
                 )
             )
             stream = decode.open_decode_stream(key)
@@ -264,7 +222,9 @@ def test_external_control_session_multiplexes_two_handoffs(monkeypatch) -> None:
                         placement.partition,
                         placement.block_ids_by_group,
                         placement.reservation_capability,
-                        ticket,
+                        compatibility_digest,
+                        "p",
+                        1,
                         "d",
                         "127.0.0.1",
                         port,
@@ -286,41 +246,4 @@ def test_external_control_session_multiplexes_two_handoffs(monkeypatch) -> None:
         assert p_core.transfer_calls == 2
         await asyncio.gather(prefill.close(), decode.close())
 
-    asyncio.run(exercise())
-
-
-def test_route_ticket_rejects_tampering_and_expiry(monkeypatch) -> None:
-    monkeypatch.setenv(
-        "TEST_PD_ROUTER_SECRET",
-        "abcdef0123456789abcdef0123456789",
-    )
-    key = HandoffKey("request", "handoff", 1, 1, 1)
-    claims = RouteTicketClaims(
-        key=key,
-        prepared_request_id="prepared",
-        prepared_digest="a" * 64,
-        compatibility_digest="b" * 64,
-        prefill_node_id="p",
-        decode_node_id="d",
-        prefill_endpoint_generation=1,
-        decode_endpoint_generation=1,
-        reservation_id="reservation",
-        issued_at_ns=time.time_ns() - 2,
-        expires_at_ns=time.time_ns() - 1,
-        nonce=os.urandom(16),
-    )
-    token = sign_route_ticket(claims, b"abcdef0123456789abcdef0123456789")
-    from pypto_serving.serving.pd.protocol import verify_route_ticket
-
-    with pytest.raises(ValueError, match="expired"):
-        verify_route_ticket(
-            token,
-            b"abcdef0123456789abcdef0123456789",
-            now_ns=time.time_ns(),
-        )
-    with pytest.raises(ValueError, match="authentication"):
-        verify_route_ticket(
-            token[:-1] + ("A" if token[-1] != "A" else "B"),
-            b"abcdef0123456789abcdef0123456789",
-            now_ns=claims.issued_at_ns,
-        )
+    asyncio.run(asyncio.wait_for(exercise(), 15))

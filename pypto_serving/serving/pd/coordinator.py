@@ -6,15 +6,14 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Single-writer routing facts for the first fixed 1P1D implementation."""
+"""Single-writer lifecycle facts for Router-assigned handoffs."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-import uuid
 
-from .config import PDConfig, PDRole
+from .config import PDConfig
 from .protocol import HandoffKey
 
 
@@ -37,36 +36,15 @@ class HandoffRecord:
     error_code: str = ""
 
 
-class FixedCoordinator:
-    """Logical coordinator for one configured P/D pair; no dynamic routing."""
+class HandoffCoordinator:
+    """Track immutable Router assignments and local handoff state."""
 
     def __init__(self, config: PDConfig) -> None:
         if not config.enabled:
-            raise ValueError("FixedCoordinator requires an enabled PD config")
+            raise ValueError("HandoffCoordinator requires an enabled PD config")
         self.config = config
         self._records: dict[HandoffKey, HandoffRecord] = {}
         self._active_request: dict[str, HandoffKey] = {}
-
-    def create_handoff(self, request_id: str, *, data_generation: int = 1) -> HandoffRecord:
-        if request_id in self._active_request:
-            raise ValueError(f"request {request_id!r} already has an active handoff")
-        if type(data_generation) is not int or data_generation < 1:
-            raise ValueError("data_generation must be a positive integer")
-        key = HandoffKey(
-            request_id=request_id,
-            handoff_id=uuid.uuid4().hex,
-            data_generation=data_generation,
-            route_epoch=self.config.route_epoch,
-            control_incarnation=self.config.control_incarnation,
-        )
-        if self.config.role is PDRole.PREFILL:
-            prefill, decode = self.config.node_id, self.config.peer_node_id
-        else:
-            prefill, decode = self.config.peer_node_id, self.config.node_id
-        record = HandoffRecord(key=key, prefill_node_id=prefill, decode_node_id=decode)
-        self._records[key] = record
-        self._active_request[request_id] = key
-        return record
 
     def register_handoff(
         self,

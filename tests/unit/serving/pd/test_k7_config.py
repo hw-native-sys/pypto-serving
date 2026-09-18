@@ -28,8 +28,24 @@ def _pd_args(tmp_path, *, role: str, speculative_tokens: int):
             }
         )
     )
-    local = "p" if role == "prefill" else "d"
-    peer = "d" if role == "prefill" else "p"
+    pd_config = tmp_path / "pd.json"
+    pd_config.write_text(
+        json.dumps(
+            {
+                "runtime": {
+                    "run_id": "run-k7",
+                    "prefill": [
+                        {"host": "127.0.0.1", "port": 8101, "node_id": "p"}
+                    ],
+                    "decode": [
+                        {"host": "127.0.0.1", "port": 8102, "node_id": "d"}
+                    ],
+                },
+                "observability": {"root": str(tmp_path / "logs")},
+            }
+        ),
+        encoding="utf-8",
+    )
     return cli.build_parser().parse_args(
         [
             "--model",
@@ -57,26 +73,8 @@ def _pd_args(tmp_path, *, role: str, speculative_tokens: int):
             ),
             "--pd-role",
             role,
-            "--pd-node-id",
-            local,
-            "--pd-peer-node-id",
-            peer,
-            "--pd-run-id",
-            "run-k7",
-            "--pd-control-host",
-            "127.0.0.1",
-            "--pd-peer-host",
-            "127.0.0.1",
-            "--pd-transfer-hostname",
-            "127.0.0.1",
-            "--pd-model-revision",
-            "dsv4-flash-dspark",
-            "--pd-connect-timeout-seconds",
-            "600",
-            "--pd-request-timeout-seconds",
-            "300",
-            "--pd-journal-path",
-            str(tmp_path / f"{role}-journal.jsonl"),
+            "--pd-config",
+            str(pd_config),
         ]
     )
 
@@ -102,8 +100,8 @@ def test_pd_k7_uses_target_only_prefill_and_k7_decode(
     assert config.executor_kwargs["num_speculative_tokens"] == expected_local_tokens
     assert config.runtime_config.num_speculative_tokens == expected_local_tokens
     assert config.async_scheduling is False
-    assert config.pd_config.connect_timeout_seconds == 600
-    assert config.pd_config.request_timeout_seconds == 300
+    assert config.pd_config.connect_timeout_seconds == 30
+    assert config.pd_config.request_timeout_seconds == 600
     assert config.pd_config.max_pending_handoffs == 8
     assert config.pd_config.max_transfer_attempts == 2
     config.validate_pd()
@@ -118,17 +116,13 @@ def test_pd_rejects_k0_at_startup(tmp_path, role) -> None:
 
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])
-def test_external_router_config_does_not_require_a_fixed_peer(tmp_path, role) -> None:
+def test_external_router_config_is_derived_from_shared_document(tmp_path, role) -> None:
     args = _pd_args(
         tmp_path,
         role=role,
         speculative_tokens=PD_DSPARK_SPECULATIVE_TOKENS,
     )
-    args.pd_deployment_mode = "external-router"
-    args.pd_control_advertise_host = "192.0.2.10"
-    args.pd_peer_node_id = ""
-    args.pd_peer_host = ""
     config = cli.build_serving_engine_config(args)
-    assert config.pd_config.external_router
-    assert config.pd_config.peer_node_id == ""
-    assert config.pd_config.control_advertise_host == "192.0.2.10"
+    assert config.pd_config.run_id == "run-k7"
+    assert config.pd_config.control_advertise_host == "127.0.0.1"
+    assert config.pd_config.journal_path.endswith("state/journal.jsonl")

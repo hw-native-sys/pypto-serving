@@ -11,7 +11,6 @@
 from .config import (
     PDCapabilities,
     PDConfig,
-    PDDeploymentMode,
     PDRole,
     PDWorkerConfig,
 )
@@ -21,7 +20,6 @@ __all__ = [
     "HandoffKey",
     "PDCapabilities",
     "PDConfig",
-    "PDDeploymentMode",
     "PDRole",
     "PDWorkerConfig",
 ]
