@@ -160,14 +160,15 @@ def capability_compatibility_digest(value: CapabilityWire) -> str:
     """Digest only fields that must match across P and D owner registries."""
     contract = (
         value.schema_version,
+        value.adapter_id,
+        value.contract_version,
+        value.contract_digest,
+        value.continuation_schema,
         value.model_revision,
         value.layout_fingerprint,
         value.topology,
         value.provider,
         value.logical_groups,
         value.physical_regions,
-        value.chunk_transfer,
-        value.target_cache_only,
-        value.decode_speculative_tokens,
     )
     return hashlib.sha256(msgspec.msgpack.encode(contract)).hexdigest()

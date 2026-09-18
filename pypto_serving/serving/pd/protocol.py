@@ -53,6 +53,10 @@ class HandoffKey(msgspec.Struct, frozen=True):
 
 class CapabilityWire(msgspec.Struct, frozen=True):
     schema_version: int
+    adapter_id: str
+    contract_version: int
+    contract_digest: str
+    continuation_schema: str
     model_revision: str
     registry_fingerprint: str
     layout_fingerprint: str
@@ -60,14 +64,15 @@ class CapabilityWire(msgspec.Struct, frozen=True):
     provider: str
     logical_groups: tuple[str, ...]
     physical_regions: tuple[str, ...]
-    chunk_transfer: bool
-    target_cache_only: bool
-    decode_speculative_tokens: int
 
     @classmethod
     def from_capabilities(cls, value: PDCapabilities) -> "CapabilityWire":
         return cls(
             value.schema_version,
+            value.adapter_id,
+            value.contract_version,
+            value.contract_digest,
+            value.continuation_schema,
             value.model_revision,
             value.registry_fingerprint,
             value.layout_fingerprint,
@@ -75,14 +80,15 @@ class CapabilityWire(msgspec.Struct, frozen=True):
             value.provider,
             value.logical_groups,
             value.physical_regions,
-            value.chunk_transfer,
-            value.target_cache_only,
-            value.decode_speculative_tokens,
         )
 
     def to_capabilities(self) -> PDCapabilities:
         return PDCapabilities(
             schema_version=self.schema_version,
+            adapter_id=self.adapter_id,
+            contract_version=self.contract_version,
+            contract_digest=self.contract_digest,
+            continuation_schema=self.continuation_schema,
             model_revision=self.model_revision,
             registry_fingerprint=self.registry_fingerprint,
             layout_fingerprint=self.layout_fingerprint,
@@ -90,9 +96,6 @@ class CapabilityWire(msgspec.Struct, frozen=True):
             provider=self.provider,
             logical_groups=self.logical_groups,
             physical_regions=self.physical_regions,
-            chunk_transfer=self.chunk_transfer,
-            target_cache_only=self.target_cache_only,
-            decode_speculative_tokens=self.decode_speculative_tokens,
         )
 
 

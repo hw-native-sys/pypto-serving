@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
-from pypto_serving.serving.pd.config import PD_DSPARK_SPECULATIVE_TOKENS, PDRole
+from pypto_serving.serving.pd.config import PDRole
 from pypto_serving.serving.pd.http_api import NodeDescriptor
 
 from .client import NodeClient
@@ -76,17 +76,16 @@ class FixedWorkerDirectory:
         d_caps = decode.capabilities
         comparable = (
             "schema_version",
+            "adapter_id",
+            "contract_version",
+            "contract_digest",
+            "continuation_schema",
             "model_revision",
             "layout_fingerprint",
             "topology",
             "provider",
             "logical_groups",
             "physical_regions",
-            "chunk_transfer",
-            "target_cache_only",
-            "decode_speculative_tokens",
         )
         if any(getattr(p_caps, name) != getattr(d_caps, name) for name in comparable):
             raise ValueError("P/D capability or cache-layout contract differs")
-        if d_caps.decode_speculative_tokens != PD_DSPARK_SPECULATIVE_TOKENS:
-            raise ValueError("external Router requires the K7 Decode contract")

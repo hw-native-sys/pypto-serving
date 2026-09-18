@@ -97,6 +97,7 @@ def test_pd_k7_uses_target_only_prefill_and_k7_decode(
     )
 
     assert config.pd_config.decode_speculative_tokens == PD_DSPARK_SPECULATIVE_TOKENS
+    assert config.pd_config.model_contract.adapter_id == "deepseek-v4-dspark-k7"
     assert config.executor_kwargs["num_speculative_tokens"] == expected_local_tokens
     assert config.runtime_config.num_speculative_tokens == expected_local_tokens
     assert config.async_scheduling is False
@@ -109,7 +110,7 @@ def test_pd_k7_uses_target_only_prefill_and_k7_decode(
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])
 def test_pd_rejects_k0_at_startup(tmp_path, role) -> None:
-    with pytest.raises(ValueError, match="requires DeepSeek V4 DSpark K7"):
+    with pytest.raises(ValueError, match="match exactly one PD model adapter"):
         cli.build_serving_engine_config(
             _pd_args(tmp_path, role=role, speculative_tokens=0)
         )
