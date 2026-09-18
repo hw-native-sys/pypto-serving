@@ -9,6 +9,7 @@
 
 import pytest
 
+from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
 from pypto_serving.serving.memory.kv_cache import GroupReservationState
 from pypto_serving.serving.pd.connector import DecodeConnector
 from pypto_serving.serving.pd.planner import ChunkTransferPlanner
@@ -41,6 +42,7 @@ def _connector(capacity_slots: int = 2):
         make_capabilities(registry),
         registry,
         make_rank_registrations(registry),
+        contract=DSV4_DSPARK_K7_CONTRACT,
     )
     return manager, registry, connector
 
@@ -56,7 +58,9 @@ def _reserve(connector: DecodeConnector, prompt: int = 33, maximum: int = 8):
 def _final_manifest(manager, registry, reservation):
     rank_ids = tuple(rank.rank_id for rank in reservation.ranks)
     tables = {rank_id: reservation.block_ids_by_group for rank_id in rank_ids}
-    plan = ChunkTransferPlanner(registry, manager.group_specs).plan_chunk(
+    plan = ChunkTransferPlanner(
+        registry, manager.group_specs, DSV4_DSPARK_K7_CONTRACT
+    ).plan_chunk(
         KEY,
         chunk_id=0,
         start_token=0,

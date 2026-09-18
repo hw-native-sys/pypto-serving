@@ -21,10 +21,9 @@ import msgspec
 from .config import PDCapabilities, PDRole
 
 
-# A final DeepSeek V4 handoff carries the prompt continuation plus the
-# expanded page/layer write set for all final-only state regions.  With the
-# frozen 1024-token K7 layout that valid frame can exceed 4 MiB.  Keep a hard
-# bound, but size it for the supported model envelope; at four active
+# A final handoff can carry the prompt continuation plus an expanded
+# page/layer write set for final-only model state. Keep a hard bound sized for
+# the supported model envelope; at four active
 # handoffs this still caps decoded control payload memory at 64 MiB per peer.
 MAX_CONTROL_MESSAGE_BYTES = 16 << 20
 MAX_ID_BYTES = 256

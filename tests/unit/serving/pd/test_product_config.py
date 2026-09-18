@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
+from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_ADAPTER
 from pypto_serving.router.config import RouterConfig
 from pypto_serving.serving.pd.config import PDRole, load_pd_document, resolve_pd_config
 from pypto_serving.serving.pd.observability import write_startup_record
@@ -30,13 +30,13 @@ def test_minimal_config_resolves_shared_identity_and_default_paths(tmp_path) -> 
         document,
         role=PDRole.PREFILL,
         model_revision="dsv4",
-        model_contract=DSV4_DSPARK_K7_CONTRACT,
+        model_adapter=DSV4_DSPARK_K7_ADAPTER,
     )
     decode = resolve_pd_config(
         document,
         role=PDRole.DECODE,
         model_revision="dsv4",
-        model_contract=DSV4_DSPARK_K7_CONTRACT,
+        model_adapter=DSV4_DSPARK_K7_ADAPTER,
     )
     router = RouterConfig.from_document(document)
 
@@ -68,7 +68,7 @@ def test_observability_can_be_disabled_without_disabling_state(tmp_path) -> None
         document,
         role=PDRole.PREFILL,
         model_revision="dsv4",
-        model_contract=DSV4_DSPARK_K7_CONTRACT,
+        model_adapter=DSV4_DSPARK_K7_ADAPTER,
     )
     write_startup_record(
         config.log_dir,
