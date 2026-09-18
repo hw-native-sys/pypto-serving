@@ -91,6 +91,50 @@ class DecodeRequest(msgspec.Struct):
     cache_partition: int | None = None
 
 
+class ExternalKVPageData(msgspec.Struct):
+    """One external object and its physical grouped-cache page."""
+
+    key: str
+    group_name: str
+    logical_block_index: int
+    physical_block_id: int
+    size_bytes: int
+
+
+class ExternalKVLoadCommand(msgspec.Struct):
+    """Start one atomic external checkpoint load in the worker."""
+
+    job_id: str
+    request_id: str
+    manifest_key: str
+    checkpoint_token_count: int
+    source_partition: int
+    destination_partition: int
+    pages: list[ExternalKVPageData]
+
+
+class ExternalKVSaveCommand(msgspec.Struct):
+    """Publish data pages and then an atomic checkpoint manifest."""
+
+    job_id: str
+    request_id: str
+    manifest_key: str
+    manifest_payload: bytes
+    checkpoint_token_count: int
+    source_partition: int
+    pages: list[ExternalKVPageData]
+
+
+class ExternalKVTransferResult(msgspec.Struct):
+    """Terminal external cache transfer status returned by the worker."""
+
+    job_id: str
+    request_id: str
+    operation: str
+    succeeded: bool
+    error: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Step-level commands (engine → worker)
 # ---------------------------------------------------------------------------
@@ -111,6 +155,10 @@ class StepCommand(msgspec.Struct, tag="step"):
     # Monotonic step counter, echoed back on StepResult. Cheap ordering guard for
     # the pipelined loop (the worker is FIFO, so results must return in order).
     step_id: int = 0
+    external_cache_loads: list[ExternalKVLoadCommand] = msgspec.field(default_factory=list)
+    external_cache_saves: list[ExternalKVSaveCommand] = msgspec.field(default_factory=list)
+    external_cache_cancellations: list[str] = msgspec.field(default_factory=list)
+    poll_external_cache: bool = False
 
 
 class ShutdownCommand(msgspec.Struct, tag="shutdown"):
@@ -146,6 +194,9 @@ class StepResult(msgspec.Struct):
     error: str | None = None
     # Echoes the originating StepCommand.step_id (pipeline ordering guard).
     step_id: int = 0
+    external_cache_completions: list[ExternalKVTransferResult] = msgspec.field(
+        default_factory=list
+    )
 
 
 class ProfileResult(msgspec.Struct):

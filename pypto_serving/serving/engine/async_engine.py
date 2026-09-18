@@ -21,6 +21,13 @@ from typing import Callable
 
 from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
+from pypto_serving.serving.external_cache.config import ExternalPrefixCacheConfig
+from pypto_serving.serving.external_cache.connector import ExternalPrefixCacheIndex
+from pypto_serving.serving.external_cache.manifest import (
+    ExternalCacheNamespace,
+    checkpoint_alignment,
+)
+from pypto_serving.serving.external_cache.mooncake import create_mooncake_backend
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.utils.env import (
     worker_init_timeout_seconds,
@@ -37,6 +44,9 @@ from pypto_serving.serving.sched.scheduler import (
 from pypto_serving.serving.server.ipc import (
     PLACEHOLDER_TOKEN,
     DecodeRequest,
+    ExternalKVLoadCommand,
+    ExternalKVPageData,
+    ExternalKVSaveCommand,
     NewRequestData,
     PrefillRequest,
     ProfileCommand,
@@ -91,6 +101,7 @@ class EngineConfig:
     # are supported: the scheduler optimistically reserves the upper bound of
     # tokens per step and subtracts the shortfall once the worker replies.
     async_scheduling: bool | None = None
+    external_prefix_cache_config: ExternalPrefixCacheConfig | None = None
 
     def resolve_async_scheduling(self) -> bool:
         """Resolve the async-scheduling flag (default on for all executors)."""
@@ -251,6 +262,7 @@ class ReplicaEngineCore:
         # construction rather than re-reading os.environ every pipelined step.
         self._init_timeout = worker_init_timeout_seconds()
         self._step_timeout = worker_step_timeout_seconds()
+        self._external_cache_backend = None
 
     async def start(self) -> None:
         """Start worker process and engine loop."""
@@ -303,6 +315,11 @@ class ReplicaEngineCore:
                     reported_num_blocks,
                     self._runtime.page_size,
                 )
+            try:
+                self._initialize_external_prefix_cache()
+            except BaseException:
+                await asyncio.to_thread(self._shutdown_worker, timeout=5)
+                raise
 
         # The KV-cache block pool, scheduler tables and tokenizer are now
         # resident. Freeze the engine-process heap so the GC won't rescan them
@@ -322,7 +339,82 @@ class ReplicaEngineCore:
             self._loop_task = None
 
         await asyncio.to_thread(self._shutdown_worker, timeout=30)
+        backend = self._external_cache_backend
+        self._external_cache_backend = None
+        if backend is not None:
+            await asyncio.to_thread(backend.close)
         logger.info("ReplicaEngineCore stopped")
+
+    def _initialize_external_prefix_cache(self) -> None:
+        config = self.config.external_prefix_cache_config
+        if config is None:
+            return
+        if not self.kv_cache_manager.has_groups:
+            raise ValueError("external prefix caching is only supported by DeepSeek grouped KV cache")
+        groups = self.kv_cache_manager.group_specs
+        parallel = self.config.parallel_config
+        tensor_parallel_size = 1 if parallel is None else parallel.tensor_parallel_size
+        world_size = len(self.config.worker_device_ids())
+        namespace = ExternalCacheNamespace.for_deepseek_v4(
+            model_id=self.config.model_id,
+            model_revision=config.model_revision,
+            tokenizer_revision=config.tokenizer_revision,
+            kv_dtype=self._runtime.kv_dtype,
+            tensor_parallel_size=tensor_parallel_size,
+            world_size=world_size,
+            parallel_config={
+                "all2all_backend": None if parallel is None else parallel.all2all_backend,
+                "data_parallel_size": 1 if parallel is None else parallel.data_parallel_size,
+                "expert_parallel_size": 1 if parallel is None else parallel.expert_parallel_size,
+                "expert_placement_strategy": (
+                    None if parallel is None else parallel.expert_placement_strategy
+                ),
+                "pipeline_parallel_size": (
+                    1 if parallel is None else parallel.pipeline_parallel_size
+                ),
+                "placement_mode": None if parallel is None else parallel.placement_mode,
+                "tensor_parallel_size": tensor_parallel_size,
+                "world_size": world_size,
+            },
+            mtp_enabled=self._runtime.num_speculative_tokens > 0,
+            group_specs=groups,
+        )
+        try:
+            backend = create_mooncake_backend(
+                config.mooncake,
+                contribute_memory=False,
+            )
+        except Exception:
+            if config.failure_policy == "fail_startup":
+                raise
+            logger.exception(
+                "External prefix cache lookup client initialization failed; using local cold misses"
+            )
+            return
+        num_partitions = groups[0].num_partitions
+        if any(group.num_partitions != num_partitions for group in groups):
+            backend.close()
+            raise ValueError("external prefix cache requires equal DeepSeek group partition counts")
+        self._external_cache_backend = backend
+        self.scheduler.set_external_cache_index(
+            ExternalPrefixCacheIndex(
+                backend,
+                namespace,
+                alignment=checkpoint_alignment(groups),
+                num_partitions=num_partitions,
+                min_tokens=config.min_tokens,
+                load_timeout_ms=config.load_timeout_ms,
+                save_timeout_ms=config.save_timeout_ms,
+                max_pending_saves=config.max_pending_saves,
+                max_pending_save_blocks=config.max_pending_save_blocks,
+                enable_save=config.enable_save,
+            )
+        )
+        logger.info(
+            "External prefix cache enabled: backend=mooncake namespace=%s min_tokens=%d",
+            namespace.digest,
+            config.min_tokens,
+        )
 
     async def start_profile(self) -> None:
         """Start SA profiling in this replica's worker."""
@@ -576,6 +668,9 @@ class ReplicaEngineCore:
 
         step_result = decode_result(raw_output)
         if step_result.step_id != step_id:
+            self._process_external_cache_completions(
+                step_result.external_cache_completions
+            )
             # Should never happen: the worker is FIFO and stale results are
             # drained in _get_live_result. Treat as a fatal desync rather than
             # silently misapplying tokens. This result is already consumed.
@@ -586,6 +681,9 @@ class ReplicaEngineCore:
             self._handle_step_error(step_id, scheduler_output, result_pending=False)
             return False
         if step_result.error:
+            self._process_external_cache_completions(
+                step_result.external_cache_completions
+            )
             logger.error(f"Worker returned error: {step_result.error}")
             # This step's result was just consumed; only in-flight steps pend.
             self._handle_step_error(step_id, scheduler_output, result_pending=False)
@@ -601,7 +699,11 @@ class ReplicaEngineCore:
             cat="scheduler",
             args={"new_tokens": len(new_tokens)},
         ):
-            self._process_step_output(scheduler_output, new_tokens)
+            self._process_step_output(
+                scheduler_output,
+                new_tokens,
+                step_result.external_cache_completions,
+            )
         return True
 
     async def _get_live_result(self) -> bytes:
@@ -615,9 +717,13 @@ class ReplicaEngineCore:
             raw = await asyncio.to_thread(self._output_queue.get, timeout=self._step_timeout)
             if not self._discard_result_step_ids:
                 return raw
-            sid = decode_result(raw).step_id
+            stale_result = decode_result(raw)
+            sid = stale_result.step_id
             if sid in self._discard_result_step_ids:
                 self._discard_result_step_ids.discard(sid)
+                self._process_external_cache_completions(
+                    stale_result.external_cache_completions
+                )
                 logger.info("Drained stale result for discarded step_id=%d", sid)
                 continue
             return raw
@@ -716,6 +822,52 @@ class ReplicaEngineCore:
             decode_requests=decode_requests,
             finished_request_ids=finished_ids,
             step_id=step_id,
+            external_cache_loads=[
+                ExternalKVLoadCommand(
+                    job_id=load.job_id,
+                    request_id=load.request_id,
+                    manifest_key=load.manifest_key,
+                    checkpoint_token_count=load.checkpoint_token_count,
+                    source_partition=load.source_partition,
+                    destination_partition=load.destination_partition,
+                    pages=[
+                        ExternalKVPageData(
+                            key=page.key,
+                            group_name=page.group_name,
+                            logical_block_index=page.logical_block_index,
+                            physical_block_id=page.physical_block_id,
+                            size_bytes=page.size_bytes,
+                        )
+                        for page in load.pages
+                    ],
+                )
+                for load in scheduler_output.external_cache_loads
+            ],
+            external_cache_saves=[
+                ExternalKVSaveCommand(
+                    job_id=save.job_id,
+                    request_id=save.request_id,
+                    manifest_key=save.manifest_key,
+                    manifest_payload=save.manifest_payload,
+                    checkpoint_token_count=save.checkpoint_token_count,
+                    source_partition=save.source_partition,
+                    pages=[
+                        ExternalKVPageData(
+                            key=page.key,
+                            group_name=page.group_name,
+                            logical_block_index=page.logical_block_index,
+                            physical_block_id=page.physical_block_id,
+                            size_bytes=page.size_bytes,
+                        )
+                        for page in save.pages
+                    ],
+                )
+                for save in scheduler_output.external_cache_saves
+            ],
+            external_cache_cancellations=list(
+                scheduler_output.external_cache_cancellations
+            ),
+            poll_external_cache=scheduler_output.poll_external_cache,
         )
 
     async def _flush_pending_frees(self) -> None:
@@ -811,8 +963,10 @@ class ReplicaEngineCore:
         self,
         scheduler_output: SchedulerOutput,
         new_tokens: dict[str, int | list[int]],
+        external_cache_completions=(),
     ) -> None:
         """Process worker results: update scheduler state, push tokens to request queues."""
+        self._process_external_cache_completions(external_cache_completions)
         request_outputs = self.scheduler.update_from_output(scheduler_output, new_tokens)
 
         for req_output in request_outputs:
@@ -862,6 +1016,26 @@ class ReplicaEngineCore:
                 ),
             )
             ctx.queue.put_nowait(token_output)
+
+    def _process_external_cache_completions(self, external_cache_completions) -> None:
+        """Apply transfer fences even when their model step is discarded."""
+        for completion in external_cache_completions:
+            if completion.operation == "load":
+                self.scheduler.finish_external_cache_load(
+                    completion.request_id,
+                    job_id=completion.job_id,
+                    succeeded=completion.succeeded,
+                )
+            elif completion.operation == "save":
+                self.scheduler.finish_external_cache_save(
+                    completion.job_id,
+                    succeeded=completion.succeeded,
+                )
+            else:
+                logger.warning(
+                    "Ignoring external cache completion with unknown operation %r",
+                    completion.operation,
+                )
 
     def _detokenize_incrementally(self, ctx: _RequestContext) -> str:
         """Decode only the newly-completed text and append it to the running text.
