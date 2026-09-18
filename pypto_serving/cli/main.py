@@ -302,11 +302,11 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         model_family=model_family,
         model_variant=model_variant,
     )
-    # Both roles advertise the K7 PD product contract.  Only D owns the
-    # request-local drafter state; P compiles and executes target Prefill only.
     local_num_speculative_tokens = num_speculative_tokens
-    if pd_config is not None and pd_config.role.value == "prefill":
-        local_num_speculative_tokens = 0
+    if pd_config is not None:
+        local_num_speculative_tokens = pd_config.model_contract.local_speculative_tokens(
+            pd_config.role.value
+        )
     if model_family == "deepseek_v4":
         executor_kwargs["compile_kernels"] = True
         executor_kwargs["num_speculative_tokens"] = local_num_speculative_tokens
@@ -410,7 +410,7 @@ def _build_pd_config(
         role=role,
         node_id=args.pd_node_id,
         model_revision=args.served_model_name or Path(args.model).name,
-        model_contract=adapter.contract,
+        model_adapter=adapter,
     )
 
 

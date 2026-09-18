@@ -98,7 +98,7 @@ class EngineConfig:
     # are supported: the scheduler optimistically reserves the upper bound of
     # tokens per step and subtracts the shortfall once the worker replies.
     async_scheduling: bool | None = None
-    # Fixed 1P1D configuration. ``None`` preserves the exact legacy path.
+    # External-router PD configuration. None preserves normal serving.
     pd_config: object | None = None
 
     def resolve_async_scheduling(self) -> bool:
@@ -108,35 +108,29 @@ class EngineConfig:
         return True
 
     def validate_pd(self) -> None:
-        """Reject configurations that violate the first-version PD contract."""
-        from pypto_serving.serving.pd.config import (  # noqa: PLC0415
-            PD_DSPARK_SPECULATIVE_TOKENS,
-            PDRole,
-        )
-
+        """Reject configurations that violate the selected model contract."""
         config = self.pd_config
         if config is None or not getattr(config, "enabled", False):
             return
-        if self.executor_cls != "PyptoDeepSeekV4DSparkExecutor":
-            raise ValueError("the first PD version supports the DeepSeek V4 DSpark executor only")
-        if self.enable_prefix_cache:
-            raise ValueError("the first PD version requires prefix caching to be disabled")
-        if self.resolve_async_scheduling():
-            raise ValueError("the first PD version requires async scheduling to be disabled")
+        contract = config.model_contract
+        if self.executor_cls != contract.executor_cls:
+            raise ValueError("PD executor differs from the selected model contract")
+        if self.enable_prefix_cache != contract.requires_prefix_cache:
+            raise ValueError("PD prefix-cache mode differs from the selected model contract")
+        if self.resolve_async_scheduling() != contract.requires_async_scheduling:
+            raise ValueError("PD scheduling mode differs from the selected model contract")
         runtime = self.runtime_config or RuntimeConfig()
-        expected_local_tokens = (
-            0 if config.role is PDRole.PREFILL else PD_DSPARK_SPECULATIVE_TOKENS
-        )
+        expected_local_tokens = contract.local_speculative_tokens(config.role.value)
         if runtime.num_speculative_tokens != expected_local_tokens:
             raise ValueError(
                 f"PD {config.role.value} requires local num_speculative_tokens="
-                f"{expected_local_tokens} under the K7 product contract"
+                f"{expected_local_tokens} under {contract.adapter_id}"
             )
         executor_tokens = self.executor_kwargs.get("num_speculative_tokens", 0)
         if executor_tokens != expected_local_tokens:
             raise ValueError(
                 f"PD {config.role.value} executor requires num_speculative_tokens="
-                f"{expected_local_tokens} under the K7 product contract"
+                f"{expected_local_tokens} under {contract.adapter_id}"
             )
 
     def resolve_runtime_config(self) -> RuntimeConfig:

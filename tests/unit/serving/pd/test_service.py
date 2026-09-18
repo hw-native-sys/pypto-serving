@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
+from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_ADAPTER
 from pypto_serving.serving.engine.async_engine import PrefillChunkReady, TokenOutput
 from pypto_serving.serving.memory.kv_cache import GroupReservationState
 from pypto_serving.serving.pd.config import PDConfig, PDRole
@@ -230,7 +230,7 @@ def _config(
         control_advertise_host="127.0.0.1",
         transfer_hostname="127.0.0.1",
         model_revision="ds-v4-test",
-        model_contract=DSV4_DSPARK_K7_CONTRACT,
+        model_adapter=DSV4_DSPARK_K7_ADAPTER,
         connect_timeout_seconds=3,
         enable_chunk_overlap=enable_chunk_overlap,
         journal_path=journal_path,

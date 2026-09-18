@@ -12,21 +12,11 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .contracts import ModelPDContract, RuntimeLayoutDescriptor
+from .adapter import ModelPDAdapter
+from .contracts import RuntimeLayoutDescriptor
 
 
 PD_SCHEMA_VERSION = 4
-PD_DSPARK_SPECULATIVE_TOKENS = 7
-PD_PHYSICAL_REGIONS = (
-    "ori", "hca_cmp", "csa_cmp", "idx_k", "idx_scale",
-    "hca_state", "csa_state", "csa_inner_state",
-)
-PD_LOGICAL_GROUPS = (
-    "ori", "cmp_c128", "cmp_c4", "idx",
-    "hca_state", "csa_state", "csa_inner_state",
-)
-
-
 def _identifier(value: str, name: str) -> str:
     if not isinstance(value, str) or not value or len(value.encode()) > 256:
         raise ValueError(f"{name} must be a nonempty string of at most 256 bytes")
@@ -200,12 +190,11 @@ class PDConfig:
     control_advertise_host: str
     transfer_hostname: str
     model_revision: str
-    model_contract: ModelPDContract
+    model_adapter: ModelPDAdapter
     provider: str = "mooncake"
     generation: int = 1
     route_epoch: int = 1
     control_incarnation: int = 1
-    decode_speculative_tokens: int = PD_DSPARK_SPECULATIVE_TOKENS
     connect_timeout_seconds: float = 30.0
     request_timeout_seconds: float = 600.0
     transfer_poll_interval_seconds: float = 0.005
@@ -229,7 +218,7 @@ class PDConfig:
             "transfer_hostname", "model_revision", "provider",
         ):
             _identifier(getattr(self, name), name)
-        if self.model_contract.model_family == "" or self.model_contract.version < 1:
+        if self.model_adapter.contract.model_family == "" or self.model_adapter.contract.version < 1:
             raise ValueError("PD model contract is invalid")
         if type(self.control_port) is not int or not 1 <= self.control_port <= 65535:
             raise ValueError("PD control_port must be in [1, 65535]")
@@ -239,6 +228,10 @@ class PDConfig:
     @property
     def enabled(self) -> bool:
         return True
+
+    @property
+    def model_contract(self):
+        return self.model_adapter.contract
 
     def worker_config(self) -> "PDWorkerConfig":
         return PDWorkerConfig(
@@ -259,7 +252,7 @@ def resolve_pd_config(
     *,
     role: PDRole,
     model_revision: str,
-    model_contract: ModelPDContract,
+    model_adapter: ModelPDAdapter,
     node_id: str = "",
 ) -> PDConfig:
     endpoint = document.endpoint(role, node_id)
@@ -284,7 +277,7 @@ def resolve_pd_config(
         control_advertise_host=endpoint.control_host or endpoint.host,
         transfer_hostname=endpoint.transfer_hostname or endpoint.host,
         model_revision=model_revision,
-        model_contract=model_contract,
+        model_adapter=model_adapter,
         provider=document.runtime.provider,
         journal_path=str(state_dir / "journal.jsonl"),
         log_dir=str(role_dir),

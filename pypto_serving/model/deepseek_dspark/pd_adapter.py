@@ -1,9 +1,12 @@
 # Copyright (c) PyPTO Contributors.
 # Licensed under CANN Open Software License Agreement Version 2.0.
-"""DeepSeek V4 DSpark K7 semantic PD contract."""
+"""DeepSeek V4 DSpark K7 PD adapter."""
 
+from pypto_serving.model.deepseek.transfer_layout import ComponentLayout, DSV4Registry
 from pypto_serving.serving.pd.adapter import ModelRuntimeFacts
+from pypto_serving.serving.pd.connector import DecodeConnector
 from pypto_serving.serving.pd.contracts import ModelPDContract, TransferComponent
+from pypto_serving.serving.pd.planner import ChunkTransferPlanner
 
 
 DSV4_DSPARK_K7_CONTRACT = ModelPDContract(
@@ -25,6 +28,9 @@ DSV4_DSPARK_K7_CONTRACT = ModelPDContract(
             "csa_inner_state", "csa_inner_state", "csa_inner_state", True
         ),
     ),
+    executor_cls="PyptoDeepSeekV4DSparkExecutor",
+    prefill_speculative_tokens=0,
+    decode_speculative_tokens=7,
 )
 
 
@@ -38,6 +44,38 @@ class DeepSeekV4DSparkK7Adapter:
             and facts.num_speculative_tokens == 7
         )
 
+    def build_registry(self, bundle) -> DSV4Registry:
+        return DSV4Registry(
+            model_revision=bundle.model_revision,
+            topology=bundle.topology,
+            components=tuple(
+                ComponentLayout(
+                    component_id=component.component_id,
+                    dtype=component.dtype,
+                    item_bytes=component.item_bytes,
+                    layers=component.layers,
+                    blocks_per_layer=component.blocks_per_layer,
+                    block_tokens=component.block_tokens,
+                    token_stride_bytes=component.token_stride_bytes,
+                )
+                for component in bundle.components
+            ),
+        )
 
-BUILTIN_PD_ADAPTERS = (DeepSeekV4DSparkK7Adapter(),)
+    def make_planner(self, registry, group_specs) -> ChunkTransferPlanner:
+        return ChunkTransferPlanner(registry, group_specs, self.contract)
 
+    def make_decode_connector(
+        self, cache_manager, capabilities, registry, destination_ranks
+    ) -> DecodeConnector:
+        return DecodeConnector(
+            cache_manager,
+            capabilities,
+            registry,
+            destination_ranks,
+            contract=self.contract,
+        )
+
+
+DSV4_DSPARK_K7_ADAPTER = DeepSeekV4DSparkK7Adapter()
+BUILTIN_PD_ADAPTERS = (DSV4_DSPARK_K7_ADAPTER,)

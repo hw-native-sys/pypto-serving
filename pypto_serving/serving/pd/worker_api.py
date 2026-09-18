@@ -14,8 +14,6 @@ from typing import TypeVar
 
 import msgspec
 
-from pypto_serving.model.deepseek.transfer_layout import ComponentLayout, DSV4Registry
-
 from .protocol import ChunkManifest, RankRegistration, TransferResult
 
 
@@ -51,25 +49,6 @@ class WorkerRegistryBundle(msgspec.Struct, frozen=True):
     layout_fingerprint: str
     components: tuple[ComponentGeometry, ...]
     ranks: tuple[RankRegistration, ...]
-
-    def registry(self) -> DSV4Registry:
-        return DSV4Registry(
-            model_revision=self.model_revision,
-            topology=self.topology,
-            components=tuple(
-                ComponentLayout(
-                    component_id=component.component_id,
-                    dtype=component.dtype,
-                    item_bytes=component.item_bytes,
-                    layers=component.layers,
-                    blocks_per_layer=component.blocks_per_layer,
-                    block_tokens=component.block_tokens,
-                    token_stride_bytes=component.token_stride_bytes,
-                )
-                for component in self.components
-            ),
-        )
-
 
 class InstallPeerRequest(msgspec.Struct, frozen=True):
     registry_fingerprint: str

@@ -10,7 +10,7 @@
 import pytest
 
 from pypto_serving.serving.pd.completion import CompletionState, CompletionTracker
-from pypto_serving.serving.pd.config import PD_PHYSICAL_REGIONS
+from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
 from pypto_serving.serving.pd.protocol import (
     ChunkManifest,
     CommitRequest,
@@ -38,7 +38,10 @@ def _final_manifest() -> ChunkManifest:
         stop_strings=(),
         eos_token_id=4,
     )
-    units = tuple(TransferUnit(0, component, 0) for component in PD_PHYSICAL_REGIONS)
+    units = tuple(
+        TransferUnit(0, component, 0)
+        for component in DSV4_DSPARK_K7_CONTRACT.physical_regions
+    )
     digest = chunk_payload_hash(
         KEY,
         chunk_id=0,
@@ -82,13 +85,16 @@ def test_missing_component_cannot_commit_then_lost_ack_is_stable() -> None:
     tracker = CompletionTracker(KEY, "reservation")
     manifest = _final_manifest()
     tracker.register_chunk(manifest)
-    for component in PD_PHYSICAL_REGIONS[:-1]:
+    for component in DSV4_DSPARK_K7_CONTRACT.physical_regions[:-1]:
         tracker.record_transfer(_result(component, CompletionCertainty.COMPLETED))
     with pytest.raises(RuntimeError, match="incomplete"):
         tracker.commit(_commit(manifest))
 
     tracker.record_transfer(
-        _result(PD_PHYSICAL_REGIONS[-1], CompletionCertainty.COMPLETED)
+        _result(
+            DSV4_DSPARK_K7_CONTRACT.physical_regions[-1],
+            CompletionCertainty.COMPLETED,
+        )
     )
     first = tracker.commit(_commit(manifest))
     assert tracker.commit(_commit(manifest)) == first

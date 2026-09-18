@@ -31,7 +31,7 @@ from .protocol import (
 
 
 class PDControlSession:
-    """Async wrapper around one ordered, authenticated fixed-peer channel."""
+    """Async wrapper around one ordered external-Router control channel."""
 
     def __init__(
         self,
@@ -78,7 +78,7 @@ class PDControlSession:
             or peer.registry_fingerprint != capabilities.registry_fingerprint
             or peer.layout_fingerprint != capabilities.layout_fingerprint
         ):
-            raise ValueError("PD peer registry differs from its authenticated hello")
+            raise ValueError("PD peer registry differs from its control hello")
         if len(peer.ranks) != peer.topology[0]:
             raise ValueError("PD peer registry rank count differs from its topology")
         validate_rank_registrations(

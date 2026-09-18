@@ -22,6 +22,14 @@ class ModelPDAdapter(Protocol):
 
     def matches(self, facts: ModelRuntimeFacts) -> bool: ...
 
+    def build_registry(self, bundle): ...
+
+    def make_planner(self, registry, group_specs): ...
+
+    def make_decode_connector(
+        self, cache_manager, capabilities, registry, destination_ranks
+    ): ...
+
 
 class ModelPDAdapterRegistry:
     def __init__(self, adapters: tuple[ModelPDAdapter, ...]) -> None:
@@ -48,4 +56,3 @@ class ModelPDAdapterRegistry:
         if len(matches) != 1:
             raise ValueError(f"unknown PD model adapter {adapter_id!r}")
         return matches[0]
-
