@@ -12,6 +12,7 @@ import socket
 
 import pytest
 
+from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
 from pypto_serving.serving.pd.config import PDCapabilities, PDRole
 from pypto_serving.serving.pd.protocol import (
     FramedChannel,
@@ -26,10 +27,16 @@ from pypto_serving.serving.pd.protocol import (
 
 def _capabilities(model_revision: str = "ds-v4-test") -> PDCapabilities:
     return PDCapabilities(
+        adapter_id=DSV4_DSPARK_K7_CONTRACT.adapter_id,
+        contract_version=DSV4_DSPARK_K7_CONTRACT.version,
+        contract_digest=DSV4_DSPARK_K7_CONTRACT.digest,
+        continuation_schema=DSV4_DSPARK_K7_CONTRACT.continuation_schema,
         model_revision=model_revision,
         registry_fingerprint="f" * 64,
         layout_fingerprint="l" * 64,
         topology=(16, 4),
+        logical_groups=DSV4_DSPARK_K7_CONTRACT.logical_groups,
+        physical_regions=DSV4_DSPARK_K7_CONTRACT.physical_regions,
     )
 
 
@@ -130,15 +137,15 @@ def test_capability_mismatch_is_rejected() -> None:
     right.close()
 
 
-def test_k7_capability_mismatch_is_rejected() -> None:
+def test_contract_digest_mismatch_is_rejected() -> None:
     local = _capabilities()
     peer = object.__new__(PDCapabilities)
     for name, value in vars(local).items():
         object.__setattr__(peer, name, value)
-    object.__setattr__(peer, "decode_speculative_tokens", 0)
+    object.__setattr__(peer, "contract_digest", "0" * 64)
 
     assert local.compatibility_error(peer) == (
-        "PD capability mismatch: decode_speculative_tokens"
+        "PD capability mismatch: contract_digest"
     )
 
 

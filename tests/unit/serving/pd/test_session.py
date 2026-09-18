@@ -11,6 +11,7 @@ import asyncio
 import socket
 
 from pypto_serving.serving.pd.config import PDCapabilities, PDConfig, PD_PHYSICAL_REGIONS, PDRole
+from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
 from pypto_serving.serving.pd.protocol import (
     HandoffKey,
     HandoffStatus,
@@ -45,16 +46,23 @@ def _config(role: PDRole, port: int) -> PDConfig:
         control_advertise_host="127.0.0.1",
         transfer_hostname="127.0.0.1",
         model_revision="model",
+        model_contract=DSV4_DSPARK_K7_CONTRACT,
         connect_timeout_seconds=3,
     )
 
 
 def _capabilities() -> PDCapabilities:
     return PDCapabilities(
+        adapter_id=DSV4_DSPARK_K7_CONTRACT.adapter_id,
+        contract_version=DSV4_DSPARK_K7_CONTRACT.version,
+        contract_digest=DSV4_DSPARK_K7_CONTRACT.digest,
+        continuation_schema=DSV4_DSPARK_K7_CONTRACT.continuation_schema,
         model_revision="model",
         registry_fingerprint="f" * 64,
         layout_fingerprint="l" * 64,
         topology=(1, 1),
+        logical_groups=DSV4_DSPARK_K7_CONTRACT.logical_groups,
+        physical_regions=DSV4_DSPARK_K7_CONTRACT.physical_regions,
     )
 
 
