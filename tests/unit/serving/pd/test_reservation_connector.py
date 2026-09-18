@@ -9,6 +9,7 @@
 
 import pytest
 
+from pypto_serving.model.deepseek_dspark.npu_runner import DSPARK_MAX_SEQ_LEN
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
 from pypto_serving.serving.memory.kv_cache import GroupReservationState
 from pypto_serving.serving.pd.connector import DecodeConnector
@@ -132,7 +133,7 @@ def test_capacity_failure_is_all_or_nothing() -> None:
         for partition in range(manager.group_partition_count)
     }
     result = connector.reserve(
-        ReserveRequest(KEY, 16384, 1, connector.registry.layout_fingerprint)
+        ReserveRequest(KEY, DSPARK_MAX_SEQ_LEN, 1, connector.registry.layout_fingerprint)
     )
     assert isinstance(result, ReserveRejected)
     free_after = {
