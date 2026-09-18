@@ -11,7 +11,22 @@
 set -euo pipefail
 : "${PYPTO_HOME:?set PYPTO_HOME to the PyPTO source root}"
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-patch --dry-run -d "$PYPTO_HOME" -p1 < "$script_dir/patches/pypto-owner-service.patch"
-patch --dry-run -d "$PYPTO_HOME/runtime" -p1 < "$script_dir/patches/simpler-owner-service.patch"
-patch -d "$PYPTO_HOME" -p1 < "$script_dir/patches/pypto-owner-service.patch"
-patch -d "$PYPTO_HOME/runtime" -p1 < "$script_dir/patches/simpler-owner-service.patch"
+expected_pypto=${PYPTO_OWNER_SERVICE_BASE:-df4dc009368d4318a1a8692ef8a4c80ea5f62b43}
+expected_simpler=${SIMPLER_OWNER_SERVICE_BASE:-22385d2b0c08b8f697fe8feede488c87cf83ef84}
+actual_pypto=$(git -C "$PYPTO_HOME" rev-parse HEAD)
+actual_simpler=$(git -C "$PYPTO_HOME/runtime" rev-parse HEAD)
+if [[ $actual_pypto != "$expected_pypto" || $actual_simpler != "$expected_simpler" ]]; then
+    printf 'owner-service overlay base mismatch: PyPTO=%s Simpler=%s\n' \
+        "$actual_pypto" "$actual_simpler" >&2
+    exit 2
+fi
+
+patch_args=(--forward --fuzz=0)
+patch "${patch_args[@]}" --dry-run -d "$PYPTO_HOME" -p1 \
+    < "$script_dir/patches/pypto-owner-service.patch"
+patch "${patch_args[@]}" --dry-run -d "$PYPTO_HOME/runtime" -p1 \
+    < "$script_dir/patches/simpler-owner-service.patch"
+patch "${patch_args[@]}" -d "$PYPTO_HOME" -p1 \
+    < "$script_dir/patches/pypto-owner-service.patch"
+patch "${patch_args[@]}" -d "$PYPTO_HOME/runtime" -p1 \
+    < "$script_dir/patches/simpler-owner-service.patch"

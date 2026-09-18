@@ -1,7 +1,9 @@
 # Phase F system validation
 
 This directory is the K7-only validation driver for the external-Router fixed
-1P1D system. It extends the Phase E launchers with bounded multi-handoff
+1P1D system. F0 passed on 2026-09-18 as run
+`phase-f-f0-pr237-20260918-03` against PR237 plus PD commit `6526b48`.
+It extends the Phase E launchers with bounded multi-handoff
 admission, request correlation, optional closed-page compute/transfer overlap,
 metrics, correctness cases, fault recovery, and repeatable soak evidence.
 
@@ -42,6 +44,12 @@ separate evidence/control directory and must have a basename beginning with
 `phase-f-`.  This keeps the current `/workspace` deployment independent from
 the legacy `/home/sj/git/phase-f-*` staging trees.  The environment file is
 explicit because its compatibility path may differ from the code location.
+
+The launcher owns Mooncake's provider requirement
+`HCCL_INTRA_ROCE_ENABLE=1`; it does not rely on a machine-wide environment
+file to select the AscendDirect RoCE path. Version locks separately record the
+PyPTO checkout, nested Simpler runtime, environment PTO-ISA checkout, and the
+managed PTO-ISA checkout actually used by binary compilation.
 
 Use `--profile` for the overlap evidence run. It enables the protected P/D
 profile endpoints and archives each node's merged trace. Analyze the P trace

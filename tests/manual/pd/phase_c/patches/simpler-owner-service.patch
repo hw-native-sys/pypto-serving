@@ -1,6 +1,6 @@
 --- a/python/simpler/worker.py
 +++ b/python/simpler/worker.py
-@@ -146,6 +146,7 @@
+@@ -146,6 +146,7 @@ from .callable_identity import (
      parse_python_callable_payload,
      parse_python_import_target,
  )
@@ -8,7 +8,7 @@
  from .comm_endpoints import (
      DEVICE_AICORE,
      DEVICE_AICPU,
-@@ -2876,6 +2877,8 @@
+@@ -2886,6 +2887,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
      prepared: set[int] | None = None,
      task_frame_count: int = 1,
      chip_rank: int | None = None,
@@ -17,17 +17,21 @@
  ) -> None:
      """Chip-process handlers for `_run_mailbox_loop`.
  
-@@ -3014,7 +3017,8 @@
+@@ -3024,7 +3027,12 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                  struct.pack_into("Q", buf, _CTRL_OFF_RESULT, ptr)
              elif sub_cmd == _CTRL_FREE:
                  ptr = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
 -                cw.free(ptr)
-+                with service_context.freeing(ptr) if service_context is not None else contextlib.nullcontext():
++                with (
++                    service_context.freeing(ptr)
++                    if service_context is not None
++                    else contextlib.nullcontext()
++                ):
 +                    cw.free(ptr)
              elif sub_cmd in (_CTRL_COPY_TO, _CTRL_COPY_FROM):
                  # Both ends resolve through the same map-once cache the task-args path uses, so a
                  # backing already imported for a task is the one this copy reaches. The offset is
-@@ -3391,6 +3395,7 @@
+@@ -3401,6 +3409,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
          else:
              _run_mailbox_loop(buf, state_addr, handle_task=handle_task, handle_control=handle_control)
      finally:
@@ -35,7 +39,7 @@
          _teardown_chip_process_resources(import_registry, cw, global_domain_store, provider_region_store)
  
  
-@@ -3408,6 +3413,7 @@
+@@ -3418,6 +3427,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
      prewarm_config=None,
      enable_sdma: bool = False,
      chip_rank: int | None = None,
@@ -43,18 +47,26 @@
  ) -> None:
      """Runs in forked child process. Loads host_runtime.so in own address space.
  
-@@ -3456,6 +3462,20 @@
+@@ -3466,6 +3476,28 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
          cw.finalize()
          return
  
 +    try:
 +        service_resolver = (
-+            ImportRegistry(ImportContext(deployment=DEVICE_AICPU, device_owner_instance_id=owner_instance_id))
++            ImportRegistry(
++                ImportContext(
++                    deployment=DEVICE_AICPU,
++                    device_owner_instance_id=owner_instance_id,
++                )
++            )
 +            if service_factory is not None
 +            else None
 +        )
 +        service_context, chip_service = start_chip_service(
-+            service_factory, device_id, owner_instance_id, service_resolver
++            service_factory,
++            device_id,
++            owner_instance_id,
++            service_resolver,
 +        )
 +    except BaseException:
 +        _write_error(buf, 1, "chip service startup failed")
@@ -64,7 +76,7 @@
      mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
      state_addr = mailbox_addr + _OFF_STATE
      # Signal init success. The parent's readiness barrier waits for every chip
-@@ -3486,8 +3506,11 @@
+@@ -3496,8 +3528,11 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
              prepared=prepared,
              task_frame_count=_local_task_frame_count(platform, runtime, int(cw.pipeline_depth)),
              chip_rank=chip_rank,
@@ -76,7 +88,7 @@
          cw.finalize()
  
  
-@@ -4582,7 +4605,7 @@
+@@ -4645,7 +4680,7 @@ class Worker:
          # Rebound from the level in `init()`; the default matches the C++ table's
          # so a span emitted before init names L3 rather than nothing.
          self._host_span_prefix = _span_prefix(WorkerLevel.node)
@@ -85,15 +97,7 @@
          self._callable_registry: dict[int, Any] = {}
          self._identity_registry: dict[bytes, _CallableIdentityState] = {}
          self._live_handles: dict[int, bytes] = {}
-@@ -4809,6 +4832,7 @@
-         # revoked BEFORE the native free (and before a domain's backend release), so an interrupted
-         # op never leaves an identity resolving to memory that is already gone. Cleared on close().
-         self._child_alloc: dict[CanonicalIdentity, Buffer] = {}
-+        self._service_buffer_pins: dict[str, CanonicalIdentity] = {}
-         # Which identities each CommDomain allocation minted, so its release revokes them together.
-         self._domain_members: dict[int, set[CanonicalIdentity]] = {}
-         # Guards both device-allocation tables. Entry points take it (`_require_device_capability`,
-@@ -8109,6 +8133,7 @@
+@@ -8149,6 +8184,7 @@ class Worker:
                              prewarm_config=self._prewarm_config,
                              enable_sdma=bool(self._config.get("enable_sdma", False)),
                              chip_rank=idx,
@@ -101,7 +105,15 @@
                          )
                      except BaseException as e:  # noqa: BLE001
                          import traceback as _tb  # noqa: PLC0415
-@@ -10629,6 +10654,8 @@
+@@ -10296,6 +10332,7 @@ class Worker:
+         # revoked BEFORE the native free (and before a domain's backend release), so an interrupted
+         # op never leaves an identity resolving to memory that is already gone. Cleared on close().
+         self._child_alloc = _DeviceAllocations()
++        self._service_buffer_pins: dict[str, CanonicalIdentity] = {}
+         # Which identities each CommDomain allocation minted, so its release revokes them together.
+         self._domain_members: dict[int, set[CanonicalIdentity]] = {}
+         # Guards every device-allocation table. Entry points take it (`_require_device_capability`,
+@@ -10692,6 +10729,8 @@ class Worker:
                  # one chip no longer blocks provenance or device ops on another.
                  with self._child_prov_lock:
                      registered = self._require_freeable(handle, api="free")
@@ -110,13 +122,12 @@
                      ptr = int(registered.base)
                      self._drop_device_alloc(handle.identity)
                  if self.level == 2:
-@@ -10637,7 +10664,25 @@
-                 else:
+@@ -10701,6 +10740,24 @@ class Worker:
                      assert self._worker is not None
                      self._worker.free(wid, ptr)
-+
+ 
 +    def retain_service_buffer(self, handle: Buffer, worker_id: int) -> tuple[str, BufferDescriptor]:
-+        """Pin an exact-chip malloc allocation and return its private service descriptor."""
++        """Pin an exact-chip malloc allocation and return its service descriptor."""
 +        if self.level != 3 or type(worker_id) is not int:
 +            raise ValueError("chip services require a local L3 chip rank")
 +        with self._operation_lease("retain_service_buffer"), self._child_prov_lock:
@@ -127,9 +138,9 @@
 +            descriptor = registered.to_descriptor()
 +            self._service_buffer_pins[token] = handle.identity
 +            return token, descriptor
- 
++
 +    def release_service_buffer(self, token: str) -> None:
-+        """Drop a service pin only after the service confirms native unregistration."""
++        """Drop a service pin only after confirmed native unregistration."""
 +        with self._operation_lease("release_service_buffer"), self._child_prov_lock:
 +            del self._service_buffer_pins[token]
 +
@@ -138,7 +149,7 @@
          ``MemoryAllocator`` (tensors + pooled arenas + runtime buffers; excludes
 --- /dev/null
 +++ b/python/simpler/chip_service.py
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,117 @@
 +# Copyright (c) PyPTO Contributors.
 +# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 +# CANN Open Software License Agreement Version 2.0 (the "License").
@@ -174,6 +185,8 @@
 +        self._resolver = resolver
 +        self._pins: dict[str, tuple[int, int]] = {}
 +        self._lock = threading.RLock()
++        self._closed = False
++        self._service_closed = False
 +
 +    def pin(self, token: str, descriptor: Any) -> tuple[int, int]:
 +        with self._lock:
@@ -196,9 +209,20 @@
 +
 +    def close(self) -> None:
 +        with self._lock:
++            if self._closed:
++                return
 +            if self._pins:
 +                raise RuntimeError("chip service closed with live allocation pins")
 +            self._resolver.close()
++            self._closed = True
++
++    def close_service(self, service: ChipService) -> None:
++        """Close the service and resolver exactly once on nested teardown paths."""
++        if self._service_closed:
++            return
++        service.close()
++        self.close()
++        self._service_closed = True
 +
 +
 +def validate_service_config(level: int, config: dict) -> dict:
@@ -208,17 +232,26 @@
 +        and (
 +            level != 3
 +            or any(
-+                type(rank) is not int or not 0 <= rank < len(config.get("device_ids", ())) or not callable(factory)
++                type(rank) is not int
++                or not 0 <= rank < len(config.get("device_ids", ()))
++                or not callable(factory)
 +                for rank, factory in factories.items()
 +            )
 +        )
 +    ):
-+        raise ValueError("chip_service_factories requires callable factories keyed by local chip rank")
++        raise ValueError(
++            "chip_service_factories requires callable factories keyed by local chip rank"
++        )
 +    return dict(config, chip_service_factories=dict(factories)) if factories else config
 +
 +
-+def start_chip_service(factory: Callable | None, device_id: int, owner_instance_id: bytes, resolver):
-+    """Called after chip initialization and before startup readiness publication."""
++def start_chip_service(
++    factory: Callable | None,
++    device_id: int,
++    owner_instance_id: bytes,
++    resolver: Any,
++):
++    """Start a service after chip initialization and before readiness publication."""
 +    if factory is None:
 +        return None, None
 +    context = ChipServiceContext(device_id, owner_instance_id, resolver)
@@ -228,12 +261,11 @@
 +    return context, service
 +
 +
-+def close_chip_service(context, service) -> None:
++def close_chip_service(context: Any, service: Any) -> None:
 +    """Unsafe service teardown exits without device allocator/context cleanup."""
 +    if service is None:
 +        return
 +    try:
-+        service.close()
-+        context.close()
++        context.close_service(service)
 +    except BaseException:
 +        os._exit(75)
