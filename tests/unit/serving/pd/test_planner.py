@@ -1,0 +1,120 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+from pypto_serving.serving.pd.planner import ChunkTransferPlanner
+from pypto_serving.serving.pd.protocol import HandoffKey
+
+from .helpers import make_cache_manager, make_registry
+
+
+KEY = HandoffKey("request", "handoff", 1, 1, 1)
+
+
+def _tables(manager, request_id: str, token_count: int, partition: int = 0):
+    return {
+        name: tuple(ids)
+        for name, ids in manager.ensure_group_blocks(
+            request_id,
+            token_count,
+            partition=partition,
+        ).items()
+    }
+
+
+def test_chunk_planner_defers_partial_pages_and_keeps_zero_units() -> None:
+    manager = make_cache_manager()
+    registry = make_registry(manager)
+    source = _tables(manager, "source", 33)
+    destination = _tables(manager, "destination", 64)
+    planner = ChunkTransferPlanner(registry, manager.group_specs)
+    rank_ids = (0, 1, 2, 3)
+    source_by_rank = {rank: source for rank in rank_ids}
+    destination_by_rank = {rank: destination for rank in rank_ids}
+
+    first = planner.plan_chunk(
+        KEY,
+        chunk_id=0,
+        start_token=0,
+        end_token=32,
+        final=False,
+        rank_ids=rank_ids,
+        source_blocks_by_rank=source_by_rank,
+        destination_blocks_by_rank=destination_by_rank,
+    )
+    first_copies = first.ranks[0].copies
+    assert {copy.component_id for copy in first_copies} == {"ori"}
+    assert {unit.component_id for unit in first.ranks[0].expected_units} == {
+        "ori", "hca_cmp", "csa_cmp", "idx_k", "idx_scale"
+    }
+    assert any(unit.nbytes == 0 for unit in first.ranks[0].expected_units)
+
+    final = planner.plan_chunk(
+        KEY,
+        chunk_id=1,
+        start_token=32,
+        end_token=33,
+        final=True,
+        rank_ids=rank_ids,
+        source_blocks_by_rank=source_by_rank,
+        destination_blocks_by_rank=destination_by_rank,
+    )
+    final_components = {copy.component_id for copy in final.ranks[0].copies}
+    assert "ori" in final_components
+    assert {"hca_state", "csa_state", "csa_inner_state"} <= final_components
+    partial_ori = [copy for copy in final.ranks[0].copies if copy.component_id == "ori"]
+    assert partial_ori and {copy.valid_tokens for copy in partial_ori} == {1}
+
+
+def test_index_regions_are_atomic_and_ring_destination_wraps() -> None:
+    manager = make_cache_manager()
+    registry = make_registry(manager)
+    source = _tables(manager, "source", 224)
+    destination = _tables(manager, "destination", 256)
+    planner = ChunkTransferPlanner(registry, manager.group_specs)
+    ring_plan = planner.plan_chunk(
+        KEY,
+        chunk_id=6,
+        start_token=192,
+        end_token=224,
+        final=False,
+        rank_ids=(0,),
+        source_blocks_by_rank={0: source},
+        destination_blocks_by_rank={0: destination},
+    )
+    ori = [
+        copy
+        for copy in ring_plan.ranks[0].copies
+        if copy.component_id == "ori"
+    ]
+    assert ori
+    assert {copy.destination_block for copy in ori} == {destination["ori"][0]}
+
+    index_plan = planner.plan_chunk(
+        KEY,
+        chunk_id=0,
+        start_token=0,
+        end_token=128,
+        final=False,
+        rank_ids=(0,),
+        source_blocks_by_rank={0: source},
+        destination_blocks_by_rank={0: destination},
+    )
+    copies = index_plan.ranks[0].copies
+    index_k = {
+        (copy.layer, copy.source_block, copy.destination_block, copy.valid_tokens)
+        for copy in copies
+        if copy.component_id == "idx_k"
+    }
+    index_scale = {
+        (copy.layer, copy.source_block, copy.destination_block, copy.valid_tokens)
+        for copy in copies
+        if copy.component_id == "idx_scale"
+    }
+    assert index_k
+    assert index_k == index_scale
