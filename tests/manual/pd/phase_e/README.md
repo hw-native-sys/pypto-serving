@@ -7,7 +7,7 @@ the CPU-only public Router.
 
 The node launcher refuses an occupied NPU process table, creates a new evidence
 directory, and stops only children proven to belong to its own process session. It
-never resets a device. P/D expose only `/health` and authenticated `/internal/pd/*`;
+never resets a device. P/D expose only `/health` and `/internal/pd/*`;
 the Router is the only process exposing `/v1/*`.
 
 The accepted topology is serving-a P (`192.169.0.173`), serving-b D
@@ -15,9 +15,8 @@ The accepted topology is serving-a P (`192.169.0.173`), serving-b D
 Prefill, D-local K7 drafter initialization, and Mooncake AscendDirect D2D.
 
 Launch D, then P, wait for both `/health` endpoints, and finally launch the Router.
-Use a new run ID, generation/incarnation, evidence name, and journal on every run.
-Both secrets are supplied through environment variables and must never be written
-to logs. Run `run_smoke.sh` for the 128-token baseline and
+Use a new run ID, evidence name, and shared PD config on every run.
+Run `run_smoke.sh` for the 128-token baseline and
 `run_multi_chunk_smoke.sh` for a prompt that crosses the configured 128-token
 Prefill chunk boundary. Terminate only the exact PID recorded by each launcher, in
 Router, D, P order.
@@ -36,17 +35,17 @@ under one stage. The verified 2026-09-13 stage was:
   ptoas -> frozen PTOAS
 ```
 
-Choose new values for every run and provide secrets through the process
-environment. The control secret is shared by Router/P/D; the route-signing secret
-is shared only by Router and D. Each must contain at least 16 bytes.
+Choose a new shared config for every run and place the same file path/content in
+both containers:
 
-```bash
-export PD_RUN_ID=replace-with-new-run-id
-export PD_GENERATION=1
-export PD_ROUTE_EPOCH=1
-export PD_CONTROL_INCARNATION=1
-export PYPTO_PD_AUTH_SECRET=replace-with-control-secret
-export PYPTO_PD_ROUTER_SECRET=replace-with-route-secret
+```json
+{
+  "runtime": {
+    "run_id": "replace-with-new-run-id",
+    "prefill": [{"host": "192.169.0.173", "port": 8111, "node_id": "serving-a-p", "control_port": 29931}],
+    "decode": [{"host": "192.169.0.85", "port": 8112, "node_id": "serving-b-d", "control_port": 29931}]
+  }
+}
 ```
 
 ## Launch order
@@ -59,8 +58,7 @@ On serving-b, launch D:
 ```bash
 export PD_ROLE=decode
 export PD_NODE_ID=serving-b-d
-export PD_LOCAL_HOST=192.169.0.85
-export PD_CONTROL_PORT=29931
+export PD_CONFIG=/absolute/path/pd.json
 export PD_API_PORT=8112
 export PD_EVIDENCE_NAME=replace-with-d-evidence-name
 setsid bash /home/sj/git/phase-e-router-20260913-v2/pypto-serving/tests/manual/pd/phase_e/run_pd_k7_node.sh
@@ -71,8 +69,7 @@ On serving-a, launch P independently:
 ```bash
 export PD_ROLE=prefill
 export PD_NODE_ID=serving-a-p
-export PD_LOCAL_HOST=192.169.0.173
-export PD_CONTROL_PORT=29931
+export PD_CONFIG=/absolute/path/pd.json
 export PD_API_PORT=8111
 export PD_EVIDENCE_NAME=replace-with-p-evidence-name
 setsid bash /home/sj/git/phase-e-router-20260913-v2/pypto-serving/tests/manual/pd/phase_e/run_pd_k7_node.sh
@@ -81,8 +78,7 @@ setsid bash /home/sj/git/phase-e-router-20260913-v2/pypto-serving/tests/manual/p
 After both health endpoints return 200, launch the CPU-only Router on serving-a:
 
 ```bash
-export ROUTER_P_URL=http://127.0.0.1:8111
-export ROUTER_D_URL=http://192.169.0.85:8112
+export PD_CONFIG=/absolute/path/pd.json
 export ROUTER_PORT=8110
 export ROUTER_EVIDENCE_NAME=replace-with-router-evidence-name
 setsid bash /home/sj/git/phase-e-router-20260913-v2/pypto-serving/tests/manual/pd/phase_e/run_router.sh
@@ -99,8 +95,8 @@ bash tests/manual/pd/phase_e/run_multi_chunk_smoke.sh \
 
 ## Endpoint and shutdown checks
 
-An external node must return 401 for an unauthenticated internal request and 404
-for `/v1/models`; the Router owns `/v1/*`. Before shutdown, confirm the launcher
+An external node must return 404 for `/v1/models`; the Router owns `/v1/*`.
+Before shutdown, confirm the launcher
 PID and command from its evidence directory. Send TERM in Router, D, P order and
 wait for each launcher to finish its owned-session cleanup and write
 `postflight-npu.log`. Do not reset an NPU and do not terminate a process selected

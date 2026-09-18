@@ -22,10 +22,7 @@ if [[ $HCCL_INTRA_ROCE_ENABLE != 1 ]]; then
     exit 2
 fi
 
-required=(
-    PD_ROLE PD_NODE_ID PD_RUN_ID PD_LOCAL_HOST PD_CONTROL_PORT
-    PD_API_PORT PD_EVIDENCE_NAME
-)
+required=(PD_ROLE PD_CONFIG PD_API_PORT PD_EVIDENCE_NAME)
 for name in "${required[@]}"; do
     if [[ -z ${!name:-} ]]; then
         echo "$name must be set" >&2
@@ -45,12 +42,8 @@ if [[ $evidence_root != /* || $evidence_root == / || ! -d $evidence_root ]]; the
     echo "PD_EVIDENCE_ROOT must be an existing explicit absolute directory" >&2
     exit 2
 fi
-if [[ ${#PYPTO_PD_AUTH_SECRET} -lt 16 ]]; then
-    echo "PYPTO_PD_AUTH_SECRET must contain at least 16 characters" >&2
-    exit 2
-fi
-if [[ $PD_ROLE == decode && ${#PYPTO_PD_ROUTER_SECRET} -lt 16 ]]; then
-    echo "PYPTO_PD_ROUTER_SECRET must contain at least 16 characters on D" >&2
+if [[ $PD_CONFIG != /* || ! -f $PD_CONFIG ]]; then
+    echo "PD_CONFIG must identify the shared absolute JSON config" >&2
     exit 2
 fi
 
@@ -180,10 +173,6 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-pd_overlap_flag=--no-pd-enable-chunk-overlap
-if [[ ${PD_ENABLE_CHUNK_OVERLAP:-false} == true ]]; then
-    pd_overlap_flag=--pd-enable-chunk-overlap
-fi
 pd_profile_args=()
 if [[ ${PD_PROFILE:-false} == true ]]; then
     pd_profile_args=(
@@ -191,6 +180,10 @@ if [[ ${PD_PROFILE:-false} == true ]]; then
         --profile-output "$run_dir/profile"
         --profile-level "${PD_PROFILE_LEVEL:-e2e,kernel}"
     )
+fi
+pd_node_args=()
+if [[ -n ${PD_NODE_ID:-} ]]; then
+    pd_node_args=(--pd-node-id "$PD_NODE_ID")
 fi
 python -m pypto_serving.cli \
     --model "$PYPTO_DSV4_DSPARK_MODEL_DIR" \
@@ -204,27 +197,8 @@ python -m pypto_serving.cli \
     --ring-heap 2147483648,2147483648,4294967296,8589934592 \
     --use-compile-cache \
     --pd-role "$PD_ROLE" \
-    --pd-deployment-mode external-router \
-    --pd-node-id "$PD_NODE_ID" \
-    --pd-run-id "$PD_RUN_ID" \
-    --pd-control-host "$PD_LOCAL_HOST" \
-    --pd-control-advertise-host "$PD_LOCAL_HOST" \
-    --pd-control-port "$PD_CONTROL_PORT" \
-    --pd-transfer-hostname "$PD_LOCAL_HOST" \
-    --pd-model-revision "${PD_MODEL_REVISION:-dsv4-flash-dspark-w8a8-phase-e}" \
-    --pd-generation "${PD_GENERATION:-1}" \
-    --pd-route-epoch "${PD_ROUTE_EPOCH:-1}" \
-    --pd-control-incarnation "${PD_CONTROL_INCARNATION:-1}" \
-    --pd-connect-timeout-seconds 1800 \
-    --pd-request-timeout-seconds 600 \
-    --pd-max-active-handoffs "${PD_MAX_ACTIVE_HANDOFFS:-1}" \
-    --pd-max-pending-handoffs "${PD_MAX_PENDING_HANDOFFS:-8}" \
-    --pd-max-inflight-transfer-bytes "${PD_MAX_INFLIGHT_TRANSFER_BYTES:-1073741824}" \
-    --pd-transfer-poll-interval-seconds "${PD_TRANSFER_POLL_INTERVAL_SECONDS:-0.005}" \
-    "$pd_overlap_flag" \
-    --pd-max-transfer-attempts 2 \
-    --pd-prepared-request-ttl-seconds 1800 \
-    --pd-journal-path "$run_dir/pd-journal.jsonl" \
+    --pd-config "$PD_CONFIG" \
+    "${pd_node_args[@]}" \
     "${pd_profile_args[@]}" \
     --host 0.0.0.0 --port "$PD_API_PORT" --show-startup-logs &
 child_pid=$!
