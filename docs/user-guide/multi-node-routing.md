@@ -61,7 +61,7 @@ Describe the replicas in a JSON file:
 }
 ```
 
-`name` is optional and defaults to `host:port`.
+`name` is optional and defaults to `host:port`. `scheme` is optional and defaults to `http`; set it to `https` when the replicas are not on a trusted network, since request bodies and generated text cross this hop in the clear otherwise.
 
 ```bash
 pypto-serving-router --replicas replicas.json --port 8000
@@ -139,3 +139,4 @@ Raise `--affinity-slack` when prefills are expensive relative to queueing — lo
 - The router does not retry. A replica that fails mid-stream ends that request; the client resends.
 - Load is counted as outstanding requests, not tokens, because the router never tokenizes.
 - The replica list is fixed at launch. Adding a replica means restarting the router.
+- Session pins are capped (100,000 by default) and evicted least-recently-used, so a flood of distinct session ids costs pins rather than memory.

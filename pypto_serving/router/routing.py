@@ -28,6 +28,7 @@ import contextlib
 import logging
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable
 
@@ -38,6 +39,11 @@ logger = logging.getLogger(__name__)
 # Consecutive failed probes before a replica leaves rotation. One blip should not
 # depin every session; recovery is immediate on the first success.
 UNHEALTHY_THRESHOLD = 2
+
+# Session ids are client-supplied, so the directory is an unbounded map keyed by
+# untrusted input until its entries expire. Cap it and evict least-recently-used
+# pins: losing a pin costs one prefill, unbounded growth costs the process.
+DEFAULT_MAX_SESSIONS = 100_000
 
 
 class NoReplicaAvailable(RuntimeError):
@@ -54,12 +60,17 @@ class SessionDirectory:
     The clock is injectable so expiry is testable without sleeping.
     """
 
-    def __init__(self, ttl_seconds: float, *, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, ttl_seconds: float, *, clock: Callable[[], float] = time.monotonic,
+                 max_sessions: int = DEFAULT_MAX_SESSIONS) -> None:
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
+        if max_sessions < 1:
+            raise ValueError("max_sessions must be positive")
         self._ttl = ttl_seconds
         self._clock = clock
-        self._pins: dict[str, tuple[str, float]] = {}
+        self._max = max_sessions
+        # Ordered by recency of pin, so eviction is a popitem from the front.
+        self._pins: OrderedDict[str, tuple[str, float]] = OrderedDict()
 
     def __len__(self) -> int:
         return len(self._pins)
@@ -77,6 +88,12 @@ class SessionDirectory:
 
     def pin(self, session_id: str, replica_name: str) -> None:
         self._pins[session_id] = (replica_name, self._clock())
+        self._pins.move_to_end(session_id)
+        if len(self._pins) > self._max:
+            self.sweep()
+        while len(self._pins) > self._max:
+            evicted, _ = self._pins.popitem(last=False)
+            logger.debug("session directory full; evicted the least-recent pin %s", evicted)
 
     def forget(self, session_id: str) -> None:
         self._pins.pop(session_id, None)
