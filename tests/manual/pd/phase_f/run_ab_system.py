@@ -378,6 +378,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model-dir", default="/models/dsv4-flash-0731-dspark-w8a8"
     )
+    parser.add_argument("--max-model-len", type=int, default=1024)
     parser.add_argument("--container", default="openeuler-2403-DS")
     parser.add_argument("--prefill-ssh", default="serving-a-sj")
     parser.add_argument("--decode-ssh", default="serving-b-sj")
@@ -415,6 +416,8 @@ def main() -> int:
         raise ValueError("cases-file must be a JSON basename inside phase_f")
     if args.soak_requests < 1:
         raise ValueError("soak-requests must be positive")
+    if args.max_model_len < 1:
+        raise ValueError("max-model-len must be positive")
     for name, value in (
         ("repo", args.repo),
         ("run-root", args.run_root),
@@ -489,6 +492,7 @@ def main() -> int:
             "PD_EVIDENCE_ROOT": run_root,
             "PYPTO_STACK_ENV_FILE": args.env_file,
             "PYPTO_DSV4_DSPARK_MODEL_DIR": args.model_dir,
+            "PYPTO_MAX_MODEL_LEN": args.max_model_len,
         }
         _start(
             args.decode_ssh,
