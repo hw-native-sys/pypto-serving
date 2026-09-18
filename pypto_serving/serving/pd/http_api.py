@@ -87,6 +87,23 @@ class PlacementReservation(msgspec.Struct, frozen=True):
     decode_endpoint_generation: int
 
 
+class PlacementRejection(msgspec.Struct, frozen=True):
+    key: HandoffKey
+    decode_node_id: str
+    decode_endpoint_generation: int
+    reason: str
+    retryable: bool
+
+
+class ReservePlacementResult(msgspec.Struct, frozen=True):
+    reservation: PlacementReservation | None = None
+    rejection: PlacementRejection | None = None
+
+    def __post_init__(self) -> None:
+        if (self.reservation is None) == (self.rejection is None):
+            raise ValueError("reserve result must contain exactly one outcome")
+
+
 class AuthorizeRouteHTTP(msgspec.Struct, frozen=True):
     key: HandoffKey
     prepared_request_id: str

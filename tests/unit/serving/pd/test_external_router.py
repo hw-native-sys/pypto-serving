@@ -18,9 +18,11 @@ from pypto_serving.serving.pd.http_api import (
     DecodeStreamFrame,
     CapacitySnapshot,
     NodeDescriptor,
+    PlacementRejection,
     PlacementReservation,
     PrefillHandoffResult,
     PreparedRequest,
+    ReservePlacementResult,
 )
 from pypto_serving.serving.pd.protocol import (
     CapabilityWire,
@@ -30,7 +32,8 @@ from pypto_serving.serving.pd.protocol import (
 )
 
 
-def _descriptor(role: PDRole) -> NodeDescriptor:
+def _descriptor(role: PDRole, node_id: str = "") -> NodeDescriptor:
+    node_id = node_id or role.value
     capabilities = PDCapabilities(
         adapter_id=DSV4_DSPARK_K7_CONTRACT.adapter_id,
         contract_version=DSV4_DSPARK_K7_CONTRACT.version,
@@ -44,7 +47,7 @@ def _descriptor(role: PDRole) -> NodeDescriptor:
         physical_regions=DSV4_DSPARK_K7_CONTRACT.physical_regions,
     )
     return NodeDescriptor(
-        node_id=role.value,
+        node_id=node_id,
         role=role.value,
         run_id="run",
         control_host="decode-control",
@@ -57,9 +60,10 @@ def _descriptor(role: PDRole) -> NodeDescriptor:
     )
 
 
-def _capacity(role: PDRole) -> CapacitySnapshot:
+def _capacity(role: PDRole, node_id: str = "") -> CapacitySnapshot:
+    node_id = node_id or role.value
     return CapacitySnapshot(
-        node_id=role.value,
+        node_id=node_id,
         role=role.value,
         active_handoffs=0,
         prepared_requests=0,
@@ -71,16 +75,18 @@ def _capacity(role: PDRole) -> CapacitySnapshot:
 
 
 class _PrefillClient:
-    def __init__(self, waiting: asyncio.Event) -> None:
+    def __init__(self, waiting: asyncio.Event, node_id: str = "prefill") -> None:
         self.waiting = waiting
+        self.node_id = node_id
         self.execute_calls = 0
         self.abort_calls = 0
+        self.query_calls = 0
 
     async def get(self, path, _type):
         if path == "/internal/pd/descriptor":
-            return _descriptor(PDRole.PREFILL)
+            return _descriptor(PDRole.PREFILL, self.node_id)
         if path == "/internal/pd/capacity":
-            return _capacity(PDRole.PREFILL)
+            return _capacity(PDRole.PREFILL, self.node_id)
         raise AssertionError(path)
 
     async def post(self, path, payload, response_type=None):
@@ -115,21 +121,24 @@ class _PrefillClient:
             self.abort_calls += 1
             return None
         if path == "/internal/pd/query":
+            self.query_calls += 1
             return None
         raise AssertionError(path)
 
 
 class _DecodeClient:
-    def __init__(self, waiting: asyncio.Event) -> None:
+    def __init__(self, waiting: asyncio.Event, node_id: str = "decode") -> None:
         self.waiting = waiting
+        self.node_id = node_id
         self.reservation = None
         self.abort_calls = 0
+        self.query_calls = 0
 
     async def get(self, path, _type):
         if path == "/internal/pd/descriptor":
-            return _descriptor(PDRole.DECODE)
+            return _descriptor(PDRole.DECODE, self.node_id)
         if path == "/internal/pd/capacity":
-            return _capacity(PDRole.DECODE)
+            return _capacity(PDRole.DECODE, self.node_id)
         raise AssertionError(path)
 
     async def post(self, path, payload, response_type=None):
@@ -142,12 +151,12 @@ class _DecodeClient:
                 block_ids_by_group={"ori": (1,)},
                 prepared_digest=payload.prepared_digest,
                 reservation_capability="capability",
-                decode_node_id="decode",
+                decode_node_id=self.node_id,
                 decode_control_host="decode-control",
                 decode_control_port=29831,
                 decode_endpoint_generation=1,
             )
-            return self.reservation
+            return ReservePlacementResult(reservation=self.reservation)
         if path == "/internal/pd/authorize":
             assert payload.reservation_id == self.reservation.reservation_id
             return None
@@ -155,6 +164,7 @@ class _DecodeClient:
             self.abort_calls += 1
             return None
         if path == "/internal/pd/query":
+            self.query_calls += 1
             return None
         raise AssertionError(path)
 
@@ -210,6 +220,26 @@ class _ReserveFailureDecodeClient(_DecodeClient):
     async def post(self, path, payload, response_type=None):
         if path == "/internal/pd/reserve":
             raise RuntimeError("D capacity unavailable")
+        return await super().post(path, payload, response_type)
+
+
+class _RejectDecodeClient(_DecodeClient):
+    def __init__(self, waiting: asyncio.Event, node_id: str = "decode-reject") -> None:
+        super().__init__(waiting, node_id)
+        self.reserve_calls = 0
+
+    async def post(self, path, payload, response_type=None):
+        if path == "/internal/pd/reserve":
+            self.reserve_calls += 1
+            return ReservePlacementResult(
+                rejection=PlacementRejection(
+                    key=payload.key,
+                    decode_node_id=self.node_id,
+                    decode_endpoint_generation=1,
+                    reason="CAPACITY_EXHAUSTED",
+                    retryable=True,
+                )
+            )
         return await super().post(path, payload, response_type)
 
 
@@ -436,6 +466,69 @@ def test_router_reservation_failure_is_definite_and_aborts_without_prefill(
     asyncio.run(exercise())
 
 
+def test_router_reselects_decode_after_retryable_reservation_rejection(
+    tmp_path,
+) -> None:
+    async def exercise() -> None:
+        waiting = asyncio.Event()
+        p_client = _PrefillClient(waiting, "p1")
+        rejected = _RejectDecodeClient(waiting, "d1")
+        accepted = _DecodeClient(waiting, "d2")
+        config = RouterConfig(
+            prefill_urls=("http://p1",),
+            decode_urls=("http://d1", "http://d2"),
+            run_id="run",
+            policy="round_robin",
+            provider="mooncake",
+            journal_path=str(tmp_path / "router-retry.jsonl"),
+            log_dir=str(tmp_path / "logs"),
+        )
+        journal = RouterJournal(config.journal_path, config.run_id)
+        coordinator = RouterCoordinator(
+            config,
+            WorkerDirectory(
+                (p_client,),
+                (rejected, accepted),
+                "run",
+                RoundRobinRoutePolicy(),
+            ),
+            journal,
+        )
+
+        outputs = [
+            output
+            async for output in coordinator.generate(
+                "completion",
+                b'{"prompt":"hello","max_tokens":2}',
+                "request-retry",
+            )
+        ]
+
+        assert outputs[-1].finished
+        assert rejected.reserve_calls == 1
+        assert p_client.execute_calls == 1
+        with open(journal.path, encoding="utf-8") as stream:
+            records = [json.loads(line) for line in stream]
+        rejection = next(
+            record for record in records if record["event"] == "RESERVATION_REJECTED"
+        )
+        reserved = next(
+            record for record in records if record["event"] == "HANDOFF_RESERVED"
+        )
+        assert (rejection["prefill_node_id"], rejection["decode_node_id"]) == (
+            "p1",
+            "d1",
+        )
+        assert (reserved["prefill_node_id"], reserved["decode_node_id"]) == (
+            "p1",
+            "d2",
+        )
+        assert journal.unresolved == ()
+        journal.close()
+
+    asyncio.run(exercise())
+
+
 def test_router_restart_queries_both_owners_and_fences_unresolved_handoff(
     monkeypatch, tmp_path
 ) -> None:
@@ -447,7 +540,14 @@ def test_router_restart_queries_both_owners_and_fences_unresolved_handoff(
             monkeypatch, tmp_path, p_client, d_client
         )
         key = HandoffKey("request", "handoff", 1, 1, 1)
-        journal.append("HANDOFF_CREATED", key)
+        journal.append(
+            "HANDOFF_CREATED",
+            key,
+            prefill_node_id="prefill",
+            decode_node_id="decode",
+            prefill_endpoint_generation=1,
+            decode_endpoint_generation=1,
+        )
 
         await coordinator.reconcile_startup()
 
@@ -459,3 +559,95 @@ def test_router_restart_queries_both_owners_and_fences_unresolved_handoff(
         journal.close()
 
     asyncio.run(exercise())
+
+
+def test_router_restart_queries_only_the_journaled_multi_node_owners(
+    tmp_path,
+) -> None:
+    async def exercise() -> None:
+        waiting = asyncio.Event()
+        p1 = _PrefillClient(waiting, "p1")
+        p2 = _PrefillClient(waiting, "p2")
+        d1 = _DecodeClient(waiting, "d1")
+        d2 = _DecodeClient(waiting, "d2")
+        config = RouterConfig(
+            prefill_urls=("http://p1", "http://p2"),
+            decode_urls=("http://d1", "http://d2"),
+            run_id="run",
+            policy="round_robin",
+            provider="mooncake",
+            journal_path=str(tmp_path / "router-recovery.jsonl"),
+            log_dir=str(tmp_path / "logs"),
+        )
+        journal = RouterJournal(config.journal_path, config.run_id)
+        coordinator = RouterCoordinator(
+            config,
+            WorkerDirectory(
+                (p1, p2),
+                (d1, d2),
+                "run",
+                RoundRobinRoutePolicy(),
+            ),
+            journal,
+        )
+        key = HandoffKey("request-bound", "handoff-bound", 1, 1, 1)
+        journal.append(
+            "HANDOFF_CREATED",
+            key,
+            prefill_node_id="p2",
+            decode_node_id="d2",
+            prefill_endpoint_generation=1,
+            decode_endpoint_generation=1,
+        )
+
+        await coordinator.reconcile_startup()
+
+        assert (p1.query_calls, p2.query_calls) == (0, 1)
+        assert (d1.query_calls, d2.query_calls) == (0, 1)
+        assert journal.unresolved == ()
+        journal.close()
+
+    asyncio.run(exercise())
+
+
+def test_router_journal_reopens_with_the_latest_reservation_attempt_binding(
+    tmp_path,
+) -> None:
+    path = tmp_path / "router-reopen.jsonl"
+    key = HandoffKey("request-reopen", "handoff-reopen", 1, 1, 1)
+    journal = RouterJournal(str(path), "run")
+    journal.append(
+        "HANDOFF_CREATED",
+        key,
+        prefill_node_id="p1",
+        decode_node_id="d1",
+        prefill_endpoint_generation=1,
+        decode_endpoint_generation=1,
+    )
+    journal.append(
+        "RESERVATION_ATTEMPT",
+        key,
+        prefill_node_id="p1",
+        decode_node_id="d2",
+        prefill_endpoint_generation=1,
+        decode_endpoint_generation=3,
+    )
+    journal.close()
+
+    reopened = RouterJournal(str(path), "run")
+    assert len(reopened.unresolved_bindings) == 1
+    binding = reopened.unresolved_bindings[0]
+    assert (
+        binding.key,
+        binding.prefill_node_id,
+        binding.decode_node_id,
+        binding.prefill_endpoint_generation,
+        binding.decode_endpoint_generation,
+    ) == (
+        key,
+        "p1",
+        "d2",
+        1,
+        3,
+    )
+    reopened.close()

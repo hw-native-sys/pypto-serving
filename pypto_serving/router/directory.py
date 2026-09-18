@@ -22,6 +22,12 @@ class WorkerCandidate:
 
 
 @dataclass(frozen=True)
+class _DescribedNode:
+    descriptor: NodeDescriptor
+    client: NodeClient
+
+
+@dataclass(frozen=True)
 class DirectorySnapshot:
     prefill: tuple[WorkerCandidate, ...]
     decode: tuple[WorkerCandidate, ...]
@@ -111,6 +117,60 @@ class WorkerDirectory:
         )
         return self._selected_pair(prefill, decode)
 
+    async def resolve_binding(
+        self,
+        prefill_node_id: str,
+        decode_node_id: str,
+        prefill_endpoint_generation: int,
+        decode_endpoint_generation: int,
+    ) -> SelectedPair:
+        """Resolve the exact journaled owners without applying placement policy."""
+        if not prefill_node_id or not decode_node_id:
+            raise ValueError("journaled route is missing its P/D owner binding")
+        prefill_results, decode_results = await asyncio.gather(
+            asyncio.gather(
+                *(
+                    self._describe_client(client, PDRole.PREFILL)
+                    for client in self.prefill_clients
+                ),
+                return_exceptions=True,
+            ),
+            asyncio.gather(
+                *(
+                    self._describe_client(client, PDRole.DECODE)
+                    for client in self.decode_clients
+                ),
+                return_exceptions=True,
+            ),
+        )
+        prefills = tuple(
+            result
+            for result in prefill_results
+            if not isinstance(result, BaseException)
+        )
+        decodes = tuple(
+            result
+            for result in decode_results
+            if not isinstance(result, BaseException)
+        )
+        matches = tuple(
+            (prefill, decode)
+            for prefill in prefills
+            for decode in decodes
+            if prefill.descriptor.node_id == prefill_node_id
+            and decode.descriptor.node_id == decode_node_id
+            and self.compatible(prefill.descriptor, decode.descriptor)
+        )
+        if len(matches) != 1:
+            raise RuntimeError("journaled P/D owner binding is unavailable or incompatible")
+        prefill, decode = matches[0]
+        if (
+            prefill.descriptor.endpoint_generation != prefill_endpoint_generation
+            or decode.descriptor.endpoint_generation != decode_endpoint_generation
+        ):
+            raise RuntimeError("journaled P/D endpoint generation is stale")
+        return self._selected_pair(prefill, decode)
+
     @staticmethod
     def _selected_pair(prefill, decode) -> SelectedPair:
         return SelectedPair(
@@ -167,10 +227,34 @@ class WorkerDirectory:
         self._validate_node(descriptor, capacity, role)
         return WorkerCandidate(descriptor, capacity, client)
 
+    async def _describe_client(
+        self,
+        client: NodeClient,
+        role: PDRole,
+    ) -> _DescribedNode:
+        descriptor = await client.get("/internal/pd/descriptor", NodeDescriptor)
+        self._validate_descriptor(descriptor, role)
+        return _DescribedNode(descriptor, client)
+
     def _validate_node(
         self,
         descriptor: NodeDescriptor,
         capacity: CapacitySnapshot,
+        role: PDRole,
+    ) -> None:
+        self._validate_descriptor(descriptor, role)
+        if capacity.node_id != descriptor.node_id or capacity.role != role.value:
+            raise ValueError("PD node descriptor and capacity identity differ")
+        if capacity.snapshot_sequence < 1:
+            raise ValueError("PD node capacity snapshot sequence must be positive")
+        if capacity.quarantined_reservations:
+            raise RuntimeError("PD node has quarantined reservations")
+        if capacity.active_limit < 1 or capacity.active_handoffs >= capacity.active_limit:
+            raise RuntimeError("PD node has no active handoff capacity")
+
+    def _validate_descriptor(
+        self,
+        descriptor: NodeDescriptor,
         role: PDRole,
     ) -> None:
         if descriptor.role != role.value:
@@ -186,11 +270,3 @@ class WorkerDirectory:
             and descriptor.control_incarnation != self.control_incarnation
         ):
             raise ValueError("Router and PD node control incarnations differ")
-        if capacity.node_id != descriptor.node_id or capacity.role != role.value:
-            raise ValueError("PD node descriptor and capacity identity differ")
-        if capacity.snapshot_sequence < 1:
-            raise ValueError("PD node capacity snapshot sequence must be positive")
-        if capacity.quarantined_reservations:
-            raise RuntimeError("PD node has quarantined reservations")
-        if capacity.active_limit < 1 or capacity.active_handoffs >= capacity.active_limit:
-            raise RuntimeError("PD node has no active handoff capacity")

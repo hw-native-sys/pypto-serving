@@ -1,6 +1,6 @@
 # Copyright (c) PyPTO Contributors.
 # Licensed under CANN Open Software License Agreement Version 2.0.
-"""One-request external Router transaction for fixed 1P1D."""
+"""Router-owned request transaction across a compatible P/D node pool."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from pypto_serving.serving.pd.http_api import (
     PrepareRequestHTTP,
     PreparedRequest,
     ReservePlacementHTTP,
+    ReservePlacementResult,
     capability_compatibility_digest,
 )
 from pypto_serving.serving.pd.protocol import (
@@ -66,23 +67,48 @@ class RouterCoordinator:
         self._replayable: dict[str, ReplayableRequest] = {}
 
     async def reconcile_startup(self) -> None:
-        """Query both owners, then durably fence interrupted routes for review."""
-        unresolved = self.journal.unresolved
+        """Query the journaled owners, then durably fence interrupted routes."""
+        unresolved = self.journal.unresolved_bindings
         if not unresolved:
             return
-        pair = await self.directory.select()
-        for key in unresolved:
-            results = await asyncio.gather(
-                pair.prefill_client.post("/internal/pd/query", HandoffHTTP(key)),
-                pair.decode_client.post("/internal/pd/query", HandoffHTTP(key)),
-                return_exceptions=True,
+        for binding in unresolved:
+            try:
+                pair = await self.directory.resolve_binding(
+                    binding.prefill_node_id,
+                    binding.decode_node_id,
+                    binding.prefill_endpoint_generation,
+                    binding.decode_endpoint_generation,
+                )
+                results = await asyncio.gather(
+                    pair.prefill_client.post(
+                        "/internal/pd/query", HandoffHTTP(binding.key)
+                    ),
+                    pair.decode_client.post(
+                        "/internal/pd/query", HandoffHTTP(binding.key)
+                    ),
+                    return_exceptions=True,
+                )
+                summary = "_".join(
+                    type(result).__name__
+                    if isinstance(result, BaseException)
+                    else "STATUS"
+                    for result in results
+                )
+            except (RuntimeError, ValueError) as exc:
+                summary = f"BINDING_{type(exc).__name__}"
+            self.journal.append(
+                "RECOVERY_REQUIRED",
+                binding.key,
+                error_code=summary[:128],
+                prefill_node_id=binding.prefill_node_id,
+                decode_node_id=binding.decode_node_id,
+                prefill_endpoint_generation=binding.prefill_endpoint_generation,
+                decode_endpoint_generation=binding.decode_endpoint_generation,
             )
-            summary = "_".join(
-                type(result).__name__ if isinstance(result, BaseException) else "STATUS"
-                for result in results
-            )
-            self.journal.append("RECOVERY_REQUIRED", key, error_code=summary[:128])
-        self.recovery.require("INTERRUPTED_ROUTER_JOURNAL", unresolved)
+        self.recovery.require(
+            "INTERRUPTED_ROUTER_JOURNAL",
+            tuple(binding.key for binding in unresolved),
+        )
 
     async def generate(
         self,
@@ -228,27 +254,81 @@ class RouterCoordinator:
             route_epoch=self.config.route_epoch,
             control_incarnation=self.recovery.current.control_incarnation,
         )
-        self.journal.append("HANDOFF_CREATED", key)
+        self.journal.append(
+            "HANDOFF_CREATED",
+            key,
+            prefill_node_id=pair.prefill.node_id,
+            decode_node_id=pair.decode.node_id,
+            prefill_endpoint_generation=pair.prefill.endpoint_generation,
+            decode_endpoint_generation=pair.decode.endpoint_generation,
+        )
         reservation: PlacementReservation | None = None
         execute_task: asyncio.Task | None = None
         next_frame: asyncio.Task | None = None
         decode_stream = None
         terminal = False
         try:
-            reservation = await pair.decode_client.post(
-                "/internal/pd/reserve",
-                ReservePlacementHTTP(
-                    key=key,
-                    prepared_request_id=prepared.prepared_request_id,
-                    prepared_digest=prepared.prepared_digest,
-                    prompt_token_count=len(prepared.continuation.prompt_token_ids),
-                    max_new_tokens=prepared.continuation.max_new_tokens,
-                    layout_fingerprint=pair.prefill.capabilities.layout_fingerprint,
+            rejected_decode_nodes: set[str] = set()
+            while True:
+                self.journal.append(
+                    "RESERVATION_ATTEMPT",
+                    key,
                     prefill_node_id=pair.prefill.node_id,
+                    decode_node_id=pair.decode.node_id,
                     prefill_endpoint_generation=pair.prefill.endpoint_generation,
-                ),
-                PlacementReservation,
-            )
+                    decode_endpoint_generation=pair.decode.endpoint_generation,
+                )
+                outcome = await pair.decode_client.post(
+                    "/internal/pd/reserve",
+                    ReservePlacementHTTP(
+                        key=key,
+                        prepared_request_id=prepared.prepared_request_id,
+                        prepared_digest=prepared.prepared_digest,
+                        prompt_token_count=len(prepared.continuation.prompt_token_ids),
+                        max_new_tokens=prepared.continuation.max_new_tokens,
+                        layout_fingerprint=pair.prefill.capabilities.layout_fingerprint,
+                        prefill_node_id=pair.prefill.node_id,
+                        prefill_endpoint_generation=pair.prefill.endpoint_generation,
+                    ),
+                    ReservePlacementResult,
+                )
+                if outcome.rejection is None:
+                    reservation = outcome.reservation
+                    break
+                rejection = outcome.rejection
+                if (
+                    rejection.key != key
+                    or rejection.decode_node_id != pair.decode.node_id
+                    or rejection.decode_endpoint_generation
+                    != pair.decode.endpoint_generation
+                ):
+                    raise RuntimeError("D returned a rejection for another route")
+                self.journal.append(
+                    "RESERVATION_REJECTED",
+                    key,
+                    error_code=rejection.reason,
+                    prefill_node_id=pair.prefill.node_id,
+                    decode_node_id=pair.decode.node_id,
+                    prefill_endpoint_generation=pair.prefill.endpoint_generation,
+                    decode_endpoint_generation=pair.decode.endpoint_generation,
+                )
+                if not rejection.retryable:
+                    raise RuntimeError(
+                        f"D deterministically rejected reservation: {rejection.reason}"
+                    )
+                rejected_decode_nodes.add(pair.decode.node_id)
+                next_pair = await self.directory.select_decode(
+                    pair.prefill.node_id,
+                    excluded_decode_node_ids=frozenset(rejected_decode_nodes),
+                )
+                if (
+                    next_pair.prefill.endpoint_generation
+                    != pair.prefill.endpoint_generation
+                ):
+                    raise RuntimeError("P endpoint changed while retrying D reservation")
+                pair = next_pair
+            if reservation is None:
+                raise RuntimeError("D returned an empty reservation outcome")
             if (
                 reservation.key != key
                 or reservation.prepared_request_id != prepared.prepared_request_id
@@ -260,7 +340,14 @@ class RouterCoordinator:
                 or not reservation.reservation_capability
             ):
                 raise RuntimeError("D returned a reservation for another route")
-            self.journal.append("HANDOFF_RESERVED", key)
+            self.journal.append(
+                "HANDOFF_RESERVED",
+                key,
+                prefill_node_id=pair.prefill.node_id,
+                decode_node_id=pair.decode.node_id,
+                prefill_endpoint_generation=pair.prefill.endpoint_generation,
+                decode_endpoint_generation=pair.decode.endpoint_generation,
+            )
             compatibility_digest = capability_compatibility_digest(
                 pair.prefill.capabilities
             )
@@ -279,7 +366,14 @@ class RouterCoordinator:
                     decode_endpoint_generation=pair.decode.endpoint_generation,
                 ),
             )
-            self.journal.append("ROUTE_AUTHORIZED", key)
+            self.journal.append(
+                "ROUTE_AUTHORIZED",
+                key,
+                prefill_node_id=pair.prefill.node_id,
+                decode_node_id=pair.decode.node_id,
+                prefill_endpoint_generation=pair.prefill.endpoint_generation,
+                decode_endpoint_generation=pair.decode.endpoint_generation,
+            )
 
             decode_stream = pair.decode_client.stream_decode(
                 "/internal/pd/await-decode",

@@ -40,6 +40,7 @@ from .http_api import (
     ExecutePrefillHTTP,
     NodeDescriptor,
     PlacementReservation,
+    PlacementRejection,
     PrefillHandoffResult,
     PreparedRequest,
     ReservePlacementHTTP,
@@ -368,7 +369,10 @@ class PDServingService:
         self._prepared_by_request[request_id] = prepared_request_id
         return public
 
-    def reserve_placement(self, request: ReservePlacementHTTP) -> PlacementReservation:
+    def reserve_placement(
+        self,
+        request: ReservePlacementHTTP,
+    ) -> PlacementReservation | PlacementRejection:
         """Reserve D cache before Prefill and return only logical placement data."""
         self._require_external_role(PDRole.DECODE)
         assert self.decode_connector is not None
@@ -395,7 +399,14 @@ class PDServingService:
             )
         )
         if isinstance(result, ReserveRejected):
-            raise RuntimeError(f"D rejected the PD reservation: {result.reason}")
+            descriptor = self.descriptor()
+            return PlacementRejection(
+                key=request.key,
+                decode_node_id=self.config.node_id,
+                decode_endpoint_generation=descriptor.endpoint_generation,
+                reason=result.reason,
+                retryable=result.retryable,
+            )
         binding = (
             request.prepared_request_id,
             request.prepared_digest,
