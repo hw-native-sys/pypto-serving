@@ -43,6 +43,14 @@ python tests/manual/pd/phase_f/run_ab_system.py \
   --concurrency 2 --repeat 1
 ```
 
+Add `--keep-services` for an interactive acceptance run.  The option retains
+Router/P/D only after the suite passes and verifies both the launcher and
+service child PIDs are still alive; a failed run still performs exact-PID
+cleanup so the next run does not inherit an ambiguous generation.  The suite
+process itself always exits.  The retained Router remains available on the
+configured `--router-port` until the recorded run-owned PIDs are explicitly
+stopped.
+
 `--repo` is the immutable code location used by both nodes; `--run-root` is a
 separate evidence/control directory and must have a basename beginning with
 `phase-f-`.  This keeps the current `/workspace` deployment independent from

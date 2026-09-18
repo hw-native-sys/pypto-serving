@@ -221,6 +221,58 @@ def _stop_with_retries(
     }
 
 
+def _record_retained_launcher(
+    host: str,
+    container: str,
+    pid_file: str,
+) -> dict[str, object]:
+    pid = _launcher_pid(host, container, pid_file)
+    child_file = _child_pid_file(pid_file)
+    child_pid = _launcher_pid(host, container, child_file)
+    if pid is None or child_pid is None:
+        return {
+            "pid_file": pid_file,
+            "state": "retain-error",
+            "error": "launcher or child PID file is absent",
+        }
+    if not _pid_alive(host, container, pid) or not _pid_alive(
+        host, container, child_pid
+    ):
+        return {
+            "pid_file": pid_file,
+            "pid": pid,
+            "child_pid": child_pid,
+            "state": "retain-error",
+            "error": "launcher or child process is not alive",
+        }
+    return {
+        "pid_file": pid_file,
+        "pid": pid,
+        "child_pid": child_pid,
+        "state": "retained",
+    }
+
+
+def _record_retained_with_retries(
+    host: str,
+    container: str,
+    pid_file: str,
+) -> dict[str, object]:
+    last_error = ""
+    for attempt in range(1, 4):
+        try:
+            return _record_retained_launcher(host, container, pid_file)
+        except subprocess.SubprocessError as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if attempt < 3:
+                time.sleep(2)
+    return {
+        "pid_file": pid_file,
+        "state": "retain-error",
+        "error": last_error,
+    }
+
+
 def _write_pd_config(
     host: str,
     container: str,
@@ -344,6 +396,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cases-file", default="cases.json")
     parser.add_argument("--soak-requests", type=int, default=64)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--keep-services",
+        action="store_true",
+        help="retain healthy Router/P/D processes after a successful suite",
+    )
     parser.add_argument("--startup-timeout-seconds", type=float, default=1800)
     parser.add_argument("--request-timeout-seconds", type=float, default=7200)
     parser.add_argument("--local-evidence-dir", required=True, type=Path)
@@ -553,27 +610,19 @@ def main() -> int:
                 f"{run_root}/{names['suite_control']}/suite-service.pid",
             )
         )
-        stops.append(
-            _stop_with_retries(
-                args.prefill_ssh,
-                args.container,
-                f"{run_root}/{names['router']}/router-service.pid",
-            )
+        retain_services = args.keep_services and result == "PASS"
+        service_actions = (
+            (args.prefill_ssh, f"{run_root}/{names['router']}/router-service.pid"),
+            (args.prefill_ssh, f"{run_root}/{names['p']}/service.pid"),
+            (args.decode_ssh, f"{run_root}/{names['d']}/service.pid"),
         )
-        stops.append(
-            _stop_with_retries(
-                args.prefill_ssh,
-                args.container,
-                f"{run_root}/{names['p']}/service.pid",
+        for host, pid_file in service_actions:
+            action = (
+                _record_retained_with_retries
+                if retain_services
+                else _stop_with_retries
             )
-        )
-        stops.append(
-            _stop_with_retries(
-                args.decode_ssh,
-                args.container,
-                f"{run_root}/{names['d']}/service.pid",
-            )
-        )
+            stops.append(action(host, args.container, pid_file))
         args.local_evidence_dir.mkdir(parents=True, exist_ok=False)
         for label, host, name in (
             ("prefill", args.prefill_ssh, names["p"]),
@@ -600,6 +649,7 @@ def main() -> int:
                     "schema_version": 1,
                     "run_id": args.run_id,
                     "result": result,
+                    "services_retained": retain_services,
                     "stops": stops,
                     "finished_ns": time.time_ns(),
                 },
@@ -608,8 +658,11 @@ def main() -> int:
             ),
             encoding="utf-8",
         )
+    allowed_states = {"absent", "stopped", "already-stopped"}
+    if args.keep_services:
+        allowed_states.add("retained")
     return 0 if result == "PASS" and all(
-        stop["state"] in ("absent", "stopped", "already-stopped") for stop in stops
+        stop["state"] in allowed_states for stop in stops
     ) else 1
 
 
