@@ -10,6 +10,7 @@ import pytest
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
 from pypto_serving.router.config import RouterConfig
 from pypto_serving.router.directory import WorkerDirectory
+from pypto_serving.router.policy import RoundRobinRoutePolicy, create_route_policy
 from pypto_serving.serving.pd.config import PDCapabilities, PDRole, load_pd_document
 from pypto_serving.serving.pd.http_api import CapacitySnapshot, NodeDescriptor
 from pypto_serving.serving.pd.protocol import CapabilityWire
@@ -107,6 +108,7 @@ def test_directory_filters_full_and_incompatible_nodes_without_losing_pool() -> 
             (p1, p2),
             (d_full, d_wrong_layout, d_ready),
             "run",
+            RoundRobinRoutePolicy(),
             control_incarnation=1,
         )
         snapshot = await directory.refresh()
@@ -165,3 +167,43 @@ def test_runtime_rejects_duplicate_endpoints(tmp_path) -> None:
     )
     with pytest.raises(ValueError, match="duplicate endpoints"):
         load_pd_document(path)
+
+
+def test_round_robin_uses_independent_p_and_d_cursors() -> None:
+    async def exercise() -> None:
+        prefills = tuple(
+            _Client(
+                _descriptor(node, PDRole.PREFILL),
+                _capacity(node, PDRole.PREFILL),
+            )
+            for node in ("p1", "p2")
+        )
+        decodes = tuple(
+            _Client(
+                _descriptor(node, PDRole.DECODE),
+                _capacity(node, PDRole.DECODE),
+            )
+            for node in ("d1", "d2", "d3")
+        )
+        directory = WorkerDirectory(
+            prefills,
+            decodes,
+            "run",
+            RoundRobinRoutePolicy(),
+            control_incarnation=1,
+        )
+        selected = [await directory.select() for _ in range(6)]
+        assert [pair.prefill.node_id for pair in selected] == [
+            "p1", "p2", "p1", "p2", "p1", "p2"
+        ]
+        assert [pair.decode.node_id for pair in selected] == [
+            "d1", "d2", "d3", "d1", "d2", "d3"
+        ]
+
+    asyncio.run(exercise())
+
+
+def test_route_policy_registry_is_allowlisted() -> None:
+    assert isinstance(create_route_policy("round_robin"), RoundRobinRoutePolicy)
+    with pytest.raises(ValueError, match="unknown PD route policy"):
+        create_route_policy("module.custom.Policy")

@@ -11,6 +11,7 @@ from pypto_serving.serving.pd.config import PDRole
 from pypto_serving.serving.pd.http_api import CapacitySnapshot, NodeDescriptor
 
 from .client import NodeClient
+from .policy import RoutePolicy
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class WorkerDirectory:
         prefill_clients: tuple[NodeClient, ...],
         decode_clients: tuple[NodeClient, ...],
         run_id: str,
+        policy: RoutePolicy,
         control_incarnation: int | None = None,
     ) -> None:
         if not prefill_clients or not decode_clients:
@@ -50,6 +52,7 @@ class WorkerDirectory:
         self.prefill_clients = prefill_clients
         self.decode_clients = decode_clients
         self.run_id = run_id
+        self.policy = policy
         self.control_incarnation = control_incarnation
         self._snapshot: DirectorySnapshot | None = None
 
@@ -91,7 +94,25 @@ class WorkerDirectory:
 
     async def select(self) -> SelectedPair:
         snapshot = await self.refresh()
-        prefill, decode = self.compatible_pairs(snapshot)[0]
+        prefill, decode = await self.policy.select(self.compatible_pairs(snapshot))
+        return self._selected_pair(prefill, decode)
+
+    async def select_decode(
+        self,
+        prefill_node_id: str,
+        *,
+        excluded_decode_node_ids: frozenset[str],
+    ) -> SelectedPair:
+        snapshot = await self.refresh()
+        prefill, decode = await self.policy.select(
+            self.compatible_pairs(snapshot),
+            prefill_node_id=prefill_node_id,
+            excluded_decode_node_ids=excluded_decode_node_ids,
+        )
+        return self._selected_pair(prefill, decode)
+
+    @staticmethod
+    def _selected_pair(prefill, decode) -> SelectedPair:
         return SelectedPair(
             prefill=prefill.descriptor,
             decode=decode.descriptor,
