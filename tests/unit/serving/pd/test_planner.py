@@ -7,8 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
-from pypto_serving.serving.pd.planner import ChunkTransferPlanner
+from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_ADAPTER
 from pypto_serving.serving.pd.protocol import HandoffKey
 
 from .helpers import make_cache_manager, make_registry
@@ -33,9 +32,7 @@ def test_chunk_planner_defers_partial_pages_and_keeps_zero_units() -> None:
     registry = make_registry(manager)
     source = _tables(manager, "source", 33)
     destination = _tables(manager, "destination", 64)
-    planner = ChunkTransferPlanner(
-        registry, manager.group_specs, DSV4_DSPARK_K7_CONTRACT
-    )
+    planner = DSV4_DSPARK_K7_ADAPTER.make_planner(registry, manager.group_specs)
     rank_ids = (0, 1, 2, 3)
     source_by_rank = {rank: source for rank in rank_ids}
     destination_by_rank = {rank: destination for rank in rank_ids}
@@ -79,9 +76,7 @@ def test_index_regions_are_atomic_and_ring_destination_wraps() -> None:
     registry = make_registry(manager)
     source = _tables(manager, "source", 224)
     destination = _tables(manager, "destination", 256)
-    planner = ChunkTransferPlanner(
-        registry, manager.group_specs, DSV4_DSPARK_K7_CONTRACT
-    )
+    planner = DSV4_DSPARK_K7_ADAPTER.make_planner(registry, manager.group_specs)
     ring_plan = planner.plan_chunk(
         KEY,
         chunk_id=6,

@@ -7,6 +7,11 @@ from pypto_serving.serving.pd.adapter import ModelRuntimeFacts
 from pypto_serving.serving.pd.connector import DecodeConnector
 from pypto_serving.serving.pd.contracts import ModelPDContract, TransferComponent
 from pypto_serving.serving.pd.planner import ChunkTransferPlanner
+from pypto_serving.serving.pd.protocol import (
+    ChunkManifest,
+    ContinuationMetadata,
+    continuation_metadata_hash,
+)
 
 
 DSV4_DSPARK_K7_CONTRACT = ModelPDContract(
@@ -74,6 +79,93 @@ class DeepSeekV4DSparkK7Adapter:
             registry,
             destination_ranks,
             contract=self.contract,
+        )
+
+    @staticmethod
+    def validate_generate_config(config) -> None:
+        if config.temperature != 0.0 or config.top_p != 1.0 or config.top_k is not None:
+            raise ValueError("DeepSeek V4 DSpark PD supports greedy sampling only")
+
+    @staticmethod
+    def build_continuation(
+        *, config, prompt_token_ids, eos_token_id: int | None
+    ) -> ContinuationMetadata:
+        return ContinuationMetadata(
+            prompt_token_ids=tuple(int(token) for token in prompt_token_ids),
+            max_new_tokens=int(config.max_new_tokens),
+            temperature=float(config.temperature),
+            top_p=float(config.top_p),
+            top_k=config.top_k,
+            seed=config.seed,
+            stop_strings=tuple(config.stop) if config.stop else (),
+            eos_token_id=None if config.ignore_eos else eos_token_id,
+            stream=bool(getattr(config, "stream", True)),
+        )
+
+    @staticmethod
+    def build_manifest(
+        *,
+        key,
+        plan,
+        chunk,
+        continuation: ContinuationMetadata | None,
+        prepared_digest: str,
+    ) -> ChunkManifest:
+        metadata_hash = (
+            continuation_metadata_hash(continuation)
+            if continuation is not None
+            else ""
+        )
+        return ChunkManifest(
+            key=key,
+            chunk_id=chunk.chunk_id,
+            start_token=chunk.start_token,
+            end_token=chunk.end_token,
+            final=chunk.final,
+            manifest_hash=plan.manifest_hash,
+            expected_units=plan.expected_units,
+            copies_by_rank=plan.copies_by_rank,
+            first_token=chunk.first_token,
+            metadata_hash=metadata_hash,
+            continuation=continuation,
+            prepared_digest=prepared_digest,
+        )
+
+    @staticmethod
+    def validate_continuation(continuation: ContinuationMetadata) -> None:
+        if not continuation.prompt_token_ids:
+            raise ValueError("DeepSeek V4 DSpark continuation requires prompt tokens")
+        if continuation.max_new_tokens <= 0:
+            raise ValueError("DeepSeek V4 DSpark continuation requires Decode tokens")
+        if (
+            continuation.temperature != 0.0
+            or continuation.top_p != 1.0
+            or continuation.top_k is not None
+        ):
+            raise ValueError("DeepSeek V4 DSpark continuation must use greedy sampling")
+
+    @staticmethod
+    def adopt_decode(
+        core,
+        *,
+        reservation_id: str,
+        request_id: str,
+        first_token: int,
+        continuation: ContinuationMetadata,
+    ):
+        return core.add_adopted_handoff(
+            reservation_id=reservation_id,
+            request_id=request_id,
+            prompt_token_ids=continuation.prompt_token_ids,
+            first_token=first_token,
+            max_new_tokens=continuation.max_new_tokens,
+            temperature=continuation.temperature,
+            top_p=continuation.top_p,
+            top_k=continuation.top_k,
+            seed=continuation.seed,
+            stop_strings=continuation.stop_strings,
+            eos_token_id=continuation.eos_token_id,
+            stream=continuation.stream,
         )
 
 
