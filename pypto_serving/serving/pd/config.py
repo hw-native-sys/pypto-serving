@@ -79,6 +79,13 @@ class PDRuntimeConfig:
     def __post_init__(self) -> None:
         if not self.prefill or not self.decode:
             raise ValueError("runtime requires at least one prefill and one decode endpoint")
+        for role, endpoints in (("prefill", self.prefill), ("decode", self.decode)):
+            identities = tuple((item.host, item.port) for item in endpoints)
+            if len(identities) != len(set(identities)):
+                raise ValueError(f"runtime.{role} contains duplicate endpoints")
+            node_ids = tuple(item.node_id for item in endpoints if item.node_id)
+            if len(node_ids) != len(set(node_ids)):
+                raise ValueError(f"runtime.{role} contains duplicate node ids")
         _identifier(self.provider, "runtime.provider")
         _identifier(self.policy, "runtime.policy")
         if self.run_id:

@@ -12,8 +12,8 @@ from pypto_serving.serving.pd.config import PDDocument
 
 @dataclass(frozen=True)
 class RouterConfig:
-    prefill_url: str
-    decode_url: str
+    prefill_urls: tuple[str, ...]
+    decode_urls: tuple[str, ...]
     run_id: str
     policy: str
     provider: str
@@ -29,8 +29,6 @@ class RouterConfig:
 
     @classmethod
     def from_document(cls, document: PDDocument) -> "RouterConfig":
-        if len(document.runtime.prefill) != 1 or len(document.runtime.decode) != 1:
-            raise ValueError("F1 Router requires exactly one P and one D endpoint")
         root = (
             Path(document.observability.root)
             if document.observability.root
@@ -40,8 +38,8 @@ class RouterConfig:
         state_dir = log_dir / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
         return cls(
-            prefill_url=document.runtime.prefill[0].url,
-            decode_url=document.runtime.decode[0].url,
+            prefill_urls=tuple(endpoint.url for endpoint in document.runtime.prefill),
+            decode_urls=tuple(endpoint.url for endpoint in document.runtime.decode),
             run_id=document.run_id,
             policy=document.runtime.policy,
             provider=document.runtime.provider,
