@@ -347,6 +347,23 @@ class ReplicaEngineCore:
         self._loop_task = asyncio.create_task(self._engine_loop())
         logger.info("ReplicaEngineCore started")
 
+    def is_ready(self) -> bool:
+        """Report whether this replica can still serve requests.
+
+        Covers the two silent deaths a route-liveness check misses: a worker
+        process that exited (the engine would keep blocking on its output queue
+        until SERVING_WORKER_STEP_TIMEOUT, 1200s by default), and an engine loop
+        that raised with its exception never retrieved — which leaves _running
+        True while nothing is ever scheduled again.
+        """
+        return (
+            self._running
+            and self._loop_task is not None
+            and not self._loop_task.done()
+            and self._worker_process is not None
+            and self._worker_process.is_alive()
+        )
+
     async def stop(self) -> None:
         """Stop engine loop and worker process."""
         self._running = False
@@ -1277,6 +1294,10 @@ class AsyncLLMEngine:
     async def stop(self) -> None:
         """Stop all DP engine cores."""
         await asyncio.gather(*(core.stop() for core in reversed(self._cores)))
+
+    def is_ready(self) -> bool:
+        """Report whether every replica core can still serve requests."""
+        return bool(self._cores) and all(core.is_ready() for core in self._cores)
 
     async def start_profile(self) -> None:
         """Start SA profiling in every replica worker."""
