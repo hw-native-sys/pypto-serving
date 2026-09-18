@@ -243,105 +243,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="P/D execution role (default: disabled).",
     )
     parser.add_argument(
-        "--pd-deployment-mode",
-        choices=("embedded-fixed-peer", "external-router"),
-        default="embedded-fixed-peer",
-        help="PD control-plane deployment mode (default: embedded-fixed-peer).",
-    )
-    parser.add_argument("--pd-node-id", default="", help="Stable local node identity for PD control.")
-    parser.add_argument("--pd-peer-node-id", default="", help="Expected fixed peer node identity.")
-    parser.add_argument("--pd-run-id", default="", help="Shared deployment generation identity.")
-    parser.add_argument("--pd-control-host", default="127.0.0.1", help="Local PD control bind host.")
-    parser.add_argument("--pd-control-port", type=int, default=29831, help="PD control port.")
-    parser.add_argument(
-        "--pd-control-advertise-host",
+        "--pd-config",
         default="",
-        help="Router-visible P/D peer-control hostname (required in external-router mode).",
+        help="Shared external-Router PD JSON config.",
     )
-    parser.add_argument("--pd-peer-host", default="", help="Fixed PD peer control host.")
-    parser.add_argument(
-        "--pd-auth-secret-env",
-        default="PYPTO_PD_AUTH_SECRET",
-        help="Environment variable containing the PD control pre-shared secret.",
-    )
-    parser.add_argument(
-        "--pd-router-auth-secret-env",
-        default="PYPTO_PD_ROUTER_SECRET",
-        help="D-only environment variable used to verify Router route tickets.",
-    )
-    parser.add_argument(
-        "--pd-transfer-hostname",
-        default="",
-        help="Mooncake/AscendDirect hostname used by owner-local engines.",
-    )
-    parser.add_argument("--pd-model-revision", default="", help="Exact P/D model-layout revision.")
-    parser.add_argument("--pd-generation", type=int, default=1, help="Owner/endpoint generation.")
-    parser.add_argument("--pd-route-epoch", type=int, default=1, help="Fixed route epoch.")
-    parser.add_argument(
-        "--pd-control-incarnation",
-        type=int,
-        default=1,
-        help="Coordinator incarnation used to reject stale messages.",
-    )
-    parser.add_argument(
-        "--pd-connect-timeout-seconds",
-        type=float,
-        default=30.0,
-        help="Deadline for the fixed P/D startup handshake (default: 30).",
-    )
-    parser.add_argument(
-        "--pd-request-timeout-seconds",
-        type=float,
-        default=60.0,
-        help="Deadline for one native PD transfer attempt (default: 60).",
-    )
-    parser.add_argument(
-        "--pd-max-active-handoffs",
-        type=int,
-        default=4,
-        help="Maximum concurrently active PD handoffs (default: 4).",
-    )
-    parser.add_argument(
-        "--pd-max-pending-handoffs",
-        type=int,
-        default=8,
-        help="Bounded active-plus-queued PD handoffs (default: 8).",
-    )
-    parser.add_argument(
-        "--pd-max-inflight-transfer-bytes",
-        type=int,
-        default=1 << 30,
-        help="Host-side byte budget for concurrent transfer chunks (default: 1 GiB).",
-    )
-    parser.add_argument(
-        "--pd-transfer-poll-interval-seconds",
-        type=float,
-        default=0.005,
-        help="Polling interval for asynchronously submitted PD transfers (default: 0.005).",
-    )
-    parser.add_argument(
-        "--pd-enable-chunk-overlap",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Overlap closed-page transfer with the next Prefill chunk (default: false).",
-    )
-    parser.add_argument(
-        "--pd-max-transfer-attempts",
-        type=int,
-        default=2,
-        help="Maximum attempts for deterministically retryable transfer failures (default: 2).",
-    )
-    parser.add_argument(
-        "--pd-prepared-request-ttl-seconds",
-        type=float,
-        default=300.0,
-        help="P-side prepared-request retention deadline (default: 300).",
-    )
-    parser.add_argument(
-        "--pd-journal-path",
-        default="",
-        help="Durable address-free JSONL recovery journal (required for PD serving).",
-    )
+    parser.add_argument("--pd-node-id", default="", help="Select a node when a role has multiple endpoints.")
 
     # Profiling
     parser.add_argument(
@@ -482,15 +388,19 @@ def _build_pd_config(
     model_variant: str | None,
 ):
     from pypto_serving.serving.pd.config import (
-        PDConfig,
-        PDDeploymentMode,
         PD_DSPARK_SPECULATIVE_TOKENS,
         PDRole,
+        load_pd_document,
+        resolve_pd_config,
     )
 
     role = PDRole(args.pd_role)
     if role is PDRole.DISABLED:
+        if args.pd_config:
+            raise ValueError("--pd-config requires --pd-role prefill or decode")
         return None
+    if not args.pd_config:
+        raise ValueError("--pd-role requires --pd-config")
     if model_family != "deepseek_v4" or model_variant != "dspark":
         raise ValueError("--pd-role currently requires the DeepSeek V4 DSpark model variant")
     if _resolve_num_speculative_tokens(args) != PD_DSPARK_SPECULATIVE_TOKENS:
@@ -498,36 +408,11 @@ def _build_pd_config(
             "--pd-role requires DeepSeek V4 DSpark K7 "
             f"(num_speculative_tokens={PD_DSPARK_SPECULATIVE_TOKENS})"
         )
-    if not args.pd_journal_path:
-        raise ValueError("--pd-role requires --pd-journal-path")
-    return PDConfig(
+    return resolve_pd_config(
+        load_pd_document(args.pd_config),
         role=role,
-        deployment_mode=PDDeploymentMode(args.pd_deployment_mode),
         node_id=args.pd_node_id,
-        peer_node_id=args.pd_peer_node_id,
-        run_id=args.pd_run_id,
-        control_host=args.pd_control_host,
-        control_port=args.pd_control_port,
-        control_advertise_host=args.pd_control_advertise_host,
-        peer_host=args.pd_peer_host,
-        auth_secret_env=args.pd_auth_secret_env,
-        router_auth_secret_env=args.pd_router_auth_secret_env,
-        transfer_hostname=args.pd_transfer_hostname,
-        model_revision=args.pd_model_revision,
-        generation=args.pd_generation,
-        route_epoch=args.pd_route_epoch,
-        control_incarnation=args.pd_control_incarnation,
-        decode_speculative_tokens=PD_DSPARK_SPECULATIVE_TOKENS,
-        connect_timeout_seconds=args.pd_connect_timeout_seconds,
-        request_timeout_seconds=args.pd_request_timeout_seconds,
-        transfer_poll_interval_seconds=args.pd_transfer_poll_interval_seconds,
-        max_active_handoffs=args.pd_max_active_handoffs,
-        max_pending_handoffs=args.pd_max_pending_handoffs,
-        max_inflight_transfer_bytes=args.pd_max_inflight_transfer_bytes,
-        max_transfer_attempts=args.pd_max_transfer_attempts,
-        enable_chunk_overlap=args.pd_enable_chunk_overlap,
-        prepared_request_ttl_seconds=args.pd_prepared_request_ttl_seconds,
-        journal_path=args.pd_journal_path,
+        model_revision=args.served_model_name or Path(args.model).name,
     )
 
 
@@ -1008,11 +893,9 @@ def run_serve(
     print(f"  Prefix cache: {'enabled' if config.enable_prefix_cache else 'disabled'}")
     print(f"  Chunk prefill: {'enabled' if config.enable_chunk_prefill else 'disabled'}")
     pd_config = getattr(config, "pd_config", None)
-    external_pd_node = bool(
-        pd_config is not None and getattr(pd_config, "external_router", False)
-    )
+    external_pd_node = pd_config is not None
     if external_pd_node:
-        endpoints = "/health, /internal/pd/* (authenticated)"
+        endpoints = "/health, /internal/pd/*"
     else:
         endpoints = "/v1/completions, /v1/chat/completions, /v1/models, /health, /metrics"
     if get_profiler().enabled and not external_pd_node:

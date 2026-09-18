@@ -10,29 +10,37 @@
 import pytest
 
 from pypto_serving.serving.pd.config import PDConfig, PDRole
-from pypto_serving.serving.pd.coordinator import CoordinatorState, FixedCoordinator
+from pypto_serving.serving.pd.coordinator import CoordinatorState, HandoffCoordinator
+from pypto_serving.serving.pd.protocol import HandoffKey
 
 
 def _config() -> PDConfig:
     return PDConfig(
         role=PDRole.PREFILL,
         node_id="p",
-        peer_node_id="d",
         run_id="run",
         control_host="127.0.0.1",
-        peer_host="127.0.0.1",
+        control_port=29831,
+        control_advertise_host="127.0.0.1",
         transfer_hostname="10.0.0.1",
         model_revision="model",
     )
 
 
-def test_fixed_coordinator_is_idempotent_and_single_writer() -> None:
-    coordinator = FixedCoordinator(_config())
-    record = coordinator.create_handoff("request")
+def test_handoff_coordinator_is_idempotent_and_single_writer() -> None:
+    coordinator = HandoffCoordinator(_config())
+    key = HandoffKey("request", "handoff", 1, 1, 1)
+    record = coordinator.register_handoff(
+        key, prefill_node_id="p", decode_node_id="d"
+    )
     assert record.prefill_node_id == "p"
     assert record.decode_node_id == "d"
     with pytest.raises(ValueError, match="already has"):
-        coordinator.create_handoff("request")
+        coordinator.register_handoff(
+            HandoffKey("request", "other", 1, 1, 1),
+            prefill_node_id="p",
+            decode_node_id="d",
+        )
     assert coordinator.mark_reserved(record.key, "reservation").state is CoordinatorState.RESERVED
     assert coordinator.mark_reserved(record.key, "reservation").state is CoordinatorState.RESERVED
     assert coordinator.mark_ready(record.key, "manifest").state is CoordinatorState.READY

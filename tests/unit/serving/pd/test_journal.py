@@ -21,10 +21,10 @@ def _config(path) -> PDConfig:
     return PDConfig(
         role=PDRole.PREFILL,
         node_id="p",
-        peer_node_id="d",
         run_id="run",
         control_host="127.0.0.1",
-        peer_host="127.0.0.1",
+        control_port=29831,
+        control_advertise_host="127.0.0.1",
         transfer_hostname="127.0.0.1",
         model_revision="model",
         journal_path=str(path),

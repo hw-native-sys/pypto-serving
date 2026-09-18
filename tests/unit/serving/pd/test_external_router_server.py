@@ -8,7 +8,7 @@ from pypto_serving.serving.server.server import ServingServer
 
 
 class _ExternalConfig:
-    external_router = True
+    enabled = True
 
 
 class _Engine:

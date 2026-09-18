@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
-import hmac
 import json
 import logging
 import time
@@ -236,7 +235,7 @@ class ServingServer:
     def _register_routes(self) -> None:
         self.app.add_api_route("/health", self._health, methods=["GET"])
         pd_config = getattr(getattr(self.engine, "config", None), "pd_config", None)
-        if pd_config is not None and getattr(pd_config, "external_router", False):
+        if pd_config is not None and getattr(pd_config, "enabled", False):
             self._register_internal_pd_routes()
             return
         self.app.add_api_route("/v1/models", self._list_models, methods=["GET"])
@@ -312,20 +311,9 @@ class ServingServer:
                 methods=["POST"],
             )
 
-    def _authenticate_pd_request(self, request: Request) -> None:
-        from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415
-            INTERNAL_AUTH_HEADER,
-        )
-
-        supplied = request.headers.get(INTERNAL_AUTH_HEADER, "")
-        expected = self.engine.config.pd_config.auth_secret().decode()
-        if not supplied or not hmac.compare_digest(supplied, expected):
-            raise PermissionError("invalid PD internal API credential")
-
     async def _pd_descriptor(self, request: Request) -> Response:
         from pypto_serving.serving.pd.http_api import encode_json  # noqa: PLC0415
 
-        self._authenticate_pd_request(request)
         return Response(
             encode_json(self.engine.pd_service.descriptor()),
             media_type="application/json",
@@ -334,22 +322,18 @@ class ServingServer:
     async def _pd_capacity(self, request: Request) -> Response:
         from pypto_serving.serving.pd.http_api import encode_json  # noqa: PLC0415
 
-        self._authenticate_pd_request(request)
         return Response(
             encode_json(self.engine.pd_service.capacity_snapshot()),
             media_type="application/json",
         )
 
     async def _pd_metrics(self, request: Request) -> JSONResponse:
-        self._authenticate_pd_request(request)
         return JSONResponse(await self.engine.pd_service.metrics_snapshot())
 
     async def _pd_start_profile(self, request: Request) -> Response:
-        self._authenticate_pd_request(request)
         return await self._start_profile()
 
     async def _pd_stop_profile(self, request: Request) -> Response:
-        self._authenticate_pd_request(request)
         return await self._stop_profile()
 
     async def _pd_prepare(self, request: Request) -> Response:
@@ -359,7 +343,6 @@ class ServingServer:
             encode_json,
         )
 
-        self._authenticate_pd_request(request)
         payload = decode_json(await request.body(), PrepareRequestHTTP)
         if payload.request_kind == "completion":
             public = CompletionRequest.model_validate_json(payload.request_json)
@@ -400,7 +383,6 @@ class ServingServer:
             encode_json,
         )
 
-        self._authenticate_pd_request(request)
         payload = decode_json(await request.body(), ReservePlacementHTTP)
         reservation = self.engine.pd_service.reserve_placement(payload)
         return Response(encode_json(reservation), media_type="application/json")
@@ -412,7 +394,6 @@ class ServingServer:
             encode_json,
         )
 
-        self._authenticate_pd_request(request)
         payload = decode_json(await request.body(), AuthorizeRouteHTTP)
         self.engine.pd_service.authorize_route(payload)
         return Response(encode_json({"status": "AUTHORIZED"}), media_type="application/json")
@@ -424,7 +405,6 @@ class ServingServer:
             encode_json,
         )
 
-        self._authenticate_pd_request(request)
         payload = decode_json(await request.body(), ExecutePrefillHTTP)
         result = await self.engine.pd_service.execute_prefill(payload)
         return Response(encode_json(result), media_type="application/json")
@@ -436,7 +416,6 @@ class ServingServer:
             encode_json,
         )
 
-        self._authenticate_pd_request(request)
         payload = decode_json(await request.body(), HandoffHTTP)
         stream = self.engine.pd_service.open_decode_stream(payload.key)
 
@@ -453,7 +432,6 @@ class ServingServer:
             encode_json,
         )
 
-        self._authenticate_pd_request(request)
         payload = decode_json(await request.body(), HandoffHTTP)
         return Response(
             encode_json(self.engine.pd_service.query_handoff(payload.key)),
@@ -467,7 +445,6 @@ class ServingServer:
             encode_json,
         )
 
-        self._authenticate_pd_request(request)
         payload = decode_json(await request.body(), AbortHandoffHTTP)
         status = await self.engine.pd_service.abort_handoff(payload.key, payload.reason)
         return Response(encode_json(status), media_type="application/json")

@@ -1695,19 +1695,7 @@ class AsyncLLMEngine:
         arrival_monotonic = time.monotonic()
         pd_config = self.config.pd_config
         if pd_config is not None and getattr(pd_config, "enabled", False):
-            if self._pd_service is None:
-                raise RuntimeError("PD serving control plane has not started")
-            if getattr(pd_config.role, "value", "") != "prefill":
-                raise ValueError("send generation requests to the PD Prefill endpoint")
-            prompt_token_ids = self._resolve_prompt_tokens(prompt, prompt_token_ids)
-            async for output in self._pd_service.generate(
-                request_id,
-                prompt,
-                config,
-                prompt_token_ids,
-            ):
-                yield output
-            return
+            raise ValueError("send generation requests through the external PD Router")
 
         replica_idx = self._select_replica()
         prompt_token_ids = self._resolve_prompt_tokens(prompt, prompt_token_ids)

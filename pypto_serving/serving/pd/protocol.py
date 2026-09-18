@@ -6,13 +6,11 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Authenticated, bounded, address-free Host protocol for fixed 1P1D."""
+"""Bounded, address-free Host protocol for Router-assigned PD handoffs."""
 
 from __future__ import annotations
 
-import base64
 import hashlib
-import hmac
 import os
 import socket
 import struct
@@ -51,95 +49,6 @@ class HandoffKey(msgspec.Struct, frozen=True):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
-
-
-class RouteTicketClaims(msgspec.Struct, frozen=True):
-    key: HandoffKey
-    prepared_request_id: str
-    prepared_digest: str
-    compatibility_digest: str
-    prefill_node_id: str
-    decode_node_id: str
-    prefill_endpoint_generation: int
-    decode_endpoint_generation: int
-    reservation_id: str
-    issued_at_ns: int
-    expires_at_ns: int
-    nonce: bytes
-
-    def __post_init__(self) -> None:
-        for name in (
-            "prepared_request_id",
-            "prepared_digest",
-            "compatibility_digest",
-            "prefill_node_id",
-            "decode_node_id",
-            "reservation_id",
-        ):
-            _identifier(getattr(self, name), name)
-        if len(self.prepared_digest) != 64 or len(self.compatibility_digest) != 64:
-            raise ValueError("ticket digests must be SHA-256 hex digests")
-        if self.prefill_node_id == self.decode_node_id:
-            raise ValueError("route ticket P and D nodes must differ")
-        for name in ("prefill_endpoint_generation", "decode_endpoint_generation"):
-            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
-                raise ValueError(f"{name} must be a positive integer")
-        if (
-            type(self.issued_at_ns) is not int
-            or type(self.expires_at_ns) is not int
-            or self.issued_at_ns < 1
-            or self.expires_at_ns <= self.issued_at_ns
-        ):
-            raise ValueError("route ticket time interval is invalid")
-        if not isinstance(self.nonce, bytes) or len(self.nonce) != 16:
-            raise ValueError("route ticket nonce must contain 16 bytes")
-
-
-_ticket_encoder = msgspec.msgpack.Encoder()
-_ticket_decoder = msgspec.msgpack.Decoder(RouteTicketClaims)
-
-
-def sign_route_ticket(claims: RouteTicketClaims, secret: bytes) -> str:
-    """Create an opaque Router-issued ticket without exposing provider data."""
-    if not isinstance(secret, bytes) or len(secret) < 16:
-        raise ValueError("PD Router signing secret must contain at least 16 bytes")
-    payload = _ticket_encoder.encode(claims)
-    signature = hmac.new(secret, b"pypto-pd-route\x00" + payload, hashlib.sha256).digest()
-    return ".".join(
-        (
-            base64.urlsafe_b64encode(payload).rstrip(b"=").decode(),
-            base64.urlsafe_b64encode(signature).rstrip(b"=").decode(),
-        )
-    )
-
-
-def verify_route_ticket(token: str, secret: bytes, *, now_ns: int) -> RouteTicketClaims:
-    """Authenticate and decode a Router ticket, including its expiry."""
-    if not isinstance(token, str) or not token or len(token.encode()) > 4096:
-        raise ValueError("invalid PD route ticket")
-    if not isinstance(secret, bytes) or len(secret) < 16:
-        raise ValueError("PD Router verification secret must contain at least 16 bytes")
-    try:
-        payload_text, signature_text = token.split(".", 1)
-        payload = base64.urlsafe_b64decode(payload_text + "=" * (-len(payload_text) % 4))
-        signature = base64.urlsafe_b64decode(
-            signature_text + "=" * (-len(signature_text) % 4)
-        )
-    except (ValueError, TypeError) as exc:
-        raise ValueError("invalid PD route ticket encoding") from exc
-    canonical_payload = base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
-    canonical_signature = base64.urlsafe_b64encode(signature).rstrip(b"=").decode()
-    if payload_text != canonical_payload or signature_text != canonical_signature:
-        raise ValueError("PD route ticket authentication failed")
-    expected = hmac.new(secret, b"pypto-pd-route\x00" + payload, hashlib.sha256).digest()
-    if not hmac.compare_digest(signature, expected):
-        raise ValueError("PD route ticket authentication failed")
-    claims = _ticket_decoder.decode(payload)
-    if claims.issued_at_ns > now_ns + 5_000_000_000:
-        raise ValueError("PD route ticket was issued in the future")
-    if now_ns > claims.expires_at_ns:
-        raise ValueError("PD route ticket expired")
-    return claims
 
 
 class CapabilityWire(msgspec.Struct, frozen=True):
@@ -342,8 +251,10 @@ class OpenRoute(msgspec.Struct, tag="open_route", frozen=True):
     prepared_request_id: str
     reservation_id: str
     prepared_digest: str
-    route_ticket: str
     reservation_capability: str
+    compatibility_digest: str
+    prefill_node_id: str
+    prefill_endpoint_generation: int
 
 
 class RouteOpened(msgspec.Struct, tag="route_opened", frozen=True):
@@ -411,17 +322,16 @@ def message_handoff_key(message: ControlMessage) -> HandoffKey | None:
     return key if isinstance(key, HandoffKey) else None
 
 
-class _SignedFrame(msgspec.Struct):
+class _Frame(msgspec.Struct):
     sender: str
     sequence: int
     payload: bytes
-    mac: bytes
 
 
 _message_encoder = msgspec.msgpack.Encoder()
 _message_decoder = msgspec.msgpack.Decoder(ControlMessage)
 _frame_encoder = msgspec.msgpack.Encoder()
-_frame_decoder = msgspec.msgpack.Decoder(_SignedFrame)
+_frame_decoder = msgspec.msgpack.Decoder(_Frame)
 
 
 def encode_message(message: ControlMessage) -> bytes:
@@ -490,72 +400,47 @@ def chunk_payload_hash(
     return hashlib.sha256(_message_encoder.encode(payload)).hexdigest()
 
 
-class AuthenticatedFramedChannel:
-    """Per-direction sequence and HMAC guard around an already private socket."""
+class FramedChannel:
+    """Bounded frame transport with peer identity and replay sequencing."""
 
     def __init__(
         self,
         channel: socket.socket,
         *,
-        secret: bytes,
-        context: str,
         local_node_id: str,
         peer_node_id: str,
     ) -> None:
-        if not isinstance(secret, bytes) or len(secret) < 16:
-            raise ValueError("PD channel secret must contain at least 16 bytes")
-        for name, value in (
-            ("context", context),
-            ("local_node_id", local_node_id),
-            ("peer_node_id", peer_node_id),
-        ):
+        for name, value in (("local_node_id", local_node_id), ("peer_node_id", peer_node_id)):
             _identifier(value, name)
         if local_node_id == peer_node_id:
             raise ValueError("PD channel peers must have distinct node ids")
         self._channel = channel
-        self._secret = secret
-        self._context = context.encode()
         self._local_node_id = local_node_id
         self._peer_node_id = peer_node_id
         self._send_sequence = 0
         self._recv_sequence = 0
 
-    def _mac(self, sender: str, sequence: int, payload: bytes) -> bytes:
-        material = b"\x00".join(
-            (
-                self._context,
-                sender.encode(),
-                sequence.to_bytes(8, "big", signed=False),
-                payload,
-            )
-        )
-        return hmac.new(self._secret, material, hashlib.sha256).digest()
-
     def send(self, message: ControlMessage) -> None:
         payload = encode_message(message)
         self._send_sequence += 1
-        frame = _SignedFrame(
+        frame = _Frame(
             sender=self._local_node_id,
             sequence=self._send_sequence,
             payload=payload,
-            mac=self._mac(self._local_node_id, self._send_sequence, payload),
         )
         wire = _frame_encoder.encode(frame)
         if len(wire) > MAX_CONTROL_MESSAGE_BYTES:
-            raise ValueError("authenticated PD frame exceeds the bounded wire size")
+            raise ValueError("PD frame exceeds the bounded wire size")
         self._channel.sendall(struct.pack("!I", len(wire)) + wire)
 
     def receive(self) -> ControlMessage:
         length = struct.unpack("!I", self._read_exact(4))[0]
         if not 0 < length <= MAX_CONTROL_MESSAGE_BYTES:
-            raise ValueError("invalid authenticated PD frame size")
+            raise ValueError("invalid PD frame size")
         frame = _frame_decoder.decode(self._read_exact(length))
         expected_sequence = self._recv_sequence + 1
         if frame.sender != self._peer_node_id or frame.sequence != expected_sequence:
             raise ValueError("stale, replayed, or misrouted PD control frame")
-        expected_mac = self._mac(frame.sender, frame.sequence, frame.payload)
-        if not hmac.compare_digest(frame.mac, expected_mac):
-            raise ValueError("PD control frame authentication failed")
         message = decode_message(frame.payload)
         self._recv_sequence = frame.sequence
         return message
@@ -591,7 +476,7 @@ def make_hello(
 
 
 def exchange_and_validate_hello(
-    channel: AuthenticatedFramedChannel,
+    channel: FramedChannel,
     hello: Hello,
     *,
     expected_peer_node_id: str,

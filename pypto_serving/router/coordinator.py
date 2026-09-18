@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import suppress
-import os
 import time
 import uuid
 
@@ -27,8 +26,6 @@ from pypto_serving.serving.pd.http_api import (
 from pypto_serving.serving.pd.protocol import (
     DecodeOutputWire,
     HandoffKey,
-    RouteTicketClaims,
-    sign_route_ticket,
 )
 from pypto_serving.serving.pd.admission import FairHandoffAdmission
 from pypto_serving.serving.pd.metrics import PDMetrics
@@ -264,29 +261,8 @@ class RouterCoordinator:
             ):
                 raise RuntimeError("D returned a reservation for another route")
             self.journal.append("HANDOFF_RESERVED", key)
-            expires_at_ns = min(
-                prepared.expires_at_ns,
-                time.time_ns() + int(self.config.ticket_ttl_seconds * 1_000_000_000),
-            )
-            issued_at_ns = time.time_ns()
-            ticket = sign_route_ticket(
-                RouteTicketClaims(
-                    key=key,
-                    prepared_request_id=prepared.prepared_request_id,
-                    prepared_digest=prepared.prepared_digest,
-                    compatibility_digest=capability_compatibility_digest(
-                        pair.prefill.capabilities
-                    ),
-                    prefill_node_id=pair.prefill.node_id,
-                    decode_node_id=pair.decode.node_id,
-                    prefill_endpoint_generation=pair.prefill.endpoint_generation,
-                    decode_endpoint_generation=pair.decode.endpoint_generation,
-                    reservation_id=reservation.reservation_id,
-                    issued_at_ns=issued_at_ns,
-                    expires_at_ns=expires_at_ns,
-                    nonce=os.urandom(16),
-                ),
-                self.config.route_secret(),
+            compatibility_digest = capability_compatibility_digest(
+                pair.prefill.capabilities
             )
             await pair.decode_client.post(
                 "/internal/pd/authorize",
@@ -296,7 +272,11 @@ class RouterCoordinator:
                     prepared_digest=prepared.prepared_digest,
                     reservation_id=reservation.reservation_id,
                     reservation_capability=reservation.reservation_capability,
-                    route_ticket=ticket,
+                    compatibility_digest=compatibility_digest,
+                    prefill_node_id=pair.prefill.node_id,
+                    prefill_endpoint_generation=pair.prefill.endpoint_generation,
+                    decode_node_id=pair.decode.node_id,
+                    decode_endpoint_generation=pair.decode.endpoint_generation,
                 ),
             )
             self.journal.append("ROUTE_AUTHORIZED", key)
@@ -320,7 +300,9 @@ class RouterCoordinator:
                         partition=reservation.partition,
                         block_ids_by_group=reservation.block_ids_by_group,
                         reservation_capability=reservation.reservation_capability,
-                        route_ticket=ticket,
+                        compatibility_digest=compatibility_digest,
+                        prefill_node_id=pair.prefill.node_id,
+                        prefill_endpoint_generation=pair.prefill.endpoint_generation,
                         decode_node_id=pair.decode.node_id,
                         decode_control_host=reservation.decode_control_host,
                         decode_control_port=reservation.decode_control_port,

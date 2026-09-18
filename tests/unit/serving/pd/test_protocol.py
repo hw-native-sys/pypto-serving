@@ -14,7 +14,7 @@ import pytest
 
 from pypto_serving.serving.pd.config import PDCapabilities, PDRole
 from pypto_serving.serving.pd.protocol import (
-    AuthenticatedFramedChannel,
+    FramedChannel,
     HandoffKey,
     QueryHandoff,
     decode_message,
@@ -33,32 +33,28 @@ def _capabilities(model_revision: str = "ds-v4-test") -> PDCapabilities:
     )
 
 
-def _channels(secret_a: bytes, secret_b: bytes):
+def _channels():
     left, right = socket.socketpair()
     left.settimeout(2)
     right.settimeout(2)
     return (
         left,
         right,
-        AuthenticatedFramedChannel(
+        FramedChannel(
             left,
-            secret=secret_a,
-            context="pypto-pd:run-1",
             local_node_id="prefill",
             peer_node_id="decode",
         ),
-        AuthenticatedFramedChannel(
+        FramedChannel(
             right,
-            secret=secret_b,
-            context="pypto-pd:run-1",
             local_node_id="decode",
             peer_node_id="prefill",
         ),
     )
 
 
-def test_authenticated_hello_and_message_round_trip() -> None:
-    left, right, prefill, decode = _channels(b"a" * 32, b"a" * 32)
+def test_hello_and_message_round_trip() -> None:
+    left, right, prefill, decode = _channels()
     p_hello = make_hello(
         node_id="prefill",
         role=PDRole.PREFILL,
@@ -96,17 +92,8 @@ def test_authenticated_hello_and_message_round_trip() -> None:
     right.close()
 
 
-def test_wrong_secret_is_rejected() -> None:
-    left, right, prefill, decode = _channels(b"a" * 32, b"b" * 32)
-    prefill.send(QueryHandoff(HandoffKey("request", "handoff", 1, 1, 1)))
-    with pytest.raises(ValueError, match="authentication"):
-        decode.receive()
-    left.close()
-    right.close()
-
-
 def test_capability_mismatch_is_rejected() -> None:
-    left, right, prefill, decode = _channels(b"a" * 32, b"a" * 32)
+    left, right, prefill, decode = _channels()
     p_hello = make_hello(
         node_id="prefill",
         role=PDRole.PREFILL,
