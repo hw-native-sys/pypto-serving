@@ -46,6 +46,11 @@ if [[ $PD_CONFIG != /* || ! -f $PD_CONFIG ]]; then
     echo "PD_CONFIG must identify the shared absolute JSON config" >&2
     exit 2
 fi
+max_model_len=${PYPTO_MAX_MODEL_LEN:-1024}
+if [[ ! $max_model_len =~ ^[1-9][0-9]*$ ]]; then
+    echo "PYPTO_MAX_MODEL_LEN must be a positive integer" >&2
+    exit 2
+fi
 
 run_dir="$evidence_root/$PD_EVIDENCE_NAME"
 test ! -e "$run_dir"
@@ -75,6 +80,7 @@ cd "$repo_root"
     printf 'ptoas=%s\n' "$(command -v ptoas)"
     ptoas --version || true
     printf 'HCCL_INTRA_ROCE_ENABLE=%s\n' "$HCCL_INTRA_ROCE_ENABLE"
+    printf 'max_model_len=%s\n' "$max_model_len"
     python - <<'PY'
 import mooncake.engine
 import pypto
@@ -190,7 +196,7 @@ python -m pypto_serving.cli \
     --served-model-name dsv4-flash-dspark-w8a8 \
     --backend npu --platform a2a3 \
     --devices "$TASK_DEVICE" --dp 4 --ep 16 --tp 4 \
-    --block-size 32 --max-model-len 1024 --max-num-seqs 8 \
+    --block-size 32 --max-model-len "$max_model_len" --max-num-seqs 8 \
     --max-num-batched-tokens 8192 --long-prefill-token-threshold 128 \
     --speculative-config '{"method":"dspark","num_speculative_tokens":7}' \
     --no-enable-prefix-caching \
