@@ -1,0 +1,80 @@
+[
+  {
+    "name": "forbidden-city-128",
+    "payload": {"model": "dsv4-flash-dspark-w8a8", "prompt": "紫禁城", "max_tokens": 128, "temperature": 0.0, "top_p": 1.0, "stream": false},
+    "expected_completion_tokens": 128,
+    "expected_finish_reason": "length"
+  },
+  {
+    "name": "single-token-decode",
+    "prompt_token_count": 3,
+    "prompt_token_id": 100,
+    "payload": {"model": "dsv4-flash-dspark-w8a8", "max_tokens": 1, "temperature": 0.0, "top_p": 1.0, "stream": false},
+    "expected_completion_tokens": 1,
+    "expected_finish_reason": "length"
+  },
+  {
+    "name": "block-minus-one",
+    "prompt_token_count": 31,
+    "prompt_token_id": 100,
+    "payload": {"model": "dsv4-flash-dspark-w8a8", "max_tokens": 8, "temperature": 0.0, "top_p": 1.0, "stream": false},
+    "expected_completion_tokens": 8,
+    "expected_finish_reason": "length"
+  },
+  {
+    "name": "block-exact",
+    "prompt_token_count": 32,
+    "prompt_token_id": 100,
+    "payload": {"model": "dsv4-flash-dspark-w8a8", "max_tokens": 8, "temperature": 0.0, "top_p": 1.0, "stream": false},
+    "expected_completion_tokens": 8,
+    "expected_finish_reason": "length"
+  },
+  {
+    "name": "block-plus-one",
+    "prompt_token_count": 33,
+    "prompt_token_id": 100,
+    "payload": {"model": "dsv4-flash-dspark-w8a8", "max_tokens": 8, "temperature": 0.0, "top_p": 1.0, "stream": false},
+    "expected_completion_tokens": 8,
+    "expected_finish_reason": "length"
+  },
+  {
+    "name": "chunk-minus-one",
+    "prompt_token_count": 127,
+    "prompt_token_id": 100,
+    "payload": {"model": "dsv4-flash-dspark-w8a8", "max_tokens": 8, "temperature": 0.0, "top_p": 1.0, "stream": false},
+    "expected_completion_tokens": 8,
+    "expected_finish_reason": "length"
+  },
+  {
+    "name": "chunk-exact",
+    "prompt_token_count": 128,
+    "prompt_token_id": 100,
+    "payload": {"model": "dsv4-flash-dspark-w8a8", "max_tokens": 8, "temperature": 0.0, "top_p": 1.0, "stream": false},
+    "expected_completion_tokens": 8,
+    "expected_finish_reason": "length"
+  },
+  {
+    "name": "chunk-plus-one",
+    "prompt_token_count": 129,
+    "prompt_token_id": 100,
+    "payload": {"model": "dsv4-flash-dspark-w8a8", "max_tokens": 8, "temperature": 0.0, "top_p": 1.0, "stream": false},
+    "expected_completion_tokens": 8,
+    "expected_finish_reason": "length"
+  },
+  {
+    "name": "three-chunks-partial-page",
+    "prompt_token_count": 257,
+    "prompt_token_id": 100,
+    "payload": {"model": "dsv4-flash-dspark-w8a8", "max_tokens": 16, "temperature": 0.0, "top_p": 1.0, "stream": false},
+    "expected_completion_tokens": 16,
+    "expected_finish_reason": "length"
+  },
+  {
+    "name": "model-limit-1024",
+    "prompt_token_count": 896,
+    "prompt_token_id": 100,
+    "payload": {"model": "dsv4-flash-dspark-w8a8", "max_tokens": 128, "temperature": 0.0, "top_p": 1.0, "stream": false},
+    "expected_completion_tokens": 128,
+    "expected_finish_reason": "length"
+  }
+]
