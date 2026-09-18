@@ -12,6 +12,7 @@ from pypto_serving.router.config import RouterConfig
 from pypto_serving.router.coordinator import RouterCoordinator
 from pypto_serving.router.directory import WorkerDirectory
 from pypto_serving.router.journal import RouterJournal
+from pypto_serving.router.policy import RoundRobinRoutePolicy
 from pypto_serving.serving.pd.config import PDCapabilities, PDRole
 from pypto_serving.serving.pd.http_api import (
     DecodeStreamFrame,
@@ -225,7 +226,12 @@ def _coordinator(monkeypatch, tmp_path, p_client, d_client):
     journal = RouterJournal(config.journal_path, config.run_id)
     coordinator = RouterCoordinator(
         config,
-        WorkerDirectory((p_client,), (d_client,), "run"),
+        WorkerDirectory(
+            (p_client,),
+            (d_client,),
+            "run",
+            RoundRobinRoutePolicy(),
+        ),
         journal,
     )
     return coordinator, journal
@@ -268,6 +274,7 @@ def test_directory_rejects_a_stale_router_control_incarnation() -> None:
             (_PrefillClient(waiting),),
             (_DecodeClient(waiting),),
             "run",
+            RoundRobinRoutePolicy(),
             control_incarnation=2,
         )
         with pytest.raises(RuntimeError, match="no eligible P/D pool"):

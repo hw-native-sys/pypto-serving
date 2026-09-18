@@ -22,6 +22,7 @@ from .config import RouterConfig
 from .coordinator import RouterCoordinator
 from .directory import WorkerDirectory
 from .journal import RouterJournal
+from .policy import create_route_policy
 from .recovery import RecoveryPhase
 
 
@@ -70,6 +71,7 @@ def create_router_app(config: RouterConfig) -> FastAPI:
         prefill_clients,
         decode_clients,
         config.run_id,
+        create_route_policy(config.policy),
         config.control_incarnation,
     )
     journal = RouterJournal(config.journal_path, config.run_id)
