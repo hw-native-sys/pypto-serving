@@ -221,18 +221,14 @@ def _stop_with_retries(
     }
 
 
-def _write_secret_file(
+def _write_pd_config(
     host: str,
     container: str,
     path: str,
-    auth_secret: str,
-    router_secret: str,
+    document: dict[str, object],
 ) -> None:
-    body = (
-        f"export PYPTO_PD_AUTH_SECRET={auth_secret}\n"
-        f"export PYPTO_PD_ROUTER_SECRET={router_secret}\n"
-    )
-    command = f"umask 077; tee {shlex.quote(path)} >/dev/null"
+    body = json.dumps(document, indent=2, sort_keys=True) + "\n"
+    command = f"tee {shlex.quote(path)} >/dev/null"
     _ssh(
         host,
         ["docker", "exec", "-i", container, "bash", "-lc", command],
@@ -244,12 +240,10 @@ def _write_secret_file(
 def _start(
     host: str,
     container: str,
-    secret_file: str,
     launcher: str,
     values: dict[str, object],
 ) -> None:
     command = (
-        f"source {shlex.quote(secret_file)}; "
         f"{_shell_exports(values)}; "
         f"exec {shlex.quote(launcher)}"
     )
@@ -263,14 +257,13 @@ def _start(
 def _start_suite(
     host: str,
     container: str,
-    secret_file: str,
     repo: str,
     control_dir: str,
     driver: str,
     suite_args: list[str],
 ) -> None:
     command = (
-        f"source {shlex.quote(secret_file)}; cd {shlex.quote(repo)}; "
+        f"cd {shlex.quote(repo)}; "
         "exec tests/manual/pd/phase_f/run_remote_suite.sh "
         f"{shlex.quote(control_dir)} {shlex.quote(driver)} {shlex.join(suite_args)}"
     )
@@ -335,7 +328,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--container", default="openeuler-2403-DS")
     parser.add_argument("--prefill-ssh", default="serving-a-sj")
-    parser.add_argument("--decode-ssh", default="serving-b")
+    parser.add_argument("--decode-ssh", default="serving-b-sj")
     # serving-a currently exposes its RoCE-facing address as 192.169.0.173
     # inside the host-networked test container.  Keep the default aligned with
     # the frozen Phase D/E topology so ADXL never tries to bind a stale address.
@@ -345,14 +338,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefill-port", type=int, default=8111)
     parser.add_argument("--decode-port", type=int, default=8112)
     parser.add_argument("--router-port", type=int, default=8110)
-    parser.add_argument("--generation", type=int, default=1)
-    parser.add_argument("--control-incarnation", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--mode", choices=("suite", "soak"), default="suite")
     parser.add_argument("--cases-file", default="cases.json")
     parser.add_argument("--soak-requests", type=int, default=64)
-    parser.add_argument("--disable-overlap", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--startup-timeout-seconds", type=float, default=1800)
     parser.add_argument("--request-timeout-seconds", type=float, default=7200)
@@ -386,7 +376,7 @@ def main() -> int:
     run_root = args.run_root.rstrip("/")
     launcher = f"{repo}/tests/manual/pd/phase_f/run_pd_k7_node.sh"
     router_launcher = f"{repo}/tests/manual/pd/phase_f/run_router.sh"
-    secret_file = f"{run_root}/.{args.run_id}.secrets"
+    config_file = f"{run_root}/{args.run_id}.json"
     names = {
         "p": f"{args.run_id}-prefill",
         "d": f"{args.run_id}-decode",
@@ -394,8 +384,32 @@ def main() -> int:
         "suite": f"{args.run_id}-suite",
         "suite_control": f"{args.run_id}-suite-control",
     }
-    auth_secret = secrets.token_hex(32)
-    router_secret = secrets.token_hex(32)
+    document = {
+        "runtime": {
+            "run_id": args.run_id,
+            "prefill": [
+                {
+                    "host": args.prefill_data_host,
+                    "port": args.prefill_port,
+                    "node_id": f"{args.run_id}-p",
+                    "control_host": args.prefill_data_host,
+                    "control_port": args.control_port,
+                    "transfer_hostname": args.prefill_data_host,
+                }
+            ],
+            "decode": [
+                {
+                    "host": args.decode_data_host,
+                    "port": args.decode_port,
+                    "node_id": f"{args.run_id}-d",
+                    "control_host": args.decode_data_host,
+                    "control_port": args.control_port,
+                    "transfer_hostname": args.decode_data_host,
+                }
+            ],
+        },
+        "observability": {"root": f"{run_root}/serving_log/pd_disag"},
+    }
     stops = []
     result = "FAIL"
     try:
@@ -406,20 +420,15 @@ def main() -> int:
                 ["mkdir", "-p", run_root],
                 timeout=30,
             )
-            _write_secret_file(
+            _write_pd_config(
                 host,
                 args.container,
-                secret_file,
-                auth_secret,
-                router_secret,
+                config_file,
+                document,
             )
         common = {
-            "PD_RUN_ID": args.run_id,
-            "PD_GENERATION": args.generation,
-            "PD_ROUTE_EPOCH": 1,
-            "PD_CONTROL_INCARNATION": args.control_incarnation,
+            "PD_CONFIG": config_file,
             "PD_PROFILE": str(args.profile).lower(),
-            "PD_ENABLE_CHUNK_OVERLAP": str(not args.disable_overlap).lower(),
             "PD_EVIDENCE_ROOT": run_root,
             "PYPTO_STACK_ENV_FILE": args.env_file,
             "PYPTO_DSV4_DSPARK_MODEL_DIR": args.model_dir,
@@ -427,14 +436,11 @@ def main() -> int:
         _start(
             args.decode_ssh,
             args.container,
-            secret_file,
             launcher,
             {
                 **common,
                 "PD_ROLE": "decode",
                 "PD_NODE_ID": f"{args.run_id}-d",
-                "PD_LOCAL_HOST": args.decode_data_host,
-                "PD_CONTROL_PORT": args.control_port,
                 "PD_API_PORT": args.decode_port,
                 "PD_EVIDENCE_NAME": names["d"],
             },
@@ -442,14 +448,11 @@ def main() -> int:
         _start(
             args.prefill_ssh,
             args.container,
-            secret_file,
             launcher,
             {
                 **common,
                 "PD_ROLE": "prefill",
                 "PD_NODE_ID": f"{args.run_id}-p",
-                "PD_LOCAL_HOST": args.prefill_data_host,
-                "PD_CONTROL_PORT": args.control_port,
                 "PD_API_PORT": args.prefill_port,
                 "PD_EVIDENCE_NAME": names["p"],
             },
@@ -462,8 +465,8 @@ def main() -> int:
             expected={
                 "run_id": args.run_id,
                 "role": "decode",
-                "generation": args.generation,
-                "control_incarnation": args.control_incarnation,
+                "generation": 1,
+                "control_incarnation": 1,
             },
         )
         _wait_health(
@@ -474,19 +477,16 @@ def main() -> int:
             expected={
                 "run_id": args.run_id,
                 "role": "prefill",
-                "generation": args.generation,
-                "control_incarnation": args.control_incarnation,
+                "generation": 1,
+                "control_incarnation": 1,
             },
         )
         _start(
             args.prefill_ssh,
             args.container,
-            secret_file,
             router_launcher,
             {
                 **common,
-                "ROUTER_P_URL": f"http://127.0.0.1:{args.prefill_port}",
-                "ROUTER_D_URL": f"http://{args.decode_data_host}:{args.decode_port}",
                 "ROUTER_PORT": args.router_port,
                 "ROUTER_EVIDENCE_NAME": names["router"],
             },
@@ -498,7 +498,7 @@ def main() -> int:
             args.startup_timeout_seconds,
             expected={
                 "run_id": args.run_id,
-                "control_incarnation": args.control_incarnation,
+                "control_incarnation": 1,
             },
         )
         suite_args = [
@@ -533,7 +533,6 @@ def main() -> int:
         _start_suite(
             args.prefill_ssh,
             args.container,
-            secret_file,
             repo,
             f"{run_root}/{names['suite_control']}",
             driver,
@@ -575,11 +574,6 @@ def main() -> int:
                 f"{run_root}/{names['d']}/service.pid",
             )
         )
-        for host in (args.prefill_ssh, args.decode_ssh):
-            try:
-                _docker(host, args.container, ["rm", "-f", secret_file], timeout=15)
-            except subprocess.SubprocessError:
-                pass
         args.local_evidence_dir.mkdir(parents=True, exist_ok=False)
         for label, host, name in (
             ("prefill", args.prefill_ssh, names["p"]),
