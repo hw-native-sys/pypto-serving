@@ -203,6 +203,101 @@ def test_round_robin_uses_independent_p_and_d_cursors() -> None:
     asyncio.run(exercise())
 
 
+def test_concurrent_round_robin_selection_remains_balanced() -> None:
+    async def exercise() -> None:
+        prefills = tuple(
+            _Client(
+                _descriptor(node, PDRole.PREFILL),
+                _capacity(node, PDRole.PREFILL),
+            )
+            for node in ("p1", "p2")
+        )
+        decodes = tuple(
+            _Client(
+                _descriptor(node, PDRole.DECODE),
+                _capacity(node, PDRole.DECODE),
+            )
+            for node in ("d1", "d2", "d3")
+        )
+        directory = WorkerDirectory(
+            prefills,
+            decodes,
+            "run",
+            RoundRobinRoutePolicy(),
+            control_incarnation=1,
+        )
+
+        selected = await asyncio.gather(*(directory.select() for _ in range(60)))
+        assert {node: sum(pair.prefill.node_id == node for pair in selected) for node in ("p1", "p2")} == {
+            "p1": 30,
+            "p2": 30,
+        }
+        assert {node: sum(pair.decode.node_id == node for pair in selected) for node in ("d1", "d2", "d3")} == {
+            "d1": 20,
+            "d2": 20,
+            "d3": 20,
+        }
+
+    asyncio.run(exercise())
+
+
+def test_directory_refresh_restores_a_recovered_node() -> None:
+    async def exercise() -> None:
+        p = _Client(
+            _descriptor("p1", PDRole.PREFILL),
+            _capacity("p1", PDRole.PREFILL),
+        )
+        d1 = _Client(
+            _descriptor("d1", PDRole.DECODE),
+            _capacity("d1", PDRole.DECODE, active=4),
+        )
+        d2 = _Client(
+            _descriptor("d2", PDRole.DECODE),
+            _capacity("d2", PDRole.DECODE),
+        )
+        directory = WorkerDirectory(
+            (p,),
+            (d1, d2),
+            "run",
+            RoundRobinRoutePolicy(),
+            control_incarnation=1,
+        )
+
+        first = await directory.refresh()
+        assert [item.descriptor.node_id for item in first.decode] == ["d2"]
+        d1.capacity = _capacity("d1", PDRole.DECODE)
+        recovered = await directory.refresh()
+        assert [item.descriptor.node_id for item in recovered.decode] == ["d1", "d2"]
+
+    asyncio.run(exercise())
+
+
+def test_recovery_binding_uses_exact_generation_without_capacity_filter() -> None:
+    async def exercise() -> None:
+        p = _Client(
+            _descriptor("p1", PDRole.PREFILL),
+            _capacity("p1", PDRole.PREFILL),
+        )
+        d = _Client(
+            _descriptor("d1", PDRole.DECODE),
+            _capacity("d1", PDRole.DECODE, active=4),
+        )
+        directory = WorkerDirectory(
+            (p,),
+            (d,),
+            "run",
+            RoundRobinRoutePolicy(),
+            control_incarnation=1,
+        )
+
+        bound = await directory.resolve_binding("p1", "d1", 1, 1)
+        assert (bound.prefill.node_id, bound.decode.node_id) == ("p1", "d1")
+        with pytest.raises(RuntimeError, match="generation is stale"):
+            await directory.resolve_binding("p1", "d1", 1, 2)
+
+    asyncio.run(exercise())
+
+
 def test_route_policy_registry_is_allowlisted() -> None:
     assert isinstance(create_route_policy("round_robin"), RoundRobinRoutePolicy)
     with pytest.raises(ValueError, match="unknown PD route policy"):
