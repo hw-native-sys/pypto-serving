@@ -2629,7 +2629,6 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     bridge,
                     poison=supervisor.poison,
                     max_tasks=self._pd_worker_config.max_active_handoffs,
-                    max_bytes=self._pd_worker_config.max_inflight_transfer_bytes,
                 )
             )
         self._pd_peer_leases = tuple(peer_leases)

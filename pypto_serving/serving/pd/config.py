@@ -207,7 +207,6 @@ class PDConfig:
     transfer_poll_interval_seconds: float = 0.005
     max_active_handoffs: int = 4
     max_pending_handoffs: int = 8
-    max_inflight_transfer_bytes: int = 1 << 30
     max_transfer_attempts: int = 2
     enable_chunk_overlap: bool = False
     prepared_request_ttl_seconds: float = 300.0
@@ -250,7 +249,6 @@ class PDConfig:
             endpoint_generation=self.generation,
             model_revision=self.model_revision,
             max_active_handoffs=self.max_active_handoffs,
-            max_inflight_transfer_bytes=self.max_inflight_transfer_bytes,
         )
 
 
@@ -302,7 +300,6 @@ class PDWorkerConfig:
     endpoint_generation: int
     model_revision: str
     max_active_handoffs: int = 1
-    max_inflight_transfer_bytes: int = 1 << 30
 
 
 @dataclass(frozen=True)
