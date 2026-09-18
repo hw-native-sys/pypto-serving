@@ -362,6 +362,9 @@ class ServingServer:
                 public.chat_template_kwargs,
                 reasoning_effort=public.reasoning_effort,
             )
+            prompt_token_ids = tuple(
+                int(token) for token in self.engine._tokenize_prompt(prompt)
+            )
             config = dataclasses.replace(
                 self._resolve_generate_config(public),
                 ignore_eos=self.generate_config.ignore_eos,
