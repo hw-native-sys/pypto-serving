@@ -1194,6 +1194,36 @@ def accept_mtp_tokens(main_token_ids: torch.Tensor, draft_token_ids: torch.Tenso
 class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
     """Runner boundary for DeepSeekV4 W8A8 kernels and model-specific caches."""
 
+    def export_transfer_registry(self, rank: int, *, model_revision: str):
+        """Describe resident cache shards without exporting their addresses."""
+        from pypto_serving.model.deepseek.transfer_layout import DSV4Registry
+
+        if self._decode_device_cache is None:
+            raise RuntimeError("resident cache must exist before exporting its transfer layout")
+        all_layers = tuple(layer.layer_id for layer in self._compiled.layer_plan)
+        csa_layers = tuple(
+            layer.layer_id for layer in self._compiled.layer_plan if layer.compress_ratio == 4
+        )
+        hca_layers = tuple(
+            layer.layer_id for layer in self._compiled.layer_plan if layer.compress_ratio == 128
+        )
+        return DSV4Registry.from_device_cache(
+            self._decode_device_cache,
+            rank=rank,
+            model_revision=model_revision,
+            topology=(self._compiled.layout.ranks,),
+            layer_mapping={
+                "ori": all_layers,
+                "hca_cmp": hca_layers,
+                "csa_cmp": csa_layers,
+                "idx_k": csa_layers,
+                "idx_scale": csa_layers,
+                "hca_state": hca_layers,
+                "csa_state": csa_layers,
+                "csa_inner_state": csa_layers,
+            },
+        )
+
     def __init__(
         self,
         *,
@@ -4572,12 +4602,14 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         shard = device_pre_hc.shards[owner_rank]
         worker_id = device_pre_hc.worker_ids[owner_rank]
         row_nbytes = host_row.numel() * host_row.element_size()
+        copy_kwargs = {"worker_id": worker_id}
+        if row:
+            copy_kwargs["src_offset"] = row * row_nbytes
         self._shared_l3_worker().copy_from(
             host_row.data_ptr(),
             shard.data_ptr,
             row_nbytes,
-            src_offset=row * row_nbytes,
-            worker_id=worker_id,
+            **copy_kwargs,
         )
         return host_row.detach().cpu().clone()
 

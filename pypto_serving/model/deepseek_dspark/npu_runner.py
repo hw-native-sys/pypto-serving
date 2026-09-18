@@ -32,6 +32,7 @@ import logging
 import math
 import os
 import threading
+from collections import OrderedDict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -1110,9 +1111,68 @@ def _accept_dspark_tokens(
 class DSparkModelRunner(L3DispatchMixin, ModelRunner):
     """Runner boundary for the DSpark target kernels."""
 
-    def __init__(self, *, compiled: DSparkCompiledKernels) -> None:
+    def export_transfer_registry(self, rank: int, *, model_revision: str):
+        """Describe the eight resident cache regions without exporting addresses."""
+        from pypto_serving.model.deepseek.transfer_layout import DSV4Registry  # noqa: PLC0415
+
+        if self._decode_device_cache is None:
+            raise RuntimeError("resident cache must exist before exporting its transfer layout")
+        all_layers = tuple(layer.layer_id for layer in self._compiled.layer_plan)
+        csa_layers = tuple(
+            layer.layer_id
+            for layer in self._compiled.layer_plan
+            if layer.compress_ratio == 4
+        )
+        hca_layers = tuple(
+            layer.layer_id
+            for layer in self._compiled.layer_plan
+            if layer.compress_ratio == 128
+        )
+        return DSV4Registry.from_device_cache(
+            self._decode_device_cache,
+            rank=rank,
+            model_revision=model_revision,
+            # The second dimension is the replicated-cache TP group.  A
+            # reservation selects one group, so only those four rank owners
+            # participate in a request transfer even though all 16 owners are
+            # registered at process startup.
+            topology=(self._compiled.layout.ranks, DSPARK_TP_SIZE),
+            layer_mapping={
+                "ori": all_layers,
+                "hca_cmp": hca_layers,
+                "csa_cmp": csa_layers,
+                "idx_k": csa_layers,
+                "idx_scale": csa_layers,
+                "hca_state": hca_layers,
+                "csa_state": csa_layers,
+                "csa_inner_state": csa_layers,
+            },
+        )
+
+    def __init__(self, *, compiled: DSparkCompiledKernels, pd_worker_config=None) -> None:
         super().__init__()
         self._compiled = compiled
+        self._pd_worker_config = pd_worker_config
+        self._pd_owner_bridges = ()
+        self._pd_owner_leases = ()
+        self._pd_owner_envelopes = ()
+        self._pd_peer_leases = ()
+        self._pd_transfer_agents = ()
+        self._pd_transfer_jobs = OrderedDict()
+        self._dspark_completed_metrics = {
+            "requests": 0.0,
+            "verify_steps": 0.0,
+            "proposed_drafts": 0.0,
+            "matched_drafts": 0.0,
+            "accepted_tokens": 0.0,
+            "fallback_steps": 0.0,
+            "drafter_lease_scrubs": 0.0,
+        }
+        # StatusIndex sequences are scoped to one owner lifetime, not to one
+        # request or chunk.  Keep one monotonic counter per rank so later
+        # chunks and later handoffs cannot reuse sequence zero.
+        self._pd_attempt_sequences = [0] * self._compiled.layout.ranks
+        self._pd_peer_registration_request = None
         self.cache_metadata = DSparkCacheMetadataBuilder(layout=compiled.layout)
         self._init_l3_dispatch(stacked=True)
         self._decode_run_config: Any = None
@@ -1150,6 +1210,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._dspark_device_state_meta: StackedDeviceTensor | None = None
         self._dspark_rope_device_tables: dict[str, StackedDeviceTensor] | None = None
         self._dspark_state_buffers: list[_DSparkDeviceStateBuffers] = []
+        # A drafter lease names persistent KV rows, not just Host bookkeeping.
+        # Once returned to the free list it must be scrubbed before another
+        # request can inherit it; otherwise a short PD-adopted prompt can see
+        # history left by an earlier long request in the same TP group.
+        self._drafter_dirty_leases: set[tuple[int, int]] = set()
+        self._drafter_lease_zero: torch.Tensor | None = None
         self._drafter_task_args: TaskArgs | None = None
         self._markov_task_args: TaskArgs | None = None
         self._fused_drafter_task_args: list[TaskArgs] = []
@@ -2281,16 +2347,505 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             ):
                 worker_kwargs: dict[str, Any] = {
                     "persistent": True,
-                    "reset_persistent_windows": False,
+                    # Keep the serving default fast, but retain a diagnostic
+                    # switch that can prove whether stale retained CommDomain
+                    # bytes are involved in a cross-request correctness fault.
+                    "reset_persistent_windows": os.environ.get(
+                        "PYPTO_DSPARK_RESET_PERSISTENT_WINDOWS", "0"
+                    )
+                    == "1",
                     "inherited_host_tensors": self._inherited_host_weights(),
                 }
+                if self._pd_worker_config is not None:
+                    from pypto_serving.transfer.owner import (  # noqa: PLC0415
+                        OwnerBridge,
+                        OwnerBridgeGroup,
+                    )
+                    from pypto_serving.transfer.types import OwnerRef  # noqa: PLC0415
+
+                    owners = tuple(
+                        OwnerRef(
+                            self._pd_worker_config.run_id,
+                            rank,
+                            self._pd_worker_config.generation,
+                            self._pd_worker_config.endpoint_generation,
+                            self._pd_worker_config.worker_id,
+                        )
+                        for rank in range(self._compiled.layout.ranks)
+                    )
+                    bridges = tuple(
+                        OwnerBridge(owner, self._pd_worker_config.transfer_hostname)
+                        for owner in owners
+                    )
+                    worker_kwargs["chip_service_factories"] = OwnerBridgeGroup(
+                        bridges
+                    ).factories
+                    self._pd_owner_bridges = bridges
                 run_config = getattr(self, "_l3_run_config", None)
                 if run_config is not None:
                     # Prewarm the full prefill arena before KV sizing reads free HBM.
                     worker_kwargs["config"] = run_config
                 worker = DistributedWorker(compiled, **worker_kwargs)
             self._l3_worker = worker
+            for bridge in self._pd_owner_bridges:
+                bridge.ready()
         return worker
+
+    def handle_pd_command(self, operation: str, payload: bytes) -> bytes:
+        """Execute owner-local registry/install/transfer operations in FIFO order."""
+        from pypto_serving.serving.pd.worker_api import (  # noqa: PLC0415
+            OP_INSPECT_REGISTRY,
+            OP_INSPECT_RUNTIME_METRICS,
+            OP_INSTALL_PEER,
+            OP_POLL_TRANSFER_CHUNK,
+            OP_PREPARE_REGISTRY,
+            OP_SUBMIT_TRANSFER_CHUNK,
+            OP_TRANSFER_CHUNK,
+            InstallPeerRequest,
+            TransferPollRequest,
+            TransferChunkRequest,
+            WorkerRuntimeMetrics,
+            decode_worker_payload,
+            encode_worker_payload,
+        )
+
+        if operation == OP_PREPARE_REGISTRY:
+            if payload:
+                raise ValueError("prepare_registry does not accept a payload")
+            return encode_worker_payload(self._prepare_pd_registry())
+        if operation == OP_INSPECT_REGISTRY:
+            if payload:
+                raise ValueError("inspect_registry does not accept a payload")
+            if not self._pd_owner_envelopes:
+                raise RuntimeError("PD registry has not been prepared")
+            return encode_worker_payload(self._pd_registry_bundle())
+        if operation == OP_INSPECT_RUNTIME_METRICS:
+            if payload:
+                raise ValueError("inspect_runtime_metrics does not accept a payload")
+            values = self.dspark_speculation_summary()
+            values["pd_transfer_jobs"] = float(len(self._pd_transfer_jobs))
+            values["pd_transfer_jobs_active"] = float(
+                sum(job["response"] is None for job in self._pd_transfer_jobs.values())
+            )
+            return encode_worker_payload(WorkerRuntimeMetrics(values))
+        if operation == OP_INSTALL_PEER:
+            request = decode_worker_payload(payload, InstallPeerRequest)
+            self._install_pd_peer(request)
+            return b""
+        if operation == OP_TRANSFER_CHUNK:
+            request = decode_worker_payload(payload, TransferChunkRequest)
+            return encode_worker_payload(self._transfer_pd_chunk(request))
+        if operation == OP_SUBMIT_TRANSFER_CHUNK:
+            request = decode_worker_payload(payload, TransferChunkRequest)
+            return encode_worker_payload(self._submit_pd_chunk(request))
+        if operation == OP_POLL_TRANSFER_CHUNK:
+            request = decode_worker_payload(payload, TransferPollRequest)
+            return encode_worker_payload(self._poll_pd_chunk(request.job_id))
+        raise ValueError(f"unknown DSpark PD worker operation {operation!r}")
+
+    def _prepare_pd_registry(self):
+        """Register all eight resident regions in their owning chip children."""
+        import json  # noqa: PLC0415
+
+        from pypto_serving.model.deepseek.transfer_layout import COMPONENTS  # noqa: PLC0415
+        from pypto_serving.serving.pd.protocol import (  # noqa: PLC0415
+            RankRegistration,
+            RegionRegistration,
+        )
+        from pypto_serving.transfer.types import RegionLease  # noqa: PLC0415
+
+        if self._pd_worker_config is None or not self._pd_owner_bridges:
+            raise RuntimeError("PD owner services were not configured before worker creation")
+        if self._pd_owner_envelopes:
+            return self._pd_registry_bundle()
+        worker = self._shared_l3_worker()
+        cache = self._materialize_decode_device_cache()
+        leases_by_rank = []
+        registrations = []
+        try:
+            for rank, bridge in enumerate(self._pd_owner_bridges):
+                registry = self.export_transfer_registry(
+                    rank,
+                    model_revision=self._pd_worker_config.model_revision,
+                )
+                leases = {}
+                regions = []
+                for component_id, (tensor_name, _, _) in COMPONENTS.items():
+                    entry = registry.entry(component_id)
+                    lease = RegionLease(
+                        bridge.owner,
+                        component_id,
+                        self._pd_worker_config.generation,
+                        entry.extent,
+                    )
+                    envelope = bridge.register_tensor(
+                        worker,
+                        cache[tensor_name].shards[rank],
+                        lease,
+                    )
+                    opaque = json.dumps(
+                        envelope,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode()
+                    leases[component_id] = lease
+                    regions.append(
+                        RegionRegistration(
+                            component_id=component_id,
+                            lease=lease.lease,
+                            extent=lease.extent,
+                            provider_envelope=opaque,
+                        )
+                    )
+                leases_by_rank.append(leases)
+                registrations.append(
+                    RankRegistration(
+                        rank_id=rank,
+                        owner_generation=bridge.owner.generation,
+                        endpoint_generation=bridge.owner.endpoint_generation,
+                        worker_id=bridge.owner.worker_id,
+                        regions=tuple(regions),
+                    )
+                )
+        except BaseException:
+            # No peer has received these envelopes yet, so confirmed local
+            # unregister is sufficient and leaves this generation retryable.
+            for bridge in self._pd_owner_bridges:
+                bridge.release()
+            raise
+        self._pd_owner_leases = tuple(leases_by_rank)
+        self._pd_owner_envelopes = tuple(registrations)
+        return self._pd_registry_bundle()
+
+    def _pd_registry_bundle(self):
+        from pypto_serving.serving.pd.worker_api import (  # noqa: PLC0415
+            ComponentGeometry,
+            WorkerRegistryBundle,
+        )
+
+        if self._pd_worker_config is None or not self._pd_owner_envelopes:
+            raise RuntimeError("PD registry has not been prepared")
+        registry = self.export_transfer_registry(
+            0,
+            model_revision=self._pd_worker_config.model_revision,
+        )
+        components = tuple(
+            ComponentGeometry(
+                component_id=entry.component_id,
+                dtype=entry.dtype,
+                item_bytes=entry.item_bytes,
+                layers=entry.layers,
+                blocks_per_layer=entry.blocks_per_layer,
+                block_tokens=entry.block_tokens,
+                token_stride_bytes=entry.token_stride_bytes,
+                extent=entry.extent,
+            )
+            for entry in registry.components
+        )
+        return WorkerRegistryBundle(
+            model_revision=registry.model_revision,
+            topology=registry.topology,
+            registry_fingerprint=registry.fingerprint,
+            layout_fingerprint=registry.layout_fingerprint,
+            components=components,
+            ranks=self._pd_owner_envelopes,
+        )
+
+    def _install_pd_peer(self, request) -> None:
+        from pypto_serving.model.deepseek.transfer_layout import COMPONENTS  # noqa: PLC0415
+        from pypto_serving.transfer.agent import TransferAgent  # noqa: PLC0415
+        from pypto_serving.transfer.supervisor import OwnerSupervisor  # noqa: PLC0415
+        from pypto_serving.transfer.types import OwnerRef, RegionLease  # noqa: PLC0415
+        import json  # noqa: PLC0415
+
+        local = self._prepare_pd_registry()
+        if request.layout_fingerprint != local.layout_fingerprint:
+            raise ValueError("peer registry layout fingerprint mismatch")
+        if len(request.ranks) != self._compiled.layout.ranks:
+            raise ValueError("peer registry rank count mismatch")
+        if self._pd_peer_leases:
+            if request != self._pd_peer_registration_request:
+                raise ValueError(
+                    "peer registry changed without a new worker generation"
+                )
+            return
+
+        peer_leases = []
+        expected_components = set(COMPONENTS)
+        for rank, registration in enumerate(request.ranks):
+            if registration.rank_id != rank:
+                raise ValueError("peer registrations must be rank ordered")
+            owner = OwnerRef(
+                self._pd_worker_config.run_id,
+                rank,
+                registration.owner_generation,
+                registration.endpoint_generation,
+                registration.worker_id,
+            )
+            regions = {region.component_id: region for region in registration.regions}
+            if set(regions) != expected_components:
+                raise ValueError("peer registration does not contain all eight regions")
+            leases = {}
+            registry = self.export_transfer_registry(
+                rank,
+                model_revision=self._pd_worker_config.model_revision,
+            )
+            for component_id in COMPONENTS:
+                region = regions[component_id]
+                entry = registry.entry(component_id)
+                per_layer_extent = len(entry.layers) * entry.block_stride_bytes
+                peer_blocks, remainder = divmod(region.extent, per_layer_extent)
+                if remainder or not peer_blocks:
+                    raise ValueError("peer region extent differs from transfer geometry")
+                lease = RegionLease(owner, component_id, region.lease, region.extent)
+                envelope = json.loads(region.provider_envelope)
+                self._pd_owner_bridges[rank].install_destination(lease, envelope)
+                leases[component_id] = lease
+            peer_leases.append(leases)
+
+        local_owners = tuple(bridge.owner for bridge in self._pd_owner_bridges)
+        peer_owners = tuple(next(iter(leases.values())).owner for leases in peer_leases)
+        processes = tuple(bridge.process_handle for bridge in self._pd_owner_bridges)
+        agents = []
+        for rank, bridge in enumerate(self._pd_owner_bridges):
+            supervisor = OwnerSupervisor(
+                bridge.owner,
+                processes,
+                emit=lambda event: logger.error(
+                    "PD transfer recovery event: stage=%s owner=%s "
+                    "parent_event_id=%s recovery_set=%s",
+                    event.stage,
+                    event.owner,
+                    event.parent_event_id,
+                    event.recovery_set,
+                ),
+                local_owners=local_owners,
+                peer_owners=peer_owners,
+            )
+            agents.append(
+                TransferAgent(
+                    bridge.owner,
+                    bridge,
+                    poison=supervisor.poison,
+                    max_tasks=self._pd_worker_config.max_active_handoffs,
+                    max_bytes=self._pd_worker_config.max_inflight_transfer_bytes,
+                )
+            )
+        self._pd_peer_leases = tuple(peer_leases)
+        self._pd_transfer_agents = tuple(agents)
+        self._pd_peer_registration_request = request
+
+    def _next_pd_attempt_sequence(self, rank: int) -> int:
+        sequence = self._pd_attempt_sequences[rank] + 1
+        self._pd_attempt_sequences[rank] = sequence
+        return sequence
+
+    def _transfer_pd_chunk(self, request):
+        """Compatibility path: submit asynchronously, then wait for completion."""
+        import time  # noqa: PLC0415
+
+        submission = self._submit_pd_chunk(request)
+        deadline = time.monotonic() + request.timeout_seconds + 5
+        while True:
+            response = self._poll_pd_chunk(submission.job_id)
+            if response.complete:
+                from pypto_serving.serving.pd.worker_api import (  # noqa: PLC0415
+                    TransferChunkResponse,
+                )
+
+                return TransferChunkResponse(response.results)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("PD transfer job did not publish a terminal result")
+            time.sleep(0.001)
+
+    def _submit_pd_chunk(self, request):
+        from pypto_serving.model.deepseek.transfer_layout import BlockCopy  # noqa: PLC0415
+        from pypto_serving.serving.pd.worker_api import TransferSubmission  # noqa: PLC0415
+        from pypto_serving.transfer.agent import AlreadyCompletedFence  # noqa: PLC0415
+        from pypto_serving.transfer.types import TransferAttemptRef  # noqa: PLC0415
+
+        if not self._pd_peer_leases or not self._pd_transfer_agents:
+            raise RuntimeError("peer owner registry must be installed before transfer")
+        manifest = request.manifest
+        if request.destination_fingerprint != self._pd_peer_registration_request.registry_fingerprint:
+            raise ValueError("destination registry fingerprint mismatch")
+        job_id = (
+            f"{manifest.key.handoff_id}-c{manifest.chunk_id}"
+            f"-a{request.attempt_ordinal}"
+        )
+        existing = self._pd_transfer_jobs.get(job_id)
+        if existing is not None:
+            if existing["request"] != request:
+                raise ValueError("PD transfer job id was replayed with different input")
+            self._pd_transfer_jobs.move_to_end(job_id)
+            return TransferSubmission(job_id)
+        job_limit = max(32, self._pd_worker_config.max_active_handoffs * 16)
+        while len(self._pd_transfer_jobs) >= job_limit:
+            completed_id = next(
+                (
+                    known_id
+                    for known_id, known in self._pd_transfer_jobs.items()
+                    if known["response"] is not None
+                ),
+                None,
+            )
+            if completed_id is None:
+                break
+            self._pd_transfer_jobs.pop(completed_id)
+        if len(self._pd_transfer_jobs) >= job_limit:
+            raise RuntimeError("PD transfer job index reached its configured bound")
+        units_by_rank = {}
+        for unit in manifest.expected_units:
+            units_by_rank.setdefault(unit.rank_id, {})[unit.component_id] = unit
+        if set(units_by_rank) != set(manifest.copies_by_rank):
+            raise ValueError("manifest rank completion set differs from page copies")
+
+        ranks = []
+        stop_error = None
+        for rank in sorted(manifest.copies_by_rank):
+            copies = tuple(
+                BlockCopy(
+                    copy.component_id,
+                    copy.layer,
+                    copy.source_block,
+                    copy.destination_block,
+                    copy.valid_tokens,
+                )
+                for copy in manifest.copies_by_rank[rank]
+            )
+            registry = self.export_transfer_registry(
+                rank,
+                model_revision=self._pd_worker_config.model_revision,
+            )
+            actual_bytes = {
+                component_id: sum(
+                    registry.entry(component_id).block_stride_bytes
+                    for copy in copies
+                    if copy.component_id == component_id
+                )
+                for component_id in units_by_rank[rank]
+            }
+            expected_bytes = {
+                component_id: unit.nbytes
+                for component_id, unit in units_by_rank[rank].items()
+            }
+            if actual_bytes != expected_bytes:
+                raise ValueError("manifest byte accounting differs from registry lowering")
+            attempt_id = (
+                f"{manifest.key.handoff_id}-c{manifest.chunk_id}-r{rank}"
+                f"-a{request.attempt_ordinal}"
+            )
+            future = None
+            if stop_error is None and copies:
+                attempt = TransferAttemptRef(
+                    manifest.key.request_id,
+                    f"{manifest.key.handoff_id}-c{manifest.chunk_id}-r{rank}",
+                    manifest.key.handoff_id,
+                    attempt_id,
+                    manifest.key.data_generation,
+                    manifest.key.route_epoch,
+                    manifest.chunk_id,
+                    self._pd_owner_bridges[rank].owner,
+                    next(iter(self._pd_peer_leases[rank].values())).owner,
+                    registry.manifest_hash(copies, manifest.final),
+                    attempt_sequence=self._next_pd_attempt_sequence(rank),
+                )
+                task = registry.lower(
+                    attempt,
+                    copies,
+                    destination_layout_fingerprint=(
+                        self._pd_peer_registration_request.layout_fingerprint
+                    ),
+                    source_leases=self._pd_owner_leases[rank],
+                    destination_leases=self._pd_peer_leases[rank],
+                    final=manifest.final,
+                )
+                try:
+                    future = self._pd_transfer_agents[rank].submit(
+                        task,
+                        AlreadyCompletedFence(),
+                        timeout=request.timeout_seconds,
+                    )
+                except BaseException as exc:
+                    stop_error = exc
+            ranks.append(
+                {
+                    "rank": rank,
+                    "components": tuple(units_by_rank[rank]),
+                    "attempt_id": attempt_id,
+                    "future": future,
+                    "submit_error": stop_error if future is None and copies else None,
+                    "empty": not copies,
+                }
+            )
+        self._pd_transfer_jobs[job_id] = {
+            "request": request,
+            "ranks": tuple(ranks),
+            "response": None,
+        }
+        return TransferSubmission(job_id)
+
+    def _poll_pd_chunk(self, job_id):
+        from pypto_serving.serving.pd.protocol import TransferResult  # noqa: PLC0415
+        from pypto_serving.serving.pd.worker_api import TransferPollResponse  # noqa: PLC0415
+        from pypto_serving.transfer.errors import TransferFailure  # noqa: PLC0415
+        from pypto_serving.transfer.types import CompletionCertainty  # noqa: PLC0415
+
+        job = self._pd_transfer_jobs.get(job_id)
+        if job is None:
+            raise ValueError("unknown PD transfer job")
+        response = job["response"]
+        if response is not None:
+            self._pd_transfer_jobs.move_to_end(job_id)
+            return response
+        if any(
+            rank["future"] is not None and not rank["future"].done()
+            for rank in job["ranks"]
+        ):
+            return TransferPollResponse(job_id, False)
+        manifest = job["request"].manifest
+        results = []
+        for rank in job["ranks"]:
+            certainty = CompletionCertainty.COMPLETED
+            error_code = ""
+            future = rank["future"]
+            submit_error = rank["submit_error"]
+            if submit_error is not None:
+                if isinstance(submit_error, TransferFailure):
+                    certainty = submit_error.error.certainty
+                    error_code = submit_error.error.code.value
+                else:
+                    certainty = CompletionCertainty.NOT_SUBMITTED
+                    error_code = type(submit_error).__name__
+            elif future is not None:
+                try:
+                    event = future.result()
+                    certainty = event.certainty
+                    error_code = (
+                        event.error.code.value if event.error is not None else ""
+                    )
+                except BaseException as exc:
+                    # A progress/supervision exception after a task was accepted
+                    # cannot prove that the native writer never started.
+                    certainty = CompletionCertainty.UNKNOWN
+                    error_code = type(exc).__name__
+            for component_id in rank["components"]:
+                results.append(
+                    TransferResult(
+                        key=manifest.key,
+                        chunk_id=manifest.chunk_id,
+                        rank_id=rank["rank"],
+                        component_id=component_id,
+                        attempt_id=rank["attempt_id"],
+                        certainty=certainty.value,
+                        error_code=error_code,
+                    )
+                )
+        response = TransferPollResponse(job_id, True, tuple(results))
+        job["response"] = response
+        self._pd_transfer_jobs.move_to_end(job_id)
+        return response
 
     # ------------------------------------------------------------------
     # prefill
@@ -3393,11 +3948,29 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                         )
                     )
                 else:
-                    accepted.append([int(sampled[rank, row, 0].item())])
+                    token = int(sampled[rank, row, 0].item())
+                    accepted.append([token])
                     if state is not None:
                         state.verify_steps += 1
                         state.accepted_tokens += 1
                         state.committed_count += 1
+                        # A D-side adopted request intentionally has no
+                        # Prefill-local drafter cache.  Its first target Decode
+                        # is the correctness anchor; use that verified hidden
+                        # row to bootstrap proposals for the next K7 step.
+                        anchor = inputs.anchor_positions[index]
+                        rows_by_rank[rank].append(
+                            DSparkDrafterRequestRow(
+                                request_id=request_id,
+                                group=state.group,
+                                lease=state.lease,
+                                anchor=anchor,
+                                valid_count=1,
+                                token_source=token,
+                                hidden_row=inputs.verify_hidden_rows[index],
+                                decode_mode=True,
+                            )
+                        )
             self._maybe_log_acceptance()
             return accepted, rows_by_rank
 
@@ -3527,19 +4100,27 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
     def dspark_speculation_summary(self) -> dict[str, float]:
         """Aggregate speculation counters before scheduler truncation."""
         states = list(self._drafter_states.values())
-        verifies = sum(state.verify_steps for state in states)
+        verifies = self._dspark_completed_metrics["verify_steps"] + sum(
+            state.verify_steps for state in states
+        )
+        accepted = self._dspark_completed_metrics["accepted_tokens"] + sum(
+            state.accepted_tokens for state in states
+        )
         return {
-            "requests": float(len(states)),
+            "requests": self._dspark_completed_metrics["requests"] + float(len(states)),
+            "active_requests": float(len(states)),
             "verify_steps": float(verifies),
-            "proposed_drafts": float(sum(state.proposed_tokens for state in states)),
-            "matched_drafts": float(sum(state.matched_drafts for state in states)),
-            "accepted_tokens": float(sum(state.accepted_tokens for state in states)),
-            "fallback_steps": float(sum(state.fallback_steps for state in states)),
-            "mean_accepted_length": (
-                sum(state.accepted_tokens for state in states) / verifies
-            )
-            if verifies
-            else 0.0,
+            "proposed_drafts": self._dspark_completed_metrics["proposed_drafts"]
+            + float(sum(state.proposed_tokens for state in states)),
+            "matched_drafts": self._dspark_completed_metrics["matched_drafts"]
+            + float(sum(state.matched_drafts for state in states)),
+            "accepted_tokens": float(accepted),
+            "fallback_steps": self._dspark_completed_metrics["fallback_steps"]
+            + float(sum(state.fallback_steps for state in states)),
+            "drafter_lease_scrubs": self._dspark_completed_metrics[
+                "drafter_lease_scrubs"
+            ],
+            "mean_accepted_length": accepted / verifies if verifies else 0.0,
         }
 
     def _correct_dspark_seq_lens(self, batch: DecodeBatch) -> torch.Tensor:
@@ -3562,6 +4143,60 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             if state is not None and state.prompt_len > 0:
                 corrected[index] = state.committed_count + 1
         return corrected
+
+    def _initialize_pd_adopted_drafter_states(
+        self,
+        batch: DecodeBatch,
+        assignment: _DSparkGroupAssignment | None = None,
+    ) -> None:
+        """Create Decode-local K7 state for committed target-cache handoffs.
+
+        Prefill-local prompt-tail/drafter state is deliberately not transferred.
+        The first D target step therefore runs without proposals and bootstraps
+        the drafter from its verified hidden row.  Normal K7 requests still
+        require ``finalize_prefill`` to have seeded their state.
+        """
+        if not self.speculative or not batch.pd_adopted:
+            return
+        if len(batch.pd_adopted) != len(batch.request_ids):
+            raise ValueError("PD adoption requires one marker per Decode request")
+        groups = (
+            assignment.groups
+            if assignment is not None
+            else tuple(int(group) for group in batch.cache_partitions)
+        )
+        if len(groups) != len(batch.request_ids):
+            raise ValueError("PD adoption requires one cache partition per Decode request")
+        lengths = batch.seq_lens[: len(batch.request_ids)].detach().cpu().tolist()
+        for index, adopted in enumerate(batch.pd_adopted):
+            if not adopted:
+                continue
+            request_id = batch.request_ids[index]
+            group = groups[index]
+            state = self._drafter_states.get(request_id)
+            if state is None:
+                seq_len = int(lengths[index])
+                if seq_len < 1:
+                    raise ValueError("PD-adopted Decode sequence length must be positive")
+                prompt_len = seq_len - 1
+                state = self._reserve_drafter_state(
+                    request_id,
+                    group=group,
+                    prompt_len=prompt_len,
+                )
+                state.committed_count = prompt_len
+                logger.info(
+                    "Initialized K7 drafter state for PD-adopted request %s "
+                    "(group=%d, prompt_len=%d)",
+                    request_id,
+                    group,
+                    prompt_len,
+                )
+            elif state.group != group:
+                raise RuntimeError(
+                    f"PD-adopted request {request_id!r} changed cache partition "
+                    f"from {state.group} to {group}"
+                )
 
     def _decode_assignment(self, batch: DecodeBatch) -> _DSparkGroupAssignment:
         """Assign batch rows to TP groups and rank-local request slots."""
@@ -3646,6 +4281,11 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             )
 
         layout = self._compiled.layout
+        # The fused DSpark assignment consults persistent drafter leases to
+        # preserve each request's owner rank.  A PD-adopted request has no
+        # Prefill-local drafter state, so create its Decode-local lease from
+        # the scheduler-selected cache partition before computing the plan.
+        self._initialize_pd_adopted_drafter_states(batch)
         assignment = self._decode_assignment(batch)
         actual_batch = len(batch.request_ids)
         group_batch = layout.decode_local_batch * layout.tp_size
@@ -4073,6 +4713,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 f"prepared DSpark slot {plan.buffer_slot} does not match requested slot {buffer_slot}"
             )
         assignment = plan.assignment
+        self._initialize_pd_adopted_drafter_states(batch, assignment)
         task_args = self._decode_task_args[buffer_slot]
         local_batch = layout.decode_local_batch
         staged = task_args.tensors
@@ -4636,7 +5277,15 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 f"DSpark drafter leases exhausted for TP group {group} "
                 f"({DSPARK_DRAFTER_LEASES_PER_GROUP} live requests per group)"
             )
-        lease = free.pop()
+        lease = free[-1]
+        dirty_key = (group, lease)
+        if dirty_key in self._drafter_dirty_leases:
+            # Keep the lease on the free list until every rank replica has
+            # been cleared.  A failed scrub therefore cannot publish a partly
+            # sanitized lease to a new request.
+            self._clear_drafter_lease(group, lease)
+            self._drafter_dirty_leases.remove(dirty_key)
+        free.pop()
         self._drafter_lease_generations[group][lease] += 1
         state = _DSparkDraftRequestState(
             group=group,
@@ -4646,6 +5295,62 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         )
         self._drafter_states[request_id] = state
         return state
+
+    def _clear_drafter_lease(self, group: int, lease: int) -> None:
+        """Synchronously zero one reused K7 KV ring on every TP replica.
+
+        The drafter pools live for the whole process and are addressed by a
+        stable six-block lease.  PD adoption deliberately does not transfer P
+        drafter state, so the first D redraft must begin from an empty private
+        history rather than bytes retained by the previous lease owner.
+        """
+        cache = self._device_scratch.get(("drafter", "kv_caches"))
+        if cache is None:
+            raise RuntimeError("DSpark drafter KV pool is not materialized")
+        if not 0 <= group < self._compiled.layout.partitions:
+            raise ValueError("DSpark drafter group is outside the runtime topology")
+        if not 0 <= lease < DSPARK_DRAFTER_LEASES_PER_GROUP:
+            raise ValueError("DSpark drafter lease is outside the private pool")
+
+        block_nbytes = DSPARK_BLOCK_SIZE * DSPARK_HEAD_DIM * 2
+        lease_nbytes = DSPARK_DRAFTER_RING_BLOCKS * block_nbytes
+        zero = self._drafter_lease_zero
+        if zero is None or zero.numel() != lease_nbytes:
+            zero = torch.zeros(lease_nbytes, dtype=torch.uint8)
+            self._drafter_lease_zero = zero
+
+        worker = self._shared_l3_worker()
+        layer_stride = DSPARK_DRAFTER_KV_BLOCKS * block_nbytes
+        lease_offset = lease * DSPARK_DRAFTER_RING_BLOCKS * block_nbytes
+        first_rank = group * self._compiled.layout.tp_size
+        for rank in range(first_rank, first_rank + self._compiled.layout.tp_size):
+            shard = cache.shards[rank]
+            for layer in range(DSPARK_DRAFT_LAYERS):
+                worker.copy_to(
+                    shard.data_ptr,
+                    zero.data_ptr(),
+                    lease_nbytes,
+                    dst_offset=layer * layer_stride + lease_offset,
+                    worker_id=rank,
+                )
+        if os.environ.get("PYPTO_DSPARK_VERIFY_DRAFTER_SCRUB") == "1":
+            readback = torch.empty(lease_nbytes, dtype=torch.uint8)
+            for rank in range(first_rank, first_rank + self._compiled.layout.tp_size):
+                shard = cache.shards[rank]
+                for layer in range(DSPARK_DRAFT_LAYERS):
+                    worker.copy_from(
+                        readback.data_ptr(),
+                        shard.data_ptr,
+                        lease_nbytes,
+                        src_offset=layer * layer_stride + lease_offset,
+                        worker_id=rank,
+                    )
+                    if torch.count_nonzero(readback).item():
+                        raise RuntimeError(
+                            "DSpark drafter lease scrub verification found non-zero bytes "
+                            f"(group={group}, lease={lease}, rank={rank}, layer={layer})"
+                        )
+        self._dspark_completed_metrics["drafter_lease_scrubs"] += 1
 
     def _drafter_state(self, request_id: str) -> _DSparkDraftRequestState:
         state = self._drafter_states.get(request_id)
@@ -5590,6 +6295,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         for request_id in request_ids:
             state = self._drafter_states.pop(request_id, None)
             if state is not None:
+                self._dspark_completed_metrics["requests"] += 1
+                self._dspark_completed_metrics["verify_steps"] += state.verify_steps
+                self._dspark_completed_metrics["proposed_drafts"] += state.proposed_tokens
+                self._dspark_completed_metrics["matched_drafts"] += state.matched_drafts
+                self._dspark_completed_metrics["accepted_tokens"] += state.accepted_tokens
+                self._dspark_completed_metrics["fallback_steps"] += state.fallback_steps
                 if state.verify_steps:
                     logger.info(
                         "DSpark speculation finished: request=%s verifies=%d "
@@ -5604,13 +6315,30 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                         state.fallback_steps,
                     )
                 free = self._drafter_free_leases.setdefault(state.group, [])
-                free.append(state.lease)
+                if os.environ.get("PYPTO_DSPARK_DELAY_DRAFTER_LEASE_REUSE") == "1":
+                    # Diagnostic mode: consume every never-used lease in a TP
+                    # group before returning to a released address.  This
+                    # distinguishes address-local drafter state from other
+                    # group-persistent target/drafter workspaces.
+                    free.insert(0, state.lease)
+                else:
+                    free.append(state.lease)
+                self._drafter_dirty_leases.add((state.group, state.lease))
 
     def close(self) -> None:
         worker = self._l3_worker
+        close_error: BaseException | None = None
         try:
             if worker is not None:
-                worker.close()
+                try:
+                    self._close_pd_owner_services()
+                except BaseException as exc:
+                    close_error = exc
+                try:
+                    worker.close()
+                except BaseException as exc:
+                    if close_error is None:
+                        close_error = exc
         finally:
             self._l3_worker = None
             self._cache_group_num_blocks.clear()
@@ -5640,6 +6368,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             # every drafter-era reference must drop here or staging buffers,
             # weights, and per-request states outlive the model.
             self._drafter_states.clear()
+            self._drafter_dirty_leases.clear()
+            self._drafter_lease_zero = None
             for leases in self._drafter_free_leases.values():
                 leases.clear()
             self._drafter_context_staging.clear()
@@ -5669,3 +6399,39 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             self._markov_task_args = None
             with self._pending_decode_dispatch_lock:
                 self._pending_decode_dispatches.clear()
+        if close_error is not None:
+            raise close_error
+
+    def _close_pd_owner_services(self) -> None:
+        """Stop transfer threads and unregister arenas before allocator teardown."""
+        if not self._pd_owner_bridges:
+            return
+        close_error: BaseException | None = None
+        try:
+            for agent in self._pd_transfer_agents:
+                try:
+                    agent.close()
+                except BaseException as exc:
+                    if close_error is None:
+                        close_error = exc
+            for bridge in self._pd_owner_bridges:
+                try:
+                    bridge.release()
+                except BaseException as exc:
+                    if close_error is None:
+                        close_error = exc
+                try:
+                    bridge.close()
+                except BaseException as exc:
+                    if close_error is None:
+                        close_error = exc
+        finally:
+            self._pd_transfer_agents = ()
+            self._pd_transfer_jobs = OrderedDict()
+            self._pd_peer_leases = ()
+            self._pd_peer_registration_request = None
+            self._pd_owner_envelopes = ()
+            self._pd_owner_leases = ()
+            self._pd_owner_bridges = ()
+        if close_error is not None:
+            raise close_error

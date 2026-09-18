@@ -1,0 +1,8 @@
+[
+  {
+    "name": "forbidden-city-128",
+    "payload": {"model": "dsv4-flash-dspark-w8a8", "prompt": "紫禁城", "max_tokens": 128, "temperature": 0.0, "top_p": 1.0, "stream": false},
+    "expected_completion_tokens": 128,
+    "expected_finish_reason": "length"
+  }
+]

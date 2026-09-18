@@ -30,6 +30,7 @@ class RequestStatus(Enum):
     FINISHED_LENGTH = auto()
     FINISHED_STOP = auto()
     FINISHED_ABORTED = auto()
+    FINISHED_HANDOFF = auto()
 
     @property
     def is_finished(self) -> bool:
@@ -38,6 +39,7 @@ class RequestStatus(Enum):
             RequestStatus.FINISHED_LENGTH,
             RequestStatus.FINISHED_STOP,
             RequestStatus.FINISHED_ABORTED,
+            RequestStatus.FINISHED_HANDOFF,
         )
 
 
@@ -59,6 +61,8 @@ class SchedulerConfig:
     # Async (pipelined) scheduling: schedule step N+1 before step N's sampled
     # token returns, advancing request state optimistically via placeholders.
     async_scheduling: bool = False
+    # P role stops after terminal Prefill until D commits the handoff.
+    prefill_handoff: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -146,6 +150,9 @@ class Request:
     # prefill result.  This is a per-request barrier, so unrelated ready requests
     # can continue to use the depth-2 pipeline.
     terminal_prefill_in_flight: bool = False
+    handoff_pending: bool = False
+    chunk_transfer_pending: bool = False
+    pd_reservation_id: str = ""
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -206,6 +213,7 @@ class RequestOutput:
     new_token_id: int | None = None
     finished: bool = False
     finish_reason: str = ""
+    handoff_ready: bool = False
 
 
 class Scheduler:
@@ -271,6 +279,91 @@ class Scheduler:
         self.waiting.append(request)
         self.requests[request.request_id] = request
 
+    def adopt_handoff(
+        self,
+        *,
+        reservation_id: str,
+        request_id: str,
+        prompt_token_ids: list[int],
+        first_token: int,
+        max_new_tokens: int,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int | None = None,
+        seed: int | None = None,
+        stop_strings: tuple[str, ...] = (),
+        eos_token_id: int | None = None,
+    ) -> tuple[Request, RequestOutput]:
+        """Adopt D-owned cache without entering WAITING/Prefill or reallocating it."""
+        if request_id in self.requests:
+            raise ValueError(f"request {request_id!r} already exists in the scheduler")
+        reservation = self.kv_cache_manager.group_cache_reservation(reservation_id)
+        if reservation is None or reservation.request_id != request_id:
+            raise ValueError("Decode adoption does not match the cache reservation")
+        if len(prompt_token_ids) + max_new_tokens > reservation.token_capacity:
+            raise ValueError("Decode request exceeds its D-first reservation capacity")
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive")
+        reservation = self.kv_cache_manager.adopt_group_cache(reservation_id)
+        request = Request(
+            request_id=request_id,
+            prompt_token_ids=list(prompt_token_ids),
+            max_new_tokens=max_new_tokens,
+            status=RequestStatus.RUNNING,
+            num_computed_tokens=len(prompt_token_ids),
+            output_token_ids=[int(first_token)],
+            stop_strings=tuple(stop_strings),
+            eos_token_id=eos_token_id,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+            allocated_group_block_ids={
+                name: list(block_ids)
+                for name, block_ids in reservation.block_ids_by_group.items()
+            },
+            cache_partition=reservation.partition,
+            pd_reservation_id=reservation_id,
+        )
+        self.requests[request_id] = request
+        self.running.append(request)
+        output = RequestOutput(request_id=request_id, new_token_id=int(first_token))
+        finish = self._check_finish(request)
+        if finish is not None:
+            request.status = finish
+            output.finished = True
+            output.finish_reason = finish.name
+            self._free_request_blocks(request)
+            self.running.remove(request)
+        return request, output
+
+    def complete_prefill_handoff(self, request_id: str) -> None:
+        """Release P cache only after the matching D READY acknowledgement."""
+        request = self.requests.get(request_id)
+        if request is None or not request.handoff_pending:
+            raise ValueError("request has no pending Prefill handoff")
+        request.handoff_pending = False
+        request.chunk_transfer_pending = False
+        request.status = RequestStatus.FINISHED_HANDOFF
+        self._free_request_blocks(request)
+        self.running = [item for item in self.running if item.request_id != request_id]
+
+    def mark_prefill_chunk_transfer_pending(self, request_id: str) -> None:
+        request = self.requests.get(request_id)
+        if request is None or not self.config.prefill_handoff:
+            raise ValueError("request is not owned by a Prefill handoff scheduler")
+        if request.chunk_transfer_pending:
+            raise RuntimeError("request already has a pending chunk transfer")
+        request.chunk_transfer_pending = True
+
+    def complete_prefill_chunk_transfer(self, request_id: str) -> None:
+        request = self.requests.get(request_id)
+        if request is None or not request.chunk_transfer_pending:
+            raise ValueError("request has no pending chunk transfer")
+        if request.handoff_pending:
+            raise RuntimeError("terminal Prefill remains pinned until D READY acknowledgement")
+        request.chunk_transfer_pending = False
+
     def abort_request(self, request_id: str) -> None:
         request = self.requests.get(request_id)
         if request is None:
@@ -309,6 +402,12 @@ class Scheduler:
             if request.status is RequestStatus.PREEMPTED:
                 continue
             if request.terminal_prefill_in_flight:
+                running_to_keep.append(request)
+                continue
+            if request.handoff_pending:
+                running_to_keep.append(request)
+                continue
+            if request.chunk_transfer_pending:
                 running_to_keep.append(request)
                 continue
             if grouped_phase is not None and request.is_prefill != (grouped_phase == "prefill"):
@@ -623,6 +722,8 @@ class Scheduler:
         has_running_prefill = any(
             request.status is not RequestStatus.PREEMPTED
             and not request.terminal_prefill_in_flight
+            and not request.handoff_pending
+            and not request.chunk_transfer_pending
             and request.is_prefill
             and request.num_new_tokens_needed > 0
             for request in self.running
@@ -634,6 +735,8 @@ class Scheduler:
         has_decode = any(
             request.status is not RequestStatus.PREEMPTED
             and not request.terminal_prefill_in_flight
+            and not request.handoff_pending
+            and not request.chunk_transfer_pending
             and not request.is_prefill
             and request.num_new_tokens_needed > 0
             for request in self.running
@@ -791,7 +894,15 @@ class Scheduler:
                     continue
                 for token_id in token_ids:
                     request.output_token_ids.append(token_id)
-                    outputs.append(RequestOutput(request_id=request.request_id, new_token_id=token_id))
+                    output = RequestOutput(
+                        request_id=request.request_id,
+                        new_token_id=token_id,
+                        handoff_ready=self.config.prefill_handoff,
+                    )
+                    outputs.append(output)
+                    if self.config.prefill_handoff:
+                        request.handoff_pending = True
+                        break
                     if self._check_finish(request) is not None:
                         break
             else:
@@ -808,6 +919,8 @@ class Scheduler:
         finished_ids: list[str] = []
         for request in self.running:
             if request.status.is_finished:
+                continue
+            if request.handoff_pending:
                 continue
             finish_reason = self._check_finish(request)
             if finish_reason is not None:
@@ -992,7 +1105,11 @@ class Scheduler:
         """
         if not self.running:
             return None
-        candidates = [r for r in self.running if r.request_id != exclude.request_id]
+        candidates = [
+            r
+            for r in self.running
+            if r.request_id != exclude.request_id and not r.handoff_pending
+        ]
         if self.kv_cache_manager.has_groups and exclude.cache_partition is not None:
             same_partition = [
                 request
@@ -1043,7 +1160,11 @@ class Scheduler:
         request.cached_block_ids = []
         request.allocated_block_ids = []
         if request.allocated_group_block_ids:
-            self.kv_cache_manager.release_all_group_requests(request.request_id)
+            if request.pd_reservation_id:
+                self.kv_cache_manager.release_group_cache(request.pd_reservation_id)
+                request.pd_reservation_id = ""
+            else:
+                self.kv_cache_manager.release_all_group_requests(request.request_id)
             request.allocated_group_block_ids = {}
         request.cache_partition = None
         request.num_group_blocks_cached = {}

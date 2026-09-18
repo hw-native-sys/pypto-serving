@@ -52,6 +52,9 @@ class NewRequestData(msgspec.Struct):
     top_p: float
     top_k: int | None
     seed: int | None = None
+    # The target cache was adopted from a committed PD handoff.  This is
+    # request metadata only; no device address or provider envelope crosses IPC.
+    pd_adopted: bool = False
 
 
 class PrefillRequest(msgspec.Struct):
@@ -123,8 +126,16 @@ class ProfileCommand(msgspec.Struct, tag="profile"):
     active: bool
 
 
+class PDWorkerCommand(msgspec.Struct, tag="pd_control"):
+    """Address-free control request to the worker that owns cache/device state."""
+
+    command_id: int
+    operation: str
+    payload: bytes = b""
+
+
 # Union used for the decoder — tag field ("type") discriminates.
-Command = Union[StepCommand, ShutdownCommand, ProfileCommand]
+Command = Union[StepCommand, ShutdownCommand, ProfileCommand, PDWorkerCommand]
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +167,14 @@ class ProfileResult(msgspec.Struct):
     error: str | None = None
 
 
+class PDWorkerResult(msgspec.Struct):
+    """Ordered result for one :class:`PDWorkerCommand`."""
+
+    command_id: int
+    payload: bytes = b""
+    error: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Codec — thin wrappers so call sites are transport-agnostic
 # ---------------------------------------------------------------------------
@@ -166,6 +185,8 @@ _result_encoder: msgspec.msgpack.Encoder = msgspec.msgpack.Encoder()
 _result_decoder: msgspec.msgpack.Decoder = msgspec.msgpack.Decoder(StepResult)
 _profile_result_encoder: msgspec.msgpack.Encoder = msgspec.msgpack.Encoder()
 _profile_result_decoder: msgspec.msgpack.Decoder = msgspec.msgpack.Decoder(ProfileResult)
+_pd_result_encoder: msgspec.msgpack.Encoder = msgspec.msgpack.Encoder()
+_pd_result_decoder: msgspec.msgpack.Decoder = msgspec.msgpack.Decoder(PDWorkerResult)
 
 
 def encode_command(cmd: Command) -> bytes:
@@ -196,3 +217,13 @@ def encode_profile_result(result: ProfileResult) -> bytes:
 def decode_profile_result(data: bytes) -> ProfileResult:
     """Decode a profile-control acknowledgement."""
     return _profile_result_decoder.decode(data)
+
+
+def encode_pd_result(result: PDWorkerResult) -> bytes:
+    """Encode one worker-local PD control result."""
+    return _pd_result_encoder.encode(result)
+
+
+def decode_pd_result(data: bytes) -> PDWorkerResult:
+    """Decode one worker-local PD control result."""
+    return _pd_result_decoder.decode(data)

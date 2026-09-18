@@ -891,6 +891,93 @@ def test_fused_reclaim_reports_consumed_drafts(monkeypatch, anchor, drafts, acce
     assert state.committed_count == anchor + accepted
 
 
+def test_reused_drafter_lease_is_scrubbed_before_new_request(monkeypatch) -> None:
+    """A free-list lease cannot expose one request's K7 history to another."""
+    runner = _runner(speculative=True)
+    cleared: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        runner,
+        "_clear_drafter_lease",
+        lambda group, lease: cleared.append((group, lease)),
+    )
+
+    first = runner._reserve_drafter_state("first", group=1, prompt_len=257)
+    assert cleared == []  # the persistent pool is zero-initialized at startup
+    runner.release_finished_requests(["first"])
+
+    second = runner._reserve_drafter_state("second", group=1, prompt_len=3)
+    assert second.lease == first.lease
+    assert cleared == [(1, first.lease)]
+    assert (1, first.lease) not in runner._drafter_dirty_leases
+
+
+def test_drafter_lease_scrub_covers_every_layer_and_tp_replica(monkeypatch) -> None:
+    from pypto_serving.model.deepseek_dspark.npu_runner import (
+        DSPARK_BLOCK_SIZE,
+        DSPARK_DRAFTER_KV_BLOCKS,
+        DSPARK_DRAFTER_RING_BLOCKS,
+        DSPARK_DRAFT_LAYERS,
+        DSPARK_HEAD_DIM,
+    )
+
+    runner = _runner(speculative=True)
+    runner._device_scratch[("drafter", "kv_caches")] = SimpleNamespace(
+        shards=[SimpleNamespace(data_ptr=10_000 + rank) for rank in range(16)]
+    )
+    copies: list[tuple[int, int, int, int, int]] = []
+
+    class Worker:
+        def copy_to(
+            self,
+            destination,
+            source,
+            nbytes,
+            *,
+            dst_offset,
+            worker_id,
+        ) -> None:
+            assert source == runner._drafter_lease_zero.data_ptr()
+            copies.append((destination, nbytes, dst_offset, worker_id, source))
+
+    monkeypatch.setattr(runner, "_shared_l3_worker", lambda: Worker())
+    runner._clear_drafter_lease(group=2, lease=5)
+
+    block_nbytes = DSPARK_BLOCK_SIZE * DSPARK_HEAD_DIM * 2
+    lease_nbytes = DSPARK_DRAFTER_RING_BLOCKS * block_nbytes
+    layer_stride = DSPARK_DRAFTER_KV_BLOCKS * block_nbytes
+    lease_offset = 5 * lease_nbytes
+    assert len(copies) == runner._compiled.layout.tp_size * DSPARK_DRAFT_LAYERS
+    assert {(copy[3], copy[2]) for copy in copies} == {
+        (rank, layer * layer_stride + lease_offset)
+        for rank in range(8, 12)
+        for layer in range(DSPARK_DRAFT_LAYERS)
+    }
+    assert {copy[1] for copy in copies} == {lease_nbytes}
+    assert runner.dspark_speculation_summary()["drafter_lease_scrubs"] == 1.0
+
+
+def test_drafter_lease_scrub_optional_readback_rejects_stale_bytes(monkeypatch) -> None:
+    runner = _runner(speculative=True)
+    runner._device_scratch[("drafter", "kv_caches")] = SimpleNamespace(
+        shards=[SimpleNamespace(data_ptr=10_000 + rank) for rank in range(16)]
+    )
+
+    class Worker:
+        def copy_to(self, *args, **kwargs) -> None:
+            return None
+
+        def copy_from(self, destination, source, nbytes, **kwargs) -> None:
+            del source, nbytes, kwargs
+            torch.frombuffer(
+                (ctypes.c_ubyte * 1).from_address(destination), dtype=torch.uint8
+            )[0] = 1
+
+    monkeypatch.setenv("PYPTO_DSPARK_VERIFY_DRAFTER_SCRUB", "1")
+    monkeypatch.setattr(runner, "_shared_l3_worker", lambda: Worker())
+    with pytest.raises(RuntimeError, match="non-zero bytes"):
+        runner._clear_drafter_lease(group=0, lease=0)
+
+
 def test_run_decode_accepts_and_redrafts(monkeypatch) -> None:
     """Acceptance drives state updates and the next drafter context rows."""
     runner = _runner(speculative=True)
@@ -1005,3 +1092,89 @@ def test_run_decode_accepts_and_redrafts(monkeypatch) -> None:
     runner._compiled.num_speculative_tokens = 0
     plain = runner.run_decode(SimpleNamespace(), decode)
     assert plain.num_draft_tokens is None
+
+
+def test_pd_adopted_decode_bootstraps_k7_after_one_target_step(monkeypatch) -> None:
+    """D creates local drafter state without importing P request-local state."""
+    runner = _runner(speculative=True)
+    runner._compiled.decode = object()
+    runner._l3_shared_buffers_ready = True
+    decode = DecodeBatch(
+        request_ids=["pd-adopted"],
+        token_ids=torch.tensor([[10]], dtype=torch.long),
+        hidden_states=None,
+        # 64 prompt tokens plus P's first sampled token.
+        seq_lens=torch.tensor([65], dtype=torch.int32),
+        block_ids_by_group=_block_rows(1),
+        cache_partitions=[0],
+        pd_adopted=[True],
+        allow_device_greedy_sampling=True,
+    )
+
+    monkeypatch.setattr(runner, "_run_l3", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        runner,
+        "_alloc_zeroed_stacked_tensor",
+        lambda name, shape, dtype, scope=None: torch.zeros(shape, dtype=dtype),
+    )
+    monkeypatch.setattr(runner, "_static_lm_head_weight_tensor", lambda: torch.zeros(1))
+    monkeypatch.setattr(
+        runner, "_materialize_embedding_device_weight", lambda: torch.zeros(1)
+    )
+    runner._stacked_host_weights = {
+        name: torch.zeros(1) for name in task_args_module._DECODE_TENSOR_ORDER
+    }
+    monkeypatch.setattr(runner, "_static_weight", lambda name: torch.zeros(1))
+    monkeypatch.setattr(
+        runner,
+        "_device_cache_values",
+        lambda: __import__("collections").defaultdict(lambda: torch.zeros(1)),
+    )
+    runner._decode_task_args[0].tensors["sampled_ids"][0, 0, 0] = 321
+
+    redraft_rows: list[list[DSparkDrafterRequestRow]] = []
+
+    def capture_redraft(rows_by_rank) -> None:
+        redraft_rows.extend(rows_by_rank)
+        runner._drafter_state("pd-adopted").pending_draft_tokens = list(range(7))
+
+    monkeypatch.setattr(runner, "_run_decode_drafter", capture_redraft)
+
+    result = runner.run_decode(SimpleNamespace(), decode)
+
+    state = runner._drafter_state("pd-adopted")
+    assert result.accepted_token_ids == [[321]]
+    assert state.prompt_len == 64
+    assert state.committed_count == 65
+    assert state.fallback_steps == 1
+    assert state.pending_draft_tokens == list(range(7))
+    row = next(row for rows in redraft_rows for row in rows)
+    assert row.request_id == "pd-adopted"
+    assert row.anchor == 64
+    assert row.valid_count == 1
+    assert row.token_source == 321
+
+
+def test_non_pd_k7_decode_still_requires_prefill_seed() -> None:
+    runner = _runner(speculative=True)
+    decode = DecodeBatch(
+        request_ids=["not-adopted"],
+        token_ids=torch.tensor([[10]], dtype=torch.long),
+        hidden_states=None,
+        seq_lens=torch.tensor([65], dtype=torch.int32),
+        block_ids_by_group=_block_rows(1),
+        cache_partitions=[0],
+        allow_device_greedy_sampling=True,
+    )
+
+    with pytest.raises(RuntimeError, match="no drafter state"):
+        runner.prepare_decode_inputs(SimpleNamespace(), decode)
+
+
+def test_pd_attempt_sequence_is_monotonic_per_owner_across_chunks() -> None:
+    runner = _runner()
+
+    assert runner._next_pd_attempt_sequence(0) == 1
+    assert runner._next_pd_attempt_sequence(0) == 2
+    assert runner._next_pd_attempt_sequence(1) == 1
+    assert runner._next_pd_attempt_sequence(0) == 3

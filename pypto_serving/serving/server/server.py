@@ -12,14 +12,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import hmac
 import json
 import logging
 import time
 import uuid
+from collections.abc import Sequence
 from typing import Literal
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput
+from pypto_serving.serving.pd.metrics import token_ids_sha256
 from pypto_serving.serving.reasoning import OutputParserSpec, ToolCallDelta, supports_tool_calls
 from pypto_serving.tools.profile import (
     get_profiler,
@@ -35,7 +38,7 @@ logger = logging.getLogger(__name__)
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 try:
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse, Response, StreamingResponse
     from pydantic import BaseModel, Field, model_serializer
 except ImportError as e:
@@ -48,7 +51,7 @@ except ImportError as e:
 
 class CompletionRequest(BaseModel):
     model: str = ""
-    prompt: str = ""
+    prompt: str | list[int] = ""
     # Sampling fields are optional: omitted fields fall back to the server's
     # default GenerateConfig (from --generate-config, else GenerateConfig()).
     max_tokens: int | None = None
@@ -205,8 +208,37 @@ class ServingServer:
                 content={"object": "error", "message": str(exc)},
             )
 
+        from pypto_serving.serving.pd.admission import (  # noqa: PLC0415
+            PDBackpressureError,
+        )
+
+        @self.app.exception_handler(PDBackpressureError)
+        async def _pd_backpressure_handler(  # noqa: ANN001
+            request,
+            exc: PDBackpressureError,
+        ) -> JSONResponse:
+            return JSONResponse(
+                status_code=503,
+                headers={"Retry-After": "1"},
+                content={"object": "error", "message": str(exc)},
+            )
+
+        @self.app.exception_handler(PermissionError)
+        async def _permission_error_handler(  # noqa: ANN001
+            request,
+            exc: PermissionError,
+        ) -> JSONResponse:
+            return JSONResponse(
+                status_code=401,
+                content={"object": "error", "message": str(exc)},
+            )
+
     def _register_routes(self) -> None:
         self.app.add_api_route("/health", self._health, methods=["GET"])
+        pd_config = getattr(getattr(self.engine, "config", None), "pd_config", None)
+        if pd_config is not None and getattr(pd_config, "external_router", False):
+            self._register_internal_pd_routes()
+            return
         self.app.add_api_route("/v1/models", self._list_models, methods=["GET"])
         self.app.add_api_route("/v1/completions", self._completions, methods=["POST"], response_model=None)
         self.app.add_api_route("/v1/chat/completions", self._chat_completions, methods=["POST"], response_model=None)
@@ -217,8 +249,251 @@ class ServingServer:
             self.app.add_api_route("/start_profile", self._start_profile, methods=["POST"])
             self.app.add_api_route("/stop_profile", self._stop_profile, methods=["POST"])
 
+    def _register_internal_pd_routes(self) -> None:
+        self.app.add_api_route(
+            "/internal/pd/descriptor",
+            self._pd_descriptor,
+            methods=["GET"],
+        )
+        self.app.add_api_route(
+            "/internal/pd/capacity",
+            self._pd_capacity,
+            methods=["GET"],
+        )
+        self.app.add_api_route(
+            "/internal/pd/metrics",
+            self._pd_metrics,
+            methods=["GET"],
+        )
+        self.app.add_api_route(
+            "/internal/pd/prepare",
+            self._pd_prepare,
+            methods=["POST"],
+        )
+        self.app.add_api_route(
+            "/internal/pd/reserve",
+            self._pd_reserve,
+            methods=["POST"],
+        )
+        self.app.add_api_route(
+            "/internal/pd/authorize",
+            self._pd_authorize,
+            methods=["POST"],
+        )
+        self.app.add_api_route(
+            "/internal/pd/execute",
+            self._pd_execute,
+            methods=["POST"],
+        )
+        self.app.add_api_route(
+            "/internal/pd/await-decode",
+            self._pd_await_decode,
+            methods=["POST"],
+        )
+        self.app.add_api_route(
+            "/internal/pd/query",
+            self._pd_query,
+            methods=["POST"],
+        )
+        self.app.add_api_route(
+            "/internal/pd/abort",
+            self._pd_abort,
+            methods=["POST"],
+        )
+        if get_profiler().enabled:
+            self.app.add_api_route(
+                "/internal/pd/start-profile",
+                self._pd_start_profile,
+                methods=["POST"],
+            )
+            self.app.add_api_route(
+                "/internal/pd/stop-profile",
+                self._pd_stop_profile,
+                methods=["POST"],
+            )
+
+    def _authenticate_pd_request(self, request: Request) -> None:
+        from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415
+            INTERNAL_AUTH_HEADER,
+        )
+
+        supplied = request.headers.get(INTERNAL_AUTH_HEADER, "")
+        expected = self.engine.config.pd_config.auth_secret().decode()
+        if not supplied or not hmac.compare_digest(supplied, expected):
+            raise PermissionError("invalid PD internal API credential")
+
+    async def _pd_descriptor(self, request: Request) -> Response:
+        from pypto_serving.serving.pd.http_api import encode_json  # noqa: PLC0415
+
+        self._authenticate_pd_request(request)
+        return Response(
+            encode_json(self.engine.pd_service.descriptor()),
+            media_type="application/json",
+        )
+
+    async def _pd_capacity(self, request: Request) -> Response:
+        from pypto_serving.serving.pd.http_api import encode_json  # noqa: PLC0415
+
+        self._authenticate_pd_request(request)
+        return Response(
+            encode_json(self.engine.pd_service.capacity_snapshot()),
+            media_type="application/json",
+        )
+
+    async def _pd_metrics(self, request: Request) -> JSONResponse:
+        self._authenticate_pd_request(request)
+        return JSONResponse(await self.engine.pd_service.metrics_snapshot())
+
+    async def _pd_start_profile(self, request: Request) -> Response:
+        self._authenticate_pd_request(request)
+        return await self._start_profile()
+
+    async def _pd_stop_profile(self, request: Request) -> Response:
+        self._authenticate_pd_request(request)
+        return await self._stop_profile()
+
+    async def _pd_prepare(self, request: Request) -> Response:
+        from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415
+            PrepareRequestHTTP,
+            decode_json,
+            encode_json,
+        )
+
+        self._authenticate_pd_request(request)
+        payload = decode_json(await request.body(), PrepareRequestHTTP)
+        if payload.request_kind == "completion":
+            public = CompletionRequest.model_validate_json(payload.request_json)
+            prompt, prompt_token_ids = self._completion_prompt(public.prompt)
+            if prompt_token_ids is None:
+                prompt_token_ids = tuple(
+                    int(token) for token in self.engine._tokenize_prompt(prompt)
+                )
+            config = dataclasses.replace(
+                self._resolve_generate_config(public),
+                ignore_eos=True,
+            )
+        elif payload.request_kind == "chat":
+            public = ChatCompletionRequest.model_validate_json(payload.request_json)
+            prompt = self._apply_chat_template(
+                public.messages,
+                public.chat_template_kwargs,
+                reasoning_effort=public.reasoning_effort,
+            )
+            config = dataclasses.replace(
+                self._resolve_generate_config(public),
+                ignore_eos=self.generate_config.ignore_eos,
+            )
+        else:
+            raise ValueError("unsupported PD public request kind")
+        prepared = self.engine.pd_service.prepare_request(
+            payload.request_id,
+            prompt,
+            config,
+            prompt_token_ids,
+        )
+        return Response(encode_json(prepared), media_type="application/json")
+
+    async def _pd_reserve(self, request: Request) -> Response:
+        from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415
+            ReservePlacementHTTP,
+            decode_json,
+            encode_json,
+        )
+
+        self._authenticate_pd_request(request)
+        payload = decode_json(await request.body(), ReservePlacementHTTP)
+        reservation = self.engine.pd_service.reserve_placement(payload)
+        return Response(encode_json(reservation), media_type="application/json")
+
+    async def _pd_authorize(self, request: Request) -> Response:
+        from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415
+            AuthorizeRouteHTTP,
+            decode_json,
+            encode_json,
+        )
+
+        self._authenticate_pd_request(request)
+        payload = decode_json(await request.body(), AuthorizeRouteHTTP)
+        self.engine.pd_service.authorize_route(payload)
+        return Response(encode_json({"status": "AUTHORIZED"}), media_type="application/json")
+
+    async def _pd_execute(self, request: Request) -> Response:
+        from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415
+            ExecutePrefillHTTP,
+            decode_json,
+            encode_json,
+        )
+
+        self._authenticate_pd_request(request)
+        payload = decode_json(await request.body(), ExecutePrefillHTTP)
+        result = await self.engine.pd_service.execute_prefill(payload)
+        return Response(encode_json(result), media_type="application/json")
+
+    async def _pd_await_decode(self, request: Request) -> StreamingResponse:
+        from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415
+            HandoffHTTP,
+            decode_json,
+            encode_json,
+        )
+
+        self._authenticate_pd_request(request)
+        payload = decode_json(await request.body(), HandoffHTTP)
+        stream = self.engine.pd_service.open_decode_stream(payload.key)
+
+        async def ndjson():
+            async for frame in stream:
+                yield encode_json(frame) + b"\n"
+
+        return StreamingResponse(ndjson(), media_type="application/x-ndjson")
+
+    async def _pd_query(self, request: Request) -> Response:
+        from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415
+            HandoffHTTP,
+            decode_json,
+            encode_json,
+        )
+
+        self._authenticate_pd_request(request)
+        payload = decode_json(await request.body(), HandoffHTTP)
+        return Response(
+            encode_json(self.engine.pd_service.query_handoff(payload.key)),
+            media_type="application/json",
+        )
+
+    async def _pd_abort(self, request: Request) -> Response:
+        from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415
+            AbortHandoffHTTP,
+            decode_json,
+            encode_json,
+        )
+
+        self._authenticate_pd_request(request)
+        payload = decode_json(await request.body(), AbortHandoffHTTP)
+        status = await self.engine.pd_service.abort_handoff(payload.key, payload.reason)
+        return Response(encode_json(status), media_type="application/json")
+
     async def _health(self) -> JSONResponse:
-        return JSONResponse({"status": "ok"})
+        if getattr(self.engine, "pd_health_error", ""):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "error",
+                    "reason": "PD_RECOVERY_REQUIRED",
+                },
+            )
+        content = {"status": "ok"}
+        pd_config = getattr(getattr(self.engine, "config", None), "pd_config", None)
+        if pd_config is not None and getattr(pd_config, "enabled", False):
+            content.update(
+                {
+                    "run_id": pd_config.run_id,
+                    "node_id": pd_config.node_id,
+                    "role": pd_config.role.value,
+                    "generation": pd_config.generation,
+                    "control_incarnation": pd_config.control_incarnation,
+                }
+            )
+        return JSONResponse(content)
 
     async def _list_models(self) -> JSONResponse:
         return JSONResponse({
@@ -304,6 +579,7 @@ class ServingServer:
     async def _completions(self, request: CompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"cmpl-{uuid.uuid4().hex[:8]}"
         config = dataclasses.replace(self._resolve_generate_config(request), ignore_eos=True)
+        prompt, prompt_token_ids = self._completion_prompt(request.prompt)
 
         with profile_span(
             "http.completions",
@@ -312,17 +588,30 @@ class ServingServer:
         ):
             if request.stream:
                 return StreamingResponse(
-                    self._stream_completion(request_id, request.prompt, config, request.model or self.model_id),
+                    self._stream_completion(
+                        request_id,
+                        prompt,
+                        config,
+                        request.model or self.model_id,
+                        prompt_token_ids=prompt_token_ids,
+                    ),
                     media_type="text/event-stream",
                 )
 
             full_text = ""
             finish_reason = ""
             usage = None
-            async for output in self.engine.add_request(request_id, request.prompt, config):
+            final_token_ids: tuple[int, ...] = ()
+            async for output in self.engine.add_request(
+                request_id,
+                prompt,
+                config,
+                prompt_token_ids=prompt_token_ids,
+            ):
                 if output.text:
                     full_text = output.text
                 if output.finished:
+                    final_token_ids = output.token_ids
                     finish_reason = self._map_finish_reason(output.finish_reason)
                     usage = ResponseUsage(
                         prompt_tokens=output.prompt_tokens,
@@ -337,7 +626,12 @@ class ServingServer:
                 choices=[CompletionChoice(text=full_text, finish_reason=finish_reason)],
                 usage=usage,
             )
-            return JSONResponse(response.model_dump())
+            return JSONResponse(
+                response.model_dump(),
+                headers={
+                    "x-pypto-token-ids-sha256": token_ids_sha256(final_token_ids)
+                },
+            )
 
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
@@ -379,6 +673,7 @@ class ServingServer:
             tool_calls = ()
             finish_reason = ""
             usage = None
+            final_token_ids: tuple[int, ...] = ()
             async for output in self.engine.add_request(
                 request_id,
                 prompt,
@@ -390,6 +685,7 @@ class ServingServer:
                 if output.reasoning:
                     full_reasoning = output.reasoning
                 if output.finished:
+                    final_token_ids = output.token_ids
                     finish_reason = self._chat_finish_reason(output)
                     tool_calls = output.tool_calls if request.parallel_tool_calls else output.tool_calls[:1]
                     usage = ResponseUsage(
@@ -417,14 +713,30 @@ class ServingServer:
                 )],
                 usage=usage,
             )
-            return JSONResponse(response.model_dump())
+            return JSONResponse(
+                response.model_dump(),
+                headers={
+                    "x-pypto-token-ids-sha256": token_ids_sha256(final_token_ids)
+                },
+            )
 
     async def _stream_completion(
-        self, request_id: str, prompt: str, config: GenerateConfig, model: str
+        self,
+        request_id: str,
+        prompt: str,
+        config: GenerateConfig,
+        model: str,
+        *,
+        prompt_token_ids: Sequence[int] | None = None,
     ):
         with profile_span("http.stream_completion", cat="request", args={"request_id": request_id}):
             prev_text = ""
-            async for output in self.engine.add_request(request_id, prompt, config):
+            async for output in self.engine.add_request(
+                request_id,
+                prompt,
+                config,
+                prompt_token_ids=prompt_token_ids,
+            ):
                 delta = output.text[len(prev_text):] if output.text else ""
                 prev_text = output.text or prev_text
                 finish_reason = self._map_finish_reason(output.finish_reason) if output.finished else None
@@ -460,6 +772,17 @@ class ServingServer:
                     )
                     yield "data: [DONE]\n\n"
                     break
+
+    def _completion_prompt(
+        self,
+        prompt: str | list[int],
+    ) -> tuple[str, tuple[int, ...] | None]:
+        if isinstance(prompt, str):
+            return prompt, None
+        tokens = tuple(prompt)
+        if not tokens or any(type(token) is not int or token < 0 for token in tokens):
+            raise ValueError("Prompt token IDs must be nonempty non-negative integers.")
+        return "", tokens
 
     async def _stream_chat_completion(
         self,

@@ -38,15 +38,18 @@ from pypto_serving.serving.sched.scheduler import (
     SchedulerConfig,
     SchedulerOutput,
 )
+from pypto_serving.serving.pd.worker_api import MAX_WORKER_PD_PAYLOAD_BYTES
 from pypto_serving.serving.server.ipc import (
     PLACEHOLDER_TOKEN,
     DecodeRequest,
     NewRequestData,
+    PDWorkerCommand,
     PrefillRequest,
     ProfileCommand,
     ShutdownCommand,
     StepCommand,
     decode_profile_result,
+    decode_pd_result,
     decode_result,
     encode_command,
 )
@@ -95,12 +98,46 @@ class EngineConfig:
     # are supported: the scheduler optimistically reserves the upper bound of
     # tokens per step and subtracts the shortfall once the worker replies.
     async_scheduling: bool | None = None
+    # Fixed 1P1D configuration. ``None`` preserves the exact legacy path.
+    pd_config: object | None = None
 
     def resolve_async_scheduling(self) -> bool:
         """Resolve the async-scheduling flag (default on for all executors)."""
         if self.async_scheduling is not None:
             return self.async_scheduling
         return True
+
+    def validate_pd(self) -> None:
+        """Reject configurations that violate the first-version PD contract."""
+        from pypto_serving.serving.pd.config import (  # noqa: PLC0415
+            PD_DSPARK_SPECULATIVE_TOKENS,
+            PDRole,
+        )
+
+        config = self.pd_config
+        if config is None or not getattr(config, "enabled", False):
+            return
+        if self.executor_cls != "PyptoDeepSeekV4DSparkExecutor":
+            raise ValueError("the first PD version supports the DeepSeek V4 DSpark executor only")
+        if self.enable_prefix_cache:
+            raise ValueError("the first PD version requires prefix caching to be disabled")
+        if self.resolve_async_scheduling():
+            raise ValueError("the first PD version requires async scheduling to be disabled")
+        runtime = self.runtime_config or RuntimeConfig()
+        expected_local_tokens = (
+            0 if config.role is PDRole.PREFILL else PD_DSPARK_SPECULATIVE_TOKENS
+        )
+        if runtime.num_speculative_tokens != expected_local_tokens:
+            raise ValueError(
+                f"PD {config.role.value} requires local num_speculative_tokens="
+                f"{expected_local_tokens} under the K7 product contract"
+            )
+        executor_tokens = self.executor_kwargs.get("num_speculative_tokens", 0)
+        if executor_tokens != expected_local_tokens:
+            raise ValueError(
+                f"PD {config.role.value} executor requires num_speculative_tokens="
+                f"{expected_local_tokens} under the K7 product contract"
+            )
 
     def resolve_runtime_config(self) -> RuntimeConfig:
         """Return runtime settings with executor requirements resolved."""
@@ -178,6 +215,20 @@ class TokenOutput:
     tool_calls: tuple[ParsedToolCall, ...] = ()
 
 
+@dataclass(frozen=True)
+class PrefillChunkReady:
+    """Confirmed P chunk plus its exact scheduler block-table snapshot."""
+
+    request_id: str
+    chunk_id: int
+    start_token: int
+    end_token: int
+    final: bool
+    first_token: int | None
+    block_ids_by_group: dict[str, tuple[int, ...]]
+    cache_partition: int
+
+
 class ReplicaEngineCore:
     """Engine core for one serving replica.
 
@@ -192,6 +243,7 @@ class ReplicaEngineCore:
         config: EngineConfig,
         tokenizer
     ) -> None:
+        config.validate_pd()
         runtime = config.resolve_runtime_config()
         self.config = replace(config, runtime_config=runtime)
         self.tokenizer = tokenizer
@@ -224,6 +276,10 @@ class ReplicaEngineCore:
                 runtime.requires_homogeneous_prefill_decode
             ),
             async_scheduling=self._async_scheduling,
+            prefill_handoff=(
+                getattr(getattr(self.config.pd_config, "role", None), "value", None)
+                == "prefill"
+            ),
         )
         # Validate before worker startup, while the manager's pools are still lazy.
         scheduler_config.validate_cache_groups(runtime.kv_cache_groups)
@@ -240,6 +296,11 @@ class ReplicaEngineCore:
         self._output_queue = None
         self._profile_output_queue = None
         self._profile_lock = asyncio.Lock()
+        self._pd_command_counter = 0
+        # Chunk readiness is request-scoped. A single global queue lets one
+        # concurrent handoff consume another request's cache snapshot.
+        self._pd_prefill_chunks: dict[str, asyncio.Queue[PrefillChunkReady]] = {}
+        self._pd_chunk_counters: dict[str, int] = {}
         # Tracks which request_ids the worker has already received via
         # NewRequestData — prompt tokens are sent exactly once per request.
         self._worker_known_req_ids: set[str] = set()
@@ -398,6 +459,52 @@ class ReplicaEngineCore:
                     f"received active={result.active}"
                 )
 
+    async def call_pd_worker(self, operation: str, payload: bytes = b"") -> bytes:
+        """Run an ordered owner/cache operation in the spawned worker process."""
+        if not isinstance(operation, str) or not operation or len(operation) > 128:
+            raise ValueError("PD worker operation must be a nonempty bounded string")
+        if (
+            not isinstance(payload, bytes)
+            or len(payload) > MAX_WORKER_PD_PAYLOAD_BYTES
+        ):
+            raise ValueError(
+                "PD worker payload must be bytes no larger than "
+                f"{MAX_WORKER_PD_PAYLOAD_BYTES >> 20} MiB"
+            )
+        if self.config.pd_config is None or not getattr(self.config.pd_config, "enabled", False):
+            raise RuntimeError("PD worker control is disabled")
+        async with self._profile_lock:
+            input_queue = self._input_queue
+            output_queue = self._profile_output_queue
+            if input_queue is None or output_queue is None:
+                raise RuntimeError("Serving worker is not running")
+            self._pd_command_counter += 1
+            command_id = self._pd_command_counter
+            input_queue.put(
+                encode_command(
+                    PDWorkerCommand(
+                        command_id=command_id,
+                        operation=operation,
+                        payload=payload,
+                    )
+                )
+            )
+            try:
+                raw_result = await asyncio.to_thread(
+                    output_queue.get,
+                    timeout=self._step_timeout,
+                )
+            except queue.Empty as exc:
+                raise RuntimeError(
+                    f"Worker PD control timed out ({self._step_timeout:g}s)"
+                ) from exc
+            result = decode_pd_result(raw_result)
+            if result.command_id != command_id:
+                raise RuntimeError("Worker PD control response ordering mismatch")
+            if result.error:
+                raise RuntimeError(result.error)
+            return result.payload
+
     def generate_request_id(self) -> str:
         self._request_counter += 1
         return f"serving-req-{self._request_counter}"
@@ -421,6 +528,7 @@ class ReplicaEngineCore:
         *,
         on_queued: Callable[[], None] | None = None,
         prompt_token_ids: Sequence[int] | None = None,
+        cache_partition: int | None = None,
         output_parser_spec: OutputParserSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
@@ -440,15 +548,28 @@ class ReplicaEngineCore:
                 top_p=config.top_p,
                 top_k=config.top_k,
                 seed=config.seed,
+                cache_partition=cache_partition,
             )
 
+            if request_id in self._request_contexts:
+                raise ValueError(f"request {request_id!r} is already active")
             ctx = _RequestContext(
                 request=request,
                 stream=getattr(config, "stream", True),
                 output_parser=create_output_parser(output_parser_spec, self.tokenizer),
             )
             self._request_contexts[request_id] = ctx
-            self.scheduler.add_request(request)
+            if self.scheduler.config.prefill_handoff:
+                if request_id in self._pd_prefill_chunks:
+                    self._request_contexts.pop(request_id, None)
+                    raise ValueError(f"request {request_id!r} already has a PD chunk queue")
+                self._pd_prefill_chunks[request_id] = asyncio.Queue()
+            try:
+                self.scheduler.add_request(request)
+            except BaseException:
+                self._request_contexts.pop(request_id, None)
+                self._pd_prefill_chunks.pop(request_id, None)
+                raise
             stat_logger = getattr(self, "_stat_logger", None)
             if stat_logger is not None:
                 stat_logger.record_queued(getattr(self, "_engine_index", 0), request_id)
@@ -504,6 +625,7 @@ class ReplicaEngineCore:
                 # finished_request_ids, otherwise they leak in _req_cache /
                 # _worker_known_req_ids and pin device resources.
                 self._schedule_worker_free(request_id)
+                self._pd_prefill_chunks.pop(request_id, None)
 
     async def abort_request(self, request_id: str) -> None:
         ctx = self._request_contexts.pop(request_id, None)
@@ -511,6 +633,8 @@ class ReplicaEngineCore:
             # Already finished/cleaned up: nothing pinned to release, and the
             # scheduler no longer tracks it. Avoid scheduling a duplicate free.
             return
+        getattr(self, "_pd_prefill_chunks", {}).pop(request_id, None)
+        getattr(self, "_pd_chunk_counters", {}).pop(request_id, None)
         self.scheduler.abort_request(request_id)
         self._record_scheduler_stats()
         stat_logger = getattr(self, "_stat_logger", None)
@@ -525,6 +649,97 @@ class ReplicaEngineCore:
         )
         # See note in add_request's finally block: schedule worker-side cleanup.
         self._schedule_worker_free(request_id)
+
+    async def next_prefill_chunk(self, request_id: str) -> PrefillChunkReady:
+        """Wait for one confirmed P chunk that is safe to hand to the connector."""
+        if not self.scheduler.config.prefill_handoff:
+            raise RuntimeError("this engine is not configured as the PD Prefill role")
+        try:
+            queue = self._pd_prefill_chunks[request_id]
+        except KeyError as exc:
+            raise ValueError("request has no PD Prefill chunk queue") from exc
+        chunk = await queue.get()
+        if chunk.request_id != request_id:
+            raise RuntimeError("PD Prefill chunk queue correlation mismatch")
+        return chunk
+
+    def complete_prefill_chunk_transfer(self, request_id: str) -> None:
+        """Allow the next P chunk after a deterministic non-final completion."""
+        self.scheduler.complete_prefill_chunk_transfer(request_id)
+
+    def acknowledge_prefill_handoff(self, request_id: str) -> None:
+        """Release P state only after D returned the matching READY fact."""
+        self.scheduler.complete_prefill_handoff(request_id)
+        self._schedule_worker_free(request_id)
+        self._pd_chunk_counters.pop(request_id, None)
+        self._pd_prefill_chunks.pop(request_id, None)
+        context = self._request_contexts.get(request_id)
+        if context is not None:
+            context.queue.put_nowait(
+                TokenOutput(finished=True, finish_reason="FINISHED_HANDOFF")
+            )
+
+    async def add_adopted_handoff(
+        self,
+        *,
+        reservation_id: str,
+        request_id: str,
+        prompt_token_ids: Sequence[int],
+        first_token: int,
+        max_new_tokens: int,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int | None = None,
+        seed: int | None = None,
+        stop_strings: tuple[str, ...] = (),
+        eos_token_id: int | None = None,
+        stream: bool = True,
+    ) -> AsyncGenerator[TokenOutput, None]:
+        """Enter D Decode from committed cache; never enqueue a Prefill request."""
+        request, first_output = self.scheduler.adopt_handoff(
+            reservation_id=reservation_id,
+            request_id=request_id,
+            prompt_token_ids=list(prompt_token_ids),
+            first_token=first_token,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+            stop_strings=stop_strings,
+            eos_token_id=eos_token_id,
+        )
+        ctx = _RequestContext(request=request, stream=stream)
+        self._request_contexts[request_id] = ctx
+        text = self._detokenize_incrementally(ctx)
+        ctx.queue.put_nowait(
+            TokenOutput(
+                token_id=first_token,
+                text=text,
+                finished=first_output.finished,
+                finish_reason=first_output.finish_reason,
+                prompt_tokens=request.num_prompt_tokens,
+                completion_tokens=1,
+                token_ids=(first_token,) if first_output.finished else (),
+            )
+        )
+        finished_normally = False
+        try:
+            while True:
+                queued = await ctx.queue.get()
+                if isinstance(queued, BaseException):
+                    self._request_contexts.pop(request_id, None)
+                    raise queued
+                output: TokenOutput = queued
+                yield output
+                if output.finished:
+                    finished_normally = True
+                    break
+        finally:
+            if not finished_normally and request_id in self._request_contexts:
+                self._request_contexts.pop(request_id, None)
+                self.scheduler.abort_request(request_id)
+                self._schedule_worker_free(request_id)
 
     def _schedule_worker_free(self, request_id: str) -> None:
         """Queue a request id for worker-side release on the next StepCommand.
@@ -730,6 +945,7 @@ class ReplicaEngineCore:
                     top_p=req.top_p,
                     top_k=req.top_k,
                     seed=req.seed,
+                    pd_adopted=bool(req.pd_reservation_id),
                 ))
                 self._worker_known_req_ids.add(req_id)
 
@@ -924,7 +1140,54 @@ class ReplicaEngineCore:
             )
             stat_logger.record_iteration(engine_index, iteration)
         self._record_scheduler_stats()
+
+        if getattr(getattr(self.scheduler, "config", None), "prefill_handoff", False):
+            for scheduled in scheduler_output.scheduled_requests:
+                if not scheduled.is_prefill:
+                    continue
+                if scheduled.cache_partition is None:
+                    raise RuntimeError("PD Prefill chunk has no cache partition")
+                request = scheduled.request
+                start = scheduled.num_computed_tokens
+                end = start + scheduled.num_new_tokens
+                final = end >= request.num_prompt_tokens
+                token_value = new_tokens.get(request.request_id)
+                if isinstance(token_value, list):
+                    first_token = int(token_value[0]) if token_value else None
+                elif token_value is None:
+                    first_token = None
+                else:
+                    first_token = int(token_value)
+                if final and first_token is None:
+                    raise RuntimeError("terminal PD Prefill did not return the first token")
+                chunk_id = self._pd_chunk_counters.get(request.request_id, 0)
+                self._pd_chunk_counters[request.request_id] = chunk_id + 1
+                self.scheduler.mark_prefill_chunk_transfer_pending(request.request_id)
+                try:
+                    chunk_queue = self._pd_prefill_chunks[request.request_id]
+                except KeyError as exc:
+                    raise RuntimeError("PD Prefill request lost its chunk queue") from exc
+                chunk_queue.put_nowait(
+                    PrefillChunkReady(
+                        request_id=request.request_id,
+                        chunk_id=chunk_id,
+                        start_token=start,
+                        end_token=end,
+                        final=final,
+                        first_token=first_token,
+                        block_ids_by_group={
+                            name: tuple(block_ids)
+                            for name, block_ids in scheduled.block_ids_by_group.items()
+                        },
+                        cache_partition=scheduled.cache_partition,
+                    )
+                )
+
         for req_output in request_outputs:
+            if req_output.handoff_ready:
+                # The first token is part of the final handoff metadata. It is
+                # published only by the D output path after READY commit.
+                continue
             ctx = self._request_contexts.get(req_output.request_id)
             if ctx is None:
                 continue
@@ -1261,6 +1524,7 @@ class AsyncLLMEngine:
             max_model_len=config.runtime_config.max_seq_len,
             num_speculative_tokens=config.runtime_config.num_speculative_tokens,
         )
+        self._pd_service = None
 
         for dp_rank, device_group in enumerate(parallel.replica_device_groups):
             replica_parallel = parallel.for_replica(device_group)
@@ -1292,9 +1556,24 @@ class AsyncLLMEngine:
             await asyncio.gather(*tasks, return_exceptions=True)
             await self.stop()
             raise
+        pd_config = self.config.pd_config
+        if pd_config is not None and getattr(pd_config, "enabled", False):
+            from pypto_serving.serving.pd.service import PDServingService
+
+            service = PDServingService(self, pd_config)
+            try:
+                await service.start()
+            except BaseException:
+                await service.close()
+                await self.stop()
+                raise
+            self._pd_service = service
 
     async def stop(self) -> None:
         """Stop all DP engine cores."""
+        if self._pd_service is not None:
+            await self._pd_service.close()
+            self._pd_service = None
         await asyncio.gather(*(core.stop() for core in reversed(self._cores)))
 
     async def start_profile(self) -> None:
@@ -1327,6 +1606,19 @@ class AsyncLLMEngine:
 
     def pending_token_load(self) -> int:
         return sum(core.pending_token_load() for core in self._cores)
+
+    @property
+    def pd_health_error(self) -> str:
+        if self._pd_service is None:
+            return ""
+        return self._pd_service.health_error
+
+    @property
+    def pd_service(self):
+        """Expose the role-local control plane to the protected internal API."""
+        if self._pd_service is None:
+            raise RuntimeError("PD serving control plane has not started")
+        return self._pd_service
 
     async def generate_result(
         self,
@@ -1397,11 +1689,28 @@ class AsyncLLMEngine:
         prompt: str,
         config,
         *,
+        prompt_token_ids: Sequence[int] | None = None,
         output_parser_spec: OutputParserSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         arrival_monotonic = time.monotonic()
+        pd_config = self.config.pd_config
+        if pd_config is not None and getattr(pd_config, "enabled", False):
+            if self._pd_service is None:
+                raise RuntimeError("PD serving control plane has not started")
+            if getattr(pd_config.role, "value", "") != "prefill":
+                raise ValueError("send generation requests to the PD Prefill endpoint")
+            prompt_token_ids = self._resolve_prompt_tokens(prompt, prompt_token_ids)
+            async for output in self._pd_service.generate(
+                request_id,
+                prompt,
+                config,
+                prompt_token_ids,
+            ):
+                yield output
+            return
+
         replica_idx = self._select_replica()
-        prompt_token_ids = self._tokenize_prompt(prompt)
+        prompt_token_ids = self._resolve_prompt_tokens(prompt, prompt_token_ids)
         self.metrics.start_request(
             replica_idx,
             request_id,
@@ -1505,6 +1814,21 @@ class AsyncLLMEngine:
         if not prompt_token_ids:
             raise ValueError("Prompt tokenization produced no tokens.")
         return prompt_token_ids
+
+    def _resolve_prompt_tokens(
+        self,
+        prompt: str,
+        prompt_token_ids: Sequence[int] | None,
+    ) -> tuple[int, ...]:
+        if prompt_token_ids is None:
+            return tuple(int(token) for token in self._tokenize_prompt(prompt))
+        tokens = tuple(prompt_token_ids)
+        if not tokens or any(type(token) is not int or token < 0 for token in tokens):
+            raise ValueError("Prompt token IDs must be nonempty non-negative integers.")
+        vocab_size = getattr(self.tokenizer, "vocab_size", None)
+        if isinstance(vocab_size, int) and any(token >= vocab_size for token in tokens):
+            raise ValueError("Prompt token ID is outside the tokenizer vocabulary.")
+        return tokens
 
     def _estimate_request_load(self, prompt_token_ids: Sequence[int] | None, config) -> int:
         prompt_tokens = len(prompt_token_ids) if prompt_token_ids is not None else 0

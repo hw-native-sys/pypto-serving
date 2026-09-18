@@ -199,6 +199,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         cache_ranks: int = DSPARK_RANKS,
         compile_kernels: bool = False,
         num_speculative_tokens: int = 0,
+        pd_worker_config=None,
     ) -> None:
         worker_device_ids = tuple(device_ids) if device_ids is not None else (int(device_id),)
         super().__init__(
@@ -215,6 +216,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         # layout freezes every rank-derived axis (kernel import arguments,
         # scheduler cache partitions, packed-prefill capacity) from it.
         self._topology_layout = DSparkCacheLayout.for_ranks(cache_ranks)
+        self._pd_worker_config = pd_worker_config
         if self._num_speculative_tokens not in (0, DSPARK_SPECULATIVE_TOKENS):
             raise ValueError(
                 "DSpark speculation is fixed at K="
@@ -305,7 +307,19 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         """Create the DSpark runtime runner."""
         if not isinstance(compiled, DSparkCompiledKernels):
             raise TypeError("DeepSeekV4DSparkPyptoExecutor requires DSpark compiled metadata.")
-        return DSparkModelRunner(compiled=compiled)
+        return DSparkModelRunner(compiled=compiled, pd_worker_config=self._pd_worker_config)
+
+    def handle_pd_command(self, operation: str, payload: bytes) -> bytes:
+        """Dispatch an ordered PD command to the only registered DSpark runner."""
+        if self._pd_worker_config is None:
+            raise RuntimeError("DSpark PD worker support is not configured")
+        if len(self._runners) != 1:
+            raise RuntimeError("PD worker control requires exactly one registered model")
+        runner = next(iter(self._runners.values()))
+        handler = getattr(runner, "handle_pd_command", None)
+        if not callable(handler):
+            raise RuntimeError("DSpark runner has no PD worker control handler")
+        return handler(operation, payload)
 
     def _compile_model(self, model: RuntimeModel) -> DSparkCompiledKernels:
         """Validate DSpark metadata, compile the two L3 programs, and package."""

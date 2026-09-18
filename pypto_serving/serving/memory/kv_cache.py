@@ -10,7 +10,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from enum import Enum
 
 import torch
 
@@ -22,6 +23,32 @@ NONE_HASH = hash(("__none__",))
 
 class KVCacheCapacityError(RuntimeError):
     """Raised when a cache allocation cannot fit in the physical pools."""
+
+
+class GroupReservationState(str, Enum):
+    """Lifecycle of an externally filled grouped-cache allocation."""
+
+    PREPARING = "PREPARING"
+    CONSTRUCTING = "CONSTRUCTING"
+    READY = "READY"
+    IN_USE = "IN_USE"
+    RELEASED = "RELEASED"
+    ABORTING = "ABORTING"
+    QUARANTINED = "QUARANTINED"
+
+
+@dataclass(frozen=True)
+class GroupCacheReservation:
+    """One D-first reservation backed by the normal grouped block pools."""
+
+    reservation_id: str
+    request_id: str
+    token_capacity: int
+    partition: int
+    block_ids_by_group: dict[str, tuple[int, ...]]
+    state: GroupReservationState
+    write_authorized: bool = False
+    manifest_hash: str = ""
 
 
 def hash_block_tokens(parent_hash: int, token_ids: tuple[int, ...]) -> int:
@@ -176,6 +203,8 @@ class KvCacheManager:
         self._group_pools: dict[str, _GroupBlockPool] = {}
         self._group_request_partitions: dict[str, int] = {}
         self._next_group_partition = 0
+        self._group_reservations: dict[str, GroupCacheReservation] = {}
+        self._group_request_reservations: dict[str, str] = {}
         if num_blocks is not None:
             self._init_blocks(num_blocks, block_size)
 
@@ -564,7 +593,7 @@ class KvCacheManager:
 
     @property
     def group_specs(self) -> tuple[KVCacheGroupSpec, ...]:
-        """Return the immutable contracts for the configured cache groups."""
+        """Return the immutable scheduler/runner cache geometry in group order."""
         return tuple(pool.spec for pool in self._group_pools.values())
 
     def init_groups(
@@ -1374,9 +1403,213 @@ class KvCacheManager:
                     pool.free_queues[partition].append(block)
         self._group_request_partitions.pop(request_id, None)
 
+    def reserve_group_cache(
+        self,
+        reservation_id: str,
+        request_id: str,
+        token_capacity: int,
+        *,
+        partition: int | None = None,
+    ) -> GroupCacheReservation:
+        """Atomically reserve every configured group through the existing allocator.
+
+        A reservation is deliberately not a second page allocator. It is a
+        lifecycle record around ``ensure_group_blocks`` and the same request maps
+        used by local scheduling. Repeating the identical request is idempotent;
+        changing any field under a reused identity is rejected.
+        """
+        if not self._group_pools:
+            raise RuntimeError("grouped cache must be initialized before PD reservation")
+        if not isinstance(reservation_id, str) or not reservation_id:
+            raise ValueError("reservation_id must be a nonempty string")
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("request_id must be a nonempty string")
+        if type(token_capacity) is not int or token_capacity <= 0:
+            raise ValueError("token_capacity must be a positive integer")
+
+        existing = self._group_reservations.get(reservation_id)
+        if existing is not None:
+            expected_partition = existing.partition if partition is None else partition
+            if (
+                existing.request_id != request_id
+                or existing.token_capacity != token_capacity
+                or existing.partition != expected_partition
+            ):
+                raise ValueError("reservation identity was reused with different parameters")
+            return existing
+        existing_id = self._group_request_reservations.get(request_id)
+        if existing_id is not None:
+            raise ValueError(
+                f"request {request_id!r} already belongs to reservation {existing_id!r}"
+            )
+        if request_id in self._group_request_partitions:
+            raise ValueError(f"request {request_id!r} already owns grouped cache blocks")
+
+        # The normal allocator preflights every group before mutation. The catch
+        # still rolls back an unexpected mid-allocation exception so a failed
+        # reservation cannot strand a partially populated request.
+        try:
+            block_ids = self.ensure_group_blocks(
+                request_id,
+                token_capacity,
+                partition=partition,
+            )
+            selected = self.group_request_partition(request_id)
+            if selected is None:
+                raise RuntimeError("grouped reservation has no selected partition")
+        except BaseException:
+            if request_id in self._group_request_partitions:
+                self.release_all_group_requests(request_id)
+            raise
+
+        reservation = GroupCacheReservation(
+            reservation_id=reservation_id,
+            request_id=request_id,
+            token_capacity=token_capacity,
+            partition=selected,
+            block_ids_by_group={
+                name: tuple(ids) for name, ids in block_ids.items()
+            },
+            state=GroupReservationState.CONSTRUCTING,
+        )
+        self._group_reservations[reservation_id] = reservation
+        self._group_request_reservations[request_id] = reservation_id
+        return reservation
+
+    def group_cache_reservation(self, reservation_id: str) -> GroupCacheReservation | None:
+        """Return the stable reservation fact for status/query handling."""
+        return self._group_reservations.get(reservation_id)
+
+    @property
+    def group_cache_reservations(self) -> tuple[GroupCacheReservation, ...]:
+        """Return lifecycle facts for diagnostics without exposing mutable indexes."""
+        return tuple(self._group_reservations.values())
+
+    def authorize_group_cache_write(self, reservation_id: str) -> GroupCacheReservation:
+        """Mark the destination pages as exposed to a remote writer."""
+        current = self._require_group_reservation(reservation_id)
+        if current.state is GroupReservationState.CONSTRUCTING:
+            current = replace(current, write_authorized=True)
+            self._group_reservations[reservation_id] = current
+            return current
+        if current.write_authorized and current.state in (
+            GroupReservationState.READY,
+            GroupReservationState.IN_USE,
+            GroupReservationState.QUARANTINED,
+        ):
+            return current
+        raise ValueError(f"cannot authorize a reservation in state {current.state.value}")
+
+    def commit_group_cache(
+        self,
+        reservation_id: str,
+        manifest_hash: str,
+    ) -> GroupCacheReservation:
+        """Atomically publish a completely received reservation as READY."""
+        if not isinstance(manifest_hash, str) or not manifest_hash:
+            raise ValueError("manifest_hash must be a nonempty string")
+        current = self._require_group_reservation(reservation_id)
+        if current.state in (
+            GroupReservationState.READY,
+            GroupReservationState.IN_USE,
+        ):
+            if current.manifest_hash != manifest_hash:
+                raise ValueError("ready reservation manifest mismatch")
+            return current
+        if current.state is not GroupReservationState.CONSTRUCTING:
+            raise ValueError(f"cannot commit a reservation in state {current.state.value}")
+        if not current.write_authorized:
+            raise ValueError("cannot commit a reservation before remote-write authorization")
+        current = replace(
+            current,
+            state=GroupReservationState.READY,
+            manifest_hash=manifest_hash,
+        )
+        self._group_reservations[reservation_id] = current
+        return current
+
+    def adopt_group_cache(self, reservation_id: str) -> GroupCacheReservation:
+        """Transfer a READY reservation into the normal Decode request lifecycle."""
+        current = self._require_group_reservation(reservation_id)
+        if current.state is GroupReservationState.IN_USE:
+            return current
+        if current.state is not GroupReservationState.READY:
+            raise ValueError(f"cannot adopt a reservation in state {current.state.value}")
+        current = replace(current, state=GroupReservationState.IN_USE)
+        self._group_reservations[reservation_id] = current
+        return current
+
+    def quarantine_group_cache(self, reservation_id: str) -> GroupCacheReservation:
+        """Keep all pages pinned after an uncertain write or owner loss."""
+        current = self._require_group_reservation(reservation_id)
+        if current.state is GroupReservationState.RELEASED:
+            raise ValueError("released reservations cannot be quarantined")
+        if current.state is GroupReservationState.QUARANTINED:
+            return current
+        current = replace(current, state=GroupReservationState.QUARANTINED)
+        self._group_reservations[reservation_id] = current
+        return current
+
+    def release_group_cache(
+        self,
+        reservation_id: str,
+        *,
+        confirmed_stopped: bool = False,
+    ) -> GroupCacheReservation:
+        """Release through the normal group pools only when no writer can remain.
+
+        Before authorization, abort is always deterministic. After authorization,
+        CONSTRUCTING/QUARANTINED pages require an external stop/death proof.
+        READY and IN_USE have a completed transfer fact and use normal lifecycle
+        release.
+        """
+        current = self._require_group_reservation(reservation_id)
+        if current.state is GroupReservationState.RELEASED:
+            return current
+        uncertain = current.state in (
+            GroupReservationState.CONSTRUCTING,
+            GroupReservationState.ABORTING,
+            GroupReservationState.QUARANTINED,
+        ) and current.write_authorized
+        if uncertain and not confirmed_stopped:
+            raise RuntimeError("reservation may still have a native writer; keep it quarantined")
+        self.release_all_group_requests(current.request_id)
+        self._group_request_reservations.pop(current.request_id, None)
+        current = replace(current, state=GroupReservationState.RELEASED)
+        self._group_reservations[reservation_id] = current
+        return current
+
+    def retire_group_cache_reservation(self, reservation_id: str) -> None:
+        """Forget a terminal reservation after its stable fact was persisted.
+
+        The cache manager owns only live allocator state.  PD keeps a bounded
+        terminal tombstone separately for idempotent status replies; retaining
+        every RELEASED allocator record here would otherwise grow for the
+        lifetime of the serving process.
+        """
+        current = self._require_group_reservation(reservation_id)
+        if current.state is not GroupReservationState.RELEASED:
+            raise RuntimeError("only a released grouped reservation can be retired")
+        if current.request_id in self._group_request_reservations:
+            raise RuntimeError("released reservation still has a request index")
+        self._group_reservations.pop(reservation_id)
+
+    def _require_group_reservation(self, reservation_id: str) -> GroupCacheReservation:
+        try:
+            return self._group_reservations[reservation_id]
+        except KeyError as exc:
+            raise KeyError(f"unknown grouped cache reservation {reservation_id!r}") from exc
+
     def group_num_blocks(self, group_name: str) -> int:
         """Return the rank-local physical block capacity of one cache group."""
         return self._group_pool(group_name).blocks_per_partition
+
+    def group_num_free_blocks(self, group_name: str, partition: int) -> int:
+        """Return allocatable blocks in one scheduler-visible cache namespace."""
+        pool = self._group_pool(group_name)
+        if not 0 <= partition < len(pool.free_queues):
+            raise ValueError(f"Invalid cache partition {partition}")
+        return pool.num_free_blocks_in(partition)
 
     def _group_pool(self, group_name: str) -> _GroupBlockPool:
         try:

@@ -32,6 +32,8 @@ from pypto_serving.serving.server.ipc import (
     PLACEHOLDER_TOKEN,
     DecodeRequest,
     NewRequestData,
+    PDWorkerCommand,
+    PDWorkerResult,
     PrefillRequest,
     ProfileCommand,
     ProfileResult,
@@ -39,6 +41,7 @@ from pypto_serving.serving.server.ipc import (
     StepCommand,
     StepResult,
     decode_command,
+    encode_pd_result,
     encode_profile_result,
     encode_result,
 )
@@ -98,6 +101,14 @@ class _ProfileBarrier:
     """FIFO barrier that keeps profiler control ordered with output reclaim."""
 
     command: ProfileCommand
+    completed: threading.Event
+
+
+@dataclass(frozen=True)
+class _PDControlBarrier:
+    """FIFO barrier for owner/cache control relative to device dispatch."""
+
+    command: PDWorkerCommand
     completed: threading.Event
 
 
@@ -165,11 +176,15 @@ class WorkerProcess:
             self.sampler = Sampler()
 
             executor_cls = self._resolve_executor_cls()
+            executor_kwargs = dict(self.config.executor_kwargs)
+            pd_config = getattr(self.config, "pd_config", None)
+            if pd_config is not None and getattr(pd_config, "enabled", False):
+                executor_kwargs["pd_worker_config"] = pd_config.worker_config()
             self.executor = executor_cls(
                 platform=self.config.platform,
                 device_ids=device_ids,
                 pypto_build_dir=str(pypto_build_dir),
-                **self.config.executor_kwargs,
+                **executor_kwargs,
             )
 
             loaded = ModelLoader().load(
@@ -256,6 +271,10 @@ class WorkerProcess:
 
             if isinstance(cmd, ProfileCommand):
                 self._handle_profile_command(cmd)
+                continue
+
+            if isinstance(cmd, PDWorkerCommand):
+                self._handle_pd_worker_command(cmd)
                 continue
 
             self._handle_step_command(cmd)
@@ -375,6 +394,11 @@ class WorkerProcess:
                 output_work_queue.put(barrier)
                 barrier.completed.wait()
                 continue
+            if isinstance(cmd, PDWorkerCommand):
+                barrier = _PDControlBarrier(command=cmd, completed=threading.Event())
+                output_work_queue.put(barrier)
+                barrier.completed.wait()
+                continue
             assert isinstance(cmd, StepCommand)
             try:
                 self._wait_for_pending_decode_reclaims(cmd.finished_request_ids)
@@ -448,6 +472,12 @@ class WorkerProcess:
             if isinstance(work, _ProfileBarrier):
                 try:
                     self._handle_profile_command(work.command)
+                finally:
+                    work.completed.set()
+                continue
+            if isinstance(work, _PDControlBarrier):
+                try:
+                    self._handle_pd_worker_command(work.command)
                 finally:
                     work.completed.set()
                 continue
@@ -581,6 +611,33 @@ class WorkerProcess:
                 encode_profile_result(ProfileResult(active=profiler.active, error=error))
             )
 
+    def _handle_pd_worker_command(self, cmd: PDWorkerCommand) -> None:
+        """Run a worker-owned PD operation after all older device work settles."""
+        error = None
+        payload = b""
+        try:
+            handler = getattr(self.executor, "handle_pd_command", None)
+            if not callable(handler):
+                raise RuntimeError(
+                    f"{type(self.executor).__name__} does not support PD worker control"
+                )
+            payload = handler(cmd.operation, cmd.payload)
+            if not isinstance(payload, bytes):
+                raise TypeError("PD worker handler must return bytes")
+        except Exception as exc:
+            error = str(exc)
+            logger.error("Worker PD control failed: %s", exc, exc_info=True)
+        if self.profile_output_queue is not None:
+            self.profile_output_queue.put(
+                encode_pd_result(
+                    PDWorkerResult(
+                        command_id=cmd.command_id,
+                        payload=payload,
+                        error=error,
+                    )
+                )
+            )
+
     def _handle_step_command(self, cmd: StepCommand) -> None:
         """Handle a StepCommand and push an encoded StepResult.
 
@@ -637,7 +694,11 @@ class WorkerProcess:
                     continue
             self._req_cache.pop(req_id, None)
             self._last_tokens.pop(req_id, None)
-            release_sampler = getattr(self.sampler, "release_requests", None)
+            release_sampler = getattr(
+                getattr(self, "sampler", None),
+                "release_requests",
+                None,
+            )
             if callable(release_sampler):
                 release_sampler([req_id])
 
@@ -930,6 +991,9 @@ class WorkerProcess:
             block_ids=[dr.block_ids for dr in scheduled],
             block_ids_by_group=[dr.block_ids_by_group for dr in scheduled],
             cache_partitions=[dr.cache_partition for dr in scheduled],
+            pd_adopted=[
+                self._req_cache[dr.request_id].pd_adopted for dr in scheduled
+            ],
         )
 
     def _batch_decode(
