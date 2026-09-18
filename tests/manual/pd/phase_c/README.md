@@ -20,9 +20,14 @@ export PYPTO_HOME=/path/to/pypto
 bash tests/manual/pd/phase_c/apply_runtime_overlays.sh
 ```
 
-The patches add explicit `prepare(chip_service_factories=...)` propagation,
-resident allocation retain/release, chip-child service lifecycle, and pin-aware
-free rejection. They do not modify or rebuild native libraries.
+The patches are a deliberately narrow compatibility overlay pinned to PyPTO
+`df4dc0093` and Simpler `22385d2b`. They add explicit
+`prepare(chip_service_factories=...)` propagation, resident allocation
+retain/release, chip-child service lifecycle, pin-aware free rejection, and a
+binary-cache revision check which ignores only Python control-plane changes.
+They do not modify or rebuild native libraries. The apply script uses zero
+fuzz and fails closed on a different base revision; porting this small overlay
+is the only PyPTO/Simpler work required when the framework stack advances.
 
 ## Validation record
 

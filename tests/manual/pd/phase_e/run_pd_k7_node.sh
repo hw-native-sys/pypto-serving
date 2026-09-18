@@ -69,8 +69,15 @@ cd "$repo_root"
     git -C "$PYPTO_LIB_HOME" rev-parse HEAD || true
     printf 'pypto_head='
     git -C "$PYPTO_HOME" rev-parse HEAD || true
-    printf 'pto_isa_head='
+    printf 'simpler_runtime_head='
+    git -C "$PYPTO_HOME/runtime" rev-parse HEAD || true
+    printf 'pto_isa_env_root=%s\n' "$PTO_ISA_ROOT"
+    printf 'pto_isa_env_head='
     git -C "$PTO_ISA_ROOT" rev-parse HEAD || true
+    managed_pto_isa_root="$PYPTO_HOME/runtime/build/pto-isa"
+    printf 'pto_isa_managed_root=%s\n' "$managed_pto_isa_root"
+    printf 'pto_isa_managed_head='
+    git -C "$managed_pto_isa_root" rev-parse HEAD || true
     printf 'python=%s\n' "$(command -v python)"
     printf 'ptoas=%s\n' "$(command -v ptoas)"
     ptoas --version || true
