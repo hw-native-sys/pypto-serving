@@ -25,7 +25,7 @@ from pypto_serving.serving.engine.async_engine import TokenOutput
 from pypto_serving.tools.profile import profile_instant
 from pypto_serving.transfer.types import CompletionCertainty
 
-from .admission import FairByteBudget, FairHandoffAdmission
+from .admission import FairHandoffAdmission
 from .config import PDCapabilities, PDConfig, PDRole
 from .contracts import RuntimeLayoutDescriptor
 from .connector import DecodeConnector
@@ -140,7 +140,11 @@ class PDServingService:
             config.max_active_handoffs,
             config.max_pending_handoffs,
         )
-        self._transfer_budget = FairByteBudget(config.max_inflight_transfer_bytes)
+        # Transfer size is model/chunk dependent and is not a resource
+        # allocation: the source and destination cache pages already exist.
+        # Bound request concurrency, but keep bytes as telemetry rather than a
+        # model-independent rejection threshold.
+        self._inflight_transfer_bytes = 0
         self.journal = (
             DurablePDJournal(config.journal_path, config)
             if config.journal_path
@@ -296,7 +300,10 @@ class PDServingService:
         self.metrics.set_gauge("queued_handoffs", self._admission.queued)
         self.metrics.set_gauge("prepared_requests", len(self._prepared_by_id))
         self.metrics.set_gauge("reservations", len(reservations))
-        self.metrics.set_gauge("inflight_transfer_bytes", self._transfer_budget.used)
+        self.metrics.set_gauge(
+            "inflight_transfer_bytes",
+            self._inflight_transfer_bytes,
+        )
         return CapacitySnapshot(
             node_id=self.config.node_id,
             role=self.config.role.value,
@@ -310,8 +317,8 @@ class PDServingService:
             snapshot_sequence=self._snapshot_sequence,
             active_limit=self._admission.active_limit,
             queued_handoffs=self._admission.queued,
-            inflight_transfer_bytes=self._transfer_budget.used,
-            inflight_transfer_byte_limit=self._transfer_budget.limit,
+            inflight_transfer_bytes=self._inflight_transfer_bytes,
+            inflight_transfer_byte_limit=0,
         )
 
     async def metrics_snapshot(self) -> dict[str, object]:
@@ -1091,57 +1098,58 @@ class PDServingService:
                 "overlap": release_next_chunk,
             },
         )
-        async with self._transfer_budget.reserve(transfer_bytes):
-            try:
-                if not release_next_chunk:
-                    raw_response = await self.core.call_pd_worker(
-                        OP_TRANSFER_CHUNK,
-                        encode_worker_payload(request),
-                    )
-                    return (
-                        decode_worker_payload(raw_response, TransferChunkResponse),
-                        False,
-                    )
-
-                self.metrics.increment("overlap.submitted")
-                raw_submission = await self.core.call_pd_worker(
-                    OP_SUBMIT_TRANSFER_CHUNK,
+        self._inflight_transfer_bytes += transfer_bytes
+        try:
+            if not release_next_chunk:
+                raw_response = await self.core.call_pd_worker(
+                    OP_TRANSFER_CHUNK,
                     encode_worker_payload(request),
                 )
-                submission = decode_worker_payload(raw_submission, TransferSubmission)
-                self.core.complete_prefill_chunk_transfer(request_id)
-                deadline = time.monotonic() + self.config.request_timeout_seconds + 10
-                while True:
-                    # Yield to the engine loop before polling so the next Prefill
-                    # StepCommand can reach the worker/device lane.
-                    await asyncio.sleep(self.config.transfer_poll_interval_seconds)
-                    raw_poll = await self.core.call_pd_worker(
-                        OP_POLL_TRANSFER_CHUNK,
-                        encode_worker_payload(TransferPollRequest(submission.job_id)),
+                return (
+                    decode_worker_payload(raw_response, TransferChunkResponse),
+                    False,
+                )
+
+            self.metrics.increment("overlap.submitted")
+            raw_submission = await self.core.call_pd_worker(
+                OP_SUBMIT_TRANSFER_CHUNK,
+                encode_worker_payload(request),
+            )
+            submission = decode_worker_payload(raw_submission, TransferSubmission)
+            self.core.complete_prefill_chunk_transfer(request_id)
+            deadline = time.monotonic() + self.config.request_timeout_seconds + 10
+            while True:
+                # Yield to the engine loop before polling so the next Prefill
+                # StepCommand can reach the worker/device lane.
+                await asyncio.sleep(self.config.transfer_poll_interval_seconds)
+                raw_poll = await self.core.call_pd_worker(
+                    OP_POLL_TRANSFER_CHUNK,
+                    encode_worker_payload(TransferPollRequest(submission.job_id)),
+                )
+                poll = decode_worker_payload(raw_poll, TransferPollResponse)
+                if poll.job_id != submission.job_id:
+                    raise RuntimeError("worker returned another PD transfer job")
+                if poll.complete:
+                    self.metrics.increment("overlap.completed")
+                    return TransferChunkResponse(poll.results), True
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "PD asynchronous transfer polling exceeded its bound"
                     )
-                    poll = decode_worker_payload(raw_poll, TransferPollResponse)
-                    if poll.job_id != submission.job_id:
-                        raise RuntimeError("worker returned another PD transfer job")
-                    if poll.complete:
-                        self.metrics.increment("overlap.completed")
-                        return TransferChunkResponse(poll.results), True
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError(
-                            "PD asynchronous transfer polling exceeded its bound"
-                        )
-            finally:
-                self.metrics.observe_ns(
-                    "transfer.duration",
-                    time.monotonic_ns() - started_ns,
-                )
-                profile_instant(
-                    "pd.transfer.end",
-                    cat="pd",
-                    args={
-                        "request_id": request_id,
-                        "chunk_id": request.manifest.chunk_id,
-                    },
-                )
+        finally:
+            self._inflight_transfer_bytes -= transfer_bytes
+            self.metrics.observe_ns(
+                "transfer.duration",
+                time.monotonic_ns() - started_ns,
+            )
+            profile_instant(
+                "pd.transfer.end",
+                cat="pd",
+                args={
+                    "request_id": request_id,
+                    "chunk_id": request.manifest.chunk_id,
+                },
+            )
 
     async def _drain_prefill_request(
         self,

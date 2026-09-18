@@ -39,9 +39,10 @@ class TransferAgent:
 
     def __init__(self, owner: OwnerRef, provider: TransferProvider, *,
                  poison: Callable[[TransferEvent], None], max_tasks: int = 64,
-                 max_bytes: int = 1 << 30, status_capacity: int = 1024):
+                 max_bytes: int | None = None, status_capacity: int = 1024):
         integer(max_tasks, "task limit", 1)
-        integer(max_bytes, "byte limit", 1)
+        if max_bytes is not None:
+            integer(max_bytes, "byte limit", 1)
         self.owner, self.provider, self.poison = owner, provider, poison
         self.status = StatusIndex(owner, status_capacity)
         self.max_tasks, self.max_bytes = max_tasks, max_bytes
@@ -61,7 +62,10 @@ class TransferAgent:
         with self._cv:
             if self._closing or self._poisoned:
                 raise TransferFailure(TransferError(ErrorCode.POISONED, Certainty.NOT_SUBMITTED))
-            if self._count >= self.max_tasks or self._bytes + task.nbytes > self.max_bytes:
+            if self._count >= self.max_tasks or (
+                self.max_bytes is not None
+                and self._bytes + task.nbytes > self.max_bytes
+            ):
                 raise TransferFailure(TransferError(ErrorCode.BACKPRESSURE, Certainty.NOT_SUBMITTED, True))
             self.status.create(task.attempt)
             self.status.advance(task.attempt, Stage.VALIDATED)

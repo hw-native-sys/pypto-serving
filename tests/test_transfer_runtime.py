@@ -126,6 +126,42 @@ def test_backpressure_counts_inflight_bytes(task):
         agent.close()
 
 
+def test_agent_default_does_not_reject_by_transfer_size(task):
+    provider = FakeTransferProvider("block")
+    agent = TransferAgent(task.attempt.source, provider, poison=lambda event: None)
+    try:
+        first = agent.submit(task, AlreadyCompletedFence())
+        assert provider.started.wait(1)
+        large_extent = (1 << 30) + 64
+        segment = task.segments[0]
+        large_segment = replace(
+            segment,
+            source=replace(segment.source, extent=large_extent),
+            destination=replace(segment.destination, extent=large_extent),
+            source_offset=0,
+            destination_offset=0,
+            length=large_extent,
+        )
+        second = agent.submit(
+            replace(
+                task,
+                attempt=replace(
+                    task.attempt,
+                    attempt_id="large-second",
+                    attempt_sequence=1,
+                ),
+                segments=(large_segment,),
+            ),
+            AlreadyCompletedFence(),
+        )
+        provider.unblock.set()
+        assert first.result(2).stage == Stage.COMPLETED
+        assert second.result(2).stage == Stage.COMPLETED
+    finally:
+        provider.unblock.set()
+        agent.close()
+
+
 def test_native_deadline_poison_and_late_completion(task):
     provider = FakeTransferProvider("block")
     poisoned = []

@@ -13,7 +13,6 @@ import pytest
 
 from pypto_serving.serving.pd.admission import (
     BoundedSerialAdmission,
-    FairByteBudget,
     FairHandoffAdmission,
     PDBackpressureError,
 )
@@ -102,33 +101,5 @@ def test_fair_handoff_admission_runs_up_to_active_limit_in_fifo_order() -> None:
         await asyncio.gather(*tasks)
         assert entered == [0, 1, 2, 3]
         assert admission.count == 0
-
-    asyncio.run(exercise())
-
-
-def test_weighted_transfer_budget_is_bounded_and_fifo() -> None:
-    async def exercise() -> None:
-        budget = FairByteBudget(10)
-        release = asyncio.Event()
-        entered = []
-
-        async def reserve(name: str, amount: int) -> None:
-            async with budget.reserve(amount):
-                entered.append(name)
-                if name == "large":
-                    await release.wait()
-
-        large = asyncio.create_task(reserve("large", 8))
-        await asyncio.sleep(0)
-        head = asyncio.create_task(reserve("head", 5))
-        tail = asyncio.create_task(reserve("tail", 2))
-        await asyncio.sleep(0)
-        assert entered == ["large"]
-        assert budget.used == 8
-        assert budget.queued == 2
-        release.set()
-        await asyncio.gather(large, head, tail)
-        assert entered == ["large", "head", "tail"]
-        assert budget.used == 0
 
     asyncio.run(exercise())
