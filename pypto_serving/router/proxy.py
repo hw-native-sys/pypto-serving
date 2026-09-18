@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import AsyncIterator
 
 from pypto_serving.router.routing import NoReplicaAvailable, ReplicaRegistry
@@ -26,6 +27,12 @@ from pypto_serving.router.routing import NoReplicaAvailable, ReplicaRegistry
 logger = logging.getLogger(__name__)
 
 SESSION_HEADER = "x-session-id"
+
+# A session id is echoed back in a response header and used as a dictionary key,
+# so it must be header-safe: no CR/LF (which Uvicorn's h11 path rejects) and no
+# non-latin-1 byte (which raises when Starlette builds the response). Anchored so
+# a trailing newline cannot slip through.
+_SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,128}\Z")
 
 # Headers that describe one hop and must not be relayed to the next.
 _HOP_BY_HOP = frozenset({
@@ -41,21 +48,28 @@ _DROP_RESPONSE = _HOP_BY_HOP | {"content-length"}
 def resolve_session_id(headers, body: bytes) -> str:
     """Header, then a top-level ``session_id`` in the JSON body, then a new id.
 
-    An absent or unparsable body is not an error here: the router does not
-    validate the payload, the replica does.
+    A client-supplied id is rejected unless it is header-safe and bounded; an
+    unusable one is replaced rather than refused, because the id only decides
+    routing and a bad one should not fail the request. An absent or unparsable
+    body is likewise not an error: the router does not validate the payload,
+    the replica does.
     """
     from pypto_serving.router.routing import new_session_id
 
     supplied = headers.get(SESSION_HEADER)
-    if supplied:
+    if supplied is None:
+        try:
+            payload = json.loads(body) if body else None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            candidate = payload.get("session_id")
+            supplied = candidate if isinstance(candidate, str) else None
+
+    if supplied and _SESSION_ID_RE.match(supplied):
         return supplied
-    try:
-        payload = json.loads(body) if body else None
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        payload = None
-    if isinstance(payload, dict) and isinstance(payload.get("session_id"), str):
-        if payload["session_id"]:
-            return payload["session_id"]
+    if supplied:
+        logger.warning("ignoring an unusable session id (%d chars); minting a new one", len(supplied))
     return new_session_id()
 
 
@@ -80,9 +94,12 @@ class ReplicaProxy:
         try:
             decision = self._registry.select(session_id)
         except NoReplicaAvailable:
+            # The session id is returned on every response, this one included:
+            # clients rely on it for affinity and may retry with the same id.
             return JSONResponse(
                 status_code=503,
                 content={"object": "error", "message": "no serving replica is currently routable"},
+                headers={SESSION_HEADER: session_id},
             )
 
         replica = decision.replica

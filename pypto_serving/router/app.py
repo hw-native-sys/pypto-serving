@@ -122,7 +122,13 @@ class ServingRouter:
             if not state.ready:
                 continue
             try:
-                response = await self.client.get(f"{state.spec.base_url}/v1/models")
+                # Without an explicit timeout this inherits the client default
+                # read=None, so a replica that accepts the connection and then
+                # sends nothing would hang /v1/models forever.
+                response = await self.client.get(
+                    f"{state.spec.base_url}/v1/models",
+                    timeout=self.config.connect_timeout_seconds,
+                )
             except Exception:  # noqa: BLE001 - try the next replica
                 logger.debug("listing models via %s failed", state.name, exc_info=True)
                 continue

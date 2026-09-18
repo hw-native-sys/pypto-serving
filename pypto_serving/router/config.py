@@ -34,15 +34,21 @@ DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
 
 @dataclass(frozen=True)
 class ReplicaSpec:
-    """One serving replica reachable over HTTP."""
+    """One serving replica reachable over HTTP.
+
+    The scheme is per replica so a deployment whose replicas are not on a
+    trusted network can terminate TLS in front of them; prompts and generated
+    text cross this hop in the clear otherwise.
+    """
 
     name: str
     host: str
     port: int
+    scheme: str = "http"
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        return f"{self.scheme}://{self.host}:{self.port}"
 
 
 @dataclass(frozen=True)
@@ -88,11 +94,16 @@ def load_replica_table(path: str | Path) -> tuple[ReplicaSpec, ...]:
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict) or not {"host", "port"} <= set(entry):
             raise ValueError(f"replica {index} needs 'host' and 'port'")
-        unknown = sorted(set(entry) - {"name", "host", "port"})
+        unknown = sorted(set(entry) - {"name", "host", "port", "scheme"})
         if unknown:
             raise ValueError(f"replica {index} has unknown fields: {', '.join(unknown)}")
         host, port = entry["host"], entry["port"]
         if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
             raise ValueError(f"replica {index} has an invalid port: {port!r}")
-        replicas.append(ReplicaSpec(name=entry.get("name") or f"{host}:{port}", host=host, port=port))
+        scheme = entry.get("scheme", "http")
+        if scheme not in ("http", "https"):
+            raise ValueError(f"replica {index} has an invalid scheme: {scheme!r}")
+        replicas.append(ReplicaSpec(
+            name=entry.get("name") or f"{host}:{port}", host=host, port=port, scheme=scheme,
+        ))
     return tuple(replicas)

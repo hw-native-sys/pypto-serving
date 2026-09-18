@@ -30,6 +30,7 @@ A JSON file listing the replicas. Either `{"replicas": [...]}` or a bare list is
 | `host` | Required | Hostname or address of the replica. |
 | `port` | Required | Port the replica's HTTP server listens on. |
 | `name` | `host:port` | Label used in logs and on `/health`. |
+| `scheme` | `http` | `http` or `https`. Request bodies and generated text cross this hop in the clear under `http`; set `https` when the replicas are not on a trusted network and TLS is terminated in front of them. |
 
 ## Arguments
 
@@ -60,6 +61,7 @@ A JSON file listing the replicas. Either `{"replicas": [...]}` or a bare list is
 | Request | `X-Session-Id` header, else a top-level `session_id` in the JSON body. The header wins. |
 | Response | `X-Session-Id` header, always, on streaming and non-streaming responses. |
 | Absent | A new session id is minted and returned. |
+| Unusable | An id longer than 128 characters, or outside `[A-Za-z0-9._:-]`, is replaced by a fresh one rather than rejected: it only decides routing, and it is echoed into a response header. |
 
 A `session_id` left in the request body is ignored by the replica, which rejects no unknown fields.
 
@@ -69,3 +71,4 @@ A `session_id` left in the request body is ignored by the replica, which rejects
 | --- | --- |
 | `0` | The router shut down normally. |
 | `1` | The replica file is missing, unreadable, or invalid. |
+| `2` | Invalid command-line arguments (from `argparse`, before the replica file is read). |

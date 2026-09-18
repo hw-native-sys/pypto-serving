@@ -85,7 +85,7 @@ class _FakeClient:
         return upstream
 
     async def get(self, url, timeout=None):
-        self.gets.append(url)
+        self.gets.append((url, timeout))
         return _FakeUpstream(self.chunks, self.status_code, self.headers)
 
     async def aclose(self) -> None:
@@ -323,17 +323,59 @@ def test_transport_failure_returns_502_and_takes_the_replica_out():
     assert router.registry.state("r0").outstanding == 0
 
 
-def test_all_replicas_down_returns_503():
+def test_all_replicas_down_returns_503_still_carrying_the_session():
     router = _router()
     for state in router.registry.states:
         router.registry.set_ready(state.name, False)
 
     async def check():
-        return await router.proxy.forward(_FakeRequest(b"{}"), "/v1/completions")
+        return await router.proxy.forward(
+            _FakeRequest(b"{}", {SESSION_HEADER: "conv-1"}), "/v1/completions"
+        )
 
     response = asyncio.run(check())
     assert response.status_code == 503
     assert router.registry.rejected == 1
+    # Every response carries the id; clients retry with it.
+    assert response.headers[SESSION_HEADER] == "conv-1"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "with\r\ninjected: header",   # CR/LF would be rejected by the HTTP layer
+        "caffè-non-latin1-\u2603",     # non latin-1 raises when the response is built
+        "x" * 129,                     # unbounded length
+        "has space",
+        "",
+    ],
+)
+def test_an_unusable_session_id_is_replaced_not_echoed(bad):
+    """A bad id must not fail the request, and must never reach a header."""
+    router = _router()
+    body = json.dumps({"session_id": bad}).encode()
+
+    async def check():
+        return await router.proxy.forward(_FakeRequest(body), "/v1/completions")
+
+    response = asyncio.run(check())
+    assert response.status_code == 200
+    returned = response.headers[SESSION_HEADER]
+    assert returned != bad
+    assert len(returned) == 32
+    returned.encode("latin-1")  # must be header-encodable
+
+
+def test_a_well_formed_supplied_id_is_still_honoured():
+    router = _router()
+
+    async def check():
+        return await router.proxy.forward(
+            _FakeRequest(json.dumps({"session_id": "conv.1:abc-DEF_9"}).encode()),
+            "/v1/completions",
+        )
+
+    assert asyncio.run(check()).headers[SESSION_HEADER] == "conv.1:abc-DEF_9"
 
 
 # --- router's own routes ---
@@ -385,7 +427,11 @@ def test_list_models_is_answered_by_a_routable_replica():
 
     response = asyncio.run(router._list_models())
     assert json.loads(response.body) == payload
-    assert client.gets == ["http://h:8001/v1/models"]
+    url, timeout = client.gets[0]
+    assert url == "http://h:8001/v1/models"
+    # The client default is read=None, so this call must bound itself or a
+    # replica that accepts and then goes silent would hang /v1/models forever.
+    assert timeout is not None
 
 
 def test_list_models_is_503_when_nothing_is_routable():

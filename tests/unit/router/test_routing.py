@@ -64,6 +64,20 @@ def test_replica_table_round_trips(tmp_path):
     assert load_replica_table(path) == (ReplicaSpec(name="node0", host="127.0.0.1", port=8001),)
 
 
+def test_replica_scheme_defaults_to_http_and_can_be_https(tmp_path):
+    """Prompts cross this hop in the clear unless the deployment terminates TLS."""
+    (plain,) = load_replica_table(_write(tmp_path, {"replicas": [{"host": "h", "port": 8001}]}))
+    assert plain.base_url == "http://h:8001"
+
+    (secure,) = load_replica_table(
+        _write(tmp_path, {"replicas": [{"host": "h", "port": 8443, "scheme": "https"}]})
+    )
+    assert secure.base_url == "https://h:8443"
+
+    with pytest.raises(ValueError, match="invalid scheme"):
+        load_replica_table(_write(tmp_path, {"replicas": [{"host": "h", "port": 8001, "scheme": "ftp"}]}))
+
+
 def test_replica_name_defaults_to_host_port(tmp_path):
     (replica,) = load_replica_table(_write(tmp_path, {"replicas": [{"host": "10.0.0.2", "port": 8001}]}))
     assert replica.name == "10.0.0.2:8001"
@@ -153,10 +167,37 @@ def test_sweep_drops_only_expired_pins():
     assert sessions.lookup("fresh") == "r1"
 
 
+def test_the_directory_evicts_least_recently_used_pins_when_full():
+    """Session ids are client-supplied, so the map needs a cardinality bound."""
+    sessions = SessionDirectory(60.0, clock=_Clock(), max_sessions=3)
+    for i in range(3):
+        sessions.pin(f"s{i}", "r0")
+    sessions.pin("s0", "r0")          # refresh s0, making s1 the oldest
+    sessions.pin("s3", "r0")          # overflows
+
+    assert len(sessions) == 3
+    assert sessions.lookup("s1") is None, "the least-recently pinned entry is evicted"
+    assert sessions.lookup("s0") == "r0"
+    assert sessions.lookup("s3") == "r0"
+
+
+def test_expired_pins_are_reclaimed_before_anything_is_evicted():
+    clock = _Clock()
+    sessions = SessionDirectory(60.0, clock=clock, max_sessions=2)
+    sessions.pin("old", "r0")
+    clock.advance(61.0)
+    sessions.pin("fresh", "r0")
+    sessions.pin("newest", "r0")
+    assert sessions.lookup("fresh") == "r0", "a live pin survives when an expired one can go"
+    assert sessions.lookup("newest") == "r0"
+
+
 def test_session_ids_are_unique_and_ttl_must_be_positive():
     assert new_session_id() != new_session_id()
     with pytest.raises(ValueError, match="ttl_seconds must be positive"):
         SessionDirectory(0)
+    with pytest.raises(ValueError, match="max_sessions must be positive"):
+        SessionDirectory(60.0, max_sessions=0)
 
 
 # --- replica selection ---
