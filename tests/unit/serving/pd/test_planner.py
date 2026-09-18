@@ -74,14 +74,17 @@ def test_chunk_planner_defers_partial_pages_and_keeps_zero_units() -> None:
 def test_index_regions_are_atomic_and_ring_destination_wraps() -> None:
     manager = make_cache_manager()
     registry = make_registry(manager)
-    source = _tables(manager, "source", 224)
-    destination = _tables(manager, "destination", 256)
+    ori_spec = next(spec for spec in manager.group_specs if spec.name == "ori")
+    wrap_start = ori_spec.max_blocks_per_seq * ori_spec.spec.token_capacity
+    wrap_end = wrap_start + ori_spec.spec.token_capacity
+    source = _tables(manager, "source", wrap_end)
+    destination = _tables(manager, "destination", wrap_end)
     planner = DSV4_DSPARK_K7_ADAPTER.make_planner(registry, manager.group_specs)
     ring_plan = planner.plan_chunk(
         KEY,
-        chunk_id=6,
-        start_token=192,
-        end_token=224,
+        chunk_id=ori_spec.max_blocks_per_seq,
+        start_token=wrap_start,
+        end_token=wrap_end,
         final=False,
         rank_ids=(0,),
         source_blocks_by_rank={0: source},
