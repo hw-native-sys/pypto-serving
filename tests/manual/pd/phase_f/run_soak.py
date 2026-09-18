@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
-import os
 from pathlib import Path
 import statistics
 import time
@@ -26,26 +25,25 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-fd-growth", type=int, default=32)
     parser.add_argument("--max-thread-growth", type=int, default=16)
     parser.add_argument("--timeout-seconds", type=float, default=1800)
-    parser.add_argument("--auth-secret-env", default="PYPTO_PD_AUTH_SECRET")
     return parser
 
 
-def _snapshots(args, headers) -> dict:
+def _snapshots(args) -> dict:
     return {
         "timestamp_ns": time.time_ns(),
         "router": _get(f"{args.router_url.rstrip('/')}/metrics", 30),
         "recovery": _get(f"{args.router_url.rstrip('/')}/recovery", 30),
         "prefill_capacity": _get(
-            f"{args.prefill_url.rstrip('/')}/internal/pd/capacity", 30, headers
+            f"{args.prefill_url.rstrip('/')}/internal/pd/capacity", 30
         ),
         "decode_capacity": _get(
-            f"{args.decode_url.rstrip('/')}/internal/pd/capacity", 30, headers
+            f"{args.decode_url.rstrip('/')}/internal/pd/capacity", 30
         ),
         "prefill": _get(
-            f"{args.prefill_url.rstrip('/')}/internal/pd/metrics", 30, headers
+            f"{args.prefill_url.rstrip('/')}/internal/pd/metrics", 30
         ),
         "decode": _get(
-            f"{args.decode_url.rstrip('/')}/internal/pd/metrics", 30, headers
+            f"{args.decode_url.rstrip('/')}/internal/pd/metrics", 30
         ),
     }
 
@@ -58,10 +56,6 @@ def main() -> int:
     if evidence.exists():
         raise FileExistsError(f"evidence directory already exists: {evidence}")
     evidence.mkdir(parents=True)
-    secret = os.environ.get(args.auth_secret_env, "")
-    if len(secret.encode()) < 16:
-        raise RuntimeError(f"{args.auth_secret_env} must contain at least 16 bytes")
-    headers = {"x-pypto-pd-auth": secret}
     case = {
         "name": "soak-forbidden-city",
         "payload": {
@@ -75,7 +69,7 @@ def main() -> int:
         "expected_completion_tokens": 128,
         "expected_finish_reason": "length",
     }
-    samples = [_snapshots(args, headers)]
+    samples = [_snapshots(args)]
     results = []
     started_ns = time.time_ns()
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
@@ -96,7 +90,7 @@ def main() -> int:
             results.extend(batch_results)
             if any(result["errors"] for result in batch_results):
                 break
-            samples.append(_snapshots(args, headers))
+            samples.append(_snapshots(args))
 
     with (evidence / "results.jsonl").open("w", encoding="utf-8") as stream:
         for result in results:

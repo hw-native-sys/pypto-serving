@@ -14,20 +14,24 @@ dead before incrementing generation and control incarnation. The scripts never
 reset an NPU and may stop only PIDs recorded by the current run.
 
 `run_pd_k7_node.sh` and `run_router.sh` retain the Phase E launcher safety
-checks and add these defaults:
+checks. Router、P、D share one strict JSON document; its required product
+surface is only the P/D HTTP endpoints, while run ID, node IDs, control/RoCE
+addresses and observability root are explicit in this reproducible harness:
 
-```text
---pd-max-active-handoffs 4
---pd-max-pending-handoffs 8
---pd-max-inflight-transfer-bytes 1073741824
---pd-enable-chunk-overlap
+```json
+{
+  "runtime": {
+    "prefill": [{"host": "192.169.0.173", "port": 8111}],
+    "decode": [{"host": "192.169.0.85", "port": 8112}]
+  }
+}
 ```
 
 On the control host, the complete fixed-pair matrix is one command. The
-orchestrator creates per-run authentication material through stdin, starts D,
-P, and Router independently, waits for all health gates, runs the exact-token
-matrix, stops only the launcher PIDs recorded by this run, removes the two
-mode-0600 secret files, and copies four evidence directories locally:
+orchestrator writes the same config into both containers, starts D, P, and
+Router independently, waits for all health gates, runs the exact-token matrix,
+stops only the launcher PIDs recorded by this run, and copies five evidence
+directories locally:
 
 ```bash
 python tests/manual/pd/phase_f/run_ab_system.py \

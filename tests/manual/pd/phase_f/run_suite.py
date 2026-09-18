@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
-import os
 from pathlib import Path
 import platform
 import time
@@ -125,7 +124,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout-seconds", type=float, default=1800)
     parser.add_argument("--baseline-url", default="")
     parser.add_argument("--profile", action="store_true")
-    parser.add_argument("--auth-secret-env", default="PYPTO_PD_AUTH_SECRET")
     return parser
 
 
@@ -138,10 +136,6 @@ def main() -> int:
         raise FileExistsError(f"evidence directory already exists: {evidence}")
     evidence.mkdir(parents=True)
     cases = json.loads(Path(args.cases).read_text(encoding="utf-8"))
-    secret = os.environ.get(args.auth_secret_env, "")
-    if len(secret.encode()) < 16:
-        raise RuntimeError(f"{args.auth_secret_env} must contain at least 16 bytes")
-    internal_headers = {"x-pypto-pd-auth": secret}
     work = [
         (case, iteration)
         for iteration in range(args.repeat)
@@ -170,7 +164,6 @@ def main() -> int:
             _post_empty(
                 f"{url.rstrip('/')}/internal/pd/start-profile",
                 120,
-                internal_headers,
             )
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futures = {
@@ -205,7 +198,6 @@ def main() -> int:
             _post_empty(
                 f"{url.rstrip('/')}/internal/pd/stop-profile",
                 300,
-                internal_headers,
             )
     snapshots = {
         "router_metrics": _get(f"{args.router_url.rstrip('/')}/metrics", 30),
@@ -213,22 +205,18 @@ def main() -> int:
         "prefill_capacity": _get(
             f"{args.prefill_url.rstrip('/')}/internal/pd/capacity",
             30,
-            internal_headers,
         ),
         "decode_capacity": _get(
             f"{args.decode_url.rstrip('/')}/internal/pd/capacity",
             30,
-            internal_headers,
         ),
         "prefill_metrics": _get(
             f"{args.prefill_url.rstrip('/')}/internal/pd/metrics",
             30,
-            internal_headers,
         ),
         "decode_metrics": _get(
             f"{args.decode_url.rstrip('/')}/internal/pd/metrics",
             30,
-            internal_headers,
         ),
     }
     (evidence / "snapshots.json").write_text(
