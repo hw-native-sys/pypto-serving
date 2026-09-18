@@ -378,14 +378,20 @@ class ServingServer:
 
     async def _pd_reserve(self, request: Request) -> Response:
         from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415
+            PlacementRejection,
+            ReservePlacementResult,
             ReservePlacementHTTP,
             decode_json,
             encode_json,
         )
 
         payload = decode_json(await request.body(), ReservePlacementHTTP)
-        reservation = self.engine.pd_service.reserve_placement(payload)
-        return Response(encode_json(reservation), media_type="application/json")
+        outcome = self.engine.pd_service.reserve_placement(payload)
+        result = ReservePlacementResult(
+            rejection=outcome if isinstance(outcome, PlacementRejection) else None,
+            reservation=None if isinstance(outcome, PlacementRejection) else outcome,
+        )
+        return Response(encode_json(result), media_type="application/json")
 
     async def _pd_authorize(self, request: Request) -> Response:
         from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415

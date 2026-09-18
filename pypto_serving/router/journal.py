@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -12,6 +13,15 @@ import threading
 import time
 
 from pypto_serving.serving.pd.protocol import HandoffKey
+
+
+@dataclass(frozen=True)
+class JournalRouteBinding:
+    key: HandoffKey
+    prefill_node_id: str = ""
+    decode_node_id: str = ""
+    prefill_endpoint_generation: int = 0
+    decode_endpoint_generation: int = 0
 
 
 class RouterJournal:
@@ -26,9 +36,23 @@ class RouterJournal:
 
     @property
     def unresolved(self) -> tuple[HandoffKey, ...]:
+        return tuple(binding.key for binding in self._active.values())
+
+    @property
+    def unresolved_bindings(self) -> tuple[JournalRouteBinding, ...]:
         return tuple(self._active.values())
 
-    def append(self, event: str, key: HandoffKey, *, error_code: str = "") -> None:
+    def append(
+        self,
+        event: str,
+        key: HandoffKey,
+        *,
+        error_code: str = "",
+        prefill_node_id: str = "",
+        decode_node_id: str = "",
+        prefill_endpoint_generation: int = 0,
+        decode_endpoint_generation: int = 0,
+    ) -> None:
         with self._lock:
             self._sequence += 1
             record = {
@@ -43,6 +67,10 @@ class RouterJournal:
                 "route_epoch": key.route_epoch,
                 "control_incarnation": key.control_incarnation,
                 "error_code": error_code,
+                "prefill_node_id": prefill_node_id,
+                "decode_node_id": decode_node_id,
+                "prefill_endpoint_generation": prefill_endpoint_generation,
+                "decode_endpoint_generation": decode_endpoint_generation,
                 "previous_hash": self._last_hash,
             }
             canonical = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
@@ -55,9 +83,25 @@ class RouterJournal:
             self._last_hash = record_hash
             identity = (key.request_id, key.handoff_id)
             if event == "HANDOFF_CREATED":
-                self._active[identity] = key
+                self._active[identity] = JournalRouteBinding(
+                    key,
+                    prefill_node_id,
+                    decode_node_id,
+                    prefill_endpoint_generation,
+                    decode_endpoint_generation,
+                )
             elif event in ("HANDOFF_COMPLETED", "HANDOFF_FAILED", "RECOVERY_REQUIRED"):
                 self._active.pop(identity, None)
+            elif identity in self._active:
+                current = self._active[identity]
+                self._active[identity] = JournalRouteBinding(
+                    key,
+                    prefill_node_id or current.prefill_node_id,
+                    decode_node_id or current.decode_node_id,
+                    prefill_endpoint_generation
+                    or current.prefill_endpoint_generation,
+                    decode_endpoint_generation or current.decode_endpoint_generation,
+                )
 
     def close(self) -> None:
         with self._lock:
@@ -66,10 +110,12 @@ class RouterJournal:
                 os.close(self._fd)
                 self._fd = None
 
-    def _audit(self) -> tuple[int, str, dict[tuple[str, str], HandoffKey]]:
+    def _audit(
+        self,
+    ) -> tuple[int, str, dict[tuple[str, str], JournalRouteBinding]]:
         last_hash = "0" * 64
         sequence = 0
-        active: dict[tuple[str, str], HandoffKey] = {}
+        active: dict[tuple[str, str], JournalRouteBinding] = {}
         with self.path.open("rb") as stream:
             for sequence, line in enumerate(stream, 1):
                 record = json.loads(line)
@@ -94,11 +140,29 @@ class RouterJournal:
                 )
                 identity = (key.request_id, key.handoff_id)
                 if record["event"] == "HANDOFF_CREATED":
-                    active[identity] = key
+                    active[identity] = JournalRouteBinding(
+                        key,
+                        record.get("prefill_node_id", ""),
+                        record.get("decode_node_id", ""),
+                        record.get("prefill_endpoint_generation", 0),
+                        record.get("decode_endpoint_generation", 0),
+                    )
                 elif record["event"] in (
                     "HANDOFF_COMPLETED",
                     "HANDOFF_FAILED",
                     "RECOVERY_REQUIRED",
                 ):
                     active.pop(identity, None)
+                elif identity in active:
+                    current = active[identity]
+                    active[identity] = JournalRouteBinding(
+                        key,
+                        record.get("prefill_node_id", "")
+                        or current.prefill_node_id,
+                        record.get("decode_node_id", "") or current.decode_node_id,
+                        record.get("prefill_endpoint_generation", 0)
+                        or current.prefill_endpoint_generation,
+                        record.get("decode_endpoint_generation", 0)
+                        or current.decode_endpoint_generation,
+                    )
         return sequence, last_hash, active
