@@ -155,6 +155,14 @@ class _GroupBlockPool:
         return self.blocks[partition * self.blocks_per_partition + block_id]
 
 
+@dataclass(frozen=True, slots=True)
+class RetainedGroupBlockSnapshot:
+    """Main-process handle that pins one grouped block-table generation."""
+
+    partition: int
+    groups: tuple[tuple[_GroupBlockPool, tuple[KVCacheBlock, ...]], ...]
+
+
 class KvCacheManager:
     """Unified KV block metadata and paged KV tensor storage manager."""
 
@@ -668,6 +676,25 @@ class KvCacheManager:
             counts[name] = logical_blocks
         return counts
 
+    def group_blocks_cover(
+        self,
+        request_id: str,
+        token_count: int,
+        *,
+        partition: int | None = None,
+    ) -> bool:
+        """Return whether the request's current grouped tables cover ``token_count``."""
+        if not self._group_pools or token_count < 0:
+            return False
+        assigned = self._group_request_partitions.get(request_id)
+        if assigned is None or (partition is not None and partition != assigned):
+            return False
+        return all(
+            pool.request_logical_blocks.get(request_id, 0)
+            >= self._logical_group_blocks(pool, token_count)
+            for pool in self._group_pools.values()
+        )
+
     def completed_group_block_counts(self, token_count: int) -> dict[str, int]:
         """Return absolute full-page counts at a logical token boundary."""
         if token_count < 0:
@@ -916,9 +943,9 @@ class KvCacheManager:
 
     def retain_group_block_snapshot(
         self,
-        block_ids_by_group: dict[str, list[int]],
+        request_id: str,
         partition: int,
-    ) -> None:
+    ) -> RetainedGroupBlockSnapshot:
         """Pin one scheduled grouped block-table snapshot until its step settles.
 
         Async scheduling may advance a rolling request table before an older
@@ -926,45 +953,52 @@ class KvCacheManager:
         until that step is confirmed or discarded, matching vLLM's in-flight
         block lifetime fence.
         """
-        if not block_ids_by_group:
-            return
-        if set(block_ids_by_group) != set(self._group_pools):
-            raise ValueError("Grouped block snapshot does not match configured cache groups")
+        assigned = self._group_request_partitions.get(request_id)
+        if assigned != partition:
+            raise ValueError(
+                f"Request {request_id!r} is assigned to cache partition {assigned}, got {partition}"
+            )
 
-        blocks = []
-        for name, block_ids in block_ids_by_group.items():
-            pool = self._group_pools[name]
-            if len(block_ids) != len(set(block_ids)):
-                raise ValueError(f"Cache group {name!r} snapshot contains duplicate block IDs")
-            for block_id in block_ids:
-                block = pool.block_from_local_id(partition, block_id)
+        groups = []
+        for name, pool in self._group_pools.items():
+            if pool.request_partitions.get(request_id) != partition:
+                raise ValueError(
+                    f"Cache group {name!r} has no request table in partition {partition}"
+                )
+            owned = pool.request_blocks.get(request_id)
+            if owned is None:
+                raise RuntimeError(f"Cache group {name!r} has an incomplete request table")
+            blocks = tuple(owned)
+            for block in blocks:
+                if block is None:
+                    raise RuntimeError(f"Cache group {name!r} has an incomplete request table")
                 if block.ref_cnt <= 0:
                     raise RuntimeError(
-                        f"Cannot retain unowned grouped KV block {name}:{block_id}"
+                        f"Cannot retain unowned grouped KV block {name}:{pool.local_block_id(block)}"
                     )
-                blocks.append(block)
+            groups.append((pool, blocks))
 
-        for block in blocks:
-            block.ref_cnt += 1
+        for _, blocks in groups:
+            for block in blocks:
+                block.ref_cnt += 1
+        return RetainedGroupBlockSnapshot(partition=partition, groups=tuple(groups))
 
     def release_group_block_snapshot(
         self,
-        block_ids_by_group: dict[str, list[int]],
-        partition: int,
+        snapshot: RetainedGroupBlockSnapshot,
     ) -> None:
         """Release pins acquired by :meth:`retain_group_block_snapshot`."""
-        for name, block_ids in block_ids_by_group.items():
-            pool = self._group_pools[name]
-            for block_id in block_ids:
-                block = pool.block_from_local_id(partition, block_id)
+        for pool, blocks in snapshot.groups:
+            for block in blocks:
                 if block.ref_cnt <= 0:
                     raise RuntimeError(
-                        f"Grouped KV snapshot block {name}:{block_id} has "
+                        f"Grouped KV snapshot block {pool.spec.name}:"
+                        f"{pool.local_block_id(block)} has "
                         f"invalid ref_cnt={block.ref_cnt}"
                     )
                 block.ref_cnt -= 1
                 if block.ref_cnt == 0:
-                    pool.free_queues[partition].append(block)
+                    pool.free_queues[snapshot.partition].append(block)
 
     def cache_group_blocks_from_snapshot(
         self,
