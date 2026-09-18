@@ -31,7 +31,7 @@ from pypto_serving.serving.pd.admission import FairHandoffAdmission
 from pypto_serving.serving.pd.metrics import PDMetrics
 
 from .config import RouterConfig
-from .directory import FixedWorkerDirectory
+from .directory import WorkerDirectory
 from .journal import RouterJournal
 from .recovery import (
     FixedPairRecoveryController,
@@ -48,7 +48,7 @@ class RouterCoordinator:
     def __init__(
         self,
         config: RouterConfig,
-        directory: FixedWorkerDirectory,
+        directory: WorkerDirectory,
         journal: RouterJournal,
     ) -> None:
         self.config = config
@@ -70,7 +70,7 @@ class RouterCoordinator:
         unresolved = self.journal.unresolved
         if not unresolved:
             return
-        pair = await self.directory.refresh()
+        pair = await self.directory.select()
         for key in unresolved:
             results = await asyncio.gather(
                 pair.prefill_client.post("/internal/pd/query", HandoffHTTP(key)),

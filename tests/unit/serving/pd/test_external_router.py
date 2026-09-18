@@ -10,11 +10,12 @@ import pytest
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
 from pypto_serving.router.config import RouterConfig
 from pypto_serving.router.coordinator import RouterCoordinator
-from pypto_serving.router.directory import FixedWorkerDirectory
+from pypto_serving.router.directory import WorkerDirectory
 from pypto_serving.router.journal import RouterJournal
 from pypto_serving.serving.pd.config import PDCapabilities, PDRole
 from pypto_serving.serving.pd.http_api import (
     DecodeStreamFrame,
+    CapacitySnapshot,
     NodeDescriptor,
     PlacementReservation,
     PrefillHandoffResult,
@@ -55,14 +56,31 @@ def _descriptor(role: PDRole) -> NodeDescriptor:
     )
 
 
+def _capacity(role: PDRole) -> CapacitySnapshot:
+    return CapacitySnapshot(
+        node_id=role.value,
+        role=role.value,
+        active_handoffs=0,
+        prepared_requests=0,
+        reservations=0,
+        quarantined_reservations=0,
+        snapshot_sequence=1,
+        active_limit=4,
+    )
+
+
 class _PrefillClient:
     def __init__(self, waiting: asyncio.Event) -> None:
         self.waiting = waiting
         self.execute_calls = 0
         self.abort_calls = 0
 
-    async def get(self, _path, _type):
-        return _descriptor(PDRole.PREFILL)
+    async def get(self, path, _type):
+        if path == "/internal/pd/descriptor":
+            return _descriptor(PDRole.PREFILL)
+        if path == "/internal/pd/capacity":
+            return _capacity(PDRole.PREFILL)
+        raise AssertionError(path)
 
     async def post(self, path, payload, response_type=None):
         if path == "/internal/pd/prepare":
@@ -106,8 +124,12 @@ class _DecodeClient:
         self.reservation = None
         self.abort_calls = 0
 
-    async def get(self, _path, _type):
-        return _descriptor(PDRole.DECODE)
+    async def get(self, path, _type):
+        if path == "/internal/pd/descriptor":
+            return _descriptor(PDRole.DECODE)
+        if path == "/internal/pd/capacity":
+            return _capacity(PDRole.DECODE)
+        raise AssertionError(path)
 
     async def post(self, path, payload, response_type=None):
         if path == "/internal/pd/reserve":
@@ -192,8 +214,8 @@ class _ReserveFailureDecodeClient(_DecodeClient):
 
 def _coordinator(monkeypatch, tmp_path, p_client, d_client):
     config = RouterConfig(
-        prefill_url="http://prefill",
-        decode_url="http://decode",
+        prefill_urls=("http://prefill",),
+        decode_urls=("http://decode",),
         run_id="run",
         policy="round_robin",
         provider="mooncake",
@@ -203,7 +225,7 @@ def _coordinator(monkeypatch, tmp_path, p_client, d_client):
     journal = RouterJournal(config.journal_path, config.run_id)
     coordinator = RouterCoordinator(
         config,
-        FixedWorkerDirectory(p_client, d_client, "run"),
+        WorkerDirectory((p_client,), (d_client,), "run"),
         journal,
     )
     return coordinator, journal
@@ -242,13 +264,13 @@ def test_router_owns_route_and_opens_d_stream_before_p_execute(
 def test_directory_rejects_a_stale_router_control_incarnation() -> None:
     async def exercise() -> None:
         waiting = asyncio.Event()
-        directory = FixedWorkerDirectory(
-            _PrefillClient(waiting),
-            _DecodeClient(waiting),
+        directory = WorkerDirectory(
+            (_PrefillClient(waiting),),
+            (_DecodeClient(waiting),),
             "run",
             control_incarnation=2,
         )
-        with pytest.raises(ValueError, match="Router and P/D control incarnations"):
+        with pytest.raises(RuntimeError, match="no eligible P/D pool"):
             await directory.refresh()
 
     asyncio.run(exercise())

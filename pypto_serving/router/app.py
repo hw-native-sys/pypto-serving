@@ -20,7 +20,7 @@ from pypto_serving.serving.pd.observability import write_startup_record
 from .client import NodeClient
 from .config import RouterConfig
 from .coordinator import RouterCoordinator
-from .directory import FixedWorkerDirectory
+from .directory import WorkerDirectory
 from .journal import RouterJournal
 from .recovery import RecoveryPhase
 
@@ -60,11 +60,15 @@ class ChatCompletionRequest(BaseModel):
 
 
 def create_router_app(config: RouterConfig) -> FastAPI:
-    p_client = NodeClient(config.prefill_url, config.request_timeout_seconds)
-    d_client = NodeClient(config.decode_url, config.request_timeout_seconds)
-    directory = FixedWorkerDirectory(
-        p_client,
-        d_client,
+    prefill_clients = tuple(
+        NodeClient(url, config.request_timeout_seconds) for url in config.prefill_urls
+    )
+    decode_clients = tuple(
+        NodeClient(url, config.request_timeout_seconds) for url in config.decode_urls
+    )
+    directory = WorkerDirectory(
+        prefill_clients,
+        decode_clients,
         config.run_id,
         config.control_incarnation,
     )
