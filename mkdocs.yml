@@ -98,6 +98,7 @@ nav:
           - Benchmarking: user-guide/benchmarking.md
           - Profiling: user-guide/profile.md
       - Models:
+          - Model Support Matrix: user-guide/model-support.md
           - Qwen3-14B: user-guide/qwen.md
           - DeepSeek V4: user-guide/deepseek-v4.md
   - CLI Reference:
@@ -105,9 +106,18 @@ nav:
       - pypto-serving: cli-reference/pypto-serving.md
       - DeepSeek V4 Conversion: cli-reference/deepseek-v4-conversion.md
       - pypto-prepack-deepseek-v4: cli-reference/pypto-prepack-deepseek-v4.md
+      - Environment Variables: cli-reference/env-vars.md
   - Developer Guide:
-      - Architecture: developer-guide/architecture.md
-      - Model Integration: developer-guide/model-integration.md
-      - Weight Staging: developer-guide/weight-staging.md
-      - DeepSeek V4 Runtime: developer-guide/deepseek-v4-runtime.md
-      - DeepSeek V4 DSpark: developer-guide/deepseek-v4-dspark.md
+      - Overview: developer-guide/index.md
+      - Serving Internals:
+          - Architecture: developer-guide/architecture.md
+          - Weight Staging: developer-guide/weight-staging.md
+      - Model Integration:
+          - Overview: developer-guide/model-integration/index.md
+          - Family Detection and Model Loading: developer-guide/model-integration/family-detection.md
+          - Weight Spec Rules: developer-guide/model-integration/weight-spec.md
+          - Executor and Runner: developer-guide/model-integration/executor-runner.md
+          - Testing: developer-guide/model-integration/testing.md
+      - Model Runtime Notes:
+          - DeepSeek V4 Runtime: developer-guide/deepseek-v4-runtime.md
+          - DeepSeek V4 DSpark: developer-guide/deepseek-v4-dspark.md
