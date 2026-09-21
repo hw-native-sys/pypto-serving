@@ -97,6 +97,9 @@ def main() -> int:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--name", required=True)
     parser.add_argument("--host", default="127.0.0.1")
+    # A launch wrapper hands its payload through as a trailing argument. The
+    # stub ignores it, which is what lets it stand in for a wrapped launch.
+    parser.add_argument("ignored", nargs="*", help=argparse.SUPPRESS)
     args = parser.parse_args()
     uvicorn.run(build_app(args.name), host=args.host, port=args.port, log_level="warning")
     return 0
