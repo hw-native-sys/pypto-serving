@@ -1174,6 +1174,36 @@ def test_pd_adopted_decode_bootstraps_k7_after_one_target_step(monkeypatch) -> N
     assert row.token_source == 321
 
 
+def test_pd_adopted_fused_decode_publishes_late_bound_first_token(monkeypatch) -> None:
+    runner = _runner(speculative=True)
+    decode = DecodeBatch(
+        request_ids=["pd-adopted"],
+        token_ids=torch.tensor([[101]], dtype=torch.long),
+        hidden_states=None,
+        seq_lens=torch.tensor([65], dtype=torch.int32),
+        block_ids_by_group=_block_rows(1),
+        cache_partitions=[0],
+        pd_adopted=[True],
+        allow_device_greedy_sampling=True,
+    )
+    runner._initialize_pd_adopted_drafter_states(decode)
+    state = runner._drafter_state("pd-adopted")
+    published = []
+
+    def publish(value) -> None:
+        published.append(value)
+        value.device_state_initialized = True
+
+    monkeypatch.setattr(runner, "_initialize_dspark_device_state", publish)
+
+    runner._finalize_pd_adopted_device_states(decode)
+
+    assert published == [state]
+    assert state.current_token_id == 101
+    assert state.pending_draft_tokens == []
+    assert state.device_state_initialized is True
+
+
 def test_non_pd_k7_decode_still_requires_prefill_seed() -> None:
     runner = _runner(speculative=True)
     decode = DecodeBatch(

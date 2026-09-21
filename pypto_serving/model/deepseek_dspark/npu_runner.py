@@ -3419,6 +3419,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         with profile_span("DSparkModelRunner.decode", cat="executor"):
             self._ensure_l3_shared_buffers(model)
             if self._compiled.decode_full_fused:
+                self._finalize_pd_adopted_device_states(batch)
                 return self.reclaim_prepared_decode(
                     self.dispatch_prepared_decode(model, batch, prepared)
                 )
@@ -4219,6 +4220,31 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     f"PD-adopted request {request_id!r} changed cache partition "
                     f"from {state.group} to {group}"
                 )
+
+    def _finalize_pd_adopted_device_states(self, batch: DecodeBatch) -> None:
+        """Publish D-local K7 state after the real first token is late-bound.
+
+        Async preparation deliberately builds Decode plans with placeholder
+        tokens.  A remotely prefetched request therefore reserves its local
+        drafter lease during early preparation, but must wait until execution
+        binds the real P-sampled token before publishing persistent device
+        state.  The initial state carries no proposals: the first fused target
+        step is the correctness anchor and produces the next K7 window.
+        """
+        if not self.speculative or not batch.pd_adopted:
+            return
+        if len(batch.pd_adopted) != len(batch.request_ids):
+            raise ValueError("PD adoption requires one marker per Decode request")
+        if batch.token_ids.shape[0] < len(batch.request_ids):
+            raise ValueError("PD adoption requires one late-bound token per request")
+        for index, adopted in enumerate(batch.pd_adopted):
+            if not adopted:
+                continue
+            state = self._drafter_state(batch.request_ids[index])
+            if state.device_state_initialized:
+                continue
+            state.current_token_id = int(batch.token_ids[index].reshape(-1)[-1].item())
+            self._initialize_dspark_device_state(state)
 
     def _decode_assignment(self, batch: DecodeBatch) -> _DSparkGroupAssignment:
         """Assign batch rows to TP groups and rank-local request slots."""
