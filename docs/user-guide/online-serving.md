@@ -52,7 +52,10 @@ curl --noproxy "*" http://127.0.0.1:8899/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"What is 1+1?"}],"max_tokens":32}'
 ```
 
-Chat completions accept `model`, `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop`, `stream`, `reasoning_effort`, `include_reasoning`, and `chat_template_kwargs`. DeepSeek V4 also supports the function-tool fields described below.
+Chat completions accept `model`, `messages`, `max_tokens`, `temperature`,
+`top_p`, `top_k`, `stop`, `stream`, `reasoning_effort`, `include_reasoning`, and
+`chat_template_kwargs`. DeepSeek V4 also supports the function-tool fields
+described below.
 
 The server converts chat messages to a prompt with the tokenizer's `apply_chat_template` method. `chat_template_kwargs` is forwarded to the tokenizer, which allows model-specific controls such as Qwen thinking-mode settings when the tokenizer supports them.
 
@@ -132,7 +135,10 @@ Each event is emitted as `data: {...}`. The stream ends with:
 data: [DONE]
 ```
 
-Accumulate `choices[0].text` for completions and `choices[0].delta.content` for chat completions. The final usage event has an empty `choices` list and authoritative token counts.
+Accumulate `choices[0].text` for completions. For chat completions, accumulate
+`choices[0].delta.reasoning` and `choices[0].delta.content` independently;
+models without a reasoning parser only produce `content`. The final usage event
+has an empty `choices` list and authoritative token counts.
 
 For tool-enabled chat, collect `delta.tool_calls` separately, keyed by `index`. The first delta for a call supplies its `id`, `type`, and `function.name`; concatenate subsequent `function.arguments` fragments for that index. Arguments can be incomplete JSON until the call finishes. String parameters stream before their closing delimiter; non-string parameters are emitted once their JSON value is complete. Accumulate `delta.reasoning` separately when present.
 

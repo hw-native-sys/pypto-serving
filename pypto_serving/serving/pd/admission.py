@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from collections import deque
 from contextlib import asynccontextmanager
 
@@ -69,7 +70,13 @@ class FairHandoffAdmission:
     of relying on implementation details of :class:`asyncio.Semaphore`.
     """
 
-    def __init__(self, active_limit: int, total_limit: int) -> None:
+    def __init__(
+        self,
+        active_limit: int,
+        total_limit: int,
+        *,
+        state_observer: Callable[[int, int], None] | None = None,
+    ) -> None:
         if type(active_limit) is not int or active_limit < 1:
             raise ValueError("PD active handoff limit must be a positive integer")
         if type(total_limit) is not int or total_limit < active_limit:
@@ -79,6 +86,7 @@ class FairHandoffAdmission:
         self._active = 0
         self._waiters: deque[asyncio.Future[None]] = deque()
         self._lock = asyncio.Lock()
+        self._state_observer = state_observer
 
     @property
     def active(self) -> int:
@@ -100,6 +108,10 @@ class FairHandoffAdmission:
             self._active += 1
             waiter.set_result(None)
 
+    def _observe_locked(self) -> None:
+        if self._state_observer is not None:
+            self._state_observer(self._active, len(self._waiters))
+
     @asynccontextmanager
     async def admit(self):
         loop = asyncio.get_running_loop()
@@ -111,6 +123,7 @@ class FairHandoffAdmission:
                 )
             self._waiters.append(waiter)
             self._wake_locked()
+            self._observe_locked()
         acquired = False
         try:
             await waiter
@@ -129,3 +142,4 @@ class FairHandoffAdmission:
                 else:
                     self._active -= 1
                 self._wake_locked()
+                self._observe_locked()

@@ -9,7 +9,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
+import struct
 from dataclasses import dataclass, field, replace
 from enum import Enum
 
@@ -18,7 +20,7 @@ import torch
 from pypto_serving.config.types import KVCacheGroupSpec, KvAllocation, ModelConfig, RuntimeConfig
 
 
-NONE_HASH = hash(("__none__",))
+NONE_HASH = hashlib.sha256(b"pypto-serving-prefix-root/v1").digest()
 
 
 class KVCacheCapacityError(RuntimeError):
@@ -44,16 +46,30 @@ class GroupCacheReservation:
     reservation_id: str
     request_id: str
     token_capacity: int
+    prompt_token_count: int
     partition: int
     block_ids_by_group: dict[str, tuple[int, ...]]
+    shared_block_ids_by_group: dict[str, tuple[int, ...]]
+    writable_block_ids_by_group: dict[str, tuple[int, ...]]
+    prefix_block_hashes: dict[str, tuple[bytes, ...]]
+    prefix_hit_tokens: int
+    published_block_counts: dict[str, int]
     state: GroupReservationState
     write_authorized: bool = False
     manifest_hash: str = ""
+    quarantined_block_ids_by_group: dict[str, tuple[int, ...]] = field(
+        default_factory=dict
+    )
 
 
-def hash_block_tokens(parent_hash: int, token_ids: tuple[int, ...]) -> int:
-    """Return a chained prefix-cache hash for one full token block."""
-    return hash((parent_hash, token_ids))
+def hash_block_tokens(parent_hash: bytes, token_ids: tuple[int, ...]) -> bytes:
+    """Return a stable chained digest suitable for cross-process identity."""
+    digest = hashlib.sha256()
+    digest.update(parent_hash)
+    digest.update(struct.pack(">I", len(token_ids)))
+    for token_id in token_ids:
+        digest.update(struct.pack(">q", int(token_id)))
+    return digest.digest()
 
 
 @dataclass(slots=True)
@@ -62,7 +78,7 @@ class KVCacheBlock:
 
     block_id: int
     ref_cnt: int = 0
-    block_hash: int | None = None
+    block_hash: bytes | None = None
     prev_free: "KVCacheBlock | None" = field(default=None, repr=False)
     next_free: "KVCacheBlock | None" = field(default=None, repr=False)
 
@@ -164,7 +180,7 @@ class _GroupBlockPool:
     request_blocks: dict[str, list[KVCacheBlock | None]] = field(default_factory=dict)
     request_partitions: dict[str, int] = field(default_factory=dict)
     request_logical_blocks: dict[str, int] = field(default_factory=dict)
-    hash_to_block: dict[tuple[int, int], KVCacheBlock] = field(default_factory=dict)
+    hash_to_block: dict[tuple[int, bytes], KVCacheBlock] = field(default_factory=dict)
 
     def num_free_blocks_in(self, partition: int) -> int:
         return len(self.free_queues[partition])
@@ -198,13 +214,16 @@ class KvCacheManager:
         self.enable_prefix_cache = enable_prefix_cache
         self.blocks: list[KVCacheBlock] = []
         self.free_queue = FreeKVCacheBlockQueue()
-        self.hash_to_block: dict[int, KVCacheBlock] = {}
+        self.hash_to_block: dict[bytes, KVCacheBlock] = {}
         self.request_blocks: dict[str, list[KVCacheBlock]] = {}
         self._group_pools: dict[str, _GroupBlockPool] = {}
         self._group_request_partitions: dict[str, int] = {}
         self._next_group_partition = 0
         self._group_reservations: dict[str, GroupCacheReservation] = {}
         self._group_request_reservations: dict[str, str] = {}
+        self._group_request_spares: dict[
+            str, dict[str, list[KVCacheBlock]]
+        ] = {}
         if num_blocks is not None:
             self._init_blocks(num_blocks, block_size)
 
@@ -362,7 +381,7 @@ class KvCacheManager:
         for block in blocks:
             self.release(block)
 
-    def get_cached_block(self, block_hash: int) -> KVCacheBlock | None:
+    def get_cached_block(self, block_hash: bytes) -> KVCacheBlock | None:
         """Return and reference a cached block for one block hash."""
         if not self.enable_prefix_cache:
             return None
@@ -374,7 +393,7 @@ class KvCacheManager:
         block.ref_cnt += 1
         return block
 
-    def cache_block(self, block: KVCacheBlock, block_hash: int) -> None:
+    def cache_block(self, block: KVCacheBlock, block_hash: bytes) -> None:
         """Publish a full block to the prefix cache."""
         if not self.enable_prefix_cache:
             return
@@ -383,7 +402,13 @@ class KvCacheManager:
         block.block_hash = block_hash
         self.hash_to_block[block_hash] = block
 
-    def cache_block_ids(self, block_ids: list[int], block_hashes: list[int], start: int, end: int) -> None:
+    def cache_block_ids(
+        self,
+        block_ids: list[int],
+        block_hashes: list[bytes],
+        start: int,
+        end: int,
+    ) -> None:
         """Publish a range of full blocks to the prefix cache."""
         if not self.enable_prefix_cache:
             return
@@ -456,7 +481,7 @@ class KvCacheManager:
             hit_blocks.append(block)
         return hit_blocks
 
-    def compute_block_hashes(self, token_ids: list[int]) -> list[int]:
+    def compute_block_hashes(self, token_ids: list[int]) -> list[bytes]:
         """Compute chained hashes for all full blocks in the token sequence."""
         return [block_hash for _, block_hash in self._iter_block_hashes(token_ids)]
 
@@ -754,10 +779,19 @@ class KvCacheManager:
         """Return whether grouped lookup uses shifted EAGLE/MTP page hashes."""
         return any(pool.spec.is_eagle_group for pool in self._group_pools.values())
 
-    def compute_group_block_hashes(self, token_ids: list[int]) -> dict[str, list[int]]:
+    def compute_group_block_hashes(
+        self,
+        token_ids: list[int],
+        *,
+        group_names: tuple[str, ...] | None = None,
+    ) -> dict[str, list[bytes]]:
         """Compute full-page prefix hashes independently for every cache group."""
+        selected = tuple(self._group_pools) if group_names is None else group_names
+        if len(selected) != len(set(selected)) or set(selected) - set(self._group_pools):
+            raise ValueError("prefix hash groups must be unique configured cache groups")
         hashes = {}
-        for name, pool in self._group_pools.items():
+        for name in selected:
+            pool = self._group_pools[name]
             iterator = (
                 self._iter_eagle_token_block_hashes
                 if pool.spec.is_eagle_group
@@ -775,9 +809,11 @@ class KvCacheManager:
     def acquire_group_prefix_blocks(
         self,
         request_id: str,
-        block_hashes: dict[str, list[int]],
+        block_hashes: dict[str, list[bytes]],
         *,
         max_cache_hit_tokens: int,
+        shareable_group_names: tuple[str, ...] | None = None,
+        partition: int | None = None,
     ) -> tuple[dict[str, list[int]], int, int | None]:
         """Attach the longest strict zero-copy grouped prefix to a request.
 
@@ -794,7 +830,21 @@ class KvCacheManager:
             return {}, 0, None
         if request_id in self._group_request_partitions:
             raise ValueError(f"Request {request_id!r} already owns grouped KV cache blocks")
-        expected_names = set(self._group_pools)
+        selected_names = (
+            tuple(self._group_pools)
+            if shareable_group_names is None
+            else shareable_group_names
+        )
+        if len(selected_names) != len(set(selected_names)):
+            raise ValueError("shareable cache groups must be unique")
+        if not selected_names:
+            raise ValueError("shareable cache groups must not be empty")
+        expected_names = set(selected_names)
+        unknown = expected_names - set(self._group_pools)
+        if unknown:
+            raise ValueError(
+                "unknown shareable cache groups: " + ", ".join(sorted(unknown))
+            )
         if set(block_hashes) != expected_names:
             missing = sorted(expected_names - set(block_hashes))
             extra = sorted(set(block_hashes) - expected_names)
@@ -818,9 +868,17 @@ class KvCacheManager:
         best_partition: int | None = None
         best_hit_tokens = 0
         best_blocks: dict[str, list[KVCacheBlock | None]] = {}
-        for partition in range(self.group_partition_count):
+        candidate_partitions = (
+            range(self.group_partition_count)
+            if partition is None
+            else (partition,)
+        )
+        if partition is not None and not 0 <= partition < self.group_partition_count:
+            raise ValueError(f"Invalid cache partition {partition}")
+        for candidate_partition in candidate_partitions:
             candidate = max_candidate
-            for name, pool in self._group_pools.items():
+            for name in selected_names:
+                pool = self._group_pools[name]
                 if pool.spec.sliding_window is not None:
                     continue
                 token_capacity = pool.spec.spec.token_capacity
@@ -831,7 +889,7 @@ class KvCacheManager:
                 )
                 num_hit_blocks = 0
                 for block_hash in block_hashes[name][:max_blocks]:
-                    block = pool.hash_to_block.get((partition, block_hash))
+                    block = pool.hash_to_block.get((candidate_partition, block_hash))
                     if block is None:
                         break
                     num_hit_blocks += 1
@@ -843,6 +901,9 @@ class KvCacheManager:
                 candidate_blocks = {}
                 valid = True
                 for name, pool in self._group_pools.items():
+                    if name not in expected_names:
+                        candidate_blocks[name] = []
+                        continue
                     token_capacity = pool.spec.spec.token_capacity
                     end_block = candidate // token_capacity
                     if end_block > len(block_hashes[name]):
@@ -866,7 +927,7 @@ class KvCacheManager:
 
                     for block_index in lookup_indices:
                         block_hash = block_hashes[name][block_index]
-                        block = pool.hash_to_block.get((partition, block_hash))
+                        block = pool.hash_to_block.get((candidate_partition, block_hash))
                         if block is None:
                             valid = False
                             break
@@ -883,7 +944,7 @@ class KvCacheManager:
                 candidate -= alignment
 
             if candidate > best_hit_tokens:
-                best_partition = partition
+                best_partition = candidate_partition
                 best_hit_tokens = candidate
                 best_blocks = candidate_blocks
 
@@ -941,7 +1002,7 @@ class KvCacheManager:
     def cache_group_blocks(
         self,
         request_id: str,
-        block_hashes: dict[str, list[int]],
+        block_hashes: dict[str, list[bytes]],
         num_computed_tokens: int,
         already_cached: dict[str, int],
         *,
@@ -1040,7 +1101,7 @@ class KvCacheManager:
 
     def cache_group_blocks_from_snapshot(
         self,
-        block_hashes: dict[str, list[int]],
+        block_hashes: dict[str, list[bytes]],
         num_computed_tokens: int,
         already_cached: dict[str, int],
         block_ids_by_group: dict[str, list[int]],
@@ -1097,7 +1158,7 @@ class KvCacheManager:
         pool: _GroupBlockPool,
         partition: int,
         block: KVCacheBlock,
-        block_hash: int,
+        block_hash: bytes,
     ) -> None:
         """Publish one immutable full page without replacing a live duplicate."""
         key = (partition, block_hash)
@@ -1196,7 +1257,10 @@ class KvCacheManager:
             block = owned[slot]
             if block is not None and block.ref_cnt > 1:
                 shared_slots.add(slot)
-        return missing + len(shared_slots)
+        reserved_spares = len(
+            self._group_request_spares.get(request_id, {}).get(pool.spec.name, ())
+        )
+        return missing + max(0, len(shared_slots) - reserved_spares)
 
     def _candidate_group_partitions(
         self,
@@ -1354,7 +1418,14 @@ class KvCacheManager:
                         # owners. The replacement starts empty: no KV copy is
                         # needed because this request is about to overwrite it.
                         block.ref_cnt -= 1
-                        owned[slot] = self._take_group_block(pool, selected)
+                        spares = self._group_request_spares.get(
+                            request_id, {}
+                        ).get(name, [])
+                        owned[slot] = (
+                            spares.pop()
+                            if spares
+                            else self._take_group_block(pool, selected)
+                        )
                     else:
                         # Rotate through the eviction queue even for a sole
                         # owner. This preserves immutable rolling checkpoints
@@ -1380,6 +1451,7 @@ class KvCacheManager:
 
     def release_all_group_requests(self, request_id: str) -> None:
         """Release every grouped block owned by a request."""
+        spares_by_group = self._group_request_spares.pop(request_id, {})
         for pool in self._group_pools.values():
             partition = pool.request_partitions.get(request_id)
             blocks = pool.request_blocks.get(request_id, [])
@@ -1401,7 +1473,75 @@ class KvCacheManager:
                 block.ref_cnt -= 1
                 if block.ref_cnt == 0:
                     pool.free_queues[partition].append(block)
+            for block in spares_by_group.get(pool.spec.name, ()):
+                if block.ref_cnt != 1:
+                    raise RuntimeError(
+                        f"Reserved grouped KV spare {block.block_id} has "
+                        f"invalid ref_cnt={block.ref_cnt}"
+                    )
+                block.ref_cnt = 0
+                pool.free_queues[partition].append(block)
         self._group_request_partitions.pop(request_id, None)
+
+    def _reserve_group_decode_capacity(
+        self,
+        request_id: str,
+        token_capacity: int,
+        partition: int,
+    ) -> None:
+        """Pin future Decode capacity without advancing rolling cache time.
+
+        Full-history table slots can be appended immediately. Rolling tables
+        keep their prompt-time mapping; only future detach-on-write pages are
+        held as request-owned spares until the scheduler actually advances.
+        """
+        needs: dict[str, tuple[int, int]] = {}
+        for name, pool in self._group_pools.items():
+            target = self._logical_group_blocks(pool, token_capacity)
+            if pool.spec.sliding_window is None:
+                if target > pool.spec.max_blocks_per_seq:
+                    raise KVCacheCapacityError(
+                        f"Full-history KV cache table capacity exceeded ({name})"
+                    )
+                append_count = max(0, target - len(pool.request_blocks[request_id]))
+                spare_count = 0
+            else:
+                owned = pool.request_blocks[request_id]
+                target_size = min(target, pool.spec.max_blocks_per_seq)
+                append_count = max(0, target_size - len(owned))
+                previous = pool.request_logical_blocks.get(request_id, 0)
+                shared_slots = {
+                    logical % pool.spec.max_blocks_per_seq
+                    for logical in range(
+                        max(previous, pool.spec.max_blocks_per_seq), target
+                    )
+                    if logical % pool.spec.max_blocks_per_seq < len(owned)
+                    and owned[logical % pool.spec.max_blocks_per_seq] is not None
+                    and owned[logical % pool.spec.max_blocks_per_seq].ref_cnt > 1
+                }
+                spare_count = len(shared_slots)
+            needs[name] = (append_count, spare_count)
+            required = append_count + spare_count
+            if required > pool.num_free_blocks_in(partition):
+                raise KVCacheCapacityError(
+                    f"Insufficient grouped KV cache blocks ({name}: need "
+                    f"{required}, free {pool.num_free_blocks_in(partition)})"
+                )
+
+        spares_by_group = self._group_request_spares.setdefault(request_id, {})
+        for name, pool in self._group_pools.items():
+            append_count, spare_count = needs[name]
+            owned = pool.request_blocks[request_id]
+            owned.extend(
+                self._take_group_block(pool, partition)
+                for _ in range(append_count)
+            )
+            if spare_count:
+                spares = spares_by_group.setdefault(name, [])
+                spares.extend(
+                    self._take_group_block(pool, partition)
+                    for _ in range(spare_count)
+                )
 
     def reserve_group_cache(
         self,
@@ -1410,6 +1550,9 @@ class KvCacheManager:
         token_capacity: int,
         *,
         partition: int | None = None,
+        prompt_token_count: int | None = None,
+        prefix_block_hashes: dict[str, list[bytes]] | None = None,
+        shareable_group_names: tuple[str, ...] = (),
     ) -> GroupCacheReservation:
         """Atomically reserve every configured group through the existing allocator.
 
@@ -1426,6 +1569,12 @@ class KvCacheManager:
             raise ValueError("request_id must be a nonempty string")
         if type(token_capacity) is not int or token_capacity <= 0:
             raise ValueError("token_capacity must be a positive integer")
+        prompt_tokens = token_capacity if prompt_token_count is None else prompt_token_count
+        if type(prompt_tokens) is not int or not 0 < prompt_tokens <= token_capacity:
+            raise ValueError("prompt_token_count must be within the reservation capacity")
+        prefix_hashes = prefix_block_hashes or {}
+        if prefix_hashes and not shareable_group_names:
+            raise ValueError("prefix hashes require explicit shareable cache groups")
 
         existing = self._group_reservations.get(reservation_id)
         if existing is not None:
@@ -1433,7 +1582,10 @@ class KvCacheManager:
             if (
                 existing.request_id != request_id
                 or existing.token_capacity != token_capacity
+                or existing.prompt_token_count != prompt_tokens
                 or existing.partition != expected_partition
+                or existing.prefix_block_hashes
+                != {name: tuple(values) for name, values in prefix_hashes.items()}
             ):
                 raise ValueError("reservation identity was reused with different parameters")
             return existing
@@ -1449,27 +1601,87 @@ class KvCacheManager:
         # still rolls back an unexpected mid-allocation exception so a failed
         # reservation cannot strand a partially populated request.
         try:
+            shared_ids: dict[str, list[int]] = {
+                name: [] for name in self._group_pools
+            }
+            prefix_hit_tokens = 0
+            selected_prefix_partition = None
+            if prefix_hashes and self.enable_prefix_cache:
+                (
+                    shared_ids,
+                    prefix_hit_tokens,
+                    selected_prefix_partition,
+                ) = self.acquire_group_prefix_blocks(
+                    request_id,
+                    prefix_hashes,
+                    max_cache_hit_tokens=prompt_tokens,
+                    shareable_group_names=shareable_group_names,
+                    partition=partition,
+                )
             block_ids = self.ensure_group_blocks(
                 request_id,
-                token_capacity,
-                partition=partition,
+                prompt_tokens,
+                partition=(
+                    selected_prefix_partition
+                    if selected_prefix_partition is not None
+                    else partition
+                ),
             )
             selected = self.group_request_partition(request_id)
             if selected is None:
                 raise RuntimeError("grouped reservation has no selected partition")
+            self._reserve_group_decode_capacity(
+                request_id,
+                token_capacity,
+                selected,
+            )
+            block_ids = {
+                name: [
+                    pool.local_block_id(block)
+                    for block in pool.request_blocks[request_id]
+                    if block is not None
+                ]
+                for name, pool in self._group_pools.items()
+            }
         except BaseException:
             if request_id in self._group_request_partitions:
                 self.release_all_group_requests(request_id)
             raise
 
+        shared = {
+            name: tuple(shared_ids.get(name, ())) for name in self._group_pools
+        }
+        writable = {
+            name: tuple(
+                block_id
+                for block_id in block_ids[name]
+                if block_id not in set(shared[name])
+            )
+            for name in self._group_pools
+        }
+        cached_counts = {
+            name: min(
+                prefix_hit_tokens // self._group_pools[name].spec.spec.token_capacity,
+                len(prefix_hashes.get(name, ())),
+            )
+            for name in prefix_hashes
+        }
         reservation = GroupCacheReservation(
             reservation_id=reservation_id,
             request_id=request_id,
             token_capacity=token_capacity,
+            prompt_token_count=prompt_tokens,
             partition=selected,
             block_ids_by_group={
                 name: tuple(ids) for name, ids in block_ids.items()
             },
+            shared_block_ids_by_group=shared,
+            writable_block_ids_by_group=writable,
+            prefix_block_hashes={
+                name: tuple(values) for name, values in prefix_hashes.items()
+            },
+            prefix_hit_tokens=prefix_hit_tokens,
+            published_block_counts=cached_counts,
             state=GroupReservationState.CONSTRUCTING,
         )
         self._group_reservations[reservation_id] = reservation
@@ -1520,10 +1732,20 @@ class KvCacheManager:
             raise ValueError(f"cannot commit a reservation in state {current.state.value}")
         if not current.write_authorized:
             raise ValueError("cannot commit a reservation before remote-write authorization")
+        published = self.cache_group_blocks(
+            current.request_id,
+            {
+                name: list(values)
+                for name, values in current.prefix_block_hashes.items()
+            },
+            current.prompt_token_count,
+            current.published_block_counts,
+        )
         current = replace(
             current,
             state=GroupReservationState.READY,
             manifest_hash=manifest_hash,
+            published_block_counts=published,
         )
         self._group_reservations[reservation_id] = current
         return current
@@ -1540,13 +1762,21 @@ class KvCacheManager:
         return current
 
     def quarantine_group_cache(self, reservation_id: str) -> GroupCacheReservation:
-        """Keep all pages pinned after an uncertain write or owner loss."""
+        """Quarantine only remote-writable pages after an uncertain write.
+
+        Shared prefix references remain pinned until owner recovery so the
+        request view stays intact, but they are never classified as polluted.
+        """
         current = self._require_group_reservation(reservation_id)
         if current.state is GroupReservationState.RELEASED:
             raise ValueError("released reservations cannot be quarantined")
         if current.state is GroupReservationState.QUARANTINED:
             return current
-        current = replace(current, state=GroupReservationState.QUARANTINED)
+        current = replace(
+            current,
+            state=GroupReservationState.QUARANTINED,
+            quarantined_block_ids_by_group=current.writable_block_ids_by_group,
+        )
         self._group_reservations[reservation_id] = current
         return current
 

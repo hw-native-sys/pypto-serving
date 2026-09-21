@@ -2,7 +2,8 @@
 # Install an exported D0 stack in its dedicated container workspace.
 set -eo pipefail
 stage=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-source /home/sj/git/env_all.sh
+stack_env=${PYPTO_STACK_ENV_FILE:-/workspace/env_all.sh}
+source "$stack_env"
 cd "$stage/pypto"
 for repo in . runtime 3rdparty/libbacktrace 3rdparty/msgpack-c; do
     git -C "$repo" init -q
@@ -17,7 +18,8 @@ python3 -m venv --system-site-packages "$stage/pypto/runtime/.venv"
 source "$stage/env_pinned_stack.sh"
 mkdir -p "$stage/ascend" "$SIMPLER_ROOT/build"
 if [[ ! -e $SIMPLER_ROOT/build/pto-isa ]]; then
-    git clone --local /home/sj/git/phase-c-20260908/pypto/runtime/build/pto-isa "$SIMPLER_ROOT/build/pto-isa"
+    : "${PYPTO_ISA_SEED_DIR:=/workspace/phase-c-runtime/pypto/runtime/build/pto-isa}"
+    git clone --local "$PYPTO_ISA_SEED_DIR" "$SIMPLER_ROOT/build/pto-isa"
 fi
 test "$(git -C "$SIMPLER_ROOT/build/pto-isa" rev-parse HEAD)" = "$(tr -d '[:space:]' < runtime/pto_isa.pin)"
 python -m pip install 'scikit-build-core>=0.12.2,<2' 'pybind11<3' 'nanobind>=2.4,<3' 'setuptools>=77.0.3' ninja
@@ -31,7 +33,7 @@ python -m pip install --no-build-isolation --no-deps -e . \
     --config-settings="build.tool-args=-j$PYPTO_BUILD_JOBS"
 python -m pip install --no-build-isolation --no-deps -e runtime \
     --config-settings="build.tool-args=-j$PYPTO_BUILD_JOBS"
-if rg -l '/home/sj/git/pypto/runtime' "$SIMPLER_ROOT/build/cache" -g CMakeCache.txt >/dev/null; then
+if rg -l '/workspace/pypto/runtime' "$SIMPLER_ROOT/build/cache" -g CMakeCache.txt >/dev/null; then
     bash "$stage/rebuild_pinned_runtime.sh"
     exit 0
 fi

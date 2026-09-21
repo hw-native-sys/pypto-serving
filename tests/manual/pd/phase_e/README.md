@@ -10,8 +10,8 @@ directory, and stops only children proven to belong to its own process session. 
 never resets a device. P/D expose only `/health` and `/internal/pd/*`;
 the Router is the only process exposing `/v1/*`.
 
-The accepted topology is serving-a P (`192.169.0.173`), serving-b D
-(`192.169.0.85`), 16 physical devices per host, TP4/DP4/EP16, target-only P
+The accepted topology is one P host and one D host, with 16 physical devices
+per host, TP4/DP4/EP16, target-only P
 Prefill, D-local K7 drafter initialization, and Mooncake AscendDirect D2D.
 
 Launch D, then P, wait for both `/health` endpoints, and finally launch the Router.
@@ -27,7 +27,7 @@ The scripts expect the Phase D frozen dependencies plus the Phase E serving tree
 under one stage. The verified 2026-09-13 stage was:
 
 ```text
-/home/sj/git/phase-e-router-20260913-v2/
+/workspace/pd-serving-validation/
   env_pinned_stack.sh
   pypto-serving/
   pypto-serving/build_output -> frozen Phase D build output
@@ -42,8 +42,8 @@ both containers:
 {
   "runtime": {
     "run_id": "replace-with-new-run-id",
-    "prefill": [{"host": "192.169.0.173", "port": 8111, "node_id": "serving-a-p", "control_port": 29931}],
-    "decode": [{"host": "192.169.0.85", "port": 8112, "node_id": "serving-b-d", "control_port": 29931}]
+    "prefill": [{"host": "prefill.example.internal", "port": 8111, "node_id": "prefill-0", "control_port": 29931}],
+    "decode": [{"host": "decode.example.internal", "port": 8112, "node_id": "decode-0", "control_port": 29931}]
   }
 }
 ```
@@ -53,38 +53,38 @@ both containers:
 Run each node launcher in its own process session. The following values match the
 verified A/B topology; ports and evidence names must be changed if already used.
 
-On serving-b, launch D:
+On the decode host, launch D:
 
 ```bash
 export PD_ROLE=decode
-export PD_NODE_ID=serving-b-d
+export PD_NODE_ID=decode-0
 export PD_CONFIG=/absolute/path/pd.json
 export PD_API_PORT=8112
 export PD_EVIDENCE_NAME=replace-with-d-evidence-name
-setsid bash /home/sj/git/phase-e-router-20260913-v2/pypto-serving/tests/manual/pd/phase_e/run_pd_k7_node.sh
+setsid bash /workspace/pd-serving-validation/pypto-serving/tests/manual/pd/phase_e/run_pd_k7_node.sh
 ```
 
-On serving-a, launch P independently:
+On the prefill host, launch P independently:
 
 ```bash
 export PD_ROLE=prefill
-export PD_NODE_ID=serving-a-p
+export PD_NODE_ID=prefill-0
 export PD_CONFIG=/absolute/path/pd.json
 export PD_API_PORT=8111
 export PD_EVIDENCE_NAME=replace-with-p-evidence-name
-setsid bash /home/sj/git/phase-e-router-20260913-v2/pypto-serving/tests/manual/pd/phase_e/run_pd_k7_node.sh
+setsid bash /workspace/pd-serving-validation/pypto-serving/tests/manual/pd/phase_e/run_pd_k7_node.sh
 ```
 
-After both health endpoints return 200, launch the CPU-only Router on serving-a:
+After both health endpoints return 200, launch the CPU-only Router on the control host:
 
 ```bash
 export PD_CONFIG=/absolute/path/pd.json
 export ROUTER_PORT=8110
 export ROUTER_EVIDENCE_NAME=replace-with-router-evidence-name
-setsid bash /home/sj/git/phase-e-router-20260913-v2/pypto-serving/tests/manual/pd/phase_e/run_router.sh
+setsid bash /workspace/pd-serving-validation/pypto-serving/tests/manual/pd/phase_e/run_router.sh
 ```
 
-Submit both acceptance cases from inside the serving-a container:
+Submit both acceptance cases from the control container:
 
 ```bash
 bash tests/manual/pd/phase_e/run_smoke.sh \

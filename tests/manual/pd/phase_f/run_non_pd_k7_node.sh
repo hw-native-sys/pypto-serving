@@ -4,8 +4,12 @@ set -eo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/../../../.." && pwd)
-stage=$(cd "$repo_root/.." && pwd)
-source "$stage/env_pinned_stack.sh"
+stack_env=${PYPTO_STACK_ENV_FILE:-/workspace/env_all.sh}
+if [[ ! -f $stack_env ]]; then
+    echo "PYPTO stack environment file does not exist: $stack_env" >&2
+    exit 2
+fi
+source "$stack_env"
 
 : "${BASELINE_RUN_ID:?BASELINE_RUN_ID must be set}"
 : "${BASELINE_API_PORT:?BASELINE_API_PORT must be set}"
@@ -13,10 +17,66 @@ source "$stage/env_pinned_stack.sh"
 [[ $BASELINE_RUN_ID =~ ^[a-zA-Z0-9_.-]+$ ]]
 [[ $BASELINE_EVIDENCE_NAME =~ ^[a-zA-Z0-9_-]+$ ]]
 
-run_dir="$stage/$BASELINE_EVIDENCE_NAME"
+evidence_root=${BASELINE_EVIDENCE_ROOT:-/workspace/phase-g-runs}
+if [[ $evidence_root != /* || $evidence_root == / || ! -d $evidence_root ]]; then
+    echo "BASELINE_EVIDENCE_ROOT must be an existing explicit absolute directory" >&2
+    exit 2
+fi
+max_model_len=${PYPTO_MAX_MODEL_LEN:-524288}
+if [[ ! $max_model_len =~ ^[1-9][0-9]*$ ]]; then
+    echo "PYPTO_MAX_MODEL_LEN must be a positive integer" >&2
+    exit 2
+fi
+case ${PYPTO_ENABLE_PREFIX_CACHE:-1} in
+    1|true|TRUE|yes|YES)
+        prefix_cache_flag=--enable-prefix-caching
+        ;;
+    0|false|FALSE|no|NO)
+        prefix_cache_flag=--no-enable-prefix-caching
+        ;;
+    *)
+        echo "PYPTO_ENABLE_PREFIX_CACHE must be a boolean value" >&2
+        exit 2
+        ;;
+esac
+
+run_dir="$evidence_root/$BASELINE_EVIDENCE_NAME"
 test ! -e "$run_dir"
 mkdir "$run_dir"
 exec > "$run_dir/service.log" 2>&1
+
+{
+    printf 'stack_env=%s\n' "$stack_env"
+    sha256sum "$stack_env" || true
+    printf 'serving_head='
+    git -C "$repo_root" rev-parse HEAD || true
+    printf 'pypto_lib_head='
+    git -C "$PYPTO_LIB_HOME" rev-parse HEAD || true
+    printf 'pypto_head='
+    git -C "$PYPTO_HOME" rev-parse HEAD || true
+    printf 'simpler_runtime_head='
+    git -C "$PYPTO_HOME/runtime" rev-parse HEAD || true
+    printf 'pto_isa_env_head='
+    git -C "$PTO_ISA_ROOT" rev-parse HEAD || true
+    printf 'python=%s\n' "$(command -v python)"
+    printf 'ptoas=%s\n' "$(command -v ptoas)"
+    ptoas --version || true
+    printf 'max_model_len=%s\n' "$max_model_len"
+    printf 'prefix_cache_flag=%s\n' "$prefix_cache_flag"
+    python - <<'PY'
+import pypto
+import pypto_serving
+import simpler
+
+for name, module in (
+    ("pypto", pypto),
+    ("simpler", simpler),
+    ("pypto_serving", pypto_serving),
+):
+    print(f"{name}_version={getattr(module, '__version__', '<unset>')}")
+    print(f"{name}_file={module.__file__}")
+PY
+} > "$run_dir/version-lock.txt" 2>&1
 
 session_id=$(ps -o sid= -p $$ | tr -d ' ')
 if [[ $session_id != $$ ]]; then
@@ -30,7 +90,7 @@ if awk '/Process id/ {table=1; next} table && $2 ~ /^[0-9]+$/ {busy=1} END {exit
     exit 3
 fi
 
-export PYPTO_DSV4_DSPARK_MODEL_DIR=/models/dsv4-flash-0731-dspark-w8a8
+export PYPTO_DSV4_DSPARK_MODEL_DIR=${PYPTO_DSV4_DSPARK_MODEL_DIR:-/models/dsv4-flash-0731-dspark-w8a8}
 export TASK_DEVICE=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export ASCEND_PROCESS_LOG_PATH="$run_dir/ascend"
 export PYPTO_PROG_BUILD_DIR=${PYPTO_PROG_BUILD_DIR:-$repo_root/build_output}
@@ -84,10 +144,10 @@ python -m pypto_serving.cli \
     --served-model-name dsv4-flash-dspark-w8a8 \
     --backend npu --platform a2a3 \
     --devices "$TASK_DEVICE" --dp 4 --ep 16 --tp 4 \
-    --block-size 32 --max-model-len 1024 --max-num-seqs 8 \
+    --block-size 32 --max-model-len "$max_model_len" --max-num-seqs 8 \
     --max-num-batched-tokens 8192 --long-prefill-token-threshold 128 \
     --speculative-config '{"method":"dspark","num_speculative_tokens":7}' \
-    --no-enable-prefix-caching \
+    "$prefix_cache_flag" \
     --ring-heap 2147483648,2147483648,4294967296,8589934592 \
     --use-compile-cache \
     --host 0.0.0.0 --port "$BASELINE_API_PORT" --show-startup-logs &

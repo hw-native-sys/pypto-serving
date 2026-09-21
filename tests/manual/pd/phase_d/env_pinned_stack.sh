@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Source this file to select the Phase D D0 frozen stack.
-source /home/sj/git/env_all.sh
+stack_env=${PYPTO_STACK_ENV_FILE:-/workspace/env_all.sh}
+source "$stack_env"
 
 # The validation containers are not built from the same image.  Do not inherit
 # image-level toolkit aliases; select one CANN root and one project stack.

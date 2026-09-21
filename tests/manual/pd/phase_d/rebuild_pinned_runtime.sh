@@ -7,7 +7,7 @@ cd "$stage/pypto"
 source .claude/skills/testing/load-env.sh
 export CMAKE_BUILD_PARALLEL_LEVEL=${DSPARK_BUILD_JOBS:-$PYPTO_BUILD_JOBS}
 python -c 'import simpler_setup; from pathlib import Path; import os; assert Path(simpler_setup.__file__).resolve().is_relative_to(Path(os.environ["SIMPLER_ROOT"])), simpler_setup.__file__'
-if rg -l '/home/sj/git/pypto/runtime' "$SIMPLER_ROOT/build/cache" -g CMakeCache.txt >/dev/null; then
+if rg -l '/workspace/pypto/runtime' "$SIMPLER_ROOT/build/cache" -g CMakeCache.txt >/dev/null; then
     test ! -e runtime/build/cache-bootstrap
     test ! -e runtime/build/lib-bootstrap
     mv runtime/build/cache runtime/build/cache-bootstrap

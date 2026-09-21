@@ -22,6 +22,8 @@ from collections import deque
 from functools import partial, wraps
 from typing import Callable
 
+from pypto_serving.tools.profile import configure_profiler, get_profiler
+
 from .errors import ErrorCode, TransferError, TransferFailure
 from .mooncake import MooncakeTransferProvider
 from .types import (CompletionCertainty as Certainty, OwnerRef, ProviderCapabilities,
@@ -125,6 +127,7 @@ class OwnerBridge:
         self.process_handle = None
         self._monitor = None
         self._on_owner_lost = on_owner_lost
+        self._profile_config = get_profiler(initially_active=False).config
         self.health_events = deque(maxlen=16)
         self.commands = deque(maxlen=64)
         self._sources = {}
@@ -135,7 +138,14 @@ class OwnerBridge:
         if os.getpid() == self._parent_pid:
             raise RuntimeError("owner service must run inside the chip child")
         self._parent.close()
-        return _OwnerService(context, self._child, self.owner, self.hostname, self.native_timeout)
+        return _OwnerService(
+            context,
+            self._child,
+            self.owner,
+            self.hostname,
+            self.native_timeout,
+            self._profile_config,
+        )
 
     @_serialized
     def ready(self):
@@ -220,6 +230,16 @@ class OwnerBridge:
         self._request("write", task=asdict(task))
 
     @_serialized
+    def set_profile_active(self, active: bool) -> None:
+        if type(active) is not bool:
+            raise ValueError("owner profile state must be boolean")
+        reply = self._request("profile", active=active)
+        if reply.get("profile_error"):
+            raise RuntimeError(str(reply["profile_error"]))
+        if reply.get("profile_active") is not active:
+            raise RuntimeError("owner profiler did not enter the requested state")
+
+    @_serialized
     def release(self):
         self._request("release")
         for runtime, token in self._retentions:
@@ -277,9 +297,22 @@ class OwnerBridgeGroup:
 
 
 class _OwnerService:
-    def __init__(self, context, channel, owner, hostname, native_timeout):
+    def __init__(
+        self,
+        context,
+        channel,
+        owner,
+        hostname,
+        native_timeout,
+        profile_config,
+    ):
         self.context, self.channel, self.owner = context, channel, owner
         self.hostname, self.native_timeout = hostname, native_timeout
+        configure_profiler(
+            profile_config,
+            process_name=f"pd-transfer-owner-rank-{owner.rank_id}",
+            initially_active=False,
+        )
         self.tokens = []
         self.stopped = False
         self._acl = ctypes.CDLL("libascendcl.so")
@@ -330,6 +363,30 @@ class _OwnerService:
                         if task.attempt.source != self.owner:
                             raise ValueError("stale write owner")
                         provider.write(task)
+                    elif operation == "profile":
+                        requested = request.get("active")
+                        if type(requested) is not bool:
+                            raise ValueError("owner profile state must be boolean")
+                        profiler = get_profiler(
+                            process_name=(
+                                f"pd-transfer-owner-rank-{self.owner.rank_id}"
+                            ),
+                            initially_active=False,
+                        )
+                        try:
+                            if requested:
+                                # The chip child can have inherited an open
+                                # pre-start fragment. Reopen it after the API
+                                # process has cleared the previous profile run.
+                                profiler.stop()
+                                profiler.start()
+                            else:
+                                profiler.stop()
+                        except Exception as exc:
+                            reply["profile_error"] = (
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                        reply["profile_active"] = profiler.active
                     elif operation == "release":
                         provider.release()
                         for token in self.tokens:

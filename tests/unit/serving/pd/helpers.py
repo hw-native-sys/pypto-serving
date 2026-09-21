@@ -18,10 +18,14 @@ from pypto_serving.serving.pd.protocol import (
 )
 
 
-def make_cache_manager(*, capacity_slots: int = 2) -> KvCacheManager:
+def make_cache_manager(
+    *,
+    capacity_slots: int = 2,
+    enable_prefix_cache: bool = False,
+) -> KvCacheManager:
     ratios = tuple(4 if layer % 2 == 0 else 128 for layer in range(43))
     specs = build_dspark_cache_group_specs(43, ratios)
-    manager = KvCacheManager(enable_prefix_cache=False)
+    manager = KvCacheManager(enable_prefix_cache=enable_prefix_cache)
     manager.init_groups(
         specs,
         max_batch_size=capacity_slots,

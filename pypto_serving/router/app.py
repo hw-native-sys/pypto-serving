@@ -23,7 +23,7 @@ from .coordinator import RouterCoordinator
 from .directory import WorkerDirectory
 from .journal import RouterJournal
 from .policy import create_route_policy
-from .recovery import RecoveryPhase
+from .recovery import FixedPairRuntimeManager, RecoveryPhase
 
 
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
@@ -58,9 +58,13 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     reasoning_effort: ReasoningEffort | None = None
     chat_template_kwargs: dict | None = None
+    include_reasoning: bool = True
 
 
-def create_router_app(config: RouterConfig) -> FastAPI:
+def create_router_app(
+    config: RouterConfig,
+    runtime_manager: FixedPairRuntimeManager | None = None,
+) -> FastAPI:
     prefill_clients = tuple(
         NodeClient(url, config.request_timeout_seconds) for url in config.prefill_urls
     )
@@ -75,7 +79,12 @@ def create_router_app(config: RouterConfig) -> FastAPI:
         config.control_incarnation,
     )
     journal = RouterJournal(config.journal_path, config.run_id)
-    coordinator = RouterCoordinator(config, directory, journal)
+    coordinator = RouterCoordinator(
+        config,
+        directory,
+        journal,
+        runtime_manager=runtime_manager,
+    )
     app = FastAPI(title="PyPTO External PD Router")
 
     @app.exception_handler(ValueError)
@@ -139,7 +148,10 @@ def create_router_app(config: RouterConfig) -> FastAPI:
             {
                 "status": "ok",
                 "run_id": config.run_id,
-                "control_incarnation": config.control_incarnation,
+                "control_incarnation": (
+                    coordinator.recovery.current.control_incarnation
+                ),
+                "data_generation": coordinator.recovery.current.data_generation,
             }
         )
 
@@ -227,7 +239,7 @@ def create_router_app(config: RouterConfig) -> FastAPI:
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": final.text},
+                        "message": _chat_message(final),
                         "finish_reason": _map_finish_reason(final.finish_reason),
                     }
                 ],
@@ -256,7 +268,7 @@ async def _stream_completion(
 ):
     previous = ""
     async for output in coordinator.generate("completion", raw, request_id):
-        delta = output.text[len(previous) :] if output.text else ""
+        delta = _cumulative_delta(output.text, previous, "content")
         previous = output.text or previous
         finish_reason = _map_finish_reason(output.finish_reason) if output.finished else None
         yield _sse(
@@ -289,9 +301,16 @@ async def _stream_chat(
     model: str,
 ):
     previous = ""
+    previous_reasoning = ""
     async for output in coordinator.generate("chat", raw, request_id):
-        delta = output.text[len(previous) :] if output.text else ""
+        delta = _cumulative_delta(output.text, previous, "content")
         previous = output.text or previous
+        reasoning_delta = _cumulative_delta(
+            output.reasoning,
+            previous_reasoning,
+            "reasoning",
+        )
+        previous_reasoning = output.reasoning or previous_reasoning
         finish_reason = _map_finish_reason(output.finish_reason) if output.finished else None
         yield _sse(
             {
@@ -302,7 +321,11 @@ async def _stream_chat(
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {"role": "assistant", "content": delta},
+                        "delta": {
+                            "role": "assistant",
+                            "reasoning": reasoning_delta or None,
+                            "content": delta,
+                        },
                         "finish_reason": finish_reason,
                     }
                 ],
@@ -324,6 +347,21 @@ async def _stream_chat(
 
 def _sse(value: dict) -> bytes:
     return b"data: " + json.dumps(value, ensure_ascii=False).encode() + b"\n\n"
+
+
+def _cumulative_delta(current: str, previous: str, field: str) -> str:
+    """Validate replay-safe cumulative output and return only its new suffix."""
+    if not current.startswith(previous):
+        raise RuntimeError(f"Decode {field} output changed an already published prefix")
+    return current[len(previous) :]
+
+
+def _chat_message(output) -> dict:
+    return {
+        "role": "assistant",
+        "reasoning": output.reasoning or None,
+        "content": output.text,
+    }
 
 
 def _usage(output) -> dict:

@@ -260,6 +260,19 @@ def main() -> int:
                 errors.append(
                     f"{case_name}: repeated greedy token-ID digests differ"
                 )
+    comparison_groups: dict[str, set[str]] = {}
+    for case in cases:
+        group = case.get("comparison_group", "")
+        if not group:
+            continue
+        comparison_groups.setdefault(group, set()).update(
+            digests_by_case.get(case["name"], set())
+        )
+    for group, digests in sorted(comparison_groups.items()):
+        if len(digests) != 1:
+            errors.append(
+                f"comparison group {group}: greedy token-ID digests differ"
+            )
     if snapshots["router_recovery"]["phase"] != "RUNNING":
         errors.append("Router recovery gate is not RUNNING")
     for role in ("prefill_capacity", "decode_capacity"):
@@ -300,6 +313,10 @@ def main() -> int:
             )
         },
         "errors": errors,
+        "comparison_groups": {
+            group: sorted(digests)
+            for group, digests in sorted(comparison_groups.items())
+        },
         "result": "PASS" if not errors else "FAIL",
     }
     (evidence / "audit.json").write_text(
