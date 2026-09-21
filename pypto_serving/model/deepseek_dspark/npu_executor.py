@@ -199,8 +199,8 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         platform: str = "a2a3sim",
         device_id: int = 0,
         device_ids: Sequence[int] | None = None,
-        pypto_build_dir: str = "build_output",
-        use_compile_cache: bool = False,
+        pypto_build_dir: str | None = None,
+        use_compile_cache: bool | None = None,
         compile_kernels: bool = False,
         num_speculative_tokens: int = 0,
     ) -> None:
@@ -223,14 +223,14 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                 "model without speculation."
             )
         self._embedding_cache: dict[str, torch.Tensor] = {}
-        compile_cache_dir = self._pypto_build_dir if self._use_compile_cache else None
+        # The persistent JIT cache is resolved by PyPTO through the run config
+        # policy; an explicit build dir stays a diagnostic/output request.
         self._compiler = KernelCompiler(
             run_config=build_pypto_run_config(
                 platform=self._platform,
                 device_ids=self._device_ids,
-                pypto_build_dir=compile_cache_dir,
+                pypto_build_dir=self._pypto_build_dir,
             ),
-            cache_dir=compile_cache_dir,
         )
 
     @property
