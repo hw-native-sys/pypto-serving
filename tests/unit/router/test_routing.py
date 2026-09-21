@@ -87,8 +87,9 @@ def test_replica_name_defaults_to_host_port(tmp_path):
 @pytest.mark.parametrize(
     ("payload", "message"),
     [
-        ({"nodes": []}, "non-empty 'replicas' list"),
-        ({"replicas": []}, "non-empty 'replicas' list"),
+        ({"nodes": []}, "unknown top-level keys: nodes"),
+        ({"replicas": []}, "neither a replica nor a launchable host"),
+        ({"replicas": [], "hosts": []}, "neither a replica nor a launchable host"),
         ({"replicas": [{"host": "h"}]}, "needs 'host' and 'port'"),
         ({"replicas": [{"port": 8000}]}, "needs 'host' and 'port'"),
         ({"replicas": ["nope"]}, "needs 'host' and 'port'"),
