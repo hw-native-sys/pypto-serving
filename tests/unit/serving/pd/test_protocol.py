@@ -250,6 +250,8 @@ def test_parser_spec_and_reasoning_survive_pd_wire_round_trip() -> None:
         token_id=101,
         text="answer",
         reasoning="hidden on request but valid on the wire",
+        text_delta="swer",
+        reasoning_delta="valid on the wire",
         finished=True,
         finish_reason="FINISHED_LENGTH",
         prompt_tokens=3,

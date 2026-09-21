@@ -10,7 +10,6 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-import pytest
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.router.app import _chat_message, _stream_chat
@@ -162,11 +161,13 @@ def _decode_sse(chunks: list[bytes]) -> list[dict]:
     return decoded
 
 
-def test_router_streams_independent_cumulative_reasoning_and_content() -> None:
+def test_router_streams_independent_reasoning_and_content_deltas() -> None:
     outputs = [
         SimpleNamespace(
             reasoning="plan",
             text="",
+            reasoning_delta="plan",
+            text_delta="",
             finished=False,
             finish_reason="",
             prompt_tokens=3,
@@ -175,6 +176,8 @@ def test_router_streams_independent_cumulative_reasoning_and_content() -> None:
         SimpleNamespace(
             reasoning="plan more",
             text="answer",
+            reasoning_delta=" more",
+            text_delta="answer",
             finished=False,
             finish_reason="",
             prompt_tokens=3,
@@ -183,6 +186,8 @@ def test_router_streams_independent_cumulative_reasoning_and_content() -> None:
         SimpleNamespace(
             reasoning="plan more",
             text="answer",
+            reasoning_delta="",
+            text_delta="",
             finished=True,
             finish_reason="FINISHED_LENGTH",
             prompt_tokens=3,
@@ -216,11 +221,13 @@ def test_router_non_streaming_message_preserves_both_semantic_channels() -> None
     }
 
 
-def test_router_rejects_replay_that_changes_published_reasoning_prefix() -> None:
+def test_router_streams_authoritative_deltas_when_cumulative_fields_change() -> None:
     outputs = [
         SimpleNamespace(
             reasoning="stable prefix",
             text="",
+            reasoning_delta="stable prefix",
+            text_delta="",
             finished=False,
             finish_reason="",
             prompt_tokens=1,
@@ -228,7 +235,9 @@ def test_router_rejects_replay_that_changes_published_reasoning_prefix() -> None
         ),
         SimpleNamespace(
             reasoning="different",
-            text="",
+            text="answer",
+            reasoning_delta="",
+            text_delta="answer",
             finished=True,
             finish_reason="FINISHED_LENGTH",
             prompt_tokens=1,
@@ -244,5 +253,7 @@ def test_router_rejects_replay_that_changes_published_reasoning_prefix() -> None
             )
         ]
 
-    with pytest.raises(RuntimeError, match="reasoning output changed"):
-        asyncio.run(collect())
+    events = _decode_sse(asyncio.run(collect()))
+    deltas = [event["choices"][0]["delta"] for event in events if event["choices"]]
+    assert [delta["reasoning"] for delta in deltas] == ["stable prefix", None]
+    assert [delta["content"] for delta in deltas] == ["", "answer"]

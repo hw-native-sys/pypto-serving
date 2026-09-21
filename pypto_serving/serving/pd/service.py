@@ -1714,6 +1714,8 @@ class PDServingService:
                     token_ids=output.token_ids,
                     output_sequence=output_sequence,
                     reasoning=output.reasoning,
+                    text_delta=output.text_delta,
+                    reasoning_delta=output.reasoning_delta,
                 )
                 queue = self._decode_queues.get(key)
                 if queue is None:

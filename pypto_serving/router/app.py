@@ -306,17 +306,7 @@ async def _stream_chat(
     request_id: str,
     model: str,
 ):
-    previous = ""
-    previous_reasoning = ""
     async for output in coordinator.generate("chat", raw, request_id):
-        delta = _cumulative_delta(output.text, previous, "content")
-        previous = output.text or previous
-        reasoning_delta = _cumulative_delta(
-            output.reasoning,
-            previous_reasoning,
-            "reasoning",
-        )
-        previous_reasoning = output.reasoning or previous_reasoning
         finish_reason = _map_finish_reason(output.finish_reason) if output.finished else None
         yield _sse(
             {
@@ -329,8 +319,8 @@ async def _stream_chat(
                         "index": 0,
                         "delta": {
                             "role": "assistant",
-                            "reasoning": reasoning_delta or None,
-                            "content": delta,
+                            "reasoning": output.reasoning_delta or None,
+                            "content": output.text_delta,
                         },
                         "finish_reason": finish_reason,
                     }
