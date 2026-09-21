@@ -77,6 +77,37 @@ def _result(component: str, certainty: CompletionCertainty, attempt: str = "a1")
     )
 
 
+def _chunk_manifest(
+    chunk_id: int,
+    start_token: int,
+    end_token: int,
+    *,
+    source_prefix_hit_tokens: int,
+) -> ChunkManifest:
+    units = (TransferUnit(0, "ori", 0),)
+    digest = chunk_payload_hash(
+        KEY,
+        chunk_id=chunk_id,
+        start_token=start_token,
+        end_token=end_token,
+        final=False,
+        expected_units=units,
+        copies_by_rank={0: ()},
+        source_prefix_hit_tokens=source_prefix_hit_tokens,
+    )
+    return ChunkManifest(
+        key=KEY,
+        chunk_id=chunk_id,
+        start_token=start_token,
+        end_token=end_token,
+        final=False,
+        manifest_hash=digest,
+        expected_units=units,
+        copies_by_rank={0: ()},
+        source_prefix_hit_tokens=source_prefix_hit_tokens,
+    )
+
+
 def _commit(manifest: ChunkManifest) -> CommitRequest:
     return CommitRequest(KEY, manifest.manifest_hash, 9, manifest.metadata_hash)
 
@@ -174,3 +205,15 @@ def test_manifest_hash_and_generation_are_fail_closed() -> None:
     )
     with pytest.raises(ValueError, match="identity"):
         tracker.record_transfer(stale)
+
+
+def test_p_prefix_hit_must_remain_stable_across_chunks() -> None:
+    tracker = CompletionTracker(KEY, "reservation")
+    tracker.register_chunk(
+        _chunk_manifest(0, 0, 256, source_prefix_hit_tokens=128)
+    )
+
+    with pytest.raises(ValueError, match="remain stable"):
+        tracker.register_chunk(
+            _chunk_manifest(1, 256, 512, source_prefix_hit_tokens=256)
+        )

@@ -139,6 +139,11 @@ def test_pd_prefix_cache_profile_drives_local_engine_flag(
         )
     )
     assert config.enable_prefix_cache is expected
+    if expected:
+        assert config.runtime_config.speculative_prefix_cache_replay_tokens == max(
+            group.sliding_window or 0
+            for group in config.runtime_config.kv_cache_groups
+        )
     config.validate_pd()
 
 
