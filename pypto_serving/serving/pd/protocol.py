@@ -219,6 +219,7 @@ class ChunkManifest(msgspec.Struct, tag="chunk_manifest", frozen=True):
     manifest_hash: str
     expected_units: tuple[TransferUnit, ...]
     copies_by_rank: dict[int, tuple[PageCopy, ...]]
+    source_prefix_hit_tokens: int = 0
     first_token: int | None = None
     metadata_hash: str = ""
     continuation: ContinuationMetadata | None = None
@@ -464,6 +465,7 @@ def chunk_payload_hash(
     final: bool,
     expected_units: tuple[TransferUnit, ...],
     copies_by_rank: dict[int, tuple[PageCopy, ...]],
+    source_prefix_hit_tokens: int = 0,
 ) -> str:
     """Digest the canonical physical write set, independent of wire ordering."""
     units = sorted(
@@ -492,6 +494,7 @@ def chunk_payload_hash(
         start_token,
         end_token,
         final,
+        source_prefix_hit_tokens,
         tuple(units),
         tuple((rank_id, tuple(rank_copies)) for rank_id, rank_copies in copies),
     )

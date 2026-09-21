@@ -22,7 +22,7 @@ from .adapter import ModelPDAdapter
 from .contracts import RuntimeLayoutDescriptor
 
 
-PD_SCHEMA_VERSION = 5
+PD_SCHEMA_VERSION = 6
 SUPPORTED_PD_PROVIDERS = frozenset({"mooncake"})
 
 

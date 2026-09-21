@@ -57,6 +57,7 @@ class GroupCacheReservation:
     state: GroupReservationState
     write_authorized: bool = False
     manifest_hash: str = ""
+    publication_valid_from: dict[str, int] = field(default_factory=dict)
     quarantined_block_ids_by_group: dict[str, tuple[int, ...]] = field(
         default_factory=dict
     )
@@ -1716,10 +1717,24 @@ class KvCacheManager:
         self,
         reservation_id: str,
         manifest_hash: str,
+        *,
+        valid_from: dict[str, int] | None = None,
     ) -> GroupCacheReservation:
         """Atomically publish a completely received reservation as READY."""
         if not isinstance(manifest_hash, str) or not manifest_hash:
             raise ValueError("manifest_hash must be a nonempty string")
+        publication_floor = dict(valid_from or {})
+        unknown = set(publication_floor) - set(self._group_pools)
+        if unknown:
+            raise ValueError(
+                "unknown cache groups in publication floor: "
+                + ", ".join(sorted(unknown))
+            )
+        if any(
+            type(value) is not int or value < 0
+            for value in publication_floor.values()
+        ):
+            raise ValueError("cache publication floors must be non-negative integers")
         current = self._require_group_reservation(reservation_id)
         if current.state in (
             GroupReservationState.READY,
@@ -1727,6 +1742,8 @@ class KvCacheManager:
         ):
             if current.manifest_hash != manifest_hash:
                 raise ValueError("ready reservation manifest mismatch")
+            if current.publication_valid_from != publication_floor:
+                raise ValueError("ready reservation publication floor mismatch")
             return current
         if current.state is not GroupReservationState.CONSTRUCTING:
             raise ValueError(f"cannot commit a reservation in state {current.state.value}")
@@ -1740,12 +1757,14 @@ class KvCacheManager:
             },
             current.prompt_token_count,
             current.published_block_counts,
+            valid_from=publication_floor,
         )
         current = replace(
             current,
             state=GroupReservationState.READY,
             manifest_hash=manifest_hash,
             published_block_counts=published,
+            publication_valid_from=publication_floor,
         )
         self._group_reservations[reservation_id] = current
         return current
