@@ -274,6 +274,8 @@ class DecodeOutputWire(msgspec.Struct, tag="decode_output", frozen=True):
     token_ids: tuple[int, ...] = ()
     output_sequence: int = 0
     reasoning: str = ""
+    text_delta: str = ""
+    reasoning_delta: str = ""
 
 
 class OpenRoute(msgspec.Struct, tag="open_route", frozen=True):
