@@ -31,9 +31,12 @@ DEFAULT_HEALTH_INTERVAL_SECONDS = 5.0
 # the whole exchange instead.
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 3600.0
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
-# A model load is minutes, not seconds: Qwen3-14B takes ~130s with a warm kernel
-# cache and DeepSeek considerably longer. A replica that misses this is stopped,
-# so a launch that will never serve does not keep holding its device.
+# A model load is minutes, not seconds, and the spread is wide: Qwen3-14B
+# reports ready in ~130s with a warm kernel cache, DeepSeek V4 on eight cards in
+# ~370s as measured here. Older measurements of DeepSeek on a different
+# checkpoint and an earlier stack ran to 1198s, so the figure moves with both --
+# size this for the model and the stack the deployment actually runs, and raise
+# it rather than have the router stop a replica that was still loading.
 DEFAULT_LAUNCH_TIMEOUT_SECONDS = 600.0
 # Aborting a half-finished generation to reclaim a device is worse than waiting.
 DEFAULT_DRAIN_TIMEOUT_SECONDS = 300.0
@@ -64,8 +67,18 @@ class HostSpec:
 
     ``devices`` is declared, not discovered: plenty of deployments have no
     scheduler to ask, and a wrong answer that over-subscribes a card is worse
-    than one the operator wrote down. It is also the ceiling -- the router
-    launches at most one replica per declared device.
+    than one the operator wrote down.
+
+    ``devices_per_replica`` is how many of those cards one replica needs, which
+    is a property of the model and its kernels rather than anything the router
+    can measure -- 1 for Qwen3-14B, exactly 8 for DeepSeek V4, 16 for its DSpark
+    variant, where the expert-parallel width is compiled in. Declared for the
+    same reason: deriving it would mean reading a checkpoint on a machine the
+    router has no business being able to see. A wrong value fails on the replica
+    at startup, where the model topology is validated and the error names the
+    number it wanted.
+
+    Together they give the host's ceiling: ``len(devices) // devices_per_replica``.
     """
 
     name: str
@@ -74,6 +87,7 @@ class HostSpec:
     # Path to a private key. Key material never appears in the config itself.
     identity_file: str | None = None
     devices: tuple[int, ...] = ()
+    devices_per_replica: int = 1
     port_base: int = 8001
     model: str = ""
     served_model_name: str | None = None
@@ -102,24 +116,47 @@ class HostSpec:
             raise ValueError(f"host {self.name!r} repeats a device id")
         if not self.model:
             raise ValueError(f"host {self.name!r} must declare a model path")
-        for device in self.devices:
-            port = self.port_base + device
+        if self.devices_per_replica < 1:
+            raise ValueError(f"host {self.name!r} devices_per_replica must be positive")
+        # Refused here rather than leaving a partial group to fail on the device:
+        # a leftover card is either a typo or a model the operator has misread.
+        if len(self.devices) % self.devices_per_replica:
+            raise ValueError(
+                f"host {self.name!r} declares {len(self.devices)} devices, which is not a "
+                f"multiple of devices_per_replica={self.devices_per_replica}"
+            )
+        for group in self.device_groups():
+            port = self.port_for(group)
             if not 1 <= port <= 65535:
                 raise ValueError(
-                    f"host {self.name!r} device {device} maps to invalid port {port}"
+                    f"host {self.name!r} device group {list(group)} maps to invalid port {port}"
                 )
 
     @property
     def is_local(self) -> bool:
         return self.ssh is None
 
-    def port_for(self, device: int) -> int:
-        """Port a replica on this device listens on.
+    @property
+    def replica_capacity(self) -> int:
+        """How many replicas fit on this host."""
+        return len(self.devices) // self.devices_per_replica
 
-        Derived rather than allocated, so two launches on one host can never
-        pick the same port and a relaunch is predictable.
+    def device_groups(self) -> tuple[tuple[int, ...], ...]:
+        """The declared devices cut into one group per replica, in order."""
+        width = self.devices_per_replica
+        return tuple(
+            tuple(self.devices[start:start + width])
+            for start in range(0, len(self.devices), width)
+        )
+
+    def port_for(self, group: tuple[int, ...]) -> int:
+        """Port a replica on this device group listens on.
+
+        Keyed on the group's first device, so it is derived rather than
+        allocated: two launches on one host can never pick the same port, and a
+        relaunch into the same group is predictable.
         """
-        return self.port_base + device
+        return self.port_base + group[0]
 
     def address(self) -> str:
         """Address the router reaches this host's replicas on."""
@@ -180,8 +217,12 @@ class RouterConfig:
 
     @property
     def pool_ceiling(self) -> int:
-        """How many replicas the router may own at once."""
-        declared = sum(len(host.devices) for host in self.hosts)
+        """How many replicas the router may own at once.
+
+        Cards, divided by the cards one replica of this model needs -- so eight
+        cards serve eight Qwen replicas or exactly one DeepSeek V4.
+        """
+        declared = sum(host.replica_capacity for host in self.hosts)
         if self.max_replicas is None:
             return declared
         return min(declared, self.max_replicas)
@@ -205,9 +246,9 @@ def _parse_replica(entry: object, index: int) -> ReplicaSpec:
 
 
 _HOST_FIELDS = frozenset({
-    "name", "ssh", "identity_file", "devices", "port_base", "model",
-    "served_model_name", "serve_args", "env", "launch_wrapper", "stop_command",
-    "python", "workdir", "log_dir",
+    "name", "ssh", "identity_file", "devices", "devices_per_replica", "port_base",
+    "model", "served_model_name", "serve_args", "env", "launch_wrapper",
+    "stop_command", "python", "workdir", "log_dir",
 })
 
 
@@ -241,11 +282,18 @@ def _parse_host(entry: object, index: int) -> HostSpec:
     if isinstance(port_base, bool) or not isinstance(port_base, int):
         raise ValueError(f"host {index} 'port_base' must be an integer")
 
+    per_replica = entry.get("devices_per_replica", 1)
+    if isinstance(per_replica, bool) or not isinstance(per_replica, int) or per_replica < 1:
+        raise ValueError(
+            f"host {index} 'devices_per_replica' must be a positive integer"
+        )
+
     return HostSpec(
         name=entry.get("name") or f"host{index}",
         ssh=entry.get("ssh"),
         identity_file=entry.get("identity_file"),
         devices=tuple(devices),
+        devices_per_replica=per_replica,
         port_base=port_base,
         model=entry.get("model", ""),
         served_model_name=entry.get("served_model_name"),

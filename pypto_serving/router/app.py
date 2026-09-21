@@ -80,7 +80,7 @@ class ServingRouter:
         self.proxy = ReplicaProxy(self.registry, self.client)
         self.health = HealthMonitor(config, self.registry, self.sessions, self.client)
         self._admin_token = admin_token
-        fleet_kwargs = {"state_path": state_path}
+        fleet_kwargs = {"state_path": state_path, "probe": self._probe_replica}
         if transport_factory is not None:
             fleet_kwargs["transport_factory"] = transport_factory
         self.fleet = FleetManager(config, self.registry, **fleet_kwargs)
@@ -373,7 +373,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"  Replica (external): {replica.name} -> {replica.base_url}")
     for host in config.hosts:
         where = "local" if host.is_local else host.ssh
-        print(f"  Host: {host.name} [{where}] devices={list(host.devices)}")
+        print(
+            f"  Host: {host.name} [{where}] devices={list(host.devices)} "
+            f"({host.devices_per_replica}/replica -> {host.replica_capacity} slot(s))"
+        )
     print(f"  Pool: launching {config.initial_replicas} of {config.pool_ceiling} slot(s) at startup")
     print(f"  Session TTL: {config.session_ttl_seconds:g}s, affinity slack: {config.affinity_slack}")
     print("  Endpoints: /v1/completions, /v1/chat/completions, /v1/models, /health, /replicas")

@@ -40,17 +40,18 @@ One slot per declared device; a replica launched from a slot is owned by the rou
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `devices` | Required | Device ids the router may use. Declared, not discovered — this is the capacity ceiling for the host. |
+| `devices` | Required | Device ids the router may use. Declared, not discovered. |
+| `devices_per_replica` | `1` | How many of those cards one replica needs — 1 for Qwen3-14B, 8 for DeepSeek V4, 16 for DSpark, where the count is compiled into the kernels. The host's capacity is `len(devices) // devices_per_replica`; a list that is not a whole multiple is refused. |
 | `model` | Required | Model path **on that machine**. |
 | `name` | `host<N>` | Label; slots are named `<name>-d<device>`. |
 | `ssh` | none | ssh destination, e.g. `user@host`. Omitted means the machine the router runs on. |
 | `identity_file` | none | Path to a private key. A path only — key material never appears in the config. |
-| `port_base` | `8001` | A replica on device *d* listens on `port_base + d`. |
+| `port_base` | `8001` | A replica listens on `port_base +` the first device of its group. |
 | `served_model_name` | checkpoint name | Should match across hosts, since the fleet serves one model. |
 | `serve_args` | `[]` | Extra `pypto-serving` flags, passed through verbatim. |
-| `env` | `{}` | Environment for the launched process. `{device}` and `{port}` expand. |
-| `launch_wrapper` | `[]` | Prefix such as `["task-submit", "--device", "{device}", "--run"]`; the serving command is appended as one argument. Absent, the command runs bare. |
-| `stop_command` | `pkill` by port | How to stop a replica. `{device}` and `{port}` expand. |
+| `env` | `{}` | Environment for the launched process. `{device}` (the group's first), `{devices}` (the whole comma-separated group) and `{port}` expand. |
+| `launch_wrapper` | `[]` | Prefix such as `["task-submit", "--device", "{devices}", "--run"]`; the serving command is appended as one argument. Absent, the command runs bare. |
+| `stop_command` | `pkill` by port | How to stop a replica. `{device}`, `{devices}` and `{port}` expand. |
 | `python` | `python3` | Interpreter on that machine. |
 | `workdir` | none | Directory to run from. |
 | `log_dir` | `/tmp/pypto-serving-router` | Where a launched replica's startup output goes. A launch is detached, so this is the only record of a failed model load. |
@@ -69,7 +70,7 @@ One slot per declared device; a replica launched from a slot is owned by the rou
 | `--connect-timeout SECONDS` | `5` | Connect timeout per replica. |
 | `--initial-replicas N` | `1` with hosts, else `0` | Replicas to launch at startup, filling slots in config order, local machine first. Refused at startup if it exceeds the pool. |
 | `--max-replicas N` | declared pool | Cap launched replicas below the declared devices. |
-| `--launch-timeout SECONDS` | `600` | How long a launch may take to report ready before it is stopped and its device released. |
+| `--launch-timeout SECONDS` | `600` | How long a launch may take to report ready before it is stopped and its devices released. Measured loads: Qwen3-14B ~130s warm, DeepSeek V4 ~370s on eight cards. Load times move with the checkpoint and the stack, so time your own and leave headroom — too low means the router stops a replica that was loading normally. |
 | `--drain-timeout SECONDS` | `300` | How long to wait for in-flight requests before stopping a replica. |
 | `--state-file PATH` | none | Records launched replicas so a restarted router can adopt them instead of paying for a fresh model load. |
 | `--admin-token TOKEN` | none | Require `Authorization: Bearer TOKEN` on `/replicas`. |

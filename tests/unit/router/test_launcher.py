@@ -22,7 +22,7 @@ import json
 import pytest
 
 from pypto_serving.router.config import HostSpec, ReplicaSpec, RouterConfig
-from pypto_serving.router.fleet import FleetManager
+from pypto_serving.router.fleet import STOP_GRACE_SECONDS, FleetManager
 from pypto_serving.router.launcher import (
     HostPool,
     LaunchError,
@@ -131,7 +131,7 @@ def test_the_serve_command_carries_what_a_remote_launch_needs():
 
     assert argv[:3] == ["python3", "-m", "pypto_serving.cli"]
     assert "--model" in argv and "/weights/Qwen3-14B" in argv
-    assert argv[argv.index("--device") + 1] == "1"
+    assert argv[argv.index("--devices") + 1] == "1"
     assert argv[argv.index("--port") + 1] == "8002"
     # Binds on all interfaces or the router on another host cannot reach it.
     assert argv[argv.index("--host") + 1] == "0.0.0.0"
@@ -523,3 +523,162 @@ def test_get_replicas_reports_the_fleet_and_what_is_left():
     assert payload["capacity"] == {
         "owned": 1, "ceiling": 3, "free_slots": ["node02-d0", "node02-d1"],
     }
+
+
+# --- a stopped slot is not free until the replica is really gone ---
+
+def test_a_slot_is_held_until_the_stopped_replica_stops_answering():
+    """Freeing on the signal alone would let the next launch race the port."""
+    answers = {"alive": True}
+
+    async def probe(_spec):
+        return answers["alive"]
+
+    config = RouterConfig(hosts=_hosts(), initial_replicas=0, health_interval_seconds=0.01)
+    sessions = SessionDirectory(config.session_ttl_seconds)
+    registry = ReplicaRegistry(config, sessions)
+    manager = FleetManager(
+        config, registry, transport_factory=lambda _h: _FakeTransport(), probe=probe,
+    )
+
+    async def check():
+        spec = await manager.launch_one()
+        registry.set_ready(spec.name, True)
+
+        stopping = asyncio.create_task(manager.stop(spec.name))
+        await asyncio.sleep(0.2)
+        # Signalled, but still answering: the slot must not be handed out yet.
+        assert not stopping.done()
+        assert manager.pool.in_use == 1
+
+        answers["alive"] = False
+        await stopping
+        assert manager.pool.in_use == 0
+
+    asyncio.run(check())
+
+
+def test_the_stop_grace_period_is_bounded_and_modest():
+    assert 0 < STOP_GRACE_SECONDS <= 60
+
+
+def test_a_replica_that_will_not_die_does_not_wedge_the_slot_forever():
+    async def always_alive(_spec):
+        return True
+
+    config = RouterConfig(hosts=_hosts(), initial_replicas=0, health_interval_seconds=0.01)
+    sessions = SessionDirectory(config.session_ttl_seconds)
+    registry = ReplicaRegistry(config, sessions)
+    manager = FleetManager(
+        config, registry, transport_factory=lambda _h: _FakeTransport(), probe=always_alive,
+    )
+
+    async def check():
+        spec = await manager.launch_one()
+        registry.set_ready(spec.name, True)
+        # Bounded: a replica that ignores its stop must not hold a device for
+        # the life of the router, so the wait gives up and reuses it anyway.
+        started = asyncio.get_running_loop().time()
+        await manager._wait_gone(spec, timeout=0.3)
+        assert asyncio.get_running_loop().time() - started < 3.0, "the wait is not bounded"
+
+    asyncio.run(check())
+
+
+# --- a replica may need more than one card ---
+
+def _wide_host(devices=(0, 1, 2, 3, 4, 5, 6, 7), per_replica=8) -> HostSpec:
+    """A host sized for a model whose replica spans several cards."""
+    return HostSpec(
+        name="dsv4", ssh="u@h", devices=tuple(devices),
+        devices_per_replica=per_replica, port_base=8001,
+        model="/weights/dsv4-flash-w8a8", served_model_name="dsv4",
+        serve_args=("--dp", "8", "--ep", "8", "--tp", "1", "--block-size", "128"),
+    )
+
+
+def test_eight_cards_at_eight_per_replica_is_one_slot():
+    """The DeepSeek V4 shape: a whole node is one replica, not eight."""
+    host = _wide_host()
+    assert host.replica_capacity == 1
+    assert host.device_groups() == ((0, 1, 2, 3, 4, 5, 6, 7),)
+
+    pool = HostPool(RouterConfig(hosts=(host,)))
+    assert pool.ceiling == 1
+    slot = pool.allocate()
+    assert slot.devices == (0, 1, 2, 3, 4, 5, 6, 7)
+    with pytest.raises(PoolExhausted):
+        pool.allocate()
+
+
+def test_sixteen_cards_at_eight_per_replica_is_two_slots():
+    host = _wide_host(devices=tuple(range(16)))
+    assert host.replica_capacity == 2
+    assert host.device_groups() == (tuple(range(8)), tuple(range(8, 16)))
+
+    pool = HostPool(RouterConfig(hosts=(host,)))
+    names = [pool.allocate().name for _ in range(2)]
+    # Named and ported by the group's first device, so the two never collide.
+    assert names == ["dsv4-d0", "dsv4-d8"]
+    assert [host.port_for(group) for group in host.device_groups()] == [8001, 8009]
+
+
+def test_the_whole_group_is_passed_to_serving():
+    pool = HostPool(RouterConfig(hosts=(_wide_host(),)))
+    argv = pool.serve_argv(pool.free_slots()[0])
+    # One --devices with the full group; serving validates it against what the
+    # model's kernels require and refuses a wrong count at startup.
+    assert argv[argv.index("--devices") + 1] == "0,1,2,3,4,5,6,7"
+    assert "--device" not in argv
+    assert argv[argv.index("--port") + 1] == "8001"
+    for flag in ("--dp", "--ep", "--tp"):
+        assert flag in argv, f"{flag} from serve_args must survive"
+
+
+def test_templates_can_expand_the_group_or_its_first_device():
+    host = HostSpec(
+        name="dsv4", ssh="u@h", devices=tuple(range(8)), devices_per_replica=8,
+        model="/m",
+        launch_wrapper=("task-submit", "--device", "{devices}", "--run"),
+        env={"VIS": "{devices}", "BUILD": "/b/{device}"},
+    )
+    pool = HostPool(RouterConfig(hosts=(host,)))
+    slot = pool.free_slots()[0]
+    assert pool.launch_argv(slot)[:4] == ["task-submit", "--device", "0,1,2,3,4,5,6,7", "--run"]
+    assert pool.launch_env(slot) == {"VIS": "0,1,2,3,4,5,6,7", "BUILD": "/b/0"}
+
+
+def test_a_device_count_that_is_not_a_whole_number_of_replicas_is_refused():
+    """A leftover card is a typo or a misread model, not a partial replica."""
+    with pytest.raises(ValueError, match="not a multiple of devices_per_replica=8"):
+        HostSpec(name="h", devices=tuple(range(6)), devices_per_replica=8, model="/m")
+
+
+def test_devices_per_replica_must_be_positive():
+    with pytest.raises(ValueError, match="devices_per_replica must be positive"):
+        HostSpec(name="h", devices=(0,), devices_per_replica=0, model="/m")
+
+
+def test_the_pool_ceiling_mixes_hosts_of_different_widths():
+    """One Qwen card next to an eight-card DeepSeek node is 1 + 1 slots."""
+    qwen = HostSpec(name="qwen", devices=(4,), model="/q")
+    config = RouterConfig(hosts=(qwen, _wide_host()))
+    assert config.pool_ceiling == 2
+
+
+def test_a_wide_replica_is_launched_and_stopped_as_one_unit():
+    config = RouterConfig(hosts=(_wide_host(),), initial_replicas=0)
+    sessions = SessionDirectory(config.session_ttl_seconds)
+    registry = ReplicaRegistry(config, sessions)
+    transport = _FakeTransport()
+    manager = FleetManager(config, registry, transport_factory=lambda _h: transport)
+
+    async def check():
+        spec = await manager.launch_one()
+        registry.set_ready(spec.name, True)
+        assert manager.pool.in_use == 1
+        assert "0,1,2,3,4,5,6,7" in transport.commands()[0]
+        await manager.stop(spec.name)
+        assert manager.pool.in_use == 0, "the whole group comes back, not one card"
+
+    asyncio.run(check())
