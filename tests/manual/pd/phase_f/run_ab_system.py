@@ -398,7 +398,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model-dir", default="/models/dsv4-flash-0731-dspark-w8a8"
     )
-    parser.add_argument("--max-model-len", type=int, default=524288)
+    parser.add_argument("--max-model-len", type=int, default=293888)
+    parser.add_argument("--max-output-tokens", type=int, default=131072)
     parser.add_argument("--container", default="openeuler-2403-DS")
     parser.add_argument(
         "--prefill-container",
@@ -491,6 +492,8 @@ def main() -> int:
         raise ValueError("soak-requests must be positive")
     if args.max_model_len < 1:
         raise ValueError("max-model-len must be positive")
+    if args.max_output_tokens < 1:
+        raise ValueError("max-output-tokens must be positive")
     for name in ("generation", "route_epoch", "control_incarnation"):
         if getattr(args, name) < 1:
             raise ValueError(f"{name.replace('_', '-')} must be positive")
@@ -591,6 +594,7 @@ def main() -> int:
             "PYPTO_STACK_ENV_FILE": args.env_file,
             "PYPTO_DSV4_DSPARK_MODEL_DIR": args.model_dir,
             "PYPTO_MAX_MODEL_LEN": args.max_model_len,
+            "PYPTO_MAX_OUTPUT_TOKENS": args.max_output_tokens,
         }
         _start(
             args.decode_ssh,
