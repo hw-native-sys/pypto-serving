@@ -39,6 +39,11 @@ from pypto_serving.router.routing import ReplicaRegistry
 
 logger = logging.getLogger(__name__)
 
+# How long to wait for a signalled replica to actually stop answering before
+# reusing its device anyway. A replica that ignores its stop must not hold a
+# card for the life of the router.
+STOP_GRACE_SECONDS = 30.0
+
 
 class FleetManager:
     """Launches, drains and stops the replicas this router owns."""
@@ -50,11 +55,15 @@ class FleetManager:
         *,
         transport_factory=transport_for,
         state_path: Path | None = None,
+        probe=None,
     ) -> None:
         self._config = config
         self._registry = registry
         self._pool = HostPool(config, transport_factory=transport_factory)
         self._state_path = state_path
+        # Answers "is something serving at this address?". Used both to adopt a
+        # previous run's replicas and to confirm a stopped one is really gone.
+        self._probe = probe
         # name -> slot, for every replica this router started.
         self._owned: dict[str, Slot] = {}
         self._watchers: dict[str, asyncio.Task] = {}
@@ -116,8 +125,10 @@ class FleetManager:
         except asyncio.CancelledError:
             raise
         logger.error(
-            "replica %s never became ready within %.0fs; stopping it and freeing its device",
-            name, deadline,
+            "replica %s never became ready within the %.0fs launch timeout; stopping it and "
+            "freeing its device(s). If the model was still loading -- DeepSeek V4 needs well "
+            "over 1200s from cold -- raise --launch-timeout; %s holds the startup output",
+            name, deadline, self._pool.log_path_for(name) or "the host's log_dir",
         )
         await self.stop(name, drain=False)
 
@@ -157,11 +168,33 @@ class FleetManager:
 
         if drain:
             await self._drain(name)
-        self._registry.remove(name)
-        await self._pool.stop(slot)
+        state = self._registry.remove(name)
+        await self._pool.signal_stop(slot)
+        # Only now is the device really free. Releasing the slot on the signal
+        # alone would let the next launch bind a port the old replica still
+        # holds, and that failure would look like a bad configuration.
+        if state is not None:
+            await self._wait_gone(state.spec)
+        self._pool.release(name)
         self._owned.pop(name, None)
         self._write_state()
+        logger.info("replica %s stopped; slot %s is free", name, slot.name)
         return True
+
+    async def _wait_gone(self, spec: ReplicaSpec, timeout: float = STOP_GRACE_SECONDS) -> None:
+        """Wait until nothing answers at a stopped replica's address."""
+        if self._probe is None:
+            return
+        waited = 0.0
+        while waited < timeout:
+            if not await self._probe(spec):
+                return
+            await asyncio.sleep(0.5)
+            waited += 0.5
+        logger.warning(
+            "%s still answered %s after %.0fs; reusing its slot anyway",
+            spec.name, spec.base_url, timeout,
+        )
 
     async def _drain(self, name: str) -> None:
         """Stop routing to a replica and wait for its in-flight work.
@@ -204,7 +237,7 @@ class FleetManager:
                 {
                     "slot": name,
                     "host": slot.host.name,
-                    "device": slot.device,
+                    "devices": list(slot.devices),
                     "address": slot.host.address(),
                     "port": slot.port,
                 }
@@ -217,7 +250,7 @@ class FleetManager:
         except OSError as exc:
             logger.warning("could not write fleet state to %s: %s", self._state_path, exc)
 
-    async def adopt_previous(self, probe) -> list[str]:
+    async def adopt_previous(self, probe=None) -> list[str]:
         """Re-take replicas a previous run of this router left behind.
 
         A crash runs no shutdown hook, so its replicas keep serving. Throwing
@@ -243,11 +276,12 @@ class FleetManager:
             )
             if not spec.host or not spec.port:
                 continue
-            if not await probe(spec):
+            checker = probe if probe is not None else self._probe
+            if checker is None or not await checker(spec):
                 logger.warning(
                     "replica %s from the previous run does not answer at %s; if a process "
-                    "is still holding %s device %s, stop it by hand",
-                    name, spec.base_url, entry.get("host"), entry.get("device"),
+                    "is still holding %s device(s) %s, stop it by hand",
+                    name, spec.base_url, entry.get("host"), entry.get("devices"),
                 )
                 continue
             slot = self._pool.reserve(name)

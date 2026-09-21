@@ -46,18 +46,34 @@ class PoolExhausted(RuntimeError):
 
 @dataclass(frozen=True)
 class Slot:
-    """One launchable (host, device) pair, and the replica it would become."""
+    """One launchable device group on a host, and the replica it would become.
+
+    A group, not a single card: one replica of DeepSeek V4 needs eight of them
+    and one of Qwen3-14B needs one, so the group is the unit that can be
+    allocated and freed.
+    """
 
     host: HostSpec
-    device: int
+    devices: tuple[int, ...]
 
     @property
     def name(self) -> str:
-        return f"{self.host.name}-d{self.device}"
+        # Named after the group's first device, which is also what fixes its
+        # port, so a slot's identity survives a restart.
+        return f"{self.host.name}-d{self.devices[0]}"
+
+    @property
+    def device(self) -> int:
+        """The group's first device; what single-device templates expand to."""
+        return self.devices[0]
+
+    @property
+    def device_list(self) -> str:
+        return ",".join(str(device) for device in self.devices)
 
     @property
     def port(self) -> int:
-        return self.host.port_for(self.device)
+        return self.host.port_for(self.devices)
 
     def replica_spec(self) -> ReplicaSpec:
         return ReplicaSpec(name=self.name, host=self.host.address(), port=self.port)
@@ -68,7 +84,7 @@ class Slot:
 
 
 def _expand(values, **substitutions: object) -> list[str]:
-    """Substitute ``{device}``/``{port}`` placeholders in a command template."""
+    """Substitute ``{device}``, ``{devices}`` and ``{port}`` in a template."""
     return [str(value).format(**substitutions) for value in values]
 
 
@@ -240,7 +256,9 @@ class HostPool:
         # reaching for another one.
         ordered = sorted(config.hosts, key=lambda host: not host.is_local)
         self._slots: list[Slot] = [
-            Slot(host=host, device=device) for host in ordered for device in host.devices
+            Slot(host=host, devices=group)
+            for host in ordered
+            for group in host.device_groups()
         ]
         self._taken: dict[str, Slot] = {}
 
@@ -271,6 +289,11 @@ class HostPool:
                 return slot
         raise PoolExhausted("no free device slot")
 
+    def log_path_for(self, name: str) -> str | None:
+        """Where a slot's startup output went, for an error that needs to cite it."""
+        slot = self._taken.get(name)
+        return slot.log_path if slot else None
+
     def reserve(self, name: str) -> Slot | None:
         """Re-take a named slot, for adopting a replica after a restart."""
         if name in self._taken:
@@ -290,7 +313,10 @@ class HostPool:
         argv = [
             host.python, "-m", "pypto_serving.cli",
             "--model", host.model,
-            "--device", str(slot.device),
+            # --devices takes the whole group; serving derives the parallel
+            # placement from it, and validates it against what the model's
+            # kernels require.
+            "--devices", slot.device_list,
             "--host", "0.0.0.0",
             "--port", str(slot.port),
             # Without this, startup logs go to /dev/null and a launch that fails
@@ -304,7 +330,10 @@ class HostPool:
 
     def launch_argv(self, slot: Slot) -> list[str]:
         """The full command, wrapper included."""
-        wrapper = _expand(slot.host.launch_wrapper, device=slot.device, port=slot.port)
+        wrapper = _expand(
+            slot.host.launch_wrapper,
+            device=slot.device, devices=slot.device_list, port=slot.port,
+        )
         serve = self.serve_argv(slot)
         if not wrapper:
             return serve
@@ -313,7 +342,10 @@ class HostPool:
 
     def stop_argv(self, slot: Slot) -> list[str]:
         if slot.host.stop_command:
-            return _expand(slot.host.stop_command, device=slot.device, port=slot.port)
+            return _expand(
+                slot.host.stop_command,
+                device=slot.device, devices=slot.device_list, port=slot.port,
+            )
         # Default: kill whatever is serving on that port. Matches on the port
         # rather than the model, so a relaunch with different flags is still hit.
         #
@@ -327,7 +359,7 @@ class HostPool:
 
     def launch_env(self, slot: Slot) -> dict[str, str]:
         return {
-            key: value.format(device=slot.device, port=slot.port)
+            key: value.format(device=slot.device, devices=slot.device_list, port=slot.port)
             for key, value in slot.host.env.items()
         }
 
@@ -343,27 +375,27 @@ class HostPool:
             self.release(slot.name)
             raise
         logger.info(
-            "launched replica %s on %s device %d (port %d); it will report ready when "
+            "launched replica %s on %s device(s) %s (port %d); it will report ready when "
             "its model has loaded. Startup output: %s",
-            slot.name, slot.host.name, slot.device, slot.port, slot.log_path,
+            slot.name, slot.host.name, slot.device_list, slot.port, slot.log_path,
         )
         return LaunchedReplica(slot=slot, spec=slot.replica_spec())
 
-    async def stop(self, slot: Slot) -> None:
-        """Stop a replica and return its slot to the pool.
+    async def signal_stop(self, slot: Slot) -> None:
+        """Ask a replica to stop. Does not release the slot.
 
-        The slot is released whatever happens: a stop command that fails leaves
-        a device in an unknown state, and refusing to reuse it forever is worse
-        than the operator seeing the error in the log.
+        Signalling is not stopping: a stop command returns as soon as the signal
+        is delivered, while the replica takes seconds more to shut its worker
+        down and let go of its port. The slot stays taken until the caller has
+        confirmed it is really gone, or a relaunch could race the port.
         """
         transport = self._transport_factory(slot.host)
         try:
             await transport.run(slot.host, self.stop_argv(slot), {}, detach=False)
         except LaunchError as exc:
+            # A stop command that fails leaves the device in an unknown state.
+            # Reported, not raised: refusing to ever reuse the slot is worse.
             logger.warning("stopping replica %s failed: %s", slot.name, exc)
-        finally:
-            self.release(slot.name)
-            logger.info("released slot %s", slot.name)
 
 
 @dataclass

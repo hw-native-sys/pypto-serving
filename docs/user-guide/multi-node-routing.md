@@ -133,15 +133,47 @@ Declare the machines and the devices the router may use:
 }
 ```
 
-A host with no `ssh` is the machine the router is on. `identity_file` is a path — key material never goes in the config. `{device}` and `{port}` expand per slot.
+A host with no `ssh` is the machine the router is on. `identity_file` is a path — key material never goes in the config. `{device}`, `{devices}` and `{port}` expand per slot.
 
 `launch_wrapper` is optional. Present, the serving command is handed to it as a single argument, which is what a broker such as `task-submit` expects. Absent, the command runs directly — deployments without a broker are exactly why this is configuration rather than something built in.
 
 Ports are derived as `port_base + device`, so two replicas on one host can never collide.
 
+### How many replicas fit on a host
+
+`devices` says which cards the router may use; `devices_per_replica` says how many of them one replica needs. The host's capacity is the quotient:
+
+```
+capacity = len(devices) // devices_per_replica
+```
+
+`devices_per_replica` is a property of the model and its kernels, not something the router can measure:
+
+| Model | Devices per replica | Enforced by |
+| --- | --- | --- |
+| Qwen3-14B | 1, or the `--tp` group size | `ParallelConfig.worker_group_size` |
+| DeepSeek V4 | exactly 8, with `--dp 8 --ep 8 --tp 1` | serving refuses any other count at startup |
+| DeepSeek V4 DSpark | exactly 16 | `DSPARK_RANKS` |
+
+For DeepSeek those counts are compiled into the kernels — the expert-parallel width is not a tuning knob — so an eight-card node holds **eight** Qwen replicas or **one** DeepSeek V4:
+
+```json
+{
+  "name": "node01",
+  "devices": [0, 1, 2, 3, 4, 5, 6, 7],
+  "devices_per_replica": 8,
+  "model": "/models/dsv4-flash-w8a8",
+  "serve_args": ["--dp", "8", "--ep", "8", "--tp", "1", "--block-size", "128"]
+}
+```
+
+It is declared rather than inferred because deriving it means reading a checkpoint on a machine the router has no reason to be able to see. A wrong value is caught on the replica at startup, where the model's topology is validated and the error names the count it wanted. A `devices` list that is not a whole multiple of `devices_per_replica` is refused when the config is read — a leftover card is a typo or a misread model, not a partial replica.
+
+Memory is not the binding constraint: KV sizing claims about 90% of whatever is free once the weights are loaded, so the first replica on a card effectively takes it.
+
 ### Capacity
 
-The declared devices are the ceiling. This config has five slots: one on `node01`, four on `node02`.
+The declared devices are the ceiling. The Qwen config above has five slots: one on `node01`, four on `node02`.
 
 ```bash
 pypto-serving-router --replicas fleet.json --port 8000 --initial-replicas 1
@@ -160,6 +192,8 @@ curl -s http://localhost:8000/replicas             # the fleet, and what is left
 ```
 
 `POST` answers `202`, not `200`: the replica is starting, and cannot serve for the minutes its model takes to load. It is registered immediately but not routable, and the health poller promotes it when it answers. A replica that never becomes ready within `--launch-timeout` (default 600s) is stopped and its device released, so a failed launch cannot hold a card for the life of the router.
+
+**Set `--launch-timeout` for the slowest model you actually run.** Qwen3-14B reports ready in about 130s with a warm kernel cache; DeepSeek V4 on eight cards took 370s in a measured run on this stack, comfortably inside the 600s default. That figure is not fixed, though — an earlier measurement of DeepSeek on a different checkpoint and an older stack ran to 1198s. Time your own launch and leave headroom, because the cost of setting it too low is the router stopping a replica that was loading normally.
 
 `DELETE` drains first — the replica stops taking new sessions, its pinned sessions are released so they re-route on their next turn, and only once its in-flight requests finish (or `--drain-timeout`, default 300s, expires) is it stopped.
 
