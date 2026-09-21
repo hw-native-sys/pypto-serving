@@ -56,6 +56,9 @@ if [[ ! $max_output_tokens =~ ^[1-9][0-9]*$ ]]; then
     echo "PYPTO_MAX_OUTPUT_TOKENS must be a positive integer" >&2
     exit 2
 fi
+serving_revision=$(git -C "$repo_root" rev-parse --short=12 HEAD)
+lib_revision=$(git -C "$PYPTO_LIB_HOME" rev-parse --short=12 HEAD)
+export PYPTO_PROG_BUILD_DIR=${PYPTO_PROG_BUILD_DIR:-$stage/pd_build_cache/$serving_revision-$lib_revision}
 
 run_dir="$evidence_root/$PD_EVIDENCE_NAME"
 test ! -e "$run_dir"
@@ -87,6 +90,7 @@ cd "$repo_root"
     printf 'HCCL_INTRA_ROCE_ENABLE=%s\n' "$HCCL_INTRA_ROCE_ENABLE"
     printf 'max_model_len=%s\n' "$max_model_len"
     printf 'max_output_tokens=%s\n' "$max_output_tokens"
+    printf 'pypto_prog_build_dir=%s\n' "$PYPTO_PROG_BUILD_DIR"
     python - <<'PY'
 import mooncake.engine
 import pypto
@@ -130,7 +134,6 @@ fi
 export PYPTO_DSV4_DSPARK_MODEL_DIR=${PYPTO_DSV4_DSPARK_MODEL_DIR:-/models/dsv4-flash-0731-dspark-w8a8}
 export TASK_DEVICE=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export ASCEND_PROCESS_LOG_PATH="$run_dir/ascend"
-export PYPTO_PROG_BUILD_DIR=${PYPTO_PROG_BUILD_DIR:-$repo_root/build_output}
 mkdir "$ASCEND_PROCESS_LOG_PATH"
 
 child_pid=""
