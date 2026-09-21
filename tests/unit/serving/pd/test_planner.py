@@ -7,6 +7,8 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+import pytest
+
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_ADAPTER
 from pypto_serving.serving.pd.protocol import HandoffKey
 
@@ -121,3 +123,84 @@ def test_index_regions_are_atomic_and_ring_destination_wraps() -> None:
     }
     assert index_k
     assert index_k == index_scale
+
+
+@pytest.mark.parametrize(
+    ("p_hit", "d_hit", "expected_ori_start", "expected_full_start"),
+    (
+        (128, 512, 512, 512),
+        (256, 256, 256, 256),
+        (512, 128, 384, 128),
+    ),
+)
+def test_pc2_plans_independent_hits_without_reading_stale_rolling_slots(
+    p_hit: int,
+    d_hit: int,
+    expected_ori_start: int,
+    expected_full_start: int,
+) -> None:
+    manager = make_cache_manager()
+    registry = make_registry(manager)
+    prompt_tokens = 640
+    source = _tables(manager, "pc2-source", prompt_tokens)
+    destination = _tables(manager, "pc2-destination", prompt_tokens)
+    planner = DSV4_DSPARK_K7_ADAPTER.make_planner(registry, manager.group_specs)
+
+    plan = planner.plan_chunk(
+        KEY,
+        chunk_id=0,
+        start_token=0,
+        end_token=prompt_tokens,
+        final=True,
+        rank_ids=(0,),
+        source_blocks_by_rank={0: source},
+        destination_blocks_by_rank={0: destination},
+        destination_prefix_hit_tokens=d_hit,
+        source_prefix_hit_tokens=p_hit,
+    )
+
+    ori_slots = {block_id: index for index, block_id in enumerate(destination["ori"])}
+    hca_slots = {
+        block_id: index for index, block_id in enumerate(destination["cmp_c128"])
+    }
+    ori_indices = {
+        ori_slots[copy.destination_block]
+        for copy in plan.ranks[0].copies
+        if copy.component_id == "ori" and copy.layer == 0
+    }
+    hca_layer = next(
+        copy.layer
+        for copy in plan.ranks[0].copies
+        if copy.component_id == "hca_cmp"
+    )
+    hca_indices = {
+        hca_slots[copy.destination_block]
+        for copy in plan.ranks[0].copies
+        if copy.component_id == "hca_cmp" and copy.layer == hca_layer
+    }
+
+    assert plan.source_prefix_hit_tokens == p_hit
+    assert ori_indices == set(range(expected_ori_start // 32, prompt_tokens // 32))
+    assert hca_indices == set(
+        range(expected_full_start // 128, prompt_tokens // 128)
+    )
+
+
+def test_pc2_rejects_unaligned_p_hit() -> None:
+    manager = make_cache_manager()
+    registry = make_registry(manager)
+    tables = _tables(manager, "unaligned", 256)
+    planner = DSV4_DSPARK_K7_ADAPTER.make_planner(registry, manager.group_specs)
+
+    with pytest.raises(ValueError, match="common cache alignment"):
+        planner.plan_chunk(
+            KEY,
+            chunk_id=0,
+            start_token=0,
+            end_token=256,
+            final=True,
+            rank_ids=(0,),
+            source_blocks_by_rank={0: tables},
+            destination_blocks_by_rank={0: tables},
+            source_prefix_hit_tokens=127,
+        )

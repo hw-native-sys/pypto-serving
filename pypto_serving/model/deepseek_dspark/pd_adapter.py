@@ -23,7 +23,7 @@ from pypto_serving.serving.pd.protocol import (
 
 DSV4_DSPARK_K7_CONTRACT = ModelPDContract(
     adapter_id="deepseek-v4-dspark-k7",
-    version=3,
+    version=4,
     model_family="deepseek_v4",
     model_variant="dspark",
     transfer_granularity="chunk-after-prefill",
@@ -43,9 +43,7 @@ DSV4_DSPARK_K7_CONTRACT = ModelPDContract(
     executor_cls="PyptoDeepSeekV4DSparkExecutor",
     prefill_speculative_tokens=0,
     decode_speculative_tokens=7,
-    # ``independent`` is a protocol-level profile reserved for PC2/H8.  Do not
-    # advertise it until P_hit > D_hit source backfill is implemented.
-    supported_prefix_cache_modes=("disabled", "d_only"),
+    supported_prefix_cache_modes=("disabled", "d_only", "independent"),
 )
 
 
@@ -146,12 +144,13 @@ class DeepSeekV4DSparkK7Adapter:
         return ChunkManifest(
             key=key,
             chunk_id=chunk.chunk_id,
-            start_token=chunk.start_token,
-            end_token=chunk.end_token,
-            final=chunk.final,
+            start_token=plan.start_token,
+            end_token=plan.end_token,
+            final=plan.final,
             manifest_hash=plan.manifest_hash,
             expected_units=plan.expected_units,
             copies_by_rank=plan.copies_by_rank,
+            source_prefix_hit_tokens=plan.source_prefix_hit_tokens,
             first_token=chunk.first_token,
             metadata_hash=metadata_hash,
             continuation=continuation,

@@ -39,14 +39,14 @@ def main() -> int:
     cold = _load(args.after_cold)
     hit = _load(args.after_hit)
 
-    cold_requests = _counter(cold, "decode", "prefix.cold_requests") - _counter(
-        before, "decode", "prefix.cold_requests"
+    cold_requests = _counter(cold, "decode", "prefix.d_cold_requests") - _counter(
+        before, "decode", "prefix.d_cold_requests"
     )
-    hit_requests = _counter(hit, "decode", "prefix.hit_requests") - _counter(
-        cold, "decode", "prefix.hit_requests"
+    hit_requests = _counter(hit, "decode", "prefix.d_hit_requests") - _counter(
+        cold, "decode", "prefix.d_hit_requests"
     )
-    hit_tokens = _counter(hit, "decode", "prefix.hit_tokens") - _counter(
-        cold, "decode", "prefix.hit_tokens"
+    hit_tokens = _counter(hit, "decode", "prefix.d_hit_tokens") - _counter(
+        cold, "decode", "prefix.d_hit_tokens"
     )
     cold_bytes = _counter(cold, "prefill", "transfer.bytes") - _counter(
         before, "prefill", "transfer.bytes"

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 from pypto_serving.config.types import KVCacheGroupSpec
@@ -34,6 +35,7 @@ class ChunkPlan:
     chunk_id: int
     start_token: int
     end_token: int
+    source_prefix_hit_tokens: int
     final: bool
     ranks: tuple[RankChunkPlan, ...]
     manifest_hash: str
@@ -72,6 +74,9 @@ class ChunkTransferPlanner:
                         f"physical page rows differ for {group_name}/{component_name}: "
                         f"registry={entry.block_tokens}, scheduler={spec.storage_block_size}"
                     )
+        self.prefix_alignment = math.lcm(
+            *(spec.spec.token_capacity for spec in self.group_specs.values())
+        )
 
     def plan_chunk(
         self,
@@ -85,6 +90,7 @@ class ChunkTransferPlanner:
         source_blocks_by_rank: dict[int, dict[str, tuple[int, ...]]],
         destination_blocks_by_rank: dict[int, dict[str, tuple[int, ...]]],
         destination_prefix_hit_tokens: int = 0,
+        source_prefix_hit_tokens: int = 0,
     ) -> ChunkPlan:
         if type(chunk_id) is not int or chunk_id < 0:
             raise ValueError("chunk_id must be a non-negative integer")
@@ -95,6 +101,13 @@ class ChunkTransferPlanner:
             or destination_prefix_hit_tokens < 0
         ):
             raise ValueError("destination prefix hit must be a non-negative integer")
+        if (
+            type(source_prefix_hit_tokens) is not int
+            or not 0 <= source_prefix_hit_tokens <= end_token
+        ):
+            raise ValueError("source prefix hit must be within the chunk history")
+        if source_prefix_hit_tokens % self.prefix_alignment:
+            raise ValueError("source prefix hit must use the common cache alignment")
         if not rank_ids or len(rank_ids) != len(set(rank_ids)):
             raise ValueError("rank_ids must be a nonempty unique tuple")
         if set(rank_ids) != set(source_blocks_by_rank) or set(rank_ids) != set(
@@ -120,6 +133,7 @@ class ChunkTransferPlanner:
                     source_blocks=source[group_name],
                     destination_blocks=destination[group_name],
                     destination_prefix_hit_tokens=destination_prefix_hit_tokens,
+                    source_prefix_hit_tokens=source_prefix_hit_tokens,
                 )
                 for component_name in component_names:
                     entry = self.registry.entry(component_name)
@@ -157,16 +171,50 @@ class ChunkTransferPlanner:
             final=final,
             expected_units=expected_units,
             copies_by_rank=copies_by_rank,
+            source_prefix_hit_tokens=source_prefix_hit_tokens,
         )
         return ChunkPlan(
             key=key,
             chunk_id=chunk_id,
             start_token=start_token,
             end_token=end_token,
+            source_prefix_hit_tokens=source_prefix_hit_tokens,
             final=final,
             ranks=tuple(rank_plans),
             manifest_hash=manifest_hash,
         )
+
+    def publication_valid_from(
+        self,
+        *,
+        destination_prefix_hit_tokens: int,
+        source_prefix_hit_tokens: int,
+    ) -> dict[str, int]:
+        """Return the first newly valid token for each rolling cache group.
+
+        When P hits farther than D, P cannot backfill rolling rows older than
+        its live history window.  D may decode from the received tail, but it
+        must not publish the untouched gap as reusable prefix data.
+        """
+        for name, value in (
+            ("destination", destination_prefix_hit_tokens),
+            ("source", source_prefix_hit_tokens),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} prefix hit must be a non-negative integer")
+            if value % self.prefix_alignment:
+                raise ValueError(
+                    f"{name} prefix hit must use the common cache alignment"
+                )
+        return {
+            group_name: max(
+                destination_prefix_hit_tokens,
+                source_prefix_hit_tokens - group.sliding_window,
+            )
+            for group_name, group in self.group_specs.items()
+            if group_name not in self.final_only_groups
+            and group.sliding_window is not None
+        }
 
     def _group_copies(
         self,
@@ -178,6 +226,7 @@ class ChunkTransferPlanner:
         source_blocks: tuple[int, ...],
         destination_blocks: tuple[int, ...],
         destination_prefix_hit_tokens: int,
+        source_prefix_hit_tokens: int,
     ) -> tuple[tuple[int, int, int], ...]:
         group = self.group_specs[group_name]
         capacity = group.spec.token_capacity
@@ -190,6 +239,15 @@ class ChunkTransferPlanner:
             logical_indices = range(first, logical_end)
         else:
             transfer_start = max(start_token, destination_prefix_hit_tokens)
+            if group.sliding_window is not None:
+                # A P-local rolling hit owns only the live history window at
+                # P_hit, followed by rows computed for this request. Older ring
+                # slots are merely allocated table storage and must never be
+                # treated as valid backfill data when P_hit > D_hit.
+                transfer_start = max(
+                    transfer_start,
+                    source_prefix_hit_tokens - group.sliding_window,
+                )
             first_closed = transfer_start // capacity
             closed_end = end_token // capacity
             logical_indices = range(first_closed, closed_end)

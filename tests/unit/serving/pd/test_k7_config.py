@@ -123,6 +123,8 @@ def test_pd_k7_uses_target_only_prefill_and_k7_decode(
     (
         ("d_only", "prefill", False),
         ("d_only", "decode", True),
+        ("independent", "prefill", True),
+        ("independent", "decode", True),
     ),
 )
 def test_pd_prefix_cache_profile_drives_local_engine_flag(
