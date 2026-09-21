@@ -458,7 +458,11 @@ class ServingServer:
         )
 
         payload = decode_json(await request.body(), AbortHandoffHTTP)
-        status = await self.engine.pd_service.abort_handoff(payload.key, payload.reason)
+        status = await self.engine.pd_service.abort_handoff(
+            payload.key,
+            payload.reason,
+            deterministic=payload.deterministic,
+        )
         return Response(encode_json(status), media_type="application/json")
 
     async def _health(self) -> JSONResponse:

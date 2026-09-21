@@ -690,6 +690,7 @@ class ReplicaEngineCore:
         stop_strings: tuple[str, ...] = (),
         eos_token_id: int | None = None,
         stream: bool = True,
+        output_parser_spec: OutputParserSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Enter D Decode from committed cache; never enqueue a Prefill request."""
         request, first_output = self.scheduler.adopt_handoff(
@@ -705,7 +706,11 @@ class ReplicaEngineCore:
             stop_strings=stop_strings,
             eos_token_id=eos_token_id,
         )
-        ctx = _RequestContext(request=request, stream=stream)
+        ctx = _RequestContext(
+            request=request,
+            stream=stream,
+            output_parser=create_output_parser(output_parser_spec, self.tokenizer),
+        )
         self._request_contexts[request_id] = ctx
         text = self._detokenize_incrementally(ctx)
         ctx.queue.put_nowait(
