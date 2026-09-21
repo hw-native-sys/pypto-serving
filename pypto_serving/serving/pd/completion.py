@@ -69,6 +69,12 @@ class CompletionTracker:
         self._error_code = ""
         self._admitted = False
 
+    @property
+    def source_prefix_hit_tokens(self) -> int:
+        if not self._chunks:
+            return 0
+        return self._chunks[min(self._chunks)].manifest.source_prefix_hit_tokens
+
     def register_chunk(self, manifest: ChunkManifest) -> None:
         if manifest.key != self.key:
             raise ValueError("chunk manifest handoff identity mismatch")
@@ -86,6 +92,7 @@ class CompletionTracker:
             final=manifest.final,
             expected_units=manifest.expected_units,
             copies_by_rank=manifest.copies_by_rank,
+            source_prefix_hit_tokens=manifest.source_prefix_hit_tokens,
         ):
             raise ValueError("chunk manifest hash does not match its physical write set")
         existing = self._chunks.get(manifest.chunk_id)
@@ -114,6 +121,13 @@ class CompletionTracker:
         )
         if manifest.start_token != expected_start:
             raise ValueError("chunk token intervals must be contiguous")
+        if self._chunks:
+            first_manifest = self._chunks[min(self._chunks)].manifest
+            if (
+                manifest.source_prefix_hit_tokens
+                != first_manifest.source_prefix_hit_tokens
+            ):
+                raise ValueError("P prefix hit must remain stable across chunks")
 
         units: dict[tuple[int, str], _UnitState] = {}
         for unit in manifest.expected_units:

@@ -171,9 +171,16 @@ class DecodeConnector:
     def commit(self, request: CommitRequest) -> ReadyAck:
         tracker = self._require_tracker(request.key)
         ack = tracker.commit(request)
+        current = self.cache_manager.group_cache_reservation(tracker.reservation_id)
+        if current is None:
+            raise RuntimeError("D completion tracker lost its cache reservation")
         reservation = self.cache_manager.commit_group_cache(
             tracker.reservation_id,
             request.manifest_hash,
+            valid_from=self._planner.publication_valid_from(
+                destination_prefix_hit_tokens=current.prefix_hit_tokens,
+                source_prefix_hit_tokens=tracker.source_prefix_hit_tokens,
+            ),
         )
         if reservation.state is not GroupReservationState.READY:
             raise RuntimeError("completion and cache reservation commit diverged")
@@ -313,6 +320,11 @@ class DecodeConnector:
             raise RuntimeError("D completion tracker lost its cache reservation")
         if manifest.end_token > reservation.token_capacity:
             raise ValueError("chunk exceeds the D-first reservation capacity")
+        if (
+            self.capabilities.prefix_cache_mode != "independent"
+            and manifest.source_prefix_hit_tokens
+        ):
+            raise ValueError("P prefix hits require independent cache mode")
 
         rank_ids = self._active_rank_ids(reservation.partition)
         if set(manifest.copies_by_rank) != set(rank_ids):
@@ -351,6 +363,7 @@ class DecodeConnector:
             source_blocks_by_rank=destination_tables,
             destination_blocks_by_rank=destination_tables,
             destination_prefix_hit_tokens=reservation.prefix_hit_tokens,
+            source_prefix_hit_tokens=manifest.source_prefix_hit_tokens,
         )
         expected_writes = {
             rank.rank_id: {

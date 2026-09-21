@@ -237,11 +237,13 @@ def test_parser_spec_and_reasoning_survive_pd_wire_round_trip() -> None:
         manifest_hash="m" * 64,
         expected_units=(),
         copies_by_rank={},
+        source_prefix_hit_tokens=128,
         first_token=100,
         continuation=continuation,
     )
     decoded_manifest = decode_message(encode_message(manifest))
     assert decoded_manifest.continuation == continuation
+    assert decoded_manifest.source_prefix_hit_tokens == 128
 
     output = DecodeOutputWire(
         key=key,

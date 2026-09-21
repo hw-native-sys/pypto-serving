@@ -440,13 +440,15 @@ class PDServingService:
             raise ValueError("D reservation was replayed with a different P binding")
         capability = self._reservation_capabilities.get(request.key)
         if capability is None:
-            self.metrics.increment("prefix.requests")
-            self.metrics.increment("prefix.hit_tokens", result.prefix_hit_tokens)
+            self.metrics.increment("prefix.d_requests")
+            self.metrics.increment("prefix.d_hit_tokens", result.prefix_hit_tokens)
             self.metrics.set_gauge(
-                "prefix.last_hit_tokens", result.prefix_hit_tokens
+                "prefix.d_last_hit_tokens", result.prefix_hit_tokens
             )
             self.metrics.increment(
-                "prefix.hit_requests" if result.prefix_hit_tokens else "prefix.cold_requests"
+                "prefix.d_hit_requests"
+                if result.prefix_hit_tokens
+                else "prefix.d_cold_requests"
             )
             capability = secrets.token_urlsafe(32)
             self._reservation_capabilities[request.key] = capability
@@ -956,9 +958,39 @@ class PDServingService:
             transfer_started = False
             d_ready = False
             remote_aborted = False
+            source_prefix_hit_tokens: int | None = None
             try:
                 while True:
                     chunk = await self._next_chunk_or_failure(request_id, prefill_task)
+                    if chunk.chunk_id == 0:
+                        if source_prefix_hit_tokens is not None:
+                            raise RuntimeError("P produced more than one first chunk")
+                        source_prefix_hit_tokens = chunk.start_token
+                        if (
+                            self.config.prefix_cache_mode.value != "independent"
+                            and source_prefix_hit_tokens
+                        ):
+                            raise RuntimeError(
+                                "P prefix hit requires independent cache mode"
+                            )
+                        self.metrics.increment("prefix.p_requests")
+                        self.metrics.increment(
+                            "prefix.p_hit_tokens", source_prefix_hit_tokens
+                        )
+                        self.metrics.set_gauge(
+                            "prefix.p_last_hit_tokens", source_prefix_hit_tokens
+                        )
+                        self.metrics.increment(
+                            "prefix.p_hit_requests"
+                            if source_prefix_hit_tokens
+                            else "prefix.p_cold_requests"
+                        )
+                        transfer_start_token = 0
+                    else:
+                        if source_prefix_hit_tokens is None:
+                            raise RuntimeError("P produced a non-initial chunk first")
+                        transfer_start_token = chunk.start_token
+                    assert source_prefix_hit_tokens is not None
                     rank_ids = tuple(rank.rank_id for rank in reservation.ranks)
                     source_tables = {
                         rank_id: chunk.block_ids_by_group for rank_id in rank_ids
@@ -969,7 +1001,7 @@ class PDServingService:
                     plan = self.planner.plan_chunk(
                         record.key,
                         chunk_id=chunk.chunk_id,
-                        start_token=chunk.start_token,
+                        start_token=transfer_start_token,
                         end_token=chunk.end_token,
                         final=chunk.final,
                         rank_ids=rank_ids,
@@ -978,6 +1010,7 @@ class PDServingService:
                         destination_prefix_hit_tokens=(
                             reservation.prefix_hit_tokens
                         ),
+                        source_prefix_hit_tokens=source_prefix_hit_tokens,
                     )
                     guard = self.source_lifecycle.begin(
                         request_id,

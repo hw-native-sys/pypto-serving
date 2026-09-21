@@ -137,6 +137,7 @@ def test_runtime_controls_are_shared_by_router_and_nodes(tmp_path) -> None:
     (
         ("disabled", False, False),
         ("d_only", False, True),
+        ("independent", True, True),
     ),
 )
 def test_prefix_cache_profile_is_role_specific(
@@ -164,21 +165,22 @@ def test_prefix_cache_profile_is_role_specific(
     assert decode.prefix_cache_enabled is decode_enabled
 
 
-def test_pc2_profile_is_reserved_until_independent_source_backfill_exists(
-    tmp_path,
-) -> None:
+def test_pc2_profile_enables_independent_p_and_d_caches(tmp_path) -> None:
     path = _write_config(tmp_path)
     value = json.loads(path.read_text(encoding="utf-8"))
     value["runtime"]["prefix_cache_mode"] = "independent"
     path.write_text(json.dumps(value), encoding="utf-8")
     document = load_pd_document(path)
-    with pytest.raises(ValueError, match="does not support prefix-cache mode"):
+    resolved = tuple(
         resolve_pd_config(
             document,
-            role=PDRole.PREFILL,
+            role=role,
             model_revision="dsv4",
             model_adapter=DSV4_DSPARK_K7_ADAPTER,
         )
+        for role in (PDRole.PREFILL, PDRole.DECODE)
+    )
+    assert all(config.prefix_cache_enabled for config in resolved)
 
 
 @pytest.mark.parametrize(

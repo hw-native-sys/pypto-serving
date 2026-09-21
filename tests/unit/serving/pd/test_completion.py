@@ -146,6 +146,23 @@ def test_manifest_hash_and_generation_are_fail_closed() -> None:
     with pytest.raises(ValueError, match="physical write set"):
         tracker.register_chunk(tampered)
 
+    tampered_p_hit = ChunkManifest(
+        key=manifest.key,
+        chunk_id=manifest.chunk_id,
+        start_token=manifest.start_token,
+        end_token=manifest.end_token,
+        final=manifest.final,
+        manifest_hash=manifest.manifest_hash,
+        expected_units=manifest.expected_units,
+        copies_by_rank=manifest.copies_by_rank,
+        source_prefix_hit_tokens=128,
+        first_token=manifest.first_token,
+        metadata_hash=manifest.metadata_hash,
+        continuation=manifest.continuation,
+    )
+    with pytest.raises(ValueError, match="physical write set"):
+        tracker.register_chunk(tampered_p_hit)
+
     tracker.register_chunk(manifest)
     stale = TransferResult(
         key=HandoffKey("request", "handoff", 2, 2, 3),

@@ -10,10 +10,13 @@
 
 from dataclasses import replace
 
+import pytest
+
 from pypto_serving.model.deepseek_dspark.pd_adapter import (
     DSV4_DSPARK_K7_ADAPTER,
     DSV4_DSPARK_K7_CONTRACT,
 )
+from pypto_serving.serving.engine.async_engine import PrefillChunkReady
 from pypto_serving.serving.memory.kv_cache import GroupReservationState
 from pypto_serving.serving.pd.connector import DecodeConnector
 from pypto_serving.serving.pd.protocol import (
@@ -38,12 +41,12 @@ from .helpers import (
 )
 
 
-def _connector():
+def _connector(prefix_cache_mode: str = "d_only"):
     manager = make_cache_manager(capacity_slots=3, enable_prefix_cache=True)
     registry = make_registry(manager)
     capabilities = replace(
         make_capabilities(registry),
-        prefix_cache_mode="d_only",
+        prefix_cache_mode=prefix_cache_mode,
     )
     connector = DecodeConnector(
         manager,
@@ -53,6 +56,13 @@ def _connector():
         contract=DSV4_DSPARK_K7_CONTRACT,
     )
     return manager, registry, connector
+
+
+def _warm_prefix(manager, prompt, token_count: int, request_id: str) -> None:
+    hashes = manager.compute_group_block_hashes(prompt)
+    manager.ensure_group_blocks(request_id, token_count, partition=0)
+    manager.cache_group_blocks(request_id, hashes, token_count, {})
+    manager.release_all_group_requests(request_id)
 
 
 def _spec(manager, prompt):
@@ -74,7 +84,15 @@ def _reserve(connector, key, prompt, spec):
     return accepted
 
 
-def _manifest(manager, registry, key, accepted, prompt):
+def _manifest(
+    manager,
+    registry,
+    key,
+    accepted,
+    prompt,
+    *,
+    source_prefix_hit_tokens: int = 0,
+):
     rank_ids = tuple(rank.rank_id for rank in accepted.ranks)
     tables = {rank_id: accepted.block_ids_by_group for rank_id in rank_ids}
     plan = DSV4_DSPARK_K7_ADAPTER.make_planner(
@@ -89,6 +107,7 @@ def _manifest(manager, registry, key, accepted, prompt):
         source_blocks_by_rank=tables,
         destination_blocks_by_rank=tables,
         destination_prefix_hit_tokens=accepted.prefix_hit_tokens,
+        source_prefix_hit_tokens=source_prefix_hit_tokens,
     )
     continuation = ContinuationMetadata(
         prompt_token_ids=tuple(prompt),
@@ -109,6 +128,7 @@ def _manifest(manager, registry, key, accepted, prompt):
         manifest_hash=plan.manifest_hash,
         expected_units=plan.expected_units,
         copies_by_rank=plan.copies_by_rank,
+        source_prefix_hit_tokens=source_prefix_hit_tokens,
         first_token=7,
         metadata_hash=continuation_metadata_hash(continuation),
         continuation=continuation,
@@ -264,3 +284,118 @@ def test_prefix_reservation_failure_rolls_back_shared_refs_without_cache_loss() 
     )
     assert aborted.state == "ABORTED"
     assert manager.group_cache_reservation(retry.reservation_id) is None
+
+
+def test_pc2_p_hit_greater_than_d_hit_backfills_full_history_and_commits() -> None:
+    d_manager, registry, connector = _connector("independent")
+    prompt = list(range(640))
+    _warm_prefix(d_manager, prompt, 128, "d-warm")
+    spec = _spec(d_manager, prompt)
+    key = HandoffKey("pc2", "pc2-handoff", 1, 1, 1)
+    accepted = _reserve(connector, key, prompt, spec)
+    assert accepted.prefix_hit_tokens == 128
+
+    p_manager = make_cache_manager(capacity_slots=2, enable_prefix_cache=True)
+    _warm_prefix(p_manager, prompt, 512, "p-warm")
+    p_hashes = p_manager.compute_group_block_hashes(prompt)
+    _, p_hit, p_partition = p_manager.acquire_group_prefix_blocks(
+        "p-source",
+        p_hashes,
+        max_cache_hit_tokens=512,
+    )
+    assert p_hit == 512
+    assert p_partition == 0
+    p_tables = {
+        name: tuple(ids)
+        for name, ids in p_manager.ensure_group_blocks(
+            "p-source",
+            len(prompt),
+            partition=p_partition,
+        ).items()
+    }
+    rank_ids = tuple(rank.rank_id for rank in accepted.ranks)
+    plan = DSV4_DSPARK_K7_ADAPTER.make_planner(
+        registry,
+        d_manager.group_specs,
+    ).plan_chunk(
+        key,
+        chunk_id=0,
+        start_token=0,
+        end_token=len(prompt),
+        final=True,
+        rank_ids=rank_ids,
+        source_blocks_by_rank={rank_id: p_tables for rank_id in rank_ids},
+        destination_blocks_by_rank={
+            rank_id: accepted.block_ids_by_group for rank_id in rank_ids
+        },
+        destination_prefix_hit_tokens=accepted.prefix_hit_tokens,
+        source_prefix_hit_tokens=p_hit,
+    )
+    continuation = ContinuationMetadata(
+        prompt_token_ids=tuple(prompt),
+        max_new_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=None,
+        seed=None,
+        stop_strings=(),
+        eos_token_id=None,
+    )
+    manifest = DSV4_DSPARK_K7_ADAPTER.build_manifest(
+        key=key,
+        plan=plan,
+        chunk=PrefillChunkReady(
+            request_id=key.request_id,
+            chunk_id=0,
+            start_token=p_hit,
+            end_token=len(prompt),
+            final=True,
+            first_token=7,
+            block_ids_by_group=p_tables,
+            cache_partition=p_partition,
+        ),
+        continuation=continuation,
+        prepared_digest="p" * 64,
+    )
+    assert manifest.start_token == 0
+    assert manifest.source_prefix_hit_tokens == 512
+    ready = _complete(connector, manifest)
+    committed = d_manager.group_cache_reservation(ready.reservation_id)
+    assert committed is not None
+    assert committed.publication_valid_from == {"ori": 384}
+    assert connector.claim_decode_admission(key)
+    d_manager.release_group_cache(ready.reservation_id)
+    connector.mark_decode_completed(key)
+
+    # The untouched rolling gap (D_hit..P_hit-window) must not be published.
+    # A shorter request may still reuse D's original prefix, but cannot falsely
+    # match pages that P never transferred.
+    short_prompt = prompt[:256]
+    short_key = HandoffKey("pc2-short", "pc2-short-handoff", 1, 1, 1)
+    short = _reserve(connector, short_key, short_prompt, _spec(d_manager, short_prompt))
+    assert short.prefix_hit_tokens == 128
+    connector.abort(AbortHandoff(short_key, "test-cleanup"), deterministic=True)
+
+    # The final rolling tail and every full-history page are valid, so the
+    # complete prompt remains reusable even though the older rolling gap is not.
+    next_key = HandoffKey("pc2-next", "pc2-next-handoff", 1, 1, 1)
+    next_reservation = _reserve(connector, next_key, prompt, spec)
+    assert next_reservation.prefix_hit_tokens == len(prompt)
+
+
+def test_pc2_p_hit_is_rejected_outside_independent_mode() -> None:
+    manager, registry, connector = _connector("d_only")
+    prompt = list(range(256))
+    key = HandoffKey("pc2-mode", "pc2-mode-handoff", 1, 1, 1)
+    accepted = _reserve(connector, key, prompt, _spec(manager, prompt))
+    manifest = _manifest(
+        manager,
+        registry,
+        key,
+        accepted,
+        prompt,
+        source_prefix_hit_tokens=128,
+    )
+
+    with pytest.raises(ValueError, match="independent cache mode"):
+        connector.register_chunk(manifest)

@@ -1,8 +1,9 @@
-# Phase H PC1 dual-node acceptance
+# Phase H PC1/PC2 dual-node acceptance
 
 This directory contains the **prepared but intentionally unexecuted** H7
-acceptance gate. H0–H6 are Host/code-ready; do not call PC1 end-to-end complete
-until this gate runs on two fully available 16-device nodes.
+acceptance gate. H0–H6 and the PC2 Host implementation are code-ready; do not
+call PC1 or PC2 end-to-end complete until this gate runs on two fully available
+16-device nodes.
 
 ## Runtime profile
 
@@ -22,6 +23,15 @@ The shared profile is authoritative. The P engine derives Prefix Cache
 disabled and the D engine derives Prefix Cache enabled; no extra launcher flag
 is required. `provider` remains `mooncake` unless explicitly configured.
 
+For PC2, change only the shared mode:
+
+```json
+{"runtime": {"prefix_cache_mode": "independent"}}
+```
+
+Both engines then enable their own local Prefix Cache. P and D still match
+independently; neither side infers the other side's hit length.
+
 ## H7 sequence
 
 1. Capture P and D `/internal/pd/metrics` as `before.json`.
@@ -39,10 +49,10 @@ Each composite snapshot has this address-free shape:
   "prefill": {"counters": {"transfer.bytes": 0}},
   "decode": {
     "counters": {
-      "prefix.requests": 0,
-      "prefix.cold_requests": 0,
-      "prefix.hit_requests": 0,
-      "prefix.hit_tokens": 0
+      "prefix.d_requests": 0,
+      "prefix.d_cold_requests": 0,
+      "prefix.d_hit_requests": 0,
+      "prefix.d_hit_tokens": 0
     }
   }
 }
@@ -55,3 +65,17 @@ reach normal commit/Decode completion.
 
 Do not use mock results as H7 evidence. Do not reset devices or stop unrelated
 processes to obtain the test window.
+
+## H8 PC2 matrix
+
+After PC1, repeat with `prefix_cache_mode=independent` and independently warm
+P and D to cover all three relationships:
+
+- `P_hit < D_hit`: P computes from its hit; transfer starts at D's later hit.
+- `P_hit = D_hit`: computation and transfer skip the same logical prefix.
+- `P_hit > D_hit`: full-history groups backfill from D hit, while rolling
+  groups backfill only P's valid live window plus newly computed rows.
+
+For every case, capture `prefix.p_hit_tokens` on P and
+`prefix.d_hit_tokens` on D, compare output token IDs with non-PD K7, and verify
+that full KV hits still transfer request-local final state.
