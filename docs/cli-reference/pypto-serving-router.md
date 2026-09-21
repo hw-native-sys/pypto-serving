@@ -14,7 +14,7 @@ pypto-serving-router --replicas replicas.json --port 8000
 
 ## Replica File
 
-A JSON file listing the replicas. Either `{"replicas": [...]}` or a bare list is accepted.
+A JSON file with `replicas` (endpoints that already exist) and/or `hosts` (machines the router may launch on). At least one of the two must be present.
 
 ```json
 {
@@ -25,12 +25,35 @@ A JSON file listing the replicas. Either `{"replicas": [...]}` or a bare list is
 }
 ```
 
+### `replicas` — already running, never stopped by the router
+
 | Field | Default | Description |
 | --- | --- | --- |
 | `host` | Required | Hostname or address of the replica. |
 | `port` | Required | Port the replica's HTTP server listens on. |
 | `name` | `host:port` | Label used in logs and on `/health`. |
 | `scheme` | `http` | `http` or `https`. Request bodies and generated text cross this hop in the clear under `http`; set `https` when the replicas are not on a trusted network and TLS is terminated in front of them. |
+
+### `hosts` — machines the router may launch on
+
+One slot per declared device; a replica launched from a slot is owned by the router.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `devices` | Required | Device ids the router may use. Declared, not discovered — this is the capacity ceiling for the host. |
+| `model` | Required | Model path **on that machine**. |
+| `name` | `host<N>` | Label; slots are named `<name>-d<device>`. |
+| `ssh` | none | ssh destination, e.g. `user@host`. Omitted means the machine the router runs on. |
+| `identity_file` | none | Path to a private key. A path only — key material never appears in the config. |
+| `port_base` | `8001` | A replica on device *d* listens on `port_base + d`. |
+| `served_model_name` | checkpoint name | Should match across hosts, since the fleet serves one model. |
+| `serve_args` | `[]` | Extra `pypto-serving` flags, passed through verbatim. |
+| `env` | `{}` | Environment for the launched process. `{device}` and `{port}` expand. |
+| `launch_wrapper` | `[]` | Prefix such as `["task-submit", "--device", "{device}", "--run"]`; the serving command is appended as one argument. Absent, the command runs bare. |
+| `stop_command` | `pkill` by port | How to stop a replica. `{device}` and `{port}` expand. |
+| `python` | `python3` | Interpreter on that machine. |
+| `workdir` | none | Directory to run from. |
+| `log_dir` | `/tmp/pypto-serving-router` | Where a launched replica's startup output goes. A launch is detached, so this is the only record of a failed model load. |
 
 ## Arguments
 
@@ -44,6 +67,12 @@ A JSON file listing the replicas. Either `{"replicas": [...]}` or a bare list is
 | `--health-interval SECONDS` | `5` | Interval between replica health probes. |
 | `--request-timeout SECONDS` | `3600` | Overall timeout for one proxied request. There is no read timeout: decode is slow by design. |
 | `--connect-timeout SECONDS` | `5` | Connect timeout per replica. |
+| `--initial-replicas N` | `1` with hosts, else `0` | Replicas to launch at startup, filling slots in config order, local machine first. Refused at startup if it exceeds the pool. |
+| `--max-replicas N` | declared pool | Cap launched replicas below the declared devices. |
+| `--launch-timeout SECONDS` | `600` | How long a launch may take to report ready before it is stopped and its device released. |
+| `--drain-timeout SECONDS` | `300` | How long to wait for in-flight requests before stopping a replica. |
+| `--state-file PATH` | none | Records launched replicas so a restarted router can adopt them instead of paying for a fresh model load. |
+| `--admin-token TOKEN` | none | Require `Authorization: Bearer TOKEN` on `/replicas`. |
 
 ## Endpoints
 
@@ -53,6 +82,9 @@ A JSON file listing the replicas. Either `{"replicas": [...]}` or a bare list is
 | `POST /v1/chat/completions` | Same, including streaming responses. |
 | `GET /v1/models` | Answered by any routable replica. |
 | `GET /health` | The router's own view of the replica table. 503 when no replica is routable. |
+| `GET /replicas` | The fleet, with each replica's ready/draining/owned state, and the capacity left. |
+| `POST /replicas` | Launch one replica on the next free declared device. `202` once started, `409` when the pool is full, `502` when the launch command failed. |
+| `DELETE /replicas/{name}` | Drain then stop a replica the router launched. `409` for one it did not launch, `404` for an unknown name. |
 
 ## Session Identity
 
@@ -70,5 +102,5 @@ A `session_id` left in the request body is ignored by the replica, which rejects
 | Code | Meaning |
 | --- | --- |
 | `0` | The router shut down normally. |
-| `1` | The replica file is missing, unreadable, or invalid. |
+| `1` | The replica file is missing, unreadable, or invalid — including an `--initial-replicas` above the declared pool. |
 | `2` | Invalid command-line arguments (from `argparse`, before the replica file is read). |

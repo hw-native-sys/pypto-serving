@@ -98,6 +98,18 @@ class SessionDirectory:
     def forget(self, session_id: str) -> None:
         self._pins.pop(session_id, None)
 
+    def forget_replica(self, replica_name: str) -> int:
+        """Drop every pin to one replica, returning how many were dropped.
+
+        Used when a replica starts draining: its sessions should re-route on
+        their next turn instead of waiting out the TTL pointing at something
+        that is going away.
+        """
+        stale = [sid for sid, (name, _) in self._pins.items() if name == replica_name]
+        for session_id in stale:
+            del self._pins[session_id]
+        return len(stale)
+
     def sweep(self) -> int:
         """Drop every expired pin. Lookup only expires pins it touches, so this
         bounds the memory held by sessions that are never seen again."""
@@ -118,14 +130,24 @@ class ReplicaState:
     index: int = 0
     outstanding: int = 0
     routed: int = 0
-    # Replicas start routable: a launch still loading refuses the connection
-    # anyway, and the first probe corrects an optimistic guess quickly.
+    # Statically configured replicas start routable: one that is still loading
+    # refuses the connection anyway, and the first probe corrects an optimistic
+    # guess quickly. A replica the router launches is added with ready=False,
+    # because it provably cannot serve for the minutes its model takes to load.
     ready: bool = True
     failures: int = 0
+    # Excluded from routing while it finishes what it already has.
+    draining: bool = False
+    # True only for replicas this router started, and so may stop.
+    owned: bool = False
 
     @property
     def name(self) -> str:
         return self.spec.name
+
+    @property
+    def routable(self) -> bool:
+        return self.ready and not self.draining
 
 
 @dataclass
@@ -156,10 +178,70 @@ class ReplicaRegistry:
         return self._by_name.get(name)
 
     def ready_count(self) -> int:
-        return sum(1 for state in self._states if state.ready)
+        return sum(1 for state in self._states if state.routable)
 
     def total_routed(self) -> int:
         return sum(state.routed for state in self._states)
+
+    def add(self, spec: ReplicaSpec, *, ready: bool = False, owned: bool = False) -> ReplicaState:
+        """Register a replica at runtime.
+
+        Appending keeps the rotating tiebreak honest for free: both sites that
+        use ``index`` recompute the modulus from the live list, so an index of
+        ``len(states)`` stays inside it.
+
+        Defaults to ``ready=False`` — a launched replica cannot serve until its
+        model is loaded, and the health poller is what promotes it.
+        """
+        if spec.name in self._by_name:
+            raise ValueError(f"replica {spec.name!r} is already registered")
+        state = ReplicaState(
+            spec=spec, index=len(self._states), ready=ready, owned=owned,
+        )
+        self._states.append(state)
+        self._by_name[state.name] = state
+        logger.info(
+            "registered replica %s at %s (%s, %s)",
+            state.name, spec.base_url,
+            "ready" if ready else "starting",
+            "owned" if owned else "external",
+        )
+        return state
+
+    def remove(self, name: str) -> ReplicaState | None:
+        """Drop a replica and reindex the rest.
+
+        Reindexing is the point: leaving gaps makes ``(index - counter) % count``
+        alias two replicas onto the same tiebreak slot, which is unfair rather
+        than wrong, but silently so.
+        """
+        state = self._by_name.pop(name, None)
+        if state is None:
+            return None
+        self._states = [existing for existing in self._states if existing.name != name]
+        for position, existing in enumerate(self._states):
+            existing.index = position
+        if self._states:
+            self._route_counter %= len(self._states)
+        else:
+            self._route_counter = 0
+        self._sessions.forget_replica(name)
+        logger.info("removed replica %s", name)
+        return state
+
+    def set_draining(self, name: str, draining: bool) -> None:
+        """Take a replica out of routing without dropping its in-flight work.
+
+        Pins are released at the same moment: a session whose replica is going
+        away should re-route on its next turn rather than wait out the TTL.
+        """
+        state = self._by_name.get(name)
+        if state is None or state.draining == draining:
+            return
+        state.draining = draining
+        if draining:
+            self._sessions.forget_replica(name)
+        logger.info("replica %s is %s", name, "draining" if draining else "routable again")
 
     def set_ready(self, name: str, ready: bool) -> None:
         state = self._by_name.get(name)
@@ -185,7 +267,7 @@ class ReplicaRegistry:
         so a hit is never guaranteed, and the one prefill it saves is worth less
         than an unbounded wait behind a saturated replica.
         """
-        candidates = [state for state in self._states if state.ready]
+        candidates = [state for state in self._states if state.routable]
         if not candidates:
             self.rejected += 1
             raise NoReplicaAvailable("no routable replica")
@@ -194,7 +276,7 @@ class ReplicaRegistry:
         pinned = self._by_name.get(self._sessions.lookup(session_id) or "")
         chosen, affinity_hit = least, False
 
-        if pinned is not None and pinned.ready:
+        if pinned is not None and pinned.routable:
             if pinned.outstanding > least.outstanding + self._config.affinity_slack:
                 logger.info(
                     "session %s leaves %s (outstanding=%d) for %s (outstanding=%d): slack %d exceeded",
