@@ -1745,6 +1745,12 @@ class PDServingService:
                     )
                     return
         except BaseException as exc:
+            logger.exception(
+                "PD Decode continuation failed: request=%s handoff=%s error=%s",
+                key.request_id,
+                key.handoff_id,
+                type(exc).__name__,
+            )
             router_cancelled = key in self._router_cancelled_keys
             if not router_cancelled:
                 # The HTTP abort path can publish the durable ABORTED tombstone

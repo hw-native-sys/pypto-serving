@@ -11,10 +11,12 @@ import asyncio
 from collections import deque
 from types import SimpleNamespace
 
+from pypto_serving.serving.engine import async_engine as async_engine_module
 from pypto_serving.serving.engine.async_engine import (
     ReplicaEngineCore,
     TokenOutput,
 )
+from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.serving.server.ipc import (
     StepResult,
     decode_command,
@@ -98,6 +100,50 @@ def test_abort_request_emits_abort_token_before_scheduling_free():
     assert token.finished is True
     assert token.finish_reason == "FINISHED_ABORTED"
     assert core._pending_free_ids == ["req-y"]
+
+
+def test_adopted_handoff_installs_output_parser(monkeypatch):
+    parser = object()
+    captured = {}
+    monkeypatch.setattr(
+        async_engine_module,
+        "create_output_parser",
+        lambda spec, tokenizer: captured.update(spec=spec, tokenizer=tokenizer) or parser,
+    )
+    request = SimpleNamespace(num_prompt_tokens=3, output_token_ids=[])
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.tokenizer = object()
+    core.scheduler = SimpleNamespace(
+        adopt_handoff=lambda **_kwargs: (
+            request,
+            SimpleNamespace(finished=False, finish_reason=None),
+        ),
+        abort_request=lambda _request_id: None,
+    )
+    core._request_contexts = {}
+    core._pending_free_ids = []
+    core._detokenize_incrementally = lambda _ctx: ""
+    spec = OutputParserSpec("deepseek_v4", "reasoning")
+
+    async def drive():
+        outputs = core.add_adopted_handoff(
+            reservation_id="reservation",
+            request_id="request",
+            prompt_token_ids=(1, 2, 3),
+            first_token=4,
+            max_new_tokens=8,
+            output_parser_spec=spec,
+        )
+        first = await anext(outputs)
+        installed = core._request_contexts["request"].output_parser
+        await outputs.aclose()
+        return first, installed
+
+    first, installed = asyncio.run(drive())
+
+    assert first.token_id == 4
+    assert installed is parser
+    assert captured == {"spec": spec, "tokenizer": core.tokenizer}
 
 
 def test_flush_pending_frees_sends_cleanup_only_step_command(monkeypatch):
