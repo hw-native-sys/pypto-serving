@@ -344,6 +344,7 @@ class ServingServer:
         )
 
         payload = decode_json(await request.body(), PrepareRequestHTTP)
+        output_parser_spec = None
         if payload.request_kind == "completion":
             public = CompletionRequest.model_validate_json(payload.request_json)
             prompt, prompt_token_ids = self._completion_prompt(public.prompt)
@@ -369,6 +370,7 @@ class ServingServer:
                 self._resolve_generate_config(public),
                 ignore_eos=self.generate_config.ignore_eos,
             )
+            output_parser_spec = self._output_parser_spec(public)
         else:
             raise ValueError("unsupported PD public request kind")
         prepared = self.engine.pd_service.prepare_request(
@@ -376,6 +378,7 @@ class ServingServer:
             prompt,
             config,
             prompt_token_ids,
+            output_parser_spec=output_parser_spec,
         )
         return Response(encode_json(prepared), media_type="application/json")
 
