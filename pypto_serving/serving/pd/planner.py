@@ -84,11 +84,17 @@ class ChunkTransferPlanner:
         rank_ids: tuple[int, ...],
         source_blocks_by_rank: dict[int, dict[str, tuple[int, ...]]],
         destination_blocks_by_rank: dict[int, dict[str, tuple[int, ...]]],
+        destination_prefix_hit_tokens: int = 0,
     ) -> ChunkPlan:
         if type(chunk_id) is not int or chunk_id < 0:
             raise ValueError("chunk_id must be a non-negative integer")
         if not 0 <= start_token < end_token:
             raise ValueError("chunk token range must be nonempty and increasing")
+        if (
+            type(destination_prefix_hit_tokens) is not int
+            or destination_prefix_hit_tokens < 0
+        ):
+            raise ValueError("destination prefix hit must be a non-negative integer")
         if not rank_ids or len(rank_ids) != len(set(rank_ids)):
             raise ValueError("rank_ids must be a nonempty unique tuple")
         if set(rank_ids) != set(source_blocks_by_rank) or set(rank_ids) != set(
@@ -113,6 +119,7 @@ class ChunkTransferPlanner:
                     final=final,
                     source_blocks=source[group_name],
                     destination_blocks=destination[group_name],
+                    destination_prefix_hit_tokens=destination_prefix_hit_tokens,
                 )
                 for component_name in component_names:
                     entry = self.registry.entry(component_name)
@@ -170,6 +177,7 @@ class ChunkTransferPlanner:
         final: bool,
         source_blocks: tuple[int, ...],
         destination_blocks: tuple[int, ...],
+        destination_prefix_hit_tokens: int,
     ) -> tuple[tuple[int, int, int], ...]:
         group = self.group_specs[group_name]
         capacity = group.spec.token_capacity
@@ -181,7 +189,8 @@ class ChunkTransferPlanner:
             first = max(0, logical_end - len(source_blocks))
             logical_indices = range(first, logical_end)
         else:
-            first_closed = start_token // capacity
+            transfer_start = max(start_token, destination_prefix_hit_tokens)
+            first_closed = transfer_start // capacity
             closed_end = end_token // capacity
             logical_indices = range(first_closed, closed_end)
 
@@ -189,7 +198,12 @@ class ChunkTransferPlanner:
             logical: physical_rows for logical in logical_indices
         }
         remainder = end_token % capacity
-        if final and remainder and group_name not in self.final_only_groups:
+        if (
+            final
+            and remainder
+            and group_name not in self.final_only_groups
+            and end_token > destination_prefix_hit_tokens
+        ):
             valid_rows = remainder // ratio
             if valid_rows:
                 rows_by_index[end_token // capacity] = valid_rows

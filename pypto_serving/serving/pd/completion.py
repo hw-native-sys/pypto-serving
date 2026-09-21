@@ -252,8 +252,8 @@ class CompletionTracker:
         """Publish a deterministic terminal fact after scheduler-side abort."""
         if self.state is CompletionState.ABORTED:
             return
-        if self.state is not CompletionState.IN_USE:
-            raise RuntimeError("only an admitted Decode request can be cancelled")
+        if self.state not in (CompletionState.READY, CompletionState.IN_USE):
+            raise RuntimeError("only a committed Decode request can be cancelled")
         self.state = CompletionState.ABORTED
         self._error_code = error_code
 

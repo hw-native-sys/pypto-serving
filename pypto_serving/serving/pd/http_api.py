@@ -15,7 +15,13 @@ from typing import TypeVar
 
 import msgspec
 
-from .protocol import CapabilityWire, ContinuationMetadata, DecodeOutputWire, HandoffKey
+from .protocol import (
+    CapabilityWire,
+    ContinuationMetadata,
+    DecodeOutputWire,
+    HandoffKey,
+    PrefixMatchSpec,
+)
 
 
 MAX_INTERNAL_BODY_BYTES = 4 << 20
@@ -60,6 +66,7 @@ class PreparedRequest(msgspec.Struct, frozen=True):
     prepared_digest: str
     continuation: ContinuationMetadata
     expires_at_ns: int
+    prefix_match_spec: PrefixMatchSpec | None = None
 
 
 class ReservePlacementHTTP(msgspec.Struct, frozen=True):
@@ -71,6 +78,7 @@ class ReservePlacementHTTP(msgspec.Struct, frozen=True):
     layout_fingerprint: str
     prefill_node_id: str
     prefill_endpoint_generation: int
+    prefix_match_spec: PrefixMatchSpec | None = None
 
 
 class PlacementReservation(msgspec.Struct, frozen=True):
@@ -85,6 +93,7 @@ class PlacementReservation(msgspec.Struct, frozen=True):
     decode_control_host: str
     decode_control_port: int
     decode_endpoint_generation: int
+    prefix_hit_tokens: int = 0
 
 
 class PlacementRejection(msgspec.Struct, frozen=True):
@@ -132,6 +141,7 @@ class ExecutePrefillHTTP(msgspec.Struct, frozen=True):
     decode_control_host: str
     decode_control_port: int
     decode_endpoint_generation: int
+    prefix_hit_tokens: int = 0
 
 
 class PrefillHandoffResult(msgspec.Struct, frozen=True):
@@ -148,6 +158,7 @@ class HandoffHTTP(msgspec.Struct, frozen=True):
 class AbortHandoffHTTP(msgspec.Struct, frozen=True):
     key: HandoffKey
     reason: str
+    deterministic: bool = True
 
 
 class DecodeStreamFrame(msgspec.Struct, frozen=True):
@@ -187,5 +198,6 @@ def capability_compatibility_digest(value: CapabilityWire) -> str:
         value.provider,
         value.logical_groups,
         value.physical_regions,
+        value.prefix_cache_mode,
     )
     return hashlib.sha256(msgspec.msgpack.encode(contract)).hexdigest()

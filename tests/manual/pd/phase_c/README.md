@@ -33,13 +33,13 @@ is the only PyPTO/Simpler work required when the framework stack advances.
 
 On 2026-09-11 the current serving base
 `e79a6ec9da716d8ab5f89b2ff430c494babf06d8` passed all 130 selected transfer
-tests in both `serving-a` and `serving-b` containers. Run
-`phase-c-pr223-one-20260911-03` then passed a one-rank A-to-B hardware smoke:
+tests in both validation containers. Run `phase-c-pr223-one-20260911-03` then
+passed a one-rank P-to-D hardware smoke:
 both roles reported `status=ok`, `components=8`, `payload_validated=true`, and
 `source_kernel=true`.
 
-The successful smoke used physical chip id 8 on both hosts because B's physical
-chips 0-7 were occupied. `npu-smi` groups two physical chips under each displayed
+The successful smoke used physical chip id 8 on both hosts because the decode
+host's physical chips 0-7 were occupied. `npu-smi` groups two physical chips under each displayed
 NPU row: displayed NPU 4 corresponds to physical chip ids 8 and 9. Always select
 from the process table by physical chip id and never infer availability from
 AICore utilization.
@@ -47,7 +47,7 @@ AICore utilization.
 Evidence is stored in each container under:
 
 ```text
-/home/sj/git/phase-d-pypto783-lib216-20260910/
+/workspace/phase-d-validation/
   phase-c-pr223-one-20260911-03/sender.log
   phase-c-pr223-one-20260911-03/receiver.log
 ```

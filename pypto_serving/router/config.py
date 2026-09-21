@@ -20,6 +20,7 @@ class RouterConfig:
     journal_path: str
     log_dir: str
     observability_enabled: bool = True
+    data_generation: int = 1
     route_epoch: int = 1
     control_incarnation: int = 1
     request_timeout_seconds: float = 600.0
@@ -46,4 +47,9 @@ class RouterConfig:
             journal_path=str(state_dir / "journal.jsonl"),
             log_dir=str(log_dir),
             observability_enabled=document.observability.enabled,
+            data_generation=document.runtime.generation,
+            route_epoch=document.runtime.route_epoch,
+            control_incarnation=document.runtime.control_incarnation,
+            max_active_handoffs=document.runtime.max_active_handoffs,
+            max_pending_handoffs=document.runtime.max_pending_handoffs,
         )

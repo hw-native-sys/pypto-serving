@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import socket
 
 import pytest
@@ -15,14 +16,21 @@ import pytest
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
 from pypto_serving.serving.pd.config import PDCapabilities, PDRole
 from pypto_serving.serving.pd.protocol import (
+    ChunkManifest,
+    ContinuationMetadata,
+    DecodeOutputWire,
     FramedChannel,
     HandoffKey,
+    PrefixMatchSpec,
     QueryHandoff,
     decode_message,
     encode_message,
     exchange_and_validate_hello,
     make_hello,
+    make_prefix_match_spec,
+    validate_prefix_match_spec,
 )
+from pypto_serving.serving.reasoning import OutputParserSpec
 
 
 def _capabilities(model_revision: str = "ds-v4-test") -> PDCapabilities:
@@ -149,6 +157,43 @@ def test_contract_digest_mismatch_is_rejected() -> None:
     )
 
 
+def test_prefix_cache_profile_mismatch_is_rejected() -> None:
+    local = replace(_capabilities(), prefix_cache_mode="d_only")
+    peer = replace(_capabilities(), prefix_cache_mode="disabled")
+    assert local.compatibility_error(peer) == (
+        "PD capability mismatch: prefix_cache_mode"
+    )
+
+
+def test_prefix_match_spec_is_canonical_bounded_and_tamper_evident() -> None:
+    spec = make_prefix_match_spec(
+        token_count=128,
+        alignment=128,
+        contract_digest=DSV4_DSPARK_K7_CONTRACT.digest,
+        group_block_hashes={"ori": [b"a" * 32, b"b" * 32]},
+    )
+    validate_prefix_match_spec(spec)
+    tampered = PrefixMatchSpec(
+        spec.schema_version,
+        spec.token_count,
+        spec.alignment,
+        spec.contract_digest,
+        spec.groups,
+        "0" * 64,
+    )
+    with pytest.raises(ValueError, match="tampered"):
+        validate_prefix_match_spec(tampered)
+
+
+def test_old_continuation_schema_is_rejected_before_handoff() -> None:
+    local = _capabilities()
+    peer = replace(local, continuation_schema="deepseek-v4-dspark-k7/v1")
+
+    assert local.compatibility_error(peer) == (
+        "PD capability mismatch: continuation_schema"
+    )
+
+
 def test_capacity_specific_registry_fingerprint_is_not_a_peer_compatibility_gate() -> None:
     local = _capabilities()
     peer = object.__new__(PDCapabilities)
@@ -164,3 +209,48 @@ def test_control_message_codec_rejects_empty_input() -> None:
     assert decode_message(encode_message(message)) == message
     with pytest.raises(ValueError, match="size"):
         decode_message(b"")
+
+
+def test_parser_spec_and_reasoning_survive_pd_wire_round_trip() -> None:
+    key = HandoffKey("request", "handoff", 1, 1, 1)
+    continuation = ContinuationMetadata(
+        prompt_token_ids=(1, 2, 3),
+        max_new_tokens=4,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=None,
+        seed=None,
+        stop_strings=(),
+        eos_token_id=2,
+        output_parser_spec=OutputParserSpec(
+            "deepseek_v4",
+            "reasoning",
+            include_reasoning=False,
+        ),
+    )
+    manifest = ChunkManifest(
+        key=key,
+        chunk_id=0,
+        start_token=0,
+        end_token=3,
+        final=True,
+        manifest_hash="m" * 64,
+        expected_units=(),
+        copies_by_rank={},
+        first_token=100,
+        continuation=continuation,
+    )
+    decoded_manifest = decode_message(encode_message(manifest))
+    assert decoded_manifest.continuation == continuation
+
+    output = DecodeOutputWire(
+        key=key,
+        token_id=101,
+        text="answer",
+        reasoning="hidden on request but valid on the wire",
+        finished=True,
+        finish_reason="FINISHED_LENGTH",
+        prompt_tokens=3,
+        completion_tokens=2,
+    )
+    assert decode_message(encode_message(output)) == output

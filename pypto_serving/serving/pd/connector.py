@@ -34,6 +34,7 @@ from .protocol import (
     ReserveRejected,
     ReserveRequest,
     TransferResult,
+    validate_prefix_match_spec,
 )
 
 
@@ -78,6 +79,43 @@ class DecodeConnector:
             return ReserveRejected(request.key, "INVALID_LENGTH", False)
         if request.prepared_digest and len(request.prepared_digest) != 64:
             return ReserveRejected(request.key, "INVALID_PREPARED_DIGEST", False)
+        prefix_spec = request.prefix_match_spec
+        if self.capabilities.prefix_cache_mode == "disabled":
+            if prefix_spec is not None:
+                return ReserveRejected(request.key, "UNEXPECTED_PREFIX_MATCH", False)
+            prefix_hashes: dict[str, list[bytes]] = {}
+        else:
+            if prefix_spec is None:
+                return ReserveRejected(request.key, "MISSING_PREFIX_MATCH", False)
+            try:
+                validate_prefix_match_spec(prefix_spec)
+            except ValueError:
+                return ReserveRejected(request.key, "INVALID_PREFIX_MATCH", False)
+            if (
+                prefix_spec.token_count != request.prompt_token_count
+                or prefix_spec.alignment
+                != self.cache_manager.group_prefix_cache_alignment
+                or prefix_spec.contract_digest != self.contract.digest
+                or tuple(group.group_name for group in prefix_spec.groups)
+                != tuple(sorted(self.contract.prefix_cache_groups))
+            ):
+                return ReserveRejected(request.key, "PREFIX_MATCH_CONTRACT_MISMATCH", False)
+            prefix_hashes = {
+                group.group_name: list(group.block_hashes)
+                for group in prefix_spec.groups
+            }
+            specs = {spec.name: spec for spec in self.cache_manager.group_specs}
+            for group_name, hashes in prefix_hashes.items():
+                spec = specs[group_name]
+                expected = (
+                    max(0, request.prompt_token_count - 1)
+                    if spec.is_eagle_group
+                    else request.prompt_token_count
+                ) // spec.spec.token_capacity
+                if len(hashes) != expected:
+                    return ReserveRejected(
+                        request.key, "PREFIX_MATCH_BLOCK_COUNT", False
+                    )
         if request.key in self._terminal_status:
             return ReserveRejected(request.key, "HANDOFF_TERMINAL", False)
         spec = (
@@ -86,6 +124,7 @@ class DecodeConnector:
             request.layout_fingerprint,
             request.requested_partition,
             request.prepared_digest,
+            "" if prefix_spec is None else prefix_spec.identity_digest,
         )
         existing_id = self._reservation_by_key.get(request.key)
         if existing_id is not None:
@@ -105,6 +144,9 @@ class DecodeConnector:
                 request.key.request_id,
                 request.prompt_token_count + request.max_new_tokens,
                 partition=request.requested_partition,
+                prompt_token_count=request.prompt_token_count,
+                prefix_block_hashes=prefix_hashes,
+                shareable_group_names=self.contract.prefix_cache_groups,
             )
             # Returning destination envelopes is the authorization boundary:
             # after this message is visible, timeout alone cannot free the pages.
@@ -201,6 +243,7 @@ class DecodeConnector:
                 self.destination_ranks[rank_id]
                 for rank_id in self._active_rank_ids(reservation.partition)
             ),
+            prefix_hit_tokens=reservation.prefix_hit_tokens,
         )
 
     def _require_tracker(self, key: HandoffKey) -> CompletionTracker:
@@ -262,7 +305,7 @@ class DecodeConnector:
 
     def _validate_manifest(self, manifest: ChunkManifest) -> None:
         tracker = self._require_tracker(manifest.key)
-        expected_digest = self._reservation_specs[manifest.key][-1]
+        expected_digest = self._reservation_specs[manifest.key][4]
         if manifest.prepared_digest != expected_digest:
             raise ValueError("chunk manifest prepared-request digest mismatch")
         reservation = self.cache_manager.group_cache_reservation(tracker.reservation_id)
@@ -307,6 +350,7 @@ class DecodeConnector:
             rank_ids=rank_ids,
             source_blocks_by_rank=destination_tables,
             destination_blocks_by_rank=destination_tables,
+            destination_prefix_hit_tokens=reservation.prefix_hit_tokens,
         )
         expected_writes = {
             rank.rank_id: {

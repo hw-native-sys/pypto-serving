@@ -33,8 +33,15 @@ class ModelPDAdapter(Protocol):
     def validate_generate_config(self, config) -> None: ...
 
     def build_continuation(
-        self, *, config, prompt_token_ids, eos_token_id: int | None
+        self,
+        *,
+        config,
+        prompt_token_ids,
+        eos_token_id: int | None,
+        output_parser_spec=None,
     ): ...
+
+    def build_prefix_match_spec(self, prompt_token_ids, cache_manager): ...
 
     def build_manifest(
         self,

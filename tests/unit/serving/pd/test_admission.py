@@ -103,3 +103,65 @@ def test_fair_handoff_admission_runs_up_to_active_limit_in_fifo_order() -> None:
         assert admission.count == 0
 
     asyncio.run(exercise())
+
+
+def test_fair_handoff_admission_removes_cancelled_waiter_without_reordering() -> None:
+    async def exercise() -> None:
+        admission = FairHandoffAdmission(active_limit=1, total_limit=4)
+        release = asyncio.Event()
+        entered = []
+
+        async def hold(index: int) -> None:
+            async with admission.admit():
+                entered.append(index)
+                if index == 0:
+                    await release.wait()
+
+        first = asyncio.create_task(hold(0))
+        await asyncio.sleep(0)
+        cancelled = asyncio.create_task(hold(1))
+        second = asyncio.create_task(hold(2))
+        third = asyncio.create_task(hold(3))
+        await asyncio.sleep(0)
+        assert admission.active == 1
+        assert admission.queued == 3
+
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        assert admission.active == 1
+        assert admission.queued == 2
+
+        release.set()
+        await asyncio.gather(first, second, third)
+        assert entered == [0, 2, 3]
+        assert admission.count == 0
+
+    asyncio.run(exercise())
+
+
+def test_fair_handoff_admission_observes_queue_before_it_is_admitted() -> None:
+    async def exercise() -> None:
+        states = []
+        admission = FairHandoffAdmission(
+            active_limit=1,
+            total_limit=2,
+            state_observer=lambda active, queued: states.append((active, queued)),
+        )
+        release = asyncio.Event()
+
+        async def hold() -> None:
+            async with admission.admit():
+                await release.wait()
+
+        first = asyncio.create_task(hold())
+        await asyncio.sleep(0)
+        second = asyncio.create_task(hold())
+        await asyncio.sleep(0)
+        assert (1, 1) in states
+
+        release.set()
+        await asyncio.gather(first, second)
+        assert states[-1] == (0, 0)
+
+    asyncio.run(exercise())

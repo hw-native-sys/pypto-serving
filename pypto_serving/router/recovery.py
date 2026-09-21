@@ -47,6 +47,41 @@ class FixedPairRuntimeManager(Protocol):
     async def validate_ready(self, expected: RuntimeGeneration) -> bool: ...
 
 
+class CallbackFixedPairRuntimeManager:
+    """Bind the Router state machine to a deployment-owned process supervisor.
+
+    The callbacks are deliberately semantic rather than shell-oriented.  The
+    deployment layer keeps ownership of PID/session identities and launch
+    mechanics; the Router only accepts a positive death barrier and an exact
+    generation-ready validation before replay is possible.
+    """
+
+    def __init__(
+        self,
+        *,
+        retire: Callable[[RuntimeGeneration, str], Awaitable[None]],
+        confirm_dead: Callable[[RuntimeGeneration], Awaitable[bool]],
+        restart: Callable[[RuntimeGeneration], Awaitable[None]],
+        validate_ready: Callable[[RuntimeGeneration], Awaitable[bool]],
+    ) -> None:
+        self._retire = retire
+        self._confirm_dead = confirm_dead
+        self._restart = restart
+        self._validate_ready = validate_ready
+
+    async def retire(self, current: RuntimeGeneration, reason: str) -> None:
+        await self._retire(current, reason)
+
+    async def confirm_dead(self, current: RuntimeGeneration) -> bool:
+        return bool(await self._confirm_dead(current))
+
+    async def restart(self, next_generation: RuntimeGeneration) -> None:
+        await self._restart(next_generation)
+
+    async def validate_ready(self, expected: RuntimeGeneration) -> bool:
+        return bool(await self._validate_ready(expected))
+
+
 class FixedPairRecoveryController:
     """Gate admission and orchestrate a new-generation re-prefill recovery.
 

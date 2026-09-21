@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
+from contextlib import suppress
+import socket
 import urllib.error
 import urllib.request
 
@@ -53,7 +55,22 @@ class NodeClient:
                     raise ValueError("Decode stream frame exceeds the bounded size")
                 yield decode_json(line.rstrip(b"\n"), DecodeStreamFrame)
         finally:
-            response.close()
+            # A cancelled public stream can race a worker thread blocked in
+            # ``readline``.  Closing the HTTP response on the event loop may
+            # then wait on the buffered reader's lock and freeze every Router
+            # endpoint.  Interrupt the stdlib response socket before closing,
+            # and keep both operations off the event loop.
+            await asyncio.to_thread(self._close_stream_response, response)
+
+    @staticmethod
+    def _close_stream_response(response) -> None:
+        fp = getattr(response, "fp", None)
+        raw = getattr(fp, "raw", None)
+        stream_socket = getattr(raw, "_sock", None)
+        if stream_socket is not None:
+            with suppress(OSError):
+                stream_socket.shutdown(socket.SHUT_RDWR)
+        response.close()
 
     def _request(self, method: str, path: str, body: bytes | None) -> bytes:
         response = self._open(method, path, body)

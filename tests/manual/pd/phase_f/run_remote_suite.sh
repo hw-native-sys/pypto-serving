@@ -13,7 +13,7 @@ control_dir=$1
 shift
 driver=$1
 shift
-if [[ $driver != run_suite.py && $driver != run_soak.py && $driver != run_non_pd_suite.py ]]; then
+if [[ $driver != run_suite.py && $driver != run_soak.py && $driver != run_non_pd_suite.py && $driver != run_concurrency.py && $driver != run_fault_matrix.py ]]; then
     echo "unsupported Phase F driver: $driver" >&2
     exit 2
 fi

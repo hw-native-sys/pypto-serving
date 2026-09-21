@@ -98,6 +98,19 @@ def main() -> int:
         for case_name, digests in digests_by_case.items():
             if len(digests) != 1:
                 errors.append(f"{case_name}: repeated greedy token-ID digests differ")
+    comparison_groups: dict[str, set[str]] = {}
+    for case in cases:
+        group = case.get("comparison_group", "")
+        if not group:
+            continue
+        comparison_groups.setdefault(group, set()).update(
+            digests_by_case.get(case["name"], set())
+        )
+    for group, digests in sorted(comparison_groups.items()):
+        if len(digests) != 1:
+            errors.append(
+                f"comparison group {group}: greedy token-ID digests differ"
+            )
     audit = {
         "schema_version": 1,
         "repeat": args.repeat,
@@ -111,6 +124,10 @@ def main() -> int:
         },
         "unique_token_id_digests_by_case": {
             name: len(digests) for name, digests in digests_by_case.items()
+        },
+        "comparison_groups": {
+            group: sorted(digests)
+            for group, digests in sorted(comparison_groups.items())
         },
         "errors": errors,
         "result": "PASS" if not errors else "FAIL",
