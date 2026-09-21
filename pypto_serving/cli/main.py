@@ -346,7 +346,11 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     # DSpark rebuilds its private drafter context from a prefilled suffix.
     # Arbitrary-depth MTP still lacks a grouped prefix-cache contract.
     enable_prefix_cache = args.enable_prefix_caching
-    if model_family == "deepseek_v4" and (
+    if pd_config is not None:
+        # PD uses the one shared runtime profile as the source of truth.  P/D
+        # launchers do not need a second, easy-to-mismatch cache flag.
+        enable_prefix_cache = pd_config.prefix_cache_enabled
+    elif model_family == "deepseek_v4" and (
         num_speculative_tokens > 1 and model_variant != "dspark"
     ):
         enable_prefix_cache = False

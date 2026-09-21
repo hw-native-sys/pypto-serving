@@ -16,7 +16,7 @@ def test_contract_digest_is_canonical_and_semantic() -> None:
     contract = DSV4_DSPARK_K7_CONTRACT
     assert contract.digest == contract.digest
     assert len(contract.digest) == 64
-    assert replace(contract, version=2).digest != contract.digest
+    assert replace(contract, version=contract.version + 1).digest != contract.digest
     assert contract.logical_groups == (
         "ori",
         "cmp_c128",

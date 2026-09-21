@@ -5,6 +5,7 @@ import asyncio
 import json
 import time
 
+import anyio
 import pytest
 
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
@@ -29,10 +30,17 @@ from pypto_serving.serving.pd.protocol import (
     ContinuationMetadata,
     DecodeOutputWire,
     HandoffKey,
+    HandoffStatus,
 )
 
 
-def _descriptor(role: PDRole, node_id: str = "") -> NodeDescriptor:
+def _descriptor(
+    role: PDRole,
+    node_id: str = "",
+    *,
+    generation: int = 1,
+    control_incarnation: int = 1,
+) -> NodeDescriptor:
     node_id = node_id or role.value
     capabilities = PDCapabilities(
         adapter_id=DSV4_DSPARK_K7_CONTRACT.adapter_id,
@@ -52,9 +60,9 @@ def _descriptor(role: PDRole, node_id: str = "") -> NodeDescriptor:
         run_id="run",
         control_host="decode-control",
         control_port=29831,
-        owner_generation=1,
-        endpoint_generation=1,
-        control_incarnation=1,
+        owner_generation=generation,
+        endpoint_generation=generation,
+        control_incarnation=control_incarnation,
         capabilities=CapabilityWire.from_capabilities(capabilities),
         health="READY",
     )
@@ -75,16 +83,31 @@ def _capacity(role: PDRole, node_id: str = "") -> CapacitySnapshot:
 
 
 class _PrefillClient:
-    def __init__(self, waiting: asyncio.Event, node_id: str = "prefill") -> None:
+    def __init__(
+        self,
+        waiting: asyncio.Event,
+        node_id: str = "prefill",
+        *,
+        generation: int = 1,
+        control_incarnation: int = 1,
+    ) -> None:
         self.waiting = waiting
         self.node_id = node_id
+        self.generation = generation
+        self.control_incarnation = control_incarnation
         self.execute_calls = 0
         self.abort_calls = 0
+        self.abort_deterministic = []
         self.query_calls = 0
 
     async def get(self, path, _type):
         if path == "/internal/pd/descriptor":
-            return _descriptor(PDRole.PREFILL, self.node_id)
+            return _descriptor(
+                PDRole.PREFILL,
+                self.node_id,
+                generation=self.generation,
+                control_incarnation=self.control_incarnation,
+            )
         if path == "/internal/pd/capacity":
             return _capacity(PDRole.PREFILL, self.node_id)
         raise AssertionError(path)
@@ -118,8 +141,10 @@ class _PrefillClient:
                 "READY",
             )
         if path == "/internal/pd/abort":
+            await asyncio.sleep(0)
             self.abort_calls += 1
-            return None
+            self.abort_deterministic.append(payload.deterministic)
+            return HandoffStatus(payload.key, "ABORTED", error_code=payload.reason)
         if path == "/internal/pd/query":
             self.query_calls += 1
             return None
@@ -127,16 +152,31 @@ class _PrefillClient:
 
 
 class _DecodeClient:
-    def __init__(self, waiting: asyncio.Event, node_id: str = "decode") -> None:
+    def __init__(
+        self,
+        waiting: asyncio.Event,
+        node_id: str = "decode",
+        *,
+        generation: int = 1,
+        control_incarnation: int = 1,
+    ) -> None:
         self.waiting = waiting
         self.node_id = node_id
+        self.generation = generation
+        self.control_incarnation = control_incarnation
         self.reservation = None
         self.abort_calls = 0
+        self.abort_deterministic = []
         self.query_calls = 0
 
     async def get(self, path, _type):
         if path == "/internal/pd/descriptor":
-            return _descriptor(PDRole.DECODE, self.node_id)
+            return _descriptor(
+                PDRole.DECODE,
+                self.node_id,
+                generation=self.generation,
+                control_incarnation=self.control_incarnation,
+            )
         if path == "/internal/pd/capacity":
             return _capacity(PDRole.DECODE, self.node_id)
         raise AssertionError(path)
@@ -154,15 +194,24 @@ class _DecodeClient:
                 decode_node_id=self.node_id,
                 decode_control_host="decode-control",
                 decode_control_port=29831,
-                decode_endpoint_generation=1,
+                decode_endpoint_generation=self.generation,
             )
             return ReservePlacementResult(reservation=self.reservation)
         if path == "/internal/pd/authorize":
             assert payload.reservation_id == self.reservation.reservation_id
             return None
         if path == "/internal/pd/abort":
+            await asyncio.sleep(0)
             self.abort_calls += 1
-            return None
+            self.abort_deterministic.append(payload.deterministic)
+            return HandoffStatus(
+                payload.key,
+                "ABORTED",
+                reservation_id=(
+                    "" if self.reservation is None else self.reservation.reservation_id
+                ),
+                error_code=payload.reason,
+            )
         if path == "/internal/pd/query":
             self.query_calls += 1
             return None
@@ -216,10 +265,48 @@ class _EOFDecodeClient(_DecodeClient):
         yield DecodeStreamFrame(event="waiting", state="AUTHORIZED")
 
 
+class _BlockingAfterOutputDecodeClient(_DecodeClient):
+    async def stream_decode(self, _path, payload):
+        self.waiting.set()
+        yield DecodeStreamFrame(event="waiting", state="AUTHORIZED")
+        yield DecodeStreamFrame(
+            event="output",
+            state="IN_USE",
+            output=DecodeOutputWire(
+                key=payload.key,
+                token_id=101,
+                text="hel",
+                finished=False,
+                finish_reason="",
+                prompt_tokens=3,
+                completion_tokens=1,
+                token_ids=(),
+                output_sequence=1,
+            ),
+        )
+        await anyio.sleep_forever()
+
+
 class _ReserveFailureDecodeClient(_DecodeClient):
     async def post(self, path, payload, response_type=None):
         if path == "/internal/pd/reserve":
             raise RuntimeError("D capacity unavailable")
+        return await super().post(path, payload, response_type)
+
+
+class _AuthorizeFailureDecodeClient(_DecodeClient):
+    async def post(self, path, payload, response_type=None):
+        if path == "/internal/pd/authorize":
+            raise RuntimeError("D authorization failed")
+        return await super().post(path, payload, response_type)
+
+
+class _AbortFailureDecodeClient(_AuthorizeFailureDecodeClient):
+    async def post(self, path, payload, response_type=None):
+        if path == "/internal/pd/abort":
+            self.abort_calls += 1
+            self.abort_deterministic.append(payload.deterministic)
+            raise RuntimeError("D abort acknowledgement lost")
         return await super().post(path, payload, response_type)
 
 
@@ -243,7 +330,59 @@ class _RejectDecodeClient(_DecodeClient):
         return await super().post(path, payload, response_type)
 
 
-def _coordinator(monkeypatch, tmp_path, p_client, d_client):
+class _ReplacementRuntimeManager:
+    def __init__(self) -> None:
+        self.coordinator = None
+        self.calls = []
+
+    async def retire(self, current, reason) -> None:
+        self.calls.append(("retire", current, reason))
+
+    async def confirm_dead(self, current) -> bool:
+        self.calls.append(("confirm_dead", current))
+        return True
+
+    async def restart(self, next_generation) -> None:
+        self.calls.append(("restart", next_generation))
+        waiting = asyncio.Event()
+        self.coordinator.directory.prefill_clients = (
+            _PrefillClient(
+                waiting,
+                generation=next_generation.data_generation,
+                control_incarnation=next_generation.control_incarnation,
+            ),
+        )
+        self.coordinator.directory.decode_clients = (
+            _DecodeClient(
+                waiting,
+                generation=next_generation.data_generation,
+                control_incarnation=next_generation.control_incarnation,
+            ),
+        )
+
+    async def validate_ready(self, expected) -> bool:
+        self.calls.append(("validate_ready", expected))
+        p_client = self.coordinator.directory.prefill_clients[0]
+        d_client = self.coordinator.directory.decode_clients[0]
+        p_descriptor, d_descriptor = await asyncio.gather(
+            p_client.get("/internal/pd/descriptor", NodeDescriptor),
+            d_client.get("/internal/pd/descriptor", NodeDescriptor),
+        )
+        return all(
+            descriptor.endpoint_generation == expected.data_generation
+            and descriptor.control_incarnation == expected.control_incarnation
+            for descriptor in (p_descriptor, d_descriptor)
+        )
+
+
+def _coordinator(
+    monkeypatch,
+    tmp_path,
+    p_client,
+    d_client,
+    *,
+    runtime_manager=None,
+):
     config = RouterConfig(
         prefill_urls=("http://prefill",),
         decode_urls=("http://decode",),
@@ -263,6 +402,7 @@ def _coordinator(monkeypatch, tmp_path, p_client, d_client):
             RoundRobinRoutePolicy(),
         ),
         journal,
+        runtime_manager=runtime_manager,
     )
     return coordinator, journal
 
@@ -335,6 +475,8 @@ def test_router_fails_closed_and_aborts_both_nodes_on_output_gap(
             ]
         assert p_client.abort_calls == 1
         assert d_client.abort_calls == 1
+        assert p_client.abort_deterministic == [False]
+        assert d_client.abort_deterministic == [False]
         assert journal.unresolved == ()
         with open(journal.path, encoding="utf-8") as stream:
             events = [json.loads(line)["event"] for line in stream]
@@ -371,7 +513,7 @@ def test_non_streaming_failure_remains_eligible_for_new_generation_reprefill(
     asyncio.run(exercise())
 
 
-def test_router_client_cancellation_records_recovery_and_aborts_pair(
+def test_router_client_cancellation_after_output_is_lightweight_and_aborts_pair(
     monkeypatch, tmp_path
 ) -> None:
     async def exercise() -> None:
@@ -393,14 +535,52 @@ def test_router_client_cancellation_records_recovery_and_aborts_pair(
 
         assert p_client.abort_calls == 1
         assert d_client.abort_calls == 1
+        assert p_client.abort_deterministic == [True]
+        assert d_client.abort_deterministic == [True]
         assert journal.unresolved == ()
         with open(journal.path, encoding="utf-8") as stream:
             records = [json.loads(line) for line in stream]
-        assert records[-1]["event"] == "RECOVERY_REQUIRED"
+        assert records[-1]["event"] == "HANDOFF_FAILED"
         assert records[-1]["error_code"] == "GeneratorExit"
+        coordinator.recovery.assert_admission()
         journal.close()
 
     asyncio.run(exercise())
+
+
+def test_router_anyio_cancel_scope_cannot_interrupt_pair_abort(
+    monkeypatch, tmp_path
+) -> None:
+    async def exercise() -> None:
+        waiting = asyncio.Event()
+        p_client = _PrefillClient(waiting)
+        d_client = _BlockingAfterOutputDecodeClient(waiting)
+        coordinator, journal = _coordinator(
+            monkeypatch, tmp_path, p_client, d_client
+        )
+
+        async def consume() -> None:
+            async for output in coordinator.generate(
+                "completion",
+                b'{"prompt":"hello","max_tokens":2}',
+                "request-anyio-cancel",
+            ):
+                assert output.output_sequence == 1
+                task_group.cancel_scope.cancel()
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(consume)
+
+        assert p_client.abort_deterministic == [True]
+        assert d_client.abort_deterministic == [True]
+        coordinator.recovery.assert_admission()
+        with open(journal.path, encoding="utf-8") as stream:
+            records = [json.loads(line) for line in stream]
+        assert records[-1]["event"] == "HANDOFF_FAILED"
+        assert records[-1]["error_code"] == "CancelledError"
+        journal.close()
+
+    anyio.run(exercise)
 
 
 def test_router_decode_eof_is_recovery_required_and_aborts_pair(
@@ -425,10 +605,57 @@ def test_router_decode_eof_is_recovery_required_and_aborts_pair(
             ]
         assert p_client.abort_calls == 1
         assert d_client.abort_calls == 1
+        assert p_client.abort_deterministic == [False]
+        assert d_client.abort_deterministic == [False]
         with open(journal.path, encoding="utf-8") as stream:
             records = [json.loads(line) for line in stream]
         assert records[-1]["event"] == "RECOVERY_REQUIRED"
         assert records[-1]["error_code"] == "EOFError"
+        journal.close()
+
+    asyncio.run(exercise())
+
+
+def test_unpublished_request_is_automatically_reprefilled_on_new_generation(
+    monkeypatch, tmp_path
+) -> None:
+    async def exercise() -> None:
+        waiting = asyncio.Event()
+        manager = _ReplacementRuntimeManager()
+        coordinator, journal = _coordinator(
+            monkeypatch,
+            tmp_path,
+            _PrefillClient(waiting),
+            _GapDecodeClient(waiting),
+            runtime_manager=manager,
+        )
+        manager.coordinator = coordinator
+
+        outputs = [
+            output
+            async for output in coordinator.generate(
+                "completion",
+                b'{"prompt":"hello","max_tokens":2}',
+                "request-auto-reprefill",
+                publish_immediately=False,
+            )
+        ]
+
+        assert [output.output_sequence for output in outputs] == [1, 2]
+        assert outputs[-1].finished
+        assert [call[0] for call in manager.calls] == [
+            "retire",
+            "confirm_dead",
+            "restart",
+            "validate_ready",
+        ]
+        assert coordinator.recovery.snapshot()["phase"] == "RUNNING"
+        assert coordinator.recovery.snapshot()["data_generation"] == 2
+        assert coordinator.recovery.snapshot()["control_incarnation"] == 2
+        assert coordinator.directory.control_incarnation == 2
+        assert coordinator._replayable == {}
+        assert coordinator._replay_results == {}
+        assert journal.unresolved == ()
         journal.close()
 
     asyncio.run(exercise())
@@ -457,10 +684,75 @@ def test_router_reservation_failure_is_definite_and_aborts_without_prefill(
         assert p_client.execute_calls == 0
         assert p_client.abort_calls == 1
         assert d_client.abort_calls == 1
+        assert p_client.abort_deterministic == [True]
+        assert d_client.abort_deterministic == [True]
         with open(journal.path, encoding="utf-8") as stream:
             records = [json.loads(line) for line in stream]
         assert records[-1]["event"] == "HANDOFF_FAILED"
         assert records[-1]["error_code"] == "RuntimeError"
+        journal.close()
+
+    asyncio.run(exercise())
+
+
+def test_router_authorization_failure_after_reservation_is_lightweight(
+    monkeypatch, tmp_path
+) -> None:
+    async def exercise() -> None:
+        waiting = asyncio.Event()
+        p_client = _PrefillClient(waiting)
+        d_client = _AuthorizeFailureDecodeClient(waiting)
+        coordinator, journal = _coordinator(
+            monkeypatch, tmp_path, p_client, d_client
+        )
+
+        with pytest.raises(RuntimeError, match="authorization failed"):
+            _ = [
+                output
+                async for output in coordinator.generate(
+                    "completion",
+                    b'{"prompt":"hello","max_tokens":2}',
+                    "request-authorize-failure",
+                )
+            ]
+        assert p_client.abort_deterministic == [True]
+        assert d_client.abort_deterministic == [True]
+        coordinator.recovery.assert_admission()
+        with open(journal.path, encoding="utf-8") as stream:
+            records = [json.loads(line) for line in stream]
+        assert records[-1]["event"] == "HANDOFF_FAILED"
+        journal.close()
+
+    asyncio.run(exercise())
+
+
+def test_router_escalates_when_deterministic_abort_is_not_confirmed(
+    monkeypatch, tmp_path
+) -> None:
+    async def exercise() -> None:
+        waiting = asyncio.Event()
+        p_client = _PrefillClient(waiting)
+        d_client = _AbortFailureDecodeClient(waiting)
+        coordinator, journal = _coordinator(
+            monkeypatch, tmp_path, p_client, d_client
+        )
+
+        with pytest.raises(RuntimeError, match="authorization failed"):
+            _ = [
+                output
+                async for output in coordinator.generate(
+                    "completion",
+                    b'{"prompt":"hello","max_tokens":2}',
+                    "request-abort-unconfirmed",
+                )
+            ]
+        assert p_client.abort_deterministic == [True]
+        assert d_client.abort_deterministic == [True]
+        with pytest.raises(RuntimeError, match="admission is stopped"):
+            coordinator.recovery.assert_admission()
+        with open(journal.path, encoding="utf-8") as stream:
+            records = [json.loads(line) for line in stream]
+        assert records[-1]["event"] == "RECOVERY_REQUIRED"
         journal.close()
 
     asyncio.run(exercise())

@@ -18,6 +18,8 @@ from typing import Union
 
 import msgspec
 
+from pypto_serving.serving.reasoning import OutputParserSpec
+
 from .config import PDCapabilities, PDRole
 
 
@@ -27,6 +29,8 @@ from .config import PDCapabilities, PDRole
 # handoffs this still caps decoded control payload memory at 64 MiB per peer.
 MAX_CONTROL_MESSAGE_BYTES = 16 << 20
 MAX_ID_BYTES = 256
+PREFIX_MATCH_SCHEMA_VERSION = 1
+MAX_PREFIX_MATCH_SPEC_BYTES = 2 << 20
 
 
 def _identifier(value: str, name: str) -> None:
@@ -63,6 +67,7 @@ class CapabilityWire(msgspec.Struct, frozen=True):
     provider: str
     logical_groups: tuple[str, ...]
     physical_regions: tuple[str, ...]
+    prefix_cache_mode: str = "disabled"
 
     @classmethod
     def from_capabilities(cls, value: PDCapabilities) -> "CapabilityWire":
@@ -79,6 +84,7 @@ class CapabilityWire(msgspec.Struct, frozen=True):
             value.provider,
             value.logical_groups,
             value.physical_regions,
+            value.prefix_cache_mode,
         )
 
     def to_capabilities(self) -> PDCapabilities:
@@ -95,6 +101,7 @@ class CapabilityWire(msgspec.Struct, frozen=True):
             provider=self.provider,
             logical_groups=self.logical_groups,
             physical_regions=self.physical_regions,
+            prefix_cache_mode=self.prefix_cache_mode,
         )
 
 
@@ -135,6 +142,22 @@ class RegistryAdvertisement(msgspec.Struct, tag="registry", frozen=True):
     ranks: tuple[RankRegistration, ...]
 
 
+class PrefixGroupMatch(msgspec.Struct, frozen=True):
+    group_name: str
+    block_hashes: tuple[bytes, ...]
+
+
+class PrefixMatchSpec(msgspec.Struct, frozen=True):
+    """Bounded, versioned and address-free cache lookup material."""
+
+    schema_version: int
+    token_count: int
+    alignment: int
+    contract_digest: str
+    groups: tuple[PrefixGroupMatch, ...]
+    identity_digest: str
+
+
 class ReserveRequest(msgspec.Struct, tag="reserve", frozen=True):
     key: HandoffKey
     prompt_token_count: int
@@ -142,6 +165,7 @@ class ReserveRequest(msgspec.Struct, tag="reserve", frozen=True):
     layout_fingerprint: str
     requested_partition: int | None = None
     prepared_digest: str = ""
+    prefix_match_spec: PrefixMatchSpec | None = None
 
 
 class ReserveAccepted(msgspec.Struct, tag="reserve_ok", frozen=True):
@@ -150,6 +174,7 @@ class ReserveAccepted(msgspec.Struct, tag="reserve_ok", frozen=True):
     partition: int
     block_ids_by_group: dict[str, tuple[int, ...]]
     ranks: tuple[RankRegistration, ...]
+    prefix_hit_tokens: int = 0
 
 
 class ReserveRejected(msgspec.Struct, tag="reserve_rejected", frozen=True):
@@ -182,6 +207,7 @@ class ContinuationMetadata(msgspec.Struct, frozen=True):
     stop_strings: tuple[str, ...]
     eos_token_id: int | None
     stream: bool = True
+    output_parser_spec: OutputParserSpec | None = None
 
 
 class ChunkManifest(msgspec.Struct, tag="chunk_manifest", frozen=True):
@@ -246,6 +272,7 @@ class DecodeOutputWire(msgspec.Struct, tag="decode_output", frozen=True):
     completion_tokens: int
     token_ids: tuple[int, ...] = ()
     output_sequence: int = 0
+    reasoning: str = ""
 
 
 class OpenRoute(msgspec.Struct, tag="open_route", frozen=True):
@@ -357,6 +384,75 @@ def continuation_metadata_hash(metadata: ContinuationMetadata) -> str:
     if not isinstance(metadata, ContinuationMetadata):
         raise TypeError("metadata must be ContinuationMetadata")
     return hashlib.sha256(_message_encoder.encode(metadata)).hexdigest()
+
+
+def make_prefix_match_spec(
+    *,
+    token_count: int,
+    alignment: int,
+    contract_digest: str,
+    group_block_hashes: dict[str, list[bytes]],
+) -> PrefixMatchSpec:
+    if type(token_count) is not int or token_count <= 0:
+        raise ValueError("prefix match token_count must be positive")
+    if type(alignment) is not int or alignment <= 0:
+        raise ValueError("prefix match alignment must be positive")
+    if len(contract_digest) != 64:
+        raise ValueError("prefix match contract digest must be SHA-256")
+    groups = tuple(
+        PrefixGroupMatch(name, tuple(group_block_hashes[name]))
+        for name in sorted(group_block_hashes)
+    )
+    for group in groups:
+        _identifier(group.group_name, "prefix group")
+        if any(len(block_hash) != 32 for block_hash in group.block_hashes):
+            raise ValueError("prefix block hashes must be SHA-256 digests")
+    identity_payload = (
+        PREFIX_MATCH_SCHEMA_VERSION,
+        token_count,
+        alignment,
+        contract_digest,
+        groups,
+    )
+    identity_digest = hashlib.sha256(
+        msgspec.msgpack.encode(identity_payload)
+    ).hexdigest()
+    spec = PrefixMatchSpec(
+        PREFIX_MATCH_SCHEMA_VERSION,
+        token_count,
+        alignment,
+        contract_digest,
+        groups,
+        identity_digest,
+    )
+    if len(msgspec.msgpack.encode(spec)) > MAX_PREFIX_MATCH_SPEC_BYTES:
+        raise ValueError("prefix match specification exceeds its bounded wire size")
+    return spec
+
+
+def validate_prefix_match_spec(spec: PrefixMatchSpec) -> None:
+    rebuilt = make_prefix_match_spec(
+        token_count=spec.token_count,
+        alignment=spec.alignment,
+        contract_digest=spec.contract_digest,
+        group_block_hashes={
+            group.group_name: list(group.block_hashes) for group in spec.groups
+        },
+    )
+    if rebuilt != spec:
+        raise ValueError("prefix match specification is non-canonical or tampered")
+
+
+def prepared_request_hash(
+    continuation: ContinuationMetadata,
+    prefix_match_spec: PrefixMatchSpec | None,
+) -> str:
+    """Bind execution metadata to the exact cache match material."""
+    payload = (
+        continuation_metadata_hash(continuation),
+        "" if prefix_match_spec is None else prefix_match_spec.identity_digest,
+    )
+    return hashlib.sha256(msgspec.msgpack.encode(payload)).hexdigest()
 
 
 def chunk_payload_hash(

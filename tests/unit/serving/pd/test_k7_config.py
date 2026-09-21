@@ -18,7 +18,13 @@ from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRA
 K7 = DSV4_DSPARK_K7_CONTRACT.decode_speculative_tokens
 
 
-def _pd_args(tmp_path, *, role: str, speculative_tokens: int):
+def _pd_args(
+    tmp_path,
+    *,
+    role: str,
+    speculative_tokens: int,
+    prefix_cache_mode: str = "disabled",
+):
     model_dir = tmp_path / f"dspark-{role}-{speculative_tokens}"
     model_dir.mkdir()
     (model_dir / "config.json").write_text(
@@ -37,6 +43,7 @@ def _pd_args(tmp_path, *, role: str, speculative_tokens: int):
             {
                 "runtime": {
                     "run_id": "run-k7",
+                    "prefix_cache_mode": prefix_cache_mode,
                     "prefill": [
                         {"host": "127.0.0.1", "port": 8101, "node_id": "p"}
                     ],
@@ -108,6 +115,28 @@ def test_pd_k7_uses_target_only_prefill_and_k7_decode(
     assert config.pd_config.request_timeout_seconds == 600
     assert config.pd_config.max_pending_handoffs == 8
     assert config.pd_config.max_transfer_attempts == 2
+    config.validate_pd()
+
+
+@pytest.mark.parametrize(
+    ("mode", "role", "expected"),
+    (
+        ("d_only", "prefill", False),
+        ("d_only", "decode", True),
+    ),
+)
+def test_pd_prefix_cache_profile_drives_local_engine_flag(
+    tmp_path, mode, role, expected
+) -> None:
+    config = cli.build_serving_engine_config(
+        _pd_args(
+            tmp_path,
+            role=role,
+            speculative_tokens=K7,
+            prefix_cache_mode=mode,
+        )
+    )
+    assert config.enable_prefix_cache is expected
     config.validate_pd()
 
 

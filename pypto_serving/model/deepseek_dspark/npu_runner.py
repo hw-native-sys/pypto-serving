@@ -2443,6 +2443,29 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             return encode_worker_payload(self._poll_pd_chunk(request.job_id))
         raise ValueError(f"unknown DSpark PD worker operation {operation!r}")
 
+    def set_transfer_profile_active(self, active: bool) -> None:
+        """Synchronize SA profiling with all owner-local transfer threads."""
+        if type(active) is not bool:
+            raise ValueError("transfer profile state must be boolean")
+        if not self._pd_owner_bridges:
+            return
+        failures = []
+        for bridge in self._pd_owner_bridges:
+            try:
+                bridge.set_profile_active(active)
+            except Exception as exc:
+                failures.append(f"rank {bridge.owner.rank_id}: {exc}")
+        if failures and active:
+            for bridge in self._pd_owner_bridges:
+                try:
+                    bridge.set_profile_active(False)
+                except Exception:
+                    pass
+        if failures:
+            raise RuntimeError(
+                "owner transfer profiler control failed: " + "; ".join(failures)
+            )
+
     def _prepare_pd_registry(self):
         """Register all eight resident regions in their owning chip children."""
         import json  # noqa: PLC0415
@@ -4239,10 +4262,16 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     self._compiled.state_accept is not None
                     or self._compiled.decode_full_fused
                 ):
-                    state = self._drafter_state(batch.request_ids[request_index])
+                    request_id = batch.request_ids[request_index]
+                    state = self._drafter_states.get(request_id)
+                    if state is None:
+                        raise RuntimeError(
+                            f"DSpark speculation is active but request {request_id!r} has "
+                            "no drafter state (seeded before its first decode?)"
+                        )
                     if state.group != group:
                         raise RuntimeError(
-                            f"DSpark state group changed for {batch.request_ids[request_index]!r}: "
+                            f"DSpark state group changed for {request_id!r}: "
                             f"state={state.group}, scheduled={group}"
                         )
                     owner = state.lease % layout.tp_size
@@ -4285,6 +4314,18 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         # Prefill-local drafter state, so create its Decode-local lease from
         # the scheduler-selected cache partition before computing the plan.
         self._initialize_pd_adopted_drafter_states(batch)
+        if self.speculative:
+            missing = [
+                request_id
+                for request_id in batch.request_ids
+                if request_id not in self._drafter_states
+            ]
+            if missing:
+                raise RuntimeError(
+                    "DSpark speculation is active but request "
+                    f"{missing[0]!r} has no drafter state "
+                    "(seeded before its first decode?)"
+                )
         assignment = self._decode_assignment(batch)
         actual_batch = len(batch.request_ids)
         group_batch = layout.decode_local_batch * layout.tp_size

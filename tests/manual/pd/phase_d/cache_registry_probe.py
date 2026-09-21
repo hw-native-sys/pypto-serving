@@ -83,7 +83,7 @@ def _engine_config(args: argparse.Namespace):
             "--pd-role",
             args.role,
             "--pd-node-id",
-            f"serving-a-{args.role}",
+            f"pd-probe-{args.role}",
             "--pd-peer-node-id",
             f"synthetic-peer-{args.role}",
             "--pd-run-id",

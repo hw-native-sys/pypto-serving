@@ -595,14 +595,27 @@ class WorkerProcess:
         """Apply a profile command and acknowledge it after the file is flushed."""
         profiler = get_profiler(initially_active=False)
         error = None
+        transfer_profile = getattr(
+            self.executor,
+            "set_transfer_profile_active",
+            None,
+        )
         try:
             if cmd.active:
                 profiler.start()
+                if callable(transfer_profile):
+                    transfer_profile(True)
             else:
-                profiler.stop()
+                try:
+                    if callable(transfer_profile):
+                        transfer_profile(False)
+                finally:
+                    profiler.stop()
             if profiler.active != cmd.active:
                 error = "SA profiling is not configured in the worker process"
         except Exception as exc:
+            if cmd.active:
+                profiler.stop()
             error = str(exc)
             logger.error("Worker profile command failed: %s", exc, exc_info=True)
 

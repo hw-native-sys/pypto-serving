@@ -7,22 +7,24 @@ It extends the Phase E launchers with bounded multi-handoff
 admission, request correlation, optional closed-page compute/transfer overlap,
 metrics, correctness cases, fault recovery, and repeatable soak evidence.
 
-Use a fresh stage, run id, generation, control incarnation, ports, journals,
-and evidence directory for every run. Never reuse an arena after an UNKNOWN
-transfer. A recovery run must prove the exact old launcher/runtime processes
-dead before incrementing generation and control incarnation. The scripts never
+Use a fresh stage, ports, journals, and evidence directory for every run. The
+launcher creates one run id for Router/P/D; protocol generations start from
+their internal defaults. Never reuse an arena after an UNKNOWN transfer. A
+recovery run must prove the exact old launcher/runtime processes dead before
+the recovery controller advances its internal generation. The scripts never
 reset an NPU and may stop only PIDs recorded by the current run.
 
 `run_pd_k7_node.sh` and `run_router.sh` retain the Phase E launcher safety
 checks. Router、P、D share one strict JSON document; its required product
-surface is only the P/D HTTP endpoints, while run ID, node IDs, control/RoCE
-addresses and observability root are explicit in this reproducible harness:
+surface is only the P/D HTTP endpoints. Run identity is generated once by the
+launcher and shared by all three roles; protocol generations are internal
+defaults unless a dedicated recovery drill overrides them:
 
 ```json
 {
   "runtime": {
-    "prefill": [{"host": "192.169.0.173", "port": 8111}],
-    "decode": [{"host": "192.169.0.85", "port": 8112}]
+    "prefill": [{"host": "prefill.example.internal", "port": 8111}],
+    "decode": [{"host": "decode.example.internal", "port": 8112}]
   }
 }
 ```
@@ -35,10 +37,13 @@ directories locally:
 
 ```bash
 python tests/manual/pd/phase_f/run_ab_system.py \
-  --run-id phase-f-functional-01 \
   --repo /workspace/pypto-serving \
-  --run-root /workspace/phase-f-runs \
-  --env-file /home/sj/git/env_all.sh \
+  --run-root /workspace/phase-g-runs \
+  --env-file /workspace/env_all.sh \
+  --prefill-ssh <prefill-validation-host> \
+  --decode-ssh <decode-validation-host> \
+  --prefill-data-host <prefill-roce-address> \
+  --decode-data-host <decode-roce-address> \
   --local-evidence-dir /absolute/new/evidence/path \
   --concurrency 2 --repeat 1
 ```
@@ -53,9 +58,9 @@ stopped.
 
 `--repo` is the immutable code location used by both nodes; `--run-root` is a
 separate evidence/control directory and must have a basename beginning with
-`phase-f-`.  This keeps the current `/workspace` deployment independent from
-the legacy `/home/sj/git/phase-f-*` staging trees.  The environment file is
-explicit because its compatibility path may differ from the code location.
+`phase-g-`. This keeps the current `/workspace` deployment independent from
+legacy host-specific staging trees. The environment file is explicit because
+its compatibility path may differ from the code location.
 
 The launcher owns Mooncake's provider requirement
 `HCCL_INTRA_ROCE_ENABLE=1`; it does not rely on a machine-wide environment
@@ -79,7 +84,7 @@ Run the bounded functional matrix after Router, P, and D report ready:
 python tests/manual/pd/phase_f/run_suite.py \
   --router-url http://127.0.0.1:8110 \
   --prefill-url http://127.0.0.1:8111 \
-  --decode-url http://192.169.0.85:8112 \
+  --decode-url http://decode.example.internal:8112 \
   --evidence-dir /absolute/new/evidence/path \
   --concurrency 2 --repeat 1
 ```

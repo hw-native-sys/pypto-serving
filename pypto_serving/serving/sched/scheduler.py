@@ -133,8 +133,8 @@ class Request:
     allocated_block_ids: list[int] = field(default_factory=list)
     allocated_group_block_ids: dict[str, list[int]] = field(default_factory=dict)
     cache_partition: int | None = None
-    block_hashes: list[int] = field(default_factory=list)
-    group_block_hashes: dict[str, list[int]] = field(default_factory=dict)
+    block_hashes: list[bytes] = field(default_factory=list)
+    group_block_hashes: dict[str, list[bytes]] = field(default_factory=dict)
     num_blocks_cached: int = 0  # Track how many blocks have been published to prefix cache
     num_group_blocks_cached: dict[str, int] = field(default_factory=dict)
     # Earliest valid KV position after a model skips the beginning of a
@@ -324,6 +324,11 @@ class Scheduler:
             },
             cache_partition=reservation.partition,
             pd_reservation_id=reservation_id,
+            group_block_hashes={
+                name: list(reservation.prefix_block_hashes.get(name, ()))
+                for name in self.kv_cache_manager.group_names
+            },
+            num_group_blocks_cached=dict(reservation.published_block_counts),
         )
         self.requests[request_id] = request
         self.running.append(request)

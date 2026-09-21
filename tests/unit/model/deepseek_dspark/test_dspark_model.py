@@ -154,6 +154,24 @@ def test_packed_prefill_executor_limits_follow_runtime(monkeypatch, max_batch_si
     assert executor.max_prefill_tokens_per_partition == 8192
 
 
+def test_executor_forwards_transfer_profile_control_to_registered_runner() -> None:
+    states = []
+    executor = DeepSeekV4DSparkPyptoExecutor.__new__(
+        DeepSeekV4DSparkPyptoExecutor
+    )
+    executor._pd_worker_config = object()
+    executor._runners = {
+        "model": SimpleNamespace(
+            set_transfer_profile_active=lambda active: states.append(active)
+        )
+    }
+
+    executor.set_transfer_profile_active(True)
+    executor.set_transfer_profile_active(False)
+
+    assert states == [True, False]
+
+
 def test_prefill_to_decode_staging_contract() -> None:
     runner = _runner()
     layout = runner._compiled.layout
@@ -1134,7 +1152,8 @@ def test_pd_adopted_decode_bootstraps_k7_after_one_target_step(monkeypatch) -> N
 
     redraft_rows: list[list[DSparkDrafterRequestRow]] = []
 
-    def capture_redraft(rows_by_rank) -> None:
+    def capture_redraft(rows_by_rank, *, buffer_slot: int) -> None:
+        assert buffer_slot == 0
         redraft_rows.extend(rows_by_rank)
         runner._drafter_state("pd-adopted").pending_draft_tokens = list(range(7))
 

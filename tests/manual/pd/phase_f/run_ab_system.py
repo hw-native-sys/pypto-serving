@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""One-command, exact-PID Phase F orchestration for serving-a/b."""
+"""One-command, exact-PID Phase F orchestration for a P/D host pair."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import secrets
 import shlex
@@ -14,6 +15,11 @@ from pathlib import Path
 
 
 _IDENTITY = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _default_run_id(prefix: str = "pd") -> str:
+    """Create one readable launch identity; all three roles share this value."""
+    return f"{prefix}-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
 
 
 def _run(argv: list[str], *, stdin: str | None = None, timeout: float = 180) -> str:
@@ -371,31 +377,80 @@ def _wait_suite(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "--run-id",
+        default=_default_run_id(),
+        help="shared Router/P/D run identity (default: timestamped unique tag)",
+    )
     parser.add_argument("--repo", default="/workspace/pypto-serving")
-    parser.add_argument("--run-root", default="/workspace/phase-f-runs")
-    parser.add_argument("--env-file", default="/home/sj/git/env_all.sh")
+    parser.add_argument("--run-root", default="/workspace/phase-g-runs")
+    parser.add_argument(
+        "--env-file",
+        default=os.environ.get("PYPTO_STACK_ENV_FILE", "/workspace/env_all.sh"),
+    )
     parser.add_argument(
         "--model-dir", default="/models/dsv4-flash-0731-dspark-w8a8"
     )
-    parser.add_argument("--max-model-len", type=int, default=1024)
+    parser.add_argument("--max-model-len", type=int, default=524288)
     parser.add_argument("--container", default="openeuler-2403-DS")
-    parser.add_argument("--prefill-ssh", default="serving-a-sj")
-    parser.add_argument("--decode-ssh", default="serving-b-sj")
-    # serving-a currently exposes its RoCE-facing address as 192.169.0.173
-    # inside the host-networked test container.  Keep the default aligned with
-    # the frozen Phase D/E topology so ADXL never tries to bind a stale address.
-    parser.add_argument("--prefill-data-host", default="192.169.0.173")
-    parser.add_argument("--decode-data-host", default="192.169.0.85")
+    parser.add_argument(
+        "--prefill-container",
+        default=None,
+        help="Prefill container name; defaults to --container.",
+    )
+    parser.add_argument(
+        "--decode-container",
+        default=None,
+        help="Decode container name; defaults to --container.",
+    )
+    parser.add_argument(
+        "--prefill-ssh", default=os.environ.get("PYPTO_PD_PREFILL_SSH", "")
+    )
+    parser.add_argument(
+        "--decode-ssh", default=os.environ.get("PYPTO_PD_DECODE_SSH", "")
+    )
+    parser.add_argument(
+        "--prefill-data-host",
+        default=os.environ.get("PYPTO_PD_PREFILL_DATA_HOST", ""),
+    )
+    parser.add_argument(
+        "--decode-data-host",
+        default=os.environ.get("PYPTO_PD_DECODE_DATA_HOST", ""),
+    )
     parser.add_argument("--control-port", type=int, default=29015)
     parser.add_argument("--prefill-port", type=int, default=8111)
     parser.add_argument("--decode-port", type=int, default=8112)
     parser.add_argument("--router-port", type=int, default=8110)
+    # These are protocol identities, not ordinary launch knobs.  They remain
+    # hidden for deterministic recovery drills; a fresh run starts at one.
+    parser.add_argument(
+        "--generation", type=int, default=1, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--route-epoch", type=int, default=1, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--control-incarnation", type=int, default=1, help=argparse.SUPPRESS
+    )
+    parser.add_argument("--max-active-handoffs", type=int, default=4)
+    parser.add_argument("--max-pending-handoffs", type=int, default=8)
+    parser.add_argument("--enable-chunk-overlap", action="store_true")
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--repeat", type=int, default=1)
-    parser.add_argument("--mode", choices=("suite", "soak"), default="suite")
+    parser.add_argument(
+        "--mode",
+        choices=(
+            "suite",
+            "soak",
+            "concurrency",
+            "fault-cancel",
+            "fault-uncertain",
+        ),
+        default="suite",
+    )
     parser.add_argument("--cases-file", default="cases.json")
     parser.add_argument("--soak-requests", type=int, default=64)
+    parser.add_argument("--expected-token-digest", default="")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument(
         "--keep-services",
@@ -410,6 +465,17 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
+    for name in (
+        "prefill_ssh",
+        "decode_ssh",
+        "prefill_data_host",
+        "decode_data_host",
+    ):
+        if not getattr(args, name):
+            raise ValueError(
+                f"--{name.replace('_', '-')} (or its PYPTO_PD_* environment variable) "
+                "must be set"
+            )
     if not _IDENTITY.fullmatch(args.run_id):
         raise ValueError("run-id contains unsupported characters")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+\.json", args.cases_file):
@@ -418,6 +484,14 @@ def main() -> int:
         raise ValueError("soak-requests must be positive")
     if args.max_model_len < 1:
         raise ValueError("max-model-len must be positive")
+    for name in ("generation", "route_epoch", "control_incarnation"):
+        if getattr(args, name) < 1:
+            raise ValueError(f"{name.replace('_', '-')} must be positive")
+    if (
+        args.max_active_handoffs < 1
+        or args.max_pending_handoffs < args.max_active_handoffs
+    ):
+        raise ValueError("pending handoffs must cover positive active handoffs")
     for name, value in (
         ("repo", args.repo),
         ("run-root", args.run_root),
@@ -427,13 +501,21 @@ def main() -> int:
         path = Path(value)
         if not path.is_absolute() or path == Path("/"):
             raise ValueError(f"{name} must be an explicit absolute path")
-    if not Path(args.run_root).name.startswith("phase-f-"):
-        raise ValueError("run-root basename must start with phase-f-")
+    if not Path(args.run_root).name.startswith("phase-g-"):
+        raise ValueError("run-root basename must start with phase-g-")
     if args.local_evidence_dir.exists():
         raise FileExistsError(args.local_evidence_dir)
 
     repo = args.repo.rstrip("/")
     run_root = args.run_root.rstrip("/")
+    prefill_container = args.prefill_container or args.container
+    decode_container = args.decode_container or args.container
+    for name, value in (
+        ("prefill-container", prefill_container),
+        ("decode-container", decode_container),
+    ):
+        if not _IDENTITY.fullmatch(value):
+            raise ValueError(f"{name} contains unsupported characters")
     launcher = f"{repo}/tests/manual/pd/phase_f/run_pd_k7_node.sh"
     router_launcher = f"{repo}/tests/manual/pd/phase_f/run_router.sh"
     config_file = f"{run_root}/{args.run_id}.json"
@@ -447,6 +529,12 @@ def main() -> int:
     document = {
         "runtime": {
             "run_id": args.run_id,
+            "generation": args.generation,
+            "route_epoch": args.route_epoch,
+            "control_incarnation": args.control_incarnation,
+            "max_active_handoffs": args.max_active_handoffs,
+            "max_pending_handoffs": args.max_pending_handoffs,
+            "enable_chunk_overlap": args.enable_chunk_overlap,
             "prefill": [
                 {
                     "host": args.prefill_data_host,
@@ -473,16 +561,19 @@ def main() -> int:
     stops = []
     result = "FAIL"
     try:
-        for host in (args.prefill_ssh, args.decode_ssh):
+        for host, container in (
+            (args.prefill_ssh, prefill_container),
+            (args.decode_ssh, decode_container),
+        ):
             _docker(
                 host,
-                args.container,
+                container,
                 ["mkdir", "-p", run_root],
                 timeout=30,
             )
             _write_pd_config(
                 host,
-                args.container,
+                container,
                 config_file,
                 document,
             )
@@ -496,7 +587,7 @@ def main() -> int:
         }
         _start(
             args.decode_ssh,
-            args.container,
+            decode_container,
             launcher,
             {
                 **common,
@@ -508,7 +599,7 @@ def main() -> int:
         )
         _start(
             args.prefill_ssh,
-            args.container,
+            prefill_container,
             launcher,
             {
                 **common,
@@ -520,31 +611,31 @@ def main() -> int:
         )
         _wait_health(
             args.decode_ssh,
-            args.container,
+            decode_container,
             f"http://127.0.0.1:{args.decode_port}/health",
             args.startup_timeout_seconds,
             expected={
                 "run_id": args.run_id,
                 "role": "decode",
-                "generation": 1,
-                "control_incarnation": 1,
+                "generation": args.generation,
+                "control_incarnation": args.control_incarnation,
             },
         )
         _wait_health(
             args.prefill_ssh,
-            args.container,
+            prefill_container,
             f"http://127.0.0.1:{args.prefill_port}/health",
             args.startup_timeout_seconds,
             expected={
                 "run_id": args.run_id,
                 "role": "prefill",
-                "generation": 1,
-                "control_incarnation": 1,
+                "generation": args.generation,
+                "control_incarnation": args.control_incarnation,
             },
         )
         _start(
             args.prefill_ssh,
-            args.container,
+            prefill_container,
             router_launcher,
             {
                 **common,
@@ -554,12 +645,12 @@ def main() -> int:
         )
         _wait_health(
             args.prefill_ssh,
-            args.container,
+            prefill_container,
             f"http://127.0.0.1:{args.router_port}/health",
             args.startup_timeout_seconds,
             expected={
                 "run_id": args.run_id,
-                "control_incarnation": 1,
+                "control_incarnation": args.control_incarnation,
             },
         )
         suite_args = [
@@ -586,14 +677,60 @@ def main() -> int:
             if args.profile:
                 suite_args.append("--profile")
             driver = "run_suite.py"
-        else:
+        elif args.mode == "soak":
             if args.profile:
                 raise ValueError("profile is supported only for suite mode")
             suite_args.extend(["--requests", str(args.soak_requests)])
             driver = "run_soak.py"
+        elif args.mode == "concurrency":
+            if args.profile:
+                raise ValueError("profile is supported only for suite mode")
+            if args.concurrency <= args.max_pending_handoffs:
+                raise ValueError(
+                    "concurrency mode requires more clients than the total "
+                    "handoff limit"
+                )
+            suite_args.extend(
+                [
+                    "--requests",
+                    str(args.concurrency),
+                    "--expected-successes",
+                    str(args.max_pending_handoffs),
+                    "--expected-active-peak",
+                    str(args.max_active_handoffs),
+                    "--expected-queued-peak",
+                    str(args.max_pending_handoffs - args.max_active_handoffs),
+                ]
+            )
+            if args.expected_token_digest:
+                suite_args.extend(
+                    ["--expected-token-digest", args.expected_token_digest]
+                )
+            driver = "run_concurrency.py"
+        else:
+            if args.profile:
+                raise ValueError("profile is not supported by fault scenarios")
+            suite_args.extend(
+                [
+                    "--scenario",
+                    (
+                        "cancel-after-output"
+                        if args.mode == "fault-cancel"
+                        else "kill-prefill"
+                    ),
+                ]
+            )
+            if args.mode == "fault-uncertain":
+                suite_args.extend(
+                    [
+                        "--prefill-python-pid-file",
+                        f"{run_root}/{names['p']}/python.pid",
+                    ]
+                )
+            driver = "run_fault_matrix.py"
         _start_suite(
             args.prefill_ssh,
-            args.container,
+            prefill_container,
             repo,
             f"{run_root}/{names['suite_control']}",
             driver,
@@ -601,7 +738,7 @@ def main() -> int:
         )
         _wait_suite(
             args.prefill_ssh,
-            args.container,
+            prefill_container,
             f"{run_root}/{names['suite_control']}",
             args.request_timeout_seconds,
         )
@@ -610,36 +747,53 @@ def main() -> int:
         stops.append(
             _stop_with_retries(
                 args.prefill_ssh,
-                args.container,
+                prefill_container,
                 f"{run_root}/{names['suite_control']}/suite-service.pid",
             )
         )
         retain_services = args.keep_services and result == "PASS"
         service_actions = (
-            (args.prefill_ssh, f"{run_root}/{names['router']}/router-service.pid"),
-            (args.prefill_ssh, f"{run_root}/{names['p']}/service.pid"),
-            (args.decode_ssh, f"{run_root}/{names['d']}/service.pid"),
+            (
+                args.prefill_ssh,
+                prefill_container,
+                f"{run_root}/{names['router']}/router-service.pid",
+            ),
+            (
+                args.prefill_ssh,
+                prefill_container,
+                f"{run_root}/{names['p']}/service.pid",
+            ),
+            (
+                args.decode_ssh,
+                decode_container,
+                f"{run_root}/{names['d']}/service.pid",
+            ),
         )
-        for host, pid_file in service_actions:
+        for host, container, pid_file in service_actions:
             action = (
                 _record_retained_with_retries
                 if retain_services
                 else _stop_with_retries
             )
-            stops.append(action(host, args.container, pid_file))
+            stops.append(action(host, container, pid_file))
         args.local_evidence_dir.mkdir(parents=True, exist_ok=False)
-        for label, host, name in (
-            ("prefill", args.prefill_ssh, names["p"]),
-            ("decode", args.decode_ssh, names["d"]),
-            ("router", args.prefill_ssh, names["router"]),
-            ("suite", args.prefill_ssh, names["suite"]),
-            ("suite-control", args.prefill_ssh, names["suite_control"]),
+        for label, host, container, name in (
+            ("prefill", args.prefill_ssh, prefill_container, names["p"]),
+            ("decode", args.decode_ssh, decode_container, names["d"]),
+            ("router", args.prefill_ssh, prefill_container, names["router"]),
+            ("suite", args.prefill_ssh, prefill_container, names["suite"]),
+            (
+                "suite-control",
+                args.prefill_ssh,
+                prefill_container,
+                names["suite_control"],
+            ),
         ):
             destination = args.local_evidence_dir / label
             try:
                 _copy_container_tree(
                     host,
-                    args.container,
+                    container,
                     f"{run_root}/{name}",
                     destination,
                 )

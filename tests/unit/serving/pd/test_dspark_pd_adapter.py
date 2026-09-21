@@ -18,6 +18,7 @@ from pypto_serving.serving.pd.protocol import (
     continuation_metadata_hash,
 )
 from pypto_serving.serving.pd.worker_api import ComponentGeometry, WorkerRegistryBundle
+from pypto_serving.serving.reasoning import OutputParserSpec
 
 from .helpers import make_cache_manager, make_rank_registrations, make_registry
 
@@ -82,6 +83,8 @@ def test_adapter_owns_eight_region_registry_and_transfer_policy() -> None:
 
 
 def test_adapter_plans_closed_then_partial_final_pages_and_builds_manifest() -> None:
+    assert DSV4_DSPARK_K7_CONTRACT.version == 3
+    assert DSV4_DSPARK_K7_CONTRACT.continuation_schema.endswith("/v2")
     manager = make_cache_manager()
     registry = make_registry(manager)
     planner = DSV4_DSPARK_K7_ADAPTER.make_planner(registry, manager.group_specs)
@@ -128,6 +131,18 @@ def test_adapter_plans_closed_then_partial_final_pages_and_builds_manifest() -> 
         config=GenerateConfig(max_new_tokens=128, stream=True),
         prompt_token_ids=(1, 2, 3),
         eos_token_id=2,
+        output_parser_spec=OutputParserSpec("deepseek_v4", "reasoning"),
+    )
+    assert continuation.output_parser_spec == OutputParserSpec(
+        "deepseek_v4", "reasoning"
+    )
+    without_parser = DSV4_DSPARK_K7_ADAPTER.build_continuation(
+        config=GenerateConfig(max_new_tokens=128, stream=True),
+        prompt_token_ids=(1, 2, 3),
+        eos_token_id=2,
+    )
+    assert continuation_metadata_hash(continuation) != continuation_metadata_hash(
+        without_parser
     )
     chunk = PrefillChunkReady(
         request_id="request",
@@ -205,4 +220,5 @@ def test_adapter_validates_continuation_and_owns_k7_adoption() -> None:
         "stop_strings": ("stop",),
         "eos_token_id": 2,
         "stream": True,
+        "output_parser_spec": None,
     }

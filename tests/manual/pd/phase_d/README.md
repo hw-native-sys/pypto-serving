@@ -11,7 +11,7 @@ two-host 16-device evidence is indexed from the Phase D task document.
 The container stage is fixed at:
 
 ```text
-/home/sj/git/phase-d-pypto783-lib216-20260910
+/workspace/phase-d-validation
 ```
 
 The source and native versions are recorded in `d0-lock.json`.  The lock is
@@ -28,7 +28,7 @@ Copy the scripts in this directory and `d0-lock.json` to the stage root.  Then
 select and verify the environment without allocating an NPU:
 
 ```bash
-source /home/sj/git/phase-d-pypto783-lib216-20260910/env_pinned_stack.sh
+source /workspace/phase-d-validation/env_pinned_stack.sh
 bash "$DSPARK_STAGE/inspect_d0_environment.sh"
 python "$DSPARK_STAGE/verify_d0_environment.py"
 ```
@@ -38,7 +38,7 @@ already prepared A/B stage, first overlay the current `pypto-serving` files and
 apply the Python-only owner hooks exactly once:
 
 ```bash
-export PYPTO_HOME=/home/sj/git/phase-d-pypto783-lib216-20260910/pypto
+export PYPTO_HOME=/workspace/phase-d-validation/pypto
 bash "$PYPTO_HOME/../pypto-serving/tests/manual/pd/phase_c/apply_runtime_overlays.sh"
 ```
 
@@ -124,8 +124,8 @@ and never reset an NPU.  A completed D5 result must come from the P HTTP endpoin
 and contain 64 prompt tokens, 128 completion tokens, `finish_reason=length`,
 coherent text and D-side K7 acceptance statistics.
 
-The accepted D5 run is `phase-d-k7-d5-20260912-04`: serving-a ran P,
-serving-b ran D, the response was 64+128 tokens with coherent text, and D
+The accepted D5 run is `phase-d-k7-d5-20260912-04`: the prefill host ran P,
+the decode host ran D, the response was 64+128 tokens with coherent text, and D
 reported `verifies=68, matched=61, proposed=469, accepted=129,
 mean_len=1.90, fallbacks=1`.  This is the single-request semantic smoke; D8
 adds a 192-token prompt to force two Prefill transfer chunks.

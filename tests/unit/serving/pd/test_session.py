@@ -10,6 +10,8 @@
 import asyncio
 import socket
 
+import pytest
+
 from pypto_serving.serving.pd.config import PDCapabilities, PDConfig, PDRole
 from pypto_serving.model.deepseek_dspark.pd_adapter import (
     DSV4_DSPARK_K7_ADAPTER,
@@ -185,5 +187,58 @@ def test_multiplexed_session_fails_every_open_route_on_peer_eof() -> None:
         assert all(isinstance(result, RuntimeError) for result in results)
         assert all("session failed" in str(result) for result in results)
         await multiplex.close()
+
+    asyncio.run(exercise())
+
+
+def test_multiplexed_session_absorbs_late_reply_for_a_closed_route() -> None:
+    port = _free_port()
+
+    async def exercise() -> None:
+        decode, prefill = await _open_pair(port)
+        await asyncio.gather(
+            decode.exchange_registry(_advertisement()),
+            prefill.exchange_registry(_advertisement()),
+        )
+        multiplex = MultiplexedPDControlSession(prefill)
+        closed = HandoffKey("request-closed", "handoff-closed", 1, 1, 1)
+        active = HandoffKey("request-active", "handoff-active", 1, 1, 1)
+        multiplex.open_route(closed)
+        multiplex.open_route(active)
+        multiplex.start()
+        multiplex.close_route(closed)
+
+        await decode.send(HandoffStatus(closed, "READY"))
+        await decode.send(HandoffStatus(active, "RESERVED"))
+        reply = await multiplex.receive(active)
+        assert reply == HandoffStatus(active, "RESERVED")
+
+        multiplex.close_route(active)
+        await asyncio.gather(multiplex.close(), decode.close())
+
+    asyncio.run(exercise())
+
+
+def test_multiplexed_session_fails_all_routes_on_unknown_correlation() -> None:
+    port = _free_port()
+
+    async def exercise() -> None:
+        decode, prefill = await _open_pair(port)
+        await asyncio.gather(
+            decode.exchange_registry(_advertisement()),
+            prefill.exchange_registry(_advertisement()),
+        )
+        multiplex = MultiplexedPDControlSession(prefill)
+        active = HandoffKey("request-active", "handoff-active", 1, 1, 1)
+        unknown = HandoffKey("request-unknown", "handoff-unknown", 1, 1, 1)
+        multiplex.open_route(active)
+        multiplex.start()
+
+        waiting = asyncio.create_task(multiplex.receive(active))
+        await decode.send(HandoffStatus(unknown, "READY"))
+        with pytest.raises(RuntimeError, match="session failed"):
+            await waiting
+        assert multiplex.closed
+        await asyncio.gather(multiplex.close(), decode.close())
 
     asyncio.run(exercise())

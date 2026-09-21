@@ -10,6 +10,8 @@ from contextlib import suppress
 import time
 import uuid
 
+import anyio
+
 from pypto_serving.serving.pd.http_api import (
     AbortHandoffHTTP,
     AuthorizeRouteHTTP,
@@ -27,6 +29,7 @@ from pypto_serving.serving.pd.http_api import (
 from pypto_serving.serving.pd.protocol import (
     DecodeOutputWire,
     HandoffKey,
+    HandoffStatus,
 )
 from pypto_serving.serving.pd.admission import FairHandoffAdmission
 from pypto_serving.serving.pd.metrics import PDMetrics
@@ -51,20 +54,31 @@ class RouterCoordinator:
         config: RouterConfig,
         directory: WorkerDirectory,
         journal: RouterJournal,
+        runtime_manager: FixedPairRuntimeManager | None = None,
     ) -> None:
         self.config = config
         self.directory = directory
         self.journal = journal
+        self.metrics = PDMetrics("pd-router", config.run_id)
         self.admission = FairHandoffAdmission(
             config.max_active_handoffs,
             config.max_pending_handoffs,
+            state_observer=self._observe_admission,
         )
-        self.metrics = PDMetrics("pd-router", config.run_id)
         self.recovery = FixedPairRecoveryController(
-            generation=1,
+            generation=config.data_generation,
             control_incarnation=config.control_incarnation,
         )
+        self.runtime_manager = runtime_manager
         self._replayable: dict[str, ReplayableRequest] = {}
+        self._replay_results: dict[str, tuple[DecodeOutputWire, ...]] = {}
+        self._automatic_recovery_task: asyncio.Task[RuntimeGeneration] | None = None
+
+    def _observe_admission(self, active: int, queued: int) -> None:
+        self.metrics.set_gauge("handoffs.active", active)
+        self.metrics.set_gauge("handoffs.queued", queued)
+        self.metrics.set_peak_gauge("handoffs.active_peak", active)
+        self.metrics.set_peak_gauge("handoffs.queued_peak", queued)
 
     async def reconcile_startup(self) -> None:
         """Query the journaled owners, then durably fence interrupted routes."""
@@ -171,6 +185,54 @@ class RouterCoordinator:
                     token_ids=final.token_ids,
                 )
         except BaseException as exc:
+            if (
+                self.runtime_manager is not None
+                and not replayable.output_published
+                and not isinstance(exc, (GeneratorExit, asyncio.CancelledError))
+                and (
+                    self.recovery.phase is RecoveryPhase.RECOVERY_REQUIRED
+                    or request_id in self._replay_results
+                )
+            ):
+                try:
+                    if request_id not in self._replay_results:
+                        await self._ensure_automatic_recovery()
+                    replayed = self._replay_results.pop(request_id)
+                    for output in replayed:
+                        now_ns = time.monotonic_ns()
+                        if previous_output_ns is None:
+                            self.metrics.observe_ns(
+                                "request.ttft", now_ns - started_ns
+                            )
+                        else:
+                            self.metrics.observe_ns(
+                                "request.inter_output",
+                                now_ns - previous_output_ns,
+                            )
+                        previous_output_ns = now_ns
+                        final = output
+                        yield output
+                    if final is None or not final.finished:
+                        raise RuntimeError(
+                            "automatic re-prefill ended without terminal output"
+                        )
+                    self.metrics.increment("requests.completed")
+                    self.metrics.record_terminal(
+                        request_id=request_id,
+                        state="COMPLETED",
+                        prompt_tokens=final.prompt_tokens,
+                        completion_tokens=final.completion_tokens,
+                        token_ids=final.token_ids,
+                    )
+                    return
+                except BaseException as recovery_exc:
+                    self.metrics.increment("requests.failed")
+                    self.metrics.record_terminal(
+                        request_id=request_id,
+                        state="FAILED",
+                        error_code=type(recovery_exc).__name__,
+                    )
+                    raise recovery_exc from exc
             self.metrics.increment("requests.failed")
             self.metrics.record_terminal(
                 request_id=request_id,
@@ -209,15 +271,17 @@ class RouterCoordinator:
             self.directory.control_incarnation = (
                 self.recovery.current.control_incarnation
             )
-            final = None
+            outputs = []
             async for output in self._generate_admitted(
                 request.request_kind,
                 request.request_json,
                 request.request_id,
             ):
-                final = output
+                outputs.append(output)
+            final = outputs[-1] if outputs else None
             if final is None or not final.finished:
                 raise RuntimeError("re-prefill replay ended without terminal Decode output")
+            self._replay_results[request.request_id] = tuple(outputs)
             self._replayable.pop(request.request_id, None)
 
         generation = await self.recovery.recover(
@@ -232,6 +296,22 @@ class RouterCoordinator:
             if not request.output_published
         }
         return generation
+
+    async def _ensure_automatic_recovery(self) -> RuntimeGeneration:
+        """Join the single runtime recovery task for all affected requests."""
+        if self.runtime_manager is None:
+            raise RuntimeError("automatic recovery has no runtime manager")
+        task = self._automatic_recovery_task
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self.recover_fixed_pair(self.runtime_manager)
+            )
+            self._automatic_recovery_task = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done() and self._automatic_recovery_task is task:
+                self._automatic_recovery_task = None
 
     async def _generate_admitted(
         self,
@@ -267,6 +347,8 @@ class RouterCoordinator:
         next_frame: asyncio.Task | None = None
         decode_stream = None
         terminal = False
+        native_may_have_started = False
+        transfer_completed = False
         try:
             rejected_decode_nodes: set[str] = set()
             while True:
@@ -289,6 +371,7 @@ class RouterCoordinator:
                         layout_fingerprint=pair.prefill.capabilities.layout_fingerprint,
                         prefill_node_id=pair.prefill.node_id,
                         prefill_endpoint_generation=pair.prefill.endpoint_generation,
+                        prefix_match_spec=prepared.prefix_match_spec,
                     ),
                     ReservePlacementResult,
                 )
@@ -383,6 +466,7 @@ class RouterCoordinator:
             if first.event != "waiting":
                 raise RuntimeError("D did not establish output waiting before Prefill")
 
+            native_may_have_started = True
             execute_task = asyncio.create_task(
                 pair.prefill_client.post(
                     "/internal/pd/execute",
@@ -401,6 +485,7 @@ class RouterCoordinator:
                         decode_control_host=reservation.decode_control_host,
                         decode_control_port=reservation.decode_control_port,
                         decode_endpoint_generation=reservation.decode_endpoint_generation,
+                        prefix_hit_tokens=reservation.prefix_hit_tokens,
                     ),
                     PrefillHandoffResult,
                 )
@@ -419,6 +504,7 @@ class RouterCoordinator:
                     if prefill_result.key != key or prefill_result.reservation_id != reservation.reservation_id:
                         raise RuntimeError("P returned a mismatched handoff result")
                     self.journal.append("PREFILL_READY", key)
+                    transfer_completed = True
                     if next_frame not in done:
                         continue
                 if next_frame not in done:
@@ -430,6 +516,9 @@ class RouterCoordinator:
                 if frame.event == "error":
                     raise RuntimeError(f"D Decode failed: {frame.error_code}")
                 output = self._validate_output(frame, key, expected_sequence)
+                # Any Decode output is downstream of a committed final
+                # manifest, even if the Prefill HTTP reply races behind it.
+                transfer_completed = True
                 expected_sequence += 1
                 yield output
                 if frame.event == "finished":
@@ -443,14 +532,33 @@ class RouterCoordinator:
                     return
                 next_frame = asyncio.create_task(anext(decode_stream))
         except BaseException as exc:
-            self.journal.append(
-                "RECOVERY_REQUIRED" if reservation is not None else "HANDOFF_FAILED",
-                key,
-                error_code=type(exc).__name__,
+            deterministic_abort = not native_may_have_started or (
+                isinstance(exc, (GeneratorExit, asyncio.CancelledError))
+                and transfer_completed
             )
-            if reservation is not None:
-                self.recovery.require(type(exc).__name__, (key,))
-            await self._abort_pair(pair, key, type(exc).__name__)
+            # Starlette runs StreamingResponse bodies inside an AnyIO cancel
+            # scope.  Once the client disconnects, every checkpoint remains
+            # cancelled unless cleanup is explicitly shielded.  The P/D abort
+            # acknowledgements are part of the safety decision, not optional
+            # response work, so complete this bounded convergence before
+            # propagating the original cancellation.
+            with anyio.CancelScope(shield=True):
+                abort_confirmed = await self._abort_pair(
+                    pair,
+                    key,
+                    type(exc).__name__,
+                    deterministic=deterministic_abort,
+                )
+                recovery_required = reservation is not None and (
+                    not deterministic_abort or not abort_confirmed
+                )
+                self.journal.append(
+                    "RECOVERY_REQUIRED" if recovery_required else "HANDOFF_FAILED",
+                    key,
+                    error_code=type(exc).__name__,
+                )
+                if recovery_required:
+                    self.recovery.require(type(exc).__name__, (key,))
             raise
         finally:
             if next_frame is not None and not next_frame.done():
@@ -485,13 +593,27 @@ class RouterCoordinator:
         return output
 
     @staticmethod
-    async def _abort_pair(pair, key: HandoffKey, reason: str) -> None:
-        payload = AbortHandoffHTTP(key=key, reason=reason[:128])
+    async def _abort_pair(
+        pair,
+        key: HandoffKey,
+        reason: str,
+        *,
+        deterministic: bool,
+    ) -> bool:
+        payload = AbortHandoffHTTP(
+            key=key,
+            reason=reason[:128],
+            deterministic=deterministic,
+        )
         try:
-            await asyncio.wait_for(
+            results = await asyncio.wait_for(
                 asyncio.gather(
-                    pair.prefill_client.post("/internal/pd/abort", payload),
-                    pair.decode_client.post("/internal/pd/abort", payload),
+                    pair.prefill_client.post(
+                        "/internal/pd/abort", payload, HandoffStatus
+                    ),
+                    pair.decode_client.post(
+                        "/internal/pd/abort", payload, HandoffStatus
+                    ),
                     return_exceptions=True,
                 ),
                 timeout=15,
@@ -500,4 +622,13 @@ class RouterCoordinator:
             # The durable recovery decision is already recorded.  Abort is a
             # convergence hint and must not keep the public request open for
             # the full node HTTP timeout when a peer is unhealthy.
-            return
+            return False
+        if not deterministic or any(
+            isinstance(result, BaseException) for result in results
+        ):
+            return False
+        safe_terminal = {"ABORTED", "FAILED", "RELEASED", "COMPLETED"}
+        return all(
+            isinstance(result, HandoffStatus) and result.state in safe_terminal
+            for result in results
+        )

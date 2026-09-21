@@ -11,16 +11,17 @@ from pypto_serving.serving.pd.protocol import (
     ChunkManifest,
     ContinuationMetadata,
     continuation_metadata_hash,
+    make_prefix_match_spec,
 )
 
 
 DSV4_DSPARK_K7_CONTRACT = ModelPDContract(
     adapter_id="deepseek-v4-dspark-k7",
-    version=1,
+    version=3,
     model_family="deepseek_v4",
     model_variant="dspark",
     transfer_granularity="chunk-after-prefill",
-    continuation_schema="deepseek-v4-dspark-k7/v1",
+    continuation_schema="deepseek-v4-dspark-k7/v2",
     components=(
         TransferComponent("ori", "ori", "ori"),
         TransferComponent("hca_cmp", "cmp_c128", "hca_cmp"),
@@ -36,6 +37,9 @@ DSV4_DSPARK_K7_CONTRACT = ModelPDContract(
     executor_cls="PyptoDeepSeekV4DSparkExecutor",
     prefill_speculative_tokens=0,
     decode_speculative_tokens=7,
+    # ``independent`` is a protocol-level profile reserved for PC2/H8.  Do not
+    # advertise it until P_hit > D_hit source backfill is implemented.
+    supported_prefix_cache_modes=("disabled", "d_only"),
 )
 
 
@@ -88,7 +92,11 @@ class DeepSeekV4DSparkK7Adapter:
 
     @staticmethod
     def build_continuation(
-        *, config, prompt_token_ids, eos_token_id: int | None
+        *,
+        config,
+        prompt_token_ids,
+        eos_token_id: int | None,
+        output_parser_spec=None,
     ) -> ContinuationMetadata:
         return ContinuationMetadata(
             prompt_token_ids=tuple(int(token) for token in prompt_token_ids),
@@ -100,6 +108,19 @@ class DeepSeekV4DSparkK7Adapter:
             stop_strings=tuple(config.stop) if config.stop else (),
             eos_token_id=None if config.ignore_eos else eos_token_id,
             stream=bool(getattr(config, "stream", True)),
+            output_parser_spec=output_parser_spec,
+        )
+
+    def build_prefix_match_spec(self, prompt_token_ids, cache_manager):
+        hashes = cache_manager.compute_group_block_hashes(
+            list(prompt_token_ids),
+            group_names=self.contract.prefix_cache_groups,
+        )
+        return make_prefix_match_spec(
+            token_count=len(prompt_token_ids),
+            alignment=cache_manager.group_prefix_cache_alignment,
+            contract_digest=self.contract.digest,
+            group_block_hashes=hashes,
         )
 
     @staticmethod
@@ -166,6 +187,7 @@ class DeepSeekV4DSparkK7Adapter:
             stop_strings=continuation.stop_strings,
             eos_token_id=continuation.eos_token_id,
             stream=continuation.stream,
+            output_parser_spec=continuation.output_parser_spec,
         )
 
 

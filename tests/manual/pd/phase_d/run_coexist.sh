@@ -9,7 +9,7 @@
 # -----------------------------------------------------------------------------------------------------------
 set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-d0_stage=${DSPARK_STAGE:-/home/sj/git/phase-d-pypto783-lib216-20260910}
+d0_stage=${DSPARK_STAGE:-/workspace/phase-d-validation}
 source "$d0_stage/env_pinned_stack.sh"
 export ASCEND_PROCESS_LOG_PATH="${PHASE_D_COEXIST_ASCEND_DIR:-$d0_stage/ascend}"
 export HCCL_INTRA_ROCE_ENABLE=1

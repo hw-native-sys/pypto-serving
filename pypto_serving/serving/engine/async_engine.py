@@ -115,8 +115,10 @@ class EngineConfig:
         contract = config.model_contract
         if self.executor_cls != contract.executor_cls:
             raise ValueError("PD executor differs from the selected model contract")
-        if self.enable_prefix_cache != contract.requires_prefix_cache:
-            raise ValueError("PD prefix-cache mode differs from the selected model contract")
+        if self.enable_prefix_cache != config.prefix_cache_enabled:
+            raise ValueError(
+                "PD prefix-cache flag differs from the configured role/profile"
+            )
         if self.resolve_async_scheduling() != contract.requires_async_scheduling:
             raise ValueError("PD scheduling mode differs from the selected model contract")
         runtime = self.runtime_config or RuntimeConfig()

@@ -321,6 +321,18 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             raise RuntimeError("DSpark runner has no PD worker control handler")
         return handler(operation, payload)
 
+    def set_transfer_profile_active(self, active: bool) -> None:
+        """Forward profile control to the runner that owns transfer services."""
+        if self._pd_worker_config is None:
+            return
+        if len(self._runners) != 1:
+            raise RuntimeError("PD transfer profiling requires one registered model")
+        runner = next(iter(self._runners.values()))
+        handler = getattr(runner, "set_transfer_profile_active", None)
+        if not callable(handler):
+            raise RuntimeError("DSpark runner has no transfer profile handler")
+        handler(active)
+
     def _compile_model(self, model: RuntimeModel) -> DSparkCompiledKernels:
         """Validate DSpark metadata, compile the two L3 programs, and package."""
         metadata = model.extra
