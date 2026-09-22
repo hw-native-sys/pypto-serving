@@ -89,8 +89,10 @@ def test_adapter_owns_eight_region_registry_and_transfer_policy() -> None:
 
 
 def test_adapter_plans_closed_then_partial_final_pages_and_builds_manifest() -> None:
-    assert DSV4_DSPARK_K7_CONTRACT.version == 4
+    assert DSV4_DSPARK_K7_CONTRACT.version == 5
     assert DSV4_DSPARK_K7_CONTRACT.continuation_schema.endswith("/v2")
+    assert not DSV4_DSPARK_K7_CONTRACT.async_scheduling_for_role("prefill")
+    assert DSV4_DSPARK_K7_CONTRACT.async_scheduling_for_role("decode")
     manager = make_cache_manager()
     registry = make_registry(manager)
     planner = DSV4_DSPARK_K7_ADAPTER.make_planner(registry, manager.group_specs)

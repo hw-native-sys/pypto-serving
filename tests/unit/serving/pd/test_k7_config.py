@@ -90,13 +90,14 @@ def _pd_args(
 
 
 @pytest.mark.parametrize(
-    ("role", "expected_local_tokens"),
-    [("prefill", 0), ("decode", K7)],
+    ("role", "expected_local_tokens", "expected_async_scheduling"),
+    [("prefill", 0, False), ("decode", K7, True)],
 )
 def test_pd_k7_uses_target_only_prefill_and_k7_decode(
     tmp_path,
     role,
     expected_local_tokens,
+    expected_async_scheduling,
 ) -> None:
     config = cli.build_serving_engine_config(
         _pd_args(
@@ -110,7 +111,7 @@ def test_pd_k7_uses_target_only_prefill_and_k7_decode(
     assert config.pd_config.model_contract.adapter_id == "deepseek-v4-dspark-k7"
     assert config.executor_kwargs["num_speculative_tokens"] == expected_local_tokens
     assert config.runtime_config.num_speculative_tokens == expected_local_tokens
-    assert config.async_scheduling is False
+    assert config.async_scheduling is expected_async_scheduling
     assert config.pd_config.connect_timeout_seconds == 30
     assert config.pd_config.request_timeout_seconds == 600
     assert config.pd_config.max_pending_handoffs == 8
