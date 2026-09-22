@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import TokenOutput
-from pypto_serving.serving.pd.metrics import token_ids_sha256
+from pypto_serving.serving.pd.observability import token_ids_sha256
 from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.serving.server.server import (
     ChatCompletionRequest,

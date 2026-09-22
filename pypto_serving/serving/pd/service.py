@@ -30,10 +30,9 @@ from .admission import FairHandoffAdmission
 from .config import PDCapabilities, PDConfig, PDRole
 from .contracts import RuntimeLayoutDescriptor
 from .connector import DecodeConnector
-from .coordinator import CoordinatorState, HandoffCoordinator
+from .handoff import CoordinatorState, HandoffCoordinator
 from .journal import DurablePDJournal
-from .metrics import PDMetrics
-from .observability import write_startup_record
+from .observability import PDMetrics, write_startup_record
 from .http_api import (
     AuthorizeRouteHTTP,
     CapacitySnapshot,

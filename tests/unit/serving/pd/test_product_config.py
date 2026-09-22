@@ -165,7 +165,7 @@ def test_prefix_cache_profile_is_role_specific(
     assert decode.prefix_cache_enabled is decode_enabled
 
 
-def test_pc2_profile_enables_independent_p_and_d_caches(tmp_path) -> None:
+def test_profile_enables_independent_p_and_d_caches(tmp_path) -> None:
     path = _write_config(tmp_path)
     value = json.loads(path.read_text(encoding="utf-8"))
     value["runtime"]["prefix_cache_mode"] = "independent"

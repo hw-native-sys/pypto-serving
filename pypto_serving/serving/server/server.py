@@ -25,7 +25,7 @@ from pypto_serving.model.model_family import read_model_config
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.constraints.provider import XGrammarProvider
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput
-from pypto_serving.serving.pd.metrics import token_ids_sha256
+from pypto_serving.serving.pd.observability import token_ids_sha256
 from pypto_serving.serving.reasoning import OutputParserSpec, ToolCallDelta, supports_tool_calls
 from pypto_serving.tools.profile import (
     get_profiler,

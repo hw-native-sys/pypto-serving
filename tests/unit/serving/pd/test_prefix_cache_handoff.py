@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Host-only Phase H Prefix Cache reservation and transfer tests."""
+"""Prefix-cache reservation, suffix transfer, and shared-page ownership tests."""
 
 from dataclasses import replace
 
@@ -286,12 +286,12 @@ def test_prefix_reservation_failure_rolls_back_shared_refs_without_cache_loss() 
     assert manager.group_cache_reservation(retry.reservation_id) is None
 
 
-def test_pc2_p_hit_greater_than_d_hit_backfills_full_history_and_commits() -> None:
+def test_p_hit_greater_than_d_hit_backfills_full_history_and_commits() -> None:
     d_manager, registry, connector = _connector("independent")
     prompt = list(range(640))
     _warm_prefix(d_manager, prompt, 128, "d-warm")
     spec = _spec(d_manager, prompt)
-    key = HandoffKey("pc2", "pc2-handoff", 1, 1, 1)
+    key = HandoffKey("independent", "independent-handoff", 1, 1, 1)
     accepted = _reserve(connector, key, prompt, spec)
     assert accepted.prefix_hit_tokens == 128
 
@@ -371,22 +371,22 @@ def test_pc2_p_hit_greater_than_d_hit_backfills_full_history_and_commits() -> No
     # A shorter request may still reuse D's original prefix, but cannot falsely
     # match pages that P never transferred.
     short_prompt = prompt[:256]
-    short_key = HandoffKey("pc2-short", "pc2-short-handoff", 1, 1, 1)
+    short_key = HandoffKey("short", "short-handoff", 1, 1, 1)
     short = _reserve(connector, short_key, short_prompt, _spec(d_manager, short_prompt))
     assert short.prefix_hit_tokens == 128
     connector.abort(AbortHandoff(short_key, "test-cleanup"), deterministic=True)
 
     # The final rolling tail and every full-history page are valid, so the
     # complete prompt remains reusable even though the older rolling gap is not.
-    next_key = HandoffKey("pc2-next", "pc2-next-handoff", 1, 1, 1)
+    next_key = HandoffKey("next", "next-handoff", 1, 1, 1)
     next_reservation = _reserve(connector, next_key, prompt, spec)
     assert next_reservation.prefix_hit_tokens == len(prompt)
 
 
-def test_pc2_p_hit_is_rejected_outside_independent_mode() -> None:
+def test_p_hit_is_rejected_outside_independent_mode() -> None:
     manager, registry, connector = _connector("d_only")
     prompt = list(range(256))
-    key = HandoffKey("pc2-mode", "pc2-mode-handoff", 1, 1, 1)
+    key = HandoffKey("mode", "mode-handoff", 1, 1, 1)
     accepted = _reserve(connector, key, prompt, _spec(manager, prompt))
     manifest = _manifest(
         manager,

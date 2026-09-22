@@ -20,8 +20,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from pypto_serving.serving.pd.admission import PDBackpressureError
-from pypto_serving.serving.pd.metrics import token_ids_sha256
-from pypto_serving.serving.pd.observability import write_startup_record
+from pypto_serving.serving.pd.observability import token_ids_sha256, write_startup_record
 
 from .client import NodeClient
 from .config import RouterConfig

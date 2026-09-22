@@ -38,7 +38,7 @@ from pypto_serving.serving.pd.protocol import (
     HandoffStatus,
 )
 from pypto_serving.serving.pd.admission import FairHandoffAdmission
-from pypto_serving.serving.pd.metrics import PDMetrics
+from pypto_serving.serving.pd.observability import PDMetrics
 
 from .config import RouterConfig
 from .directory import WorkerDirectory
