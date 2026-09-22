@@ -36,7 +36,8 @@ class ModelPDContract:
     prefill_speculative_tokens: int
     decode_speculative_tokens: int
     supported_prefix_cache_modes: tuple[str, ...] = ("disabled",)
-    requires_async_scheduling: bool = False
+    prefill_async_scheduling: bool = False
+    decode_async_scheduling: bool = False
 
     @property
     def digest(self) -> str:
@@ -79,6 +80,14 @@ class ModelPDContract:
             return self.prefill_speculative_tokens
         if role == "decode":
             return self.decode_speculative_tokens
+        raise ValueError(f"unknown PD role {role!r}")
+
+    def async_scheduling_for_role(self, role: str) -> bool:
+        """Return the scheduling mode required by one side of the PD contract."""
+        if role == "prefill":
+            return self.prefill_async_scheduling
+        if role == "decode":
+            return self.decode_async_scheduling
         raise ValueError(f"unknown PD role {role!r}")
 
     def supports_prefix_cache_mode(self, mode: str) -> bool:

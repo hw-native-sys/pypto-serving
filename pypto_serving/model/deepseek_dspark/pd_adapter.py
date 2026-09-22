@@ -23,7 +23,7 @@ from pypto_serving.serving.pd.protocol import (
 
 DSV4_DSPARK_K7_CONTRACT = ModelPDContract(
     adapter_id="deepseek-v4-dspark-k7",
-    version=4,
+    version=5,
     model_family="deepseek_v4",
     model_variant="dspark",
     transfer_granularity="chunk-after-prefill",
@@ -44,6 +44,8 @@ DSV4_DSPARK_K7_CONTRACT = ModelPDContract(
     prefill_speculative_tokens=0,
     decode_speculative_tokens=7,
     supported_prefix_cache_modes=("disabled", "d_only", "independent"),
+    prefill_async_scheduling=False,
+    decode_async_scheduling=True,
 )
 
 
