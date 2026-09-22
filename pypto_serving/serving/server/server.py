@@ -21,7 +21,7 @@ from typing import Literal
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput
-from pypto_serving.serving.pd.metrics import token_ids_sha256
+from pypto_serving.serving.pd.observability import token_ids_sha256
 from pypto_serving.serving.reasoning import OutputParserSpec, ToolCallDelta, supports_tool_calls
 from pypto_serving.tools.profile import (
     get_profiler,

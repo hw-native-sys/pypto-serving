@@ -2,6 +2,9 @@
 
 Online serving starts `pypto-serving`, loads the model in worker processes, and exposes an OpenAI-compatible HTTP API subset.
 
+For separate Prefill and Decode nodes behind an external Router, see
+[Disaggregated Serving](disaggregated-serving.md).
+
 ## Start a Qwen Server
 
 ```bash

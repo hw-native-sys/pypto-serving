@@ -133,7 +133,7 @@ def test_index_regions_are_atomic_and_ring_destination_wraps() -> None:
         (512, 128, 384, 128),
     ),
 )
-def test_pc2_plans_independent_hits_without_reading_stale_rolling_slots(
+def test_plans_independent_hits_without_reading_stale_rolling_slots(
     p_hit: int,
     d_hit: int,
     expected_ori_start: int,
@@ -142,8 +142,8 @@ def test_pc2_plans_independent_hits_without_reading_stale_rolling_slots(
     manager = make_cache_manager()
     registry = make_registry(manager)
     prompt_tokens = 640
-    source = _tables(manager, "pc2-source", prompt_tokens)
-    destination = _tables(manager, "pc2-destination", prompt_tokens)
+    source = _tables(manager, "independent-source", prompt_tokens)
+    destination = _tables(manager, "independent-destination", prompt_tokens)
     planner = DSV4_DSPARK_K7_ADAPTER.make_planner(registry, manager.group_specs)
 
     plan = planner.plan_chunk(
@@ -186,7 +186,7 @@ def test_pc2_plans_independent_hits_without_reading_stale_rolling_slots(
     )
 
 
-def test_pc2_rejects_unaligned_p_hit() -> None:
+def test_rejects_unaligned_p_hit() -> None:
     manager = make_cache_manager()
     registry = make_registry(manager)
     tables = _tables(manager, "unaligned", 256)

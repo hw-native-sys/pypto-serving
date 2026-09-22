@@ -214,7 +214,7 @@ class PeerSessionHandle:
 
 
 class PeerSessionPool:
-    """Single-entry Phase E pool with a stable Phase F expansion seam."""
+    """Cache the control session for the currently selected Decode peer."""
 
     def __init__(self) -> None:
         self._handle: PeerSessionHandle | None = None

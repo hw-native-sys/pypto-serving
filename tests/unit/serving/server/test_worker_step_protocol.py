@@ -46,6 +46,7 @@ from ..device_sampling_fakes import _FixedSampler, _ImmediateEosExecutor, _model
 def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
     core._worker_known_req_ids = {"req"}
+    core._request_contexts = {}
     request = Request(
         request_id="req",
         prompt_token_ids=[1, 2],
