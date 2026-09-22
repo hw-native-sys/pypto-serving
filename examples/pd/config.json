@@ -1,0 +1,6 @@
+{
+  "runtime": {
+    "prefill": [{"host": "prefill.example.internal", "port": 8111}],
+    "decode": [{"host": "decode.example.internal", "port": 8112}]
+  }
+}
