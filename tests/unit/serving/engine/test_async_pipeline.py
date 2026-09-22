@@ -77,6 +77,8 @@ def _async_pipeline_core(*, num_speculative_tokens: int = 0):
     core._worker_known_req_ids = set()
     core._request_contexts = {}
     core._batch_queue = deque()
+    core._worker_free_ids_by_step = {}
+    core._pd_bootstrap_step_ids = set()
     core._discard_result_step_ids = set()
     core._step_timeout = 300.0
     core._max_in_flight = 2
@@ -194,6 +196,34 @@ def test_async_pipeline_dispatches_two_steps_before_applying_first(monkeypatch):
     asyncio.run(core._await_and_apply_oldest())
     assert req.output_token_ids == [50, 51, 52]
     assert req.num_output_placeholders == 0
+
+
+def test_pd_adopted_first_decode_is_a_one_step_pipeline_barrier(monkeypatch):
+    """D applies the adopted request's bootstrap before scheduling step two."""
+
+    async def run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    core, dispatched = _async_pipeline_core()
+    req = _running_decode_request(prompt=(1, 2), first_output=50)
+    req.pd_reservation_id = "reservation-1"
+    core.scheduler.running.append(req)
+    core.scheduler.requests[req.request_id] = req
+
+    assert core._try_dispatch_step() is True
+    first_step_id = core._batch_queue[0][0]
+    assert first_step_id in core._pd_bootstrap_step_ids
+    assert len(dispatched) == 1
+
+    assert asyncio.run(core._await_and_apply_oldest()) is True
+    assert first_step_id not in core._pd_bootstrap_step_ids
+    assert req.output_token_ids == [50, 51]
+
+    # Once bootstrapped, the ordinary depth-two Decode pipeline resumes.
+    assert core._try_dispatch_step() is True
+    assert core._try_dispatch_step() is True
+    assert len(core._batch_queue) == 2
 
 
 def test_async_pipeline_waits_for_terminal_prefill_before_first_decode(monkeypatch):

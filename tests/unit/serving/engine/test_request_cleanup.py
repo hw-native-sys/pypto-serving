@@ -163,6 +163,10 @@ def test_flush_pending_frees_sends_cleanup_only_step_command(monkeypatch):
     core._discard_result_step_ids = set()
     core._step_counter = 0
     core._step_timeout = 300.0
+    release_done = asyncio.Event()
+    core._request_contexts = {
+        "aborted": SimpleNamespace(worker_release_done=release_done)
+    }
 
     sent: list[bytes] = []
     core._input_queue = SimpleNamespace(put=sent.append)
@@ -181,3 +185,47 @@ def test_flush_pending_frees_sends_cleanup_only_step_command(monkeypatch):
     # Pending list drained; known-set no longer tracks the released id.
     assert core._pending_free_ids == []
     assert "aborted" not in core._worker_known_req_ids
+    assert release_done.is_set()
+
+
+def test_adopted_handoff_holds_terminal_output_until_worker_release():
+    request = SimpleNamespace(num_prompt_tokens=3, output_token_ids=[])
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.tokenizer = object()
+    core._step_timeout = 1.0
+    core.scheduler = SimpleNamespace(
+        adopt_handoff=lambda **_kwargs: (
+            request,
+            SimpleNamespace(finished=False, finish_reason=None),
+        ),
+        abort_request=lambda _request_id: None,
+    )
+    core._request_contexts = {}
+    core._pending_free_ids = []
+    core._detokenize_incrementally = lambda _ctx: ""
+
+    async def drive():
+        outputs = core.add_adopted_handoff(
+            reservation_id="reservation",
+            request_id="request",
+            prompt_token_ids=(1, 2, 3),
+            first_token=4,
+            max_new_tokens=8,
+        )
+        first = await anext(outputs)
+        assert first.finished is False
+        context = core._request_contexts["request"]
+        context.queue.put_nowait(
+            TokenOutput(token_id=5, finished=True, finish_reason="length")
+        )
+        terminal = asyncio.create_task(anext(outputs))
+        await asyncio.sleep(0)
+        assert not terminal.done()
+
+        core._acknowledge_worker_frees(("request",))
+        final = await terminal
+        assert final.finished is True
+        assert "request" not in core._request_contexts
+        await outputs.aclose()
+
+    asyncio.run(drive())

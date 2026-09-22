@@ -931,6 +931,11 @@ class DSparkPreparedDecodePlan:
     owner_ranks: tuple[int, ...]
     owner_rows: tuple[int, ...]
     buffer_slot: int
+    # A newly adopted PD request has no Decode-local device state yet.  Its
+    # first prepared step must bind P's sampled token on the device lane before
+    # publishing the local drafter state.  Later steps consume recurrent device
+    # state and remain fully token-independent.
+    pd_bootstrap_request_ids: tuple[str, ...] = ()
     dispatch_inputs: DSparkPreparedDecodeInputs | None = None
 
 
@@ -1500,6 +1505,11 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
     @staticmethod
     def prepared_decode_requires_token(prepared: object) -> bool:
         """A fully staged one-L2 snapshot reads its next token from device state."""
+        if (
+            isinstance(prepared, DSparkPreparedDecodePlan)
+            and prepared.pd_bootstrap_request_ids
+        ):
+            return True
         return not (
             isinstance(prepared, DSparkPreparedDecodePlan)
             and prepared.dispatch_inputs is not None
@@ -3451,6 +3461,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         if inputs is None or inputs.dispatch_args is None:
             raise RuntimeError("DSpark fused decode was not fully bound during prepare")
         self._ensure_l3_shared_buffers(model)
+        # The first PD-adopted step is prepared before its real input token is
+        # available.  The worker late-binds that token immediately before this
+        # FIFO dispatch; publish the Decode-local drafter state exactly once.
+        self._finalize_pd_adopted_device_states(batch)
         for request_id in inputs.request_ids:
             if not self._drafter_state(request_id).device_state_initialized:
                 raise RuntimeError(
@@ -4335,6 +4349,16 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             )
 
         layout = self._compiled.layout
+        pd_bootstrap_request_ids = tuple(
+            request_id
+            for request_id, adopted in zip(
+                batch.request_ids,
+                batch.pd_adopted or [False] * len(batch.request_ids),
+                strict=True,
+            )
+            if adopted and request_id not in self._drafter_states
+        )
+
         # The fused DSpark assignment consults persistent drafter leases to
         # preserve each request's owner rank.  A PD-adopted request has no
         # Prefill-local drafter state, so create its Decode-local lease from
@@ -4615,6 +4639,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             owner_ranks=tuple(owner_ranks),
             owner_rows=tuple(owner_rows),
             buffer_slot=buffer_slot,
+            pd_bootstrap_request_ids=pd_bootstrap_request_ids,
         )
         if self.speculative and self._dspark_state_buffers:
             state_buffers = self._dspark_state_buffers[buffer_slot]

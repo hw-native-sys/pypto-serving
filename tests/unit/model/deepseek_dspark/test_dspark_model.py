@@ -1186,7 +1186,8 @@ def test_pd_adopted_fused_decode_publishes_late_bound_first_token(monkeypatch) -
         pd_adopted=[True],
         allow_device_greedy_sampling=True,
     )
-    runner._initialize_pd_adopted_drafter_states(decode)
+    plan = runner._prepare_decode_plan(decode, buffer_slot=0)
+    assert plan.pd_bootstrap_request_ids == ("pd-adopted",)
     state = runner._drafter_state("pd-adopted")
     published = []
 

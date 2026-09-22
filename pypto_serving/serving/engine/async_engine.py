@@ -119,7 +119,10 @@ class EngineConfig:
             raise ValueError(
                 "PD prefix-cache flag differs from the configured role/profile"
             )
-        if self.resolve_async_scheduling() != contract.requires_async_scheduling:
+        expected_async_scheduling = contract.async_scheduling_for_role(
+            config.role.value
+        )
+        if self.resolve_async_scheduling() != expected_async_scheduling:
             raise ValueError("PD scheduling mode differs from the selected model contract")
         runtime = self.runtime_config or RuntimeConfig()
         expected_local_tokens = contract.local_speculative_tokens(config.role.value)
@@ -170,6 +173,11 @@ class EngineConfig:
 class _RequestContext:
     request: Request
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    # The public terminal output is held until the worker has acknowledged the
+    # FIFO release command.  In async mode a speculative step may already be in
+    # flight when the request reaches its token limit; publishing completion
+    # before that step drains leaves request-local K7 state visible to metrics.
+    worker_release_done: asyncio.Event = field(default_factory=asyncio.Event)
     # When False (non-streaming), intermediate TokenOutputs are suppressed and
     # only the final one is enqueued — one queue push / one HTTP wake-up per
     # request instead of one per token. Stop-string detection still runs every
@@ -305,6 +313,16 @@ class ReplicaEngineCore:
         # executing on the device while the next is scheduled. Each entry is the
         # SchedulerOutput awaiting its StepResult. Sync mode leaves this empty.
         self._batch_queue: deque[tuple[int, SchedulerOutput]] = deque()
+        # Request ids released by each queued worker step.  A successful reply
+        # is the acknowledgement that the FIFO worker applied the release
+        # before executing that step.
+        self._worker_free_ids_by_step: dict[int, tuple[str, ...]] = {}
+        # The first Decode step of a remotely adopted request publishes
+        # Decode-local recurrent state from P's sampled token.  It is a
+        # one-time barrier: do not optimistically schedule the next step until
+        # that bootstrap result has been applied.  Steady-state Decode resumes
+        # the normal depth-two pipeline immediately afterwards.
+        self._pd_bootstrap_step_ids: set[int] = set()
         self._max_in_flight = 2 if self._async_scheduling else 1
         self._step_counter = 0
         # step_ids of dispatched steps whose worker StepResult has NOT yet been
@@ -589,9 +607,20 @@ class ReplicaEngineCore:
                     self._request_contexts.pop(request_id, None)
                     raise queued
                 output: TokenOutput = queued
-                yield output
                 if output.finished:
+                    try:
+                        await asyncio.wait_for(
+                            ctx.worker_release_done.wait(),
+                            timeout=self._step_timeout,
+                        )
+                    except TimeoutError as exc:
+                        raise RuntimeError(
+                            f"worker request release timed out ({self._step_timeout:g}s)"
+                        ) from exc
                     finished_normally = True
+                    self._request_contexts.pop(request_id, None)
+                    self._pd_prefill_chunks.pop(request_id, None)
+                    self._pd_chunk_counters.pop(request_id, None)
                     e2e = time.time() - request.arrival_time
                     n_out = len(request.output_token_ids)
                     logger.info(
@@ -599,7 +628,9 @@ class ReplicaEngineCore:
                         request_id, len(prompt_token_ids), n_out, output.finish_reason,
                         e2e, (n_out / e2e) if e2e > 0 else 0.0,
                     )
+                    yield output
                     break
+                yield output
         finally:
             # Only cancellation/disconnect needs cleanup here. On normal
             # completion the request already finished in the scheduler and
@@ -711,6 +742,10 @@ class ReplicaEngineCore:
             stream=stream,
             output_parser=create_output_parser(output_parser_spec, self.tokenizer),
         )
+        if first_output.finished:
+            # No Decode worker state was created when P's first token already
+            # satisfies the request.
+            ctx.worker_release_done.set()
         self._request_contexts[request_id] = ctx
         text = self._detokenize_incrementally(ctx)
         ctx.queue.put_nowait(
@@ -732,10 +767,21 @@ class ReplicaEngineCore:
                     self._request_contexts.pop(request_id, None)
                     raise queued
                 output: TokenOutput = queued
-                yield output
                 if output.finished:
+                    try:
+                        await asyncio.wait_for(
+                            ctx.worker_release_done.wait(),
+                            timeout=self._step_timeout,
+                        )
+                    except TimeoutError as exc:
+                        raise RuntimeError(
+                            f"worker request release timed out ({self._step_timeout:g}s)"
+                        ) from exc
                     finished_normally = True
+                    self._request_contexts.pop(request_id, None)
+                    yield output
                     break
+                yield output
         finally:
             if not finished_normally and request_id in self._request_contexts:
                 self._request_contexts.pop(request_id, None)
@@ -751,6 +797,13 @@ class ReplicaEngineCore:
         """
         if request_id not in self._pending_free_ids:
             self._pending_free_ids.append(request_id)
+
+    def _acknowledge_worker_frees(self, request_ids: Sequence[str]) -> None:
+        """Publish worker FIFO release acknowledgements to request producers."""
+        for request_id in request_ids:
+            context = self._request_contexts.get(request_id)
+            if context is not None:
+                context.worker_release_done.set()
 
     async def _engine_loop(self) -> None:
         """Pipelined schedule/execute loop.
@@ -776,8 +829,15 @@ class ReplicaEngineCore:
 
             if self._batch_queue:
                 # Block on the oldest in-flight step when the queue is full, or
-                # when we could not dispatch anything new this iteration.
-                if len(self._batch_queue) >= self._max_in_flight or not dispatched:
+                # when we could not dispatch anything new this iteration.  A
+                # PD-adopted request's first Decode is also an explicit state
+                # bootstrap barrier before steady-state pipelining begins.
+                oldest_step_id = self._batch_queue[0][0]
+                if (
+                    len(self._batch_queue) >= self._max_in_flight
+                    or not dispatched
+                    or oldest_step_id in self._pd_bootstrap_step_ids
+                ):
                     applied = await self._await_and_apply_oldest()
                     if not applied:
                         continue
@@ -814,6 +874,11 @@ class ReplicaEngineCore:
 
         finished_ids = self._pending_free_ids.copy()
         self._pending_free_ids.clear()
+        pd_bootstrap = any(
+            scheduled.request.pd_reservation_id
+            and scheduled.request.request_id not in self._worker_known_req_ids
+            for scheduled in scheduler_output.scheduled_requests
+        )
         self._step_counter += 1
         with profile_span(
             "scheduler.queue_worker_step",
@@ -824,6 +889,16 @@ class ReplicaEngineCore:
                 scheduler_output, finished_ids, step_id=self._step_counter
             )
             self._input_queue.put(encode_command(step_cmd))
+        reregistered_ids = {
+            request.request_id for request in step_cmd.new_requests
+        }
+        release_only_ids = tuple(
+            request_id
+            for request_id in finished_ids
+            if request_id not in reregistered_ids
+        )
+        if release_only_ids:
+            self._worker_free_ids_by_step[self._step_counter] = release_only_ids
 
         stat_logger = getattr(self, "_stat_logger", None)
         if stat_logger is not None:
@@ -839,6 +914,10 @@ class ReplicaEngineCore:
         self.scheduler.advance_after_schedule(scheduler_output)
 
         self._batch_queue.append((self._step_counter, scheduler_output))
+        if pd_bootstrap:
+            if not hasattr(self, "_pd_bootstrap_step_ids"):
+                self._pd_bootstrap_step_ids = set()
+            self._pd_bootstrap_step_ids.add(self._step_counter)
         return True
 
     async def _await_and_apply_oldest(self) -> bool:
@@ -850,6 +929,10 @@ class ReplicaEngineCore:
         oldest dispatched step is the next result off the output queue.
         """
         step_id, scheduler_output = self._batch_queue.popleft()
+        getattr(self, "_pd_bootstrap_step_ids", set()).discard(step_id)
+        finished_ids = getattr(self, "_worker_free_ids_by_step", {}).pop(
+            step_id, ()
+        )
         try:
             with profile_span("scheduler.wait_worker_output", cat="scheduler"):
                 raw_output = await self._get_live_result()
@@ -875,6 +958,8 @@ class ReplicaEngineCore:
             # This step's result was just consumed; only in-flight steps pend.
             self._handle_step_error(step_id, scheduler_output, result_pending=False)
             return False
+
+        self._acknowledge_worker_frees(finished_ids)
 
         # Unwrap list[int] values back to int | list[int] for update_from_output.
         new_tokens: dict[str, int | list[int]] = {
@@ -939,6 +1024,13 @@ class ReplicaEngineCore:
 
             # Register with worker the first time this request is scheduled.
             if req_id not in self._worker_known_req_ids:
+                context = self._request_contexts.get(req_id)
+                release_done = getattr(context, "worker_release_done", None)
+                if release_done is not None:
+                    # A preempted request may release and re-register in this
+                    # same FIFO command.  Its old-incarnation acknowledgement
+                    # must not satisfy the eventual terminal release barrier.
+                    release_done.clear()
                 new_requests.append(NewRequestData(
                     request_id=req_id,
                     prompt_token_ids=list(req.prompt_token_ids),
@@ -1044,6 +1136,8 @@ class ReplicaEngineCore:
         step_result = decode_result(raw_output)
         if step_result.error:
             logger.error(f"Worker cleanup-step returned error: {step_result.error}")
+            return
+        self._acknowledge_worker_frees(finished_ids)
 
     def _handle_step_error(
         self,
@@ -1074,6 +1168,8 @@ class ReplicaEngineCore:
         # Their results are still in transit and must be drained.
         while self._batch_queue:
             sid, batch = self._batch_queue.popleft()
+            getattr(self, "_pd_bootstrap_step_ids", set()).discard(sid)
+            getattr(self, "_worker_free_ids_by_step", {}).pop(sid, None)
             self._discard_result_step_ids.add(sid)
             failed_batches.append(batch)
 

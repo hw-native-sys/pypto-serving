@@ -380,7 +380,11 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         long_prefill_token_threshold=args.long_prefill_token_threshold,
         enable_prefix_cache=enable_prefix_cache,
         enable_chunk_prefill=args.enable_chunked_prefill,
-        async_scheduling=False if pd_config is not None else None,
+        async_scheduling=(
+            pd_config.model_contract.async_scheduling_for_role(pd_config.role.value)
+            if pd_config is not None
+            else None
+        ),
         pd_config=pd_config,
     )
 
