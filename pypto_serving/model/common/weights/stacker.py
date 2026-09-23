@@ -86,6 +86,7 @@ def allocate_slabs(
     template: Mapping[str, torch.Tensor],
     *,
     stack_axis: int = 1,
+    new_axis_members: frozenset[str] = frozenset(),
     allocate: Callable[[tuple[int, ...], torch.dtype], torch.Tensor] | None = None,
     rank_error: str = "packed weight {name} must have rank >= 2, got {ndim}",
 ) -> dict[str, torch.Tensor]:
@@ -98,6 +99,12 @@ def allocate_slabs(
     DeepSeekV4 weight leads with the rank axis that ``alloc_stacked_tensor`` shards on, so its
     layers stack on axis 1, while a rank-less Qwen weight stacks on axis 0. Getting it wrong
     produces a correctly-sized slab holding a transposed model.
+
+    ``new_axis_members`` names weights that cannot widen ``stack_axis`` by concatenation: an
+    NZ-packed weight's row axis is already fractal-blocked per layer, so stitching two layers'
+    rows together on that axis would splice two independently blocked fractals into one that
+    addresses neither correctly. Those weights get a new axis of size ``count`` inserted at
+    ``stack_axis`` instead, and a layer becomes an index into it rather than a row window.
 
     ``allocate`` builds each slab, defaulting to plain host memory. A family whose upload reads
     the slab from a forked child passes one that returns shared memory instead.
@@ -115,7 +122,11 @@ def allocate_slabs(
             if not -source.ndim <= stack_axis < source.ndim:
                 raise ValueError(f"stack_axis {stack_axis} is out of range for {name} with rank {source.ndim}")
             shape = list(int(dim) for dim in source.shape)
-            shape[stack_axis] *= count
+            if name in new_axis_members:
+                axis = stack_axis if stack_axis >= 0 else stack_axis + len(shape) + 1
+                shape.insert(axis, count)
+            else:
+                shape[stack_axis] *= count
             slabs[name] = build(tuple(shape), source.dtype)
     return slabs
 
@@ -127,6 +138,7 @@ def destinations_for(
     *,
     layer_id: int,
     stack_axis: int = 1,
+    new_axis_members: frozenset[str] = frozenset(),
 ) -> dict[str, torch.Tensor]:
     """Return this layer's slice of every slab it belongs to, as views into the slabs.
 
@@ -139,8 +151,11 @@ def destinations_for(
         if position is None:
             continue
         for name in group.members or ():
-            width = int(template[name].shape[stack_axis])
-            destinations[name] = slabs[name].narrow(stack_axis, position * width, width)
+            if name in new_axis_members:
+                destinations[name] = slabs[name].select(stack_axis, position)
+            else:
+                width = int(template[name].shape[stack_axis])
+                destinations[name] = slabs[name].narrow(stack_axis, position * width, width)
     return destinations
 
 
@@ -181,6 +196,7 @@ def stack_layers(
     on_layer_done: Callable[[int], None] | None = None,
     policy: "StagingPolicy | None" = None,
     stack_axis: int = 1,
+    new_axis_members: frozenset[str] = frozenset(),
     allocate: Callable[[tuple[int, ...], torch.dtype], torch.Tensor] | None = None,
     rank_error: str = "packed weight {name} must have rank >= 2, got {ndim}",
     mismatch_error: str = (
@@ -193,6 +209,9 @@ def stack_layers(
     ``template_layer_id`` names it, its tensors are copied into place instead of being packed a
     second time. ``pack_into(layer_id, destinations)`` must write every destination it is
     given; it is the caller's packer, so this module never learns what a weight means.
+
+    ``new_axis_members`` is forwarded to ``allocate_slabs``/``destinations_for`` -- see
+    ``allocate_slabs`` for why some NZ-packed weights need a new axis instead of a wider one.
 
     ``on_layer_done`` fires once per layer whichever path it took, so progress reporting does
     not silently skip the template layer.
@@ -207,12 +226,22 @@ def stack_layers(
 
     resolved = resolve_members(groups, template)
     slabs = allocate_slabs(
-        resolved, template, stack_axis=stack_axis, allocate=allocate, rank_error=rank_error
+        resolved,
+        template,
+        stack_axis=stack_axis,
+        new_axis_members=new_axis_members,
+        allocate=allocate,
+        rank_error=rank_error,
     )
 
     def _stage(layer_id: int) -> None:
         destinations = destinations_for(
-            slabs, resolved, template, layer_id=layer_id, stack_axis=stack_axis
+            slabs,
+            resolved,
+            template,
+            layer_id=layer_id,
+            stack_axis=stack_axis,
+            new_axis_members=new_axis_members,
         )
         if template_layer_id is not None and int(layer_id) == int(template_layer_id):
             copy_packed_layer(template, destinations, mismatch_error=mismatch_error)
