@@ -106,7 +106,7 @@ class PDRuntimeConfig:
     control_incarnation: int = 1
     max_active_handoffs: int = 4
     max_pending_handoffs: int = 8
-    enable_chunk_overlap: bool = False
+    enable_chunk_overlap: bool = True
     prefix_cache_mode: PDPrefixCacheMode = PDPrefixCacheMode.DISABLED
 
     def __post_init__(self) -> None:
@@ -253,7 +253,7 @@ def load_pd_document(path: str | os.PathLike[str]) -> PDDocument:
         control_incarnation=runtime.get("control_incarnation", 1),
         max_active_handoffs=runtime.get("max_active_handoffs", 4),
         max_pending_handoffs=runtime.get("max_pending_handoffs", 8),
-        enable_chunk_overlap=runtime.get("enable_chunk_overlap", False),
+        enable_chunk_overlap=runtime.get("enable_chunk_overlap", True),
         prefix_cache_mode=runtime.get("prefix_cache_mode", "disabled"),
     )
     observability = raw.get("observability", {})
@@ -292,7 +292,7 @@ class PDConfig:
     max_active_handoffs: int = 4
     max_pending_handoffs: int = 8
     max_transfer_attempts: int = 2
-    enable_chunk_overlap: bool = False
+    enable_chunk_overlap: bool = True
     prepared_request_ttl_seconds: float = 300.0
     journal_path: str = ""
     log_dir: str = ""

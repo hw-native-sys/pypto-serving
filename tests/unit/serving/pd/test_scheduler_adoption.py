@@ -12,7 +12,7 @@ from pypto_serving.serving.sched.scheduler import Request, Scheduler, SchedulerC
 from .helpers import make_cache_manager
 
 
-def _scheduler(manager, *, prefill_handoff: bool = False) -> Scheduler:
+def _scheduler(manager, *, stop_after_prefill: bool = False) -> Scheduler:
     return Scheduler(
         SchedulerConfig(
             max_num_running_reqs=4,
@@ -22,7 +22,7 @@ def _scheduler(manager, *, prefill_handoff: bool = False) -> Scheduler:
             enable_prefix_cache=False,
             enable_chunk_prefill=True,
             requires_homogeneous_prefill_decode=True,
-            prefill_handoff=prefill_handoff,
+            stop_after_prefill=stop_after_prefill,
         ),
         manager,
     )
@@ -30,17 +30,17 @@ def _scheduler(manager, *, prefill_handoff: bool = False) -> Scheduler:
 
 def test_prefill_role_stops_before_decode_and_keeps_requested_partition() -> None:
     manager = make_cache_manager()
-    scheduler = _scheduler(manager, prefill_handoff=True)
+    scheduler = _scheduler(manager, stop_after_prefill=True)
     request = Request("request", list(range(33)), 8, cache_partition=2)
     scheduler.add_request(request)
     scheduled = scheduler.schedule()
     assert scheduled.scheduled_requests[0].cache_partition == 2
     outputs = scheduler.update_from_output(scheduled, {"request": 7})
-    assert outputs[0].handoff_ready
-    assert request.handoff_pending
+    assert outputs[0].prefill_finished
+    assert request.prefill_complete
     assert scheduler.schedule().is_empty
-    scheduler.mark_prefill_chunk_transfer_pending("request")
-    scheduler.complete_prefill_handoff("request")
+    scheduler.hold_request("request")
+    scheduler.finish_prefilled_request("request")
     assert manager.group_request_partition("request") is None
 
 
@@ -49,8 +49,8 @@ def test_decode_adoption_skips_prefill_and_handles_first_token_boundary() -> Non
     scheduler = _scheduler(manager)
     reservation = manager.reserve_group_cache("reservation", "request", 41, partition=1)
     manager.authorize_group_cache_write(reservation.reservation_id)
-    manager.commit_group_cache(reservation.reservation_id, "manifest")
-    request, first = scheduler.adopt_handoff(
+    manager.commit_group_cache(reservation.reservation_id)
+    request, first = scheduler.admit_prefilled(
         reservation_id="reservation",
         request_id="request",
         prompt_token_ids=list(range(33)),
@@ -73,8 +73,8 @@ def test_max_new_tokens_one_finishes_without_fabricating_decode() -> None:
     scheduler = _scheduler(manager)
     reservation = manager.reserve_group_cache("reservation", "request", 34)
     manager.authorize_group_cache_write(reservation.reservation_id)
-    manager.commit_group_cache(reservation.reservation_id, "manifest")
-    _, first = scheduler.adopt_handoff(
+    manager.commit_group_cache(reservation.reservation_id)
+    _, first = scheduler.admit_prefilled(
         reservation_id="reservation",
         request_id="request",
         prompt_token_ids=list(range(33)),

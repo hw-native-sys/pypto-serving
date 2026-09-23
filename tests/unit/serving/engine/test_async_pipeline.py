@@ -78,11 +78,12 @@ def _async_pipeline_core(*, num_speculative_tokens: int = 0):
     core._request_contexts = {}
     core._batch_queue = deque()
     core._worker_free_ids_by_step = {}
-    core._pd_bootstrap_step_ids = set()
+    core._initialization_steps = set()
     core._discard_result_step_ids = set()
     core._step_timeout = 300.0
     core._max_in_flight = 2
     core._step_counter = 0
+    core._result_handler = core._process_step_output
 
     dispatched: list = []
     results: "deque" = deque()
@@ -207,17 +208,18 @@ def test_pd_adopted_first_decode_is_a_one_step_pipeline_barrier(monkeypatch):
     monkeypatch.setattr(asyncio, "to_thread", run_inline)
     core, dispatched = _async_pipeline_core()
     req = _running_decode_request(prompt=(1, 2), first_output=50)
-    req.pd_reservation_id = "reservation-1"
+    req.cache_reservation_id = "reservation-1"
+    req.requires_initial_step = True
     core.scheduler.running.append(req)
     core.scheduler.requests[req.request_id] = req
 
     assert core._try_dispatch_step() is True
     first_step_id = core._batch_queue[0][0]
-    assert first_step_id in core._pd_bootstrap_step_ids
+    assert first_step_id in core._initialization_steps
     assert len(dispatched) == 1
 
     assert asyncio.run(core._await_and_apply_oldest()) is True
-    assert first_step_id not in core._pd_bootstrap_step_ids
+    assert first_step_id not in core._initialization_steps
     assert req.output_token_ids == [50, 51]
 
     # Once bootstrapped, the ordinary depth-two Decode pipeline resumes.

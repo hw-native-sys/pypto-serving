@@ -10,8 +10,9 @@
 
 from __future__ import annotations
 
+from pypto_serving.observability.tokens import token_ids_sha256
+
 from collections import deque
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -33,14 +34,6 @@ def write_startup_record(log_dir: str, *, enabled: bool, values: dict[str, objec
     (directory / "events.jsonl").touch(exist_ok=True)
 
 
-def token_ids_sha256(token_ids: tuple[int, ...]) -> str:
-    """Return the canonical address-free digest used by all serving planes."""
-    if not token_ids:
-        return ""
-    material = b"".join(
-        int(token).to_bytes(8, "big", signed=True) for token in token_ids
-    )
-    return hashlib.sha256(material).hexdigest()
 
 
 class PDMetrics:

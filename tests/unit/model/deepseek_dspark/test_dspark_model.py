@@ -17,6 +17,8 @@ import pytest
 import torch
 
 from pypto_serving.config.types import DecodeBatch, PrefillBatch
+from pypto_serving.model.deepseek_dspark.pd_adapter import DSparkPDWorker
+from pypto_serving.serving.pd.worker import PDWorkerRuntime
 from pypto_serving.model.deepseek_dspark import task_args as task_args_module
 from pypto_serving.model.deepseek_dspark import npu_executor as executor_module
 from pypto_serving.model.deepseek_dspark import npu_runner as runner_module
@@ -33,7 +35,7 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
 )
 
 
-def _runner(*, speculative: bool = False, max_position: int = 512) -> DSparkModelRunner:
+def _runner(*, speculative: bool = False, max_position: int = 512, pd: bool = False) -> DSparkModelRunner:
     rows = torch.arange(max_position * 64, dtype=torch.float32).reshape(max_position, 64)
     rope = DSparkRopeTables(
         max_position=max_position,
@@ -64,7 +66,8 @@ def _runner(*, speculative: bool = False, max_position: int = 512) -> DSparkMode
             kernel_dir="unused",
             rope=rope,
             num_speculative_tokens=7 if speculative else 0,
-        )
+        ),
+        extension_factory=(lambda **capabilities: DSparkPDWorker(config=object(), **capabilities)) if pd else None,
     )
     runner._cache_group_num_blocks = {name: 8 for name in DSPARK_CACHE_GROUP_NAMES}
     runner._prefill_task_args = task_args_module.prefill_task_args(runner)
@@ -154,22 +157,17 @@ def test_packed_prefill_executor_limits_follow_runtime(monkeypatch, max_batch_si
     assert executor.max_prefill_tokens_per_partition == 8192
 
 
-def test_executor_forwards_transfer_profile_control_to_registered_runner() -> None:
-    states = []
+def test_executor_exposes_only_registered_runtime_extensions() -> None:
+    extension = object()
     executor = DeepSeekV4DSparkPyptoExecutor.__new__(
         DeepSeekV4DSparkPyptoExecutor
     )
-    executor._pd_worker_config = object()
     executor._runners = {
-        "model": SimpleNamespace(
-            set_transfer_profile_active=lambda active: states.append(active)
-        )
+        "model": SimpleNamespace(runtime_extension=extension),
+        "ordinary": SimpleNamespace(runtime_extension=None),
     }
 
-    executor.set_transfer_profile_active(True)
-    executor.set_transfer_profile_active(False)
-
-    assert states == [True, False]
+    assert executor.runtime_extensions() == (extension,)
 
 
 def test_prefill_to_decode_staging_contract() -> None:
@@ -929,6 +927,39 @@ def test_reused_drafter_lease_is_scrubbed_before_new_request(monkeypatch) -> Non
     assert (1, first.lease) not in runner._drafter_dirty_leases
 
 
+def test_adoption_defers_device_copies_until_first_dispatch_fence(monkeypatch) -> None:
+    runner = _runner(speculative=True, pd=True)
+    old = runner._reserve_drafter_state("old", group=0, prompt_len=64)
+    runner.release_finished_requests(["old"])
+    events = []
+    monkeypatch.setattr(runner, "_clear_drafter_lease", lambda *args: events.append("clear"))
+    monkeypatch.setattr(runner, "_wait_for_pending_decode_dispatches", lambda: events.append("wait"))
+    device = SimpleNamespace(
+        shards=[SimpleNamespace(data_ptr=4096) for _ in range(16)], worker_ids=tuple(range(16)),
+    )
+    monkeypatch.setattr(runner, "_materialize_dspark_device_state_tokens", lambda: device)
+    monkeypatch.setattr(runner, "_materialize_dspark_device_state_meta", lambda: device)
+    monkeypatch.setattr(runner, "_shared_l3_worker", lambda: SimpleNamespace(
+        copy_to=lambda *args, **kwargs: events.append("copy"),
+    ))
+    batch = DecodeBatch(
+        request_ids=["new"], token_ids=torch.tensor([[101]]), hidden_states=None,
+        seq_lens=torch.tensor([65], dtype=torch.int32), block_ids_by_group=_block_rows(1),
+        cache_partitions=[0], initial_request_ids=("new",), allow_device_greedy_sampling=True,
+    )
+    runner.runtime_extension.initialize_drafter(batch)
+    state = runner._drafter_state("new")
+    assert state.lease == old.lease
+    assert events == []  # Early Host preparation must not fence or touch the device.
+    assert (0, state.lease) in runner._drafter_dirty_leases
+    runner.runtime_extension.finalize_device(batch)
+    assert events == ["wait", "clear"] + ["copy"] * 8
+    assert state.device_state_initialized
+    assert (0, state.lease) not in runner._drafter_dirty_leases
+    runner.runtime_extension.finalize_device(batch)
+    assert events == ["wait", "clear"] + ["copy"] * 8  # No per-step fence/copy.
+
+
 def test_drafter_lease_scrub_covers_every_layer_and_tp_replica(monkeypatch) -> None:
     from pypto_serving.model.deepseek_dspark.npu_runner import (
         DSPARK_BLOCK_SIZE,
@@ -1114,7 +1145,7 @@ def test_run_decode_accepts_and_redrafts(monkeypatch) -> None:
 
 def test_pd_adopted_decode_bootstraps_k7_after_one_target_step(monkeypatch) -> None:
     """D creates local drafter state without importing P request-local state."""
-    runner = _runner(speculative=True)
+    runner = _runner(speculative=True, pd=True)
     runner._compiled.decode = object()
     runner._l3_shared_buffers_ready = True
     decode = DecodeBatch(
@@ -1125,7 +1156,7 @@ def test_pd_adopted_decode_bootstraps_k7_after_one_target_step(monkeypatch) -> N
         seq_lens=torch.tensor([65], dtype=torch.int32),
         block_ids_by_group=_block_rows(1),
         cache_partitions=[0],
-        pd_adopted=[True],
+        initial_request_ids=("pd-adopted",),
         allow_device_greedy_sampling=True,
     )
 
@@ -1175,7 +1206,7 @@ def test_pd_adopted_decode_bootstraps_k7_after_one_target_step(monkeypatch) -> N
 
 
 def test_pd_adopted_fused_decode_publishes_late_bound_first_token(monkeypatch) -> None:
-    runner = _runner(speculative=True)
+    runner = _runner(speculative=True, pd=True)
     decode = DecodeBatch(
         request_ids=["pd-adopted"],
         token_ids=torch.tensor([[101]], dtype=torch.long),
@@ -1183,11 +1214,11 @@ def test_pd_adopted_fused_decode_publishes_late_bound_first_token(monkeypatch) -
         seq_lens=torch.tensor([65], dtype=torch.int32),
         block_ids_by_group=_block_rows(1),
         cache_partitions=[0],
-        pd_adopted=[True],
+        initial_request_ids=("pd-adopted",),
         allow_device_greedy_sampling=True,
     )
-    plan = runner._prepare_decode_plan(decode, buffer_slot=0)
-    assert plan.pd_bootstrap_request_ids == ("pd-adopted",)
+    plan = runner._plan_builder(decode, buffer_slot=0)
+    assert plan.bootstrap_request_ids == ("pd-adopted",)
     state = runner._drafter_state("pd-adopted")
     published = []
 
@@ -1195,9 +1226,9 @@ def test_pd_adopted_fused_decode_publishes_late_bound_first_token(monkeypatch) -
         published.append(value)
         value.device_state_initialized = True
 
-    monkeypatch.setattr(runner, "_initialize_dspark_device_state", publish)
+    runner.runtime_extension.initialize_device_state = publish
 
-    runner._finalize_pd_adopted_device_states(decode)
+    runner.runtime_extension.finalize_device(decode)
 
     assert published == [state]
     assert state.current_token_id == 101
@@ -1222,9 +1253,9 @@ def test_non_pd_k7_decode_still_requires_prefill_seed() -> None:
 
 
 def test_pd_attempt_sequence_is_monotonic_per_owner_across_chunks() -> None:
-    runner = _runner()
+    runtime = PDWorkerRuntime(object(), SimpleNamespace(ranks=2))
 
-    assert runner._next_pd_attempt_sequence(0) == 1
-    assert runner._next_pd_attempt_sequence(0) == 2
-    assert runner._next_pd_attempt_sequence(1) == 1
-    assert runner._next_pd_attempt_sequence(0) == 3
+    assert runtime._next_pd_attempt_sequence(0) == 1
+    assert runtime._next_pd_attempt_sequence(0) == 2
+    assert runtime._next_pd_attempt_sequence(1) == 1
+    assert runtime._next_pd_attempt_sequence(0) == 3

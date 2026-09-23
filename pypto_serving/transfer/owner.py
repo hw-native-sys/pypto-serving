@@ -209,10 +209,16 @@ class OwnerBridge:
         self._sources[lease.region_id] = lease
         return envelope
 
-    @_serialized
     def install_destination(self, lease: RegionLease, envelope: dict):
-        self._request("destination", lease=asdict(lease), envelope=envelope)
-        self._destinations[lease.region_id] = lease
+        self.install_destinations(((lease, envelope),))
+
+    @_serialized
+    def install_destinations(self, entries: tuple[tuple[RegionLease, dict], ...]):
+        self._request("destinations", entries=[
+            {"lease": asdict(lease), "envelope": envelope} for lease, envelope in entries
+        ])
+        for lease, _ in entries:
+            self._destinations[lease.registration_key] = lease
 
     @_serialized
     def write(self, task: ProviderTransferTask, on_submitted: Callable[[], None] = lambda: None):
@@ -223,7 +229,7 @@ class OwnerBridge:
         task.validate(self.capabilities)
         for segment in task.segments:
             if (self._sources.get(segment.source.region_id) != segment.source
-                    or self._destinations.get(segment.destination.region_id) != segment.destination):
+                    or self._destinations.get(segment.destination.registration_key) != segment.destination):
                 raise TransferFailure(TransferError(ErrorCode.STALE_GENERATION, Certainty.NOT_SUBMITTED))
         # After publication, lost replies cannot prove whether native submit occurred.
         on_submitted()
@@ -356,8 +362,9 @@ class _OwnerService:
                         if extent != lease.extent:
                             raise ValueError("registration extent mismatch")
                         reply["envelope"] = provider.register(lease, address)
-                    elif operation == "destination":
-                        provider.install_destination(_lease(request["lease"]), request["envelope"])
+                    elif operation == "destinations":
+                        for entry in request["entries"]:
+                            provider.install_destination(_lease(entry["lease"]), entry["envelope"])
                     elif operation == "write":
                         task = _task(request["task"])
                         if task.attempt.source != self.owner:

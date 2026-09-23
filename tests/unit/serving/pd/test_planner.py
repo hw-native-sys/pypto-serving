@@ -10,12 +10,62 @@
 import pytest
 
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_ADAPTER
-from pypto_serving.serving.pd.protocol import HandoffKey
+from pypto_serving.serving.pd.planner import PChunkLifecycle
+from pypto_serving.serving.pd.protocol import HandoffKey, RankMapping
+from pypto_serving.transfer.types import CompletionCertainty
 
 from .helpers import make_cache_manager, make_registry
 
 
 KEY = HandoffKey("request", "handoff", 1, 1, 1)
+
+
+@pytest.mark.parametrize("partition", range(4))
+def test_inflight_transfer_pins_rolling_pages_while_next_chunk_advances(partition):
+    manager = make_cache_manager()
+    lifecycle = PChunkLifecycle(manager)
+    spec = next(spec for spec in manager.group_specs if spec.name == "ori")
+    wrap = spec.max_blocks_per_seq * spec.spec.token_capacity
+    original = _tables(manager, "source", wrap, partition)
+    guard = lifecycle.begin("source", 0, original, partition)
+    advanced = _tables(manager, "source", wrap + spec.spec.token_capacity, partition)
+    assert original["ori"][0] != advanced["ori"][0]
+    pool = manager._group_pools["ori"]
+    pinned = pool.block_from_local_id(partition, original["ori"][0])
+    assert pinned.ref_cnt == 1
+    manager.release_all_group_requests("source")
+    assert pinned.ref_cnt == 1  # Releasing the request cannot recycle a native read.
+    lifecycle.settle(guard, CompletionCertainty.UNKNOWN)
+    assert pinned.ref_cnt == 1
+    lifecycle.settle(guard, CompletionCertainty.COMPLETED)
+    assert pinned.ref_cnt == 0
+    assert not lifecycle._in_flight
+
+
+@pytest.mark.parametrize("source_partition", range(4))
+@pytest.mark.parametrize("destination_partition", range(4))
+@pytest.mark.parametrize("p_hit,d_hit", ((0, 0), (128, 256), (256, 256), (384, 128)))
+def test_cross_partition_plan_keeps_source_and_destination_tables_distinct(
+    source_partition, destination_partition, p_hit, d_hit,
+):
+    manager = make_cache_manager()
+    registry = make_registry(manager)
+    source = _tables(manager, "source", 512, partition=source_partition)
+    # Different local block IDs expose accidental reuse of the other table.
+    destination = {name: tuple(block + 7 for block in blocks) for name, blocks in source.items()}
+    mapping = DSV4_DSPARK_K7_ADAPTER.rank_mapping((16, 4), source_partition, destination_partition)
+    plan = DSV4_DSPARK_K7_ADAPTER.make_planner(registry, manager.group_specs).plan_chunk(
+        KEY, chunk_id=0, start_token=0, end_token=512, final=True,
+        rank_mapping=mapping,
+        source_blocks_by_rank={pair.source_rank_id: source for pair in mapping},
+        destination_blocks_by_rank={pair.destination_rank_id: destination for pair in mapping},
+        source_prefix_hit_tokens=p_hit, destination_prefix_hit_tokens=d_hit,
+    )
+    assert plan.rank_mapping == mapping
+    for rank in plan.ranks:
+        assert all(copy.destination_block == copy.source_block + 7 for copy in rank.copies)
+        assert all(unit.destination_rank_id == rank.mapping.destination_rank_id for unit in rank.expected_units)
+        assert {"hca_state", "csa_state", "csa_inner_state"} <= {copy.component_id for copy in rank.copies}
 
 
 def _tables(manager, request_id: str, token_count: int, partition: int = 0):
@@ -45,7 +95,7 @@ def test_chunk_planner_defers_partial_pages_and_keeps_zero_units() -> None:
         start_token=0,
         end_token=32,
         final=False,
-        rank_ids=rank_ids,
+        rank_mapping=tuple(RankMapping(rank, rank) for rank in rank_ids),
         source_blocks_by_rank=source_by_rank,
         destination_blocks_by_rank=destination_by_rank,
     )
@@ -62,7 +112,7 @@ def test_chunk_planner_defers_partial_pages_and_keeps_zero_units() -> None:
         start_token=32,
         end_token=33,
         final=True,
-        rank_ids=rank_ids,
+        rank_mapping=tuple(RankMapping(rank, rank) for rank in rank_ids),
         source_blocks_by_rank=source_by_rank,
         destination_blocks_by_rank=destination_by_rank,
     )
@@ -88,7 +138,7 @@ def test_index_regions_are_atomic_and_ring_destination_wraps() -> None:
         start_token=wrap_start,
         end_token=wrap_end,
         final=False,
-        rank_ids=(0,),
+        rank_mapping=(RankMapping(0, 0),),
         source_blocks_by_rank={0: source},
         destination_blocks_by_rank={0: destination},
     )
@@ -106,7 +156,7 @@ def test_index_regions_are_atomic_and_ring_destination_wraps() -> None:
         start_token=0,
         end_token=128,
         final=False,
-        rank_ids=(0,),
+        rank_mapping=(RankMapping(0, 0),),
         source_blocks_by_rank={0: source},
         destination_blocks_by_rank={0: destination},
     )
@@ -152,7 +202,7 @@ def test_plans_independent_hits_without_reading_stale_rolling_slots(
         start_token=0,
         end_token=prompt_tokens,
         final=True,
-        rank_ids=(0,),
+        rank_mapping=(RankMapping(0, 0),),
         source_blocks_by_rank={0: source},
         destination_blocks_by_rank={0: destination},
         destination_prefix_hit_tokens=d_hit,
@@ -199,7 +249,7 @@ def test_rejects_unaligned_p_hit() -> None:
             start_token=0,
             end_token=256,
             final=True,
-            rank_ids=(0,),
+            rank_mapping=(RankMapping(0, 0),),
             source_blocks_by_rank={0: tables},
             destination_blocks_by_rank={0: tables},
             source_prefix_hit_tokens=127,

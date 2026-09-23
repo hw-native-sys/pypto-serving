@@ -21,7 +21,7 @@ from typing import Literal
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput
-from pypto_serving.serving.pd.observability import token_ids_sha256
+from pypto_serving.observability.tokens import token_ids_sha256
 from pypto_serving.serving.reasoning import OutputParserSpec, ToolCallDelta, supports_tool_calls
 from pypto_serving.tools.profile import (
     get_profiler,
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 try:
-    from fastapi import FastAPI, Request
+    from fastapi import FastAPI
     from fastapi.responses import JSONResponse, Response, StreamingResponse
     from pydantic import BaseModel, Field, model_serializer
 except ImportError as e:
@@ -186,6 +186,8 @@ class ServingServer:
         async_engine: AsyncLLMEngine,
         model_id: str,
         generate_config: GenerateConfig,
+        *,
+        route_factory=None,
     ) -> None:
         self.engine = async_engine
         self.model_id = model_id
@@ -195,7 +197,10 @@ class ServingServer:
         self.app = FastAPI(title="PyPTO Serving")
         self._profile_lock = asyncio.Lock()
         self._register_exception_handlers()
-        self._register_routes()
+        if route_factory is None:
+            self._register_routes()
+        else:
+            route_factory(self)
 
     def _register_exception_handlers(self) -> None:
         # Surface scheduler/engine rejections (e.g. a prompt longer than
@@ -207,37 +212,8 @@ class ServingServer:
                 content={"object": "error", "message": str(exc)},
             )
 
-        from pypto_serving.serving.pd.admission import (  # noqa: PLC0415
-            PDBackpressureError,
-        )
-
-        @self.app.exception_handler(PDBackpressureError)
-        async def _pd_backpressure_handler(  # noqa: ANN001
-            request,
-            exc: PDBackpressureError,
-        ) -> JSONResponse:
-            return JSONResponse(
-                status_code=503,
-                headers={"Retry-After": "1"},
-                content={"object": "error", "message": str(exc)},
-            )
-
-        @self.app.exception_handler(PermissionError)
-        async def _permission_error_handler(  # noqa: ANN001
-            request,
-            exc: PermissionError,
-        ) -> JSONResponse:
-            return JSONResponse(
-                status_code=401,
-                content={"object": "error", "message": str(exc)},
-            )
-
     def _register_routes(self) -> None:
         self.app.add_api_route("/health", self._health, methods=["GET"])
-        pd_config = getattr(getattr(self.engine, "config", None), "pd_config", None)
-        if pd_config is not None and getattr(pd_config, "enabled", False):
-            self._register_internal_pd_routes()
-            return
         self.app.add_api_route("/v1/models", self._list_models, methods=["GET"])
         self.app.add_api_route("/v1/completions", self._completions, methods=["POST"], response_model=None)
         self.app.add_api_route("/v1/chat/completions", self._chat_completions, methods=["POST"], response_model=None)
@@ -245,248 +221,11 @@ class ServingServer:
             self.app.add_api_route("/metrics", self._metrics, methods=["GET"])
             self.app.add_api_route("/metrics/json", self._metrics_json, methods=["GET"])
         if get_profiler(initially_active=False).enabled:
-            self.app.add_api_route("/start_profile", self._start_profile, methods=["POST"])
-            self.app.add_api_route("/stop_profile", self._stop_profile, methods=["POST"])
-
-    def _register_internal_pd_routes(self) -> None:
-        self.app.add_api_route(
-            "/internal/pd/descriptor",
-            self._pd_descriptor,
-            methods=["GET"],
-        )
-        self.app.add_api_route(
-            "/internal/pd/capacity",
-            self._pd_capacity,
-            methods=["GET"],
-        )
-        self.app.add_api_route(
-            "/internal/pd/metrics",
-            self._pd_metrics,
-            methods=["GET"],
-        )
-        self.app.add_api_route(
-            "/internal/pd/prepare",
-            self._pd_prepare,
-            methods=["POST"],
-        )
-        self.app.add_api_route(
-            "/internal/pd/reserve",
-            self._pd_reserve,
-            methods=["POST"],
-        )
-        self.app.add_api_route(
-            "/internal/pd/authorize",
-            self._pd_authorize,
-            methods=["POST"],
-        )
-        self.app.add_api_route(
-            "/internal/pd/execute",
-            self._pd_execute,
-            methods=["POST"],
-        )
-        self.app.add_api_route(
-            "/internal/pd/await-decode",
-            self._pd_await_decode,
-            methods=["POST"],
-        )
-        self.app.add_api_route(
-            "/internal/pd/query",
-            self._pd_query,
-            methods=["POST"],
-        )
-        self.app.add_api_route(
-            "/internal/pd/abort",
-            self._pd_abort,
-            methods=["POST"],
-        )
-        if get_profiler().enabled:
-            self.app.add_api_route(
-                "/internal/pd/start-profile",
-                self._pd_start_profile,
-                methods=["POST"],
-            )
-            self.app.add_api_route(
-                "/internal/pd/stop-profile",
-                self._pd_stop_profile,
-                methods=["POST"],
-            )
-
-    async def _pd_descriptor(self, request: Request) -> Response:
-        from pypto_serving.serving.pd.http_api import encode_json  # noqa: PLC0415
-
-        return Response(
-            encode_json(self.engine.pd_service.descriptor()),
-            media_type="application/json",
-        )
-
-    async def _pd_capacity(self, request: Request) -> Response:
-        from pypto_serving.serving.pd.http_api import encode_json  # noqa: PLC0415
-
-        return Response(
-            encode_json(self.engine.pd_service.capacity_snapshot()),
-            media_type="application/json",
-        )
-
-    async def _pd_metrics(self, request: Request) -> JSONResponse:
-        return JSONResponse(await self.engine.pd_service.metrics_snapshot())
-
-    async def _pd_start_profile(self, request: Request) -> Response:
-        return await self._start_profile()
-
-    async def _pd_stop_profile(self, request: Request) -> Response:
-        return await self._stop_profile()
-
-    async def _pd_prepare(self, request: Request) -> Response:
-        from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415
-            PrepareRequestHTTP,
-            decode_json,
-            encode_json,
-        )
-
-        payload = decode_json(await request.body(), PrepareRequestHTTP)
-        output_parser_spec = None
-        if payload.request_kind == "completion":
-            public = CompletionRequest.model_validate_json(payload.request_json)
-            prompt, prompt_token_ids = self._completion_prompt(public.prompt)
-            if prompt_token_ids is None:
-                prompt_token_ids = tuple(
-                    int(token) for token in self.engine._tokenize_prompt(prompt)
-                )
-            config = dataclasses.replace(
-                self._resolve_generate_config(public),
-                ignore_eos=True,
-            )
-        elif payload.request_kind == "chat":
-            public = ChatCompletionRequest.model_validate_json(payload.request_json)
-            prompt = self._apply_chat_template(
-                public.messages,
-                public.chat_template_kwargs,
-                reasoning_effort=public.reasoning_effort,
-            )
-            prompt_token_ids = tuple(
-                int(token) for token in self.engine._tokenize_prompt(prompt)
-            )
-            config = dataclasses.replace(
-                self._resolve_generate_config(public),
-                ignore_eos=self.generate_config.ignore_eos,
-            )
-            output_parser_spec = self._output_parser_spec(public)
-        else:
-            raise ValueError("unsupported PD public request kind")
-        prepared = self.engine.pd_service.prepare_request(
-            payload.request_id,
-            prompt,
-            config,
-            prompt_token_ids,
-            output_parser_spec=output_parser_spec,
-        )
-        return Response(encode_json(prepared), media_type="application/json")
-
-    async def _pd_reserve(self, request: Request) -> Response:
-        from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415
-            PlacementRejection,
-            ReservePlacementResult,
-            ReservePlacementHTTP,
-            decode_json,
-            encode_json,
-        )
-
-        payload = decode_json(await request.body(), ReservePlacementHTTP)
-        outcome = self.engine.pd_service.reserve_placement(payload)
-        result = ReservePlacementResult(
-            rejection=outcome if isinstance(outcome, PlacementRejection) else None,
-            reservation=None if isinstance(outcome, PlacementRejection) else outcome,
-        )
-        return Response(encode_json(result), media_type="application/json")
-
-    async def _pd_authorize(self, request: Request) -> Response:
-        from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415
-            AuthorizeRouteHTTP,
-            decode_json,
-            encode_json,
-        )
-
-        payload = decode_json(await request.body(), AuthorizeRouteHTTP)
-        self.engine.pd_service.authorize_route(payload)
-        return Response(encode_json({"status": "AUTHORIZED"}), media_type="application/json")
-
-    async def _pd_execute(self, request: Request) -> Response:
-        from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415
-            ExecutePrefillHTTP,
-            decode_json,
-            encode_json,
-        )
-
-        payload = decode_json(await request.body(), ExecutePrefillHTTP)
-        result = await self.engine.pd_service.execute_prefill(payload)
-        return Response(encode_json(result), media_type="application/json")
-
-    async def _pd_await_decode(self, request: Request) -> StreamingResponse:
-        from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415
-            HandoffHTTP,
-            decode_json,
-            encode_json,
-        )
-
-        payload = decode_json(await request.body(), HandoffHTTP)
-        stream = self.engine.pd_service.open_decode_stream(payload.key)
-
-        async def ndjson():
-            async for frame in stream:
-                yield encode_json(frame) + b"\n"
-
-        return StreamingResponse(ndjson(), media_type="application/x-ndjson")
-
-    async def _pd_query(self, request: Request) -> Response:
-        from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415
-            HandoffHTTP,
-            decode_json,
-            encode_json,
-        )
-
-        payload = decode_json(await request.body(), HandoffHTTP)
-        return Response(
-            encode_json(self.engine.pd_service.query_handoff(payload.key)),
-            media_type="application/json",
-        )
-
-    async def _pd_abort(self, request: Request) -> Response:
-        from pypto_serving.serving.pd.http_api import (  # noqa: PLC0415
-            AbortHandoffHTTP,
-            decode_json,
-            encode_json,
-        )
-
-        payload = decode_json(await request.body(), AbortHandoffHTTP)
-        status = await self.engine.pd_service.abort_handoff(
-            payload.key,
-            payload.reason,
-            deterministic=payload.deterministic,
-        )
-        return Response(encode_json(status), media_type="application/json")
+            self.app.add_api_route("/start_profile", self.start_profile, methods=["POST"])
+            self.app.add_api_route("/stop_profile", self.stop_profile, methods=["POST"])
 
     async def _health(self) -> JSONResponse:
-        if getattr(self.engine, "pd_health_error", ""):
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "status": "error",
-                    "reason": "PD_RECOVERY_REQUIRED",
-                },
-            )
-        content = {"status": "ok"}
-        pd_config = getattr(getattr(self.engine, "config", None), "pd_config", None)
-        if pd_config is not None and getattr(pd_config, "enabled", False):
-            content.update(
-                {
-                    "run_id": pd_config.run_id,
-                    "node_id": pd_config.node_id,
-                    "role": pd_config.role.value,
-                    "generation": pd_config.generation,
-                    "control_incarnation": pd_config.control_incarnation,
-                }
-            )
-        return JSONResponse(content)
+        return JSONResponse({"status": "ok"})
 
     async def _list_models(self) -> JSONResponse:
         return JSONResponse({
@@ -503,7 +242,7 @@ class ServingServer:
     async def _metrics_json(self) -> JSONResponse:
         return JSONResponse(self.engine.metrics.snapshot())
 
-    async def _start_profile(self) -> Response:
+    async def start_profile(self) -> Response:
         async with self._profile_lock:
             logger.info("Starting SA profiler...")
             main_started = start_sa_profile()
@@ -516,7 +255,7 @@ class ServingServer:
             logger.info("SA profiler started")
         return Response(status_code=200)
 
-    async def _stop_profile(self) -> Response:
+    async def stop_profile(self) -> Response:
         async with self._profile_lock:
             logger.info("Stopping SA profiler...")
             stop_error = None
@@ -569,10 +308,37 @@ class ServingServer:
             stream=request.stream if "stream" in provided else defaults.stream,
         )
 
+    def prepare_completion(self, request: CompletionRequest):
+        """Prepare public completion semantics without starting generation."""
+        prompt, tokens = self._completion_prompt(request.prompt)
+        config = dataclasses.replace(self._resolve_generate_config(request), ignore_eos=True)
+        return prompt, tokens, config, None
+
+    def prepare_chat(self, request: ChatCompletionRequest):
+        """Share chat templating, defaults and parser selection across entry points."""
+        prompt = self._apply_chat_template(
+            request.messages,
+            request.chat_template_kwargs,
+            reasoning_effort=request.reasoning_effort,
+            tools=request.tools,
+        )
+        # The OpenAI chat schema has no ignore_eos field, so the server-wide
+        # config decides it (the completions endpoint keeps its historic
+        # always-ignore-EOS override).
+        config = dataclasses.replace(
+            self._resolve_generate_config(request),
+            ignore_eos=self.generate_config.ignore_eos,
+        )
+        output_parser_spec = self._output_parser_spec(request)
+
+        return prompt, None, config, output_parser_spec
+
+    def resolve_prompt_tokens(self, prompt, tokens):
+        return self.engine.resolve_prompt_tokens(prompt, tokens)
+
     async def _completions(self, request: CompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"cmpl-{uuid.uuid4().hex[:8]}"
-        config = dataclasses.replace(self._resolve_generate_config(request), ignore_eos=True)
-        prompt, prompt_token_ids = self._completion_prompt(request.prompt)
+        prompt, prompt_token_ids, config, _ = self.prepare_completion(request)
 
         with profile_span(
             "http.completions",
@@ -628,20 +394,7 @@ class ServingServer:
 
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-        output_parser_spec = self._output_parser_spec(request)
-        prompt = self._apply_chat_template(
-            request.messages,
-            request.chat_template_kwargs,
-            reasoning_effort=request.reasoning_effort,
-            tools=request.tools,
-        )
-        # The OpenAI chat schema has no ignore_eos field, so the server-wide
-        # config decides it (the completions endpoint keeps its historic
-        # always-ignore-EOS override).
-        config = dataclasses.replace(
-            self._resolve_generate_config(request),
-            ignore_eos=self.generate_config.ignore_eos,
-        )
+        prompt, _, config, output_parser_spec = self.prepare_chat(request)
 
         with profile_span(
             "http.chat_completions",
@@ -1002,6 +755,8 @@ def create_serving_app(
     async_engine: AsyncLLMEngine,
     model_id: str,
     generate_config: GenerateConfig,
+    *,
+    route_factory=None,
 ) -> FastAPI:
-    server = ServingServer(async_engine, model_id, generate_config)
+    server = ServingServer(async_engine, model_id, generate_config, route_factory=route_factory)
     return server.app

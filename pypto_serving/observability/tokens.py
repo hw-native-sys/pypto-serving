@@ -6,11 +6,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Serving-owned registration point for built-in LLM PD adapters."""
-
-from pypto_serving.model.deepseek_dspark.pd_adapter import BUILTIN_PD_ADAPTERS
-from pypto_serving.serving.pd.adapter import ModelPDAdapterRegistry
 
 
-def builtin_pd_adapter_registry() -> ModelPDAdapterRegistry:
-    return ModelPDAdapterRegistry(BUILTIN_PD_ADAPTERS)
+import hashlib
+
+
+def token_ids_sha256(token_ids: tuple[int, ...]) -> str:
+    """Return the canonical address-free digest used by all serving planes."""
+    if not token_ids:
+        return ""
+    material = b"".join(
+        int(token).to_bytes(8, "big", signed=True) for token in token_ids
+    )
+    return hashlib.sha256(material).hexdigest()

@@ -30,7 +30,7 @@ class MooncakeTransferProvider:
         self._pid = os.getpid()
         self._poisoned = False
         self._regions: dict[str, tuple[RegionLease, int]] = {}
-        self._destinations: dict[str, dict] = {}
+        self._destinations: dict[tuple[str, str, int, str], dict] = {}
         self._last_leases: dict[str, int] = {}
         if engine_factory is None:
             engine_factory = importlib.import_module("mooncake.engine").TransferEngine
@@ -79,7 +79,7 @@ class MooncakeTransferProvider:
             raise ValueError("invalid private destination address")
         if not isinstance(envelope.get("endpoint"), str) or not envelope["endpoint"]:
             raise ValueError("invalid private destination endpoint")
-        previous = self._destinations.get(lease.region_id)
+        previous = self._destinations.get(lease.registration_key)
         if previous is not None:
             old = previous["lease"]
             if (lease.owner.generation < old["owner"]["generation"]
@@ -87,7 +87,7 @@ class MooncakeTransferProvider:
                     or (lease.owner.generation == old["owner"]["generation"] and lease.lease < old["lease"])
                     or (old == asdict(lease) and previous != envelope)):
                 raise ValueError("stale or inconsistent destination registration")
-        self._destinations[lease.region_id] = dict(envelope)
+        self._destinations[lease.registration_key] = dict(envelope)
 
     def write(self, task: ProviderTransferTask, on_submitted: Callable[[], None] = lambda: None) -> None:
         self._check()
@@ -95,7 +95,7 @@ class MooncakeTransferProvider:
         local, remote, lengths, endpoints = [], [], [], set()
         for segment in task.segments:
             lease, address = self._regions[segment.source.region_id]
-            envelope = self._destinations[segment.destination.region_id]
+            envelope = self._destinations[segment.destination.registration_key]
             if lease != segment.source or envelope["lease"] != asdict(segment.destination):
                 raise ValueError("stale region lease")
             local.append(address + segment.source_offset)

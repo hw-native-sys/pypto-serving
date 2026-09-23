@@ -78,6 +78,11 @@ class RegionLease:
         integer(self.lease, "lease")
         integer(self.extent, "extent", 1)
 
+    @property
+    def registration_key(self) -> tuple[str, str, int, str]:
+        """Stable registration namespace; the value must still match the full lease."""
+        return self.owner.run_id, self.owner.worker_id, self.owner.rank_id, self.region_id
+
 
 @dataclass(frozen=True)
 class TransferAttemptRef:
@@ -100,8 +105,8 @@ class TransferAttemptRef:
             integer(getattr(self, name), name)
         if not isinstance(self.source, OwnerRef) or not isinstance(self.destination, OwnerRef):
             raise TypeError("attempt endpoints must be OwnerRef")
-        if self.source.run_id != self.destination.run_id or self.source.rank_id != self.destination.rank_id:
-            raise ValueError("only same-run, same-rank transfers are supported")
+        if self.source.run_id != self.destination.run_id:
+            raise ValueError("only same-run transfers are supported")
 
 
 @dataclass(frozen=True)

@@ -24,6 +24,7 @@ from .protocol import (
     TransferResult,
     chunk_payload_hash,
     continuation_metadata_hash,
+    validate_rank_mapping,
 )
 
 
@@ -84,14 +85,16 @@ class CompletionTracker:
             raise ValueError("chunk token interval must be nonempty and increasing")
         if not manifest.manifest_hash:
             raise ValueError("chunk manifest hash must not be empty")
+        validate_rank_mapping(manifest.rank_mapping)
         if manifest.manifest_hash != chunk_payload_hash(
             manifest.key,
             chunk_id=manifest.chunk_id,
             start_token=manifest.start_token,
             end_token=manifest.end_token,
             final=manifest.final,
+            rank_mapping=manifest.rank_mapping,
             expected_units=manifest.expected_units,
-            copies_by_rank=manifest.copies_by_rank,
+            copies_by_destination_rank=manifest.copies_by_destination_rank,
             source_prefix_hit_tokens=manifest.source_prefix_hit_tokens,
         ):
             raise ValueError("chunk manifest hash does not match its physical write set")
@@ -123,6 +126,8 @@ class CompletionTracker:
             raise ValueError("chunk token intervals must be contiguous")
         if self._chunks:
             first_manifest = self._chunks[min(self._chunks)].manifest
+            if manifest.rank_mapping != first_manifest.rank_mapping:
+                raise ValueError("rank mapping must remain stable across chunks")
             if (
                 manifest.source_prefix_hit_tokens
                 != first_manifest.source_prefix_hit_tokens
@@ -131,19 +136,21 @@ class CompletionTracker:
 
         units: dict[tuple[int, str], _UnitState] = {}
         for unit in manifest.expected_units:
-            if type(unit.rank_id) is not int or unit.rank_id < 0:
+            if type(unit.destination_rank_id) is not int or unit.destination_rank_id < 0:
                 raise ValueError("completion rank_id must be a non-negative integer")
             if not unit.component_id or len(unit.component_id.encode()) > 256:
                 raise ValueError("completion component_id must be a bounded identifier")
             if type(unit.nbytes) is not int or unit.nbytes < 0:
                 raise ValueError("completion unit nbytes must be non-negative")
-            identity = (unit.rank_id, unit.component_id)
+            identity = (unit.destination_rank_id, unit.component_id)
             if identity in units:
                 raise ValueError("chunk manifest contains a duplicate completion unit")
             units[identity] = _UnitState()
         if not units:
             raise ValueError("chunk manifest must enumerate its expected completion units")
-        ranks = set(manifest.copies_by_rank)
+        ranks = set(manifest.copies_by_destination_rank)
+        if ranks != {pair.destination_rank_id for pair in manifest.rank_mapping}:
+            raise ValueError("chunk copies differ from mapped destination ranks")
         if not ranks.issubset({rank for rank, _ in units}):
             raise ValueError("chunk copies contain a rank absent from expected completion units")
 
@@ -184,9 +191,15 @@ class CompletionTracker:
         except KeyError as exc:
             raise ValueError("transfer result references an unknown chunk") from exc
         try:
-            unit = chunk.units[(result.rank_id, result.component_id)]
+            unit = chunk.units[(result.destination_rank_id, result.component_id)]
         except KeyError as exc:
             raise ValueError("transfer result is absent from the expected completion set") from exc
+        if not any(
+            pair.source_rank_id == result.source_rank_id
+            and pair.destination_rank_id == result.destination_rank_id
+            for pair in chunk.manifest.rank_mapping
+        ):
+            raise ValueError("transfer result source/destination differs from rank mapping")
         if not result.attempt_id:
             raise ValueError("transfer attempt_id must not be empty")
         certainty = CompletionCertainty(result.certainty)

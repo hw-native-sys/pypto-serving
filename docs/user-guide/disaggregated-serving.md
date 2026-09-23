@@ -52,7 +52,7 @@ Optional runtime settings include:
 | `policy` | `round_robin` | Select compatible P/D nodes. |
 | `prefix_cache_mode` | `disabled` | Use `d_only` for Decode reuse or `independent` for separate P/D reuse. |
 | `run_id` | Derived from the endpoints | Share an explicit deployment identity when needed. |
-| `enable_chunk_overlap` | `false` | Allow closed-page transfer to overlap later Prefill work. |
+| `enable_chunk_overlap` | `true` | Overlap closed-page transfer with later Prefill work. |
 
 An endpoint can also specify `node_id`, `control_host`, `control_port` and
 `transfer_hostname`. The default control port is 29831. When the device RoCE
@@ -64,6 +64,10 @@ unique `node_id`, and pass `--pd-node-id` to its model process. The Router
 checks their runtime contracts and selects a compatible pair using the
 configured policy. Each model/service deployment uses its own Router and
 configuration.
+
+The current data plane retains one peer registration per model process.
+The routing interfaces support multiple candidates, but concurrent multi-peer
+handoffs require a peer-indexed session/registry pool and are not yet validated.
 
 ## Start the Three Processes
 
@@ -151,6 +155,39 @@ network suffix. Reservations retain a read-only shared prefix and separately
 own writable suffix/state pages. Even a full KV hit must transfer the final
 request-local compressed-attention state before Decode can start.
 
+P and D also choose cache partitions independently. The model adapter maps
+the actual source partition to D's reserved partition once per handoff. For
+the validated TP=4 layout, P ranks 4–7 can send to D ranks 8–11, pairing equal
+TP slots. Source and destination block tables, owners and leases remain
+separate; the immutable mapping is included in the manifest hash and checked
+again when completion is recorded. No Router round trip or user-supplied rank
+map is required. A partition change during a handoff is rejected.
+
+All chunks use asynchronous worker submission and Host completion polling.
+Mooncake's native call is synchronous inside an owner-local progress thread;
+it does not wait in the model worker's command loop. The overlap setting only
+controls whether the next Prefill chunk may compute before the current transfer
+finishes. Overlap is enabled by default: one chunk transfer per request may overlap the next
+compute step. Only closed pages are sent early, source snapshots stay pinned,
+and rolling pages detach before reuse. Final request-local state is transferred
+after the final Prefill step. Decode starts only after all required writes and
+commit complete; its normal asynchronous scheduling pipeline is unchanged.
+
+Set `runtime.enable_chunk_overlap` to `false` to serialize each request's
+Prefill chunks with its transfers, for example when comparing traces. Worker
+submission and completion polling remain asynchronous in either mode; this
+switch does not select a blocking native call in the model execution lane.
+Multi-chunk K7 regressions verified matching output token digests with overlap
+enabled and disabled; the enabled run also exercised cross-partition handoffs.
+Host traces confirmed overlapping
+native transfer calls and later Prefill dispatch intervals. These are runtime
+timeline measurements, not a hardware-stream utilization or bandwidth guarantee.
+
+The D-local drafter lease is reserved on the Host. Clearing a reused lease
+and publishing its initial device state happen once on the device execution
+lane, after older run handles settle. This initial-admission boundary is not
+a per-token synchronization or a reason to disable asynchronous Decode.
+
 Deterministic failures release allocations only when no writer can access
 them. An uncertain transfer quarantines writable allocations and closes the
 affected admission path. Healthy shared prefix pages remain separate from
@@ -168,20 +205,40 @@ does not establish that the old memory is safe to reuse.
 pypto_serving/
 ├── router/                   # Public API, node directory, routing and recovery
 ├── serving/pd/               # Configuration, handoff protocol and lifecycle
+│   ├── integration.py        # Optional application/worker composition
 │   ├── adapter.py            # Model adapter interface and registry
 │   ├── contracts.py          # Model and runtime layout contracts
 │   ├── service.py            # Prefill/Decode control flow
+│   ├── worker.py             # Owner registration, transfer jobs and cleanup
+│   ├── http_api.py           # Node control contracts and route installation
 │   ├── handoff.py            # Node-local handoff records
 │   ├── connector.py          # Decode reservation and commit
 │   ├── planner.py            # Chunk/suffix transfer plans
 │   └── observability.py      # Startup logs and metrics
 ├── transfer/                 # Backend contract, Mooncake and owner-local memory
+├── serving/memory/
+│   └── reservation.py        # Allocator-owned external-fill cache leases
 └── model/deepseek_dspark/
     └── pd_adapter.py         # Eight-region layout and K7 continuation semantics
 ```
 
+Ordinary serving does not import or instantiate PD components. The CLI loads
+the optional composition root only when a P/D role is selected. That root
+binds public request preparation, scheduling and worker capabilities; it
+does not replace the normal engine loop. Both local and remotely prefilled
+requests use the same output, parser, stop and cancellation paths.
+
+The worker's generic ordered control envelope carries opaque bytes. PD
+operation decoding and transfer state live in `serving/pd/worker.py`; the
+model adapter supplies resident-cache geometry and Decode-local state
+initialization through explicit callbacks. The regular runner owns model
+computation and device allocations. Cache reservations use the existing
+allocator and are created only when requested; protocol manifests never
+enter the allocator.
+
 For another model, implement and register a model adapter with its cache
-components, legal transfer boundaries and Decode continuation. Keep physical
+components, legal transfer boundaries, worker factory and Decode continuation.
+Register it through the lazy model adapter factory in `model/__init__.py`. Keep physical
 cache matching and publication in `KvCacheManager`. For another transfer
 backend, implement the provider completion contract and owner-local
 registration, then connect it to provider selection. Placement policies

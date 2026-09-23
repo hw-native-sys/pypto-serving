@@ -121,7 +121,7 @@ def test_delayed_old_completion_cannot_complete_new_attempt():
     source, destination = OwnerRef("run", 0, 2, 2, "P"), OwnerRef("run", 0, 2, 2, "D")
     bridge = OwnerBridge(source, "host")
     src, dst = RegionLease(source, "s", 2, 64), RegionLease(destination, "d", 2, 64)
-    bridge._sources["s"], bridge._destinations["d"] = src, dst
+    bridge._sources["s"], bridge._destinations[dst.registration_key] = src, dst
     task = ProviderTransferTask(TransferAttemptRef("r", "p", "h", "a", 2, 2, 0, source, destination, "m"),
                                (Segment("ori", src, dst, 0, 0, 64),))
     requested, deliver = threading.Event(), threading.Event()

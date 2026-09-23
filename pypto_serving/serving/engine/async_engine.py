@@ -38,18 +38,18 @@ from pypto_serving.serving.sched.scheduler import (
     SchedulerConfig,
     SchedulerOutput,
 )
-from pypto_serving.serving.pd.worker_api import MAX_WORKER_PD_PAYLOAD_BYTES
 from pypto_serving.serving.server.ipc import (
     PLACEHOLDER_TOKEN,
     DecodeRequest,
     NewRequestData,
-    PDWorkerCommand,
+    ControlCommand,
+    MAX_CONTROL_PAYLOAD_BYTES,
     PrefillRequest,
     ProfileCommand,
     ShutdownCommand,
     StepCommand,
     decode_profile_result,
-    decode_pd_result,
+    decode_control_result,
     decode_result,
     encode_command,
 )
@@ -98,45 +98,12 @@ class EngineConfig:
     # are supported: the scheduler optimistically reserves the upper bound of
     # tokens per step and subtracts the shortfall once the worker replies.
     async_scheduling: bool | None = None
-    # External-router PD configuration. None preserves normal serving.
-    pd_config: object | None = None
 
     def resolve_async_scheduling(self) -> bool:
         """Resolve the async-scheduling flag (default on for all executors)."""
         if self.async_scheduling is not None:
             return self.async_scheduling
         return True
-
-    def validate_pd(self) -> None:
-        """Reject configurations that violate the selected model contract."""
-        config = self.pd_config
-        if config is None or not getattr(config, "enabled", False):
-            return
-        contract = config.model_contract
-        if self.executor_cls != contract.executor_cls:
-            raise ValueError("PD executor differs from the selected model contract")
-        if self.enable_prefix_cache != config.prefix_cache_enabled:
-            raise ValueError(
-                "PD prefix-cache flag differs from the configured role/profile"
-            )
-        expected_async_scheduling = contract.async_scheduling_for_role(
-            config.role.value
-        )
-        if self.resolve_async_scheduling() != expected_async_scheduling:
-            raise ValueError("PD scheduling mode differs from the selected model contract")
-        runtime = self.runtime_config or RuntimeConfig()
-        expected_local_tokens = contract.local_speculative_tokens(config.role.value)
-        if runtime.num_speculative_tokens != expected_local_tokens:
-            raise ValueError(
-                f"PD {config.role.value} requires local num_speculative_tokens="
-                f"{expected_local_tokens} under {contract.adapter_id}"
-            )
-        executor_tokens = self.executor_kwargs.get("num_speculative_tokens", 0)
-        if executor_tokens != expected_local_tokens:
-            raise ValueError(
-                f"PD {config.role.value} executor requires num_speculative_tokens="
-                f"{expected_local_tokens} under {contract.adapter_id}"
-            )
 
     def resolve_runtime_config(self) -> RuntimeConfig:
         """Return runtime settings with executor requirements resolved."""
@@ -219,20 +186,6 @@ class TokenOutput:
     tool_calls: tuple[ParsedToolCall, ...] = ()
 
 
-@dataclass(frozen=True)
-class PrefillChunkReady:
-    """Confirmed P chunk plus its exact scheduler block-table snapshot."""
-
-    request_id: str
-    chunk_id: int
-    start_token: int
-    end_token: int
-    final: bool
-    first_token: int | None
-    block_ids_by_group: dict[str, tuple[int, ...]]
-    cache_partition: int
-
-
 class ReplicaEngineCore:
     """Engine core for one serving replica.
 
@@ -245,9 +198,12 @@ class ReplicaEngineCore:
     def __init__(
         self,
         config: EngineConfig,
-        tokenizer
+        tokenizer,
+        *,
+        scheduler_factory=Scheduler,
+        worker_factory=spawn_worker,
     ) -> None:
-        config.validate_pd()
+        self._worker_factory = worker_factory
         runtime = config.resolve_runtime_config()
         self.config = replace(config, runtime_config=runtime)
         self.tokenizer = tokenizer
@@ -280,14 +236,10 @@ class ReplicaEngineCore:
                 runtime.requires_homogeneous_prefill_decode
             ),
             async_scheduling=self._async_scheduling,
-            prefill_handoff=(
-                getattr(getattr(self.config.pd_config, "role", None), "value", None)
-                == "prefill"
-            ),
         )
         # Validate before worker startup, while the manager's pools are still lazy.
         scheduler_config.validate_cache_groups(runtime.kv_cache_groups)
-        self.scheduler = Scheduler(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)
+        self.scheduler = scheduler_factory(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)
 
         self._request_contexts: dict[str, _RequestContext] = {}
         self._running = False
@@ -300,11 +252,8 @@ class ReplicaEngineCore:
         self._output_queue = None
         self._profile_output_queue = None
         self._profile_lock = asyncio.Lock()
-        self._pd_command_counter = 0
-        # Chunk readiness is request-scoped. A single global queue lets one
-        # concurrent handoff consume another request's cache snapshot.
-        self._pd_prefill_chunks: dict[str, asyncio.Queue[PrefillChunkReady]] = {}
-        self._pd_chunk_counters: dict[str, int] = {}
+        self._control_counter = 0
+        self._result_handler = self._process_step_output
         # Tracks which request_ids the worker has already received via
         # NewRequestData — prompt tokens are sent exactly once per request.
         self._worker_known_req_ids: set[str] = set()
@@ -317,12 +266,9 @@ class ReplicaEngineCore:
         # is the acknowledgement that the FIFO worker applied the release
         # before executing that step.
         self._worker_free_ids_by_step: dict[int, tuple[str, ...]] = {}
-        # The first Decode step of a remotely adopted request publishes
-        # Decode-local recurrent state from P's sampled token.  It is a
-        # one-time barrier: do not optimistically schedule the next step until
-        # that bootstrap result has been applied.  Steady-state Decode resumes
-        # the normal depth-two pipeline immediately afterwards.
-        self._pd_bootstrap_step_ids: set[int] = set()
+        # Requests admitted with an existing cache may need one step to seed
+        # model-local recurrent state. Apply that result before pipelining.
+        self._initialization_steps: set[int] = set()
         self._max_in_flight = 2 if self._async_scheduling else 1
         self._step_counter = 0
         # step_ids of dispatched steps whose worker StepResult has NOT yet been
@@ -374,7 +320,7 @@ class ReplicaEngineCore:
                 profile_output_q,
                 ready_event,
                 num_pages_value,
-            ) = spawn_worker(self.config)
+            ) = self._worker_factory(self.config)
             self._worker_process = process
             self._input_queue = input_q
             self._output_queue = output_q
@@ -473,30 +419,28 @@ class ReplicaEngineCore:
                     f"received active={result.active}"
                 )
 
-    async def call_pd_worker(self, operation: str, payload: bytes = b"") -> bytes:
+    async def call_worker(self, operation: str, payload: bytes = b"") -> bytes:
         """Run an ordered owner/cache operation in the spawned worker process."""
         if not isinstance(operation, str) or not operation or len(operation) > 128:
-            raise ValueError("PD worker operation must be a nonempty bounded string")
+            raise ValueError("worker operation must be a nonempty bounded string")
         if (
             not isinstance(payload, bytes)
-            or len(payload) > MAX_WORKER_PD_PAYLOAD_BYTES
+            or len(payload) > MAX_CONTROL_PAYLOAD_BYTES
         ):
             raise ValueError(
-                "PD worker payload must be bytes no larger than "
-                f"{MAX_WORKER_PD_PAYLOAD_BYTES >> 20} MiB"
+                "worker payload must be bytes no larger than "
+                f"{MAX_CONTROL_PAYLOAD_BYTES >> 20} MiB"
             )
-        if self.config.pd_config is None or not getattr(self.config.pd_config, "enabled", False):
-            raise RuntimeError("PD worker control is disabled")
         async with self._profile_lock:
             input_queue = self._input_queue
             output_queue = self._profile_output_queue
             if input_queue is None or output_queue is None:
                 raise RuntimeError("Serving worker is not running")
-            self._pd_command_counter += 1
-            command_id = self._pd_command_counter
+            self._control_counter += 1
+            command_id = self._control_counter
             input_queue.put(
                 encode_command(
-                    PDWorkerCommand(
+                    ControlCommand(
                         command_id=command_id,
                         operation=operation,
                         payload=payload,
@@ -510,14 +454,27 @@ class ReplicaEngineCore:
                 )
             except queue.Empty as exc:
                 raise RuntimeError(
-                    f"Worker PD control timed out ({self._step_timeout:g}s)"
+                    f"Worker control timed out ({self._step_timeout:g}s)"
                 ) from exc
-            result = decode_pd_result(raw_result)
+            result = decode_control_result(raw_result)
             if result.command_id != command_id:
-                raise RuntimeError("Worker PD control response ordering mismatch")
+                raise RuntimeError("Worker control response ordering mismatch")
             if result.error:
                 raise RuntimeError(result.error)
             return result.payload
+
+    def configure_result_handler(self, factory):
+        """Bind a result consumer before execution; ordinary mode uses the native consumer."""
+        if self._running:
+            raise RuntimeError("result handling must be configured before engine startup")
+        self._result_handler = factory(self._process_step_output)
+
+    def finish_prefilled_request(self, request_id):
+        self.scheduler.finish_prefilled_request(request_id)
+        self._schedule_worker_free(request_id)
+        context = self._request_contexts.get(request_id)
+        if context is not None:
+            context.queue.put_nowait(TokenOutput(finished=True, finish_reason="FINISHED_PREFILL"))
 
     def generate_request_id(self) -> str:
         self._request_counter += 1
@@ -573,16 +530,10 @@ class ReplicaEngineCore:
                 output_parser=create_output_parser(output_parser_spec, self.tokenizer),
             )
             self._request_contexts[request_id] = ctx
-            if self.scheduler.config.prefill_handoff:
-                if request_id in self._pd_prefill_chunks:
-                    self._request_contexts.pop(request_id, None)
-                    raise ValueError(f"request {request_id!r} already has a PD chunk queue")
-                self._pd_prefill_chunks[request_id] = asyncio.Queue()
             try:
                 self.scheduler.add_request(request)
             except BaseException:
                 self._request_contexts.pop(request_id, None)
-                self._pd_prefill_chunks.pop(request_id, None)
                 raise
             stat_logger = getattr(self, "_stat_logger", None)
             if stat_logger is not None:
@@ -599,6 +550,14 @@ class ReplicaEngineCore:
                 args={"request_id": request_id, "prompt_tokens": len(prompt_token_ids)},
             )
 
+        async with contextlib.aclosing(self._iterate_request_output(ctx)) as outputs:
+            async for output in outputs:
+                yield output
+
+    async def _iterate_request_output(self, ctx):
+        request = ctx.request
+        request_id = request.request_id
+        prompt_token_ids = request.prompt_token_ids
         finished_normally = False
         try:
             while True:
@@ -619,8 +578,6 @@ class ReplicaEngineCore:
                         ) from exc
                     finished_normally = True
                     self._request_contexts.pop(request_id, None)
-                    self._pd_prefill_chunks.pop(request_id, None)
-                    self._pd_chunk_counters.pop(request_id, None)
                     e2e = time.time() - request.arrival_time
                     n_out = len(request.output_token_ids)
                     logger.info(
@@ -652,7 +609,6 @@ class ReplicaEngineCore:
                 # finished_request_ids, otherwise they leak in _req_cache /
                 # _worker_known_req_ids and pin device resources.
                 self._schedule_worker_free(request_id)
-                self._pd_prefill_chunks.pop(request_id, None)
 
     async def abort_request(self, request_id: str) -> None:
         ctx = self._request_contexts.pop(request_id, None)
@@ -660,8 +616,6 @@ class ReplicaEngineCore:
             # Already finished/cleaned up: nothing pinned to release, and the
             # scheduler no longer tracks it. Avoid scheduling a duplicate free.
             return
-        getattr(self, "_pd_prefill_chunks", {}).pop(request_id, None)
-        getattr(self, "_pd_chunk_counters", {}).pop(request_id, None)
         self.scheduler.abort_request(request_id)
         self._record_scheduler_stats()
         stat_logger = getattr(self, "_stat_logger", None)
@@ -677,36 +631,7 @@ class ReplicaEngineCore:
         # See note in add_request's finally block: schedule worker-side cleanup.
         self._schedule_worker_free(request_id)
 
-    async def next_prefill_chunk(self, request_id: str) -> PrefillChunkReady:
-        """Wait for one confirmed P chunk that is safe to hand to the connector."""
-        if not self.scheduler.config.prefill_handoff:
-            raise RuntimeError("this engine is not configured as the PD Prefill role")
-        try:
-            queue = self._pd_prefill_chunks[request_id]
-        except KeyError as exc:
-            raise ValueError("request has no PD Prefill chunk queue") from exc
-        chunk = await queue.get()
-        if chunk.request_id != request_id:
-            raise RuntimeError("PD Prefill chunk queue correlation mismatch")
-        return chunk
-
-    def complete_prefill_chunk_transfer(self, request_id: str) -> None:
-        """Allow the next P chunk after a deterministic non-final completion."""
-        self.scheduler.complete_prefill_chunk_transfer(request_id)
-
-    def acknowledge_prefill_handoff(self, request_id: str) -> None:
-        """Release P state only after D returned the matching READY fact."""
-        self.scheduler.complete_prefill_handoff(request_id)
-        self._schedule_worker_free(request_id)
-        self._pd_chunk_counters.pop(request_id, None)
-        self._pd_prefill_chunks.pop(request_id, None)
-        context = self._request_contexts.get(request_id)
-        if context is not None:
-            context.queue.put_nowait(
-                TokenOutput(finished=True, finish_reason="FINISHED_HANDOFF")
-            )
-
-    async def add_adopted_handoff(
+    async def add_prefilled_request(
         self,
         *,
         reservation_id: str,
@@ -723,8 +648,9 @@ class ReplicaEngineCore:
         stream: bool = True,
         output_parser_spec: OutputParserSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
-        """Enter D Decode from committed cache; never enqueue a Prefill request."""
-        request, first_output = self.scheduler.adopt_handoff(
+        """Continue from an initialized cache lease using normal output delivery."""
+        parser = create_output_parser(output_parser_spec, self.tokenizer)
+        request, first_output = self.scheduler.admit_prefilled(
             reservation_id=reservation_id,
             request_id=request_id,
             prompt_token_ids=list(prompt_token_ids),
@@ -740,53 +666,19 @@ class ReplicaEngineCore:
         ctx = _RequestContext(
             request=request,
             stream=stream,
-            output_parser=create_output_parser(output_parser_spec, self.tokenizer),
+            output_parser=parser,
         )
         if first_output.finished:
-            # No Decode worker state was created when P's first token already
+            # No Decode worker state was created when the initial token already
             # satisfies the request.
             ctx.worker_release_done.set()
         self._request_contexts[request_id] = ctx
-        text = self._detokenize_incrementally(ctx)
-        ctx.queue.put_nowait(
-            TokenOutput(
-                token_id=first_token,
-                text=text,
-                finished=first_output.finished,
-                finish_reason=first_output.finish_reason,
-                prompt_tokens=request.num_prompt_tokens,
-                completion_tokens=1,
-                token_ids=(first_token,) if first_output.finished else (),
-            )
-        )
-        finished_normally = False
-        try:
-            while True:
-                queued = await ctx.queue.get()
-                if isinstance(queued, BaseException):
-                    self._request_contexts.pop(request_id, None)
-                    raise queued
-                output: TokenOutput = queued
-                if output.finished:
-                    try:
-                        await asyncio.wait_for(
-                            ctx.worker_release_done.wait(),
-                            timeout=self._step_timeout,
-                        )
-                    except TimeoutError as exc:
-                        raise RuntimeError(
-                            f"worker request release timed out ({self._step_timeout:g}s)"
-                        ) from exc
-                    finished_normally = True
-                    self._request_contexts.pop(request_id, None)
-                    yield output
-                    break
+        self._publish_outputs([first_output], release_worker=False)
+        if first_output.finished:
+            ctx.worker_release_done.set()
+        async with contextlib.aclosing(self._iterate_request_output(ctx)) as outputs:
+            async for output in outputs:
                 yield output
-        finally:
-            if not finished_normally and request_id in self._request_contexts:
-                self._request_contexts.pop(request_id, None)
-                self.scheduler.abort_request(request_id)
-                self._schedule_worker_free(request_id)
 
     def _schedule_worker_free(self, request_id: str) -> None:
         """Queue a request id for worker-side release on the next StepCommand.
@@ -830,13 +722,13 @@ class ReplicaEngineCore:
             if self._batch_queue:
                 # Block on the oldest in-flight step when the queue is full, or
                 # when we could not dispatch anything new this iteration.  A
-                # PD-adopted request's first Decode is also an explicit state
-                # bootstrap barrier before steady-state pipelining begins.
+                # request's initialization step must also complete before
+                # steady-state pipelining begins.
                 oldest_step_id = self._batch_queue[0][0]
                 if (
                     len(self._batch_queue) >= self._max_in_flight
                     or not dispatched
-                    or oldest_step_id in self._pd_bootstrap_step_ids
+                    or oldest_step_id in self._initialization_steps
                 ):
                     applied = await self._await_and_apply_oldest()
                     if not applied:
@@ -874,8 +766,8 @@ class ReplicaEngineCore:
 
         finished_ids = self._pending_free_ids.copy()
         self._pending_free_ids.clear()
-        pd_bootstrap = any(
-            scheduled.request.pd_reservation_id
+        requires_initial_step = any(
+            scheduled.request.requires_initial_step
             and scheduled.request.request_id not in self._worker_known_req_ids
             for scheduled in scheduler_output.scheduled_requests
         )
@@ -914,10 +806,10 @@ class ReplicaEngineCore:
         self.scheduler.advance_after_schedule(scheduler_output)
 
         self._batch_queue.append((self._step_counter, scheduler_output))
-        if pd_bootstrap:
-            if not hasattr(self, "_pd_bootstrap_step_ids"):
-                self._pd_bootstrap_step_ids = set()
-            self._pd_bootstrap_step_ids.add(self._step_counter)
+        if requires_initial_step:
+            if not hasattr(self, "_initialization_steps"):
+                self._initialization_steps = set()
+            self._initialization_steps.add(self._step_counter)
         return True
 
     async def _await_and_apply_oldest(self) -> bool:
@@ -929,7 +821,7 @@ class ReplicaEngineCore:
         oldest dispatched step is the next result off the output queue.
         """
         step_id, scheduler_output = self._batch_queue.popleft()
-        getattr(self, "_pd_bootstrap_step_ids", set()).discard(step_id)
+        getattr(self, "_initialization_steps", set()).discard(step_id)
         finished_ids = getattr(self, "_worker_free_ids_by_step", {}).pop(
             step_id, ()
         )
@@ -971,7 +863,7 @@ class ReplicaEngineCore:
             cat="scheduler",
             args={"new_tokens": len(new_tokens)},
         ):
-            self._process_step_output(scheduler_output, new_tokens, step_result.num_draft_tokens)
+            self._result_handler(scheduler_output, new_tokens, step_result.num_draft_tokens)
         return True
 
     async def _get_live_result(self) -> bytes:
@@ -1038,7 +930,7 @@ class ReplicaEngineCore:
                     top_p=req.top_p,
                     top_k=req.top_k,
                     seed=req.seed,
-                    pd_adopted=bool(req.pd_reservation_id),
+                    initialize_from_cache=req.requires_initial_step,
                 ))
                 self._worker_known_req_ids.add(req_id)
 
@@ -1168,7 +1060,7 @@ class ReplicaEngineCore:
         # Their results are still in transit and must be drained.
         while self._batch_queue:
             sid, batch = self._batch_queue.popleft()
-            getattr(self, "_pd_bootstrap_step_ids", set()).discard(sid)
+            getattr(self, "_initialization_steps", set()).discard(sid)
             getattr(self, "_worker_free_ids_by_step", {}).pop(sid, None)
             self._discard_result_step_ids.add(sid)
             failed_batches.append(batch)
@@ -1238,52 +1130,13 @@ class ReplicaEngineCore:
             stat_logger.record_iteration(engine_index, iteration)
         self._record_scheduler_stats()
 
-        if getattr(getattr(self.scheduler, "config", None), "prefill_handoff", False):
-            for scheduled in scheduler_output.scheduled_requests:
-                if not scheduled.is_prefill:
-                    continue
-                if scheduled.cache_partition is None:
-                    raise RuntimeError("PD Prefill chunk has no cache partition")
-                request = scheduled.request
-                start = scheduled.num_computed_tokens
-                end = start + scheduled.num_new_tokens
-                final = end >= request.num_prompt_tokens
-                token_value = new_tokens.get(request.request_id)
-                if isinstance(token_value, list):
-                    first_token = int(token_value[0]) if token_value else None
-                elif token_value is None:
-                    first_token = None
-                else:
-                    first_token = int(token_value)
-                if final and first_token is None:
-                    raise RuntimeError("terminal PD Prefill did not return the first token")
-                chunk_id = self._pd_chunk_counters.get(request.request_id, 0)
-                self._pd_chunk_counters[request.request_id] = chunk_id + 1
-                self.scheduler.mark_prefill_chunk_transfer_pending(request.request_id)
-                try:
-                    chunk_queue = self._pd_prefill_chunks[request.request_id]
-                except KeyError as exc:
-                    raise RuntimeError("PD Prefill request lost its chunk queue") from exc
-                chunk_queue.put_nowait(
-                    PrefillChunkReady(
-                        request_id=request.request_id,
-                        chunk_id=chunk_id,
-                        start_token=start,
-                        end_token=end,
-                        final=final,
-                        first_token=first_token,
-                        block_ids_by_group={
-                            name: tuple(block_ids)
-                            for name, block_ids in scheduled.block_ids_by_group.items()
-                        },
-                        cache_partition=scheduled.cache_partition,
-                    )
-                )
+        self._publish_outputs(request_outputs)
 
+    def _publish_outputs(self, request_outputs, *, release_worker=True):
+        stat_logger = getattr(self, "_stat_logger", None)
+        engine_index = getattr(self, "_engine_index", 0)
         for req_output in request_outputs:
-            if req_output.handoff_ready:
-                # The first token is part of the final handoff metadata. It is
-                # published only by the D output path after READY commit.
+            if req_output.prefill_finished:
                 continue
             ctx = self._request_contexts.get(req_output.request_id)
             if ctx is None:
@@ -1322,7 +1175,8 @@ class ReplicaEngineCore:
                 # forever. A one-shot full decode at finish guarantees the final
                 # text matches the offline baseline instead of being truncated.
                 text = self._finalize_detokenization(ctx)
-                self._schedule_worker_free(req_output.request_id)
+                if release_worker:
+                    self._schedule_worker_free(req_output.request_id)
 
             # Stop detection above operates on the original generated text.
             # Semantic parsing only changes the public presentation channels.
@@ -1392,7 +1246,8 @@ class ReplicaEngineCore:
                     self._request_contexts.pop(req_output.request_id, None)
                     ctx.queue.put_nowait(exc)
                     self.scheduler.abort_request(req_output.request_id)
-                    self._schedule_worker_free(req_output.request_id)
+                    if release_worker:
+                        self._schedule_worker_free(req_output.request_id)
                     if stat_logger is not None:
                         stat_logger.finish_request(engine_index, req_output.request_id, "error")
                     self._record_scheduler_stats()
@@ -1621,7 +1476,6 @@ class AsyncLLMEngine:
             max_model_len=config.runtime_config.max_seq_len,
             num_speculative_tokens=config.runtime_config.num_speculative_tokens,
         )
-        self._pd_service = None
 
         for dp_rank, device_group in enumerate(parallel.replica_device_groups):
             replica_parallel = parallel.for_replica(device_group)
@@ -1653,24 +1507,8 @@ class AsyncLLMEngine:
             await asyncio.gather(*tasks, return_exceptions=True)
             await self.stop()
             raise
-        pd_config = self.config.pd_config
-        if pd_config is not None and getattr(pd_config, "enabled", False):
-            from pypto_serving.serving.pd.service import PDServingService
-
-            service = PDServingService(self, pd_config)
-            try:
-                await service.start()
-            except BaseException:
-                await service.close()
-                await self.stop()
-                raise
-            self._pd_service = service
-
     async def stop(self) -> None:
         """Stop all DP engine cores."""
-        if self._pd_service is not None:
-            await self._pd_service.close()
-            self._pd_service = None
         await asyncio.gather(*(core.stop() for core in reversed(self._cores)))
 
     async def start_profile(self) -> None:
@@ -1703,19 +1541,6 @@ class AsyncLLMEngine:
 
     def pending_token_load(self) -> int:
         return sum(core.pending_token_load() for core in self._cores)
-
-    @property
-    def pd_health_error(self) -> str:
-        if self._pd_service is None:
-            return ""
-        return self._pd_service.health_error
-
-    @property
-    def pd_service(self):
-        """Expose the role-local control plane to the protected internal API."""
-        if self._pd_service is None:
-            raise RuntimeError("PD serving control plane has not started")
-        return self._pd_service
 
     async def generate_result(
         self,
@@ -1774,11 +1599,11 @@ class AsyncLLMEngine:
 
     @property
     def scheduler(self) -> Scheduler:
-        return self._single_core().scheduler
+        return self.single_core().scheduler
 
     @property
     def kv_cache_manager(self) -> KvCacheManager:
-        return self._single_core().kv_cache_manager
+        return self.single_core().kv_cache_manager
 
     async def add_request(
         self,
@@ -1790,12 +1615,8 @@ class AsyncLLMEngine:
         output_parser_spec: OutputParserSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         arrival_monotonic = time.monotonic()
-        pd_config = self.config.pd_config
-        if pd_config is not None and getattr(pd_config, "enabled", False):
-            raise ValueError("send generation requests through the external PD Router")
-
         replica_idx = self._select_replica()
-        prompt_token_ids = self._resolve_prompt_tokens(prompt, prompt_token_ids)
+        prompt_token_ids = self.resolve_prompt_tokens(prompt, prompt_token_ids)
         self.metrics.start_request(
             replica_idx,
             request_id,
@@ -1887,7 +1708,7 @@ class AsyncLLMEngine:
         self._route_counter = (replica_idx + 1) % replica_count
         return replica_idx
 
-    def _single_core(self):
+    def single_core(self):
         if len(self._cores) != 1:
             raise AttributeError("scheduler and kv_cache_manager are only exposed for single-replica engines")
         return self._cores[0]
@@ -1900,7 +1721,7 @@ class AsyncLLMEngine:
             raise ValueError("Prompt tokenization produced no tokens.")
         return prompt_token_ids
 
-    def _resolve_prompt_tokens(
+    def resolve_prompt_tokens(
         self,
         prompt: str,
         prompt_token_ids: Sequence[int] | None,

@@ -19,12 +19,12 @@ from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.transfer.types import CompletionCertainty
 
 from .contracts import ModelPDContract
-from .protocol import HandoffKey, PageCopy, TransferUnit, chunk_payload_hash
+from .protocol import HandoffKey, PageCopy, RankMapping, TransferUnit, chunk_payload_hash, validate_rank_mapping
 
 
 @dataclass(frozen=True)
 class RankChunkPlan:
-    rank_id: int
+    mapping: RankMapping
     copies: tuple[PageCopy, ...]
     expected_units: tuple[TransferUnit, ...]
 
@@ -41,8 +41,12 @@ class ChunkPlan:
     manifest_hash: str
 
     @property
-    def copies_by_rank(self) -> dict[int, tuple[PageCopy, ...]]:
-        return {rank.rank_id: rank.copies for rank in self.ranks}
+    def copies_by_destination_rank(self) -> dict[int, tuple[PageCopy, ...]]:
+        return {rank.mapping.destination_rank_id: rank.copies for rank in self.ranks}
+
+    @property
+    def rank_mapping(self) -> tuple[RankMapping, ...]:
+        return tuple(rank.mapping for rank in self.ranks)
 
     @property
     def expected_units(self) -> tuple[TransferUnit, ...]:
@@ -86,7 +90,7 @@ class ChunkTransferPlanner:
         start_token: int,
         end_token: int,
         final: bool,
-        rank_ids: tuple[int, ...],
+        rank_mapping: tuple[RankMapping, ...],
         source_blocks_by_rank: dict[int, dict[str, tuple[int, ...]]],
         destination_blocks_by_rank: dict[int, dict[str, tuple[int, ...]]],
         destination_prefix_hit_tokens: int = 0,
@@ -108,17 +112,16 @@ class ChunkTransferPlanner:
             raise ValueError("source prefix hit must be within the chunk history")
         if source_prefix_hit_tokens % self.prefix_alignment:
             raise ValueError("source prefix hit must use the common cache alignment")
-        if not rank_ids or len(rank_ids) != len(set(rank_ids)):
-            raise ValueError("rank_ids must be a nonempty unique tuple")
-        if set(rank_ids) != set(source_blocks_by_rank) or set(rank_ids) != set(
-            destination_blocks_by_rank
-        ):
+        validate_rank_mapping(rank_mapping)
+        if {pair.source_rank_id for pair in rank_mapping} != set(source_blocks_by_rank) or {
+            pair.destination_rank_id for pair in rank_mapping
+        } != set(destination_blocks_by_rank):
             raise ValueError("source/destination block tables must cover the active ranks")
 
         rank_plans = []
-        for rank_id in rank_ids:
-            source = source_blocks_by_rank[rank_id]
-            destination = destination_blocks_by_rank[rank_id]
+        for pair in rank_mapping:
+            source = source_blocks_by_rank[pair.source_rank_id]
+            destination = destination_blocks_by_rank[pair.destination_rank_id]
             self._validate_group_tables(source, destination)
             copies: list[PageCopy] = []
             expected_units: list[TransferUnit] = []
@@ -153,24 +156,25 @@ class ChunkTransferPlanner:
                     # Zero-byte units remain explicit. They prove the planner
                     # considered a region instead of silently dropping it.
                     expected_units.append(
-                        TransferUnit(rank_id, component_name, nbytes)
+                        TransferUnit(pair.destination_rank_id, component_name, nbytes)
                     )
             rank_plans.append(
-                RankChunkPlan(rank_id, tuple(copies), tuple(expected_units))
+                RankChunkPlan(pair, tuple(copies), tuple(expected_units))
             )
 
         expected_units = tuple(
             unit for rank in rank_plans for unit in rank.expected_units
         )
-        copies_by_rank = {rank.rank_id: rank.copies for rank in rank_plans}
+        copies_by_destination_rank = {rank.mapping.destination_rank_id: rank.copies for rank in rank_plans}
         manifest_hash = chunk_payload_hash(
             key,
             chunk_id=chunk_id,
             start_token=start_token,
             end_token=end_token,
             final=final,
+            rank_mapping=rank_mapping,
             expected_units=expected_units,
-            copies_by_rank=copies_by_rank,
+            copies_by_destination_rank=copies_by_destination_rank,
             source_prefix_hit_tokens=source_prefix_hit_tokens,
         )
         return ChunkPlan(

@@ -199,7 +199,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         cache_ranks: int = DSPARK_RANKS,
         compile_kernels: bool = False,
         num_speculative_tokens: int = 0,
-        pd_worker_config=None,
+        runner_extension_factory=None,
     ) -> None:
         worker_device_ids = tuple(device_ids) if device_ids is not None else (int(device_id),)
         super().__init__(
@@ -216,7 +216,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         # layout freezes every rank-derived axis (kernel import arguments,
         # scheduler cache partitions, packed-prefill capacity) from it.
         self._topology_layout = DSparkCacheLayout.for_ranks(cache_ranks)
-        self._pd_worker_config = pd_worker_config
+        self._runner_extension_factory = runner_extension_factory
         if self._num_speculative_tokens not in (0, DSPARK_SPECULATIVE_TOKENS):
             raise ValueError(
                 "DSpark speculation is fixed at K="
@@ -307,31 +307,12 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         """Create the DSpark runtime runner."""
         if not isinstance(compiled, DSparkCompiledKernels):
             raise TypeError("DeepSeekV4DSparkPyptoExecutor requires DSpark compiled metadata.")
-        return DSparkModelRunner(compiled=compiled, pd_worker_config=self._pd_worker_config)
+        return DSparkModelRunner(compiled=compiled, extension_factory=self._runner_extension_factory)
 
-    def handle_pd_command(self, operation: str, payload: bytes) -> bytes:
-        """Dispatch an ordered PD command to the only registered DSpark runner."""
-        if self._pd_worker_config is None:
-            raise RuntimeError("DSpark PD worker support is not configured")
-        if len(self._runners) != 1:
-            raise RuntimeError("PD worker control requires exactly one registered model")
-        runner = next(iter(self._runners.values()))
-        handler = getattr(runner, "handle_pd_command", None)
-        if not callable(handler):
-            raise RuntimeError("DSpark runner has no PD worker control handler")
-        return handler(operation, payload)
-
-    def set_transfer_profile_active(self, active: bool) -> None:
-        """Forward profile control to the runner that owns transfer services."""
-        if self._pd_worker_config is None:
-            return
-        if len(self._runners) != 1:
-            raise RuntimeError("PD transfer profiling requires one registered model")
-        runner = next(iter(self._runners.values()))
-        handler = getattr(runner, "set_transfer_profile_active", None)
-        if not callable(handler):
-            raise RuntimeError("DSpark runner has no transfer profile handler")
-        handler(active)
+    def runtime_extensions(self):
+        """Return explicitly configured runner services after model registration."""
+        return tuple(runner.runtime_extension for runner in self._runners.values()
+                     if runner.runtime_extension is not None)
 
     def _compile_model(self, model: RuntimeModel) -> DSparkCompiledKernels:
         """Validate DSpark metadata, compile the two L3 programs, and package."""

@@ -16,9 +16,8 @@ import secrets
 import time
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, Sequence
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import TokenOutput
@@ -84,7 +83,6 @@ from .worker_api import (
     OP_POLL_TRANSFER_CHUNK,
     OP_PREPARE_REGISTRY,
     OP_SUBMIT_TRANSFER_CHUNK,
-    OP_TRANSFER_CHUNK,
     InstallPeerRequest,
     TransferChunkRequest,
     TransferChunkResponse,
@@ -99,9 +97,6 @@ from .worker_api import (
 
 
 logger = logging.getLogger(__name__)
-
-if TYPE_CHECKING:
-    from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, ReplicaEngineCore
 
 
 @dataclass(frozen=True)
@@ -122,10 +117,10 @@ class _AuthorizedRoute:
 class PDServingService:
     """Bind request-aware Host handoffs to one Serving engine/worker group."""
 
-    def __init__(self, engine: "AsyncLLMEngine", config: PDConfig) -> None:
-        self.engine = engine
+    def __init__(self, core, config: PDConfig, *, eos_token_id: int | None = None) -> None:
+        self.eos_token_id = eos_token_id
         self.config = config
-        self.core: ReplicaEngineCore = engine._single_core()
+        self.core = core
         self.session: PDControlSession | None = None
         self.local_bundle: WorkerRegistryBundle | None = None
         self.peer_registry: RegistryAdvertisement | None = None
@@ -353,7 +348,7 @@ class PDServingService:
         continuation = self.config.model_adapter.build_continuation(
             config=config,
             prompt_token_ids=prompt_token_ids,
-            eos_token_id=self.engine.eos_token_id,
+            eos_token_id=self.eos_token_id,
             output_parser_spec=output_parser_spec,
         )
         prefix_match_spec = None
@@ -950,7 +945,6 @@ class PDServingService:
                     prompt,
                     config,
                     prompt_token_ids,
-                    reservation.partition,
                 )
             )
             guard = None
@@ -958,6 +952,8 @@ class PDServingService:
             d_ready = False
             remote_aborted = False
             source_prefix_hit_tokens: int | None = None
+            source_partition: int | None = None
+            rank_mapping = ()
             try:
                 while True:
                     chunk = await self._next_chunk_or_failure(request_id, prefill_task)
@@ -965,6 +961,15 @@ class PDServingService:
                         if source_prefix_hit_tokens is not None:
                             raise RuntimeError("P produced more than one first chunk")
                         source_prefix_hit_tokens = chunk.start_token
+                        source_partition = chunk.cache_partition
+                        rank_mapping = self.config.model_adapter.rank_mapping(
+                            self.local_bundle.topology, source_partition, reservation.partition,
+                        )
+                        logger.info(
+                            "pd_rank_mapping request_id=%s source_partition=%s destination_partition=%s pairs=%s",
+                            request_id, source_partition, reservation.partition,
+                            tuple((pair.source_rank_id, pair.destination_rank_id) for pair in rank_mapping),
+                        )
                         if (
                             self.config.prefix_cache_mode.value != "independent"
                             and source_prefix_hit_tokens
@@ -990,12 +995,13 @@ class PDServingService:
                             raise RuntimeError("P produced a non-initial chunk first")
                         transfer_start_token = chunk.start_token
                     assert source_prefix_hit_tokens is not None
-                    rank_ids = tuple(rank.rank_id for rank in reservation.ranks)
+                    if chunk.cache_partition != source_partition:
+                        raise RuntimeError("P cache partition changed during the handoff")
                     source_tables = {
-                        rank_id: chunk.block_ids_by_group for rank_id in rank_ids
+                        pair.source_rank_id: chunk.block_ids_by_group for pair in rank_mapping
                     }
                     destination_tables = {
-                        rank_id: reservation.block_ids_by_group for rank_id in rank_ids
+                        pair.destination_rank_id: reservation.block_ids_by_group for pair in rank_mapping
                     }
                     plan = self.planner.plan_chunk(
                         record.key,
@@ -1003,7 +1009,7 @@ class PDServingService:
                         start_token=transfer_start_token,
                         end_token=chunk.end_token,
                         final=chunk.final,
-                        rank_ids=rank_ids,
+                        rank_mapping=rank_mapping,
                         source_blocks_by_rank=source_tables,
                         destination_blocks_by_rank=destination_tables,
                         destination_prefix_hit_tokens=(
@@ -1021,7 +1027,7 @@ class PDServingService:
                         self.config.model_adapter.build_continuation(
                             config=config,
                             prompt_token_ids=prompt_token_ids,
-                            eos_token_id=self.engine.eos_token_id,
+                            eos_token_id=self.eos_token_id,
                             output_parser_spec=output_parser_spec,
                         )
                         if chunk.final
@@ -1245,23 +1251,15 @@ class PDServingService:
         )
         self._inflight_transfer_bytes += transfer_bytes
         try:
-            if not release_next_chunk:
-                raw_response = await self.core.call_pd_worker(
-                    OP_TRANSFER_CHUNK,
-                    encode_worker_payload(request),
-                )
-                return (
-                    decode_worker_payload(raw_response, TransferChunkResponse),
-                    False,
-                )
-
-            self.metrics.increment("overlap.submitted")
+            if release_next_chunk:
+                self.metrics.increment("overlap.submitted")
             raw_submission = await self.core.call_pd_worker(
                 OP_SUBMIT_TRANSFER_CHUNK,
                 encode_worker_payload(request),
             )
             submission = decode_worker_payload(raw_submission, TransferSubmission)
-            self.core.complete_prefill_chunk_transfer(request_id)
+            if release_next_chunk:
+                self.core.complete_prefill_chunk_transfer(request_id)
             deadline = time.monotonic() + self.config.request_timeout_seconds + 10
             while True:
                 # Yield to the engine loop before polling so the next Prefill
@@ -1275,8 +1273,9 @@ class PDServingService:
                 if poll.job_id != submission.job_id:
                     raise RuntimeError("worker returned another PD transfer job")
                 if poll.complete:
-                    self.metrics.increment("overlap.completed")
-                    return TransferChunkResponse(poll.results), True
+                    if release_next_chunk:
+                        self.metrics.increment("overlap.completed")
+                    return TransferChunkResponse(poll.results), release_next_chunk
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
                         "PD asynchronous transfer polling exceeded its bound"
@@ -1296,23 +1295,27 @@ class PDServingService:
                 },
             )
 
-    async def _drain_prefill_request(
+    def _drain_prefill_request(
         self,
         request_id: str,
         prompt: str,
         config,
         prompt_token_ids: Sequence[int],
-        partition: int,
-    ) -> None:
-        async for output in self.core.add_request(
+    ):
+        stream = self.core.add_request(
             request_id,
             prompt,
             config,
             prompt_token_ids=prompt_token_ids,
-            cache_partition=partition,
-        ):
-            if output.finish_reason not in ("", "FINISHED_HANDOFF"):
-                raise RuntimeError(f"P Prefill ended unexpectedly: {output.finish_reason}")
+        )
+
+        async def drain():
+            async with aclosing(stream):
+                async for output in stream:
+                    if output.finish_reason not in ("", "FINISHED_PREFILL"):
+                        raise RuntimeError(f"P Prefill ended unexpectedly: {output.finish_reason}")
+
+        return drain()
 
     async def _next_chunk_or_failure(
         self,

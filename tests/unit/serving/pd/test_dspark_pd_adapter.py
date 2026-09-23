@@ -17,10 +17,12 @@ from pypto_serving.model.deepseek_dspark.pd_adapter import (
     DSV4_DSPARK_K7_ADAPTER,
     DSV4_DSPARK_K7_CONTRACT,
 )
-from pypto_serving.serving.engine.async_engine import PrefillChunkReady, TokenOutput
+from pypto_serving.serving.engine.async_engine import TokenOutput
+from pypto_serving.serving.pd.integration import PrefillChunkReady
 from pypto_serving.serving.pd.protocol import (
     ContinuationMetadata,
     HandoffKey,
+    RankMapping,
     continuation_metadata_hash,
 )
 from pypto_serving.serving.pd.worker_api import ComponentGeometry, WorkerRegistryBundle
@@ -30,6 +32,18 @@ from .helpers import make_cache_manager, make_rank_registrations, make_registry
 
 
 KEY = HandoffKey("request", "handoff", 1, 1, 1)
+
+
+@pytest.mark.parametrize("source_partition", range(4))
+@pytest.mark.parametrize("destination_partition", range(4))
+def test_rank_mapping_uses_matching_tp_slots(source_partition, destination_partition):
+    mapping = DSV4_DSPARK_K7_ADAPTER.rank_mapping(
+        (16, 4), source_partition, destination_partition,
+    )
+    assert [(pair.source_rank_id, pair.destination_rank_id) for pair in mapping] == [
+        (source_partition * 4 + slot, destination_partition * 4 + slot)
+        for slot in range(4)
+    ]
 
 
 def _tables(manager, request_id: str, token_count: int):
@@ -89,7 +103,7 @@ def test_adapter_owns_eight_region_registry_and_transfer_policy() -> None:
 
 
 def test_adapter_plans_closed_then_partial_final_pages_and_builds_manifest() -> None:
-    assert DSV4_DSPARK_K7_CONTRACT.version == 5
+    assert DSV4_DSPARK_K7_CONTRACT.version == 6
     assert DSV4_DSPARK_K7_CONTRACT.continuation_schema.endswith("/v2")
     assert not DSV4_DSPARK_K7_CONTRACT.async_scheduling_for_role("prefill")
     assert DSV4_DSPARK_K7_CONTRACT.async_scheduling_for_role("decode")
@@ -105,7 +119,7 @@ def test_adapter_plans_closed_then_partial_final_pages_and_builds_manifest() -> 
         start_token=0,
         end_token=32,
         final=False,
-        rank_ids=(0,),
+        rank_mapping=(RankMapping(0, 0),),
         source_blocks_by_rank={0: source},
         destination_blocks_by_rank={0: destination},
     )
@@ -121,7 +135,7 @@ def test_adapter_plans_closed_then_partial_final_pages_and_builds_manifest() -> 
         start_token=32,
         end_token=33,
         final=True,
-        rank_ids=(0,),
+        rank_mapping=(RankMapping(0, 0),),
         source_blocks_by_rank={0: source},
         destination_blocks_by_rank={0: destination},
     )
@@ -171,7 +185,7 @@ def test_adapter_plans_closed_then_partial_final_pages_and_builds_manifest() -> 
     )
     assert manifest.manifest_hash == final.manifest_hash
     assert manifest.expected_units == final.expected_units
-    assert manifest.copies_by_rank == final.copies_by_rank
+    assert manifest.copies_by_destination_rank == final.copies_by_destination_rank
     assert manifest.metadata_hash == continuation_metadata_hash(continuation)
     assert manifest.continuation == continuation
 

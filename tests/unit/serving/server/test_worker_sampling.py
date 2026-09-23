@@ -35,6 +35,8 @@ def test_serving_worker_routes_supported_topk_candidates():
     executor = _DeviceTopkExecutor(manager, token_id=7)
     sampler = _RoutingSampler(host_token_id=9, candidate_token_id=7)
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
     worker.executor = executor
     worker.sampler = sampler
     worker.model_record = SimpleNamespace(config=model.config)
@@ -94,6 +96,8 @@ def test_serving_worker_mixed_topk_batch_falls_back_from_stale_candidates():
     )
     sampler = _RoutingSampler(host_token_id=9, candidate_token_id=7)
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
     worker.executor = executor
     worker.sampler = sampler
     worker.model_record = SimpleNamespace(config=model.config)
@@ -167,6 +171,8 @@ def test_serving_worker_skips_decode_host_embedding_when_executor_embeds_on_devi
 
     executor.lookup_embeddings = fail_lookup
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
     worker.executor = executor
     worker.sampler = _FailingSampler()
     worker.model_record = SimpleNamespace(config=model.config)
@@ -200,6 +206,8 @@ def test_worker_resolves_placeholder_decode_token_from_cache():
     """Under async scheduling the engine sends PLACEHOLDER_TOKEN; the worker must
     substitute the token(s) it last sampled for that request."""
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
     worker._last_tokens = {}
 
     # Record two sampled tokens (simulating two prior decode steps).

@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.router.app import _chat_message, _stream_chat
 from pypto_serving.serving.pd.http_api import PrepareRequestHTTP, encode_json
+from pypto_serving.serving.pd.integration import PDApplication
 from pypto_serving.serving.server.server import (
     ChatCompletionRequest,
     ChatMessage,
@@ -26,12 +27,11 @@ class _ExternalConfig:
 
 
 class _Engine:
-    config = SimpleNamespace(pd_config=_ExternalConfig())
-    pd_health_error = ""
+    pd_service = SimpleNamespace()
 
 
 def test_external_node_exposes_internal_api_but_not_public_generation() -> None:
-    server = ServingServer(_Engine(), "model", GenerateConfig())
+    server = _pd_server(_Engine(), "model", GenerateConfig())
     paths = {route.path for route in server.app.routes}
     assert "/health" in paths
     assert "/internal/pd/descriptor" in paths
@@ -39,6 +39,14 @@ def test_external_node_exposes_internal_api_but_not_public_generation() -> None:
     assert "/internal/pd/await-decode" in paths
     assert "/v1/completions" not in paths
     assert "/v1/chat/completions" not in paths
+
+
+def _pd_server(engine, model, config):
+    def install(server):
+        engine.pd_routes = PDApplication.install_routes(
+            SimpleNamespace(service=engine.pd_service), server, config=_ExternalConfig()
+        )
+    return ServingServer(engine, model, config, route_factory=install)
 
 
 class _BodyRequest:
@@ -75,14 +83,14 @@ class _ChatEngine(_Engine):
         self.pd_service = _PDService()
         self.tokenize_calls = []
 
-    def _tokenize_prompt(self, prompt: str) -> list[int]:
+    def resolve_prompt_tokens(self, prompt: str, tokens=None) -> tuple[int, ...]:
         self.tokenize_calls.append(prompt)
-        return [101, 202, 303]
+        return (101, 202, 303)
 
 
 def test_pd_chat_streaming_prepare_tokenizes_templated_prompt() -> None:
     engine = _ChatEngine()
-    server = ServingServer(
+    server = _pd_server(
         engine,
         "model",
         GenerateConfig(ignore_eos=False),
@@ -101,7 +109,7 @@ def test_pd_chat_streaming_prepare_tokenizes_templated_prompt() -> None:
         )
     )
 
-    response = asyncio.run(server._pd_prepare(_BodyRequest(wire)))
+    response = asyncio.run(engine.pd_routes._pd_prepare(_BodyRequest(wire)))
 
     assert response.status_code == 200
     assert engine.tokenize_calls == ["templated chat prompt"]
@@ -120,7 +128,7 @@ def test_pd_chat_streaming_prepare_tokenizes_templated_prompt() -> None:
 
 def test_pd_chat_prepare_preserves_include_reasoning_policy() -> None:
     engine = _ChatEngine()
-    server = ServingServer(engine, "model", GenerateConfig())
+    server = _pd_server(engine, "model", GenerateConfig())
     public = ChatCompletionRequest(
         messages=[ChatMessage(role="user", content="question")],
         chat_template_kwargs={"enable_thinking": True},
@@ -134,7 +142,7 @@ def test_pd_chat_prepare_preserves_include_reasoning_policy() -> None:
         )
     )
 
-    asyncio.run(server._pd_prepare(_BodyRequest(wire)))
+    asyncio.run(engine.pd_routes._pd_prepare(_BodyRequest(wire)))
 
     spec = engine.pd_service.prepare_calls[0][1]["output_parser_spec"]
     assert spec.initial_state == "reasoning"
