@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from pypto_serving.config.types import GenerateConfig
+from pypto_serving.config.types import GenerateConfig, ToolCallingConfig
 from pypto_serving.model.tokenizer import DeepSeekV4TokenizerAdapter
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig, ReplicaEngineCore
 from pypto_serving.serving.reasoning.deepseek_v4_tools import TOOL_END, TOOL_START
@@ -33,7 +33,8 @@ TOOLS = [{"type": "function", "function": {
 
 def _server():
     engine = SimpleNamespace(tokenizer=DeepSeekV4TokenizerAdapter(tokenizer=object()))
-    return ServingServer(engine, "test", GenerateConfig())
+    return ServingServer(engine, "test", GenerateConfig(),
+                         tool_calling_config=ToolCallingConfig(True, "deepseek_v4"))
 
 
 def _request(**kwargs):
@@ -52,9 +53,6 @@ def test_tools_default_to_auto_and_freeze_only_names():
 
 
 @pytest.mark.parametrize("extra", [
-    {"tools": TOOLS, "tool_choice": "required"},
-    {"tools": TOOLS, "tool_choice": {"type": "function", "function": {"name": "lookup"}}},
-    {"tools": [{"type": "function", "function": {"name": "lookup", "strict": True}}]},
     {"tools": TOOLS * 2},
     {"tool_choice": "auto"},
     {"chat_template_kwargs": {"tools": TOOLS}},
@@ -75,6 +73,45 @@ def test_tool_request_requires_model_capability():
     server.engine.tokenizer = SimpleNamespace(output_parser_id=None)
     with pytest.raises(ValueError, match="no tool-call parser"):
         server._output_parser_spec(_request(tools=TOOLS))
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("explicit_choice", [False, True])
+def test_auto_tools_require_server_opt_in_before_sse(stream, explicit_choice):
+    server = _server()
+    server.tool_calling_config = ToolCallingConfig(False, "deepseek_v4")
+    payload = {"messages": [{"role": "user", "content": "Question"}], "tools": TOOLS, "stream": stream}
+    if explicit_choice:
+        payload["tool_choice"] = "auto"
+    with TestClient(server.app) as client:
+        response = client.post("/v1/chat/completions", json=payload)
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/json")
+    assert "--enable-auto-tool-choice" in response.json()["message"]
+
+
+def test_required_and_named_tools_do_not_need_auto_opt_in():
+    server = _server()
+    server.tool_calling_config = ToolCallingConfig(False, "deepseek_v4")
+    for choice in ("required", {"type": "function", "function": {"name": "lookup"}}):
+        assert server._output_parser_spec(_request(tools=TOOLS, tool_choice=choice)).tool_choice == "auto"
+    assert server._output_parser_spec(_request(tools=TOOLS, tool_choice="none")).tool_choice == "none"
+
+
+def test_explicit_parser_required_and_wrong_model_rejected_at_startup():
+    server = _server()
+    server.tool_calling_config = ToolCallingConfig()
+    with pytest.raises(ValueError, match="--tool-call-parser"):
+        server._output_parser_spec(_request(tools=TOOLS, tool_choice="required"))
+    engine = SimpleNamespace(tokenizer=SimpleNamespace(output_parser_id=None))
+    with pytest.raises(ValueError, match="does not match"):
+        ServingServer(engine, "test", GenerateConfig(), tool_calling_config=ToolCallingConfig(True, "deepseek_v4"))
+
+
+def test_legacy_generate_config_keeps_tool_calling_enabled():
+    server = _server()
+    migrated = ServingServer(server.engine, "test", GenerateConfig(enforce_tool_schema=True))
+    assert migrated.tool_calling_config == ToolCallingConfig(True, "deepseek_v4", "parameter")
 
 
 def test_chat_template_preserves_tool_history_and_reasoning():
@@ -231,7 +268,8 @@ def _replay_server(*scripts, chunk_size=7, tokenizer=None):
         EngineConfig(model_id="test"), tokenizer or _ChatTokenizer(),
         core_factory=lambda **kwargs: _ReplayCore(**kwargs, scripts=scripts, chunk_size=chunk_size),
     )
-    return ServingServer(engine, "test", GenerateConfig(max_new_tokens=2048))
+    return ServingServer(engine, "test", GenerateConfig(max_new_tokens=2048),
+                         tool_calling_config=ToolCallingConfig(True, "deepseek_v4"))
 
 
 def _sse_events(response):
@@ -476,3 +514,61 @@ def test_completions_remains_unparsed(stream):
         assert response.status_code == 200
         actual = response.json()["choices"][0]["text"]
     assert actual == expected
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("choice,strict,level,enforce,constrained", [
+    ("auto", False, "auto", True, True),
+    ("auto", True, "auto", False, True),
+    ("auto", False, "auto", False, False),
+    ("auto", False, "function", False, True),
+    ("auto", False, "parameter", False, True),
+    ("required", False, "auto", False, True),
+    ("required", True, "auto", False, True),
+    ({"type": "function", "function": {"name": "lookup"}}, True, "auto", False, True),
+])
+def test_http_tool_constraint_controls_reach_engine(stream, choice, strict, level, enforce, constrained):
+    pytest.importorskip("xgrammar")
+    call = TOOL_START + invoke(city="London") + TOOL_END + "<eos>"
+    server = _replay_server((call, "FINISHED_EOS"))
+    server.generate_config = GenerateConfig(enforce_tool_schema=enforce)
+    server.tool_calling_config = ToolCallingConfig(True, "deepseek_v4", level)
+    original = server.engine.add_request
+    seen = []
+
+    async def record(request_id, prompt, config, **kwargs):
+        seen.append(config.tool_grammar)
+        async for output in original(request_id, prompt, config, **kwargs):
+            yield output
+
+    server.engine.add_request = record
+    tools = json.loads(json.dumps(TOOLS))
+    tools[0]["function"]["strict"] = strict
+    with TestClient(server.app) as client:
+        response = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Question"}],
+            "tools": tools, "tool_choice": choice, "stream": stream,
+        })
+        assert response.status_code == 200, response.text
+        message, reason, _ = _collect_chat(response, stream)
+        assert reason == "tool_calls"
+        assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {"city": "London"}
+    assert len(seen) == 1
+    assert bool(seen[0]) == constrained
+    if constrained:
+        assert "lookup" in seen[0]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_unsupported_strict_schema_fails_before_generation(stream):
+    pytest.importorskip("xgrammar")
+    server = _server()
+    tools = json.loads(json.dumps(TOOLS))
+    tools[0]["function"]["strict"] = True
+    tools[0]["function"]["parameters"]["oneOf"] = []
+    with TestClient(server.app) as client:
+        response = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Question"}], "tools": tools, "stream": stream,
+        })
+    assert response.status_code == 400
+    assert "root schema keywords" in response.json()["message"]

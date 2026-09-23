@@ -52,6 +52,7 @@ class NewRequestData(msgspec.Struct):
     top_p: float
     top_k: int | None
     seed: int | None = None
+    tool_grammar: str | None = None
 
 
 class PrefillRequest(msgspec.Struct):

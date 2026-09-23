@@ -436,6 +436,17 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             num_hash_layers=num_hash_layers,
         )
 
+    @property
+    def supports_device_tool_constraints(self) -> bool:
+        return True
+
+    def set_request_constraint(self, model_id: str, request_id: str, constraint) -> None:
+        runner = self._runners[model_id]
+        if constraint is None:
+            runner._tool_constraints.pop(request_id, None)
+        else:
+            runner._tool_constraints[request_id] = constraint
+
     def _validate_drafter_config(self, model: RuntimeModel, config_data: object) -> None:
         """Reject checkpoints whose drafter metadata contradicts the kernels."""
         if not isinstance(config_data, dict):
@@ -491,7 +502,11 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
     def _compile_l3_callable(self, name: str, jit_fn: object):
         """Compile one fully annotated DSpark HOST wrapper."""
         with profile_span(f"DeepSeekV4DSparkPyptoExecutor.compile.{name}", cat="executor"):
-            return self._compiler.compile(name, jit_fn, use_cache=self._use_compile_cache)
+            # These kernels gained grammar-mask arguments; old cache slots have a different ABI.
+            cache_name = name + "_tool_schema_v1" if name in {
+                "dspark_prefill", "dspark_decode", "dspark_decode_one_l2",
+            } else name
+            return self._compiler.compile(cache_name, jit_fn, use_cache=self._use_compile_cache)
 
     def _build_rope_tables(
         self,

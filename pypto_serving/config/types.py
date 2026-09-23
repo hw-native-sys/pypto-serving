@@ -32,6 +32,28 @@ class GenerateConfig:
     stop: tuple[str, ...] = ()
     stream: bool = False
     ignore_eos: bool = False
+    tool_grammar: str | None = None
+    # Legacy server override; new callers should use ToolCallingConfig.
+    enforce_tool_schema: bool = False
+
+
+@dataclass(frozen=True)
+class ToolCallingConfig:
+    """Server policy, separate from per-request generation settings."""
+
+    enable_auto_tool_choice: bool = False
+    tool_call_parser: str | None = None
+    tool_strict_level: Literal["auto", "function", "parameter"] = "auto"
+
+    def __post_init__(self) -> None:
+        if self.tool_call_parser not in (None, "deepseek_v4"):
+            raise ValueError("--tool-call-parser currently supports only deepseek_v4")
+        if self.tool_strict_level not in ("auto", "function", "parameter"):
+            raise ValueError("--tool-strict-level must be auto, function, or parameter")
+        if self.enable_auto_tool_choice and not self.tool_call_parser:
+            raise ValueError("--enable-auto-tool-choice requires --tool-call-parser")
+        if self.tool_strict_level != "auto" and not self.tool_call_parser:
+            raise ValueError("--tool-strict-level requires --tool-call-parser")
 
 
 @dataclass(frozen=True)

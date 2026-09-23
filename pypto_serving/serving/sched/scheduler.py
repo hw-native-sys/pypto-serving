@@ -125,6 +125,7 @@ class Request:
     top_p: float = 1.0
     top_k: int | None = None
     seed: int | None = None
+    tool_grammar: str | None = None
     cached_block_ids: list[int] = field(default_factory=list)
     allocated_block_ids: list[int] = field(default_factory=list)
     allocated_group_block_ids: dict[str, list[int]] = field(default_factory=dict)

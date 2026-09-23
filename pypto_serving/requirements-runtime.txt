@@ -6,3 +6,4 @@ pydantic>=2.0
 uvicorn
 msgspec
 prometheus-client>=0.20
+xgrammar>=0.2.7

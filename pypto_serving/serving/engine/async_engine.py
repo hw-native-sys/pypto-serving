@@ -440,6 +440,7 @@ class ReplicaEngineCore:
                 top_p=config.top_p,
                 top_k=config.top_k,
                 seed=config.seed,
+                tool_grammar=getattr(config, "tool_grammar", None),
             )
 
             ctx = _RequestContext(
@@ -730,6 +731,7 @@ class ReplicaEngineCore:
                     top_p=req.top_p,
                     top_k=req.top_k,
                     seed=req.seed,
+                    tool_grammar=req.tool_grammar,
                 ))
                 self._worker_known_req_ids.add(req_id)
 

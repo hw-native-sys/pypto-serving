@@ -18,7 +18,7 @@ import time
 import uuid
 from typing import Literal
 
-from pypto_serving.config.types import GenerateConfig
+from pypto_serving.config.types import GenerateConfig, ToolCallingConfig
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput
 from pypto_serving.serving.reasoning import OutputParserSpec, ToolCallDelta, supports_tool_calls
 from pypto_serving.tools.profile import (
@@ -184,12 +184,22 @@ class ServingServer:
         async_engine: AsyncLLMEngine,
         model_id: str,
         generate_config: GenerateConfig,
+        *,
+        tool_calling_config: ToolCallingConfig | None = None,
     ) -> None:
         self.engine = async_engine
         self.model_id = model_id
         # Server-wide generate defaults. Fields the HTTP request omits fall
         # back to this config; explicit per-request fields still win.
         self.generate_config = generate_config
+        if tool_calling_config is None and generate_config.enforce_tool_schema:
+            tool_calling_config = ToolCallingConfig(True, "deepseek_v4", "parameter")
+        self.tool_calling_config = tool_calling_config or ToolCallingConfig()
+        parser_id = getattr(getattr(self.engine, "tokenizer", None), "output_parser_id", None)
+        if self.tool_calling_config.tool_call_parser is not None and (
+            self.tool_calling_config.tool_call_parser != parser_id
+        ):
+            raise ValueError("--tool-call-parser does not match the model's output format")
         self.app = FastAPI(title="PyPTO Serving")
         self._profile_lock = asyncio.Lock()
         self._register_exception_handlers()
@@ -340,6 +350,8 @@ class ServingServer:
             return JSONResponse(response.model_dump())
 
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
+        from pypto_serving.serving.structured_output import tool_grammar
+
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         output_parser_spec = self._output_parser_spec(request)
         prompt = self._apply_chat_template(
@@ -354,6 +366,14 @@ class ServingServer:
         config = dataclasses.replace(
             self._resolve_generate_config(request),
             ignore_eos=self.generate_config.ignore_eos,
+            tool_grammar=tool_grammar(
+                [tool.model_dump(exclude_none=True) for tool in request.tools or ()],
+                request.tool_choice or ("auto" if request.tools else "none"),
+                thinking=output_parser_spec is not None and output_parser_spec.initial_state == "reasoning",
+                parallel=request.parallel_tool_calls,
+                strict_level=("parameter" if self.generate_config.enforce_tool_schema
+                              else self.tool_calling_config.tool_strict_level),
+            ),
         )
 
         with profile_span(
@@ -614,20 +634,24 @@ class ServingServer:
         return kwargs
 
     @staticmethod
-    def _validate_chat_request(request: ChatCompletionRequest) -> str:
+    def _validate_chat_request(request: ChatCompletionRequest) -> str | dict:
         if "tools" in (request.chat_template_kwargs or {}):
             raise ValueError("tools must be supplied as a top-level request field")
         choice = request.tool_choice
         if choice is None:
             choice = "auto" if request.tools else "none"
-        if choice not in ("none", "auto"):
-            raise ValueError("only tool_choice 'auto' and 'none' are supported; constrained tool choice is unavailable")
-        if choice == "auto" and not request.tools:
-            raise ValueError("tool_choice 'auto' requires non-empty tools")
+        if isinstance(choice, dict):
+            name = choice.get("function", {}).get("name") if isinstance(choice.get("function"), dict) else None
+            if choice.get("type") != "function" or not name or name not in {
+                tool.function.name for tool in request.tools or ()
+            }:
+                raise ValueError("named tool_choice must select a declared function")
+        elif choice not in ("none", "auto", "required"):
+            raise ValueError("tool_choice must be auto, none, required, or a named function")
+        if choice != "none" and not request.tools:
+            raise ValueError("tool_choice requires non-empty tools")
         names = []
         for tool in request.tools or ():
-            if tool.function.strict:
-                raise ValueError("strict tool schemas require constrained decoding, which is not supported")
             names.append(tool.function.name)
         if len(set(names)) != len(names):
             raise ValueError("tool function names must be unique")
@@ -656,6 +680,11 @@ class ServingServer:
         has_tool_history = any(m.tool_calls or m.role == "tool" for m in request.messages)
         if (request.tools or has_tool_history) and not supports_tool_calls(parser_id):
             raise ValueError("the model has no tool-call parser")
+        policy = self.tool_calling_config
+        if tool_choice == "auto" and not policy.enable_auto_tool_choice:
+            raise ValueError('tool_choice="auto" requires --enable-auto-tool-choice and --tool-call-parser')
+        if tool_choice != "none" and not policy.tool_call_parser:
+            raise ValueError("tool calling requires --tool-call-parser deepseek_v4")
         if not parser_id:
             return None
         kwargs = self._chat_kwargs(request.chat_template_kwargs, request.reasoning_effort)
@@ -666,7 +695,7 @@ class ServingServer:
             parser_id=str(parser_id),
             initial_state="reasoning" if thinking else "content",
             include_reasoning=request.include_reasoning,
-            tool_choice=tool_choice,
+            tool_choice="none" if tool_choice == "none" else "auto",
             tool_names=tuple(tool.function.name for tool in request.tools or ()),
         )
 
@@ -686,6 +715,8 @@ def create_serving_app(
     async_engine: AsyncLLMEngine,
     model_id: str,
     generate_config: GenerateConfig,
+    *,
+    tool_calling_config: ToolCallingConfig | None = None,
 ) -> FastAPI:
-    server = ServingServer(async_engine, model_id, generate_config)
+    server = ServingServer(async_engine, model_id, generate_config, tool_calling_config=tool_calling_config)
     return server.app
