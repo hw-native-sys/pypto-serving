@@ -16,8 +16,8 @@ from pypto_serving.model.deepseek_dspark.pd_adapter import (
     DSV4_DSPARK_K7_ADAPTER,
     DSV4_DSPARK_K7_CONTRACT,
 )
-from pypto_serving.serving.engine.async_engine import PrefillChunkReady
-from pypto_serving.serving.memory.kv_cache import GroupReservationState
+from pypto_serving.serving.pd.integration import PrefillChunkReady
+from pypto_serving.serving.memory.reservation import GroupReservationState
 from pypto_serving.serving.pd.connector import DecodeConnector
 from pypto_serving.serving.pd.protocol import (
     AbortHandoff,
@@ -25,6 +25,7 @@ from pypto_serving.serving.pd.protocol import (
     CommitRequest,
     ContinuationMetadata,
     HandoffKey,
+    RankMapping,
     ReserveAccepted,
     ReserveRejected,
     ReserveRequest,
@@ -54,6 +55,7 @@ def _connector(prefix_cache_mode: str = "d_only"):
         registry,
         make_rank_registrations(registry),
         contract=DSV4_DSPARK_K7_CONTRACT,
+        rank_mapping=DSV4_DSPARK_K7_ADAPTER.rank_mapping,
     )
     return manager, registry, connector
 
@@ -103,7 +105,7 @@ def _manifest(
         start_token=0,
         end_token=len(prompt),
         final=True,
-        rank_ids=rank_ids,
+        rank_mapping=tuple(RankMapping(rank, rank) for rank in rank_ids),
         source_blocks_by_rank=tables,
         destination_blocks_by_rank=tables,
         destination_prefix_hit_tokens=accepted.prefix_hit_tokens,
@@ -126,8 +128,9 @@ def _manifest(
         end_token=len(prompt),
         final=True,
         manifest_hash=plan.manifest_hash,
+        rank_mapping=plan.rank_mapping,
         expected_units=plan.expected_units,
-        copies_by_rank=plan.copies_by_rank,
+        copies_by_destination_rank=plan.copies_by_destination_rank,
         source_prefix_hit_tokens=source_prefix_hit_tokens,
         first_token=7,
         metadata_hash=continuation_metadata_hash(continuation),
@@ -143,9 +146,11 @@ def _complete(connector, manifest):
             TransferResult(
                 manifest.key,
                 manifest.chunk_id,
-                unit.rank_id,
+                next(pair.source_rank_id for pair in manifest.rank_mapping
+                     if pair.destination_rank_id == unit.destination_rank_id),
+                unit.destination_rank_id,
                 unit.component_id,
-                f"attempt-{unit.rank_id}-{unit.component_id}",
+                f"attempt-{unit.destination_rank_id}-{unit.component_id}",
                 CompletionCertainty.COMPLETED.value,
             )
         )
@@ -200,7 +205,7 @@ def test_commit_publishes_suffix_and_next_reservation_reuses_prefix() -> None:
     bytes_by_component = {
         unit.component_id: unit.nbytes
         for unit in full_hit_manifest.expected_units
-        if unit.rank_id == full_hit_manifest.expected_units[0].rank_id
+        if unit.destination_rank_id == full_hit_manifest.expected_units[0].destination_rank_id
     }
     assert all(bytes_by_component[name] == 0 for name in non_final_components)
     assert all(bytes_by_component[name] > 0 for name in final_components)
@@ -227,7 +232,8 @@ def test_unknown_quarantines_writable_suffix_but_not_shared_prefix() -> None:
         TransferResult(
             key,
             0,
-            writable_unit.rank_id,
+            writable_unit.destination_rank_id,
+            writable_unit.destination_rank_id,
             writable_unit.component_id,
             "unknown-attempt",
             CompletionCertainty.UNKNOWN.value,
@@ -323,7 +329,7 @@ def test_p_hit_greater_than_d_hit_backfills_full_history_and_commits() -> None:
         start_token=0,
         end_token=len(prompt),
         final=True,
-        rank_ids=rank_ids,
+        rank_mapping=tuple(RankMapping(rank, rank) for rank in rank_ids),
         source_blocks_by_rank={rank_id: p_tables for rank_id in rank_ids},
         destination_blocks_by_rank={
             rank_id: accepted.block_ids_by_group for rank_id in rank_ids

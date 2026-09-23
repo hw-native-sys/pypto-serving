@@ -30,6 +30,16 @@ def test_owner_identity_includes_worker_namespace():
     assert len({source, destination}) == 2
 
 
+def test_transfer_identity_allows_independent_rank_placement():
+    source = OwnerRef("run", 4, 1, 1, "P")
+    destination = OwnerRef("run", 8, 1, 1, "D")
+    attempt = TransferAttemptRef("r", "p", "h", "a", 1, 1, 0, source, destination, "m")
+    assert attempt.source.rank_id == 4
+    assert attempt.destination.rank_id == 8
+    with pytest.raises(ValueError, match="same.run"):
+        replace(attempt, destination=replace(destination, run_id="another-run"))
+
+
 @pytest.fixture
 def task():
     source, destination = OwnerRef("run", 0, 1, 1, "P"), OwnerRef("run", 0, 2, 2, "D")

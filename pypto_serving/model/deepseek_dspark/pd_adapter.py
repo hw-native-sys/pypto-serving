@@ -8,7 +8,14 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek V4 DSpark K7 PD adapter."""
 
-from pypto_serving.model.deepseek.transfer_layout import ComponentLayout, DSV4Registry
+from __future__ import annotations
+
+from dataclasses import replace
+from functools import partial
+import logging
+
+from pypto_serving.config.types import DecodeBatch
+from pypto_serving.model.deepseek.transfer_layout import BlockCopy, COMPONENTS, ComponentLayout, DSV4Registry
 from pypto_serving.serving.pd.adapter import ModelRuntimeFacts
 from pypto_serving.serving.pd.connector import DecodeConnector
 from pypto_serving.serving.pd.contracts import ModelPDContract, TransferComponent
@@ -16,6 +23,7 @@ from pypto_serving.serving.pd.planner import ChunkTransferPlanner
 from pypto_serving.serving.pd.protocol import (
     ChunkManifest,
     ContinuationMetadata,
+    RankMapping,
     continuation_metadata_hash,
     make_prefix_match_spec,
 )
@@ -23,7 +31,7 @@ from pypto_serving.serving.pd.protocol import (
 
 DSV4_DSPARK_K7_CONTRACT = ModelPDContract(
     adapter_id="deepseek-v4-dspark-k7",
-    version=5,
+    version=6,
     model_family="deepseek_v4",
     model_variant="dspark",
     transfer_granularity="chunk-after-prefill",
@@ -36,9 +44,7 @@ DSV4_DSPARK_K7_CONTRACT = ModelPDContract(
         TransferComponent("idx_scale", "idx", "index"),
         TransferComponent("hca_state", "hca_state", "hca_state", True),
         TransferComponent("csa_state", "csa_state", "csa_state", True),
-        TransferComponent(
-            "csa_inner_state", "csa_inner_state", "csa_inner_state", True
-        ),
+        TransferComponent("csa_inner_state", "csa_inner_state", "csa_inner_state", True),
     ),
     executor_cls="PyptoDeepSeekV4DSparkExecutor",
     prefill_speculative_tokens=0,
@@ -51,6 +57,28 @@ DSV4_DSPARK_K7_CONTRACT = ModelPDContract(
 
 class DeepSeekV4DSparkK7Adapter:
     contract = DSV4_DSPARK_K7_CONTRACT
+
+    @staticmethod
+    def rank_mapping(
+        topology: tuple[int, ...], source_partition: int, destination_partition: int,
+    ) -> tuple[RankMapping, ...]:
+        if len(topology) != 2:
+            raise ValueError("DSpark mapping requires rank count and TP group size")
+        ranks, tp_size = topology
+        if ranks <= 0 or tp_size <= 0 or ranks % tp_size:
+            raise ValueError("invalid DSpark mapping topology")
+        for partition in (source_partition, destination_partition):
+            if type(partition) is not int or not 0 <= partition < ranks // tp_size:
+                raise ValueError("cache partition is outside the DSpark topology")
+        # DSpark replicates cache within a TP group. Preserve the matching
+        # slot on each side without requiring equal group/rank numbers.
+        return tuple(
+            RankMapping(source_partition * tp_size + slot, destination_partition * tp_size + slot)
+            for slot in range(tp_size)
+        )
+
+    def worker_factory(self, config):
+        return partial(DSparkPDWorker, config=config)
 
     def matches(self, facts: ModelRuntimeFacts) -> bool:
         return (
@@ -89,6 +117,7 @@ class DeepSeekV4DSparkK7Adapter:
             registry,
             destination_ranks,
             contract=self.contract,
+            rank_mapping=self.rank_mapping,
         )
 
     @staticmethod
@@ -138,11 +167,7 @@ class DeepSeekV4DSparkK7Adapter:
         continuation: ContinuationMetadata | None,
         prepared_digest: str,
     ) -> ChunkManifest:
-        metadata_hash = (
-            continuation_metadata_hash(continuation)
-            if continuation is not None
-            else ""
-        )
+        metadata_hash = continuation_metadata_hash(continuation) if continuation is not None else ""
         return ChunkManifest(
             key=key,
             chunk_id=chunk.chunk_id,
@@ -150,8 +175,9 @@ class DeepSeekV4DSparkK7Adapter:
             end_token=plan.end_token,
             final=plan.final,
             manifest_hash=plan.manifest_hash,
+            rank_mapping=plan.rank_mapping,
             expected_units=plan.expected_units,
-            copies_by_rank=plan.copies_by_rank,
+            copies_by_destination_rank=plan.copies_by_destination_rank,
             source_prefix_hit_tokens=plan.source_prefix_hit_tokens,
             first_token=chunk.first_token,
             metadata_hash=metadata_hash,
@@ -165,11 +191,7 @@ class DeepSeekV4DSparkK7Adapter:
             raise ValueError("DeepSeek V4 DSpark continuation requires prompt tokens")
         if continuation.max_new_tokens <= 0:
             raise ValueError("DeepSeek V4 DSpark continuation requires Decode tokens")
-        if (
-            continuation.temperature != 0.0
-            or continuation.top_p != 1.0
-            or continuation.top_k is not None
-        ):
+        if continuation.temperature != 0.0 or continuation.top_p != 1.0 or continuation.top_k is not None:
             raise ValueError("DeepSeek V4 DSpark continuation must use greedy sampling")
 
     @staticmethod
@@ -200,3 +222,191 @@ class DeepSeekV4DSparkK7Adapter:
 
 DSV4_DSPARK_K7_ADAPTER = DeepSeekV4DSparkK7Adapter()
 BUILTIN_PD_ADAPTERS = (DSV4_DSPARK_K7_ADAPTER,)
+
+
+logger = logging.getLogger(__name__)
+
+
+class DSparkPDWorker:
+    """Per-worker model semantics using explicit resident-cache/state capabilities."""
+
+    rank_mapping = staticmethod(DeepSeekV4DSparkK7Adapter.rank_mapping)
+
+    def __init__(
+        self,
+        *,
+        config,
+        compiled,
+        worker,
+        cache,
+        draft_states,
+        reserve_state,
+        initialize_device_state,
+        metrics,
+    ):
+        from pypto_serving.serving.pd.worker import PDWorkerRuntime
+
+        self.compiled = compiled
+        self.ranks = compiled.layout.ranks
+        self.speculative = compiled.num_speculative_tokens > 0
+        self.worker = worker
+        self.cache = cache
+        self.draft_states = draft_states
+        self.reserve_state = reserve_state
+        self.initialize_device_state = initialize_device_state
+        self.metrics = metrics
+        self.component_ids = tuple(COMPONENTS)
+        self.transfer = PDWorkerRuntime(config, self)
+
+    def regions(self):
+        cache = self.cache()
+        return {name: cache[tensor] for name, (tensor, _, _) in COMPONENTS.items()}
+
+    @staticmethod
+    def copies(records):
+        return tuple(
+            BlockCopy(c.component_id, c.layer, c.source_block, c.destination_block, c.valid_tokens)
+            for c in records
+        )
+
+    def worker_options(self):
+        return self.transfer.worker_options()
+
+    def worker_ready(self):
+        self.transfer.worker_ready()
+
+    def handle_command(self, operation, payload):
+        return self.transfer.handle_pd_command(operation, payload)
+
+    def set_profile_active(self, active):
+        self.transfer.set_transfer_profile_active(active)
+
+    def close(self):
+        self.transfer.close()
+
+    def wrap_prepare(self, prepare):
+        def build(batch, *, buffer_slot):
+            bootstrap = tuple(
+                request_id for request_id in batch.initial_request_ids if request_id not in self.draft_states
+            )
+            self.initialize_drafter(batch)
+            return replace(prepare(batch, buffer_slot=buffer_slot), bootstrap_request_ids=bootstrap)
+
+        return build
+
+    def wrap_dispatch(self, dispatch):
+        def submit(batch, inputs):
+            self.finalize_device(batch)
+            return dispatch(batch, inputs)
+
+        return submit
+
+    def registry(self, rank: int, *, model_revision: str):
+        """Describe the eight resident cache regions without exporting addresses."""
+        from pypto_serving.model.deepseek.transfer_layout import DSV4Registry  # noqa: PLC0415
+
+        cache = self.cache()
+        if cache is None:
+            raise RuntimeError("resident cache must exist before exporting its transfer layout")
+        all_layers = tuple(layer.layer_id for layer in self.compiled.layer_plan)
+        csa_layers = tuple(layer.layer_id for layer in self.compiled.layer_plan if layer.compress_ratio == 4)
+        hca_layers = tuple(
+            layer.layer_id for layer in self.compiled.layer_plan if layer.compress_ratio == 128
+        )
+        return DSV4Registry.from_device_cache(
+            cache,
+            rank=rank,
+            model_revision=model_revision,
+            # The second dimension is the replicated-cache TP group.  A
+            # reservation selects one group, so only those four rank owners
+            # participate in a request transfer even though all 16 owners are
+            # registered at process startup.
+            topology=(self.compiled.layout.ranks, self.compiled.layout.tp_size),
+            layer_mapping={
+                "ori": all_layers,
+                "hca_cmp": hca_layers,
+                "csa_cmp": csa_layers,
+                "idx_k": csa_layers,
+                "idx_scale": csa_layers,
+                "hca_state": hca_layers,
+                "csa_state": csa_layers,
+                "csa_inner_state": csa_layers,
+            },
+        )
+
+    def initialize_drafter(
+        self,
+        batch: DecodeBatch,
+        assignment=None,
+    ) -> None:
+        """Create Decode-local K7 state for committed target-cache handoffs.
+
+        Prefill-local prompt-tail/drafter state is deliberately not transferred.
+        The first D target step therefore runs without proposals and bootstraps
+        the drafter from its verified hidden row.  Normal K7 requests still
+        require ``finalize_prefill`` to have seeded their state.
+        """
+        if not self.speculative or not batch.initial_request_ids:
+            return
+        if not set(batch.initial_request_ids) <= set(batch.request_ids):
+            raise ValueError("PD adoption names a request outside the Decode batch")
+        groups = (
+            assignment.groups
+            if assignment is not None
+            else tuple(int(group) for group in batch.cache_partitions)
+        )
+        if len(groups) != len(batch.request_ids):
+            raise ValueError("PD adoption requires one cache partition per Decode request")
+        lengths = batch.seq_lens[: len(batch.request_ids)].detach().cpu().tolist()
+        for index, request_id in enumerate(batch.request_ids):
+            if request_id not in batch.initial_request_ids:
+                continue
+            group = groups[index]
+            state = self.draft_states.get(request_id)
+            if state is None:
+                seq_len = int(lengths[index])
+                if seq_len < 1:
+                    raise ValueError("PD-adopted Decode sequence length must be positive")
+                prompt_len = seq_len - 1
+                state = self.reserve_state(
+                    request_id,
+                    group=group,
+                    prompt_len=prompt_len,
+                    defer_device_clear=True,
+                )
+                state.committed_count = prompt_len
+                logger.info(
+                    "Initialized K7 drafter state for PD-adopted request %s (group=%d, prompt_len=%d)",
+                    request_id,
+                    group,
+                    prompt_len,
+                )
+            elif state.group != group:
+                raise RuntimeError(
+                    f"PD-adopted request {request_id!r} changed cache partition from {state.group} to {group}"
+                )
+
+    def finalize_device(self, batch: DecodeBatch) -> None:
+        """Publish D-local K7 state after the real first token is late-bound.
+
+        Async preparation deliberately builds Decode plans with placeholder
+        tokens.  A remotely prefetched request therefore reserves its local
+        drafter lease during early preparation, but must wait until execution
+        binds the real P-sampled token before publishing persistent device
+        state.  The initial state carries no proposals: the first fused target
+        step is the correctness anchor and produces the next K7 window.
+        """
+        if not self.speculative or not batch.initial_request_ids:
+            return
+        if not set(batch.initial_request_ids) <= set(batch.request_ids):
+            raise ValueError("PD adoption names a request outside the Decode batch")
+        if batch.token_ids.shape[0] < len(batch.request_ids):
+            raise ValueError("PD adoption requires one late-bound token per request")
+        for index, request_id in enumerate(batch.request_ids):
+            if request_id not in batch.initial_request_ids:
+                continue
+            state = self.draft_states[batch.request_ids[index]]
+            if state.device_state_initialized:
+                continue
+            state.current_token_id = int(batch.token_ids[index].reshape(-1)[-1].item())
+            self.initialize_device_state(state)

@@ -13,10 +13,8 @@ from __future__ import annotations
 from collections import OrderedDict
 import uuid
 
-from pypto_serving.serving.memory.kv_cache import (
-    GroupReservationState,
-    KvCacheManager,
-)
+from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.serving.memory.reservation import GroupReservationState
 
 from .completion import CompletionState, CompletionTracker
 from .config import PDCapabilities
@@ -35,6 +33,7 @@ from .protocol import (
     ReserveRequest,
     TransferResult,
     validate_prefix_match_spec,
+    validate_rank_mapping,
 )
 
 
@@ -49,12 +48,14 @@ class DecodeConnector:
         destination_ranks: tuple[RankRegistration, ...],
         *,
         contract: ModelPDContract,
+        rank_mapping,
         terminal_history_limit: int = 1024,
     ) -> None:
         self.cache_manager = cache_manager
         self.capabilities = capabilities
         self.registry = registry
         self.contract = contract
+        self._rank_mapping = rank_mapping
         self.destination_ranks = destination_ranks
         self._trackers: dict[HandoffKey, CompletionTracker] = {}
         self._reservation_by_key: dict[HandoffKey, str] = {}
@@ -176,7 +177,6 @@ class DecodeConnector:
             raise RuntimeError("D completion tracker lost its cache reservation")
         reservation = self.cache_manager.commit_group_cache(
             tracker.reservation_id,
-            request.manifest_hash,
             valid_from=self._planner.publication_valid_from(
                 destination_prefix_hit_tokens=current.prefix_hit_tokens,
                 source_prefix_hit_tokens=tracker.source_prefix_hit_tokens,
@@ -327,7 +327,14 @@ class DecodeConnector:
             raise ValueError("P prefix hits require independent cache mode")
 
         rank_ids = self._active_rank_ids(reservation.partition)
-        if set(manifest.copies_by_rank) != set(rank_ids):
+        validate_rank_mapping(manifest.rank_mapping)
+        source_partition = min(pair.source_rank_id for pair in manifest.rank_mapping) // len(rank_ids)
+        expected_mapping = self._rank_mapping(
+            self.capabilities.topology, source_partition, reservation.partition,
+        )
+        if manifest.rank_mapping != expected_mapping:
+            raise ValueError("chunk rank mapping differs from compatible reserved TP groups")
+        if set(manifest.copies_by_destination_rank) != set(rank_ids):
             raise ValueError("chunk copies do not cover exactly the reserved TP group")
         required_components = {
             component
@@ -341,7 +348,7 @@ class DecodeConnector:
             for component in required_components
         }
         actual_unit_keys = {
-            (unit.rank_id, unit.component_id)
+            (unit.destination_rank_id, unit.component_id)
             for unit in manifest.expected_units
         }
         if actual_unit_keys != expected_unit_keys:
@@ -359,14 +366,17 @@ class DecodeConnector:
             start_token=manifest.start_token,
             end_token=manifest.end_token,
             final=manifest.final,
-            rank_ids=rank_ids,
-            source_blocks_by_rank=destination_tables,
+            rank_mapping=manifest.rank_mapping,
+            source_blocks_by_rank={
+                pair.source_rank_id: reservation.block_ids_by_group
+                for pair in manifest.rank_mapping
+            },
             destination_blocks_by_rank=destination_tables,
             destination_prefix_hit_tokens=reservation.prefix_hit_tokens,
             source_prefix_hit_tokens=manifest.source_prefix_hit_tokens,
         )
         expected_writes = {
-            rank.rank_id: {
+            rank.mapping.destination_rank_id: {
                 (
                     copy.component_id,
                     copy.layer,
@@ -387,28 +397,28 @@ class DecodeConnector:
                 )
                 for copy in copies
             }
-            for rank_id, copies in manifest.copies_by_rank.items()
+            for rank_id, copies in manifest.copies_by_destination_rank.items()
         }
         if any(
             len(copies) != len(actual_writes[rank_id])
-            for rank_id, copies in manifest.copies_by_rank.items()
+            for rank_id, copies in manifest.copies_by_destination_rank.items()
         ):
             raise ValueError("chunk manifest contains duplicate physical writes")
         if actual_writes != expected_writes:
             raise ValueError("chunk physical writes differ from the D reservation plan")
 
         expected_bytes = {
-            (rank.rank_id, unit.component_id): unit.nbytes
+            (rank.mapping.destination_rank_id, unit.component_id): unit.nbytes
             for rank in expected.ranks
             for unit in rank.expected_units
         }
         actual_bytes = {
-            (unit.rank_id, unit.component_id): unit.nbytes
+            (unit.destination_rank_id, unit.component_id): unit.nbytes
             for unit in manifest.expected_units
         }
         if actual_bytes != expected_bytes:
             raise ValueError("chunk byte accounting differs from the D registry")
-        for copies in manifest.copies_by_rank.values():
+        for copies in manifest.copies_by_destination_rank.values():
             for copy in copies:
                 if type(copy.source_block) is not int or copy.source_block < 0:
                     raise ValueError("source block is not a non-negative integer")

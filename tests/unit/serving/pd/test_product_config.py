@@ -56,6 +56,8 @@ def test_minimal_config_resolves_shared_identity_and_default_paths(tmp_path) -> 
     assert prefill.run_id == decode.run_id == router.run_id
     assert prefill.provider == router.provider == "mooncake"
     assert router.policy == "round_robin"
+    assert document.runtime.enable_chunk_overlap
+    assert prefill.enable_chunk_overlap and decode.enable_chunk_overlap
     assert prefill.node_id.startswith("prefill-")
     assert decode.node_id.startswith("decode-")
     assert Path(prefill.journal_path).parent.is_dir()
@@ -101,7 +103,8 @@ def test_observability_can_be_disabled_without_disabling_state(tmp_path) -> None
     assert not (Path(config.log_dir) / "startup.json").exists()
 
 
-def test_runtime_controls_are_shared_by_router_and_nodes(tmp_path) -> None:
+@pytest.mark.parametrize("overlap", (False, True))
+def test_runtime_controls_are_shared_by_router_and_nodes(tmp_path, overlap) -> None:
     path = _write_config(tmp_path)
     value = json.loads(path.read_text(encoding="utf-8"))
     value["runtime"].update(
@@ -111,7 +114,7 @@ def test_runtime_controls_are_shared_by_router_and_nodes(tmp_path) -> None:
             "control_incarnation": 7,
             "max_active_handoffs": 2,
             "max_pending_handoffs": 6,
-            "enable_chunk_overlap": True,
+            "enable_chunk_overlap": overlap,
         }
     )
     path.write_text(json.dumps(value), encoding="utf-8")
@@ -129,7 +132,7 @@ def test_runtime_controls_are_shared_by_router_and_nodes(tmp_path) -> None:
     assert node.control_incarnation == router.control_incarnation == 7
     assert node.max_active_handoffs == router.max_active_handoffs == 2
     assert node.max_pending_handoffs == router.max_pending_handoffs == 6
-    assert node.enable_chunk_overlap
+    assert node.enable_chunk_overlap is overlap
 
 
 @pytest.mark.parametrize(

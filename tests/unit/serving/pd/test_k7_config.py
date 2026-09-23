@@ -13,9 +13,17 @@ import pytest
 
 import pypto_serving.cli.main as cli
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
+from pypto_serving.serving.pd.integration import build_pd_launch, validate_engine_config
 
 
 K7 = DSV4_DSPARK_K7_CONTRACT.decode_speculative_tokens
+
+
+def _build(args):
+    config, application = build_pd_launch(
+        args, cli.build_serving_engine_config, model_variant=cli.resolve_model_variant(args)
+    )
+    return config, application.keywords["pd_config"]
 
 
 def _pd_args(
@@ -99,7 +107,7 @@ def test_pd_k7_uses_target_only_prefill_and_k7_decode(
     expected_local_tokens,
     expected_async_scheduling,
 ) -> None:
-    config = cli.build_serving_engine_config(
+    config, pd = _build(
         _pd_args(
             tmp_path,
             role=role,
@@ -107,16 +115,16 @@ def test_pd_k7_uses_target_only_prefill_and_k7_decode(
         )
     )
 
-    assert config.pd_config.model_contract.decode_speculative_tokens == K7
-    assert config.pd_config.model_contract.adapter_id == "deepseek-v4-dspark-k7"
+    assert pd.model_contract.decode_speculative_tokens == K7
+    assert pd.model_contract.adapter_id == "deepseek-v4-dspark-k7"
     assert config.executor_kwargs["num_speculative_tokens"] == expected_local_tokens
     assert config.runtime_config.num_speculative_tokens == expected_local_tokens
     assert config.async_scheduling is expected_async_scheduling
-    assert config.pd_config.connect_timeout_seconds == 30
-    assert config.pd_config.request_timeout_seconds == 600
-    assert config.pd_config.max_pending_handoffs == 8
-    assert config.pd_config.max_transfer_attempts == 2
-    config.validate_pd()
+    assert pd.connect_timeout_seconds == 30
+    assert pd.request_timeout_seconds == 600
+    assert pd.max_pending_handoffs == 8
+    assert pd.max_transfer_attempts == 2
+    validate_engine_config(config, pd)
 
 
 @pytest.mark.parametrize(
@@ -131,7 +139,7 @@ def test_pd_k7_uses_target_only_prefill_and_k7_decode(
 def test_pd_prefix_cache_profile_drives_local_engine_flag(
     tmp_path, mode, role, expected
 ) -> None:
-    config = cli.build_serving_engine_config(
+    config, pd = _build(
         _pd_args(
             tmp_path,
             role=role,
@@ -145,13 +153,13 @@ def test_pd_prefix_cache_profile_drives_local_engine_flag(
             group.sliding_window or 0
             for group in config.runtime_config.kv_cache_groups
         )
-    config.validate_pd()
+    validate_engine_config(config, pd)
 
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])
 def test_pd_rejects_k0_at_startup(tmp_path, role) -> None:
     with pytest.raises(ValueError, match="match exactly one PD model adapter"):
-        cli.build_serving_engine_config(
+        _build(
             _pd_args(tmp_path, role=role, speculative_tokens=0)
         )
 
@@ -163,7 +171,7 @@ def test_external_router_config_is_derived_from_shared_document(tmp_path, role) 
         role=role,
         speculative_tokens=K7,
     )
-    config = cli.build_serving_engine_config(args)
-    assert config.pd_config.run_id == "run-k7"
-    assert config.pd_config.control_advertise_host == "127.0.0.1"
-    assert config.pd_config.journal_path.endswith("state/journal.jsonl")
+    config, pd = _build(args)
+    assert pd.run_id == "run-k7"
+    assert pd.control_advertise_host == "127.0.0.1"
+    assert pd.journal_path.endswith("state/journal.jsonl")

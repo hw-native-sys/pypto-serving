@@ -10,10 +10,10 @@
 from types import SimpleNamespace
 
 from pypto_serving.serving.server.ipc import (
-    PDWorkerCommand,
+    ControlCommand,
     ProfileCommand,
     decode_command,
-    decode_pd_result,
+    decode_control_result,
     decode_profile_result,
     encode_command,
 )
@@ -21,17 +21,17 @@ from pypto_serving.serving.server.serving_worker import WorkerProcess
 
 
 def test_pd_worker_command_round_trip_and_ordered_result() -> None:
-    command = PDWorkerCommand(17, "inspect_registry", b"request")
+    command = ControlCommand(17, "inspect_registry", b"request")
     assert decode_command(encode_command(command)) == command
 
     outputs = []
     worker = WorkerProcess.__new__(WorkerProcess)
-    worker.executor = SimpleNamespace(
-        handle_pd_command=lambda operation, payload: operation.encode() + b":" + payload
+    worker._services = SimpleNamespace(
+        handle_command=lambda operation, payload: operation.encode() + b":" + payload
     )
     worker.profile_output_queue = SimpleNamespace(put=outputs.append)
-    worker._handle_pd_worker_command(command)
-    result = decode_pd_result(outputs[0])
+    worker._handle_control_command(command)
+    result = decode_control_result(outputs[0])
     assert result.command_id == 17
     assert result.payload == b"inspect_registry:request"
     assert result.error is None
@@ -44,10 +44,10 @@ def test_pd_worker_error_is_returned_without_pickle_or_address_objects() -> None
     def fail(_operation, _payload):
         raise ValueError("bad payload")
 
-    worker.executor = SimpleNamespace(handle_pd_command=fail)
+    worker._services = SimpleNamespace(handle_command=fail)
     worker.profile_output_queue = SimpleNamespace(put=outputs.append)
-    worker._handle_pd_worker_command(PDWorkerCommand(3, "transfer_chunk", b"bad"))
-    result = decode_pd_result(outputs[0])
+    worker._handle_control_command(ControlCommand(3, "transfer_chunk", b"bad"))
+    result = decode_control_result(outputs[0])
     assert result.command_id == 3
     assert result.payload == b""
     assert result.error == "bad payload"
@@ -74,8 +74,8 @@ def test_profile_command_controls_transfer_owner_before_ack(monkeypatch) -> None
     )
     outputs = []
     worker = WorkerProcess.__new__(WorkerProcess)
-    worker.executor = SimpleNamespace(
-        set_transfer_profile_active=lambda active: events.append(
+    worker._services = SimpleNamespace(
+        set_profile_active=lambda active: events.append(
             "owner-start" if active else "owner-stop"
         )
     )

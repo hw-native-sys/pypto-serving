@@ -34,8 +34,8 @@ from pypto_serving.serving.server.ipc import (
     PLACEHOLDER_TOKEN,
     DecodeRequest,
     NewRequestData,
-    PDWorkerCommand,
-    PDWorkerResult,
+    ControlCommand,
+    ControlResult,
     PrefillRequest,
     ProfileCommand,
     ProfileResult,
@@ -43,7 +43,7 @@ from pypto_serving.serving.server.ipc import (
     StepCommand,
     StepResult,
     decode_command,
-    encode_pd_result,
+    encode_control_result,
     encode_profile_result,
     encode_result,
 )
@@ -107,10 +107,10 @@ class _ProfileBarrier:
 
 
 @dataclass(frozen=True)
-class _PDControlBarrier:
+class _ControlBarrier:
     """FIFO barrier for owner/cache control relative to device dispatch."""
 
-    command: PDWorkerCommand
+    command: ControlCommand
     completed: threading.Event
 
 
@@ -127,12 +127,16 @@ class WorkerProcess:
         input_queue: mp.Queue,
         output_queue: mp.Queue,
         profile_output_queue: mp.Queue | None = None,
+        services_factory=None,
     ):
         self.config = config
         self.input_queue = input_queue
         self.output_queue = output_queue
         self.profile_output_queue = profile_output_queue
 
+        self._services_factory = services_factory
+        self._services = None
+        self._batch_builder = self._make_decode_batch
         self.executor = None
         self.sampler = None
         self.model_record = None
@@ -181,9 +185,6 @@ class WorkerProcess:
 
             executor_cls = self._resolve_executor_cls()
             executor_kwargs = dict(self.config.executor_kwargs)
-            pd_config = getattr(self.config, "pd_config", None)
-            if pd_config is not None and getattr(pd_config, "enabled", False):
-                executor_kwargs["pd_worker_config"] = pd_config.worker_config()
             self.executor = executor_cls(
                 platform=self.config.platform,
                 device_ids=device_ids,
@@ -213,6 +214,11 @@ class WorkerProcess:
             else:
                 raise RuntimeError("Executor has no register_model method")
 
+            if self._services_factory is not None:
+                self._services = self._services_factory(
+                    self.executor.runtime_extensions(), self._req_cache.__getitem__,
+                )
+                self._batch_builder = self._services.wrap_batch(self._make_decode_batch)
             logger.info("Worker model loaded and ready")
             return num_pages
 
@@ -282,8 +288,8 @@ class WorkerProcess:
                 self._handle_profile_command(cmd)
                 continue
 
-            if isinstance(cmd, PDWorkerCommand):
-                self._handle_pd_worker_command(cmd)
+            if isinstance(cmd, ControlCommand):
+                self._handle_control_command(cmd)
                 continue
 
             self._handle_step_command(cmd)
@@ -403,8 +409,8 @@ class WorkerProcess:
                 output_work_queue.put(barrier)
                 barrier.completed.wait()
                 continue
-            if isinstance(cmd, PDWorkerCommand):
-                barrier = _PDControlBarrier(command=cmd, completed=threading.Event())
+            if isinstance(cmd, ControlCommand):
+                barrier = _ControlBarrier(command=cmd, completed=threading.Event())
                 output_work_queue.put(barrier)
                 barrier.completed.wait()
                 continue
@@ -492,9 +498,9 @@ class WorkerProcess:
                 finally:
                     work.completed.set()
                 continue
-            if isinstance(work, _PDControlBarrier):
+            if isinstance(work, _ControlBarrier):
                 try:
-                    self._handle_pd_worker_command(work.command)
+                    self._handle_control_command(work.command)
                 finally:
                     work.completed.set()
                 continue
@@ -627,11 +633,7 @@ class WorkerProcess:
         """Apply a profile command and acknowledge it after the file is flushed."""
         profiler = get_profiler(initially_active=False)
         error = None
-        transfer_profile = getattr(
-            self.executor,
-            "set_transfer_profile_active",
-            None,
-        )
+        transfer_profile = self._services.set_profile_active if self._services is not None else None
         try:
             if cmd.active:
                 profiler.start()
@@ -656,26 +658,23 @@ class WorkerProcess:
                 encode_profile_result(ProfileResult(active=profiler.active, error=error))
             )
 
-    def _handle_pd_worker_command(self, cmd: PDWorkerCommand) -> None:
+    def _handle_control_command(self, cmd: ControlCommand) -> None:
         """Run a worker-owned PD operation after all older device work settles."""
         error = None
         payload = b""
         try:
-            handler = getattr(self.executor, "handle_pd_command", None)
-            if not callable(handler):
-                raise RuntimeError(
-                    f"{type(self.executor).__name__} does not support PD worker control"
-                )
-            payload = handler(cmd.operation, cmd.payload)
+            if self._services is None:
+                raise RuntimeError("worker extension control is not configured")
+            payload = self._services.handle_command(cmd.operation, cmd.payload)
             if not isinstance(payload, bytes):
-                raise TypeError("PD worker handler must return bytes")
+                raise TypeError("worker control handler must return bytes")
         except Exception as exc:
             error = str(exc)
-            logger.error("Worker PD control failed: %s", exc, exc_info=True)
+            logger.error("Worker control failed: %s", exc, exc_info=True)
         if self.profile_output_queue is not None:
             self.profile_output_queue.put(
-                encode_pd_result(
-                    PDWorkerResult(
+                encode_control_result(
+                    ControlResult(
                         command_id=cmd.command_id,
                         payload=payload,
                         error=error,
@@ -1007,7 +1006,7 @@ class WorkerProcess:
         # Tokens remain placeholders during early preparation. Executors with a
         # host-token dependency may patch them on the device lane; fused MTP
         # consumes persistent state finalized by the terminal-prefill command.
-        batch = self._make_decode_batch(
+        batch = self._batch_builder(
             cmd.decode_requests,
             runtime_model,
             resolve_tokens=False,
@@ -1073,9 +1072,6 @@ class WorkerProcess:
                 for dr in scheduled
                 if (state := getattr(self, "_constraint_states", {}).get(dr.request_id)) is not None
             },
-            pd_adopted=[
-                self._req_cache[dr.request_id].pd_adopted for dr in scheduled
-            ],
         )
 
     def _batch_decode(
@@ -1093,7 +1089,7 @@ class WorkerProcess:
             allow_device_greedy_sampling = self._allow_device_sampled_ids(scheduled)
             allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled)
 
-            batch = self._make_decode_batch(
+            batch = self._batch_builder(
                 scheduled,
                 runtime_model,
                 resolve_tokens=True,
@@ -1252,6 +1248,7 @@ def _worker_entry(
     ready_event,
     num_pages_value,
     profile_output_queue: mp.Queue | None = None,
+    services_factory=None,
 ):
     """Entry point for the worker subprocess."""
     import signal
@@ -1269,7 +1266,7 @@ def _worker_entry(
     )
     configure_runtime_logging()
 
-    worker = WorkerProcess(config, input_queue, output_queue, profile_output_queue)
+    worker = WorkerProcess(config, input_queue, output_queue, profile_output_queue, services_factory)
     try:
         num_pages = worker.init_device_and_model()
         num_pages_value.value = num_pages
@@ -1291,7 +1288,7 @@ def _worker_entry(
         get_profiler(initially_active=False).stop()
 
 
-def spawn_worker(config: EngineConfig):
+def spawn_worker(config: EngineConfig, *, services_factory=None):
     """Spawn a worker process and return its process, queues, and ready state.
 
     ``num_pages_value`` is a shared ``multiprocessing.Value('i')`` that the
@@ -1316,6 +1313,7 @@ def spawn_worker(config: EngineConfig):
             ready_event,
             num_pages_value,
             profile_output_queue,
+            services_factory,
         ),
         daemon=False,
     )
