@@ -86,6 +86,23 @@ def test_abort_request_schedules_worker_cleanup():
     assert core._pending_free_ids == ["req-x"]
 
 
+def test_abort_after_terminal_output_does_not_release_worker_twice():
+    def fail_abort(_request_id):
+        raise AssertionError("already finished")
+
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.scheduler = SimpleNamespace(abort_request=fail_abort)
+    core._pending_free_ids = ["finished"]
+    core._request_contexts = {
+        "finished": SimpleNamespace(terminal_output_queued=True, queue=asyncio.Queue())
+    }
+
+    asyncio.run(core.abort_request("finished"))
+
+    assert "finished" in core._request_contexts
+    assert core._pending_free_ids == ["finished"]
+
+
 def test_abort_request_emits_abort_token_before_scheduling_free():
     """The client-facing queue receives a FINISHED_ABORTED token on abort."""
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
