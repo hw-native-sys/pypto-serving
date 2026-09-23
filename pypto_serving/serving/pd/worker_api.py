@@ -19,7 +19,6 @@ from .protocol import ChunkManifest, RankRegistration, TransferResult
 
 OP_PREPARE_REGISTRY = "prepare_registry"
 OP_INSTALL_PEER = "install_peer"
-OP_TRANSFER_CHUNK = "transfer_chunk"
 OP_SUBMIT_TRANSFER_CHUNK = "submit_transfer_chunk"
 OP_POLL_TRANSFER_CHUNK = "poll_transfer_chunk"
 OP_INSPECT_REGISTRY = "inspect_registry"

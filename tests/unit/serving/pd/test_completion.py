@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import pytest
+import msgspec
 
 from pypto_serving.serving.pd.completion import CompletionState, CompletionTracker
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
@@ -16,6 +17,7 @@ from pypto_serving.serving.pd.protocol import (
     CommitRequest,
     ContinuationMetadata,
     HandoffKey,
+    RankMapping,
     TransferResult,
     TransferUnit,
     chunk_payload_hash,
@@ -49,7 +51,8 @@ def _final_manifest() -> ChunkManifest:
         end_token=3,
         final=True,
         expected_units=units,
-        copies_by_rank={0: ()},
+        copies_by_destination_rank={0: ()},
+        rank_mapping=(RankMapping(0, 0),),
     )
     return ChunkManifest(
         key=KEY,
@@ -59,7 +62,8 @@ def _final_manifest() -> ChunkManifest:
         final=True,
         manifest_hash=digest,
         expected_units=units,
-        copies_by_rank={0: ()},
+        copies_by_destination_rank={0: ()},
+        rank_mapping=(RankMapping(0, 0),),
         first_token=9,
         metadata_hash=continuation_metadata_hash(continuation),
         continuation=continuation,
@@ -70,7 +74,8 @@ def _result(component: str, certainty: CompletionCertainty, attempt: str = "a1")
     return TransferResult(
         key=KEY,
         chunk_id=0,
-        rank_id=0,
+        source_rank_id=0,
+        destination_rank_id=0,
         component_id=component,
         attempt_id=attempt,
         certainty=certainty.value,
@@ -92,7 +97,8 @@ def _chunk_manifest(
         end_token=end_token,
         final=False,
         expected_units=units,
-        copies_by_rank={0: ()},
+        copies_by_destination_rank={0: ()},
+        rank_mapping=(RankMapping(0, 0),),
         source_prefix_hit_tokens=source_prefix_hit_tokens,
     )
     return ChunkManifest(
@@ -103,13 +109,27 @@ def _chunk_manifest(
         final=False,
         manifest_hash=digest,
         expected_units=units,
-        copies_by_rank={0: ()},
+        copies_by_destination_rank={0: ()},
+        rank_mapping=(RankMapping(0, 0),),
         source_prefix_hit_tokens=source_prefix_hit_tokens,
     )
 
 
 def _commit(manifest: ChunkManifest) -> CommitRequest:
     return CommitRequest(KEY, manifest.manifest_hash, 9, manifest.metadata_hash)
+
+
+def test_mapping_is_hashed_and_completion_cannot_claim_another_source():
+    tracker = CompletionTracker(KEY, "reservation")
+    manifest = _final_manifest()
+    mapping = (RankMapping(4, 0),)
+    changed = msgspec.structs.replace(manifest, rank_mapping=mapping)
+    with pytest.raises(ValueError, match="physical write set"):
+        tracker.register_chunk(changed)
+    tracker.register_chunk(manifest)
+    result = msgspec.structs.replace(_result("ori", CompletionCertainty.COMPLETED), source_rank_id=4)
+    with pytest.raises(ValueError, match="rank mapping"):
+        tracker.record_transfer(result)
 
 
 def test_missing_component_cannot_commit_then_lost_ack_is_stable() -> None:
@@ -168,8 +188,9 @@ def test_manifest_hash_and_generation_are_fail_closed() -> None:
         end_token=manifest.end_token + 1,
         final=manifest.final,
         manifest_hash=manifest.manifest_hash,
+        rank_mapping=manifest.rank_mapping,
         expected_units=manifest.expected_units,
-        copies_by_rank=manifest.copies_by_rank,
+        copies_by_destination_rank=manifest.copies_by_destination_rank,
         first_token=manifest.first_token,
         metadata_hash=manifest.metadata_hash,
         continuation=manifest.continuation,
@@ -184,8 +205,9 @@ def test_manifest_hash_and_generation_are_fail_closed() -> None:
         end_token=manifest.end_token,
         final=manifest.final,
         manifest_hash=manifest.manifest_hash,
+        rank_mapping=manifest.rank_mapping,
         expected_units=manifest.expected_units,
-        copies_by_rank=manifest.copies_by_rank,
+        copies_by_destination_rank=manifest.copies_by_destination_rank,
         source_prefix_hit_tokens=128,
         first_token=manifest.first_token,
         metadata_hash=manifest.metadata_hash,
@@ -198,7 +220,8 @@ def test_manifest_hash_and_generation_are_fail_closed() -> None:
     stale = TransferResult(
         key=HandoffKey("request", "handoff", 2, 2, 3),
         chunk_id=0,
-        rank_id=0,
+        source_rank_id=0,
+        destination_rank_id=0,
         component_id="ori",
         attempt_id="old",
         certainty=CompletionCertainty.COMPLETED.value,

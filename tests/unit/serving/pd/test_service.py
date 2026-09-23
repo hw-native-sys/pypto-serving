@@ -8,27 +8,19 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import asyncio
-import json
 import socket
-from types import SimpleNamespace
 
-import pytest
-
-from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_ADAPTER
-from pypto_serving.serving.engine.async_engine import PrefillChunkReady, TokenOutput
-from pypto_serving.serving.memory.kv_cache import GroupReservationState
-from pypto_serving.serving.pd.config import PDConfig, PDRole
+from pypto_serving.serving.engine.async_engine import TokenOutput
+from pypto_serving.serving.pd.integration import PrefillChunkReady
+from pypto_serving.serving.pd.config import PDRole
 from pypto_serving.serving.pd.protocol import TransferResult
-from pypto_serving.serving.pd.service import PDServingService
 from pypto_serving.serving.pd.worker_api import (
     OP_INSTALL_PEER,
     OP_PREPARE_REGISTRY,
     OP_POLL_TRANSFER_CHUNK,
     OP_SUBMIT_TRANSFER_CHUNK,
-    OP_TRANSFER_CHUNK,
     ComponentGeometry,
     TransferChunkRequest,
-    TransferChunkResponse,
     TransferPollRequest,
     TransferPollResponse,
     TransferSubmission,
@@ -80,6 +72,7 @@ class _FakeCore:
         *,
         capacity_slots: int = 2,
         transfer_certainties: tuple[CompletionCertainty, ...] = (),
+        source_partition: int | None = None,
     ) -> None:
         self.role = role
         self.kv_cache_manager = make_cache_manager(capacity_slots=capacity_slots)
@@ -89,6 +82,9 @@ class _FakeCore:
         self.source_released = False
         self.transfer_certainties = list(transfer_certainties)
         self.transfer_calls = 0
+        self.source_partition = source_partition
+        self.transfer_jobs = {}
+        self.manifests = []
 
     async def call_pd_worker(self, operation: str, payload: bytes = b"") -> bytes:
         if operation == OP_PREPARE_REGISTRY:
@@ -96,7 +92,7 @@ class _FakeCore:
         if operation == OP_INSTALL_PEER:
             assert payload
             return b""
-        if operation == OP_TRANSFER_CHUNK:
+        if operation == OP_SUBMIT_TRANSFER_CHUNK:
             request = decode_worker_payload(payload, TransferChunkRequest)
             self.transfer_calls += 1
             certainty = (
@@ -104,17 +100,30 @@ class _FakeCore:
                 if self.transfer_certainties
                 else CompletionCertainty.COMPLETED
             )
+            job_id = f"{request.manifest.key.handoff_id}-{request.manifest.chunk_id}-{request.attempt_ordinal}"
+            self.transfer_jobs[job_id] = request, certainty
+            self.manifests.append(request.manifest)
+            return encode_worker_payload(TransferSubmission(job_id))
+        if operation == OP_POLL_TRANSFER_CHUNK:
+            poll = decode_worker_payload(payload, TransferPollRequest)
+            request, certainty = self.transfer_jobs[poll.job_id]
+            source_by_destination = {
+                pair.destination_rank_id: pair.source_rank_id for pair in request.manifest.rank_mapping
+            }
             return encode_worker_payload(
-                TransferChunkResponse(
+                TransferPollResponse(
+                    poll.job_id,
+                    True,
                     tuple(
                         TransferResult(
                             key=request.manifest.key,
                             chunk_id=request.manifest.chunk_id,
-                            rank_id=unit.rank_id,
+                            source_rank_id=source_by_destination[unit.destination_rank_id],
+                            destination_rank_id=unit.destination_rank_id,
                             component_id=unit.component_id,
                             attempt_id=(
                                 f"a{request.attempt_ordinal}-"
-                                f"{unit.rank_id}-{unit.component_id}"
+                                f"{unit.destination_rank_id}-{unit.component_id}"
                             ),
                             certainty=certainty.value,
                         )
@@ -131,13 +140,14 @@ class _FakeCore:
         _config,
         *,
         prompt_token_ids,
-        cache_partition,
+        cache_partition=None,
     ):
         blocks = self.kv_cache_manager.ensure_group_blocks(
             request_id,
             len(prompt_token_ids),
-            partition=cache_partition,
+            partition=self.source_partition if cache_partition is None else cache_partition,
         )
+        cache_partition = self.kv_cache_manager.group_request_partition(request_id)
         chunk_queue = self.chunk_queues.setdefault(request_id, asyncio.Queue())
         prefill_ack = self.prefill_acks.setdefault(request_id, asyncio.Event())
         await chunk_queue.put(
@@ -153,7 +163,7 @@ class _FakeCore:
             )
         )
         await prefill_ack.wait()
-        yield TokenOutput(finished=True, finish_reason="FINISHED_HANDOFF")
+        yield TokenOutput(finished=True, finish_reason="FINISHED_PREFILL")
 
     async def next_prefill_chunk(self, request_id):
         chunk = await self.chunk_queues[request_id].get()
@@ -204,321 +214,48 @@ class _FakeCore:
         )
 
 
-class _FakeEngine:
-    eos_token_id = 2
-
-    def __init__(self, core: _FakeCore) -> None:
-        self.core = core
-
-    def _single_core(self):
-        return self.core
-
-
-def _config(
-    role: PDRole,
-    port: int,
-    *,
-    journal_path: str = "",
-    enable_chunk_overlap: bool = False,
-) -> PDConfig:
-    return PDConfig(
-        role=role,
-        node_id="p" if role is PDRole.PREFILL else "d",
-        run_id="run",
-        control_host="127.0.0.1",
-        control_port=port,
-        control_advertise_host="127.0.0.1",
-        transfer_hostname="127.0.0.1",
-        model_revision="ds-v4-test",
-        model_adapter=DSV4_DSPARK_K7_ADAPTER,
-        connect_timeout_seconds=3,
-        enable_chunk_overlap=enable_chunk_overlap,
-        journal_path=journal_path,
-    )
-
-
 class _OverlapFakeCore(_FakeCore):
+    """Hold the first native result until the test explicitly releases it."""
+
     def __init__(self, role: PDRole, **kwargs) -> None:
         super().__init__(role, **kwargs)
         self.next_chunk_released = asyncio.Event()
         self.final_chunk_queued = asyncio.Event()
-        self.submitted_request = None
+        self.transfer_started = asyncio.Event()
+        self.allow_completion = asyncio.Event()
         self.poll_calls = 0
 
     async def add_request(
-        self,
-        request_id,
-        _prompt,
-        _config,
-        *,
-        prompt_token_ids,
-        cache_partition,
+        self, request_id, _prompt, _config, *, prompt_token_ids, cache_partition=None,
     ):
         blocks = self.kv_cache_manager.ensure_group_blocks(
-            request_id,
-            len(prompt_token_ids),
-            partition=cache_partition,
+            request_id, len(prompt_token_ids),
+            partition=self.source_partition if cache_partition is None else cache_partition,
         )
+        partition = self.kv_cache_manager.group_request_partition(request_id)
         tables = {name: tuple(ids) for name, ids in blocks.items()}
         queue = self.chunk_queues.setdefault(request_id, asyncio.Queue())
         ack = self.prefill_acks.setdefault(request_id, asyncio.Event())
-        await queue.put(
-            PrefillChunkReady(
-                request_id,
-                0,
-                0,
-                32,
-                False,
-                None,
-                tables,
-                cache_partition,
-            )
-        )
+        await queue.put(PrefillChunkReady(request_id, 0, 0, 128, False, None, tables, partition))
         await self.next_chunk_released.wait()
-        await queue.put(
-            PrefillChunkReady(
-                request_id,
-                1,
-                32,
-                len(prompt_token_ids),
-                True,
-                101,
-                tables,
-                cache_partition,
-            )
-        )
+        await queue.put(PrefillChunkReady(
+            request_id, 1, 128, len(prompt_token_ids), True, 101, tables, partition,
+        ))
         self.final_chunk_queued.set()
         await ack.wait()
-        yield TokenOutput(finished=True, finish_reason="FINISHED_HANDOFF")
+        yield TokenOutput(finished=True, finish_reason="FINISHED_PREFILL")
 
     def complete_prefill_chunk_transfer(self, _request_id: str) -> None:
         self.next_chunk_released.set()
 
     async def call_pd_worker(self, operation: str, payload: bytes = b"") -> bytes:
-        if operation == OP_SUBMIT_TRANSFER_CHUNK:
-            self.submitted_request = decode_worker_payload(payload, TransferChunkRequest)
-            return encode_worker_payload(TransferSubmission("job-1"))
         if operation == OP_POLL_TRANSFER_CHUNK:
-            poll = decode_worker_payload(payload, TransferPollRequest)
-            assert poll.job_id == "job-1"
             self.poll_calls += 1
-            assert self.final_chunk_queued.is_set()
-            request = self.submitted_request
-            return encode_worker_payload(
-                TransferPollResponse(
-                    "job-1",
-                    True,
-                    tuple(
-                        TransferResult(
-                            request.manifest.key,
-                            request.manifest.chunk_id,
-                            unit.rank_id,
-                            unit.component_id,
-                            f"overlap-{unit.rank_id}-{unit.component_id}",
-                            CompletionCertainty.COMPLETED.value,
-                        )
-                        for unit in request.manifest.expected_units
-                    ),
-                )
-            )
-        return await super().call_pd_worker(operation, payload)
-
-
-def _legacy_cpu_end_to_end_prefill_transfer_commit_and_decode(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    monkeypatch.setenv("TEST_PD_SECRET", "0123456789abcdef0123456789abcdef")
-    port = _free_port()
-
-    async def exercise() -> None:
-        # K7 Decode reserves memory for its drafter and can therefore expose a
-        # smaller target-cache arena than target-only Prefill.
-        p_core = _FakeCore(
-            PDRole.PREFILL,
-            capacity_slots=2,
-            transfer_certainties=(CompletionCertainty.NOT_SUBMITTED,),
-        )
-        d_core = _FakeCore(PDRole.DECODE, capacity_slots=1)
-        assert p_core.bundle.registry_fingerprint != d_core.bundle.registry_fingerprint
-        assert p_core.bundle.layout_fingerprint == d_core.bundle.layout_fingerprint
-        prefill = PDServingService(
-            _FakeEngine(p_core),
-            _config(
-                PDRole.PREFILL,
-                port,
-                journal_path=str(tmp_path / "p.jsonl"),
-            ),
-        )
-        decode = PDServingService(
-            _FakeEngine(d_core),
-            _config(
-                PDRole.DECODE,
-                port,
-                journal_path=str(tmp_path / "d.jsonl"),
-            ),
-        )
-        decode_start = asyncio.create_task(decode.start())
-        await asyncio.sleep(0.05)
-        await asyncio.gather(prefill.start(), decode_start)
-        config = SimpleNamespace(
-            max_new_tokens=2,
-            temperature=0.0,
-            top_p=1.0,
-            top_k=None,
-            seed=None,
-            stop=(),
-            ignore_eos=True,
-            stream=True,
-        )
-        outputs = [
-            output
-            async for output in prefill.generate(
-                "request",
-                "prompt",
-                config,
-                tuple(range(33)),
-            )
-        ]
-        assert [output.token_id for output in outputs] == [101, 102]
-        assert outputs[-1].finished
-        assert outputs[-1].token_ids == (101, 102)
-        assert p_core.source_released
-        assert p_core.transfer_calls == 2
-        d_reservations = d_core.kv_cache_manager.group_cache_reservations
-        # Released allocator records are retired into the connector's bounded
-        # terminal tombstone index; they must not grow for process lifetime.
-        assert d_reservations == ()
-        await asyncio.gather(prefill.close(), decode.close())
-
-    asyncio.run(exercise())
-    for role in ("p", "d"):
-        events = [
-            json.loads(line)["event"]
-            for line in (tmp_path / f"{role}.jsonl").read_text().splitlines()
-        ]
-        assert "HANDOFF_CREATED" in events
-        assert "HANDOFF_COMPLETED" in events
-        assert events[-1] == "SERVICE_STOPPED"
-
-
-def _legacy_unknown_transfer_quarantines_d_and_fails_both_services_closed(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    monkeypatch.setenv("TEST_PD_SECRET", "0123456789abcdef0123456789abcdef")
-    port = _free_port()
-
-    async def exercise() -> None:
-        p_core = _FakeCore(
-            PDRole.PREFILL,
-            transfer_certainties=(CompletionCertainty.UNKNOWN,),
-        )
-        d_core = _FakeCore(PDRole.DECODE)
-        prefill = PDServingService(
-            _FakeEngine(p_core),
-            _config(
-                PDRole.PREFILL,
-                port,
-                journal_path=str(tmp_path / "unknown-p.jsonl"),
-            ),
-        )
-        decode = PDServingService(
-            _FakeEngine(d_core),
-            _config(
-                PDRole.DECODE,
-                port,
-                journal_path=str(tmp_path / "unknown-d.jsonl"),
-            ),
-        )
-        decode_start = asyncio.create_task(decode.start())
-        await asyncio.sleep(0.05)
-        await asyncio.gather(prefill.start(), decode_start)
-        config = SimpleNamespace(
-            max_new_tokens=2,
-            temperature=0.0,
-            top_p=1.0,
-            top_k=None,
-            seed=None,
-            stop=(),
-            ignore_eos=True,
-            stream=True,
-        )
-        with pytest.raises(RuntimeError, match="UNKNOWN"):
-            async for _ in prefill.generate(
-                "unknown-request",
-                "prompt",
-                config,
-                tuple(range(33)),
-            ):
-                pass
-        assert prefill.health_error
-        assert decode.health_error
-        reservations = d_core.kv_cache_manager.group_cache_reservations
-        assert len(reservations) == 1
-        assert reservations[0].state is GroupReservationState.QUARANTINED
-        await asyncio.gather(prefill.close(), decode.close())
-
-    asyncio.run(exercise())
-    for role in ("p", "d"):
-        events = [
-            json.loads(line)["event"]
-            for line in (tmp_path / f"unknown-{role}.jsonl").read_text().splitlines()
-        ]
-        assert "RECOVERY_REQUIRED" in events
-
-
-def _legacy_closed_chunk_transfer_overlaps_next_prefill_chunk(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("TEST_PD_SECRET", "0123456789abcdef0123456789abcdef")
-    port = _free_port()
-
-    async def exercise() -> None:
-        p_core = _OverlapFakeCore(PDRole.PREFILL, capacity_slots=2)
-        d_core = _FakeCore(PDRole.DECODE, capacity_slots=2)
-        prefill = PDServingService(
-            _FakeEngine(p_core),
-            _config(
-                PDRole.PREFILL,
-                port,
-                journal_path=str(tmp_path / "overlap-p.jsonl"),
-                enable_chunk_overlap=True,
-            ),
-        )
-        decode = PDServingService(
-            _FakeEngine(d_core),
-            _config(
-                PDRole.DECODE,
-                port,
-                journal_path=str(tmp_path / "overlap-d.jsonl"),
-            ),
-        )
-        decode_start = asyncio.create_task(decode.start())
-        await asyncio.sleep(0.05)
-        await asyncio.gather(prefill.start(), decode_start)
-        config = SimpleNamespace(
-            max_new_tokens=2,
-            temperature=0.0,
-            top_p=1.0,
-            top_k=None,
-            seed=None,
-            stop=(),
-            ignore_eos=True,
-            stream=True,
-        )
-        outputs = [
-            output
-            async for output in prefill.generate(
-                "overlap-request",
-                "prompt",
-                config,
-                tuple(range(33)),
-            )
-        ]
-        assert outputs[-1].finished
-        assert p_core.next_chunk_released.is_set()
-        assert p_core.final_chunk_queued.is_set()
-        assert p_core.poll_calls == 1
-        assert prefill.metrics.snapshot()["counters"]["overlap.completed"] == 1
-        await asyncio.gather(prefill.close(), decode.close())
-
-    asyncio.run(exercise())
+            poll = decode_worker_payload(payload, TransferPollRequest)
+            request, _ = self.transfer_jobs[poll.job_id]
+            if not request.manifest.final and not self.allow_completion.is_set():
+                return encode_worker_payload(TransferPollResponse(poll.job_id, False))
+        result = await super().call_pd_worker(operation, payload)
+        if operation == OP_SUBMIT_TRANSFER_CHUNK:
+            self.transfer_started.set()
+        return result

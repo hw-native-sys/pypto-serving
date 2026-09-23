@@ -47,13 +47,15 @@ def test_metrics_routes_expose_prometheus_and_json():
 @pytest.mark.parametrize("counts", [[7, 0], None])
 def test_worker_preserves_speculation_metadata_in_serial_and_reclaim_results(reclaim, counts):
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
     result = DecodeResult(None, None, accepted_token_ids=[[11, 12, 13], [21]], num_draft_tokens=counts)
     worker.executor = SimpleNamespace(
         run_decode=lambda model, batch: result,
         reclaim_prepared_decode=lambda pending: result,
     )
     worker.model_record = SimpleNamespace(runtime_model=object())
-    worker._make_decode_batch = lambda *args, **kwargs: object()
+    worker._batch_builder = lambda *args, **kwargs: object()
     worker._allow_device_sampled_ids = lambda scheduled: True
     worker._allow_device_topk_sampling = lambda scheduled: False
     worker._last_tokens = {}

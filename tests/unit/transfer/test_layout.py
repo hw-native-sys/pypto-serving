@@ -131,9 +131,9 @@ def test_device_cache_view_does_not_require_pointer_access():
     assert registry.entry("ori").blocks_per_layer == 3
 
 
-def test_current_runner_exports_split_compressed_cache_pools():
+def test_model_adapter_exports_split_compressed_cache_pools():
     pytest.importorskip("torch")
-    from pypto_serving.model.deepseek.npu_runner import DeepSeekV4ModelRunner
+    from pypto_serving.model.deepseek_dspark.pd_adapter import DSparkPDWorker
 
     plans = (
         SimpleNamespace(layer_id=0, compress_ratio=0),
@@ -159,11 +159,17 @@ def test_current_runner_exports_split_compressed_cache_pools():
             nbytes=shape[0] * shape[1] * shape[2] * shape[3] * 4,
         )
         fields[field] = SimpleNamespace(shards=(shard,))
-    runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
-    runner._compiled = SimpleNamespace(layer_plan=plans, layout=SimpleNamespace(ranks=1))
-    runner._decode_device_cache = SimpleNamespace(**fields)
-
-    registry = runner.export_transfer_registry(0, model_revision="current-serving")
+    adapter = DSparkPDWorker(
+        config=object(),
+        compiled=SimpleNamespace(
+            layer_plan=plans, layout=SimpleNamespace(ranks=1, tp_size=1),
+            num_speculative_tokens=0,
+        ),
+        worker=lambda: None, cache=lambda: SimpleNamespace(**fields),
+        draft_states={}, reserve_state=None, initialize_device_state=None,
+        metrics=lambda: {},
+    )
+    registry = adapter.registry(0, model_revision="current-serving")
 
     assert set(component.component_id for component in registry.components) == set(COMPONENTS)
     assert registry.entry("hca_cmp").layers == (1,)

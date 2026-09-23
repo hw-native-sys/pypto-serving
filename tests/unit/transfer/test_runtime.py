@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """CPU integration for provider lifecycle, bounded admission, and recovery."""
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
@@ -76,6 +76,50 @@ def test_mooncake_segment_addresses_and_normal_release(task):
     assert engine.calls[-1] == ("write", ("peer:1234", [4160], [8320], [64]))
     provider.release()
     assert engine.calls[-1] == ("unregister", 4096)
+
+
+def test_same_named_regions_on_different_destination_ranks_do_not_alias():
+    class CopyEngine(Engine):
+        def __init__(self):
+            super().__init__()
+            self.memory = {4096: b"source-rank-4".ljust(64, b"!"), 8192: bytes(64), 12288: bytes(64)}
+
+        def batch_transfer_sync_write(self, endpoint, sources, destinations, lengths):
+            super().batch_transfer_sync_write(endpoint, sources, destinations, lengths)
+            for source, destination, length in zip(sources, destinations, lengths):
+                self.memory[destination] = self.memory[source][:length]
+            return 0
+
+    source = RegionLease(OwnerRef("run", 4, 1, 1, "P"), "ori", 1, 64)
+    destinations = tuple(
+        RegionLease(OwnerRef("run", rank, 1, 1, "D"), "ori", 1, 64)
+        for rank in (8, 12)
+    )
+    engine = CopyEngine()
+    provider = MooncakeTransferProvider("host", engine_factory=lambda: engine)
+    provider.register(source, 4096)
+    for lease, address in zip(destinations, (8192, 12288)):
+        provider.install_destination(lease, {
+            "lease": asdict(lease), "endpoint": f"peer-rank-{lease.owner.rank_id}:1234", "address": address,
+        })
+    try:
+        for index in (0, 1, 0):
+            destination = destinations[index]
+            attempt = TransferAttemptRef(
+                "r", "p", "h", "a", 1, 1, 0, source.owner, destination.owner, "m",
+            )
+            provider.write(ProviderTransferTask(attempt, (Segment("ori", source, destination, 0, 0, 64),)))
+        assert engine.memory[8192] == engine.memory[12288] == engine.memory[4096]
+        assert [call[1][0] for call in engine.calls if call[0] == "write"] == [
+            "peer-rank-8:1234", "peer-rank-12:1234", "peer-rank-8:1234",
+        ]
+        stale = replace(destinations[0], lease=0)
+        with pytest.raises(ValueError, match="stale"):
+            provider.install_destination(stale, {
+                "lease": asdict(stale), "endpoint": "peer-rank-8:1234", "address": 8192,
+            })
+    finally:
+        provider.release()
 
 
 def test_native_failure_forbids_unregister_and_reuse(task):

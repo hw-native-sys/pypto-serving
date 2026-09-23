@@ -191,8 +191,27 @@ class PageCopy(msgspec.Struct, frozen=True):
     valid_tokens: int
 
 
+class RankMapping(msgspec.Struct, frozen=True):
+    source_rank_id: int
+    destination_rank_id: int
+
+    def __post_init__(self) -> None:
+        for rank in (self.source_rank_id, self.destination_rank_id):
+            if type(rank) is not int or rank < 0:
+                raise ValueError("mapping ranks must be non-negative integers")
+
+
+def validate_rank_mapping(mapping: tuple[RankMapping, ...]) -> None:
+    if not mapping or any(not isinstance(pair, RankMapping) for pair in mapping):
+        raise ValueError("rank mapping must enumerate explicit source/destination pairs")
+    if len({pair.source_rank_id for pair in mapping}) != len(mapping) or len(
+        {pair.destination_rank_id for pair in mapping}
+    ) != len(mapping):
+        raise ValueError("rank mapping must be one-to-one")
+
+
 class TransferUnit(msgspec.Struct, frozen=True):
-    rank_id: int
+    destination_rank_id: int
     component_id: str
     nbytes: int
 
@@ -217,8 +236,9 @@ class ChunkManifest(msgspec.Struct, tag="chunk_manifest", frozen=True):
     end_token: int
     final: bool
     manifest_hash: str
+    rank_mapping: tuple[RankMapping, ...]
     expected_units: tuple[TransferUnit, ...]
-    copies_by_rank: dict[int, tuple[PageCopy, ...]]
+    copies_by_destination_rank: dict[int, tuple[PageCopy, ...]]
     source_prefix_hit_tokens: int = 0
     first_token: int | None = None
     metadata_hash: str = ""
@@ -229,7 +249,8 @@ class ChunkManifest(msgspec.Struct, tag="chunk_manifest", frozen=True):
 class TransferResult(msgspec.Struct, tag="transfer_result", frozen=True):
     key: HandoffKey
     chunk_id: int
-    rank_id: int
+    source_rank_id: int
+    destination_rank_id: int
     component_id: str
     attempt_id: str
     certainty: str
@@ -465,14 +486,15 @@ def chunk_payload_hash(
     start_token: int,
     end_token: int,
     final: bool,
+    rank_mapping: tuple[RankMapping, ...],
     expected_units: tuple[TransferUnit, ...],
-    copies_by_rank: dict[int, tuple[PageCopy, ...]],
+    copies_by_destination_rank: dict[int, tuple[PageCopy, ...]],
     source_prefix_hit_tokens: int = 0,
 ) -> str:
     """Digest the canonical physical write set, independent of wire ordering."""
     units = sorted(
         expected_units,
-        key=lambda unit: (unit.rank_id, unit.component_id, unit.nbytes),
+        key=lambda unit: (unit.destination_rank_id, unit.component_id, unit.nbytes),
     )
     copies = [
         (
@@ -488,7 +510,7 @@ def chunk_payload_hash(
                 ),
             ),
         )
-        for rank_id, rank_copies in sorted(copies_by_rank.items())
+        for rank_id, rank_copies in sorted(copies_by_destination_rank.items())
     ]
     payload = (
         key,
@@ -496,6 +518,7 @@ def chunk_payload_hash(
         start_token,
         end_token,
         final,
+        tuple(sorted(rank_mapping, key=lambda pair: pair.destination_rank_id)),
         source_prefix_hit_tokens,
         tuple(units),
         tuple((rank_id, tuple(rank_copies)) for rank_id, rank_copies in copies),

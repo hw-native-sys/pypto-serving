@@ -16,7 +16,8 @@ from pypto_serving.serving.engine.async_engine import (
     ReplicaEngineCore,
     TokenOutput,
 )
-from pypto_serving.serving.reasoning import OutputParserSpec
+from pypto_serving.serving.reasoning import OutputParserSpec, ParsedDelta
+from pypto_serving.serving.sched.scheduler import Request, RequestOutput
 from pypto_serving.serving.server.ipc import (
     StepResult,
     decode_command,
@@ -103,30 +104,31 @@ def test_abort_request_emits_abort_token_before_scheduling_free():
 
 
 def test_adopted_handoff_installs_output_parser(monkeypatch):
-    parser = object()
+    parser = SimpleNamespace(feed=lambda text, tokens: ParsedDelta(content=text))
     captured = {}
     monkeypatch.setattr(
         async_engine_module,
         "create_output_parser",
         lambda spec, tokenizer: captured.update(spec=spec, tokenizer=tokenizer) or parser,
     )
-    request = SimpleNamespace(num_prompt_tokens=3, output_token_ids=[])
+    request = Request("request", [1, 2, 3], 8, output_token_ids=[4])
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
-    core.tokenizer = object()
+    core.tokenizer = SimpleNamespace(decode=lambda tokens, **kwargs: "".join(map(str, tokens)))
     core.scheduler = SimpleNamespace(
-        adopt_handoff=lambda **_kwargs: (
+        admit_prefilled=lambda **_kwargs: (
             request,
-            SimpleNamespace(finished=False, finish_reason=None),
+            RequestOutput("request", new_token_id=4),
         ),
         abort_request=lambda _request_id: None,
     )
     core._request_contexts = {}
     core._pending_free_ids = []
     core._detokenize_incrementally = lambda _ctx: ""
+    core._detokenize_parser_incrementally = lambda _ctx: "4"
     spec = OutputParserSpec("deepseek_v4", "reasoning")
 
     async def drive():
-        outputs = core.add_adopted_handoff(
+        outputs = core.add_prefilled_request(
             reservation_id="reservation",
             request_id="request",
             prompt_token_ids=(1, 2, 3),
@@ -189,23 +191,24 @@ def test_flush_pending_frees_sends_cleanup_only_step_command(monkeypatch):
 
 
 def test_adopted_handoff_holds_terminal_output_until_worker_release():
-    request = SimpleNamespace(num_prompt_tokens=3, output_token_ids=[])
+    request = Request("request", [1, 2, 3], 8, output_token_ids=[4])
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
-    core.tokenizer = object()
+    core.tokenizer = SimpleNamespace(decode=lambda tokens, **kwargs: "".join(map(str, tokens)))
     core._step_timeout = 1.0
     core.scheduler = SimpleNamespace(
-        adopt_handoff=lambda **_kwargs: (
+        admit_prefilled=lambda **_kwargs: (
             request,
-            SimpleNamespace(finished=False, finish_reason=None),
+            RequestOutput("request", new_token_id=4),
         ),
         abort_request=lambda _request_id: None,
     )
     core._request_contexts = {}
     core._pending_free_ids = []
     core._detokenize_incrementally = lambda _ctx: ""
+    core._detokenize_parser_incrementally = lambda _ctx: "4"
 
     async def drive():
-        outputs = core.add_adopted_handoff(
+        outputs = core.add_prefilled_request(
             reservation_id="reservation",
             request_id="request",
             prompt_token_ids=(1, 2, 3),

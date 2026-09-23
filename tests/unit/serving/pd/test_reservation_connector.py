@@ -10,8 +10,8 @@
 import pytest
 
 from pypto_serving.model.deepseek_dspark.npu_runner import DSPARK_MAX_SEQ_LEN
-from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
-from pypto_serving.serving.memory.kv_cache import GroupReservationState
+from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_ADAPTER, DSV4_DSPARK_K7_CONTRACT
+from pypto_serving.serving.memory.reservation import GroupReservationState
 from pypto_serving.serving.pd.connector import DecodeConnector
 from pypto_serving.serving.pd.planner import ChunkTransferPlanner
 from pypto_serving.serving.pd.protocol import (
@@ -20,6 +20,7 @@ from pypto_serving.serving.pd.protocol import (
     CommitRequest,
     ContinuationMetadata,
     HandoffKey,
+    RankMapping,
     PageCopy,
     ReserveAccepted,
     ReserveRejected,
@@ -44,6 +45,7 @@ def _connector(capacity_slots: int = 2):
         registry,
         make_rank_registrations(registry),
         contract=DSV4_DSPARK_K7_CONTRACT,
+        rank_mapping=DSV4_DSPARK_K7_ADAPTER.rank_mapping,
     )
     return manager, registry, connector
 
@@ -67,7 +69,7 @@ def _final_manifest(manager, registry, reservation):
         start_token=0,
         end_token=33,
         final=True,
-        rank_ids=rank_ids,
+        rank_mapping=tuple(RankMapping(rank, rank) for rank in rank_ids),
         source_blocks_by_rank=tables,
         destination_blocks_by_rank=tables,
     )
@@ -88,8 +90,9 @@ def _final_manifest(manager, registry, reservation):
         end_token=33,
         final=True,
         manifest_hash=plan.manifest_hash,
+        rank_mapping=plan.rank_mapping,
         expected_units=plan.expected_units,
-        copies_by_rank=plan.copies_by_rank,
+        copies_by_destination_rank=plan.copies_by_destination_rank,
         first_token=7,
         metadata_hash=continuation_metadata_hash(continuation),
         continuation=continuation,
@@ -153,9 +156,10 @@ def test_d_recomputes_manifest_and_commits_only_complete_set() -> None:
         TransferResult(
             KEY,
             0,
-            unit.rank_id,
+            unit.destination_rank_id,
+            unit.destination_rank_id,
             unit.component_id,
-            f"a-{unit.rank_id}-{unit.component_id}",
+            f"a-{unit.destination_rank_id}-{unit.component_id}",
             CompletionCertainty.COMPLETED.value,
         )
         for unit in manifest.expected_units
@@ -193,8 +197,8 @@ def test_invalid_destination_and_unknown_are_fail_closed() -> None:
     manager, registry, connector = _connector()
     accepted = _reserve(connector)
     manifest = _final_manifest(manager, registry, accepted)
-    rank = next(iter(manifest.copies_by_rank))
-    copies = list(manifest.copies_by_rank[rank])
+    rank = next(iter(manifest.copies_by_destination_rank))
+    copies = list(manifest.copies_by_destination_rank[rank])
     copies[0] = PageCopy(
         component_id=copies[0].component_id,
         layer=copies[0].layer,
@@ -202,7 +206,7 @@ def test_invalid_destination_and_unknown_are_fail_closed() -> None:
         destination_block=copies[0].destination_block + 1,
         valid_tokens=copies[0].valid_tokens,
     )
-    bad_copies = dict(manifest.copies_by_rank)
+    bad_copies = dict(manifest.copies_by_destination_rank)
     bad_copies[rank] = tuple(copies)
     tampered = ChunkManifest(
         key=manifest.key,
@@ -211,8 +215,9 @@ def test_invalid_destination_and_unknown_are_fail_closed() -> None:
         end_token=manifest.end_token,
         final=manifest.final,
         manifest_hash=manifest.manifest_hash,
+        rank_mapping=manifest.rank_mapping,
         expected_units=manifest.expected_units,
-        copies_by_rank=bad_copies,
+        copies_by_destination_rank=bad_copies,
         first_token=manifest.first_token,
         metadata_hash=manifest.metadata_hash,
         continuation=manifest.continuation,
@@ -226,7 +231,8 @@ def test_invalid_destination_and_unknown_are_fail_closed() -> None:
         TransferResult(
             KEY,
             0,
-            unit.rank_id,
+            unit.destination_rank_id,
+            unit.destination_rank_id,
             unit.component_id,
             "unknown",
             CompletionCertainty.UNKNOWN.value,
