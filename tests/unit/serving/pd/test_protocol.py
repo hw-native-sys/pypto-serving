@@ -15,6 +15,7 @@ import pytest
 
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
 from pypto_serving.serving.pd.config import PDCapabilities, PDRole
+from pypto_serving.serving.pd.http_api import DecodeStreamFrame, decode_json, encode_json
 from pypto_serving.serving.pd.protocol import (
     ChunkManifest,
     ContinuationMetadata,
@@ -31,7 +32,7 @@ from pypto_serving.serving.pd.protocol import (
     make_prefix_match_spec,
     validate_prefix_match_spec,
 )
-from pypto_serving.serving.reasoning import OutputParserSpec
+from pypto_serving.serving.reasoning import OutputParserSpec, ParsedToolCall, ToolCallDelta
 
 
 def _capabilities(model_revision: str = "ds-v4-test") -> PDCapabilities:
@@ -212,7 +213,7 @@ def test_control_message_codec_rejects_empty_input() -> None:
         decode_message(b"")
 
 
-def test_parser_spec_and_reasoning_survive_pd_wire_round_trip() -> None:
+def test_tool_parser_spec_and_outputs_survive_pd_wire_round_trip() -> None:
     key = HandoffKey("request", "handoff", 1, 1, 1)
     continuation = ContinuationMetadata(
         prompt_token_ids=(1, 2, 3),
@@ -227,6 +228,8 @@ def test_parser_spec_and_reasoning_survive_pd_wire_round_trip() -> None:
             "deepseek_v4",
             "reasoning",
             include_reasoning=False,
+            tool_choice="auto",
+            tool_names=("lookup",),
         ),
     )
     manifest = ChunkManifest(
@@ -254,9 +257,13 @@ def test_parser_spec_and_reasoning_survive_pd_wire_round_trip() -> None:
         reasoning="hidden on request but valid on the wire",
         text_delta="swer",
         reasoning_delta="valid on the wire",
+        tool_call_deltas=(ToolCallDelta(index=0, id="call-1", name="lookup", arguments='{"city":'),),
+        tool_calls=(ParsedToolCall(id="call-1", name="lookup", arguments='{"city":"杭州"}'),),
         finished=True,
         finish_reason="FINISHED_LENGTH",
         prompt_tokens=3,
         completion_tokens=2,
     )
     assert decode_message(encode_message(output)) == output
+    frame = DecodeStreamFrame(event="finished", output=output)
+    assert decode_json(encode_json(frame), DecodeStreamFrame) == frame

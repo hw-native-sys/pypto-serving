@@ -1391,6 +1391,10 @@ class PDServingService:
                 token_id=message.token_id,
                 text=message.text,
                 reasoning=message.reasoning,
+                text_delta=message.text_delta,
+                reasoning_delta=message.reasoning_delta,
+                tool_call_deltas=message.tool_call_deltas,
+                tool_calls=message.tool_calls,
                 finished=message.finished,
                 finish_reason=message.finish_reason,
                 prompt_tokens=message.prompt_tokens,
@@ -1718,6 +1722,8 @@ class PDServingService:
                     reasoning=output.reasoning,
                     text_delta=output.text_delta,
                     reasoning_delta=output.reasoning_delta,
+                    tool_call_deltas=output.tool_call_deltas,
+                    tool_calls=output.tool_calls,
                 )
                 queue = self._decode_queues.get(key)
                 if queue is None:

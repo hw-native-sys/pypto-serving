@@ -17,12 +17,10 @@ import logging
 import time
 import uuid
 from collections.abc import Sequence
-from typing import Literal
-
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput
 from pypto_serving.observability.tokens import token_ids_sha256
-from pypto_serving.serving.reasoning import OutputParserSpec, ToolCallDelta, supports_tool_calls
+from pypto_serving.serving.reasoning import OutputParserSpec, supports_tool_calls
 from pypto_serving.tools.profile import (
     get_profiler,
     merge_profile,
@@ -34,148 +32,33 @@ from pypto_serving.tools.profile import (
 
 logger = logging.getLogger(__name__)
 
-ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
-
 try:
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse, Response, StreamingResponse
-    from pydantic import BaseModel, Field, model_serializer
+    from .api_types import (
+        ChatCompletionChoice,
+        ChatCompletionRequest,
+        ChatCompletionResponse,
+        ChatDelta as ChatDelta,
+        ChatMessage,
+        ChatTool,
+        CompletionChoice,
+        CompletionRequest,
+        CompletionResponse,
+        DeltaFunctionCall as DeltaFunctionCall,
+        DeltaToolCall as DeltaToolCall,
+        FunctionCall as FunctionCall,
+        FunctionDefinition as FunctionDefinition,
+        ReasoningEffort as ReasoningEffort,
+        ResponseUsage,
+        ToolCall as ToolCall,
+        validate_chat_request,
+    )
+    from .chat_format import chat_delta, chat_finish_reason, chat_message, map_finish_reason
 except ImportError as e:
     raise ImportError(
         "Serving requires fastapi and pydantic. Install with: pip install fastapi uvicorn sse-starlette pydantic"
     ) from e
-
-
-# --- Request/Response Models ---
-
-class CompletionRequest(BaseModel):
-    model: str = ""
-    prompt: str | list[int] = ""
-    # Sampling fields are optional: omitted fields fall back to the server's
-    # default GenerateConfig (from --generate-config, else GenerateConfig()).
-    max_tokens: int | None = None
-    temperature: float | None = None
-    top_p: float | None = None
-    top_k: int | None = None
-    seed: int | None = None
-    stop: list[str] | None = None
-    stream: bool = False
-
-
-class FunctionDefinition(BaseModel):
-    name: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
-    description: str | None = None
-    parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}})
-    strict: bool | None = None
-
-
-class ChatTool(BaseModel):
-    type: Literal["function"] = "function"
-    function: FunctionDefinition
-
-
-class FunctionCall(BaseModel):
-    name: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
-    arguments: str
-
-
-class ToolCall(BaseModel):
-    id: str = Field(min_length=1)
-    type: Literal["function"] = "function"
-    function: FunctionCall
-
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str | None = None
-    reasoning: str | None = None
-    tool_calls: list[ToolCall] | None = None
-    tool_call_id: str | None = None
-
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        data = handler(self)
-        for key in ("tool_calls", "tool_call_id"):
-            if not data.get(key):
-                data.pop(key, None)
-        return data
-
-
-class DeltaFunctionCall(BaseModel):
-    name: str | None = None
-    arguments: str | None = None
-
-
-class DeltaToolCall(BaseModel):
-    index: int
-    id: str | None = None
-    type: Literal["function"] | None = None
-    function: DeltaFunctionCall
-
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        data = {key: value for key, value in handler(self).items() if value is not None}
-        data["function"] = {key: value for key, value in data["function"].items() if value is not None}
-        return data
-
-
-class ChatDelta(ChatMessage):
-    tool_calls: list[DeltaToolCall] | None = None
-
-
-class ChatCompletionRequest(BaseModel):
-    model: str = ""
-    messages: list[ChatMessage]
-    max_tokens: int | None = None
-    temperature: float | None = None
-    top_p: float | None = None
-    top_k: int | None = None
-    seed: int | None = None
-    stop: list[str] | None = None
-    stream: bool = False
-    reasoning_effort: ReasoningEffort | None = None
-    chat_template_kwargs: dict | None = None
-    include_reasoning: bool = True
-    tools: list[ChatTool] | None = None
-    tool_choice: str | dict | None = None
-    parallel_tool_calls: bool = True
-
-
-class CompletionChoice(BaseModel):
-    index: int = 0
-    text: str = ""
-    finish_reason: str | None = None
-
-
-class ResponseUsage(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-
-
-class CompletionResponse(BaseModel):
-    id: str
-    object: str = "text_completion"
-    created: int
-    model: str
-    choices: list[CompletionChoice]
-    usage: ResponseUsage | None = None
-
-
-class ChatCompletionChoice(BaseModel):
-    index: int = 0
-    message: ChatMessage | None = None
-    delta: ChatDelta | None = None
-    finish_reason: str | None = None
-
-
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: str = "chat.completion"
-    created: int
-    model: str
-    choices: list[ChatCompletionChoice]
-    usage: ResponseUsage | None = None
 
 
 # --- Server ---
@@ -433,7 +316,7 @@ class ServingServer:
                 if output.finished:
                     final_token_ids = output.token_ids
                     finish_reason = self._chat_finish_reason(output)
-                    tool_calls = output.tool_calls if request.parallel_tool_calls else output.tool_calls[:1]
+                    tool_calls = output.tool_calls
                     usage = ResponseUsage(
                         prompt_tokens=output.prompt_tokens,
                         completion_tokens=output.completion_tokens,
@@ -446,14 +329,11 @@ class ServingServer:
                 created=int(time.time()),
                 model=request.model or self.model_id,
                 choices=[ChatCompletionChoice(
-                    message=ChatMessage(
-                        role="assistant",
-                        content=full_text or (None if tool_calls else ""),
-                        reasoning=full_reasoning or None,
-                        tool_calls=[
-                            ToolCall(id=call.id, function=FunctionCall(name=call.name, arguments=call.arguments))
-                            for call in tool_calls
-                        ] or None,
+                    message=chat_message(
+                        full_text,
+                        full_reasoning,
+                        tool_calls,
+                        parallel_tool_calls=request.parallel_tool_calls,
                     ),
                     finish_reason=finish_reason,
                 )],
@@ -585,22 +465,17 @@ class ServingServer:
                         reasoning_delta = output.reasoning[len(prev_reasoning):] if output.reasoning else ""
                         prev_reasoning = output.reasoning or prev_reasoning
                     finish_reason = self._chat_finish_reason(output) if output.finished else None
-                    tool_deltas = [
-                        self._tool_delta(item) for item in output.tool_call_deltas
-                        if parallel_tool_calls or item.index == 0
-                    ]
-
                     chunk = ChatCompletionResponse(
                         id=request_id,
                         object="chat.completion.chunk",
                         created=int(time.time()),
                         model=model,
                         choices=[ChatCompletionChoice(
-                            delta=ChatDelta(
-                                role="assistant",
-                                content=delta or (None if tool_deltas else ""),
-                                reasoning=reasoning_delta or None,
-                                tool_calls=tool_deltas or None,
+                            delta=chat_delta(
+                                delta,
+                                reasoning_delta,
+                                output.tool_call_deltas,
+                                parallel_tool_calls=parallel_tool_calls,
                             ),
                             finish_reason=finish_reason,
                         )],
@@ -630,20 +505,8 @@ class ServingServer:
                         break
 
     @staticmethod
-    def _tool_delta(delta: ToolCallDelta) -> DeltaToolCall:
-        return DeltaToolCall(
-            index=delta.index, id=delta.id, type="function" if delta.id else None,
-            function=DeltaFunctionCall(name=delta.name, arguments=delta.arguments or None),
-        )
-
-    @classmethod
-    def _chat_finish_reason(cls, output: TokenOutput) -> str:
-        if (
-            output.finish_reason in ("FINISHED_EOS", "FINISHED_STOP")
-            and output.tool_calls and all(call.complete for call in output.tool_calls)
-        ):
-            return "tool_calls"
-        return cls._map_finish_reason(output.finish_reason)
+    def _chat_finish_reason(output: TokenOutput) -> str:
+        return chat_finish_reason(output)
 
     def _apply_chat_template(
         self,
@@ -684,36 +547,7 @@ class ServingServer:
 
     @staticmethod
     def _validate_chat_request(request: ChatCompletionRequest) -> str:
-        if "tools" in (request.chat_template_kwargs or {}):
-            raise ValueError("tools must be supplied as a top-level request field")
-        choice = request.tool_choice
-        if choice is None:
-            choice = "auto" if request.tools else "none"
-        if choice not in ("none", "auto"):
-            raise ValueError("only tool_choice 'auto' and 'none' are supported; constrained tool choice is unavailable")
-        if choice == "auto" and not request.tools:
-            raise ValueError("tool_choice 'auto' requires non-empty tools")
-        names = []
-        for tool in request.tools or ():
-            if tool.function.strict:
-                raise ValueError("strict tool schemas require constrained decoding, which is not supported")
-            names.append(tool.function.name)
-        if len(set(names)) != len(names):
-            raise ValueError("tool function names must be unique")
-        for message in request.messages:
-            calls = message.tool_calls or ()
-            if calls and message.role != "assistant":
-                raise ValueError("only assistant messages can contain tool_calls")
-            if message.content is None and not (message.role == "assistant" and calls):
-                raise ValueError("message content must be text, or null for an assistant tool call")
-            if message.role == "tool" and not message.tool_call_id:
-                raise ValueError("tool messages require tool_call_id")
-            if len({call.id for call in calls}) != len(calls):
-                raise ValueError("assistant tool call IDs must be unique")
-            for call in calls:
-                if not isinstance(json.loads(call.function.arguments), dict):
-                    raise ValueError("tool call arguments must encode an object")
-        return choice
+        return validate_chat_request(request)
 
     def _output_parser_spec(
         self,
@@ -741,14 +575,7 @@ class ServingServer:
 
     @staticmethod
     def _map_finish_reason(reason: str) -> str:
-        mapping = {
-            "FINISHED_EOS": "stop",
-            "FINISHED_LENGTH": "length",
-            "FINISHED_STOP": "stop",
-            "FINISHED_ABORTED": "aborted",
-            "error": "error",
-        }
-        return mapping.get(reason, "stop")
+        return map_finish_reason(reason)
 
 
 def create_serving_app(

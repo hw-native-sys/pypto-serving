@@ -133,11 +133,11 @@ curl http://router.example.internal:8110/v1/chat/completions \
 `/v1/completions` is also supported. P/D nodes expose internal control APIs
 instead of public generation endpoints.
 
-The ordinary (non-PD) Serving endpoint supports DeepSeek V4 tool calls. The
-PD Router currently supports text chat and reasoning only: tool-call request
-fields and structured tool-call output are not yet part of its public and
-Decode-to-Router wire contracts. Do not use the Router for tool calls until
-those contracts are extended and validated end to end.
+For DeepSeek V4, the Router accepts the same function-tool request fields as
+ordinary Serving: `tools`, `tool_choice` (`auto` or `none`),
+`parallel_tool_calls`, and assistant/tool history. Structured tool-call
+deltas and final calls travel from D to the Router alongside text and
+reasoning. Constrained `tool_choice` and strict tool schemas are not supported.
 
 | Endpoint | Process | Contents |
 | --- | --- | --- |
