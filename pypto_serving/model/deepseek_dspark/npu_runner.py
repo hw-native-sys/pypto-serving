@@ -401,6 +401,7 @@ def build_dspark_cache_group_specs(
             max_blocks_per_seq=int(max_blocks_per_seq),
             num_partitions=partitions,
             sliding_window=sliding_window,
+            supports_sparse_blocks=sliding_window is not None,
         )
 
     c128_blocks_per_seq = math.ceil(max_seq_len / DSPARK_COMPRESSED_BLOCK_TOKENS)
@@ -641,8 +642,8 @@ class DSparkCacheMetadataBuilder:
         ids = torch.tensor([int(block_id) for block_id in block_ids], dtype=torch.long)
         if ids.numel() == 0:
             raise ValueError("ring table rows need at least one allocated block")
-        if bool((ids < 0).any()):
-            raise ValueError("ring table block IDs must not be negative")
+        if bool((ids < -1).any()):
+            raise ValueError("ring table block IDs must be >= -1")
         index = torch.arange(depth) % ids.numel()
         return ids.index_select(0, index).to(dtype)
 
@@ -659,8 +660,8 @@ class DSparkCacheMetadataBuilder:
         ids = torch.tensor([int(block_id) for block_id in block_ids], dtype=torch.long)
         if ids.numel() == 0:
             raise ValueError("trailing ring table rows need at least one allocated block")
-        if bool((ids < 0).any()):
-            raise ValueError("trailing ring table block IDs must not be negative")
+        if bool((ids < -1).any()):
+            raise ValueError("trailing ring table block IDs must be >= -1")
         if page_tokens <= 0 or depth <= 0:
             raise ValueError("page_tokens and depth must be positive")
 
@@ -739,7 +740,8 @@ class DSparkCacheMetadataBuilder:
             pages = ids.index_select(0, (logical % ids.numel()).reshape(-1)).reshape(
                 logical.shape
             )
-            rows.append(pages * int(block_size) + positions_i64 % int(block_size))
+            slots = pages * int(block_size) + positions_i64 % int(block_size)
+            rows.append(torch.where(pages >= 0, slots, torch.full_like(slots, -1)))
         return torch.stack(rows)
 
     def compressed_slot_mapping(
@@ -4593,12 +4595,17 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 blocks = tuple(int(block_id) for block_id in row[name])
                 # Immutable prefix pages may be shared across requests, but
                 # two logical pages of the same request must never alias.
-                if len(blocks) != len(set(blocks)):
+                allocated = [block_id for block_id in blocks if block_id >= 0]
+                if len(allocated) != len(set(allocated)):
                     raise ValueError("a grouped KV row must not repeat physical blocks")
-                if any(block_id < 0 or block_id >= self._cache_group_num_blocks[name] for block_id in blocks):
+                minimum = -1 if name in ("ori", "hca_state", "csa_state", "csa_inner_state") else 0
+                if any(
+                    block_id < minimum or block_id >= self._cache_group_num_blocks[name]
+                    for block_id in blocks
+                ):
                     raise ValueError(
                         f"grouped KV block IDs for {name} must be in "
-                        f"[0, {self._cache_group_num_blocks[name]}); "
+                        f"[{minimum}, {self._cache_group_num_blocks[name]}); "
                         f"[{self._cache_group_num_blocks[name]}, "
                         f"{self._cache_group_num_blocks[name] + DSPARK_DECODE_BATCH}) "
                         "is reserved for kernel padding"

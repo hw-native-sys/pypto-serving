@@ -137,6 +137,7 @@ class _GroupBlockPool:
     request_blocks: dict[str, list[KVCacheBlock | None]] = field(default_factory=dict)
     request_partitions: dict[str, int] = field(default_factory=dict)
     request_logical_blocks: dict[str, int] = field(default_factory=dict)
+    request_window_starts: dict[str, int] = field(default_factory=dict)
     hash_to_block: dict[tuple[int, int], KVCacheBlock] = field(default_factory=dict)
 
     def num_free_blocks_in(self, partition: int) -> int:
@@ -758,8 +759,8 @@ class KvCacheManager:
         needed to resume at the candidate boundary. EAGLE/MTP page hashes
         already include the boundary token consumed by their last shifted KV
         row, so a matching page is self-validating. Partial pages are never
-        shared. Sparse rolling rows are completed by ``ensure_group_blocks``
-        before they are sent to a worker.
+        shared. Runners supporting sparse tables keep expired slots unmapped;
+        other runners materialize those slots in ``ensure_group_blocks``.
         """
         if not self.enable_prefix_cache or not self._group_pools:
             return {}, 0, None
@@ -869,6 +870,10 @@ class KvCacheManager:
             pool.request_logical_blocks[request_id] = (
                 best_hit_tokens // pool.spec.spec.token_capacity
             )
+            if pool.spec.supports_sparse_blocks:
+                pool.request_window_starts[request_id] = max(
+                    0, (best_hit_tokens - pool.spec.sliding_window) // pool.spec.spec.token_capacity,
+                )
             for block in owned:
                 if block is None:
                     continue
@@ -879,9 +884,9 @@ class KvCacheManager:
         return (
             {
                 name: [
-                    pool.local_block_id(block)
+                    pool.local_block_id(block) if block is not None else -1
                     for block in best_blocks[name]
-                    if block is not None
+                    if block is not None or pool.spec.supports_sparse_blocks
                 ]
                 for name, pool in self._group_pools.items()
             },
@@ -950,6 +955,8 @@ class KvCacheManager:
                 slot = index if pool.spec.sliding_window is None else index % len(owned)
                 block = owned[slot]
                 if block is None:
+                    if pool.spec.supports_sparse_blocks:
+                        continue
                     raise RuntimeError(
                         f"KV cache group {name!r} has an unallocated table slot"
                     )
@@ -977,9 +984,13 @@ class KvCacheManager:
         blocks = []
         for name, block_ids in block_ids_by_group.items():
             pool = self._group_pools[name]
-            if len(block_ids) != len(set(block_ids)):
+            allocated_ids = [
+                block_id for block_id in block_ids
+                if block_id != -1 or not pool.spec.supports_sparse_blocks
+            ]
+            if len(allocated_ids) != len(set(allocated_ids)):
                 raise ValueError(f"Cache group {name!r} snapshot contains duplicate block IDs")
-            for block_id in block_ids:
+            for block_id in allocated_ids:
                 block = pool.block_from_local_id(partition, block_id)
                 if block.ref_cnt <= 0:
                     raise RuntimeError(
@@ -999,6 +1010,8 @@ class KvCacheManager:
         for name, block_ids in block_ids_by_group.items():
             pool = self._group_pools[name]
             for block_id in block_ids:
+                if block_id == -1 and pool.spec.supports_sparse_blocks:
+                    continue
                 block = pool.block_from_local_id(partition, block_id)
                 if block.ref_cnt <= 0:
                     raise RuntimeError(
@@ -1058,6 +1071,8 @@ class KvCacheManager:
                     raise RuntimeError(
                         f"Cache group {name!r} scheduled table cannot address logical block {index}"
                     )
+                if block_ids[slot] == -1 and pool.spec.supports_sparse_blocks:
+                    continue
                 block = pool.block_from_local_id(partition, block_ids[slot])
                 self._cache_group_block(pool, partition, block, hashes[index])
             cached_counts[name] = completed
@@ -1137,6 +1152,50 @@ class KvCacheManager:
     def _logical_group_blocks(pool: _GroupBlockPool, token_count: int) -> int:
         return math.ceil(token_count / pool.spec.spec.token_capacity)
 
+    @staticmethod
+    def _required_group_slots(
+        pool: _GroupBlockPool, request_id: str, target: int,
+    ) -> range | set[int]:
+        """Keep the ring's logical indices even when old physical pages are absent."""
+        if not pool.spec.supports_sparse_blocks:
+            return range(min(target, pool.spec.max_blocks_per_seq))
+        start = pool.request_window_starts.get(request_id, 0)
+        period = pool.spec.max_blocks_per_seq
+        return {index % period for index in range(max(start, target - period), target)}
+
+    def release_sliding_window_blocks(self, request_id: str, num_computed_tokens: int) -> None:
+        """Release pages before a confirmed window without changing its ring period.
+
+        Only confirmed progress may move the window: speculative reservations
+        can be rejected. Scheduled snapshots retain their own references, so
+        pages still used by another in-flight step cannot be reused early.
+        Prefix hashes remain available until the freed page is evicted.
+        """
+        for pool in self._group_pools.values():
+            if not pool.spec.supports_sparse_blocks:
+                continue
+            owned = pool.request_blocks.get(request_id)
+            if not owned:
+                continue
+            start = max(0, (num_computed_tokens - pool.spec.sliding_window) // pool.spec.spec.token_capacity)
+            previous_start = pool.request_window_starts.get(request_id, 0)
+            if start <= previous_start:
+                continue
+            pool.request_window_starts[request_id] = start
+            allocated = pool.request_logical_blocks[request_id]
+            period = pool.spec.max_blocks_per_seq
+            partition = pool.request_partitions[request_id]
+            for slot, block in enumerate(owned):
+                # A newer queued step may already have rotated this slot. Its
+                # most recent logical page must survive an older completion.
+                logical = slot + ((allocated - 1 - slot) // period) * period
+                if block is None or logical >= start:
+                    continue
+                block.ref_cnt -= 1
+                if block.ref_cnt == 0:
+                    pool.free_queues[partition].append(block)
+                owned[slot] = None
+
     def _additional_group_blocks(
         self,
         pool: _GroupBlockPool,
@@ -1151,9 +1210,8 @@ class KvCacheManager:
                 return pool.blocks_per_partition + 1
             return max(0, target - len(owned))
 
-        table_size = min(target, pool.spec.max_blocks_per_seq)
-        missing = max(0, table_size - len(owned))
-        missing += sum(block is None for block in owned[:table_size])
+        required = self._required_group_slots(pool, request_id, target)
+        missing = sum(slot >= len(owned) or owned[slot] is None for slot in required)
         previous = pool.request_logical_blocks.get(request_id, 0)
         shared_slots = set()
         for logical_block in range(previous, target):
@@ -1303,9 +1361,13 @@ class KvCacheManager:
                 else target
             )
             owned.extend([None] * (table_size - len(owned)))
-            # Prefix lookup leaves irrelevant rolling slots empty. Materialize
-            # them without copying any cached KV before exposing the table.
-            for slot in range(table_size):
+            # Sparse-capable runners need only the live window and new writes;
+            # preserving holes keeps the kernel's modulo addressing unchanged.
+            required = (
+                self._required_group_slots(pool, request_id, target)
+                if pool.spec.sliding_window is not None else range(table_size)
+            )
+            for slot in required:
                 if owned[slot] is None:
                     owned[slot] = self._take_group_block(pool, selected)
 
@@ -1342,6 +1404,9 @@ class KvCacheManager:
             block_ids = []
             for block in pool.request_blocks.get(request_id, ()):
                 if block is None:
+                    if pool.spec.supports_sparse_blocks:
+                        block_ids.append(-1)
+                        continue
                     raise RuntimeError(
                         f"KV cache group {name!r} has an unallocated table slot"
                     )
@@ -1359,6 +1424,7 @@ class KvCacheManager:
 
             pool.request_partitions.pop(request_id, None)
             pool.request_logical_blocks.pop(request_id, None)
+            pool.request_window_starts.pop(request_id, None)
             pool.request_blocks.pop(request_id, None)
             if partition is None:
                 continue
