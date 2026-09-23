@@ -149,6 +149,38 @@ def test_pd_chat_prepare_preserves_include_reasoning_policy() -> None:
     assert spec.include_reasoning is False
 
 
+def test_pd_chat_prepare_preserves_tools_and_tool_history() -> None:
+    engine = _ChatEngine()
+    _pd_server(engine, "model", GenerateConfig())
+    public = ChatCompletionRequest.model_validate({
+        "messages": [
+            {"role": "user", "content": "Find a city"},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call-1", "type": "function",
+                "function": {"name": "lookup", "arguments": '{"city":"杭州"}'},
+            }]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "Found"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "lookup"}}],
+    })
+    wire = encode_json(PrepareRequestHTTP(
+        request_id="chat-tools",
+        request_kind="chat",
+        request_json=public.model_dump_json().encode(),
+    ))
+
+    asyncio.run(engine.pd_routes._pd_prepare(_BodyRequest(wire)))
+
+    messages, template_kwargs = engine.tokenizer.template_calls[0]
+    assert messages[1]["content"] is None
+    assert messages[1]["tool_calls"][0]["function"]["name"] == "lookup"
+    assert messages[2]["tool_call_id"] == "call-1"
+    assert template_kwargs["tools"][0]["function"]["name"] == "lookup"
+    spec = engine.pd_service.prepare_calls[0][1]["output_parser_spec"]
+    assert spec.tool_choice == "auto"
+    assert spec.tool_names == ("lookup",)
+
+
 class _RouterCoordinator:
     def __init__(self, outputs) -> None:
         self.outputs = outputs
@@ -176,6 +208,8 @@ def test_router_streams_independent_reasoning_and_content_deltas() -> None:
             text="",
             reasoning_delta="plan",
             text_delta="",
+            tool_call_deltas=(),
+            tool_calls=(),
             finished=False,
             finish_reason="",
             prompt_tokens=3,
@@ -186,6 +220,8 @@ def test_router_streams_independent_reasoning_and_content_deltas() -> None:
             text="answer",
             reasoning_delta=" more",
             text_delta="answer",
+            tool_call_deltas=(),
+            tool_calls=(),
             finished=False,
             finish_reason="",
             prompt_tokens=3,
@@ -196,6 +232,8 @@ def test_router_streams_independent_reasoning_and_content_deltas() -> None:
             text="answer",
             reasoning_delta="",
             text_delta="",
+            tool_call_deltas=(),
+            tool_calls=(),
             finished=True,
             finish_reason="FINISHED_LENGTH",
             prompt_tokens=3,
@@ -219,7 +257,7 @@ def test_router_streams_independent_reasoning_and_content_deltas() -> None:
 
 def test_router_non_streaming_message_preserves_both_semantic_channels() -> None:
     message = _chat_message(
-        SimpleNamespace(reasoning="private reasoning", text="public answer")
+        SimpleNamespace(reasoning="private reasoning", text="public answer", tool_calls=())
     )
 
     assert message == {
@@ -236,6 +274,8 @@ def test_router_streams_authoritative_deltas_when_cumulative_fields_change() -> 
             text="",
             reasoning_delta="stable prefix",
             text_delta="",
+            tool_call_deltas=(),
+            tool_calls=(),
             finished=False,
             finish_reason="",
             prompt_tokens=1,
@@ -246,6 +286,8 @@ def test_router_streams_authoritative_deltas_when_cumulative_fields_change() -> 
             text="answer",
             reasoning_delta="",
             text_delta="answer",
+            tool_call_deltas=(),
+            tool_calls=(),
             finished=True,
             finish_reason="FINISHED_LENGTH",
             prompt_tokens=1,

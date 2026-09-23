@@ -22,6 +22,7 @@ from pypto_serving.serving.pd.http_api import (
 )
 from pypto_serving.serving.pd.protocol import HandoffKey
 from pypto_serving.serving.pd.service import PDServingService
+from pypto_serving.serving.reasoning import ParsedToolCall, ToolCallDelta
 from pypto_serving.serving.pd.worker_api import (
     OP_POLL_TRANSFER_CHUNK,
     TransferPollRequest,
@@ -194,6 +195,50 @@ async def _open_test_handoff(prefill, decode, port, *, request_id="overlap", pro
         placement.reservation_capability, digest, "p", 1, "d", "127.0.0.1", port, 1,
     )))
     return key, stream, execute
+
+
+def test_decode_node_stream_preserves_tool_call_deltas_and_final_calls():
+    class ToolDecodeCore(_FakeCore):
+        async def add_adopted_handoff(self, **kwargs):
+            async for output in super().add_adopted_handoff(**kwargs):
+                if output.finished:
+                    yield replace(
+                        output,
+                        text="",
+                        reasoning="Need data",
+                        text_delta="",
+                        reasoning_delta="",
+                        tool_call_deltas=(ToolCallDelta(0, arguments='{"city":"杭州"}'),),
+                        tool_calls=(ParsedToolCall("call-1", "lookup", '{"city":"杭州"}'),),
+                        finish_reason="FINISHED_EOS",
+                    )
+                else:
+                    yield replace(
+                        output,
+                        text="",
+                        reasoning="Need data",
+                        text_delta="",
+                        reasoning_delta="Need data",
+                        tool_call_deltas=(ToolCallDelta(0, "call-1", "lookup"),),
+                    )
+
+    async def exercise():
+        port = _free_port()
+        prefill = PDServingService(_FakeCore(PDRole.PREFILL), _external_config(PDRole.PREFILL, port))
+        decode = PDServingService(ToolDecodeCore(PDRole.DECODE), _external_config(PDRole.DECODE, port))
+        await asyncio.gather(prefill.start(), decode.start())
+        try:
+            _, stream, execute = await _open_test_handoff(prefill, decode, port, request_id="tool-call")
+            outputs = [frame.output async for frame in stream]
+            assert (await execute).state == "READY"
+            assert outputs[0].tool_call_deltas[0].id == "call-1"
+            assert outputs[-1].tool_call_deltas[0].arguments == '{"city":"杭州"}'
+            assert outputs[-1].tool_calls == (ParsedToolCall("call-1", "lookup", '{"city":"杭州"}'),)
+            assert outputs[-1].finish_reason == "FINISHED_EOS"
+        finally:
+            await asyncio.gather(prefill.close(), decode.close())
+
+    asyncio.run(asyncio.wait_for(exercise(), 15))
 
 
 @pytest.mark.parametrize("overlap", (False, True))

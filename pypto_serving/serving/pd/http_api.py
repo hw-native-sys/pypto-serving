@@ -17,6 +17,8 @@ import msgspec
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from pypto_serving.serving.server.api_types import ChatCompletionRequest, CompletionRequest
+
 from .protocol import (
     CapabilityWire,
     ContinuationMetadata,
@@ -349,8 +351,6 @@ class PDHTTPRoutes:
     async def _pd_prepare(self, request: Request) -> Response:
 
         payload = decode_json(await request.body(), PrepareRequestHTTP)
-        from pypto_serving.serving.server.server import CompletionRequest, ChatCompletionRequest
-
         if payload.request_kind == "completion":
             public = CompletionRequest.model_validate_json(payload.request_json)
             prompt, tokens, config, output_parser_spec = self.prepare_completion(public)
