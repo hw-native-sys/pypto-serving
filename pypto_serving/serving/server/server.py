@@ -340,6 +340,8 @@ class ServingServer:
             return JSONResponse(response.model_dump())
 
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
+        from pypto_serving.serving.structured_output import tool_grammar
+
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         output_parser_spec = self._output_parser_spec(request)
         prompt = self._apply_chat_template(
@@ -354,6 +356,13 @@ class ServingServer:
         config = dataclasses.replace(
             self._resolve_generate_config(request),
             ignore_eos=self.generate_config.ignore_eos,
+            tool_grammar=tool_grammar(
+                [tool.model_dump(exclude_none=True) for tool in request.tools or ()],
+                request.tool_choice or ("auto" if request.tools else "none"),
+                thinking=output_parser_spec is not None and output_parser_spec.initial_state == "reasoning",
+                parallel=request.parallel_tool_calls,
+                enforce=self.generate_config.enforce_tool_schema,
+            ),
         )
 
         with profile_span(
@@ -614,20 +623,24 @@ class ServingServer:
         return kwargs
 
     @staticmethod
-    def _validate_chat_request(request: ChatCompletionRequest) -> str:
+    def _validate_chat_request(request: ChatCompletionRequest) -> str | dict:
         if "tools" in (request.chat_template_kwargs or {}):
             raise ValueError("tools must be supplied as a top-level request field")
         choice = request.tool_choice
         if choice is None:
             choice = "auto" if request.tools else "none"
-        if choice not in ("none", "auto"):
-            raise ValueError("only tool_choice 'auto' and 'none' are supported; constrained tool choice is unavailable")
-        if choice == "auto" and not request.tools:
-            raise ValueError("tool_choice 'auto' requires non-empty tools")
+        if isinstance(choice, dict):
+            name = choice.get("function", {}).get("name") if isinstance(choice.get("function"), dict) else None
+            if choice.get("type") != "function" or not name or name not in {
+                tool.function.name for tool in request.tools or ()
+            }:
+                raise ValueError("named tool_choice must select a declared function")
+        elif choice not in ("none", "auto", "required"):
+            raise ValueError("tool_choice must be auto, none, required, or a named function")
+        if choice != "none" and not request.tools:
+            raise ValueError("tool_choice requires non-empty tools")
         names = []
         for tool in request.tools or ():
-            if tool.function.strict:
-                raise ValueError("strict tool schemas require constrained decoding, which is not supported")
             names.append(tool.function.name)
         if len(set(names)) != len(names):
             raise ValueError("tool function names must be unique")
@@ -666,7 +679,7 @@ class ServingServer:
             parser_id=str(parser_id),
             initial_state="reasoning" if thinking else "content",
             include_reasoning=request.include_reasoning,
-            tool_choice=tool_choice,
+            tool_choice="none" if tool_choice == "none" else "auto",
             tool_names=tuple(tool.function.name for tool in request.tools or ()),
         )
 

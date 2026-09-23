@@ -487,8 +487,8 @@ def test_dspark_task_arg_orders_match_pypto_lib_abis() -> None:
     assert tuple(arg.arg for arg in decode.args.args) == (
         task_args_module._DECODE_TENSOR_ORDER
     )
-    assert len(task_args_module._PREFILL_TENSOR_ORDER) == 101
-    assert len(task_args_module._DECODE_TENSOR_ORDER) == 109
+    assert len(task_args_module._PREFILL_TENSOR_ORDER) == 103
+    assert len(task_args_module._DECODE_TENSOR_ORDER) == 111
 
 
 def test_drafter_and_markov_task_arg_orders_match_pypto_lib_abis() -> None:
@@ -1005,3 +1005,43 @@ def test_run_decode_accepts_and_redrafts(monkeypatch) -> None:
     runner._compiled.num_speculative_tokens = 0
     plain = runner.run_decode(SimpleNamespace(), decode)
     assert plain.num_draft_tokens is None
+
+
+def test_tool_masks_cover_target_prefix_and_reset_between_batches():
+    runner = _runner(speculative=True)
+    task_args = runner._decode_task_args[0]
+    seen = []
+
+    def preview(drafts, width):
+        seen.append((list(drafts), width))
+        words = task_args.tensors["tool_bitmask"].shape[-1]
+        return torch.arange(width, dtype=torch.int32)[:, None].expand(width, words)
+
+    runner._tool_constraints["r"] = SimpleNamespace(preview=preview)
+    runner._stage_tool_masks(task_args, ["r", "plain"], [(3, 8), (7, 0)], [[100, 101], []])
+    enabled = task_args.tensors["tool_mask_enabled"]
+    assert int(enabled.sum()) == 3
+    assert enabled[3, 8:11].tolist() == [1, 1, 1]
+    assert task_args.tensors["tool_bitmask"][3, 8:11, 0].tolist() == [0, 1, 2]
+    assert seen == [([100, 101], 3)]
+    runner._stage_tool_masks(task_args, ["plain"], [(3, 8)])
+    assert not enabled.any()
+
+
+def test_fused_decode_argument_order_includes_masks_at_the_end(monkeypatch):
+    from pypto_serving.model.deepseek_dspark import npu_runner as module
+
+    runner = _runner(speculative=True)
+    target_names = task_args_module._DECODE_TENSOR_ORDER
+    runner._decode_task_args = [SimpleNamespace(
+        names=target_names, build=lambda: target_names,
+        tensors={"tool_bitmask": "tool_bitmask", "tool_mask_enabled": "tool_mask_enabled"},
+    )]
+    kernel = _pypto_lib_function("decode_fwd_dspark", "l3_decode_fwd_dspark")
+    expected = tuple(arg.arg for arg in kernel.args.args)
+    target = tuple(name for name in target_names if name not in module._DSPARK_FUSED_INTERNAL_PREPARE_NAMES
+                   and name not in ("tool_bitmask", "tool_mask_enabled"))
+    monkeypatch.setattr(runner, "_fused_decode_device_state_args", lambda slot: expected[len(target):-2])
+    monkeypatch.setattr(runner, "_fused_decode_prepare_args", lambda slot: ())
+    monkeypatch.setattr(runner, "_fused_decode_drafter_args", lambda slot: ())
+    assert runner._bind_fused_decode_args(SimpleNamespace(buffer_slot=0)) == expected

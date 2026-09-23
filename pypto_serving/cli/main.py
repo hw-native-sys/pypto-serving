@@ -164,6 +164,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Generation
     parser.add_argument(
+        "--enforce-tool-schema", action="store_true",
+        help="Constrain DeepSeek V4 tool calls to request schemas, including tools with strict=false.",
+    )
+    parser.add_argument(
         "--prompt",
         action="append",
         default=None,
@@ -556,7 +560,7 @@ def _build_generate_config(data: dict[str, object] | None) -> GenerateConfig:
     """Materialise the parsed --generate-config into a GenerateConfig."""
     if data is None:
         return GenerateConfig()
-    valid_fields = {field.name for field in dataclasses.fields(GenerateConfig)}
+    valid_fields = {field.name for field in dataclasses.fields(GenerateConfig)} - {"tool_grammar"}
     unknown = set(data) - valid_fields
     if unknown:
         raise ValueError(
@@ -599,6 +603,7 @@ def _validate_generate_config_options(options: dict[str, object]) -> None:
         "stop": ("a list of strings", lambda v: isinstance(v, list) and all(isinstance(item, str) for item in v)),
         "stream": ("a boolean", lambda v: isinstance(v, bool)),
         "ignore_eos": ("a boolean", lambda v: isinstance(v, bool)),
+        "enforce_tool_schema": ("a boolean", lambda v: isinstance(v, bool)),
     }
     for name, (expected, check) in checks.items():
         if name in options and not check(options[name]):
@@ -988,6 +993,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     with _startup_log_context(enabled=not args.show_startup_logs):
         config = build_serving_engine_config(args)
         generate_config = _build_generate_config(args.generate_config)
+        if args.enforce_tool_schema:
+            generate_config = dataclasses.replace(generate_config, enforce_tool_schema=True)
 
     if args.prompt:
         run_generate(config, prompts=args.prompt, generate_config=generate_config)

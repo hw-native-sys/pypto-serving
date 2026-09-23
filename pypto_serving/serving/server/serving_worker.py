@@ -131,6 +131,8 @@ class WorkerProcess:
         # PLACEHOLDER_TOKEN for a decode input it hasn't sampled yet; the worker
         # substitutes from here. Entries cleared when a request is released.
         self._last_tokens: dict[str, list[int]] = {}
+        self._tool_constraints: dict[str, object] = {}
+        self._constraint_compiler = None
 
     def init_device_and_model(self) -> int:
         from pypto_serving.config.types import ModelRecord
@@ -379,6 +381,12 @@ class WorkerProcess:
             try:
                 self._wait_for_pending_decode_reclaims(cmd.finished_request_ids)
                 self._apply_command_lifecycle(cmd, release_cache_entries)
+                constrained_ids = [
+                    item.request_id for item in cmd.decode_requests
+                    if getattr(self._req_cache[item.request_id], "tool_grammar", None)
+                ]
+                self._wait_for_pending_decode_reclaims(constrained_ids)
+                self._initialize_tool_constraints(cmd)
             except Exception as exc:
                 logger.error("Worker command lifecycle failed: %s", exc, exc_info=True)
                 output_work_queue.put(
@@ -637,9 +645,34 @@ class WorkerProcess:
                     continue
             self._req_cache.pop(req_id, None)
             self._last_tokens.pop(req_id, None)
+            if getattr(self, "_tool_constraints", {}).pop(req_id, None) is not None:
+                self.executor.set_request_constraint(self.model_record.config.model_id, req_id, None)
             release_sampler = getattr(self.sampler, "release_requests", None)
             if callable(release_sampler):
                 release_sampler([req_id])
+
+    def _initialize_tool_constraints(self, cmd: StepCommand) -> None:
+        from pypto_serving.serving.structured_output import ConstraintCompiler
+
+        for item in [*cmd.prefill_requests, *cmd.decode_requests]:
+            request_id = item.request_id
+            grammar = getattr(getattr(self, "_req_cache", {}).get(request_id), "tool_grammar", None)
+            if not grammar:
+                continue
+            if not hasattr(self, "_tool_constraints"):
+                self._tool_constraints = {}
+            if request_id in self._tool_constraints:
+                continue
+            if (getattr(getattr(self.model_record, "runtime", None), "num_speculative_tokens", 0)
+                    and not self.executor.supports_device_tool_constraints):
+                raise ValueError("Tool schema constraints are not supported by this speculative executor")
+            if getattr(self, "_constraint_compiler", None) is None:
+                self._constraint_compiler = ConstraintCompiler(
+                    self.model_record.tokenizer, self.model_record.config.vocab_size,
+                )
+            constraint = self._constraint_compiler.create(grammar)
+            self._tool_constraints[request_id] = constraint
+            self.executor.set_request_constraint(self.model_record.config.model_id, request_id, constraint)
 
     def _execute_step(
         self,
@@ -647,6 +680,7 @@ class WorkerProcess:
         prepared_decode: _PreparedDecodeWork | None = None,
     ) -> StepResult:
         """Execute one step using the lightweight IPC protocol."""
+        self._initialize_tool_constraints(cmd)
         runtime_model = self.model_record.runtime_model
         new_tokens: dict[str, list[int]] = {}
         num_draft_tokens: dict[str, int] = {}
@@ -692,6 +726,9 @@ class WorkerProcess:
 
     def _record_last_tokens(self, request_id: str, tokens: list[int]) -> None:
         """Remember the latest sampled token for async placeholder resolution."""
+        constraint = getattr(self, "_tool_constraints", {}).get(request_id)
+        if constraint is not None:
+            constraint.accept(tokens)
         recent = self._last_tokens.get(request_id, [])
         recent.extend(int(t) for t in tokens)
         self._last_tokens[request_id] = recent[-1:]
@@ -1059,6 +1096,15 @@ class WorkerProcess:
                 params,
                 request_id,
             )
+        constraint = getattr(self, "_tool_constraints", {}).get(request_id)
+        if constraint is not None:
+            if logits is None or logits.numel() == 0:
+                raise RuntimeError("Executor did not return logits for constrained sampling")
+            # Sanitize before masking: sanitizing -inf afterwards would allow forbidden tokens.
+            masked = constraint.mask_logits(self.sampler._sanitize_logits(logits))
+            allowed_ids = torch.nonzero(torch.isfinite(masked), as_tuple=False).view(-1)
+            local_id = self.sampler.sample(masked[allowed_ids], params, request_id)
+            return int(allowed_ids[local_id])
         return self.sampler.sample(logits, params, request_id)
 
     def _allow_device_topk_sampling(self, scheduled: list) -> bool:
@@ -1067,6 +1113,7 @@ class WorkerProcess:
         cached_requests = [self._req_cache[item.request_id] for item in scheduled]
         return (
             max_device_topk > 0
+            and not any(getattr(request, "tool_grammar", None) for request in cached_requests)
             and all(request.temperature > 0.0 for request in cached_requests)
             and all(request.top_k is not None for request in cached_requests)
             and all(request.top_k > 0 for request in cached_requests)
@@ -1078,6 +1125,10 @@ class WorkerProcess:
         if not self.executor.supports_device_sampling:
             return False
         requests = [self._req_cache[item.request_id] for item in scheduled]
+        if any(getattr(request, "tool_grammar", None) for request in requests) and not getattr(
+            self.executor, "supports_device_tool_constraints", False
+        ):
+            return False
         return all(
             request.temperature <= 0.0
             or (

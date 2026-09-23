@@ -173,3 +173,12 @@ def test_dspark_topology_accepts_the_8_card_and_16_card_worlds():
         )
 
         cli._validate_dspark_topology(args)
+
+
+def test_enforce_tool_schema_is_a_server_option():
+    assert cli.build_parser().parse_args(["--model", "unused", "--enforce-tool-schema"]).enforce_tool_schema
+    assert cli._build_generate_config({"enforce_tool_schema": True}).enforce_tool_schema
+    with pytest.raises(ValueError, match="boolean"):
+        cli._build_generate_config({"enforce_tool_schema": "false"})
+    with pytest.raises(ValueError, match="unknown fields"):
+        cli._build_generate_config({"tool_grammar": "untrusted"})

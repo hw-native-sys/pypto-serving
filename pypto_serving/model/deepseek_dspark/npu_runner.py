@@ -1169,6 +1169,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._pending_decode_dispatch_lock = threading.Lock()
         self._pending_decode_dispatches: dict[int, PendingL3Dispatch] = {}
         self._l3_shared_buffers_ready = False
+        self._tool_constraints: dict[str, object] = {}
 
     # ------------------------------------------------------------------
     # cache topology
@@ -2309,6 +2310,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             self._ensure_l3_shared_buffers(model)
             inputs = self.prepare_prefill_inputs(model, batch)
             self._stage_prefill_inputs(inputs)
+            self._stage_tool_masks(self._prefill_task_args, batch.request_ids, inputs.sampled_slots)
             self._prefill_task_args.clear_outputs()
             args = self._prefill_dispatch_args(
                 inputs.physical_tokens, inputs.query_start_loc.shape[1] - 1
@@ -2896,6 +2898,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             return self._reclaim_fused_decode(self._launch_fused_decode(batch, inputs))
         with profile_span("DSparkModelRunner.decode.execute", cat="executor"):
             task_args = self._decode_task_args[inputs.buffer_slot]
+            self._stage_decode_tool_masks(inputs)
             fused_device_state = self._compiled.decode_device_state_fused
             if (
                 self.speculative
@@ -2941,6 +2944,29 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 num_draft_tokens=num_draft_tokens,
             )
 
+    def _stage_tool_masks(self, task_args, request_ids, sampled_slots, drafts=None) -> None:
+        """Stage masks only after the previous constrained step has been reclaimed."""
+        enabled = task_args.tensors["tool_mask_enabled"]
+        enabled.zero_()
+        for index, (request_id, (rank, row)) in enumerate(zip(request_ids, sampled_slots, strict=True)):
+            constraint = self._tool_constraints.get(request_id)
+            if constraint is None:
+                continue
+            proposal = [] if drafts is None else drafts[index]
+            masks = constraint.preview(proposal, len(proposal) + 1)
+            task_args.tensors["tool_bitmask"][rank, row:row + len(masks)].copy_(masks)
+            enabled[rank, row:row + len(masks)] = 1
+
+    def _stage_decode_tool_masks(self, inputs) -> None:
+        drafts = None
+        if self.speculative:
+            counts = self._verified_draft_counts(inputs)
+            drafts = [self._drafter_state(rid).pending_draft_tokens[:count]
+                      for rid, count in zip(inputs.request_ids, counts, strict=True)]
+        self._stage_tool_masks(
+            self._decode_task_args[inputs.buffer_slot], inputs.request_ids, inputs.sampled_slots, drafts,
+        )
+
     def _verified_draft_counts(self, inputs: DSparkPreparedDecodeInputs) -> list[int] | None:
         """Count consumed drafts before acceptance or redrafting mutates Host state."""
         if not self.speculative:
@@ -2973,12 +2999,15 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 strict=True,
             )
             if name not in _DSPARK_FUSED_INTERNAL_PREPARE_NAMES
+            and name not in ("tool_bitmask", "tool_mask_enabled")
         )
         return (
             *target_args,
             *self._fused_decode_device_state_args(inputs.buffer_slot),
             *self._fused_decode_prepare_args(inputs.buffer_slot),
             *self._fused_decode_drafter_args(inputs.buffer_slot),
+            task_args.tensors["tool_bitmask"],
+            task_args.tensors["tool_mask_enabled"],
         )
 
     def _launch_fused_decode(
@@ -2987,6 +3016,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         inputs: DSparkPreparedDecodeInputs,
     ) -> _DSparkPendingDecode:
         """Submit one command-lane-complete one-L2 decode snapshot."""
+        self._stage_decode_tool_masks(inputs)
         args = inputs.dispatch_args
         if args is None:
             # Direct synchronous callers may bypass ``prepare_decode``; keep

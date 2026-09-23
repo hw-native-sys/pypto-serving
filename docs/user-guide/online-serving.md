@@ -84,7 +84,7 @@ curl --noproxy "*" "$DEEPSEEK_BASE_URL/v1/chat/completions" \
 
 `auto` is the default when non-empty `tools` are supplied. The model can answer normally or return `message.tool_calls`, with each call containing `id`, `type: "function"`, and `function: {name, arguments}`. `arguments` is a **JSON string**, not a JSON object. `content` can be null; `reasoning`, when enabled, remains separate from both content and tools.
 
-The parser returns a model-generated function name even if that name is absent from this request's `tools`, matching vLLM's default DeepSeek V4 behavior. Serving does not provide built-in functions such as `read_file`; the client decides which calls it can execute. Check the returned name against the client's available tools before executing it.
+Without schema constraints, the parser returns a model-generated function name even if that name is absent from this request's `tools`, matching vLLM's default DeepSeek V4 behavior. Serving does not provide built-in functions such as `read_file`; the client decides which calls it can execute. Check the returned name against the client's available tools before executing it.
 
 For a successful call, the client should validate the function name and arguments against its schema before execution. Append the returned assistant message and a tool result that references the same call ID:
 
@@ -109,12 +109,40 @@ Send that history to the same chat endpoint, including `tools` again if another 
 Supported controls and limits:
 
 - `tool_choice: "none"` suppresses tool-call output. Recognized tool blocks are consumed when tools are supplied; ordinary no-tools chat keeps its existing parser behavior.
-- Multiple calls are supported. `parallel_tool_calls: false` exposes only the first call; it does not constrain sampling or execute tools serially.
-- `required`, named tool choices, and `strict: true` return HTTP 400 because constrained tool decoding is not implemented. Non-function tool types are rejected during request validation.
+- Multiple calls are supported. With constraints enabled, `parallel_tool_calls: false` limits generation to one call. Without constraints it exposes only the first parsed call. Serving never executes tools.
+- `tool_choice: "required"` and named function choices constrain the call structure. `strict: true` also constrains parameter schemas, including in `auto` mode. Explicit `strict: false` leaves parameter schemas relaxed unless the server override below is enabled. Non-function tool types are rejected during request validation.
 - Tools on a model without a registered tool parser are rejected. DSML formatting stays in the DeepSeek implementation, not the HTTP server or scheduler.
 - Tool-history argument values cannot contain the reserved `</｜DSML｜parameter>` delimiter, including inside nested JSON values. Tool-result content cannot contain `</tool_result>`. These inputs return HTTP 400 before generation rather than breaking the history encoding.
 - The parser preserves DSML parameter types without schema-based coercion or guessed JSON repairs. A length-truncated call can have incomplete arguments: do not execute it as a successful call.
 - This feature applies to `/v1/chat/completions`; `/v1/completions` remains an unparsed text API.
+
+### Server-side Tool Schema Constraints
+
+Add `--enforce-tool-schema` to the server command to constrain all declared tools,
+including clients that send `strict: false`. The client continues to send ordinary
+OpenAI-compatible `tools`; no client-specific parameter aliases or system prompt
+are needed. `tool_choice: auto` still permits a normal text answer and EOS.
+Constraints do not require the model to call a tool for every task or guarantee
+that a valid shell command performs the intended operation.
+
+Install the updated serving runtime dependencies (`xgrammar>=0.2.7`). Strict
+function parameters must be object schemas with declared `properties` and
+`required` fields. Undeclared parameters are excluded. Nested values use
+XGrammar's JSON Schema support; unsupported root composition keywords return
+HTTP 400 before streaming starts. Plain string values retain DSML's raw-string
+encoding; other values, including constrained strings, use its JSON encoding.
+
+The DSpark runner applies packed token masks before NPU greedy sampling and
+speculative acceptance. Draft previews roll back grammar state; only committed
+tokens advance it. Constrained requests wait for their preceding decode result
+before the next mask is prepared, reducing decode overlap. Other speculative
+executors currently reject constrained requests. CPU-logit sampling supports
+constraints without speculation.
+
+This change also updates the DSpark prefill/decode kernel arguments. Update the
+`pypto-lib` kernel sources together with serving. These kernels use new compile
+cache slot names to avoid loading binaries with the previous argument layout;
+the first launch recompiles them.
 
 ## Streaming
 

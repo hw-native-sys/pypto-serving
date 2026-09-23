@@ -262,7 +262,8 @@ def test_worker_close_releases_executor_once():
     assert worker.executor is None
 
 
-def test_worker_prepares_next_decode_while_prior_device_step_runs():
+@pytest.mark.parametrize("constrained", [False, True])
+def test_worker_prepares_next_decode_while_prior_device_step_runs(constrained):
     """MRV2 cadence: prepare and reclaim overlap the FIFO device lane."""
     model = _model(max_batch_size=1, eos_token_id=0)
     first_running = threading.Event()
@@ -280,6 +281,7 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
         supports_async_decode_reclaim = True
         supports_device_decode_embedding = True
         supports_device_sampling = True
+        supports_device_tool_constraints = True
         device_topk_sampling_k = 0
         device_token = 10
 
@@ -337,10 +339,12 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
     worker.sampler = _FixedSampler(token_id=0)
     worker.model_record = SimpleNamespace(runtime_model=model)
     worker._req_cache = {
-        "req": NewRequestData("req", [1], 0.0, 1.0, None),
+        "req": NewRequestData("req", [1], 0.0, 1.0, None, tool_grammar="grammar" if constrained else None),
         "old": NewRequestData("old", [2], 0.0, 1.0, None),
     }
     worker._last_tokens = {"req": [10]}
+    committed = []
+    worker._tool_constraints = {"req": SimpleNamespace(accept=committed.extend)} if constrained else {}
 
     first = StepCommand(
         new_requests=[],
@@ -376,10 +380,14 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
     assert released == []
     allow_first_finish.set()
 
-    # N+1 is fully bound by prepare, so its device dispatch is not held behind
-    # N's host-side output processing.
+    # Constrained dispatch must see the committed matcher state from N.
+    # Unconstrained dispatch can overlap N's host-side output processing.
     assert first_reclaim_running.wait(timeout=5)
-    assert second_dispatched.wait(timeout=5)
+    if constrained:
+        assert not second_dispatched.wait(timeout=0.1)
+        assert committed == []
+    else:
+        assert second_dispatched.wait(timeout=5)
     input_queue.put(encode_command(third))
     # Step N+2 maps back to N's slot and must not prepare until reclaim has
     # finished reading that slot's captured outputs.
@@ -401,6 +409,7 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
     assert second_result.new_tokens == {"req": [12]}
     assert third_result.new_tokens == {"req": [13]}
     assert released == ["old"]
+    assert committed == ([11, 12, 13] if constrained else [])
     assert calls.index(("prepare", 0)) < calls.index(("execute", 0))
     assert calls.index(("execute", 0)) < calls.index(("reclaim", 0))
 

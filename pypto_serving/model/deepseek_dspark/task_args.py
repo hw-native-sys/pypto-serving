@@ -159,6 +159,8 @@ def _prefill_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
         "csa_idx_slot_mapping_full": (torch.int64, (ranks, tokens)),
         "csa_state_slot_mapping_full": (torch.int64, (ranks, tokens)),
         "csa_inner_state_slot_mapping_full": (torch.int64, (ranks, tokens)),
+        "tool_bitmask": (torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_VOCAB_SIZE // 32)),
+        "tool_mask_enabled": (torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS)),
         "logit_row_indices": (torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS)),
         "sampled_ids": (
             torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_SAMPLED_IDS_PAD),
@@ -296,6 +298,8 @@ def _decode_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
         "hca_kv_seq_lens": (torch.int32, (ranks, local_batch)),
         "input_ids": (torch.int64, (ranks, local_tokens)),
         "num_tokens_per_owner": (torch.int32, (ranks,)),
+        "tool_bitmask": (torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_VOCAB_SIZE // 32)),
+        "tool_mask_enabled": (torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS)),
         "logit_row_indices": (torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS)),
         "sampled_ids": (
             torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_SAMPLED_IDS_PAD),
@@ -430,7 +434,7 @@ _PREFILL_TENSOR_ORDER = (
     "attn_stage", "x_mixed", "post_ffn", "comb_ffn", "ffn_out",
     "hc_head_fn", "hc_head_scale", "hc_head_base",
     "final_norm_w", "lm_head_weight", "logit_row_indices",
-    "dspark_target_hidden", "x_out", "logits", "sampled_ids",
+    "dspark_target_hidden", "x_out", "logits", "sampled_ids", "tool_bitmask", "tool_mask_enabled",
 )
 
 # Argument order for the packed ``l3_decode_fwd`` kernel (pypto-lib
@@ -477,7 +481,7 @@ _DECODE_TENSOR_ORDER = (
     "shared_w2", "shared_w2_scale",
     "hidden_workspace", "x_ping", "x_pong",
     "x_attn_active", "x_moe_next",
-    "pre_hc_hidden_out", "dspark_target_hidden", "x_out", "logits", "sampled_ids",
+    "pre_hc_hidden_out", "dspark_target_hidden", "x_out", "logits", "sampled_ids", "tool_bitmask", "tool_mask_enabled",
 )
 
 # Argument order for the speculative drafter (pypto-lib dspark_drafter.py,

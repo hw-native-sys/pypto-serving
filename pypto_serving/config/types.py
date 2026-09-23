@@ -32,6 +32,8 @@ class GenerateConfig:
     stop: tuple[str, ...] = ()
     stream: bool = False
     ignore_eos: bool = False
+    tool_grammar: str | None = None
+    enforce_tool_schema: bool = False
 
 
 @dataclass(frozen=True)

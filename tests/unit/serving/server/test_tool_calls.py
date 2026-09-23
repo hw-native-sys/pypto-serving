@@ -52,9 +52,6 @@ def test_tools_default_to_auto_and_freeze_only_names():
 
 
 @pytest.mark.parametrize("extra", [
-    {"tools": TOOLS, "tool_choice": "required"},
-    {"tools": TOOLS, "tool_choice": {"type": "function", "function": {"name": "lookup"}}},
-    {"tools": [{"type": "function", "function": {"name": "lookup", "strict": True}}]},
     {"tools": TOOLS * 2},
     {"tool_choice": "auto"},
     {"chat_template_kwargs": {"tools": TOOLS}},
@@ -476,3 +473,52 @@ def test_completions_remains_unparsed(stream):
         assert response.status_code == 200
         actual = response.json()["choices"][0]["text"]
     assert actual == expected
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("choice,strict,enforce", [
+    ("auto", False, True), ("auto", True, False), ("required", True, False),
+    ({"type": "function", "function": {"name": "lookup"}}, True, False),
+])
+def test_http_tool_constraint_controls_reach_engine(stream, choice, strict, enforce):
+    pytest.importorskip("xgrammar")
+    call = TOOL_START + invoke(city="London") + TOOL_END + "<eos>"
+    server = _replay_server((call, "FINISHED_EOS"))
+    server.generate_config = GenerateConfig(enforce_tool_schema=enforce)
+    original = server.engine.add_request
+    seen = []
+
+    async def record(request_id, prompt, config, **kwargs):
+        seen.append(config.tool_grammar)
+        async for output in original(request_id, prompt, config, **kwargs):
+            yield output
+
+    server.engine.add_request = record
+    tools = json.loads(json.dumps(TOOLS))
+    tools[0]["function"]["strict"] = strict
+    with TestClient(server.app) as client:
+        response = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Question"}],
+            "tools": tools, "tool_choice": choice, "stream": stream,
+        })
+        assert response.status_code == 200, response.text
+        message, reason, _ = _collect_chat(response, stream)
+        assert reason == "tool_calls"
+        assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {"city": "London"}
+    assert len(seen) == 1 and seen[0]
+    assert "lookup" in seen[0]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_unsupported_strict_schema_fails_before_generation(stream):
+    pytest.importorskip("xgrammar")
+    server = _server()
+    tools = json.loads(json.dumps(TOOLS))
+    tools[0]["function"]["strict"] = True
+    tools[0]["function"]["parameters"]["oneOf"] = []
+    with TestClient(server.app) as client:
+        response = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Question"}], "tools": tools, "stream": stream,
+        })
+    assert response.status_code == 400
+    assert "root schema keywords" in response.json()["message"]

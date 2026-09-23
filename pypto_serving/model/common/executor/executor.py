@@ -36,6 +36,16 @@ class ModelExecutor(ABC):
         self._kv_cache_manager = kv_cache_manager
 
     @property
+    def supports_device_tool_constraints(self) -> bool:
+        """Whether native sampling applies per-request grammar masks."""
+        return False
+
+    def set_request_constraint(self, model_id: str, request_id: str, constraint) -> None:
+        """Attach a grammar matcher to an executor with native constraint support."""
+        if constraint is not None and self.supports_device_tool_constraints:
+            raise NotImplementedError("Native tool constraints need a runner hook")
+
+    @property
     def supports_device_sampling(self) -> bool:
         """Return whether executor results may include already-sampled token IDs."""
         return False

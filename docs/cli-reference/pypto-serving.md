@@ -90,6 +90,7 @@ The ring options size Simpler runtime queues and output heap capacity. A single 
 | --- | --- | --- |
 | `--host` | `0.0.0.0` | HTTP bind host. |
 | `--port` | `8000` | HTTP bind port. |
+| `--enforce-tool-schema` | off | Enforce DeepSeek V4 tool parameter schemas even when clients send `strict: false`. See [tool constraints](../user-guide/online-serving.md#server-side-tool-schema-constraints). |
 
 ## Generation Controls
 
