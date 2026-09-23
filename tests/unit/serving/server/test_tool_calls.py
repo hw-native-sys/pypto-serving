@@ -51,6 +51,13 @@ def test_tools_default_to_auto_and_freeze_only_names():
     assert "strict" not in request.tools[0].model_dump(exclude_none=True)["function"]
 
 
+def test_shared_chat_preparation_keeps_tool_schema_for_pd_entrypoint():
+    prompt, tokens, _, spec = _server().prepare_chat(_request(tools=TOOLS))
+    assert tokens is None
+    assert spec.tool_names == ("lookup",)
+    assert "lookup" in prompt
+
+
 @pytest.mark.parametrize("extra", [
     {"tools": TOOLS, "tool_choice": "required"},
     {"tools": TOOLS, "tool_choice": {"type": "function", "function": {"name": "lookup"}}},
@@ -215,6 +222,7 @@ class _ReplayCore(ReplicaEngineCore):
         self.config = config
         self._request_contexts = {}
         self._pending_free_ids = []
+        self._step_timeout = 1.0
         self.freed = []
         self.scheduler = _ReplayScheduler(self, scripts, chunk_size)
 
@@ -222,8 +230,10 @@ class _ReplayCore(ReplicaEngineCore):
         pass
 
     def drain_frees(self):
-        self.freed.extend(self._pending_free_ids)
+        pending = tuple(self._pending_free_ids)
+        self.freed.extend(pending)
         self._pending_free_ids.clear()
+        self._acknowledge_worker_frees(pending)
 
 
 def _replay_server(*scripts, chunk_size=7, tokenizer=None):

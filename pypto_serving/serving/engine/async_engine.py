@@ -145,6 +145,9 @@ class _RequestContext:
     # flight when the request reaches its token limit; publishing completion
     # before that step drains leaves request-local K7 state visible to metrics.
     worker_release_done: asyncio.Event = field(default_factory=asyncio.Event)
+    # The terminal output is queued, but its worker release may still be in
+    # flight. Cancellation must not schedule a second release in that window.
+    terminal_output_queued: bool = False
     # When False (non-streaming), intermediate TokenOutputs are suppressed and
     # only the final one is enqueued — one queue push / one HTTP wake-up per
     # request instead of one per token. Stop-string detection still runs every
@@ -597,25 +600,31 @@ class ReplicaEngineCore:
             # membership check and freeing the same request on the worker twice.
             if not finished_normally and request_id in self._request_contexts:
                 self._request_contexts.pop(request_id, None)
-                self.scheduler.abort_request(request_id)
-                stat_logger = getattr(self, "_stat_logger", None)
-                if stat_logger is not None:
-                    stat_logger.finish_request(
-                        getattr(self, "_engine_index", 0),
-                        request_id,
-                        "FINISHED_ABORTED",
-                    )
-                # Aborted/cancelled ids must ride the next StepCommand's
-                # finished_request_ids, otherwise they leak in _req_cache /
-                # _worker_known_req_ids and pin device resources.
-                self._schedule_worker_free(request_id)
+                if not ctx.terminal_output_queued:
+                    self.scheduler.abort_request(request_id)
+                    stat_logger = getattr(self, "_stat_logger", None)
+                    if stat_logger is not None:
+                        stat_logger.finish_request(
+                            getattr(self, "_engine_index", 0),
+                            request_id,
+                            "FINISHED_ABORTED",
+                        )
+                    # Aborted/cancelled ids must ride the next StepCommand's
+                    # finished_request_ids, otherwise they leak in _req_cache /
+                    # _worker_known_req_ids and pin device resources.
+                    self._schedule_worker_free(request_id)
 
     async def abort_request(self, request_id: str) -> None:
-        ctx = self._request_contexts.pop(request_id, None)
+        ctx = self._request_contexts.get(request_id)
         if ctx is None:
             # Already finished/cleaned up: nothing pinned to release, and the
             # scheduler no longer tracks it. Avoid scheduling a duplicate free.
             return
+        if getattr(ctx, "terminal_output_queued", False):
+            # The terminal consumer still needs the context to observe the
+            # release acknowledgement. Its finally block handles disconnects.
+            return
+        self._request_contexts.pop(request_id, None)
         self.scheduler.abort_request(request_id)
         self._record_scheduler_stats()
         stat_logger = getattr(self, "_stat_logger", None)
@@ -1288,9 +1297,9 @@ class ReplicaEngineCore:
                 ),
             )
             if req_output.finished:
-                # Final output owns the already-scheduled worker release. Drop
-                # the context before waking a consumer that may close at once.
-                self._request_contexts.pop(req_output.request_id, None)
+                # Keep the context until the worker acknowledges its release;
+                # otherwise the terminal consumer cannot observe the barrier.
+                ctx.terminal_output_queued = True
             ctx.queue.put_nowait(token_output)
 
     def _detokenize_incrementally(self, ctx: _RequestContext) -> str:
