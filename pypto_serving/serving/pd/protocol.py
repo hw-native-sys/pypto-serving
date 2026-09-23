@@ -18,7 +18,7 @@ from typing import Union
 
 import msgspec
 
-from pypto_serving.serving.reasoning import OutputParserSpec
+from pypto_serving.serving.reasoning import OutputParserSpec, ParsedToolCall, ToolCallDelta
 
 from .config import PDCapabilities, PDRole
 
@@ -297,6 +297,8 @@ class DecodeOutputWire(msgspec.Struct, tag="decode_output", frozen=True):
     reasoning: str = ""
     text_delta: str = ""
     reasoning_delta: str = ""
+    tool_call_deltas: tuple[ToolCallDelta, ...] = ()
+    tool_calls: tuple[ParsedToolCall, ...] = ()
 
 
 class OpenRoute(msgspec.Struct, tag="open_route", frozen=True):

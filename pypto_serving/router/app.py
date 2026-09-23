@@ -13,14 +13,26 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Literal
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
 
 from pypto_serving.serving.pd.admission import PDBackpressureError
 from pypto_serving.serving.pd.observability import token_ids_sha256, write_startup_record
+from pypto_serving.serving.server.api_types import (
+    ChatCompletionChoice,
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    CompletionRequest,
+    ResponseUsage,
+    validate_chat_request,
+)
+from pypto_serving.serving.server.chat_format import (
+    chat_delta,
+    chat_finish_reason,
+    chat_message,
+    map_finish_reason,
+)
 
 from .client import NodeClient
 from .config import RouterConfig
@@ -29,41 +41,6 @@ from .directory import WorkerDirectory
 from .journal import RouterJournal
 from .policy import create_route_policy
 from .recovery import FixedPairRuntimeManager, RecoveryPhase
-
-
-ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
-
-
-class CompletionRequest(BaseModel):
-    model: str = ""
-    prompt: str | list[int] = ""
-    max_tokens: int | None = None
-    temperature: float | None = None
-    top_p: float | None = None
-    top_k: int | None = None
-    seed: int | None = None
-    stop: list[str] | None = None
-    stream: bool = False
-
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-
-class ChatCompletionRequest(BaseModel):
-    model: str = ""
-    messages: list[ChatMessage]
-    max_tokens: int | None = None
-    temperature: float | None = None
-    top_p: float | None = None
-    top_k: int | None = None
-    seed: int | None = None
-    stop: list[str] | None = None
-    stream: bool = False
-    reasoning_effort: ReasoningEffort | None = None
-    chat_template_kwargs: dict | None = None
-    include_reasoning: bool = True
 
 
 def create_router_app(
@@ -221,11 +198,18 @@ def create_router_app(
     async def chat_completions(request: Request):  # noqa: ANN202
         raw = await _bounded_body(request, config.max_request_bytes)
         public = ChatCompletionRequest.model_validate_json(raw)
+        validate_chat_request(public)
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         model = public.model
         if public.stream:
             return StreamingResponse(
-                _stream_chat(coordinator, raw, request_id, model),
+                _stream_chat(
+                    coordinator,
+                    raw,
+                    request_id,
+                    model,
+                    parallel_tool_calls=public.parallel_tool_calls,
+                ),
                 media_type="text/event-stream",
             )
         final = None
@@ -235,21 +219,23 @@ def create_router_app(
             final = output
         if final is None:
             raise RuntimeError("Decode completed without output")
+        response = ChatCompletionResponse(
+            id=request_id,
+            created=int(time.time()),
+            model=model,
+            choices=[ChatCompletionChoice(
+                message=chat_message(
+                    final.text,
+                    final.reasoning,
+                    final.tool_calls,
+                    parallel_tool_calls=public.parallel_tool_calls,
+                ),
+                finish_reason=chat_finish_reason(final),
+            )],
+            usage=ResponseUsage(**_usage(final)),
+        )
         return JSONResponse(
-            {
-                "id": request_id,
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": _chat_message(final),
-                        "finish_reason": _map_finish_reason(final.finish_reason),
-                    }
-                ],
-                "usage": _usage(final),
-            },
+            response.model_dump(),
             headers={
                 "x-pypto-token-ids-sha256": token_ids_sha256(final.token_ids)
             },
@@ -304,39 +290,65 @@ async def _stream_chat(
     raw: bytes,
     request_id: str,
     model: str,
+    *,
+    parallel_tool_calls: bool = True,
+):
+    try:
+        async for chunk in _stream_chat_chunks(
+            coordinator,
+            raw,
+            request_id,
+            model,
+            parallel_tool_calls=parallel_tool_calls,
+        ):
+            yield chunk
+    except (ValueError, RuntimeError) as exc:
+        # Decode/parser errors may occur after SSE headers have been sent.
+        # Keep the public stream well formed, as ordinary Serving does.
+        yield _sse({"error": {
+            "message": str(exc),
+            "type": "invalid_model_output" if isinstance(exc, ValueError) else "pd_decode_error",
+            "code": 400 if isinstance(exc, ValueError) else 503,
+        }})
+        yield b"data: [DONE]\n\n"
+
+
+async def _stream_chat_chunks(
+    coordinator: RouterCoordinator,
+    raw: bytes,
+    request_id: str,
+    model: str,
+    *,
+    parallel_tool_calls: bool,
 ):
     async for output in coordinator.generate("chat", raw, request_id):
-        finish_reason = _map_finish_reason(output.finish_reason) if output.finished else None
-        yield _sse(
-            {
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {
-                            "role": "assistant",
-                            "reasoning": output.reasoning_delta or None,
-                            "content": output.text_delta,
-                        },
-                        "finish_reason": finish_reason,
-                    }
-                ],
-            }
+        finish_reason = chat_finish_reason(output) if output.finished else None
+        chunk = ChatCompletionResponse(
+            id=request_id,
+            object="chat.completion.chunk",
+            created=int(time.time()),
+            model=model,
+            choices=[ChatCompletionChoice(
+                delta=chat_delta(
+                    output.text_delta,
+                    output.reasoning_delta,
+                    output.tool_call_deltas,
+                    parallel_tool_calls=parallel_tool_calls,
+                ),
+                finish_reason=finish_reason,
+            )],
         )
+        yield _sse(chunk.model_dump())
         if output.finished:
-            yield _sse(
-                {
-                    "id": request_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [],
-                    "usage": _usage(output),
-                }
+            usage_chunk = ChatCompletionResponse(
+                id=request_id,
+                object="chat.completion.chunk",
+                created=int(time.time()),
+                model=model,
+                choices=[],
+                usage=ResponseUsage(**_usage(output)),
             )
+            yield _sse(usage_chunk.model_dump())
             yield b"data: [DONE]\n\n"
 
 
@@ -351,12 +363,13 @@ def _cumulative_delta(current: str, previous: str, field: str) -> str:
     return current[len(previous) :]
 
 
-def _chat_message(output) -> dict:
-    return {
-        "role": "assistant",
-        "reasoning": output.reasoning or None,
-        "content": output.text,
-    }
+def _chat_message(output, *, parallel_tool_calls: bool = True) -> dict:
+    return chat_message(
+        output.text,
+        output.reasoning,
+        output.tool_calls,
+        parallel_tool_calls=parallel_tool_calls,
+    ).model_dump()
 
 
 def _usage(output) -> dict:
@@ -368,8 +381,4 @@ def _usage(output) -> dict:
 
 
 def _map_finish_reason(reason: str) -> str:
-    return {
-        "FINISHED_EOS": "eos",
-        "FINISHED_LENGTH": "length",
-        "FINISHED_STOP": "stop",
-    }.get(reason, reason.lower() if reason else "stop")
+    return map_finish_reason(reason)
