@@ -591,6 +591,8 @@ def test_mixed_decode_does_not_overwrite_prepared_next_step():
         assert next_prepared.wait(timeout=5)
 
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
     worker.config = SimpleNamespace(resolve_async_scheduling=lambda: True)
     worker.input_queue, worker.output_queue = Queue(), Queue()
     worker.profile_output_queue = None
