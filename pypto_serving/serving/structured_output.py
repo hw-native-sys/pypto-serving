@@ -77,7 +77,7 @@ def _strict_parameters(schema: dict) -> dict:
             raise ValueError("Tool parameter names must be representable as DSML attributes")
         raw_string = isinstance(value, dict) and value.get("type") == "string" and not set(value) - annotations
         if raw_string:
-            content = {"type": "any_text", "excludes": ["</｜DSML｜parameter>"]}
+            content = {"type": "any_text", "excludes": ["</\uff5cDSML\uff5cparameter>"]}
         else:
             # Preserve local references to sibling properties and definitions by
             # retaining the complete root schema under a private definition.
@@ -88,8 +88,8 @@ def _strict_parameters(schema: dict) -> dict:
             value_schema = {"$ref": f"#/$defs/{root_name}/properties/{pointer}",
                             "$defs": {root_name: relocated}}
             content = {"type": "json_schema", "json_schema": value_schema}
-        tag = {"type": "tag", "begin": f'<｜DSML｜parameter name="{name}" string="{str(raw_string).lower()}">',
-               "content": content, "end": "</｜DSML｜parameter>\n"}
+        tag = {"type": "tag", "begin": f'<\uff5cDSML\uff5cparameter name="{name}" string="{str(raw_string).lower()}">',
+               "content": content, "end": "</\uff5cDSML\uff5cparameter>\n"}
         elements.append(tag if name in required else {"type": "optional", "content": tag})
     return {"type": "sequence", "elements": elements} if elements else {"type": "const_string", "value": ""}
 
@@ -107,25 +107,31 @@ def _apply_strict_parameters(node, schemas: dict[str, dict]) -> None:
 
 
 def tool_grammar(tools: list[dict], choice: str | dict, *, thinking: bool,
-                 parallel: bool, enforce: bool = False) -> str | None:
+                 parallel: bool, strict_level: str = "auto") -> str | None:
     """Build a grammar from request schemas, without rewriting tool arguments."""
+    if strict_level not in ("auto", "function", "parameter"):
+        raise ValueError("tool strict level must be auto, function, or parameter")
     if not tools or choice == "none":
         return None
-    if choice == "auto" and not enforce and not any(t["function"].get("strict") for t in tools):
+    if choice == "auto" and strict_level == "auto" and not any(
+        t["function"].get("strict") is True for t in tools
+    ):
         return None
     tools = copy.deepcopy(tools)
-    if enforce:
-        for tool in tools:
-            tool["function"]["strict"] = True
+    for tool in tools:
+        # XGrammar treats an omitted strict field differently. Normalize every
+        # tool explicitly, including non-strict siblings of a strict tool.
+        function = tool["function"]
+        function["strict"] = strict_level == "parameter" or function.get("strict") is True
     xgr = _xgrammar()
     tag = xgr.get_model_structural_tag(
         "deepseek_v4", tools=tools, tool_choice=choice,
         reasoning=thinking, parallel_tool_calls=parallel,
     )
     document = tag.model_dump()
-    schemas = {f'<｜DSML｜invoke name="{tool["function"]["name"]}">\n':
+    schemas = {f'<\uff5cDSML\uff5cinvoke name="{tool["function"]["name"]}">\n':
                tool["function"].get("parameters", {"type": "object", "properties": {}})
-               for tool in tools if tool["function"].get("strict") is not False}
+               for tool in tools if tool["function"]["strict"]}
     _apply_strict_parameters(document, schemas)
     return _validate_grammar(json.dumps(document, ensure_ascii=False))
 

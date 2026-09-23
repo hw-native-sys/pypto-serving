@@ -58,7 +58,10 @@ The server converts chat messages to a prompt with the tokenizer's `apply_chat_t
 
 ## DeepSeek V4 Function Tools
 
-Tool calling is selected by the model tokenizer; no extra launcher flag or vLLM dependency is required. Serving encodes tool definitions and parses model output. **The client executes tools**, then sends the results in a new chat request.
+Enable automatic tool calling with `--enable-auto-tool-choice --tool-call-parser deepseek_v4`.
+No vLLM installation is required. Serving encodes tool definitions and parses model output.
+**The client executes tools**, then sends the results in a new chat request. For server-enforced
+parameter schemas, also set `--tool-strict-level parameter` as described below.
 
 Send this request to a **DeepSeek V4** server, not the Qwen server in the examples above. Set `DEEPSEEK_BASE_URL` to that server's host and port (8000 is the default serving port).
 
@@ -110,7 +113,7 @@ Supported controls and limits:
 
 - `tool_choice: "none"` suppresses tool-call output. Recognized tool blocks are consumed when tools are supplied; ordinary no-tools chat keeps its existing parser behavior.
 - Multiple calls are supported. With constraints enabled, `parallel_tool_calls: false` limits generation to one call. Without constraints it exposes only the first parsed call. Serving never executes tools.
-- `tool_choice: "required"` and named function choices constrain the call structure. `strict: true` also constrains parameter schemas, including in `auto` mode. Explicit `strict: false` leaves parameter schemas relaxed unless the server override below is enabled. Non-function tool types are rejected during request validation.
+- `tool_choice: "required"` and named function choices constrain the call structure. `strict: true` also constrains parameter schemas, including in `auto` mode. Omitted or false `strict` leaves that tool's parameter schema relaxed unless the server uses `parameter` strictness. Non-function tool types are rejected during request validation.
 - Tools on a model without a registered tool parser are rejected. DSML formatting stays in the DeepSeek implementation, not the HTTP server or scheduler.
 - Tool-history argument values cannot contain the reserved `</｜DSML｜parameter>` delimiter, including inside nested JSON values. Tool-result content cannot contain `</tool_result>`. These inputs return HTTP 400 before generation rather than breaking the history encoding.
 - The parser preserves DSML parameter types without schema-based coercion or guessed JSON repairs. A length-truncated call can have incomplete arguments: do not execute it as a successful call.
@@ -118,12 +121,46 @@ Supported controls and limits:
 
 ### Server-side Tool Schema Constraints
 
-Add `--enforce-tool-schema` to the server command to constrain all declared tools,
-including clients that send `strict: false`. The client continues to send ordinary
-OpenAI-compatible `tools`; no client-specific parameter aliases or system prompt
-are needed. `tool_choice: auto` still permits a normal text answer and EOS.
+Tool calling uses the same three server options as current vLLM main. For
+DeepSeek V4 with OpenCode or another OpenAI-compatible client, add:
+
+```bash
+--enable-auto-tool-choice \
+--tool-call-parser deepseek_v4 \
+--tool-strict-level parameter
+```
+
+`--enable-auto-tool-choice` defaults to off. Automatic requests (including tools
+with an omitted `tool_choice`) return HTTP 400 unless enabled. Required and named
+choices need the parser but do not need automatic selection enabled. The parser
+must match the model; currently only DeepSeek V4 is supported. Ordinary chat and
+reasoning parsing do not require these flags.
+
+| Strict level | Behavior |
+| --- | --- |
+| `auto` (default) | Required/named choices activate structural constraints. Automatic choices activate them only when at least one tool has `strict: true`. Each tool's parameters are constrained only if that tool is strict. |
+| `function` | Also constrain call markup and declared function names for automatic choices. Preserve each tool's explicit strictness. |
+| `parameter` | Additionally enforce every tool's parameter schema, even for omitted or false `strict`. |
+
+The server never weakens a tool's explicit `strict: true`. A strict tool does not
+make its non-strict siblings strict. `tool_choice: none` and requests without
+tools do not activate tool constraints. A non-default strict level requires a
+configured parser; it does not implicitly enable automatic tool choice.
+
+The client continues to send ordinary OpenAI-compatible `tools`; no client-specific
+parameter aliases or system prompt are needed. `tool_choice: auto` still permits a normal text answer and EOS.
 Constraints do not require the model to call a tool for every task or guarantee
 that a valid shell command performs the intended operation.
+
+Migration: existing launches that relied on implicit tool parsing must add
+`--enable-auto-tool-choice --tool-call-parser deepseek_v4`. The deprecated
+`--enforce-tool-schema` flag (and `enforce_tool_schema` generate-config field)
+still enables those two settings plus `--tool-strict-level parameter`, with a CLI
+warning. Combining that legacy override with strict level `function` is rejected.
+
+This alignment covers Chat Completions tool selection and strictness policy, not
+vLLM's full parser catalog, parser plugins, Responses API, or environment-variable
+configuration. See the [upstream tool calling reference](https://docs.vllm.ai/en/latest/features/tool_calling/).
 
 Install the updated serving runtime dependencies (`xgrammar>=0.2.7`). Strict
 function parameters must be object schemas with declared `properties` and

@@ -24,6 +24,7 @@ from pypto_serving.config.types import (
     PREFILL_CHUNK_SIZE_CHOICES,
     GenerateConfig,
     RuntimeConfig,
+    ToolCallingConfig,
 )
 from pypto_serving.model.model_family import detect_model_family, read_model_config
 from pypto_serving.observability.access_log import create_uvicorn_log_config
@@ -162,11 +163,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # Generation
+    # Tool calling
+    parser.add_argument(
+        "--enable-auto-tool-choice", action="store_true",
+        help="Allow the model to choose tools automatically; requires --tool-call-parser.",
+    )
+    parser.add_argument(
+        "--tool-call-parser", choices=["deepseek_v4"], default=None,
+        help="Model output format for tool calls (currently deepseek_v4 only).",
+    )
+    parser.add_argument(
+        "--tool-strict-level", choices=["auto", "function", "parameter"], default="auto",
+        help="Tool constraint floor: follow request strictness, constrain function names, or enforce all parameters.",
+    )
     parser.add_argument(
         "--enforce-tool-schema", action="store_true",
-        help="Constrain DeepSeek V4 tool calls to request schemas, including tools with strict=false.",
+        help="Deprecated: enable DeepSeek V4 automatic tools with --tool-strict-level parameter.",
     )
+    # Generation
     parser.add_argument(
         "--prompt",
         action="append",
@@ -757,12 +771,30 @@ def _validate_dspark_topology(args: argparse.Namespace) -> None:
         )
 
 
+def _build_tool_calling_config(args: argparse.Namespace, generate_config: GenerateConfig) -> ToolCallingConfig:
+    legacy = args.enforce_tool_schema or generate_config.enforce_tool_schema
+    if legacy:
+        if args.tool_strict_level not in ("auto", "parameter"):
+            raise ValueError("--enforce-tool-schema conflicts with --tool-strict-level function")
+        print(
+            "WARNING: --enforce-tool-schema / enforce_tool_schema is deprecated; use "
+            "--enable-auto-tool-choice --tool-call-parser deepseek_v4 --tool-strict-level parameter.",
+            file=sys.stderr,
+        )
+    return ToolCallingConfig(
+        enable_auto_tool_choice=args.enable_auto_tool_choice or legacy,
+        tool_call_parser=args.tool_call_parser or ("deepseek_v4" if legacy else None),
+        tool_strict_level="parameter" if legacy else args.tool_strict_level,
+    )
+
+
 def run_serve(
     config: EngineConfig,
     generate_config: GenerateConfig,
     *,
     host: str = "0.0.0.0",
     port: int = 8000,
+    tool_calling_config: ToolCallingConfig | None = None,
 ) -> None:
     import logging
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -788,7 +820,7 @@ def run_serve(
         tokenizer=tokenizer
     )
 
-    app = create_serving_app(async_engine, model_id, generate_config)
+    app = create_serving_app(async_engine, model_id, generate_config, tool_calling_config=tool_calling_config)
 
     @app.on_event("startup")
     async def startup():
@@ -803,6 +835,7 @@ def run_serve(
     print(f"  Model: {model_id} (loaded in worker process)")
     print(f"  Platform: {config.platform}, Device groups: {_format_device_groups(config)}")
     print(f"  Parallelism: {_format_parallelism(config)}")
+    print(f"  Tool calling: {tool_calling_config or ToolCallingConfig()}")
     print(f"  Max running requests: {config.max_num_running_reqs}")
     print(f"  Max scheduled tokens/iter: {config.max_num_scheduled_tokens}")
     print(f"  Configured prefill chunk size: {config.long_prefill_token_threshold}")
@@ -989,12 +1022,11 @@ def _validate_backend(backend: str) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _warn_deprecated_serving_profile_env(args)
+    generate_config = _build_generate_config(args.generate_config)
+    tool_calling_config = _build_tool_calling_config(args, generate_config)
 
     with _startup_log_context(enabled=not args.show_startup_logs):
         config = build_serving_engine_config(args)
-        generate_config = _build_generate_config(args.generate_config)
-        if args.enforce_tool_schema:
-            generate_config = dataclasses.replace(generate_config, enforce_tool_schema=True)
 
     if args.prompt:
         run_generate(config, prompts=args.prompt, generate_config=generate_config)
@@ -1004,6 +1036,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             generate_config,
             host=args.host,
             port=args.port,
+            tool_calling_config=tool_calling_config,
         )
     return 0
 

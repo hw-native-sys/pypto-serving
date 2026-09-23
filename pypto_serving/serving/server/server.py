@@ -18,7 +18,7 @@ import time
 import uuid
 from typing import Literal
 
-from pypto_serving.config.types import GenerateConfig
+from pypto_serving.config.types import GenerateConfig, ToolCallingConfig
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput
 from pypto_serving.serving.reasoning import OutputParserSpec, ToolCallDelta, supports_tool_calls
 from pypto_serving.tools.profile import (
@@ -184,12 +184,22 @@ class ServingServer:
         async_engine: AsyncLLMEngine,
         model_id: str,
         generate_config: GenerateConfig,
+        *,
+        tool_calling_config: ToolCallingConfig | None = None,
     ) -> None:
         self.engine = async_engine
         self.model_id = model_id
         # Server-wide generate defaults. Fields the HTTP request omits fall
         # back to this config; explicit per-request fields still win.
         self.generate_config = generate_config
+        if tool_calling_config is None and generate_config.enforce_tool_schema:
+            tool_calling_config = ToolCallingConfig(True, "deepseek_v4", "parameter")
+        self.tool_calling_config = tool_calling_config or ToolCallingConfig()
+        parser_id = getattr(getattr(self.engine, "tokenizer", None), "output_parser_id", None)
+        if self.tool_calling_config.tool_call_parser is not None and (
+            self.tool_calling_config.tool_call_parser != parser_id
+        ):
+            raise ValueError("--tool-call-parser does not match the model's output format")
         self.app = FastAPI(title="PyPTO Serving")
         self._profile_lock = asyncio.Lock()
         self._register_exception_handlers()
@@ -361,7 +371,8 @@ class ServingServer:
                 request.tool_choice or ("auto" if request.tools else "none"),
                 thinking=output_parser_spec is not None and output_parser_spec.initial_state == "reasoning",
                 parallel=request.parallel_tool_calls,
-                enforce=self.generate_config.enforce_tool_schema,
+                strict_level=("parameter" if self.generate_config.enforce_tool_schema
+                              else self.tool_calling_config.tool_strict_level),
             ),
         )
 
@@ -669,6 +680,11 @@ class ServingServer:
         has_tool_history = any(m.tool_calls or m.role == "tool" for m in request.messages)
         if (request.tools or has_tool_history) and not supports_tool_calls(parser_id):
             raise ValueError("the model has no tool-call parser")
+        policy = self.tool_calling_config
+        if tool_choice == "auto" and not policy.enable_auto_tool_choice:
+            raise ValueError('tool_choice="auto" requires --enable-auto-tool-choice and --tool-call-parser')
+        if tool_choice != "none" and not policy.tool_call_parser:
+            raise ValueError("tool calling requires --tool-call-parser deepseek_v4")
         if not parser_id:
             return None
         kwargs = self._chat_kwargs(request.chat_template_kwargs, request.reasoning_effort)
@@ -699,6 +715,8 @@ def create_serving_app(
     async_engine: AsyncLLMEngine,
     model_id: str,
     generate_config: GenerateConfig,
+    *,
+    tool_calling_config: ToolCallingConfig | None = None,
 ) -> FastAPI:
-    server = ServingServer(async_engine, model_id, generate_config)
+    server = ServingServer(async_engine, model_id, generate_config, tool_calling_config=tool_calling_config)
     return server.app

@@ -36,19 +36,78 @@ def compiler():
 
 
 def constraint(compiler, choice="required", thinking=False):
-    grammar = tool_grammar(TOOLS, choice, thinking=thinking, parallel=False, enforce=True)
+    grammar = tool_grammar(TOOLS, choice, thinking=thinking, parallel=False, strict_level="parameter")
     return TokenConstraint(xgr.GrammarMatcher(compiler.compile_structural_tag(grammar)), 257, 256)
 
 
 def test_auto_opt_in_and_server_override_do_not_mutate_client_schema():
     original = copy.deepcopy(TOOLS)
     assert tool_grammar(TOOLS, "auto", thinking=False, parallel=True) is None
-    assert tool_grammar(TOOLS, "none", thinking=False, parallel=True, enforce=True) is None
-    assert tool_grammar(TOOLS, "auto", thinking=False, parallel=True, enforce=True)
+    assert tool_grammar(TOOLS, "none", thinking=False, parallel=True, strict_level="parameter") is None
+    assert tool_grammar(TOOLS, "auto", thinking=False, parallel=True, strict_level="parameter")
     assert TOOLS == original
     strict = copy.deepcopy(TOOLS)
     strict[0]["function"]["strict"] = True
     assert tool_grammar(strict, "auto", thinking=False, parallel=True)
+
+
+@pytest.mark.parametrize("level", ["auto", "function", "parameter"])
+@pytest.mark.parametrize("strict", [None, False, True])
+@pytest.mark.parametrize("choice", ["auto", "required", {"type": "function", "function": {"name": "shell"}}])
+def test_vllm_strictness_matrix(compiler, level, strict, choice):
+    tools = copy.deepcopy(TOOLS)
+    if strict is None:
+        tools[0]["function"].pop("strict")
+    else:
+        tools[0]["function"]["strict"] = strict
+    original = copy.deepcopy(tools)
+    grammar = tool_grammar(tools, choice, thinking=False, parallel=False, strict_level=level)
+    assert tools == original
+    if choice == "auto" and level == "auto" and strict is not True:
+        assert grammar is None
+        return
+    compiled = compiler.compile_structural_tag(grammar)
+
+    def accepts(text):
+        return xgr.GrammarMatcher(compiled).accept_string(text)
+
+    assert accepts(START + PARAM + END)
+    assert not accepts(START.replace('name="shell"', 'name="execute"') + PARAM + END)
+    enforced = level == "parameter" or strict is True
+    assert accepts(START + PARAM.replace('name="command"', 'name="cmd"') + END) == (not enforced)
+    assert accepts(START + END) == (not enforced)
+    if choice == "auto":
+        state = TokenConstraint(xgr.GrammarMatcher(compiled), 257, 256)
+        state.accept(list(b"A normal answer."))
+        state.accept([256])
+        assert state.matcher.is_terminated()
+    else:
+        assert not xgr.GrammarMatcher(compiled).accept_token(256)
+
+
+@pytest.mark.parametrize("level", ["auto", "function", "parameter"])
+@pytest.mark.parametrize("sibling_strict", [None, False])
+def test_strict_tool_does_not_tighten_non_strict_sibling(compiler, level, sibling_strict):
+    tools = copy.deepcopy(TOOLS)
+    tools[0]["function"]["strict"] = True
+    sibling = copy.deepcopy(TOOLS[0])
+    sibling["function"]["name"] = "other"
+    if sibling_strict is None:
+        sibling["function"].pop("strict")
+    tools.append(sibling)
+    compiled = compiler.compile_structural_tag(
+        tool_grammar(tools, "auto", thinking=False, parallel=True, strict_level=level)
+    )
+    wrong_param = PARAM.replace('name="command"', 'name="cmd"')
+    assert not xgr.GrammarMatcher(compiled).accept_string(START + wrong_param + END)
+    other = START.replace('name="shell"', 'name="other"')
+    assert xgr.GrammarMatcher(compiled).accept_string(other + wrong_param + END) == (level != "parameter")
+
+
+@pytest.mark.parametrize("level", ["auto", "function", "parameter"])
+def test_none_and_no_tools_never_activate_constraints(level):
+    assert tool_grammar(TOOLS, "none", thinking=False, parallel=True, strict_level=level) is None
+    assert tool_grammar([], "auto", thinking=False, parallel=True, strict_level=level) is None
 
 
 @pytest.mark.parametrize("body,valid", [
@@ -143,7 +202,7 @@ def test_nested_json_schema_and_local_refs(compiler, value, valid):
     schema["properties"]["command"] = {"$ref": "#/$defs/options"}
     schema["$defs"] = {"options": {"type": "object", "properties": {
         "count": {"type": "integer", "minimum": 1}}, "required": ["count"], "additionalProperties": False}}
-    grammar = tool_grammar(tools, "required", thinking=False, parallel=False, enforce=True)
+    grammar = tool_grammar(tools, "required", thinking=False, parallel=False, strict_level="parameter")
     state = xgr.GrammarMatcher(compiler.compile_structural_tag(grammar))
     parameter = '<｜DSML｜parameter name="command" string="false">{"count":' + value + '}</｜DSML｜parameter>\n'
     assert state.accept_string(START + parameter + END) == valid
@@ -153,7 +212,7 @@ def test_unsupported_root_schema_is_explicit_error():
     tools = copy.deepcopy(TOOLS)
     tools[0]["function"]["parameters"]["oneOf"] = []
     with pytest.raises(ValueError, match="root schema keywords"):
-        tool_grammar(tools, "auto", thinking=False, parallel=True, enforce=True)
+        tool_grammar(tools, "auto", thinking=False, parallel=True, strict_level="parameter")
 
 
 def test_worker_constraint_lifecycle_and_ipc(compiler, monkeypatch):

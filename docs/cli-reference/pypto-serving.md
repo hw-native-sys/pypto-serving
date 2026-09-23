@@ -90,7 +90,10 @@ The ring options size Simpler runtime queues and output heap capacity. A single 
 | --- | --- | --- |
 | `--host` | `0.0.0.0` | HTTP bind host. |
 | `--port` | `8000` | HTTP bind port. |
-| `--enforce-tool-schema` | off | Enforce DeepSeek V4 tool parameter schemas even when clients send `strict: false`. See [tool constraints](../user-guide/online-serving.md#server-side-tool-schema-constraints). |
+| `--enable-auto-tool-choice` | off | Allow automatic tool selection. Requires `--tool-call-parser`. |
+| `--tool-call-parser` | unset | Select the tool output format. Currently supports `deepseek_v4` only, with a matching model. |
+| `--tool-strict-level` | `auto` | Server constraint floor: `auto`, `function`, or `parameter`. See [tool constraints](../user-guide/online-serving.md#server-side-tool-schema-constraints). |
+| `--enforce-tool-schema` | off | Deprecated compatibility option: enable automatic DeepSeek V4 tools with strict level `parameter`. |
 
 ## Generation Controls
 

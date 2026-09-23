@@ -182,3 +182,53 @@ def test_enforce_tool_schema_is_a_server_option():
         cli._build_generate_config({"enforce_tool_schema": "false"})
     with pytest.raises(ValueError, match="unknown fields"):
         cli._build_generate_config({"tool_grammar": "untrusted"})
+
+
+@pytest.mark.parametrize("level", ["auto", "function", "parameter"])
+def test_tool_options_reach_serving_app_from_cli(monkeypatch, level):
+    engine_config = object()
+    seen = {}
+    monkeypatch.setattr(cli, "build_serving_engine_config", lambda args: engine_config)
+
+    def serve(config, generation, **kwargs):
+        assert config is engine_config
+        seen.update(kwargs)
+
+    monkeypatch.setattr(cli, "run_serve", serve)
+    assert cli.main([
+        "--model", "unused", "--show-startup-logs", "--enable-auto-tool-choice",
+        "--tool-call-parser", "deepseek_v4", "--tool-strict-level", level,
+    ]) == 0
+    policy = seen["tool_calling_config"]
+    assert policy.enable_auto_tool_choice
+    assert policy.tool_call_parser == "deepseek_v4"
+    assert policy.tool_strict_level == level
+
+
+def test_tool_policy_defaults_and_legacy_migration(capsys):
+    generation = cli._build_generate_config(None)
+    default = cli._build_tool_calling_config(_parse_cli_args(["--model", "unused"]), generation)
+    assert not default.enable_auto_tool_choice
+    assert default.tool_call_parser is None
+    assert default.tool_strict_level == "auto"
+    args = _parse_cli_args(["--model", "unused", "--enforce-tool-schema"])
+    legacy = cli._build_tool_calling_config(args, generation)
+    assert legacy.enable_auto_tool_choice
+    assert legacy.tool_call_parser == "deepseek_v4"
+    assert legacy.tool_strict_level == "parameter"
+    assert "deprecated" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flags,match", [
+    (["--enable-auto-tool-choice"], "requires --tool-call-parser"),
+    (["--tool-strict-level", "function"], "requires --tool-call-parser"),
+    (["--tool-strict-level", "parameter"], "requires --tool-call-parser"),
+    (["--enforce-tool-schema", "--tool-strict-level", "function"], "conflicts"),
+])
+def test_invalid_tool_options_fail_before_model_setup(monkeypatch, flags, match):
+    def unexpected(args):
+        pytest.fail("Invalid tool flags must be rejected before model setup")
+
+    monkeypatch.setattr(cli, "build_serving_engine_config", unexpected)
+    with pytest.raises(ValueError, match=match):
+        cli.main(["--model", "unused", *flags])
