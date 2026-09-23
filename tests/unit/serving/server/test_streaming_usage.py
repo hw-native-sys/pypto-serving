@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import TokenOutput
+from pypto_serving.serving.pd.observability import token_ids_sha256
 from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.serving.server.server import (
     ChatCompletionRequest,
@@ -184,6 +185,33 @@ def test_http_eos_uses_standard_stop_finish_reason(stream, chat):
     assert response.status_code == 200
     choices = _parse_sse(response.content) if stream else [response.json()]
     assert [item["choices"][0]["finish_reason"] for item in choices if item["choices"]][-1] == "stop"
+
+
+def test_completion_accepts_exact_prompt_token_ids() -> None:
+    engine = _FakeEngine(
+        [
+            TokenOutput(
+                text="ok",
+                token_ids=(77,),
+                finished=True,
+                finish_reason="FINISHED_LENGTH",
+                prompt_tokens=4,
+                completion_tokens=1,
+            )
+        ]
+    )
+    server = ServingServer(
+        async_engine=engine,
+        model_id="test-model",
+        generate_config=GenerateConfig(max_new_tokens=1),
+    )
+    response = asyncio.run(
+        server._completions(CompletionRequest(prompt=[100, 100, 100, 100]))
+    )
+    assert response.status_code == 200
+    assert engine.calls[0][1] == ""
+    assert engine.calls[0][2]["prompt_token_ids"] == (100, 100, 100, 100)
+    assert response.headers["x-pypto-token-ids-sha256"] == token_ids_sha256((77,))
 
 
 def test_chat_serializes_reasoning_and_freezes_parser_spec() -> None:

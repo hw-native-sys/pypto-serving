@@ -199,6 +199,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         cache_ranks: int = DSPARK_RANKS,
         compile_kernels: bool = False,
         num_speculative_tokens: int = 0,
+        runner_extension_factory=None,
     ) -> None:
         worker_device_ids = tuple(device_ids) if device_ids is not None else (int(device_id),)
         super().__init__(
@@ -215,6 +216,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         # layout freezes every rank-derived axis (kernel import arguments,
         # scheduler cache partitions, packed-prefill capacity) from it.
         self._topology_layout = DSparkCacheLayout.for_ranks(cache_ranks)
+        self._runner_extension_factory = runner_extension_factory
         if self._num_speculative_tokens not in (0, DSPARK_SPECULATIVE_TOKENS):
             raise ValueError(
                 "DSpark speculation is fixed at K="
@@ -305,7 +307,12 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         """Create the DSpark runtime runner."""
         if not isinstance(compiled, DSparkCompiledKernels):
             raise TypeError("DeepSeekV4DSparkPyptoExecutor requires DSpark compiled metadata.")
-        return DSparkModelRunner(compiled=compiled)
+        return DSparkModelRunner(compiled=compiled, extension_factory=self._runner_extension_factory)
+
+    def runtime_extensions(self):
+        """Return explicitly configured runner services after model registration."""
+        return tuple(runner.runtime_extension for runner in self._runners.values()
+                     if runner.runtime_extension is not None)
 
     def _compile_model(self, model: RuntimeModel) -> DSparkCompiledKernels:
         """Validate DSpark metadata, compile the two L3 programs, and package."""

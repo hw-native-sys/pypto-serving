@@ -930,6 +930,11 @@ class DSparkPreparedDecodePlan:
     owner_ranks: tuple[int, ...]
     owner_rows: tuple[int, ...]
     buffer_slot: int
+    # A newly adopted PD request has no Decode-local device state yet.  Its
+    # first prepared step must bind P's sampled token on the device lane before
+    # publishing the local drafter state.  Later steps consume recurrent device
+    # state and remain fully token-independent.
+    bootstrap_request_ids: tuple[str, ...] = ()
     dispatch_inputs: DSparkPreparedDecodeInputs | None = None
 
 
@@ -1110,9 +1115,18 @@ def _accept_dspark_tokens(
 class DSparkModelRunner(L3DispatchMixin, ModelRunner):
     """Runner boundary for the DSpark target kernels."""
 
-    def __init__(self, *, compiled: DSparkCompiledKernels) -> None:
+    def __init__(self, *, compiled: DSparkCompiledKernels, extension_factory=None) -> None:
         super().__init__()
         self._compiled = compiled
+        self._dspark_completed_metrics = {
+            "requests": 0.0,
+            "verify_steps": 0.0,
+            "proposed_drafts": 0.0,
+            "matched_drafts": 0.0,
+            "accepted_tokens": 0.0,
+            "fallback_steps": 0.0,
+            "drafter_lease_scrubs": 0.0,
+        }
         self.cache_metadata = DSparkCacheMetadataBuilder(layout=compiled.layout)
         self._init_l3_dispatch(stacked=True)
         self._decode_run_config: Any = None
@@ -1150,6 +1164,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._dspark_device_state_meta: StackedDeviceTensor | None = None
         self._dspark_rope_device_tables: dict[str, StackedDeviceTensor] | None = None
         self._dspark_state_buffers: list[_DSparkDeviceStateBuffers] = []
+        # A drafter lease names persistent KV rows, not just Host bookkeeping.
+        # Once returned to the free list it must be scrubbed before another
+        # request can inherit it; otherwise a short PD-adopted prompt can see
+        # history left by an earlier long request in the same TP group.
+        self._drafter_dirty_leases: set[tuple[int, int]] = set()
+        self._drafter_lease_zero: torch.Tensor | None = None
         self._drafter_task_args: TaskArgs | None = None
         self._markov_task_args: TaskArgs | None = None
         self._fused_drafter_task_args: list[TaskArgs] = []
@@ -1169,6 +1189,21 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._pending_decode_dispatch_lock = threading.Lock()
         self._pending_decode_dispatches: dict[int, PendingL3Dispatch] = {}
         self._l3_shared_buffers_ready = False
+        self.runtime_extension = None
+        self._plan_builder = self._prepare_decode_plan
+        self._ready_dispatch = self._dispatch_ready_decode
+        if extension_factory is not None:
+            self.runtime_extension = extension_factory(
+                compiled=compiled,
+                worker=self._shared_l3_worker,
+                cache=self._materialize_decode_device_cache,
+                draft_states=self._drafter_states,
+                reserve_state=self._reserve_drafter_state,
+                initialize_device_state=self._initialize_dspark_device_state,
+                metrics=self.dspark_speculation_summary,
+            )
+            self._plan_builder = self.runtime_extension.wrap_prepare(self._plan_builder)
+            self._ready_dispatch = self.runtime_extension.wrap_dispatch(self._ready_dispatch)
 
     # ------------------------------------------------------------------
     # cache topology
@@ -1434,6 +1469,11 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
     @staticmethod
     def prepared_decode_requires_token(prepared: object) -> bool:
         """A fully staged one-L2 snapshot reads its next token from device state."""
+        if (
+            isinstance(prepared, DSparkPreparedDecodePlan)
+            and prepared.bootstrap_request_ids
+        ):
+            return True
         return not (
             isinstance(prepared, DSparkPreparedDecodePlan)
             and prepared.dispatch_inputs is not None
@@ -2281,15 +2321,25 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             ):
                 worker_kwargs: dict[str, Any] = {
                     "persistent": True,
-                    "reset_persistent_windows": False,
+                    # Keep the serving default fast, but retain a diagnostic
+                    # switch that can prove whether stale retained CommDomain
+                    # bytes are involved in a cross-request correctness fault.
+                    "reset_persistent_windows": os.environ.get(
+                        "PYPTO_DSPARK_RESET_PERSISTENT_WINDOWS", "0"
+                    )
+                    == "1",
                     "inherited_host_tensors": self._inherited_host_weights(),
                 }
+                if self.runtime_extension is not None:
+                    worker_kwargs.update(self.runtime_extension.worker_options())
                 run_config = getattr(self, "_l3_run_config", None)
                 if run_config is not None:
                     # Prewarm the full prefill arena before KV sizing reads free HBM.
                     worker_kwargs["config"] = run_config
                 worker = DistributedWorker(compiled, **worker_kwargs)
             self._l3_worker = worker
+            if self.runtime_extension is not None:
+                self.runtime_extension.worker_ready()
         return worker
 
     # ------------------------------------------------------------------
@@ -2820,7 +2870,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 "(the kernels expose device greedy sampling; no temperature ABI yet)"
             )
         with profile_span("DSparkModelRunner.decode.prepare_early", cat="executor"):
-            plan = self._prepare_decode_plan(batch, buffer_slot=buffer_slot)
+            plan = self._plan_builder(batch, buffer_slot=buffer_slot)
             if self._compiled.decode_full_fused:
                 inputs = self._stage_device_prepared_decode(plan)
                 plan = replace(plan, dispatch_inputs=inputs)
@@ -2873,6 +2923,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         if inputs is None or inputs.dispatch_args is None:
             raise RuntimeError("DSpark fused decode was not fully bound during prepare")
         self._ensure_l3_shared_buffers(model)
+        return self._ready_dispatch(batch, inputs)
+
+    def _dispatch_ready_decode(self, batch, inputs):
         for request_id in inputs.request_ids:
             if not self._drafter_state(request_id).device_state_initialized:
                 raise RuntimeError(
@@ -3393,11 +3446,29 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                         )
                     )
                 else:
-                    accepted.append([int(sampled[rank, row, 0].item())])
+                    token = int(sampled[rank, row, 0].item())
+                    accepted.append([token])
                     if state is not None:
                         state.verify_steps += 1
                         state.accepted_tokens += 1
                         state.committed_count += 1
+                        # A D-side adopted request intentionally has no
+                        # Prefill-local drafter cache.  Its first target Decode
+                        # is the correctness anchor; use that verified hidden
+                        # row to bootstrap proposals for the next K7 step.
+                        anchor = inputs.anchor_positions[index]
+                        rows_by_rank[rank].append(
+                            DSparkDrafterRequestRow(
+                                request_id=request_id,
+                                group=state.group,
+                                lease=state.lease,
+                                anchor=anchor,
+                                valid_count=1,
+                                token_source=token,
+                                hidden_row=inputs.verify_hidden_rows[index],
+                                decode_mode=True,
+                            )
+                        )
             self._maybe_log_acceptance()
             return accepted, rows_by_rank
 
@@ -3527,19 +3598,27 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
     def dspark_speculation_summary(self) -> dict[str, float]:
         """Aggregate speculation counters before scheduler truncation."""
         states = list(self._drafter_states.values())
-        verifies = sum(state.verify_steps for state in states)
+        verifies = self._dspark_completed_metrics["verify_steps"] + sum(
+            state.verify_steps for state in states
+        )
+        accepted = self._dspark_completed_metrics["accepted_tokens"] + sum(
+            state.accepted_tokens for state in states
+        )
         return {
-            "requests": float(len(states)),
+            "requests": self._dspark_completed_metrics["requests"] + float(len(states)),
+            "active_requests": float(len(states)),
             "verify_steps": float(verifies),
-            "proposed_drafts": float(sum(state.proposed_tokens for state in states)),
-            "matched_drafts": float(sum(state.matched_drafts for state in states)),
-            "accepted_tokens": float(sum(state.accepted_tokens for state in states)),
-            "fallback_steps": float(sum(state.fallback_steps for state in states)),
-            "mean_accepted_length": (
-                sum(state.accepted_tokens for state in states) / verifies
-            )
-            if verifies
-            else 0.0,
+            "proposed_drafts": self._dspark_completed_metrics["proposed_drafts"]
+            + float(sum(state.proposed_tokens for state in states)),
+            "matched_drafts": self._dspark_completed_metrics["matched_drafts"]
+            + float(sum(state.matched_drafts for state in states)),
+            "accepted_tokens": float(accepted),
+            "fallback_steps": self._dspark_completed_metrics["fallback_steps"]
+            + float(sum(state.fallback_steps for state in states)),
+            "drafter_lease_scrubs": self._dspark_completed_metrics[
+                "drafter_lease_scrubs"
+            ],
+            "mean_accepted_length": accepted / verifies if verifies else 0.0,
         }
 
     def _correct_dspark_seq_lens(self, batch: DecodeBatch) -> torch.Tensor:
@@ -3605,10 +3684,16 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     self._compiled.state_accept is not None
                     or self._compiled.decode_full_fused
                 ):
-                    state = self._drafter_state(batch.request_ids[request_index])
+                    request_id = batch.request_ids[request_index]
+                    state = self._drafter_states.get(request_id)
+                    if state is None:
+                        raise RuntimeError(
+                            f"DSpark speculation is active but request {request_id!r} has "
+                            "no drafter state (seeded before its first decode?)"
+                        )
                     if state.group != group:
                         raise RuntimeError(
-                            f"DSpark state group changed for {batch.request_ids[request_index]!r}: "
+                            f"DSpark state group changed for {request_id!r}: "
                             f"state={state.group}, scheduled={group}"
                         )
                     owner = state.lease % layout.tp_size
@@ -3646,6 +3731,18 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             )
 
         layout = self._compiled.layout
+        if self.speculative:
+            missing = [
+                request_id
+                for request_id in batch.request_ids
+                if request_id not in self._drafter_states
+            ]
+            if missing:
+                raise RuntimeError(
+                    "DSpark speculation is active but request "
+                    f"{missing[0]!r} has no drafter state "
+                    "(seeded before its first decode?)"
+                )
         assignment = self._decode_assignment(batch)
         actual_batch = len(batch.request_ids)
         group_batch = layout.decode_local_batch * layout.tp_size
@@ -4067,7 +4164,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         del model
         layout = self._compiled.layout
         if plan is None:
-            plan = self._prepare_decode_plan(batch, buffer_slot=buffer_slot)
+            plan = self._plan_builder(batch, buffer_slot=buffer_slot)
         elif plan.buffer_slot != buffer_slot:
             raise ValueError(
                 f"prepared DSpark slot {plan.buffer_slot} does not match requested slot {buffer_slot}"
@@ -4616,7 +4713,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
     # speculative drafter: leases, block rings, and staging (milestone 2)
     # ------------------------------------------------------------------
     def _reserve_drafter_state(
-        self, request_id: str, *, group: int, prompt_len: int
+        self, request_id: str, *, group: int, prompt_len: int, defer_device_clear: bool = False
     ) -> _DSparkDraftRequestState:
         """Take a stable group-local lease for one newly prefilled request.
 
@@ -4636,7 +4733,15 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 f"DSpark drafter leases exhausted for TP group {group} "
                 f"({DSPARK_DRAFTER_LEASES_PER_GROUP} live requests per group)"
             )
-        lease = free.pop()
+        lease = free[-1]
+        dirty_key = (group, lease)
+        if dirty_key in self._drafter_dirty_leases and not defer_device_clear:
+            # Keep the lease on the free list until every rank replica has
+            # been cleared.  A failed scrub therefore cannot publish a partly
+            # sanitized lease to a new request.
+            self._clear_drafter_lease(group, lease)
+            self._drafter_dirty_leases.remove(dirty_key)
+        free.pop()
         self._drafter_lease_generations[group][lease] += 1
         state = _DSparkDraftRequestState(
             group=group,
@@ -4646,6 +4751,62 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         )
         self._drafter_states[request_id] = state
         return state
+
+    def _clear_drafter_lease(self, group: int, lease: int) -> None:
+        """Synchronously zero one reused K7 KV ring on every TP replica.
+
+        The drafter pools live for the whole process and are addressed by a
+        stable six-block lease.  PD adoption deliberately does not transfer P
+        drafter state, so the first D redraft must begin from an empty private
+        history rather than bytes retained by the previous lease owner.
+        """
+        cache = self._device_scratch.get(("drafter", "kv_caches"))
+        if cache is None:
+            raise RuntimeError("DSpark drafter KV pool is not materialized")
+        if not 0 <= group < self._compiled.layout.partitions:
+            raise ValueError("DSpark drafter group is outside the runtime topology")
+        if not 0 <= lease < DSPARK_DRAFTER_LEASES_PER_GROUP:
+            raise ValueError("DSpark drafter lease is outside the private pool")
+
+        block_nbytes = DSPARK_BLOCK_SIZE * DSPARK_HEAD_DIM * 2
+        lease_nbytes = DSPARK_DRAFTER_RING_BLOCKS * block_nbytes
+        zero = self._drafter_lease_zero
+        if zero is None or zero.numel() != lease_nbytes:
+            zero = torch.zeros(lease_nbytes, dtype=torch.uint8)
+            self._drafter_lease_zero = zero
+
+        worker = self._shared_l3_worker()
+        layer_stride = DSPARK_DRAFTER_KV_BLOCKS * block_nbytes
+        lease_offset = lease * DSPARK_DRAFTER_RING_BLOCKS * block_nbytes
+        first_rank = group * self._compiled.layout.tp_size
+        for rank in range(first_rank, first_rank + self._compiled.layout.tp_size):
+            shard = cache.shards[rank]
+            for layer in range(DSPARK_DRAFT_LAYERS):
+                worker.copy_to(
+                    shard.data_ptr,
+                    zero.data_ptr(),
+                    lease_nbytes,
+                    dst_offset=layer * layer_stride + lease_offset,
+                    worker_id=rank,
+                )
+        if os.environ.get("PYPTO_DSPARK_VERIFY_DRAFTER_SCRUB") == "1":
+            readback = torch.empty(lease_nbytes, dtype=torch.uint8)
+            for rank in range(first_rank, first_rank + self._compiled.layout.tp_size):
+                shard = cache.shards[rank]
+                for layer in range(DSPARK_DRAFT_LAYERS):
+                    worker.copy_from(
+                        readback.data_ptr(),
+                        shard.data_ptr,
+                        lease_nbytes,
+                        src_offset=layer * layer_stride + lease_offset,
+                        worker_id=rank,
+                    )
+                    if torch.count_nonzero(readback).item():
+                        raise RuntimeError(
+                            "DSpark drafter lease scrub verification found non-zero bytes "
+                            f"(group={group}, lease={lease}, rank={rank}, layer={layer})"
+                        )
+        self._dspark_completed_metrics["drafter_lease_scrubs"] += 1
 
     def _drafter_state(self, request_id: str) -> _DSparkDraftRequestState:
         state = self._drafter_states.get(request_id)
@@ -5197,6 +5358,14 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         """Publish one complete request slot to every rank in its TP group."""
         if state.device_state_initialized:
             return
+        # Initial publication is device-lane work, not asynchronous Host
+        # preparation. Direct control copies must follow older run handles;
+        # this fence runs once for a new lease, never in steady Decode.
+        self._wait_for_pending_decode_dispatches()
+        dirty_key = (state.group, state.lease)
+        if dirty_key in self._drafter_dirty_leases:
+            self._clear_drafter_lease(*dirty_key)
+            self._drafter_dirty_leases.remove(dirty_key)
         token_row, meta_row = self._build_dspark_device_state_rows(state)
         worker = self._shared_l3_worker()
         token_state = self._materialize_dspark_device_state_tokens()
@@ -5590,6 +5759,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         for request_id in request_ids:
             state = self._drafter_states.pop(request_id, None)
             if state is not None:
+                self._dspark_completed_metrics["requests"] += 1
+                self._dspark_completed_metrics["verify_steps"] += state.verify_steps
+                self._dspark_completed_metrics["proposed_drafts"] += state.proposed_tokens
+                self._dspark_completed_metrics["matched_drafts"] += state.matched_drafts
+                self._dspark_completed_metrics["accepted_tokens"] += state.accepted_tokens
+                self._dspark_completed_metrics["fallback_steps"] += state.fallback_steps
                 if state.verify_steps:
                     logger.info(
                         "DSpark speculation finished: request=%s verifies=%d "
@@ -5604,13 +5779,31 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                         state.fallback_steps,
                     )
                 free = self._drafter_free_leases.setdefault(state.group, [])
-                free.append(state.lease)
+                if os.environ.get("PYPTO_DSPARK_DELAY_DRAFTER_LEASE_REUSE") == "1":
+                    # Diagnostic mode: consume every never-used lease in a TP
+                    # group before returning to a released address.  This
+                    # distinguishes address-local drafter state from other
+                    # group-persistent target/drafter workspaces.
+                    free.insert(0, state.lease)
+                else:
+                    free.append(state.lease)
+                self._drafter_dirty_leases.add((state.group, state.lease))
 
     def close(self) -> None:
         worker = self._l3_worker
+        close_error: BaseException | None = None
         try:
             if worker is not None:
-                worker.close()
+                try:
+                    if self.runtime_extension is not None:
+                        self.runtime_extension.close()
+                except BaseException as exc:
+                    close_error = exc
+                try:
+                    worker.close()
+                except BaseException as exc:
+                    if close_error is None:
+                        close_error = exc
         finally:
             self._l3_worker = None
             self._cache_group_num_blocks.clear()
@@ -5640,6 +5833,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             # every drafter-era reference must drop here or staging buffers,
             # weights, and per-request states outlive the model.
             self._drafter_states.clear()
+            self._drafter_dirty_leases.clear()
+            self._drafter_lease_zero = None
             for leases in self._drafter_free_leases.values():
                 leases.clear()
             self._drafter_context_staging.clear()
@@ -5669,3 +5864,5 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             self._markov_task_args = None
             with self._pending_decode_dispatch_lock:
                 self._pending_decode_dispatches.clear()
+        if close_error is not None:
+            raise close_error

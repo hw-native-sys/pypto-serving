@@ -8,10 +8,29 @@
 # -----------------------------------------------------------------------------------------------------------
 """Public API for PyPTO Serving."""
 
-from pypto_serving.config.parallel import ParallelConfig
-from pypto_serving.config.types import GenerateConfig, KVCacheGroupSpec, KVCacheSpec, RuntimeConfig
-from pypto_serving.model.model_loader import ModelLoader
-from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig, ReplicaEngineCore
+from importlib import import_module
+
+# Transfer contracts are intentionally importable on control hosts that do not
+# carry Torch or an NPU runtime. Preserve the package's public API lazily.
+_EXPORT_MODULES = {
+    "ParallelConfig": "config.parallel",
+    "GenerateConfig": "config.types",
+    "KVCacheGroupSpec": "config.types",
+    "KVCacheSpec": "config.types",
+    "RuntimeConfig": "config.types",
+    "ModelLoader": "model.model_loader",
+    "AsyncLLMEngine": "serving.engine.async_engine",
+    "EngineConfig": "serving.engine.async_engine",
+    "ReplicaEngineCore": "serving.engine.async_engine",
+}
+
+
+def __getattr__(name):
+    if name not in _EXPORT_MODULES:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(f"{__name__}.{_EXPORT_MODULES[name]}"), name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "AsyncLLMEngine",

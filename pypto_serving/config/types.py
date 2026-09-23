@@ -335,6 +335,9 @@ class DecodeBatch:
     block_ids: list[list[int]] = field(default_factory=list)
     block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
     cache_partitions: list[int | None] = field(default_factory=list)
+    # Requests with preinitialized target cache that still require local model
+    # state initialization. Ordinary batches carry no additional request list.
+    initial_request_ids: tuple[str, ...] = ()
     # Optional MTP context for models (e.g. DeepSeek V4) that decode two real
     # trailing tokens per step. ``prev_token_ids`` holds the token id at absolute
     # position ``seq_len-2`` per request (shape ``[B]``) and ``prev_hidden_states``

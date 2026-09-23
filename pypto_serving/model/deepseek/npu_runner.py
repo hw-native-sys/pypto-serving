@@ -4572,12 +4572,14 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         shard = device_pre_hc.shards[owner_rank]
         worker_id = device_pre_hc.worker_ids[owner_rank]
         row_nbytes = host_row.numel() * host_row.element_size()
+        copy_kwargs = {"worker_id": worker_id}
+        if row:
+            copy_kwargs["src_offset"] = row * row_nbytes
         self._shared_l3_worker().copy_from(
             host_row.data_ptr(),
             shard.data_ptr,
             row_nbytes,
-            src_offset=row * row_nbytes,
-            worker_id=worker_id,
+            **copy_kwargs,
         )
         return host_row.detach().cpu().clone()
 

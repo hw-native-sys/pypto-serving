@@ -204,7 +204,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Speculative decoding configuration as JSON. DeepSeek V4 supports "
             "method='mtp' with a positive num_speculative_tokens, and "
-            "method='dspark' with num_speculative_tokens 0 (target-only serving)."
+            "method='dspark' with either 0 (non-PD target-only serving) or 7 "
+            "(K7 DSpark; required for PD serving)."
         ),
     )
 
@@ -235,6 +236,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Enable chunked prefill (default: True). Use --no-enable-chunked-prefill to disable.",
     )
+    parser.add_argument(
+        "--pd-role",
+        choices=("disabled", "prefill", "decode"),
+        default="disabled",
+        help="P/D execution role (default: disabled).",
+    )
+    parser.add_argument(
+        "--pd-config",
+        default="",
+        help="Shared external-Router PD JSON config.",
+    )
+    parser.add_argument("--pd-node-id", default="", help="Select a node when a role has multiple endpoints.")
 
     # Profiling
     parser.add_argument(
@@ -277,7 +290,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
-    model_variant = _resolve_model_variant(args)
+    model_variant = resolve_model_variant(args)
     _validate_prefill_chunk_size(
         model_family,
         args.long_prefill_token_threshold,
@@ -327,6 +340,11 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         num_speculative_tokens > 1 and model_variant != "dspark"
     ):
         enable_prefix_cache = False
+    runtime_config = _build_runtime_config(
+        args,
+        model_family=model_family,
+        config_data=model_config_data,
+    )
     return EngineConfig(
         model_id=args.served_model_name or Path(args.model).name,
         model_dir=model_dir,
@@ -336,11 +354,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         parallel_config=parallel_config,
         executor_cls=_executor_cls_for_model_family(model_family, variant=model_variant),
         executor_kwargs=executor_kwargs,
-        runtime_config=_build_runtime_config(
-            args,
-            model_family=model_family,
-            config_data=model_config_data,
-        ),
+        runtime_config=runtime_config,
         profile_config=_build_profile_config(args),
         max_num_running_reqs=args.max_num_seqs,
         max_num_scheduled_tokens=args.max_num_batched_tokens,
@@ -367,7 +381,7 @@ def _build_runtime_config(
     supports_chunked_prefill_with_speculation = True
     speculative_prefix_cache_replay_tokens = 0
     requires_homogeneous_prefill_decode = False
-    if model_family == "deepseek_v4" and _resolve_model_variant(args) == "dspark":
+    if model_family == "deepseek_v4" and resolve_model_variant(args) == "dspark":
         from pypto_serving.model.deepseek_dspark.npu_runner import (
             DSPARK_PREFILL_MAX_TOKENS,
             DSPARK_SLIDING_WINDOW,
@@ -447,7 +461,7 @@ def _build_runtime_config(
     )
 
 
-def _resolve_model_variant(args: argparse.Namespace) -> str:
+def resolve_model_variant(args: argparse.Namespace) -> str:
     """Return the DeepSeek V4 serving variant selected by the speculative config."""
     speculative_config = getattr(args, "speculative_config", None)
     if speculative_config is None:
@@ -758,6 +772,8 @@ def run_serve(
     *,
     host: str = "0.0.0.0",
     port: int = 8000,
+    application_factory=None,
+    endpoint_summary: str | None = None,
 ) -> None:
     import logging
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -778,21 +794,25 @@ def run_serve(
         initially_active=False,
     )
     tokenizer = load_tokenizer(config.model_dir)
-    async_engine = AsyncLLMEngine(
-        config=config,
-        tokenizer=tokenizer
-    )
-
-    app = create_serving_app(async_engine, model_id, generate_config)
+    if application_factory is None:
+        async_engine = AsyncLLMEngine(config=config, tokenizer=tokenizer)
+        app = create_serving_app(async_engine, model_id, generate_config)
+        start, stop = async_engine.start, async_engine.stop
+    else:
+        application = application_factory(config=config, tokenizer=tokenizer, generate_config=generate_config)
+        app = application.app
+        start, stop = application.start, application.stop
 
     @app.on_event("startup")
     async def startup():
-        await async_engine.start()
+        await start()
 
     @app.on_event("shutdown")
     async def shutdown():
-        await async_engine.stop()
-        merge_profile()
+        try:
+            await stop()
+        finally:
+            merge_profile()
 
     print(f"Starting PyPTO serving on {host}:{port}")
     print(f"  Model: {model_id} (loaded in worker process)")
@@ -826,8 +846,8 @@ def run_serve(
         print(f"  Chunked prefill with speculative decoding: {speculation_support}")
     print(f"  Prefix cache: {'enabled' if config.enable_prefix_cache else 'disabled'}")
     print(f"  Chunk prefill: {'enabled' if config.enable_chunk_prefill else 'disabled'}")
-    endpoints = "/v1/completions, /v1/chat/completions, /v1/models, /health, /metrics"
-    if get_profiler().enabled:
+    endpoints = endpoint_summary or "/v1/completions, /v1/chat/completions, /v1/models, /health, /metrics"
+    if get_profiler().enabled and endpoint_summary is None:
         endpoints += ", /start_profile, /stop_profile"
     print(f"  Endpoints: {endpoints}")
 
@@ -985,8 +1005,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _warn_deprecated_serving_profile_env(args)
 
+    application_factory = None
     with _startup_log_context(enabled=not args.show_startup_logs):
-        config = build_serving_engine_config(args)
+        if args.pd_role != "disabled":
+            from pypto_serving.serving.pd.integration import build_pd_launch
+
+            config, application_factory = build_pd_launch(
+                args, build_serving_engine_config, model_variant=resolve_model_variant(args),
+            )
+        else:
+            if args.pd_config:
+                raise ValueError("--pd-config requires --pd-role prefill or decode")
+            config = build_serving_engine_config(args)
         generate_config = _build_generate_config(args.generate_config)
 
     if args.prompt:
@@ -997,6 +1027,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             generate_config,
             host=args.host,
             port=args.port,
+            application_factory=application_factory,
+            endpoint_summary="/health, /internal/pd/*" if application_factory is not None else None,
         )
     return 0
 

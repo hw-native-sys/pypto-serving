@@ -42,11 +42,14 @@ from pypto_serving.serving.server.ipc import (
     PLACEHOLDER_TOKEN,
     DecodeRequest,
     NewRequestData,
+    ControlCommand,
+    MAX_CONTROL_PAYLOAD_BYTES,
     PrefillRequest,
     ProfileCommand,
     ShutdownCommand,
     StepCommand,
     decode_profile_result,
+    decode_control_result,
     decode_result,
     encode_command,
 )
@@ -137,6 +140,14 @@ class EngineConfig:
 class _RequestContext:
     request: Request
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    # The public terminal output is held until the worker has acknowledged the
+    # FIFO release command.  In async mode a speculative step may already be in
+    # flight when the request reaches its token limit; publishing completion
+    # before that step drains leaves request-local K7 state visible to metrics.
+    worker_release_done: asyncio.Event = field(default_factory=asyncio.Event)
+    # The terminal output is queued, but its worker release may still be in
+    # flight. Cancellation must not schedule a second release in that window.
+    terminal_output_queued: bool = False
     # When False (non-streaming), intermediate TokenOutputs are suppressed and
     # only the final one is enqueued — one queue push / one HTTP wake-up per
     # request instead of one per token. Stop-string detection still runs every
@@ -190,8 +201,12 @@ class ReplicaEngineCore:
     def __init__(
         self,
         config: EngineConfig,
-        tokenizer
+        tokenizer,
+        *,
+        scheduler_factory=Scheduler,
+        worker_factory=spawn_worker,
     ) -> None:
+        self._worker_factory = worker_factory
         runtime = config.resolve_runtime_config()
         self.config = replace(config, runtime_config=runtime)
         self.tokenizer = tokenizer
@@ -227,7 +242,7 @@ class ReplicaEngineCore:
         )
         # Validate before worker startup, while the manager's pools are still lazy.
         scheduler_config.validate_cache_groups(runtime.kv_cache_groups)
-        self.scheduler = Scheduler(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)
+        self.scheduler = scheduler_factory(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)
 
         self._request_contexts: dict[str, _RequestContext] = {}
         self._running = False
@@ -240,6 +255,8 @@ class ReplicaEngineCore:
         self._output_queue = None
         self._profile_output_queue = None
         self._profile_lock = asyncio.Lock()
+        self._control_counter = 0
+        self._result_handler = self._process_step_output
         # Tracks which request_ids the worker has already received via
         # NewRequestData — prompt tokens are sent exactly once per request.
         self._worker_known_req_ids: set[str] = set()
@@ -248,6 +265,13 @@ class ReplicaEngineCore:
         # executing on the device while the next is scheduled. Each entry is the
         # SchedulerOutput awaiting its StepResult. Sync mode leaves this empty.
         self._batch_queue: deque[tuple[int, SchedulerOutput]] = deque()
+        # Request ids released by each queued worker step.  A successful reply
+        # is the acknowledgement that the FIFO worker applied the release
+        # before executing that step.
+        self._worker_free_ids_by_step: dict[int, tuple[str, ...]] = {}
+        # Requests admitted with an existing cache may need one step to seed
+        # model-local recurrent state. Apply that result before pipelining.
+        self._initialization_steps: set[int] = set()
         self._max_in_flight = 2 if self._async_scheduling else 1
         self._step_counter = 0
         # step_ids of dispatched steps whose worker StepResult has NOT yet been
@@ -299,7 +323,7 @@ class ReplicaEngineCore:
                 profile_output_q,
                 ready_event,
                 num_pages_value,
-            ) = spawn_worker(self.config)
+            ) = self._worker_factory(self.config)
             self._worker_process = process
             self._input_queue = input_q
             self._output_queue = output_q
@@ -398,6 +422,63 @@ class ReplicaEngineCore:
                     f"received active={result.active}"
                 )
 
+    async def call_worker(self, operation: str, payload: bytes = b"") -> bytes:
+        """Run an ordered owner/cache operation in the spawned worker process."""
+        if not isinstance(operation, str) or not operation or len(operation) > 128:
+            raise ValueError("worker operation must be a nonempty bounded string")
+        if (
+            not isinstance(payload, bytes)
+            or len(payload) > MAX_CONTROL_PAYLOAD_BYTES
+        ):
+            raise ValueError(
+                "worker payload must be bytes no larger than "
+                f"{MAX_CONTROL_PAYLOAD_BYTES >> 20} MiB"
+            )
+        async with self._profile_lock:
+            input_queue = self._input_queue
+            output_queue = self._profile_output_queue
+            if input_queue is None or output_queue is None:
+                raise RuntimeError("Serving worker is not running")
+            self._control_counter += 1
+            command_id = self._control_counter
+            input_queue.put(
+                encode_command(
+                    ControlCommand(
+                        command_id=command_id,
+                        operation=operation,
+                        payload=payload,
+                    )
+                )
+            )
+            try:
+                raw_result = await asyncio.to_thread(
+                    output_queue.get,
+                    timeout=self._step_timeout,
+                )
+            except queue.Empty as exc:
+                raise RuntimeError(
+                    f"Worker control timed out ({self._step_timeout:g}s)"
+                ) from exc
+            result = decode_control_result(raw_result)
+            if result.command_id != command_id:
+                raise RuntimeError("Worker control response ordering mismatch")
+            if result.error:
+                raise RuntimeError(result.error)
+            return result.payload
+
+    def configure_result_handler(self, factory):
+        """Bind a result consumer before execution; ordinary mode uses the native consumer."""
+        if self._running:
+            raise RuntimeError("result handling must be configured before engine startup")
+        self._result_handler = factory(self._process_step_output)
+
+    def finish_prefilled_request(self, request_id):
+        self.scheduler.finish_prefilled_request(request_id)
+        self._schedule_worker_free(request_id)
+        context = self._request_contexts.get(request_id)
+        if context is not None:
+            context.queue.put_nowait(TokenOutput(finished=True, finish_reason="FINISHED_PREFILL"))
+
     def generate_request_id(self) -> str:
         self._request_counter += 1
         return f"serving-req-{self._request_counter}"
@@ -421,6 +502,7 @@ class ReplicaEngineCore:
         *,
         on_queued: Callable[[], None] | None = None,
         prompt_token_ids: Sequence[int] | None = None,
+        cache_partition: int | None = None,
         output_parser_spec: OutputParserSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
@@ -440,15 +522,22 @@ class ReplicaEngineCore:
                 top_p=config.top_p,
                 top_k=config.top_k,
                 seed=config.seed,
+                cache_partition=cache_partition,
             )
 
+            if request_id in self._request_contexts:
+                raise ValueError(f"request {request_id!r} is already active")
             ctx = _RequestContext(
                 request=request,
                 stream=getattr(config, "stream", True),
                 output_parser=create_output_parser(output_parser_spec, self.tokenizer),
             )
             self._request_contexts[request_id] = ctx
-            self.scheduler.add_request(request)
+            try:
+                self.scheduler.add_request(request)
+            except BaseException:
+                self._request_contexts.pop(request_id, None)
+                raise
             stat_logger = getattr(self, "_stat_logger", None)
             if stat_logger is not None:
                 stat_logger.record_queued(getattr(self, "_engine_index", 0), request_id)
@@ -464,6 +553,14 @@ class ReplicaEngineCore:
                 args={"request_id": request_id, "prompt_tokens": len(prompt_token_ids)},
             )
 
+        async with contextlib.aclosing(self._iterate_request_output(ctx)) as outputs:
+            async for output in outputs:
+                yield output
+
+    async def _iterate_request_output(self, ctx):
+        request = ctx.request
+        request_id = request.request_id
+        prompt_token_ids = request.prompt_token_ids
         finished_normally = False
         try:
             while True:
@@ -472,9 +569,18 @@ class ReplicaEngineCore:
                     self._request_contexts.pop(request_id, None)
                     raise queued
                 output: TokenOutput = queued
-                yield output
                 if output.finished:
+                    try:
+                        await asyncio.wait_for(
+                            ctx.worker_release_done.wait(),
+                            timeout=self._step_timeout,
+                        )
+                    except TimeoutError as exc:
+                        raise RuntimeError(
+                            f"worker request release timed out ({self._step_timeout:g}s)"
+                        ) from exc
                     finished_normally = True
+                    self._request_contexts.pop(request_id, None)
                     e2e = time.time() - request.arrival_time
                     n_out = len(request.output_token_ids)
                     logger.info(
@@ -482,7 +588,9 @@ class ReplicaEngineCore:
                         request_id, len(prompt_token_ids), n_out, output.finish_reason,
                         e2e, (n_out / e2e) if e2e > 0 else 0.0,
                     )
+                    yield output
                     break
+                yield output
         finally:
             # Only cancellation/disconnect needs cleanup here. On normal
             # completion the request already finished in the scheduler and
@@ -492,25 +600,31 @@ class ReplicaEngineCore:
             # membership check and freeing the same request on the worker twice.
             if not finished_normally and request_id in self._request_contexts:
                 self._request_contexts.pop(request_id, None)
-                self.scheduler.abort_request(request_id)
-                stat_logger = getattr(self, "_stat_logger", None)
-                if stat_logger is not None:
-                    stat_logger.finish_request(
-                        getattr(self, "_engine_index", 0),
-                        request_id,
-                        "FINISHED_ABORTED",
-                    )
-                # Aborted/cancelled ids must ride the next StepCommand's
-                # finished_request_ids, otherwise they leak in _req_cache /
-                # _worker_known_req_ids and pin device resources.
-                self._schedule_worker_free(request_id)
+                if not ctx.terminal_output_queued:
+                    self.scheduler.abort_request(request_id)
+                    stat_logger = getattr(self, "_stat_logger", None)
+                    if stat_logger is not None:
+                        stat_logger.finish_request(
+                            getattr(self, "_engine_index", 0),
+                            request_id,
+                            "FINISHED_ABORTED",
+                        )
+                    # Aborted/cancelled ids must ride the next StepCommand's
+                    # finished_request_ids, otherwise they leak in _req_cache /
+                    # _worker_known_req_ids and pin device resources.
+                    self._schedule_worker_free(request_id)
 
     async def abort_request(self, request_id: str) -> None:
-        ctx = self._request_contexts.pop(request_id, None)
+        ctx = self._request_contexts.get(request_id)
         if ctx is None:
             # Already finished/cleaned up: nothing pinned to release, and the
             # scheduler no longer tracks it. Avoid scheduling a duplicate free.
             return
+        if getattr(ctx, "terminal_output_queued", False):
+            # The terminal consumer still needs the context to observe the
+            # release acknowledgement. Its finally block handles disconnects.
+            return
+        self._request_contexts.pop(request_id, None)
         self.scheduler.abort_request(request_id)
         self._record_scheduler_stats()
         stat_logger = getattr(self, "_stat_logger", None)
@@ -526,6 +640,55 @@ class ReplicaEngineCore:
         # See note in add_request's finally block: schedule worker-side cleanup.
         self._schedule_worker_free(request_id)
 
+    async def add_prefilled_request(
+        self,
+        *,
+        reservation_id: str,
+        request_id: str,
+        prompt_token_ids: Sequence[int],
+        first_token: int,
+        max_new_tokens: int,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int | None = None,
+        seed: int | None = None,
+        stop_strings: tuple[str, ...] = (),
+        eos_token_id: int | None = None,
+        stream: bool = True,
+        output_parser_spec: OutputParserSpec | None = None,
+    ) -> AsyncGenerator[TokenOutput, None]:
+        """Continue from an initialized cache lease using normal output delivery."""
+        parser = create_output_parser(output_parser_spec, self.tokenizer)
+        request, first_output = self.scheduler.admit_prefilled(
+            reservation_id=reservation_id,
+            request_id=request_id,
+            prompt_token_ids=list(prompt_token_ids),
+            first_token=first_token,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+            stop_strings=stop_strings,
+            eos_token_id=eos_token_id,
+        )
+        ctx = _RequestContext(
+            request=request,
+            stream=stream,
+            output_parser=parser,
+        )
+        if first_output.finished:
+            # No Decode worker state was created when the initial token already
+            # satisfies the request.
+            ctx.worker_release_done.set()
+        self._request_contexts[request_id] = ctx
+        self._publish_outputs([first_output], release_worker=False)
+        if first_output.finished:
+            ctx.worker_release_done.set()
+        async with contextlib.aclosing(self._iterate_request_output(ctx)) as outputs:
+            async for output in outputs:
+                yield output
+
     def _schedule_worker_free(self, request_id: str) -> None:
         """Queue a request id for worker-side release on the next StepCommand.
 
@@ -535,6 +698,13 @@ class ReplicaEngineCore:
         """
         if request_id not in self._pending_free_ids:
             self._pending_free_ids.append(request_id)
+
+    def _acknowledge_worker_frees(self, request_ids: Sequence[str]) -> None:
+        """Publish worker FIFO release acknowledgements to request producers."""
+        for request_id in request_ids:
+            context = self._request_contexts.get(request_id)
+            if context is not None:
+                context.worker_release_done.set()
 
     async def _engine_loop(self) -> None:
         """Pipelined schedule/execute loop.
@@ -560,8 +730,15 @@ class ReplicaEngineCore:
 
             if self._batch_queue:
                 # Block on the oldest in-flight step when the queue is full, or
-                # when we could not dispatch anything new this iteration.
-                if len(self._batch_queue) >= self._max_in_flight or not dispatched:
+                # when we could not dispatch anything new this iteration.  A
+                # request's initialization step must also complete before
+                # steady-state pipelining begins.
+                oldest_step_id = self._batch_queue[0][0]
+                if (
+                    len(self._batch_queue) >= self._max_in_flight
+                    or not dispatched
+                    or oldest_step_id in self._initialization_steps
+                ):
                     applied = await self._await_and_apply_oldest()
                     if not applied:
                         continue
@@ -598,6 +775,11 @@ class ReplicaEngineCore:
 
         finished_ids = self._pending_free_ids.copy()
         self._pending_free_ids.clear()
+        requires_initial_step = any(
+            scheduled.request.requires_initial_step
+            and scheduled.request.request_id not in self._worker_known_req_ids
+            for scheduled in scheduler_output.scheduled_requests
+        )
         self._step_counter += 1
         with profile_span(
             "scheduler.queue_worker_step",
@@ -608,6 +790,16 @@ class ReplicaEngineCore:
                 scheduler_output, finished_ids, step_id=self._step_counter
             )
             self._input_queue.put(encode_command(step_cmd))
+        reregistered_ids = {
+            request.request_id for request in step_cmd.new_requests
+        }
+        release_only_ids = tuple(
+            request_id
+            for request_id in finished_ids
+            if request_id not in reregistered_ids
+        )
+        if release_only_ids:
+            self._worker_free_ids_by_step[self._step_counter] = release_only_ids
 
         stat_logger = getattr(self, "_stat_logger", None)
         if stat_logger is not None:
@@ -623,6 +815,10 @@ class ReplicaEngineCore:
         self.scheduler.advance_after_schedule(scheduler_output)
 
         self._batch_queue.append((self._step_counter, scheduler_output))
+        if requires_initial_step:
+            if not hasattr(self, "_initialization_steps"):
+                self._initialization_steps = set()
+            self._initialization_steps.add(self._step_counter)
         return True
 
     async def _await_and_apply_oldest(self) -> bool:
@@ -634,6 +830,10 @@ class ReplicaEngineCore:
         oldest dispatched step is the next result off the output queue.
         """
         step_id, scheduler_output = self._batch_queue.popleft()
+        getattr(self, "_initialization_steps", set()).discard(step_id)
+        finished_ids = getattr(self, "_worker_free_ids_by_step", {}).pop(
+            step_id, ()
+        )
         try:
             with profile_span("scheduler.wait_worker_output", cat="scheduler"):
                 raw_output = await self._get_live_result()
@@ -660,6 +860,8 @@ class ReplicaEngineCore:
             self._handle_step_error(step_id, scheduler_output, result_pending=False)
             return False
 
+        self._acknowledge_worker_frees(finished_ids)
+
         # Unwrap list[int] values back to int | list[int] for update_from_output.
         new_tokens: dict[str, int | list[int]] = {
             req_id: (tokens[0] if len(tokens) == 1 else tokens)
@@ -670,7 +872,7 @@ class ReplicaEngineCore:
             cat="scheduler",
             args={"new_tokens": len(new_tokens)},
         ):
-            self._process_step_output(scheduler_output, new_tokens, step_result.num_draft_tokens)
+            self._result_handler(scheduler_output, new_tokens, step_result.num_draft_tokens)
         return True
 
     async def _get_live_result(self) -> bytes:
@@ -723,6 +925,13 @@ class ReplicaEngineCore:
 
             # Register with worker the first time this request is scheduled.
             if req_id not in self._worker_known_req_ids:
+                context = self._request_contexts.get(req_id)
+                release_done = getattr(context, "worker_release_done", None)
+                if release_done is not None:
+                    # A preempted request may release and re-register in this
+                    # same FIFO command.  Its old-incarnation acknowledgement
+                    # must not satisfy the eventual terminal release barrier.
+                    release_done.clear()
                 new_requests.append(NewRequestData(
                     request_id=req_id,
                     prompt_token_ids=list(req.prompt_token_ids),
@@ -730,6 +939,7 @@ class ReplicaEngineCore:
                     top_p=req.top_p,
                     top_k=req.top_k,
                     seed=req.seed,
+                    initialize_from_cache=req.requires_initial_step,
                 ))
                 self._worker_known_req_ids.add(req_id)
 
@@ -827,6 +1037,8 @@ class ReplicaEngineCore:
         step_result = decode_result(raw_output)
         if step_result.error:
             logger.error(f"Worker cleanup-step returned error: {step_result.error}")
+            return
+        self._acknowledge_worker_frees(finished_ids)
 
     def _handle_step_error(
         self,
@@ -857,6 +1069,8 @@ class ReplicaEngineCore:
         # Their results are still in transit and must be drained.
         while self._batch_queue:
             sid, batch = self._batch_queue.popleft()
+            getattr(self, "_initialization_steps", set()).discard(sid)
+            getattr(self, "_worker_free_ids_by_step", {}).pop(sid, None)
             self._discard_result_step_ids.add(sid)
             failed_batches.append(batch)
 
@@ -924,7 +1138,15 @@ class ReplicaEngineCore:
             )
             stat_logger.record_iteration(engine_index, iteration)
         self._record_scheduler_stats()
+
+        self._publish_outputs(request_outputs)
+
+    def _publish_outputs(self, request_outputs, *, release_worker=True):
+        stat_logger = getattr(self, "_stat_logger", None)
+        engine_index = getattr(self, "_engine_index", 0)
         for req_output in request_outputs:
+            if req_output.prefill_finished:
+                continue
             ctx = self._request_contexts.get(req_output.request_id)
             if ctx is None:
                 continue
@@ -962,7 +1184,8 @@ class ReplicaEngineCore:
                 # forever. A one-shot full decode at finish guarantees the final
                 # text matches the offline baseline instead of being truncated.
                 text = self._finalize_detokenization(ctx)
-                self._schedule_worker_free(req_output.request_id)
+                if release_worker:
+                    self._schedule_worker_free(req_output.request_id)
 
             # Stop detection above operates on the original generated text.
             # Semantic parsing only changes the public presentation channels.
@@ -1032,7 +1255,8 @@ class ReplicaEngineCore:
                     self._request_contexts.pop(req_output.request_id, None)
                     ctx.queue.put_nowait(exc)
                     self.scheduler.abort_request(req_output.request_id)
-                    self._schedule_worker_free(req_output.request_id)
+                    if release_worker:
+                        self._schedule_worker_free(req_output.request_id)
                     if stat_logger is not None:
                         stat_logger.finish_request(engine_index, req_output.request_id, "error")
                     self._record_scheduler_stats()
@@ -1073,9 +1297,9 @@ class ReplicaEngineCore:
                 ),
             )
             if req_output.finished:
-                # Final output owns the already-scheduled worker release. Drop
-                # the context before waking a consumer that may close at once.
-                self._request_contexts.pop(req_output.request_id, None)
+                # Keep the context until the worker acknowledges its release;
+                # otherwise the terminal consumer cannot observe the barrier.
+                ctx.terminal_output_queued = True
             ctx.queue.put_nowait(token_output)
 
     def _detokenize_incrementally(self, ctx: _RequestContext) -> str:
@@ -1292,7 +1516,6 @@ class AsyncLLMEngine:
             await asyncio.gather(*tasks, return_exceptions=True)
             await self.stop()
             raise
-
     async def stop(self) -> None:
         """Stop all DP engine cores."""
         await asyncio.gather(*(core.stop() for core in reversed(self._cores)))
@@ -1385,11 +1608,11 @@ class AsyncLLMEngine:
 
     @property
     def scheduler(self) -> Scheduler:
-        return self._single_core().scheduler
+        return self.single_core().scheduler
 
     @property
     def kv_cache_manager(self) -> KvCacheManager:
-        return self._single_core().kv_cache_manager
+        return self.single_core().kv_cache_manager
 
     async def add_request(
         self,
@@ -1397,11 +1620,12 @@ class AsyncLLMEngine:
         prompt: str,
         config,
         *,
+        prompt_token_ids: Sequence[int] | None = None,
         output_parser_spec: OutputParserSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         arrival_monotonic = time.monotonic()
         replica_idx = self._select_replica()
-        prompt_token_ids = self._tokenize_prompt(prompt)
+        prompt_token_ids = self.resolve_prompt_tokens(prompt, prompt_token_ids)
         self.metrics.start_request(
             replica_idx,
             request_id,
@@ -1493,7 +1717,7 @@ class AsyncLLMEngine:
         self._route_counter = (replica_idx + 1) % replica_count
         return replica_idx
 
-    def _single_core(self):
+    def single_core(self):
         if len(self._cores) != 1:
             raise AttributeError("scheduler and kv_cache_manager are only exposed for single-replica engines")
         return self._cores[0]
@@ -1505,6 +1729,21 @@ class AsyncLLMEngine:
         if not prompt_token_ids:
             raise ValueError("Prompt tokenization produced no tokens.")
         return prompt_token_ids
+
+    def resolve_prompt_tokens(
+        self,
+        prompt: str,
+        prompt_token_ids: Sequence[int] | None,
+    ) -> tuple[int, ...]:
+        if prompt_token_ids is None:
+            return tuple(int(token) for token in self._tokenize_prompt(prompt))
+        tokens = tuple(prompt_token_ids)
+        if not tokens or any(type(token) is not int or token < 0 for token in tokens):
+            raise ValueError("Prompt token IDs must be nonempty non-negative integers.")
+        vocab_size = getattr(self.tokenizer, "vocab_size", None)
+        if isinstance(vocab_size, int) and any(token >= vocab_size for token in tokens):
+            raise ValueError("Prompt token ID is outside the tokenizer vocabulary.")
+        return tokens
 
     def _estimate_request_load(self, prompt_token_ids: Sequence[int] | None, config) -> int:
         prompt_tokens = len(prompt_token_ids) if prompt_token_ids is not None else 0

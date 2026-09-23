@@ -33,6 +33,7 @@ import msgspec
 # sampled token is known, so it sends this placeholder and the worker substitutes
 # the token it last sampled for that request.
 PLACEHOLDER_TOKEN: int = -1
+MAX_CONTROL_PAYLOAD_BYTES: int = 16 << 20
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +53,9 @@ class NewRequestData(msgspec.Struct):
     top_p: float
     top_k: int | None
     seed: int | None = None
+    # The target cache was adopted from a preinitialized cache lease.  This is
+    # request metadata only; no device address or provider envelope crosses IPC.
+    initialize_from_cache: bool = False
 
 
 class PrefillRequest(msgspec.Struct):
@@ -123,8 +127,16 @@ class ProfileCommand(msgspec.Struct, tag="profile"):
     active: bool
 
 
+class ControlCommand(msgspec.Struct, tag="control"):
+    """Address-free control request to the worker that owns cache/device state."""
+
+    command_id: int
+    operation: str
+    payload: bytes = b""
+
+
 # Union used for the decoder — tag field ("type") discriminates.
-Command = Union[StepCommand, ShutdownCommand, ProfileCommand]
+Command = Union[StepCommand, ShutdownCommand, ProfileCommand, ControlCommand]
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +168,14 @@ class ProfileResult(msgspec.Struct):
     error: str | None = None
 
 
+class ControlResult(msgspec.Struct):
+    """Ordered result for one :class:`ControlCommand`."""
+
+    command_id: int
+    payload: bytes = b""
+    error: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Codec — thin wrappers so call sites are transport-agnostic
 # ---------------------------------------------------------------------------
@@ -166,6 +186,8 @@ _result_encoder: msgspec.msgpack.Encoder = msgspec.msgpack.Encoder()
 _result_decoder: msgspec.msgpack.Decoder = msgspec.msgpack.Decoder(StepResult)
 _profile_result_encoder: msgspec.msgpack.Encoder = msgspec.msgpack.Encoder()
 _profile_result_decoder: msgspec.msgpack.Decoder = msgspec.msgpack.Decoder(ProfileResult)
+_control_result_encoder: msgspec.msgpack.Encoder = msgspec.msgpack.Encoder()
+_control_result_decoder: msgspec.msgpack.Decoder = msgspec.msgpack.Decoder(ControlResult)
 
 
 def encode_command(cmd: Command) -> bytes:
@@ -196,3 +218,13 @@ def encode_profile_result(result: ProfileResult) -> bytes:
 def decode_profile_result(data: bytes) -> ProfileResult:
     """Decode a profile-control acknowledgement."""
     return _profile_result_decoder.decode(data)
+
+
+def encode_control_result(result: ControlResult) -> bytes:
+    """Encode one worker-local extension control result."""
+    return _control_result_encoder.encode(result)
+
+
+def decode_control_result(data: bytes) -> ControlResult:
+    """Decode one worker-local PD control result."""
+    return _control_result_decoder.decode(data)
