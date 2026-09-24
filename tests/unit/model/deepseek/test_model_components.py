@@ -52,6 +52,8 @@ from pypto_serving.model.deepseek.npu_runner import (
     deepseek_v4_decode_layout,
 )
 from pypto_serving.model.common.runner.buffer_set import StaticDeviceTensor
+from pypto_serving.model.common.weights.nz import pack_nz
+from pypto_serving.model.deepseek.weight_spec import DEEPSEEK_V4_NZ_ROW_STACKED_NAMES
 from pypto_serving.model.deepseek.task_args import (
     _DECODE_FWD_TENSOR_ORDER,
     _FUSED_MTP_DECODE_TENSOR_ORDER,
@@ -1457,9 +1459,9 @@ def test_deepseek_layer_packer_transposes_and_stacks_rank_local_experts():
         include_gate_bias=True,
     )
 
-    assert packed.tensors["wq_a"].shape == (2, 4, 2)
-    assert packed.tensors["wq_a"][0].tolist() == raw["layers.0.attn.wq_a.weight"].t().tolist()
-    assert packed.tensors["wo_a"].shape == (2, 8, 2, 4)
+    assert packed.tensors["wq_a"].shape == (2, 16, 16)
+    assert packed.tensors["wq_a"][0].tolist() == pack_nz(raw["layers.0.attn.wq_a.weight"].t()).tolist()
+    assert packed.tensors["wo_a"].shape == (2, 8, 16, 16)
     assert packed.tensors["csa_cmp_wkv"].shape == (2, 2, 4)
     assert packed.tensors["csa_cmp_wkv"][0].tolist() == raw["layers.0.attn.compressor.wkv.weight"].tolist()
     assert packed.tensors["csa_inner_wkv"].shape == (2, 2, 4)
@@ -1471,7 +1473,7 @@ def test_deepseek_layer_packer_transposes_and_stacks_rank_local_experts():
     assert torch.count_nonzero(packed.tensors["hca_cmp_wkv"]) == 0
     assert packed.tensors["gate_bias"].shape == (2, 4)
     assert packed.tensors["tid2eid"].shape == (2, 129280, 6)
-    assert packed.tensors["routed_w1"].shape == (2, 2, 2, 4)
+    assert packed.tensors["routed_w1"].shape == (2, 2, 16, 32)
     assert packed.tensors["routed_w1"][0, 0].tolist() == raw["layers.0.ffn.experts.0.w1.weight"].tolist()
     assert packed.tensors["routed_w1"][1, 0].tolist() == raw["layers.0.ffn.experts.2.w1.weight"].tolist()
     assert torch.equal(packed.tensors["csa_hadamard_idx"][0], deepseek_v4_hadamard_idx())
@@ -1549,7 +1551,12 @@ def test_deepseek_stacked_weight_loader_packs_subsequent_layers_into_final_slice
     assert direct_flags == [False, True, True]
     assert stacked.tensors["fwd"].tolist() == [[0, 0, 1, 1, 2, 2], [0, 0, 1, 1, 2, 2]]
     for name in weight_loader.DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES:
-        assert torch.equal(stacked.tensors[name], layers[1].tensors[name])
+        expected = layers[1].tensors[name]
+        if name in DEEPSEEK_V4_NZ_ROW_STACKED_NAMES:
+            # NZ row-stacked weights take a new layer axis after the rank axis instead of
+            # widening rows; the one CSA layer here makes it size 1.
+            expected = expected.unsqueeze(1)
+        assert torch.equal(stacked.tensors[name], expected), name
     for name in weight_loader.DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES:
         assert torch.equal(stacked.tensors[name], layers[2].tensors[name])
     assert all(tensor.is_contiguous() for tensor in stacked.tensors.values())
@@ -3387,6 +3394,12 @@ def _write_deepseek_kernel_dir(
     return kernel_dir
 
 
+def _int8_ramp(rows: int, cols: int) -> torch.Tensor:
+    return (torch.arange(rows * cols) % 127).to(torch.int8).reshape(rows, cols)
+
+
+# The pack_nz weights are sized so their packed trailing [rows, cols] clears the 16-row fractal
+# and dtype C0 (bf16 = 16, int8 = 32) that NZ blocking requires; the rest stay tiny.
 def _synthetic_layer_raw(*, layer_id: int, n_experts: int) -> dict[str, torch.Tensor]:
     prefix = f"layers.{layer_id}"
     raw = {
@@ -3394,35 +3407,35 @@ def _synthetic_layer_raw(*, layer_id: int, n_experts: int) -> dict[str, torch.Te
         f"{prefix}.hc_attn_scale": torch.arange(3, dtype=torch.float32),
         f"{prefix}.hc_attn_base": torch.arange(1, dtype=torch.float32),
         f"{prefix}.attn_norm.weight": torch.arange(4, dtype=torch.bfloat16),
-        f"{prefix}.attn.wq_a.weight": torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
-        f"{prefix}.attn.wq_b.weight": torch.arange(12, dtype=torch.int8).reshape(6, 2),
-        f"{prefix}.attn.wq_b.scale": torch.arange(6, dtype=torch.float32),
-        f"{prefix}.attn.wkv.weight": torch.arange(12, dtype=torch.bfloat16).reshape(3, 4),
+        f"{prefix}.attn.wq_a.weight": torch.arange(256, dtype=torch.bfloat16).reshape(16, 16),
+        f"{prefix}.attn.wq_b.weight": _int8_ramp(32, 16),
+        f"{prefix}.attn.wq_b.scale": torch.arange(32, dtype=torch.float32),
+        f"{prefix}.attn.wkv.weight": torch.arange(256, dtype=torch.bfloat16).reshape(16, 16),
         f"{prefix}.attn.q_norm.weight": torch.arange(2, dtype=torch.bfloat16),
         f"{prefix}.attn.kv_norm.weight": torch.arange(3, dtype=torch.bfloat16),
         f"{prefix}.attn.attn_sink": torch.arange(2, dtype=torch.float32),
-        f"{prefix}.attn.wo_a.weight": torch.arange(64, dtype=torch.bfloat16).reshape(16, 4),
-        f"{prefix}.attn.wo_b.weight": torch.arange(64, dtype=torch.int8).reshape(4, 16),
-        f"{prefix}.attn.wo_b.scale": torch.arange(4, dtype=torch.float32),
+        f"{prefix}.attn.wo_a.weight": (torch.arange(2048) % 251).to(torch.bfloat16).reshape(128, 16),
+        f"{prefix}.attn.wo_b.weight": _int8_ramp(16, 256),
+        f"{prefix}.attn.wo_b.scale": torch.arange(16, dtype=torch.float32),
         f"{prefix}.hc_ffn_fn": torch.arange(4, dtype=torch.float32).reshape(1, 4),
         f"{prefix}.hc_ffn_scale": torch.arange(3, dtype=torch.float32),
         f"{prefix}.hc_ffn_base": torch.arange(1, dtype=torch.float32),
         f"{prefix}.ffn_norm.weight": torch.arange(4, dtype=torch.bfloat16),
         f"{prefix}.ffn.gate.weight": torch.arange(16, dtype=torch.bfloat16).reshape(4, 4),
         f"{prefix}.ffn.gate.bias": torch.arange(4, dtype=torch.float32),
-        f"{prefix}.ffn.shared_experts.w1.weight": torch.arange(8, dtype=torch.int8).reshape(2, 4),
-        f"{prefix}.ffn.shared_experts.w1.scale": torch.arange(2, dtype=torch.float32),
-        f"{prefix}.ffn.shared_experts.w2.weight": torch.arange(8, dtype=torch.int8).reshape(4, 2),
-        f"{prefix}.ffn.shared_experts.w2.scale": torch.arange(4, dtype=torch.float32),
-        f"{prefix}.ffn.shared_experts.w3.weight": torch.arange(8, dtype=torch.int8).reshape(2, 4),
-        f"{prefix}.ffn.shared_experts.w3.scale": torch.arange(2, dtype=torch.float32),
+        f"{prefix}.ffn.shared_experts.w1.weight": _int8_ramp(16, 32),
+        f"{prefix}.ffn.shared_experts.w1.scale": torch.arange(16, dtype=torch.float32),
+        f"{prefix}.ffn.shared_experts.w2.weight": _int8_ramp(16, 32),
+        f"{prefix}.ffn.shared_experts.w2.scale": torch.arange(16, dtype=torch.float32),
+        f"{prefix}.ffn.shared_experts.w3.weight": _int8_ramp(16, 32),
+        f"{prefix}.ffn.shared_experts.w3.scale": torch.arange(16, dtype=torch.float32),
         f"{prefix}.attn.compressor.wkv.weight": torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
         f"{prefix}.attn.compressor.wgate.weight": torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
         f"{prefix}.attn.compressor.ape": torch.arange(8, dtype=torch.float32).reshape(4, 2),
         f"{prefix}.attn.compressor.norm.weight": torch.arange(3, dtype=torch.bfloat16),
-        f"{prefix}.attn.indexer.wq_b.weight": torch.arange(12, dtype=torch.int8).reshape(6, 2),
-        f"{prefix}.attn.indexer.wq_b.scale": torch.arange(6, dtype=torch.float32),
-        f"{prefix}.attn.indexer.weights_proj.weight": torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
+        f"{prefix}.attn.indexer.wq_b.weight": _int8_ramp(32, 16),
+        f"{prefix}.attn.indexer.wq_b.scale": torch.arange(32, dtype=torch.float32),
+        f"{prefix}.attn.indexer.weights_proj.weight": torch.arange(256, dtype=torch.bfloat16).reshape(16, 16),
         f"{prefix}.attn.indexer.compressor.wkv.weight": torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
         f"{prefix}.attn.indexer.compressor.wgate.weight": torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
         f"{prefix}.attn.indexer.compressor.ape": torch.arange(8, dtype=torch.float32).reshape(4, 2),
@@ -3432,12 +3445,12 @@ def _synthetic_layer_raw(*, layer_id: int, n_experts: int) -> dict[str, torch.Te
         base = expert_id * 10
         raw.update(
             {
-                f"{prefix}.ffn.experts.{expert_id}.w1.weight": torch.full((2, 4), base, dtype=torch.int8),
-                f"{prefix}.ffn.experts.{expert_id}.w1.scale": torch.full((2,), base + 1, dtype=torch.float32),
-                f"{prefix}.ffn.experts.{expert_id}.w2.weight": torch.full((4, 2), base + 2, dtype=torch.int8),
-                f"{prefix}.ffn.experts.{expert_id}.w2.scale": torch.full((4,), base + 3, dtype=torch.float32),
-                f"{prefix}.ffn.experts.{expert_id}.w3.weight": torch.full((2, 4), base + 4, dtype=torch.int8),
-                f"{prefix}.ffn.experts.{expert_id}.w3.scale": torch.full((2,), base + 5, dtype=torch.float32),
+                f"{prefix}.ffn.experts.{expert_id}.w1.weight": torch.full((16, 32), base, dtype=torch.int8),
+                f"{prefix}.ffn.experts.{expert_id}.w1.scale": torch.full((16,), base + 1, dtype=torch.float32),
+                f"{prefix}.ffn.experts.{expert_id}.w2.weight": torch.full((16, 32), base + 2, dtype=torch.int8),
+                f"{prefix}.ffn.experts.{expert_id}.w2.scale": torch.full((16,), base + 3, dtype=torch.float32),
+                f"{prefix}.ffn.experts.{expert_id}.w3.weight": torch.full((16, 32), base + 4, dtype=torch.int8),
+                f"{prefix}.ffn.experts.{expert_id}.w3.scale": torch.full((16,), base + 5, dtype=torch.float32),
             }
         )
     return raw
@@ -3532,8 +3545,10 @@ def test_deepseek_static_lm_head_weight_replicates_one_vocab_shard_per_dp_rank()
         kernel_contract=_deepseek_serving_contract(prefill_tile_tokens=layout.prefill_seq),
     )
     runner = DeepSeekV4ModelRunner(compiled=compiled)
-    vocab_per_rank = 2
-    hidden_size = 3
+    # NZ-packed (pack_nz on the trailing [vocab_per_rank, hidden_size]): both dims must clear
+    # the 16-row fractal / bf16 C0=16 minimums, not just be shard-distinguishable.
+    vocab_per_rank = 16
+    hidden_size = 16
     # Shard s carries the constant s + 1 so every rank's copy is identifiable.
     packed = torch.stack(
         [

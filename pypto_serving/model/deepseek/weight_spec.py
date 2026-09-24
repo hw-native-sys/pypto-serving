@@ -39,6 +39,17 @@ from pypto_serving.model.common.weights.stacker import StackGroup
 # `wo_a` arrives flattened and is split into this many output groups.
 DEEPSEEK_V4_O_GROUPS = 8
 
+# The attention weights that stack their layers on the row axis under plain concatenation. NZ
+# cannot address a row window (a layer's rows sit inside every fractal column block), so these
+# stack on a new leading axis instead and a layer becomes an index -- mirrors pypto-lib's own
+# `NZ_ROW_STACKED_NAMES` in decode_fwd.py / prefill_fwd.py; `wo_a` and the routed experts are
+# NZ too but already stack on an existing leading axis (their groups/experts lead), so they are
+# not in this set.
+DEEPSEEK_V4_NZ_ROW_STACKED_NAMES = frozenset({
+    "wq_a", "wq_b", "wkv", "csa_idx_wq_b",
+    "shared_w1", "shared_w3", "shared_w2", "csa_weights_proj",
+})
+
 # Attention kinds, and the fixed dimensions their compressor/indexer weights have. These are
 # model constants rather than config knobs: the packer validates the active branch against
 # them and zero-fills the inactive branch at the same sizes, so every layer presents one
@@ -66,26 +77,30 @@ DEEPSEEK_V4_CORE_LAYER_RULES: tuple[LayerWeightRule, ...] = (
     LayerWeightRule("hc_attn_scale", "hc_attn_scale", torch.float32),
     LayerWeightRule("hc_attn_base", "hc_attn_base", torch.float32),
     LayerWeightRule("attn_norm_w", "attn_norm.weight", torch.bfloat16),
-    LayerWeightRule("wq_a", "attn.wq_a.weight", torch.bfloat16, transpose=True),
-    LayerWeightRule("wq_b", "attn.wq_b.weight", torch.int8, transpose=True),
+    LayerWeightRule("wq_a", "attn.wq_a.weight", torch.bfloat16, transpose=True, pack_nz=True),
+    LayerWeightRule("wq_b", "attn.wq_b.weight", torch.int8, transpose=True, pack_nz=True),
     LayerWeightRule("wq_b_scale", "attn.wq_b.scale", torch.float32),
-    LayerWeightRule("wkv", "attn.wkv.weight", torch.bfloat16, transpose=True),
+    LayerWeightRule("wkv", "attn.wkv.weight", torch.bfloat16, transpose=True, pack_nz=True),
     LayerWeightRule("gamma_cq", "attn.q_norm.weight", torch.bfloat16),
     LayerWeightRule("gamma_ckv", "attn.kv_norm.weight", torch.bfloat16),
     LayerWeightRule("attn_sink", "attn.attn_sink", torch.float32),
-    LayerWeightRule("wo_a", "attn.wo_a.weight", torch.bfloat16, reshape_groups=DEEPSEEK_V4_O_GROUPS),
-    LayerWeightRule("wo_b", "attn.wo_b.weight", torch.int8),
+    LayerWeightRule(
+        "wo_a", "attn.wo_a.weight", torch.bfloat16, reshape_groups=DEEPSEEK_V4_O_GROUPS, pack_nz=True
+    ),
+    LayerWeightRule(
+        "wo_b", "attn.wo_b.weight", torch.int8, column_reshape_groups=DEEPSEEK_V4_O_GROUPS, pack_nz=True
+    ),
     LayerWeightRule("wo_b_scale", "attn.wo_b.scale", torch.float32),
     LayerWeightRule("hc_ffn_fn", "hc_ffn_fn", torch.float32),
     LayerWeightRule("hc_ffn_scale", "hc_ffn_scale", torch.float32),
     LayerWeightRule("hc_ffn_base", "hc_ffn_base", torch.float32),
     LayerWeightRule("norm_w", "ffn_norm.weight", torch.bfloat16),
     LayerWeightRule("gate_w", "ffn.gate.weight", torch.float32),
-    LayerWeightRule("shared_w1", "ffn.shared_experts.w1.weight", torch.int8),
+    LayerWeightRule("shared_w1", "ffn.shared_experts.w1.weight", torch.int8, pack_nz=True),
     LayerWeightRule("shared_w1_scale", "ffn.shared_experts.w1.scale", torch.float32),
-    LayerWeightRule("shared_w3", "ffn.shared_experts.w3.weight", torch.int8),
+    LayerWeightRule("shared_w3", "ffn.shared_experts.w3.weight", torch.int8, pack_nz=True),
     LayerWeightRule("shared_w3_scale", "ffn.shared_experts.w3.scale", torch.float32),
-    LayerWeightRule("shared_w2", "ffn.shared_experts.w2.weight", torch.int8),
+    LayerWeightRule("shared_w2", "ffn.shared_experts.w2.weight", torch.int8, pack_nz=True),
     LayerWeightRule("shared_w2_scale", "ffn.shared_experts.w2.scale", torch.float32),
 )
 
@@ -145,6 +160,7 @@ DEEPSEEK_V4_OPTIONAL_LAYER_RULES: tuple[LayerRule, ...] = (
         (_Q_LORA, _ATTENTION_OUT // 4),
         (DEEPSEEK_V4_CSA_RATIO,),
         transpose=True,
+        pack_nz=True,
     ),
     OptionalWeightRule(
         "csa_idx_wq_b_scale",
@@ -160,6 +176,7 @@ DEEPSEEK_V4_OPTIONAL_LAYER_RULES: tuple[LayerRule, ...] = (
         (_HIDDEN, 64),
         (DEEPSEEK_V4_CSA_RATIO,),
         transpose=True,
+        pack_nz=True,
     ),
     SyntheticWeightRule("csa_hadamard_idx", torch.bfloat16, "hadamard_idx"),
     OptionalWeightRule(
@@ -216,11 +233,11 @@ DEEPSEEK_V4_ROUTER_LAYER_RULES: tuple[LayerRule, ...] = (
 
 # Routed experts, sharded across ranks rather than replicated.
 DEEPSEEK_V4_EXPERT_LAYER_RULES: tuple[LayerRule, ...] = (
-    ExpertWeightRule("routed_w1", "w1.weight", torch.int8),
+    ExpertWeightRule("routed_w1", "w1.weight", torch.int8, pack_nz=True),
     ExpertWeightRule("routed_w1_scale", "w1.scale", torch.float32),
-    ExpertWeightRule("routed_w3", "w3.weight", torch.int8),
+    ExpertWeightRule("routed_w3", "w3.weight", torch.int8, pack_nz=True),
     ExpertWeightRule("routed_w3_scale", "w3.scale", torch.float32),
-    ExpertWeightRule("routed_w2", "w2.weight", torch.int8),
+    ExpertWeightRule("routed_w2", "w2.weight", torch.int8, pack_nz=True),
     ExpertWeightRule("routed_w2_scale", "w2.scale", torch.float32),
 )
 
@@ -327,10 +344,10 @@ DEEPSEEK_V4_GLOBAL_RULES: tuple[GlobalWeightRule, ...] = (
 DEEPSEEK_V4_MTP_EXTRA_RULES: tuple[LayerRule, ...] = (
     LayerWeightRule("enorm_w", "enorm.weight", torch.float32),
     LayerWeightRule("hnorm_w", "hnorm.weight", torch.float32),
-    LayerWeightRule("e_proj_w", "e_proj.weight", torch.int8),
+    LayerWeightRule("e_proj_w", "e_proj.weight", torch.int8, pack_nz=True),
     LayerWeightRule("e_proj_w_scale", "e_proj.scale", torch.float32),
     SyntheticWeightRule("e_proj_smooth", torch.float32, "hidden_ones"),
-    LayerWeightRule("h_proj_w", "h_proj.weight", torch.int8),
+    LayerWeightRule("h_proj_w", "h_proj.weight", torch.int8, pack_nz=True),
     LayerWeightRule("h_proj_w_scale", "h_proj.scale", torch.float32),
     SyntheticWeightRule("h_proj_smooth", torch.float32, "hidden_ones"),
     LayerWeightRule("mtp_hc_head_fn", "hc_head_fn", torch.float32),
