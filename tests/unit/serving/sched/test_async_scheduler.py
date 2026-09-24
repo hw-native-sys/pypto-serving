@@ -15,6 +15,7 @@ from pypto_serving.config.types import (
     PREFILL_CHUNK_SIZE_CHOICES,
 )
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.sched.scheduler import (
     Request,
     RequestStatus,
@@ -902,6 +903,57 @@ def test_grouped_cache_preemption_removes_victim_from_running_queue():
     assert [request.request_id for request in output.preempted_requests] == ["newer"]
     assert [request.request_id for request in scheduler.running] == ["older"]
     assert [request.request_id for request in scheduler.waiting] == ["newer"]
+
+
+def test_constrained_request_is_not_recomputed_without_grammar_replay():
+    manager = KvCacheManager(num_blocks=4, block_size=1, enable_prefix_cache=False)
+    scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=False), manager)
+    protected = Request(
+        "protected", [1], max_new_tokens=5, status=RequestStatus.RUNNING,
+        constraint_spec=ConstraintSpec(
+            provider_id="xgrammar", format_id="deepseek_v4",
+            tools=({"type": "function", "function": {"name": "shell"}},),
+            tool_choice="required", reasoning=False,
+        ),
+    )
+    unprotected = Request("plain", [2], max_new_tokens=5, status=RequestStatus.RUNNING)
+    exclude = Request("new", [3], max_new_tokens=5)
+    scheduler.running = [protected]
+    assert scheduler._preempt_lowest_priority(exclude, set(), {}, SchedulerOutput()) is None
+    assert protected.status is RequestStatus.RUNNING
+
+    scheduler.running.append(unprotected)
+    result = scheduler._preempt_lowest_priority(exclude, set(), {}, SchedulerOutput())
+    assert result is not None and result["request"] is unprotected
+    assert protected.status is RequestStatus.RUNNING
+
+
+def test_constrained_request_waits_under_cache_pressure_then_admits_after_release():
+    manager = KvCacheManager(num_blocks=1, block_size=1, enable_prefix_cache=False)
+    scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=False), manager)
+    protected = Request(
+        "protected", [1], max_new_tokens=4,
+        constraint_spec=ConstraintSpec(
+            provider_id="xgrammar", format_id="deepseek_v4",
+            tools=({"type": "function", "function": {"name": "shell"}},),
+            tool_choice="required", reasoning=False,
+        ),
+    )
+    scheduler.add_request(protected)
+    first = scheduler.schedule()
+    scheduler.update_from_output(first, {"protected": [9]})
+    waiter = Request("waiter", [2], max_new_tokens=1)
+    scheduler.add_request(waiter)
+
+    blocked = scheduler.schedule()
+    assert blocked.is_empty
+    assert not blocked.preempted_requests
+    assert protected.status is RequestStatus.RUNNING
+    assert [request.request_id for request in scheduler.waiting] == ["waiter"]
+
+    scheduler.abort_request("protected")
+    admitted = scheduler.schedule()
+    assert [item.request.request_id for item in admitted.scheduled_requests] == ["waiter"]
 
 
 def test_grouped_cache_capacity_scales_from_device_reported_primary_pool():

@@ -487,8 +487,18 @@ def test_dspark_task_arg_orders_match_pypto_lib_abis() -> None:
     assert tuple(arg.arg for arg in decode.args.args) == (
         task_args_module._DECODE_TENSOR_ORDER
     )
-    assert len(task_args_module._PREFILL_TENSOR_ORDER) == 101
-    assert len(task_args_module._DECODE_TENSOR_ORDER) == 109
+    assert len(task_args_module._PREFILL_TENSOR_ORDER) == 102
+    assert len(task_args_module._DECODE_TENSOR_ORDER) == 110
+
+
+def test_fused_dspark_target_args_match_pypto_lib_abi() -> None:
+    """The K7 target prefix includes the mask and capped draft counts."""
+    fused = _pypto_lib_function("decode_fwd_dspark", "l3_decode_fwd_dspark")
+    target = tuple(
+        name for name in task_args_module._FUSED_DECODE_TENSOR_ORDER
+        if name not in runner_module._DSPARK_FUSED_INTERNAL_PREPARE_NAMES
+    )
+    assert tuple(arg.arg for arg in fused.args.args[:len(target)]) == target
 
 
 def test_drafter_and_markov_task_arg_orders_match_pypto_lib_abis() -> None:

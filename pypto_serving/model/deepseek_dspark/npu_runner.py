@@ -31,6 +31,7 @@ import json
 import logging
 import math
 import os
+import sys
 import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
     from pypto_serving.model.common.runner.task_args import TaskArgs
 
 import torch
+import numpy as np
 from pypto.runtime import DeviceTensor, StackedDeviceTensor
 
 from pypto_serving.config.types import (
@@ -79,6 +81,9 @@ DSPARK_HIDDEN_SIZE = 4096
 DSPARK_MAIN_HIDDEN_DIM = 3 * DSPARK_HIDDEN_SIZE
 DSPARK_HC_MULT = 4
 DSPARK_VOCAB_SIZE = 129280
+DSPARK_GRAMMAR_SEGMENT_TOKENS = 808
+DSPARK_GRAMMAR_SEGMENTS = DSPARK_VOCAB_SIZE // DSPARK_GRAMMAR_SEGMENT_TOKENS
+DSPARK_GRAMMAR_SEGMENT_WORDS = 64
 DSPARK_HEAD_DIM = 512
 DSPARK_ROPE_HEAD_DIM = 64
 DSPARK_IDX_HEAD_DIM = 128
@@ -1134,6 +1139,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._device_scratch: dict[tuple[str, str], StackedDeviceTensor] = {}
         self._prefill_task_args: TaskArgs | None = None
         self._decode_task_args: list[TaskArgs] = []
+        self._prefill_grammar_rows: set[tuple[int, int]] = set()
+        self._decode_grammar_rows: list[set[tuple[int, int]]] = [set(), set()]
         # Speculative drafter state (milestone 2): per-request leases, the
         # drafter/markov TaskArgs, their RunConfigs, and the D2H mirror for
         # the decode backbone tap.
@@ -1518,6 +1525,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
 
             self._prefill_task_args = prefill_task_args(self)
             self._prefill_task_args.allocate_host_shared(None)
+            self._prefill_task_args.tensors["grammar_mask"].fill_(-1)
             # The padding tail of the embedding slab must read as zero for the
             # life of the worker (pypto-lib#1069 contract); zero it once here.
             self._prefill_task_args.tensors["x_hc"].zero_()
@@ -1530,6 +1538,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             for _slot in (0, 1):
                 task_args = decode_task_args(self)
                 task_args.allocate_host_shared(None)
+                task_args.tensors["grammar_mask"].fill_(-1)
+                if self._compiled.decode_full_fused:
+                    task_args.tensors["valid_draft_counts"].fill_(DSPARK_DRAFTER_QUERY_WIDTH)
                 self._decode_task_args.append(task_args)
         if self.speculative:
             from pypto_serving.model.common.runner.buffer_set import (  # noqa: PLC0415
@@ -2309,6 +2320,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             self._ensure_l3_shared_buffers(model)
             inputs = self.prepare_prefill_inputs(model, batch)
             self._stage_prefill_inputs(inputs)
+            with profile_span(
+                "DSparkModelRunner.prefill.stage_constraints",
+                cat="constraints",
+                args={"constrained_requests": len(batch.constraint_states)},
+            ):
+                self._stage_prefill_grammar(batch, inputs)
             self._prefill_task_args.clear_outputs()
             args = self._prefill_dispatch_args(
                 inputs.physical_tokens, inputs.query_start_loc.shape[1] - 1
@@ -2782,6 +2799,89 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         # attention and sampling tails natively while staying in the EP MoE
         # waves (pypto-lib#1161), so no mirror replay is staged.
 
+    @staticmethod
+    def _copy_grammar_mask_row(destination: torch.Tensor, mask: np.ndarray) -> None:
+        if sys.byteorder != "little":
+            raise RuntimeError("DSpark packed grammar mask requires a little-endian host")
+        words = np.asarray(mask, dtype=np.int32)
+        if words.shape != (DSPARK_VOCAB_SIZE // 32,):
+            raise ValueError(f"invalid grammar mask shape {words.shape}")
+        if not np.any(words):
+            raise ValueError("grammar has no allowed token for an active sample row")
+        bit_rows = np.unpackbits(
+            np.ascontiguousarray(words).view(np.uint8), bitorder="little"
+        ).reshape(DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_TOKENS)
+        aligned = np.ones(
+            (DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS * 16),
+            dtype=np.uint8,
+        )
+        aligned[:, :DSPARK_GRAMMAR_SEGMENT_TOKENS] = bit_rows
+        packed = np.packbits(aligned, axis=1, bitorder="little").view(np.int16)
+        destination.copy_(torch.from_numpy(packed))
+
+    def _stage_prefill_grammar(
+        self, batch: PrefillBatch, inputs: DSparkPreparedPrefillInputs
+    ) -> None:
+        task_args = self._prefill_task_args
+        if task_args is None:
+            raise RuntimeError("DSpark prefill TaskArgs are not staged")
+        masks = task_args.tensors["grammar_mask"]
+        for rank, row in self._prefill_grammar_rows:
+            masks[rank, row].fill_(-1)
+        self._prefill_grammar_rows = set()
+        active: set[tuple[int, int]] = set()
+        try:
+            for request_id, (rank, row) in zip(inputs.request_ids, inputs.sampled_slots, strict=True):
+                state = batch.constraint_states.get(request_id)
+                if state is None:
+                    continue
+                active.add((rank, row))
+                self._copy_grammar_mask_row(masks[rank, row], state.masks_for_rows(())[0])
+        except Exception:
+            for rank, row in active:
+                masks[rank, row].fill_(-1)
+            raise
+        self._prefill_grammar_rows = active
+
+    def _stage_decode_grammar(
+        self, batch: DecodeBatch, inputs: DSparkPreparedDecodeInputs
+    ) -> None:
+        slot = inputs.buffer_slot
+        task_args = self._decode_task_args[slot]
+        masks = task_args.tensors["grammar_mask"]
+        counts = task_args.tensors["valid_draft_counts"]
+        for rank, row in self._decode_grammar_rows[slot]:
+            masks[rank, row].fill_(-1)
+        self._decode_grammar_rows[slot] = set()
+        counts.fill_(DSPARK_DRAFTER_QUERY_WIDTH)
+        active: set[tuple[int, int]] = set()
+        layout = self._compiled.layout
+        try:
+            for request_id, group, ordinal, (rank, row) in zip(
+                inputs.request_ids, inputs.groups, inputs.group_ordinals,
+                inputs.sampled_slots, strict=True,
+            ):
+                constraint = batch.constraint_states.get(request_id)
+                if constraint is None:
+                    continue
+                drafts = self._drafter_state(request_id).pending_draft_tokens
+                valid = constraint.validate_draft_prefix(drafts)
+                if not 0 <= valid <= min(len(drafts), DSPARK_DRAFTER_QUERY_WIDTH):
+                    raise ValueError("constraint provider returned an invalid draft prefix length")
+                rows = constraint.masks_for_rows(drafts[:valid])
+                if rows.shape != (valid + 1, DSPARK_VOCAB_SIZE // 32):
+                    raise ValueError(f"constraint provider returned invalid row masks {rows.shape}")
+                counts[group * layout.tp_size : (group + 1) * layout.tp_size, ordinal] = valid
+                for offset, mask in enumerate(rows):
+                    active.add((rank, row + offset))
+                    self._copy_grammar_mask_row(masks[rank, row + offset], mask)
+        except Exception:
+            for rank, row in active:
+                masks[rank, row].fill_(-1)
+            counts.fill_(DSPARK_DRAFTER_QUERY_WIDTH)
+            raise
+        self._decode_grammar_rows[slot] = active
+
     # ------------------------------------------------------------------
     # decode
     # ------------------------------------------------------------------
@@ -2878,6 +2978,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 raise RuntimeError(
                     f"DSpark device state was not finalized during prefill for {request_id!r}"
                 )
+        with profile_span(
+            "DSparkModelRunner.decode.stage_constraints",
+            cat="constraints",
+            args={"constrained_requests": len(batch.constraint_states)},
+        ):
+            self._stage_decode_grammar(batch, inputs)
         return self._launch_fused_decode(batch, inputs)
 
     def reclaim_prepared_decode(self, pending: object) -> DecodeResult:
@@ -2893,7 +2999,15 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
     ) -> DecodeResult:
         """Execute target, device acceptance, drafter, and Markov in FIFO order."""
         if self._compiled.decode_full_fused:
+            with profile_span(
+                "DSparkModelRunner.decode.stage_constraints",
+                cat="constraints",
+                args={"constrained_requests": len(batch.constraint_states)},
+            ):
+                self._stage_decode_grammar(batch, inputs)
             return self._reclaim_fused_decode(self._launch_fused_decode(batch, inputs))
+        if batch.constraint_states:
+            raise RuntimeError("DSpark grammar constraints require the fused K7 decode path")
         with profile_span("DSparkModelRunner.decode.execute", cat="executor"):
             task_args = self._decode_task_args[inputs.buffer_slot]
             fused_device_state = self._compiled.decode_device_state_fused

@@ -53,7 +53,7 @@ class DeepSeekV4ToolParser(DeepSeekV4ReasoningParser):
 
     def __init__(self, tokenizer, spec: OutputParserSpec) -> None:
         super().__init__(tokenizer, spec)
-        self._publish_tools = spec.tool_choice == "auto"
+        self._publish_tools = spec.tool_choice != "none"
         self._reset()
 
     def _extra_terminals(self, vocab: dict[str, int]) -> dict[int, str]:

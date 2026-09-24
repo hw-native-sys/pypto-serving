@@ -24,7 +24,7 @@ call sites.
 
 from __future__ import annotations
 
-from typing import Union
+from typing import Any, Union
 
 import msgspec
 
@@ -52,6 +52,7 @@ class NewRequestData(msgspec.Struct):
     top_p: float
     top_k: int | None
     seed: int | None = None
+    constraint_spec: dict[str, Any] | None = None
 
 
 class PrefillRequest(msgspec.Struct):

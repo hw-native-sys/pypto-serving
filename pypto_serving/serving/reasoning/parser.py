@@ -29,7 +29,7 @@ class OutputParserSpec:
     parser_id: str
     initial_state: Literal["content", "reasoning"]
     include_reasoning: bool = True
-    tool_choice: Literal["none", "auto"] = "none"
+    tool_choice: Literal["none", "auto", "required"] = "none"
     tool_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -37,10 +37,10 @@ class OutputParserSpec:
             raise ValueError(f"unsupported output parser {self.parser_id!r}")
         if self.initial_state not in ("content", "reasoning"):
             raise ValueError("output parser initial_state must be content or reasoning")
-        if self.tool_choice not in ("none", "auto"):
-            raise ValueError("output parser tool_choice must be none or auto")
-        if self.tool_choice == "auto" and not self.tool_names:
-            raise ValueError("auto tool choice requires tool names")
+        if self.tool_choice not in ("none", "auto", "required"):
+            raise ValueError("output parser tool_choice must be none, auto, or required")
+        if self.tool_choice != "none" and not self.tool_names:
+            raise ValueError("enabled tool choice requires tool names")
 
 
 def supports_tool_calls(parser_id: str | None) -> bool:

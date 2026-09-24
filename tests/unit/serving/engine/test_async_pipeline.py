@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from pypto_serving.observability import InMemoryStatLogger
+from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.engine.async_engine import (
     ReplicaEngineCore,
 )
@@ -50,6 +51,14 @@ def _running_decode_request(req_id="r", prompt=(1, 2), first_output=99):
         num_computed_tokens=len(prompt),
         output_token_ids=[first_output],
         status=RequestStatus.RUNNING,
+    )
+
+
+def _tool_constraint():
+    return ConstraintSpec(
+        provider_id="xgrammar", format_id="deepseek_v4",
+        tools=({"type": "function", "function": {"name": "shell"}},),
+        tool_choice="required", reasoning=False,
     )
 
 
@@ -163,6 +172,86 @@ def test_speculation_metrics_ignore_results_for_already_aborted_requests():
     counters = metrics.snapshot()["replicas"][0]["counters"]
     assert counters["draft_tokens"] == 0
     assert counters["accepted_tokens"] == 0
+
+
+def test_constrained_abort_drops_inflight_output_and_frees_worker_before_reuse():
+    core, dispatched = _async_pipeline_core(num_speculative_tokens=7)
+    request = _running_decode_request(first_output=50)
+    request.constraint_spec = _tool_constraint()
+    core.scheduler.running.append(request)
+    core.scheduler.requests[request.request_id] = request
+    ctx = SimpleNamespace(queue=asyncio.Queue(), request=request, stream=True)
+    core._request_contexts[request.request_id] = ctx
+
+    assert core._try_dispatch_step()
+    asyncio.run(core.abort_request(request.request_id))
+    assert request.status is RequestStatus.FINISHED_ABORTED
+    assert asyncio.run(core._await_and_apply_oldest())
+    assert request.output_token_ids == [50]
+    asyncio.run(core._flush_pending_frees())
+    assert dispatched[-1].finished_request_ids == [request.request_id]
+    assert request.request_id not in core._worker_known_req_ids
+    assert not core._pending_free_ids and not core._request_contexts
+    assert ctx.queue.get_nowait().finish_reason == "FINISHED_ABORTED"
+
+    next_request = Request("next", [3], max_new_tokens=1)
+    core.scheduler.add_request(next_request)
+    assert core._try_dispatch_step()
+    assert [item.request_id for item in dispatched[-1].new_requests] == ["next"]
+
+
+def test_constrained_step_error_cleans_up_before_next_request():
+    core, dispatched = _async_pipeline_core(num_speculative_tokens=7)
+    request = _running_decode_request(first_output=50)
+    request.constraint_spec = _tool_constraint()
+    core.scheduler.running.append(request)
+    core.scheduler.requests[request.request_id] = request
+    ctx = SimpleNamespace(queue=asyncio.Queue(), request=request, stream=True)
+    core._request_contexts[request.request_id] = ctx
+    assert core._try_dispatch_step()
+
+    results = deque([encode_result(StepResult(
+        new_tokens={}, error="invalid grammar mask", step_id=dispatched[0].step_id,
+    ))])
+    core._output_queue = SimpleNamespace(get=lambda timeout=None: results.popleft())
+    assert asyncio.run(core._await_and_apply_oldest()) is False
+    assert ctx.queue.get_nowait().finish_reason == "error"
+    assert request.status is RequestStatus.FINISHED_ABORTED
+
+    def put(raw):
+        command = decode_command(raw)
+        dispatched.append(command)
+        results.append(encode_result(StepResult(new_tokens={}, step_id=command.step_id)))
+
+    core._input_queue = SimpleNamespace(put=put)
+    asyncio.run(core._flush_pending_frees())
+    assert dispatched[-1].finished_request_ids == [request.request_id]
+    assert not core._pending_free_ids and not core._worker_known_req_ids
+
+    next_request = Request("next", [3], max_new_tokens=1)
+    core.scheduler.add_request(next_request)
+    assert core._try_dispatch_step()
+    assert [item.request_id for item in dispatched[-1].new_requests] == ["next"]
+
+
+def test_rejected_request_does_not_leave_an_engine_context():
+    core, _ = _async_pipeline_core()
+    config = SimpleNamespace(
+        max_new_tokens=1, stop=None, ignore_eos=True, temperature=0,
+        top_p=1, top_k=None, seed=None, stream=True,
+    )
+
+    async def consume():
+        async for _ in core.add_request(
+            "too-long", "ignored", config, prompt_token_ids=list(range(4096)),
+            constraint_spec=_tool_constraint(),
+        ):
+            pass
+
+    with pytest.raises(ValueError, match="leaves no room for generation"):
+        asyncio.run(consume())
+    assert not core._request_contexts and not core.scheduler.requests
+    assert not core._pending_free_ids
 
 
 def test_async_pipeline_dispatches_two_steps_before_applying_first(monkeypatch):

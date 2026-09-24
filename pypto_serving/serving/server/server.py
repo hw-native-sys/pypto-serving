@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import importlib.util
 import json
 import logging
 import time
@@ -19,6 +20,8 @@ import uuid
 from typing import Literal
 
 from pypto_serving.config.types import GenerateConfig
+from pypto_serving.serving.constraints import ConstraintSpec
+from pypto_serving.serving.constraints.provider import XGrammarProvider
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput
 from pypto_serving.serving.reasoning import OutputParserSpec, ToolCallDelta, supports_tool_calls
 from pypto_serving.tools.profile import (
@@ -192,6 +195,8 @@ class ServingServer:
         self.generate_config = generate_config
         self.app = FastAPI(title="PyPTO Serving")
         self._profile_lock = asyncio.Lock()
+        self._constraint_preflight_lock = asyncio.Lock()
+        self._constraint_preflight_provider: XGrammarProvider | None = None
         self._register_exception_handlers()
         self._register_routes()
 
@@ -342,6 +347,9 @@ class ServingServer:
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         output_parser_spec = self._output_parser_spec(request)
+        constraint_spec = self._constraint_spec(request, output_parser_spec)
+        if constraint_spec is not None:
+            await self._preflight_constraint(constraint_spec)
         prompt = self._apply_chat_template(
             request.messages,
             request.chat_template_kwargs,
@@ -369,6 +377,7 @@ class ServingServer:
                         config,
                         request.model or self.model_id,
                         output_parser_spec=output_parser_spec,
+                        constraint_spec=constraint_spec,
                         parallel_tool_calls=request.parallel_tool_calls,
                     ),
                     media_type="text/event-stream",
@@ -384,6 +393,7 @@ class ServingServer:
                 prompt,
                 config,
                 output_parser_spec=output_parser_spec,
+                **({"constraint_spec": constraint_spec} if constraint_spec else {}),
             ):
                 if output.text:
                     full_text = output.text
@@ -469,12 +479,14 @@ class ServingServer:
         model: str,
         *,
         output_parser_spec: OutputParserSpec | None = None,
+        constraint_spec: ConstraintSpec | None = None,
         parallel_tool_calls: bool = True,
     ):
         # Once SSE headers have been sent, request-local parser failures must be
         # reported in the stream. Cancellation still propagates to engine cleanup.
         chunks = self._stream_chat_chunks(
             request_id, prompt, config, model, output_parser_spec=output_parser_spec,
+            constraint_spec=constraint_spec,
             parallel_tool_calls=parallel_tool_calls,
         )
         try:
@@ -494,6 +506,7 @@ class ServingServer:
         model: str,
         *,
         output_parser_spec: OutputParserSpec | None,
+        constraint_spec: ConstraintSpec | None,
         parallel_tool_calls: bool,
     ):
         with profile_span("http.stream_chat_completion", cat="request", args={"request_id": request_id}):
@@ -504,6 +517,7 @@ class ServingServer:
                 prompt,
                 config,
                 output_parser_spec=output_parser_spec,
+                **({"constraint_spec": constraint_spec} if constraint_spec else {}),
             )
             async with contextlib.aclosing(outputs):
                 async for output in outputs:
@@ -614,21 +628,27 @@ class ServingServer:
         return kwargs
 
     @staticmethod
-    def _validate_chat_request(request: ChatCompletionRequest) -> str:
+    def _validate_chat_request(request: ChatCompletionRequest) -> str | dict:
         if "tools" in (request.chat_template_kwargs or {}):
             raise ValueError("tools must be supplied as a top-level request field")
         choice = request.tool_choice
         if choice is None:
             choice = "auto" if request.tools else "none"
-        if choice not in ("none", "auto"):
-            raise ValueError("only tool_choice 'auto' and 'none' are supported; constrained tool choice is unavailable")
-        if choice == "auto" and not request.tools:
-            raise ValueError("tool_choice 'auto' requires non-empty tools")
-        names = []
-        for tool in request.tools or ():
-            if tool.function.strict:
-                raise ValueError("strict tool schemas require constrained decoding, which is not supported")
-            names.append(tool.function.name)
+        names = [tool.function.name for tool in request.tools or ()]
+        if isinstance(choice, dict):
+            function = choice.get("function")
+            if (
+                set(choice) != {"type", "function"}
+                or choice.get("type") != "function"
+                or not isinstance(function, dict)
+                or set(function) != {"name"}
+                or function.get("name") not in names
+            ):
+                raise ValueError("named tool_choice must select a declared function")
+        elif choice not in ("none", "auto", "required"):
+            raise ValueError("tool_choice must be none, auto, required, or a declared function")
+        if choice != "none" and not request.tools:
+            raise ValueError("enabled tool_choice requires non-empty tools")
         if len(set(names)) != len(names):
             raise ValueError("tool function names must be unique")
         for message in request.messages:
@@ -645,6 +665,46 @@ class ServingServer:
                 if not isinstance(json.loads(call.function.arguments), dict):
                     raise ValueError("tool call arguments must encode an object")
         return choice
+
+    def _constraint_spec(
+        self, request: ChatCompletionRequest, parser_spec: OutputParserSpec | None,
+    ) -> ConstraintSpec | None:
+        """Enable structural generation only for vLLM-compatible tool-choice cases."""
+        choice = self._validate_chat_request(request)
+        if choice == "none" or (
+            choice == "auto" and not any(tool.function.strict for tool in request.tools or ())
+        ):
+            return None
+        if parser_spec is None or parser_spec.parser_id != "deepseek_v4":
+            raise ValueError("the model has no DeepSeek V4 structural-tool format")
+        engine_config = getattr(self.engine, "config", None)
+        if getattr(engine_config, "executor_cls", None) != "PyptoDeepSeekV4DSparkExecutor":
+            raise ValueError("constrained tool generation currently requires DeepSeek V4 DSpark")
+        if importlib.util.find_spec("xgrammar") is None:
+            raise ValueError("xgrammar is required for constrained tool generation")
+        return ConstraintSpec(
+            provider_id="xgrammar",
+            format_id="deepseek_v4",
+            tools=tuple(tool.model_dump(mode="json", exclude_none=True) for tool in request.tools or ()),
+            tool_choice=choice,
+            reasoning=parser_spec.initial_state == "reasoning",
+            parallel_tool_calls=request.parallel_tool_calls,
+        )
+
+    async def _preflight_constraint(self, spec: ConstraintSpec) -> None:
+        """Reject unsupported schemas before an SSE response or worker batch starts."""
+        async with self._constraint_preflight_lock:
+            try:
+                await asyncio.to_thread(self._compile_constraint_for_preflight, spec)
+            except (RuntimeError, ValueError) as exc:
+                raise ValueError(f"invalid tool constraint: {exc}") from exc
+
+    def _compile_constraint_for_preflight(self, spec: ConstraintSpec) -> None:
+        if self._constraint_preflight_provider is None:
+            self._constraint_preflight_provider = XGrammarProvider(self.engine.tokenizer)
+        with profile_span("ServingServer.constraint_preflight", cat="constraints"):
+            state = self._constraint_preflight_provider.compile(spec)
+        state.close()
 
     def _output_parser_spec(
         self,
@@ -666,7 +726,7 @@ class ServingServer:
             parser_id=str(parser_id),
             initial_state="reasoning" if thinking else "content",
             include_reasoning=request.include_reasoning,
-            tool_choice=tool_choice,
+            tool_choice="required" if tool_choice == "required" or isinstance(tool_choice, dict) else tool_choice,
             tool_names=tuple(tool.function.name for tool in request.tools or ()),
         )
 

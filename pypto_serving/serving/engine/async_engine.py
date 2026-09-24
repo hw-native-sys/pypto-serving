@@ -22,6 +22,7 @@ from typing import Callable
 from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
 from pypto_serving.observability import InMemoryStatLogger, IterationStats, SchedulerStats
+from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.reasoning import (
     OutputParserSpec, ParsedToolCall, ToolCallDelta, create_output_parser,
@@ -422,6 +423,7 @@ class ReplicaEngineCore:
         on_queued: Callable[[], None] | None = None,
         prompt_token_ids: Sequence[int] | None = None,
         output_parser_spec: OutputParserSpec | None = None,
+        constraint_spec: ConstraintSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
         with profile_span(
@@ -440,6 +442,7 @@ class ReplicaEngineCore:
                 top_p=config.top_p,
                 top_k=config.top_k,
                 seed=config.seed,
+                constraint_spec=constraint_spec,
             )
 
             ctx = _RequestContext(
@@ -447,8 +450,10 @@ class ReplicaEngineCore:
                 stream=getattr(config, "stream", True),
                 output_parser=create_output_parser(output_parser_spec, self.tokenizer),
             )
-            self._request_contexts[request_id] = ctx
             self.scheduler.add_request(request)
+            # Registration can reject a request before the generator reaches its
+            # cleanup finally block. Do not retain an orphaned context in that case.
+            self._request_contexts[request_id] = ctx
             stat_logger = getattr(self, "_stat_logger", None)
             if stat_logger is not None:
                 stat_logger.record_queued(getattr(self, "_engine_index", 0), request_id)
@@ -730,6 +735,7 @@ class ReplicaEngineCore:
                     top_p=req.top_p,
                     top_k=req.top_k,
                     seed=req.seed,
+                    constraint_spec=req.constraint_spec.to_wire() if req.constraint_spec else None,
                 ))
                 self._worker_known_req_ids.add(req_id)
 
@@ -1398,6 +1404,7 @@ class AsyncLLMEngine:
         config,
         *,
         output_parser_spec: OutputParserSpec | None = None,
+        constraint_spec: ConstraintSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         arrival_monotonic = time.monotonic()
         replica_idx = self._select_replica()
@@ -1427,23 +1434,19 @@ class AsyncLLMEngine:
         terminal_output_seen = False
         try:
             core = self._cores[replica_idx]
-            if output_parser_spec is None:
-                outputs = core.add_request(
-                    request_id,
-                    prompt,
-                    config,
-                    on_queued=clear_route_extra_load,
-                    prompt_token_ids=prompt_token_ids,
-                )
-            else:
-                outputs = core.add_request(
-                    request_id,
-                    prompt,
-                    config,
-                    on_queued=clear_route_extra_load,
-                    prompt_token_ids=prompt_token_ids,
-                    output_parser_spec=output_parser_spec,
-                )
+            request_options = {}
+            if output_parser_spec is not None:
+                request_options["output_parser_spec"] = output_parser_spec
+            if constraint_spec is not None:
+                request_options["constraint_spec"] = constraint_spec
+            outputs = core.add_request(
+                request_id,
+                prompt,
+                config,
+                on_queued=clear_route_extra_load,
+                prompt_token_ids=prompt_token_ids,
+                **request_options,
+            )
             async with contextlib.aclosing(outputs):
                 async for output in outputs:
                     if not self._core_records_metrics[replica_idx]:

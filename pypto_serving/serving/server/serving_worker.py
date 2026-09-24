@@ -26,6 +26,8 @@ from pypto_serving.config.types import (
     DecodeResult,
     SamplingParams,
 )
+from pypto_serving.serving.constraints import ConstraintSpec
+from pypto_serving.serving.constraints.provider import ConstraintState, XGrammarProvider
 from pypto_serving.serving.utils.gc_utils import freeze_gc_heap
 from pypto_serving.serving.utils.env import configure_runtime_logging
 from pypto_serving.serving.server.ipc import (
@@ -131,6 +133,8 @@ class WorkerProcess:
         # PLACEHOLDER_TOKEN for a decode input it hasn't sampled yet; the worker
         # substitutes from here. Entries cleared when a request is released.
         self._last_tokens: dict[str, list[int]] = {}
+        self._constraint_states: dict[str, ConstraintState] = {}
+        self._xgrammar_provider: XGrammarProvider | None = None
 
     def init_device_and_model(self) -> int:
         from pypto_serving.config.types import ModelRecord
@@ -378,6 +382,14 @@ class WorkerProcess:
             assert isinstance(cmd, StepCommand)
             try:
                 self._wait_for_pending_decode_reclaims(cmd.finished_request_ids)
+                self._wait_for_pending_decode_reclaims(
+                    [
+                        request.request_id
+                        for request in cmd.decode_requests
+                        if (cached := self._req_cache.get(request.request_id)) is not None
+                        and cached.constraint_spec is not None
+                    ]
+                )
                 self._apply_command_lifecycle(cmd, release_cache_entries)
             except Exception as exc:
                 logger.error("Worker command lifecycle failed: %s", exc, exc_info=True)
@@ -610,11 +622,24 @@ class WorkerProcess:
         expected_cache_entries: dict[str, object] | None = None,
     ) -> None:
         """Apply request release and registration on the FIFO device lane."""
+        if not hasattr(self, "_constraint_states"):
+            self._constraint_states = {}
         self._release_finished_request_state(
             cmd.finished_request_ids,
             expected_cache_entries=expected_cache_entries,
         )
         for new_request in cmd.new_requests:
+            previous_state = self._constraint_states.pop(new_request.request_id, None)
+            if previous_state is not None:
+                previous_state.close()
+            if new_request.constraint_spec is not None:
+                spec = ConstraintSpec.from_wire(new_request.constraint_spec)
+                if spec.provider_id != "xgrammar":
+                    raise ValueError(f"unsupported constraint provider {spec.provider_id!r}")
+                if self._xgrammar_provider is None:
+                    self._xgrammar_provider = XGrammarProvider(self.model_record.tokenizer)
+                with profile_span("WorkerProcess.constraint_compile", cat="constraints"):
+                    self._constraint_states[new_request.request_id] = self._xgrammar_provider.compile(spec)
             self._req_cache[new_request.request_id] = new_request
 
     def _release_finished_request_state(
@@ -637,6 +662,9 @@ class WorkerProcess:
                     continue
             self._req_cache.pop(req_id, None)
             self._last_tokens.pop(req_id, None)
+            constraint_state = getattr(self, "_constraint_states", {}).pop(req_id, None)
+            if constraint_state is not None:
+                constraint_state.close()
             release_sampler = getattr(self.sampler, "release_requests", None)
             if callable(release_sampler):
                 release_sampler([req_id])
@@ -770,21 +798,29 @@ class WorkerProcess:
                     runtime_model, token_ids
                 )
 
+            prefill_batch = pack_prefill_batch(
+                request_ids=[pr.request_id for pr in scheduled],
+                token_chunks=chunk_tokens_list,
+                seq_lens=seq_lens,
+                chunk_starts=chunk_starts,
+                device=device,
+                embedding_lookup=embedding_lookup,
+                allow_device_greedy_sampling=allow_device_greedy_sampling,
+                allow_device_topk_sampling=allow_device_topk_sampling,
+                block_ids=block_ids_list,
+                block_ids_by_group=[pr.block_ids_by_group for pr in scheduled],
+                cache_partitions=[pr.cache_partition for pr in scheduled],
+            )
+            prefill_batch.constraint_states = {
+                pr.request_id: state
+                for pr in scheduled
+                if (state := getattr(self, "_constraint_states", {}).get(pr.request_id)) is not None
+                and pr.num_computed_tokens + len(pr.chunk_tokens)
+                >= len(self._req_cache[pr.request_id].prompt_token_ids)
+            }
             prefill_result = self.executor.run_prefill(
                 runtime_model,
-                pack_prefill_batch(
-                    request_ids=[pr.request_id for pr in scheduled],
-                    token_chunks=chunk_tokens_list,
-                    seq_lens=seq_lens,
-                    chunk_starts=chunk_starts,
-                    device=device,
-                    embedding_lookup=embedding_lookup,
-                    allow_device_greedy_sampling=allow_device_greedy_sampling,
-                    allow_device_topk_sampling=allow_device_topk_sampling,
-                    block_ids=block_ids_list,
-                    block_ids_by_group=[pr.block_ids_by_group for pr in scheduled],
-                    cache_partitions=[pr.cache_partition for pr in scheduled],
-                ),
+                prefill_batch,
             )
 
             # Sample only for requests whose prefill chunk completes the prompt.
@@ -817,6 +853,9 @@ class WorkerProcess:
                         allow_device_topk_sampling=allow_device_topk_sampling,
                     )
                     new_tokens[pr.request_id] = [token_id]
+                    constraint_state = getattr(self, "_constraint_states", {}).get(pr.request_id)
+                    if constraint_state is not None:
+                        constraint_state.accept((token_id,))
                     completed_request_ids.append(pr.request_id)
                     completed_token_ids.append(token_id)
                     completed_sampling_params.append(params)
@@ -860,6 +899,14 @@ class WorkerProcess:
         if not self.executor.supports_device_decode_embedding:
             # Placeholder tokens cannot be embedded correctly until the prior
             # device result is available. Keep this executor on the serial path.
+            return None
+        if any(
+            (cached := self._req_cache.get(request.request_id)) is not None
+            and cached.constraint_spec is not None
+            for request in cmd.decode_requests
+        ):
+            # Its next mask depends on the previous reclaim, so bind it on
+            # the device lane after that request's output is committed.
             return None
         runtime_model = self.model_record.runtime_model
         if buffer_slot is None:
@@ -930,6 +977,11 @@ class WorkerProcess:
             block_ids=[dr.block_ids for dr in scheduled],
             block_ids_by_group=[dr.block_ids_by_group for dr in scheduled],
             cache_partitions=[dr.cache_partition for dr in scheduled],
+            constraint_states={
+                dr.request_id: state
+                for dr in scheduled
+                if (state := getattr(self, "_constraint_states", {}).get(dr.request_id)) is not None
+            },
         )
 
     def _batch_decode(
@@ -985,7 +1037,11 @@ class WorkerProcess:
         """Convert a runner result to tokens on either serial or reclaim lane."""
         if decode_result.accepted_token_ids is not None:
             for i, dr in enumerate(scheduled):
-                new_tokens[dr.request_id] = list(decode_result.accepted_token_ids[i])
+                tokens = list(decode_result.accepted_token_ids[i])
+                constraint_state = getattr(self, "_constraint_states", {}).get(dr.request_id)
+                if constraint_state is not None:
+                    constraint_state.accept(tokens)
+                new_tokens[dr.request_id] = tokens
             if decode_result.num_draft_tokens is None:
                 return {}
             return {
@@ -1019,10 +1075,17 @@ class WorkerProcess:
                 allow_device_topk_sampling=allow_device_topk_sampling,
             )
             new_tokens[dr.request_id] = [token_id]
+            constraint_state = getattr(self, "_constraint_states", {}).get(dr.request_id)
+            if constraint_state is not None:
+                constraint_state.accept((token_id,))
         return {}
 
     def close(self) -> None:
         """Release executor-owned runtime and device resources."""
+        for constraint_state in getattr(self, "_constraint_states", {}).values():
+            constraint_state.close()
+        if hasattr(self, "_constraint_states"):
+            self._constraint_states.clear()
         executor = self.executor
         self.executor = None
         if executor is None:
