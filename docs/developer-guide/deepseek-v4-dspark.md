@@ -63,6 +63,16 @@ lookup requires only its eight-token historical tail. The fused decode state
 descriptors use the same physical ring lengths as the scheduler, so device-side
 modulo stays aligned after wraparound, including after a prefix-cache hit.
 
+Once a step completes, the scheduler releases raw-KV and compressor-state
+pages older than their confirmed sliding windows. Expired entries become `-1`
+without compacting the logical table or changing its ring period. Allocation
+fills only the retained window and new write positions; full-history compressed
+pools are unchanged. For a 1024-token prompt, raw KV ownership drops from 32
+pages to four after prefill, plus pages needed for subsequent writes. Queued
+async snapshots keep their own references until completion, and speculative
+reservations never advance the reclamation boundary. Released prefix pages
+remain reusable through their hashes until the allocator evicts them.
+
 The drafter's private caches are rebuilt rather than shared. K=7 sets
 `speculative_prefix_cache_replay_tokens=128` in the runtime contract; the
 scheduler caps the hit before rounding down to the grouped page alignment.
