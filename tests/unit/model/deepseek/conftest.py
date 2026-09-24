@@ -39,26 +39,30 @@ from pypto_serving.model.deepseek.weight_loader import (
 # rather than quietly testing the old shape.
 _EXPERT_KEY = "ffn.experts.{}."
 _SHAPES: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
-    "hc_attn_fn": ((1, 4), torch.float32),
+    # DSpark's decode bank pads the HC function matrices from their natural
+    # MIX_HC=24 rows; smaller fixture shapes fail its row-count check.
+    "hc_attn_fn": ((24, 4), torch.float32),
     "hc_attn_scale": ((3,), torch.float32),
     "hc_attn_base": ((1,), torch.float32),
     "attn_norm.weight": ((4,), torch.bfloat16),
     # NZ-packed (pack_nz=True): sized so the post-transform/post-reshape trailing [rows, cols]
-    # clears the 16-row fractal and dtype C0 (bf16=16, int8=32) minimums instead of the
-    # smallest shape that merely exercises the rule.
-    "attn.wq_a.weight": ((16, 16), torch.bfloat16),
-    "attn.wq_b.weight": ((32, 16), torch.int8),
-    "attn.wq_b.scale": ((32,), torch.float32),
-    "attn.wkv.weight": ((16, 16), torch.bfloat16),
+    # spans at least two C0 column blocks (bf16 = 32 cols, int8 = 64 cols) as well as the
+    # 16-row fractal -- at one block NZ blocking is an identity, and a test could not tell
+    # a packed slab from an ND one. Shapes are pre-transpose: e.g. wq_a (32, 16) packs as
+    # its transpose [16, 32].
+    "attn.wq_a.weight": ((32, 16), torch.bfloat16),
+    "attn.wq_b.weight": ((64, 32), torch.int8),
+    "attn.wq_b.scale": ((64,), torch.float32),
+    "attn.wkv.weight": ((32, 16), torch.bfloat16),
     "attn.q_norm.weight": ((2,), torch.bfloat16),
     "attn.kv_norm.weight": ((3,), torch.bfloat16),
     "attn.attn_sink": ((2,), torch.float32),
-    "attn.wo_a.weight": ((128, 16), torch.bfloat16),
+    "attn.wo_a.weight": ((128, 32), torch.bfloat16),
     # column_reshape_groups=8 splits the trailing dim into 8 groups, so each group's trailing
-    # [16, 32] still clears int8 C0 = 32.
-    "attn.wo_b.weight": ((16, 256), torch.int8),
+    # [16, 64] spans two int8 C0 blocks.
+    "attn.wo_b.weight": ((16, 512), torch.int8),
     "attn.wo_b.scale": ((16,), torch.float32),
-    "hc_ffn_fn": ((1, 4), torch.float32),
+    "hc_ffn_fn": ((24, 4), torch.float32),
     "hc_ffn_scale": ((3,), torch.float32),
     "hc_ffn_base": ((1,), torch.float32),
     "ffn_norm.weight": ((4,), torch.bfloat16),
@@ -67,11 +71,11 @@ _SHAPES: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
     # Vocabulary-sized and replicated per rank: the one tensor here that is genuinely
     # large, so the fixture keeps num_hash_layers at 1 by default.
     "ffn.gate.tid2eid": ((129280, 6), torch.int32),
-    "ffn.shared_experts.w1.weight": ((16, 32), torch.int8),
+    "ffn.shared_experts.w1.weight": ((16, 64), torch.int8),
     "ffn.shared_experts.w1.scale": ((16,), torch.float32),
-    "ffn.shared_experts.w2.weight": ((16, 32), torch.int8),
+    "ffn.shared_experts.w2.weight": ((16, 64), torch.int8),
     "ffn.shared_experts.w2.scale": ((16,), torch.float32),
-    "ffn.shared_experts.w3.weight": ((16, 32), torch.int8),
+    "ffn.shared_experts.w3.weight": ((16, 64), torch.int8),
     "ffn.shared_experts.w3.scale": ((16,), torch.float32),
     "attn.compressor.wkv.weight": ((2, 4), torch.bfloat16),
     "attn.compressor.wgate.weight": ((2, 4), torch.bfloat16),
@@ -79,26 +83,26 @@ _SHAPES: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
     "attn.compressor.norm.weight": ((3,), torch.bfloat16),
     # NZ-packed (transpose=True) in the fallback (ratio-0) case; the ratio-4 (CSA) case
     # below always overrides these with the production-sized _KIND_SHAPES entries.
-    "attn.indexer.wq_b.weight": ((32, 16), torch.int8),
-    "attn.indexer.wq_b.scale": ((32,), torch.float32),
-    "attn.indexer.weights_proj.weight": ((16, 16), torch.bfloat16),
+    "attn.indexer.wq_b.weight": ((64, 32), torch.int8),
+    "attn.indexer.wq_b.scale": ((64,), torch.float32),
+    "attn.indexer.weights_proj.weight": ((32, 16), torch.bfloat16),
     "attn.indexer.compressor.wkv.weight": ((2, 4), torch.bfloat16),
     "attn.indexer.compressor.wgate.weight": ((2, 4), torch.bfloat16),
     "attn.indexer.compressor.ape": ((4, 2), torch.float32),
     "attn.indexer.compressor.norm.weight": ((2,), torch.bfloat16),
-    f"{_EXPERT_KEY}w1.weight": ((16, 32), torch.int8),
+    f"{_EXPERT_KEY}w1.weight": ((16, 64), torch.int8),
     f"{_EXPERT_KEY}w1.scale": ((16,), torch.float32),
-    f"{_EXPERT_KEY}w2.weight": ((16, 32), torch.int8),
+    f"{_EXPERT_KEY}w2.weight": ((16, 64), torch.int8),
     f"{_EXPERT_KEY}w2.scale": ((16,), torch.float32),
-    f"{_EXPERT_KEY}w3.weight": ((16, 32), torch.int8),
+    f"{_EXPERT_KEY}w3.weight": ((16, 64), torch.int8),
     f"{_EXPERT_KEY}w3.scale": ((16,), torch.float32),
     # MTP-only extras: the draft layer carries its own norms, the two projections that fold the
     # embedding and hidden states together, and its own head constants.
     "enorm.weight": ((4,), torch.bfloat16),
     "hnorm.weight": ((4,), torch.bfloat16),
-    "e_proj.weight": ((16, 32), torch.int8),
+    "e_proj.weight": ((16, 64), torch.int8),
     "e_proj.scale": ((16,), torch.float32),
-    "h_proj.weight": ((16, 32), torch.int8),
+    "h_proj.weight": ((16, 64), torch.int8),
     "h_proj.scale": ((16,), torch.float32),
     "hc_head_fn": ((1, 4), torch.float32),
     "hc_head_scale": ((3,), torch.float32),
@@ -117,21 +121,33 @@ _EXPERT_ID = re.compile(r"ffn\.experts\.\d+\.")
 # their pre-transpose orientation.
 _KIND_SHAPES: dict[int, dict[str, tuple[tuple[int, ...], torch.dtype]]] = {
     _DEEPSEEK_V4_HCA_COMPRESS_RATIO: {
-        "attn.compressor.wkv.weight": ((_DEEPSEEK_V4_HCA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE), torch.bfloat16),
+        "attn.compressor.wkv.weight": (
+            (_DEEPSEEK_V4_HCA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
+            torch.bfloat16,
+        ),
         "attn.compressor.wgate.weight": (
             (_DEEPSEEK_V4_HCA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
             torch.bfloat16,
         ),
-        "attn.compressor.ape": ((_DEEPSEEK_V4_HCA_COMPRESS_RATIO, _DEEPSEEK_V4_HCA_MAIN_OUT_DIM), torch.float32),
+        "attn.compressor.ape": (
+            (_DEEPSEEK_V4_HCA_COMPRESS_RATIO, _DEEPSEEK_V4_HCA_MAIN_OUT_DIM),
+            torch.float32,
+        ),
         "attn.compressor.norm.weight": ((_DEEPSEEK_V4_HEAD_DIM,), torch.bfloat16),
     },
     _DEEPSEEK_V4_CSA_COMPRESS_RATIO: {
-        "attn.compressor.wkv.weight": ((_DEEPSEEK_V4_CSA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE), torch.bfloat16),
+        "attn.compressor.wkv.weight": (
+            (_DEEPSEEK_V4_CSA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
+            torch.bfloat16,
+        ),
         "attn.compressor.wgate.weight": (
             (_DEEPSEEK_V4_CSA_MAIN_OUT_DIM, _DEEPSEEK_V4_HIDDEN_SIZE),
             torch.bfloat16,
         ),
-        "attn.compressor.ape": ((_DEEPSEEK_V4_CSA_COMPRESS_RATIO, _DEEPSEEK_V4_CSA_MAIN_OUT_DIM), torch.float32),
+        "attn.compressor.ape": (
+            (_DEEPSEEK_V4_CSA_COMPRESS_RATIO, _DEEPSEEK_V4_CSA_MAIN_OUT_DIM),
+            torch.float32,
+        ),
         "attn.compressor.norm.weight": ((_DEEPSEEK_V4_HEAD_DIM,), torch.bfloat16),
         # transposed by the packer, hence (out, in) here
         "attn.indexer.wq_b.weight": ((_DEEPSEEK_V4_ATTENTION_OUT // 4, _DEEPSEEK_V4_Q_LORA), torch.int8),

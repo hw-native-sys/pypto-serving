@@ -45,10 +45,18 @@ DEEPSEEK_V4_O_GROUPS = 8
 # `NZ_ROW_STACKED_NAMES` in decode_fwd.py / prefill_fwd.py; `wo_a` and the routed experts are
 # NZ too but already stack on an existing leading axis (their groups/experts lead), so they are
 # not in this set.
-DEEPSEEK_V4_NZ_ROW_STACKED_NAMES = frozenset({
-    "wq_a", "wq_b", "wkv", "csa_idx_wq_b",
-    "shared_w1", "shared_w3", "shared_w2", "csa_weights_proj",
-})
+DEEPSEEK_V4_NZ_ROW_STACKED_NAMES = frozenset(
+    {
+        "wq_a",
+        "wq_b",
+        "wkv",
+        "csa_idx_wq_b",
+        "shared_w1",
+        "shared_w3",
+        "shared_w2",
+        "csa_weights_proj",
+    }
+)
 
 # Attention kinds, and the fixed dimensions their compressor/indexer weights have. These are
 # model constants rather than config knobs: the packer validates the active branch against
@@ -114,7 +122,11 @@ def deepseek_v4_replicate(ranks: int) -> Replicate:
 # is the hand-written table's order, including where the synthetic Hadamard index sits.
 DEEPSEEK_V4_OPTIONAL_LAYER_RULES: tuple[LayerRule, ...] = (
     OptionalWeightRule(
-        "hca_cmp_wkv", "attn.compressor.wkv.weight", torch.bfloat16, (_HCA_OUT, _HIDDEN), (DEEPSEEK_V4_HCA_RATIO,)
+        "hca_cmp_wkv",
+        "attn.compressor.wkv.weight",
+        torch.bfloat16,
+        (_HCA_OUT, _HIDDEN),
+        (DEEPSEEK_V4_HCA_RATIO,),
     ),
     OptionalWeightRule(
         "hca_cmp_wgate",
@@ -131,10 +143,18 @@ DEEPSEEK_V4_OPTIONAL_LAYER_RULES: tuple[LayerRule, ...] = (
         (DEEPSEEK_V4_HCA_RATIO,),
     ),
     OptionalWeightRule(
-        "hca_cmp_norm_w", "attn.compressor.norm.weight", torch.bfloat16, (_HEAD_DIM,), (DEEPSEEK_V4_HCA_RATIO,)
+        "hca_cmp_norm_w",
+        "attn.compressor.norm.weight",
+        torch.bfloat16,
+        (_HEAD_DIM,),
+        (DEEPSEEK_V4_HCA_RATIO,),
     ),
     OptionalWeightRule(
-        "csa_cmp_wkv", "attn.compressor.wkv.weight", torch.bfloat16, (_CSA_OUT, _HIDDEN), (DEEPSEEK_V4_CSA_RATIO,)
+        "csa_cmp_wkv",
+        "attn.compressor.wkv.weight",
+        torch.bfloat16,
+        (_CSA_OUT, _HIDDEN),
+        (DEEPSEEK_V4_CSA_RATIO,),
     ),
     OptionalWeightRule(
         "csa_cmp_wgate",
@@ -151,7 +171,11 @@ DEEPSEEK_V4_OPTIONAL_LAYER_RULES: tuple[LayerRule, ...] = (
         (DEEPSEEK_V4_CSA_RATIO,),
     ),
     OptionalWeightRule(
-        "csa_cmp_norm_w", "attn.compressor.norm.weight", torch.bfloat16, (_HEAD_DIM,), (DEEPSEEK_V4_CSA_RATIO,)
+        "csa_cmp_norm_w",
+        "attn.compressor.norm.weight",
+        torch.bfloat16,
+        (_HEAD_DIM,),
+        (DEEPSEEK_V4_CSA_RATIO,),
     ),
     OptionalWeightRule(
         "csa_idx_wq_b",

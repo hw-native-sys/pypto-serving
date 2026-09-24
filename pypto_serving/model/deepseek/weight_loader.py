@@ -330,8 +330,7 @@ def _sample_file_page_cache_residency(fd: int, path: Path) -> float | None:
             else:
                 last_offset = size - sample_bytes
                 offsets = tuple(
-                    ((index * last_offset // (_PREPACKED_CACHE_SAMPLE_WINDOWS - 1)) // page_size)
-                    * page_size
+                    ((index * last_offset // (_PREPACKED_CACHE_SAMPLE_WINDOWS - 1)) // page_size) * page_size
                     for index in range(_PREPACKED_CACHE_SAMPLE_WINDOWS)
                 )
 
@@ -812,9 +811,7 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
     ) -> DeepSeekV4StackedLayerWeights | None:
         """Map a valid prepacked sidecar, or return ``None`` when none is usable."""
         packed_path = (
-            deepseek_v4_packed_weights_path(self.model_dir, ranks=ranks)
-            if path is None
-            else Path(path)
+            deepseek_v4_packed_weights_path(self.model_dir, ranks=ranks) if path is None else Path(path)
         )
         if not packed_path.is_file():
             return None
@@ -948,7 +945,6 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
             DEEPSEEK_V4_STAGING_POLICY,
             deepseek_v4_stack_groups,
         )
-
 
         def pack_into(layer_id: int, destinations: Mapping[str, torch.Tensor]) -> None:
             self.load_packed_layer_weights(
@@ -1111,5 +1107,3 @@ def pack_deepseek_v4_layer_weights(
         nz_pack=pack_nz,
     )
     return DeepSeekV4PackedLayerWeights(layer_id=layer_id, tensors=tensors)
-
-

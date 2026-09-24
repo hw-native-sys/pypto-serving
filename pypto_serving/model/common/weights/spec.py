@@ -71,6 +71,7 @@ class LayerWeightRule:
     # declares it pl.NZ.
     pack_nz: bool = False
 
+
 # A dimension is either a literal or the name of a `LayerContext` field to read, which keeps
 # a shape that depends on the model config expressible as data rather than as a lambda.
 Dim = int | str
@@ -162,7 +163,9 @@ class ExpertWeightRule:
     pack_nz: bool = False
 
 
-LayerRule = LayerWeightRule | OptionalWeightRule | DefaultedWeightRule | SyntheticWeightRule | ExpertWeightRule
+LayerRule = (
+    LayerWeightRule | OptionalWeightRule | DefaultedWeightRule | SyntheticWeightRule | ExpertWeightRule
+)
 
 
 @dataclass(frozen=True)

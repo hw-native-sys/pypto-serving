@@ -1911,7 +1911,14 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         if self._static_lm_head_weight is None:
             global_weights = self.load_packed_global_weights()
             self._ensure_shared_host_allocation_before_worker("lm_head_weight")
-            packed = global_weights.lm_head_weight.to(torch.bfloat16).contiguous().cpu()
+            from pypto_serving.model.common.weights.nz import pack_nz  # noqa: PLC0415
+
+            # NZ-block the whole [tp, vocab_per_rank, hidden] tensor once: the exact-vocab
+            # slice it already went through cuts into the row axis NZ packs (so that slice
+            # had to come first), while everything below only indexes the leading axis,
+            # which NZ blocking commutes with -- each TP shard blocks as an independent
+            # unit either way, and one pass avoids a packed copy per rank.
+            packed = pack_nz(global_weights.lm_head_weight.to(torch.bfloat16).contiguous().cpu())
             tp_size = packed.shape[0]
             ranks = self._compiled.layout.ranks
             rank_shards = [packed[rank % tp_size] for rank in range(ranks)]

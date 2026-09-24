@@ -105,9 +105,7 @@ def pack_layer(
             factory = (factories or {}).get(rule.factory)
             if factory is None:
                 raise ValueError(f"{rule.name} needs the {rule.factory!r} factory but none was given")
-            packed[rule.name] = policy.apply(
-                rule.name, factory(), dtype=rule.dtype, destination=destination
-            )
+            packed[rule.name] = policy.apply(rule.name, factory(), dtype=rule.dtype, destination=destination)
             continue
 
         if isinstance(rule, OptionalWeightRule):
@@ -132,9 +130,7 @@ def pack_layer(
                 if nz_pack is None:
                     raise ValueError(f"{rule.name} needs nz_pack but none was given")
                 tensor = nz_pack(tensor.to(dtype=rule.dtype))
-            packed[rule.name] = policy.apply(
-                rule.name, tensor, dtype=rule.dtype, destination=destination
-            )
+            packed[rule.name] = policy.apply(rule.name, tensor, dtype=rule.dtype, destination=destination)
             continue
 
         if isinstance(rule, DefaultedWeightRule):
@@ -151,9 +147,7 @@ def pack_layer(
                     raise ValueError(f"{rule.name} has unsupported default fill {rule.default_fill!r}")
             if rule.flatten_to_row:
                 tensor = tensor.reshape(1, -1)
-            packed[rule.name] = policy.apply(
-                rule.name, tensor, dtype=rule.dtype, destination=destination
-            )
+            packed[rule.name] = policy.apply(rule.name, tensor, dtype=rule.dtype, destination=destination)
             continue
 
         if not isinstance(rule, LayerWeightRule):  # pragma: no cover - guards a new rule kind
@@ -178,9 +172,7 @@ def pack_layer(
             if nz_pack is None:
                 raise ValueError(f"{rule.name} needs nz_pack but none was given")
             tensor = nz_pack(tensor.to(dtype=rule.dtype))
-        packed[rule.name] = policy.apply(
-            rule.name, tensor, dtype=rule.dtype, destination=destination
-        )
+        packed[rule.name] = policy.apply(rule.name, tensor, dtype=rule.dtype, destination=destination)
     return packed
 
 

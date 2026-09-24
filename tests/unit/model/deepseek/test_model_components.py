@@ -93,9 +93,7 @@ def _deepseek_serving_contract(
     def padded_prefill_tokens(active_tokens: int) -> int:
         if active_tokens <= 0 or active_tokens > max_prefill_tokens_per_request:
             raise ValueError("invalid active prefill extent")
-        return (
-            (active_tokens + prefill_tile_tokens - 1) // prefill_tile_tokens
-        ) * prefill_tile_tokens
+        return ((active_tokens + prefill_tile_tokens - 1) // prefill_tile_tokens) * prefill_tile_tokens
 
     return SimpleNamespace(
         schema_version="1",
@@ -188,9 +186,7 @@ def _pypto_lib_l3_arg_names(module_name: str, function_name: str) -> tuple[str, 
     )
     module = ast.parse(kernel_file.read_text(encoding="utf-8"))
     function = next(
-        node
-        for node in module.body
-        if isinstance(node, ast.FunctionDef) and node.name == function_name
+        node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == function_name
     )
     return tuple(arg.arg for arg in function.args.args)
 
@@ -371,18 +367,10 @@ def test_deepseek_mtp_token_step_runs_one_request_per_rank_wave(monkeypatch):
             (layout.ranks, layout.decode_tokens),
             dtype=torch.int32,
         ),
-        "sampling_temperatures": torch.empty(
-            (layout.ranks, layout.decode_tokens), dtype=torch.float32
-        ),
-        "sampling_top_ks": torch.empty(
-            (layout.ranks, layout.decode_tokens), dtype=torch.int32
-        ),
-        "sampling_seeds": torch.empty(
-            (layout.ranks, layout.decode_tokens), dtype=torch.int32
-        ),
-        "sampling_positions": torch.empty(
-            (layout.ranks, layout.decode_tokens), dtype=torch.int32
-        ),
+        "sampling_temperatures": torch.empty((layout.ranks, layout.decode_tokens), dtype=torch.float32),
+        "sampling_top_ks": torch.empty((layout.ranks, layout.decode_tokens), dtype=torch.int32),
+        "sampling_seeds": torch.empty((layout.ranks, layout.decode_tokens), dtype=torch.int32),
+        "sampling_positions": torch.empty((layout.ranks, layout.decode_tokens), dtype=torch.int32),
     }
     runner._mtp_buffers = SimpleNamespace()
     runner._mtp_decode_task_args = [SimpleNamespace(tensors=mtp_slots)]
@@ -450,16 +438,12 @@ def test_deepseek_recurrent_mtp_rebuilds_position_dependent_swa_metadata():
     runner._mtp_decode_task_args = [
         SimpleNamespace(
             tensors={
-                "swa_slot_mapping": torch.empty(
-                    (layout.ranks, layout.decode_tokens), dtype=torch.long
-                ),
+                "swa_slot_mapping": torch.empty((layout.ranks, layout.decode_tokens), dtype=torch.long),
                 "swa_indices": torch.empty(
                     (layout.ranks, layout.decode_tokens, layout.sliding_window),
                     dtype=torch.int32,
                 ),
-                "swa_lens": torch.empty(
-                    (layout.ranks, layout.decode_tokens), dtype=torch.int32
-                ),
+                "swa_lens": torch.empty((layout.ranks, layout.decode_tokens), dtype=torch.int32),
             }
         )
     ]
@@ -827,10 +811,7 @@ def test_cli_keeps_deepseek_autoregressive_decode_when_mtp_is_disabled(tmp_path)
 
     assert config.executor_kwargs["num_speculative_tokens"] == 0
     contract = npu_executor.load_deepseek_v4_serving_contract()
-    assert (
-        config.runtime_config.max_prefill_tokens_per_request
-        == contract.max_prefill_tokens_per_request
-    )
+    assert config.runtime_config.max_prefill_tokens_per_request == contract.max_prefill_tokens_per_request
 
 
 @pytest.mark.parametrize(
@@ -1048,9 +1029,7 @@ def test_deepseek_compile_selects_mtp_programs(
         ]
     )
     if num_speculative_tokens > 1:
-        expected_calls.append(
-            ("deepseek_v4_mtp_decode", decode_mtp.l3_decode_mtp, frozenset({"num_tokens"}))
-        )
+        expected_calls.append(("deepseek_v4_mtp_decode", decode_mtp.l3_decode_mtp, frozenset({"num_tokens"})))
     assert compile_calls == expected_calls
     assert compiled.prefill is not None
     assert compiled.decode is not None
@@ -1459,9 +1438,10 @@ def test_deepseek_layer_packer_transposes_and_stacks_rank_local_experts():
         include_gate_bias=True,
     )
 
-    assert packed.tensors["wq_a"].shape == (2, 16, 16)
+    assert packed.tensors["wq_a"].shape == (2, 16, 32)
     assert packed.tensors["wq_a"][0].tolist() == pack_nz(raw["layers.0.attn.wq_a.weight"].t()).tolist()
-    assert packed.tensors["wo_a"].shape == (2, 8, 16, 16)
+    assert not torch.equal(packed.tensors["wq_a"][0], raw["layers.0.attn.wq_a.weight"].t())
+    assert packed.tensors["wo_a"].shape == (2, 8, 16, 32)
     assert packed.tensors["csa_cmp_wkv"].shape == (2, 2, 4)
     assert packed.tensors["csa_cmp_wkv"][0].tolist() == raw["layers.0.attn.compressor.wkv.weight"].tolist()
     assert packed.tensors["csa_inner_wkv"].shape == (2, 2, 4)
@@ -1473,9 +1453,15 @@ def test_deepseek_layer_packer_transposes_and_stacks_rank_local_experts():
     assert torch.count_nonzero(packed.tensors["hca_cmp_wkv"]) == 0
     assert packed.tensors["gate_bias"].shape == (2, 4)
     assert packed.tensors["tid2eid"].shape == (2, 129280, 6)
-    assert packed.tensors["routed_w1"].shape == (2, 2, 16, 32)
-    assert packed.tensors["routed_w1"][0, 0].tolist() == raw["layers.0.ffn.experts.0.w1.weight"].tolist()
-    assert packed.tensors["routed_w1"][1, 0].tolist() == raw["layers.0.ffn.experts.2.w1.weight"].tolist()
+    assert packed.tensors["routed_w1"].shape == (2, 2, 16, 64)
+    assert (
+        packed.tensors["routed_w1"][0, 0].tolist()
+        == pack_nz(raw["layers.0.ffn.experts.0.w1.weight"]).tolist()
+    )
+    assert (
+        packed.tensors["routed_w1"][1, 0].tolist()
+        == pack_nz(raw["layers.0.ffn.experts.2.w1.weight"]).tolist()
+    )
     assert torch.equal(packed.tensors["csa_hadamard_idx"][0], deepseek_v4_hadamard_idx())
 
     destination_storage = {
@@ -1671,9 +1657,7 @@ def test_deepseek_cache_metadata_maps_scheduler_block_ids():
         block_size=128,
         compress_ratio=4,
     )
-    assert long_cmp_mapping.tolist() == [
-        [64 * 32, 64 * 32 + 1, 95 * 32 + 31, 96 * 32, 127 * 32 + 31]
-    ]
+    assert long_cmp_mapping.tolist() == [[64 * 32, 64 * 32 + 1, 95 * 32 + 31, 96 * 32, 127 * 32 + 31]]
 
     with pytest.raises(ValueError, match="position 4099 requires source block 32"):
         metadata.compressed_slot_mapping_from_ids(
@@ -1735,10 +1719,7 @@ def test_deepseek_cache_group_specs_leave_physical_capacity_for_runtime_sizing()
     }
 
     tail_by_name = {spec.name: spec for spec in _deepseek_cache_group_specs(8320)}
-    assert {
-        tail_by_name[name].max_blocks_per_seq
-        for name in ("cmp_c128", "cmp_c4", "idx")
-    } == {65}
+    assert {tail_by_name[name].max_blocks_per_seq for name in ("cmp_c128", "cmp_c4", "idx")} == {65}
 
     with pytest.raises(ValueError, match="needs 129 source-token blocks"):
         _deepseek_cache_group_specs(16385)
@@ -1764,10 +1745,12 @@ def test_deepseek_cache_sizing_uses_limiting_rank_post_weight_budget():
 
     # Logical worker 0 -> physical npu:2, logical worker 1 -> physical npu:5;
     # rank 1 is the limiting budget either way.
-    worker = _MemoryInfoFakeL3Worker({
-        0: (5_000_000_000, 10_000_000_000),
-        1: (4_000_000_000, 10_000_000_000),
-    })
+    worker = _MemoryInfoFakeL3Worker(
+        {
+            0: (5_000_000_000, 10_000_000_000),
+            1: (4_000_000_000, 10_000_000_000),
+        }
+    )
     runner._l3_worker = worker
     runtime = RuntimeConfig(npu_memory_utilization=0.8)
 
@@ -1793,9 +1776,7 @@ def test_deepseek_cache_sizing_uses_prewarmed_worker_memory():
             compress_ratios=tuple([0] * 43),
             layer_plan=(),
             kernel_dir="",
-            kernel_contract=_deepseek_serving_contract(
-                prefill_tile_tokens=layout.prefill_seq
-            ),
+            kernel_contract=_deepseek_serving_contract(prefill_tile_tokens=layout.prefill_seq),
             device_id=0,
             device_ids=(0, 1),
         )
@@ -1804,10 +1785,12 @@ def test_deepseek_cache_sizing_uses_prewarmed_worker_memory():
 
     total = 65_800_000_000
     free = 9_600_000_000  # post-weights with the configured ring arena resident
-    worker = _MemoryInfoFakeL3Worker({
-        0: (free, total),
-        1: (free, total),
-    })
+    worker = _MemoryInfoFakeL3Worker(
+        {
+            0: (free, total),
+            1: (free, total),
+        }
+    )
     runner._l3_worker = worker
     runtime = RuntimeConfig(
         npu_memory_utilization=0.90,
@@ -2081,9 +2064,7 @@ def test_deepseek_prepare_prefill_inputs_uses_dynamic_main_extent(
             model.runtime,
             max_seq_len=8193,
             max_num_batched_tokens=8192,
-            max_prefill_tokens_per_request=(
-                runner._compiled.kernel_contract.max_prefill_tokens_per_request
-            ),
+            max_prefill_tokens_per_request=(runner._compiled.kernel_contract.max_prefill_tokens_per_request),
         ),
     )
     grouped_rows = _grouped_cache_rows(1)
@@ -2136,9 +2117,7 @@ def test_deepseek_prepare_prefill_inputs_pads_mixed_ranks_to_one_dynamic_extent(
             model.runtime,
             max_seq_len=1024,
             max_num_batched_tokens=512,
-            max_prefill_tokens_per_request=(
-                runner._compiled.kernel_contract.max_prefill_tokens_per_request
-            ),
+            max_prefill_tokens_per_request=(runner._compiled.kernel_contract.max_prefill_tokens_per_request),
         ),
     )
     chunk_lens = [129, 257]
@@ -2164,6 +2143,7 @@ def test_deepseek_prepare_prefill_inputs_pads_mixed_ranks_to_one_dynamic_extent(
     assert prepared.logit_row_indices[6, 0].item() == 256
     assert torch.all(prepared.ori_slot_mapping[1, 129:] == -1)
     assert torch.all(prepared.ori_slot_mapping[6, 257:] == -1)
+
 
 def test_deepseek_prepare_decode_inputs_accepts_device_embedding_batch():
     runner, model = _runner_for_prepared_inputs()
@@ -3398,8 +3378,11 @@ def _int8_ramp(rows: int, cols: int) -> torch.Tensor:
     return (torch.arange(rows * cols) % 127).to(torch.int8).reshape(rows, cols)
 
 
-# The pack_nz weights are sized so their packed trailing [rows, cols] clears the 16-row fractal
-# and dtype C0 (bf16 = 16, int8 = 32) that NZ blocking requires; the rest stay tiny.
+# The pack_nz weights are sized so their packed trailing [rows, cols] spans at least two
+# C0 column blocks (bf16 = 32 cols, int8 = 64 cols) as well as the 16-row fractal -- at
+# one block NZ blocking is an identity, and a test could not tell a packed weight from
+# an unpacked one; the rest stay tiny. Shapes are pre-transpose: wq_a (32, 16) packs as
+# its transpose [16, 32].
 def _synthetic_layer_raw(*, layer_id: int, n_experts: int) -> dict[str, torch.Tensor]:
     prefix = f"layers.{layer_id}"
     raw = {
@@ -3407,15 +3390,15 @@ def _synthetic_layer_raw(*, layer_id: int, n_experts: int) -> dict[str, torch.Te
         f"{prefix}.hc_attn_scale": torch.arange(3, dtype=torch.float32),
         f"{prefix}.hc_attn_base": torch.arange(1, dtype=torch.float32),
         f"{prefix}.attn_norm.weight": torch.arange(4, dtype=torch.bfloat16),
-        f"{prefix}.attn.wq_a.weight": torch.arange(256, dtype=torch.bfloat16).reshape(16, 16),
-        f"{prefix}.attn.wq_b.weight": _int8_ramp(32, 16),
-        f"{prefix}.attn.wq_b.scale": torch.arange(32, dtype=torch.float32),
-        f"{prefix}.attn.wkv.weight": torch.arange(256, dtype=torch.bfloat16).reshape(16, 16),
+        f"{prefix}.attn.wq_a.weight": torch.arange(512, dtype=torch.bfloat16).reshape(32, 16),
+        f"{prefix}.attn.wq_b.weight": _int8_ramp(64, 32),
+        f"{prefix}.attn.wq_b.scale": torch.arange(64, dtype=torch.float32),
+        f"{prefix}.attn.wkv.weight": torch.arange(512, dtype=torch.bfloat16).reshape(32, 16),
         f"{prefix}.attn.q_norm.weight": torch.arange(2, dtype=torch.bfloat16),
         f"{prefix}.attn.kv_norm.weight": torch.arange(3, dtype=torch.bfloat16),
         f"{prefix}.attn.attn_sink": torch.arange(2, dtype=torch.float32),
-        f"{prefix}.attn.wo_a.weight": (torch.arange(2048) % 251).to(torch.bfloat16).reshape(128, 16),
-        f"{prefix}.attn.wo_b.weight": _int8_ramp(16, 256),
+        f"{prefix}.attn.wo_a.weight": (torch.arange(4096) % 251).to(torch.bfloat16).reshape(128, 32),
+        f"{prefix}.attn.wo_b.weight": _int8_ramp(16, 512),
         f"{prefix}.attn.wo_b.scale": torch.arange(16, dtype=torch.float32),
         f"{prefix}.hc_ffn_fn": torch.arange(4, dtype=torch.float32).reshape(1, 4),
         f"{prefix}.hc_ffn_scale": torch.arange(3, dtype=torch.float32),
@@ -3423,19 +3406,19 @@ def _synthetic_layer_raw(*, layer_id: int, n_experts: int) -> dict[str, torch.Te
         f"{prefix}.ffn_norm.weight": torch.arange(4, dtype=torch.bfloat16),
         f"{prefix}.ffn.gate.weight": torch.arange(16, dtype=torch.bfloat16).reshape(4, 4),
         f"{prefix}.ffn.gate.bias": torch.arange(4, dtype=torch.float32),
-        f"{prefix}.ffn.shared_experts.w1.weight": _int8_ramp(16, 32),
+        f"{prefix}.ffn.shared_experts.w1.weight": _int8_ramp(16, 64),
         f"{prefix}.ffn.shared_experts.w1.scale": torch.arange(16, dtype=torch.float32),
-        f"{prefix}.ffn.shared_experts.w2.weight": _int8_ramp(16, 32),
+        f"{prefix}.ffn.shared_experts.w2.weight": _int8_ramp(16, 64),
         f"{prefix}.ffn.shared_experts.w2.scale": torch.arange(16, dtype=torch.float32),
-        f"{prefix}.ffn.shared_experts.w3.weight": _int8_ramp(16, 32),
+        f"{prefix}.ffn.shared_experts.w3.weight": _int8_ramp(16, 64),
         f"{prefix}.ffn.shared_experts.w3.scale": torch.arange(16, dtype=torch.float32),
         f"{prefix}.attn.compressor.wkv.weight": torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
         f"{prefix}.attn.compressor.wgate.weight": torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
         f"{prefix}.attn.compressor.ape": torch.arange(8, dtype=torch.float32).reshape(4, 2),
         f"{prefix}.attn.compressor.norm.weight": torch.arange(3, dtype=torch.bfloat16),
-        f"{prefix}.attn.indexer.wq_b.weight": _int8_ramp(32, 16),
-        f"{prefix}.attn.indexer.wq_b.scale": torch.arange(32, dtype=torch.float32),
-        f"{prefix}.attn.indexer.weights_proj.weight": torch.arange(256, dtype=torch.bfloat16).reshape(16, 16),
+        f"{prefix}.attn.indexer.wq_b.weight": _int8_ramp(64, 32),
+        f"{prefix}.attn.indexer.wq_b.scale": torch.arange(64, dtype=torch.float32),
+        f"{prefix}.attn.indexer.weights_proj.weight": torch.arange(512, dtype=torch.bfloat16).reshape(32, 16),
         f"{prefix}.attn.indexer.compressor.wkv.weight": torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
         f"{prefix}.attn.indexer.compressor.wgate.weight": torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
         f"{prefix}.attn.indexer.compressor.ape": torch.arange(8, dtype=torch.float32).reshape(4, 2),
@@ -3445,12 +3428,22 @@ def _synthetic_layer_raw(*, layer_id: int, n_experts: int) -> dict[str, torch.Te
         base = expert_id * 10
         raw.update(
             {
-                f"{prefix}.ffn.experts.{expert_id}.w1.weight": torch.full((16, 32), base, dtype=torch.int8),
-                f"{prefix}.ffn.experts.{expert_id}.w1.scale": torch.full((16,), base + 1, dtype=torch.float32),
-                f"{prefix}.ffn.experts.{expert_id}.w2.weight": torch.full((16, 32), base + 2, dtype=torch.int8),
-                f"{prefix}.ffn.experts.{expert_id}.w2.scale": torch.full((16,), base + 3, dtype=torch.float32),
-                f"{prefix}.ffn.experts.{expert_id}.w3.weight": torch.full((16, 32), base + 4, dtype=torch.int8),
-                f"{prefix}.ffn.experts.{expert_id}.w3.scale": torch.full((16,), base + 5, dtype=torch.float32),
+                f"{prefix}.ffn.experts.{expert_id}.w1.weight": torch.full((16, 64), base, dtype=torch.int8),
+                f"{prefix}.ffn.experts.{expert_id}.w1.scale": torch.full(
+                    (16,), base + 1, dtype=torch.float32
+                ),
+                f"{prefix}.ffn.experts.{expert_id}.w2.weight": torch.full(
+                    (16, 64), base + 2, dtype=torch.int8
+                ),
+                f"{prefix}.ffn.experts.{expert_id}.w2.scale": torch.full(
+                    (16,), base + 3, dtype=torch.float32
+                ),
+                f"{prefix}.ffn.experts.{expert_id}.w3.weight": torch.full(
+                    (16, 64), base + 4, dtype=torch.int8
+                ),
+                f"{prefix}.ffn.experts.{expert_id}.w3.scale": torch.full(
+                    (16,), base + 5, dtype=torch.float32
+                ),
             }
         )
     return raw
@@ -3520,9 +3513,7 @@ def _runner_for_prepared_inputs(
         kernel_dir="",
         kernel_contract=_deepseek_serving_contract(),
         num_speculative_tokens=num_speculative_tokens,
-        embedding_weight=torch.arange(128 * 4, dtype=torch.float32)
-        .reshape(128, 4)
-        .to(torch.bfloat16),
+        embedding_weight=torch.arange(128 * 4, dtype=torch.float32).reshape(128, 4).to(torch.bfloat16),
     )
     runner = DeepSeekV4ModelRunner(compiled=compiled)
     runner.init_kv_cache("dsv4", model.config, model.runtime)
@@ -3988,12 +3979,9 @@ def test_deepseek_fused_mtp_write_only_outputs_are_device_resident():
 
     block_tables = [object(), object()]
     runner._decode_task_args = [
-        SimpleNamespace(tensors={"block_table": block_table})
-        for block_table in block_tables
+        SimpleNamespace(tensors={"block_table": block_table}) for block_table in block_tables
     ]
-    runner._mtp_device_weights = {
-        name: object() for name in _FUSED_MTP_DECODE_TENSOR_ORDER
-    }
+    runner._mtp_device_weights = {name: object() for name in _FUSED_MTP_DECODE_TENSOR_ORDER}
     runner._materialize_mtp_device_kv_cache = lambda: object()
     runner._materialize_mtp_tail_pre_hc_pool = lambda _hidden: object()
     runner._materialize_mtp_device_state_tokens = lambda: object()
@@ -4003,7 +3991,4 @@ def test_deepseek_fused_mtp_write_only_outputs_are_device_resident():
     slot_one_mtp.allocate_host_shared(None)
     slot_one_mtp.allocate_device(worker, None)
     slot_one_args = slot_one_mtp.build()
-    assert (
-        slot_one_args[slot_one_mtp.names.index("ori_block_table")]
-        is block_tables[1]
-    )
+    assert slot_one_args[slot_one_mtp.names.index("ori_block_table")] is block_tables[1]

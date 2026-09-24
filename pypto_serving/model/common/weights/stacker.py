@@ -53,7 +53,9 @@ class StackGroup:
             return None
 
 
-def resolve_members(groups: Sequence[StackGroup], template: Mapping[str, torch.Tensor]) -> tuple[StackGroup, ...]:
+def resolve_members(
+    groups: Sequence[StackGroup], template: Mapping[str, torch.Tensor]
+) -> tuple[StackGroup, ...]:
     """Fill in the one group declared with ``members=None`` from what the others do not claim.
 
     Order follows the template, which is the order the packer produced — and therefore the
@@ -109,7 +111,11 @@ def allocate_slabs(
     ``allocate`` builds each slab, defaulting to plain host memory. A family whose upload reads
     the slab from a forked child passes one that returns shared memory instead.
     """
-    build = allocate if allocate is not None else (lambda shape, dtype: torch.empty(shape, dtype=dtype, device="cpu"))
+    build = (
+        allocate
+        if allocate is not None
+        else (lambda shape, dtype: torch.empty(shape, dtype=dtype, device="cpu"))
+    )
     slabs: dict[str, torch.Tensor] = {}
     for group in groups:
         count = len(group.layer_ids)
@@ -120,7 +126,9 @@ def allocate_slabs(
             if source.ndim < 2:
                 raise ValueError(rank_error.format(name=name, ndim=source.ndim))
             if not -source.ndim <= stack_axis < source.ndim:
-                raise ValueError(f"stack_axis {stack_axis} is out of range for {name} with rank {source.ndim}")
+                raise ValueError(
+                    f"stack_axis {stack_axis} is out of range for {name} with rank {source.ndim}"
+                )
             shape = list(int(dim) for dim in source.shape)
             if name in new_axis_members:
                 axis = stack_axis if stack_axis >= 0 else stack_axis + len(shape) + 1
