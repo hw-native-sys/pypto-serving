@@ -46,10 +46,10 @@ class LayerContext:
 class LayerWeightRule:
     """One kernel weight: where it comes from and the shape-preserving edits it needs.
 
-    ``transpose`` and ``reshape_groups`` are the only transforms expressed here on purpose.
-    Both are pure re-orientations of the same bytes, which is what lets the evaluator stay
-    generic; anything that computes new values belongs in a family's own code, not in a
-    field that looks declarative but hides arithmetic.
+    ``transpose``, ``reshape_groups``, ``column_reshape_groups`` and ``pack_nz`` are the only
+    transforms expressed here on purpose. All four are pure re-orientations of the same bytes,
+    which is what lets the evaluator stay generic; anything that computes new values belongs in
+    a family's own code, not in a field that looks declarative but hides arithmetic.
     """
 
     name: str
@@ -57,9 +57,20 @@ class LayerWeightRule:
     dtype: torch.dtype
     transpose: bool = False
     reshape_groups: int | None = None
+    # Some weights carry their group split on the trailing axis instead of the leading one
+    # `reshape_groups` splits: `column_reshape_groups` reshapes the trailing dim into
+    # `[groups, cols // groups]` and moves `groups` to the front, so the result matches the
+    # `[groups, rows, cols // groups]` shape `reshape_groups` produces from a leading split.
+    # Mutually exclusive with `reshape_groups`.
+    column_reshape_groups: int | None = None
     # A 1-D gamma has nothing to stack on: reshaping it to `[1, dim]` is what makes it stackable
     # over layers at all, and it is the shape the kernels read.
     flatten_to_row: bool = False
+    # Applied last, after any transpose/reshape_groups/column_reshape_groups: the trailing
+    # [R, C] this weight ends up at is what gets NZ-blocked, matching a kernel signature that
+    # declares it pl.NZ.
+    pack_nz: bool = False
+
 
 # A dimension is either a literal or the name of a `LayerContext` field to read, which keeps
 # a shape that depends on the model config expressible as data rather than as a lambda.
@@ -100,6 +111,9 @@ class OptionalWeightRule:
     absent_shape: tuple[Dim, ...]
     enabled_ratios: tuple[int, ...]
     transpose: bool = False
+    # Applied to the active branch only: an inactive branch is all zeros, and NZ-blocking a
+    # zero tensor is an identity, so it stays plain-filled rather than paying the permute.
+    pack_nz: bool = False
 
     def enabled_for(self, compress_ratio: int) -> bool:
         """Return whether the checkpoint carries this weight at ``compress_ratio``."""
@@ -143,9 +157,15 @@ class ExpertWeightRule:
     name: str
     source: str
     dtype: torch.dtype
+    # Applied per expert, before the rank stack: NZ-blocking commutes with stacking along a
+    # leading batch axis, so packing one expert at a time gives the same bytes as packing the
+    # assembled `[ranks, local, *expert.shape]` tensor.
+    pack_nz: bool = False
 
 
-LayerRule = LayerWeightRule | OptionalWeightRule | DefaultedWeightRule | SyntheticWeightRule | ExpertWeightRule
+LayerRule = (
+    LayerWeightRule | OptionalWeightRule | DefaultedWeightRule | SyntheticWeightRule | ExpertWeightRule
+)
 
 
 @dataclass(frozen=True)

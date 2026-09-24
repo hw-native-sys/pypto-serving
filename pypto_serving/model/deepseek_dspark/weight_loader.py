@@ -54,9 +54,12 @@ class DSparkDrafterWeights:
     ``l3_distributed_markov_sample`` with a leading rank axis: the 3-layer
     banks flatten the draft layers along their first rank-local axis (no
     decode-bank row padding -- the drafter keeps the natural ``MIX_HC``
-    layout), the o-projection is TP group/column sharded per rank, and the
-    routed experts are EP sharded.  ``embedding_weight`` / ``lm_head_weight``
-    are reused from the target banks and deliberately absent here.
+    layout) or, for the NZ row-stacked names, keep a dedicated draft-layer
+    axis; the o-projection is TP group sharded per rank (``wo_b`` group-major
+    ``[groups, D, O_LORA]``), and the routed experts are EP sharded.  The
+    weights ``l3_dspark_drafter`` declares ``pl.NZ`` are NZ-blocked here as a
+    final whole-bank pass.  ``embedding_weight`` / ``lm_head_weight`` are
+    reused from the target banks and deliberately absent here.
     """
 
     tensors: Mapping[str, torch.Tensor]
@@ -74,9 +77,12 @@ class DSparkStackedLayerWeights:
     """All hidden-layer weights stacked on the layer axis for the DSpark kernels.
 
     ``tensors`` holds the decode weight-bank layout (HC function matrices padded
-    to ``DSPARK_HC_FN_STORAGE_ROWS`` rows); ``prefill_tensors`` holds the two
-    prefill-only unpadded HC slabs.  Every other name is shared by both
-    dispatch classes and appears once, in ``tensors``.
+    to ``DSPARK_HC_FN_STORAGE_ROWS`` rows); ``prefill_tensors`` holds the
+    prefill-only slabs: the two unpadded HC derivatives plus the layout-divergent
+    copies prefill reads differently from decode (ND ``wo_a`` / ``wo_b``, NZ
+    ``csa_weights_proj``), popped out of ``tensors`` so each is uploaded exactly
+    once.  Every other name is shared by both dispatch classes and appears once,
+    in ``tensors``.
     """
 
     tensors: Mapping[str, torch.Tensor]
@@ -108,9 +114,7 @@ def dspark_prefill_hc_slab(
         raise ValueError(f"padded HC slab must be rank-3, got shape={tuple(padded.shape)}")
     rows = int(padded.shape[1])
     if rows != layers * storage_rows:
-        raise ValueError(
-            f"padded HC slab has {rows} rows, expected {layers} x {storage_rows}"
-        )
+        raise ValueError(f"padded HC slab has {rows} rows, expected {layers} x {storage_rows}")
     unpadded = torch.empty(
         (padded.shape[0], layers * mix_hc_rows, padded.shape[2]),
         dtype=padded.dtype,
@@ -119,6 +123,23 @@ def dspark_prefill_hc_slab(
         source = padded[:, layer * storage_rows : layer * storage_rows + mix_hc_rows]
         unpadded[:, layer * mix_hc_rows : (layer + 1) * mix_hc_rows].copy_(source)
     return unpadded.contiguous()
+
+
+# Drafter weights whose 3-layer banks keep a dedicated draft-layer axis instead of
+# flattening layers onto the row axis -- the drafter-side subset of the lib's
+# NZ_ROW_STACKED_NAMES (dspark_drafter.py declares these pl.NZ and indexes [layer]).
+_DRAFTER_NZ_NEW_AXIS_NAMES = frozenset({"wq_a", "wq_b", "shared_w1", "shared_w3", "shared_w2"})
+
+# Every drafter bank l3_dspark_drafter reads NZ: draft layers, groups and experts all
+# sit on leading axes, so one whole-bank pass is byte-identical to per-layer packing.
+_DRAFTER_NZ_BANK_NAMES = (
+    *_DRAFTER_NZ_NEW_AXIS_NAMES,
+    "wo_a",
+    "wo_b",
+    "routed_w1",
+    "routed_w3",
+    "routed_w2",
+)
 
 
 class DSparkWeightStore(DeepSeekV4WeightStore):
@@ -137,6 +158,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         destinations: Mapping[str, torch.Tensor] | None = None,
     ) -> DeepSeekV4PackedLayerWeights:
         """Pack one layer under the DSpark rank layout (TP o-proj, padded HC)."""
+        from pypto_serving.model.common.weights.nz import pack_nz  # noqa: PLC0415
         from pypto_serving.model.common.weights.packer import pack_layer  # noqa: PLC0415
         from pypto_serving.model.common.weights.spec import LayerContext  # noqa: PLC0415
 
@@ -146,6 +168,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         from pypto_serving.model.deepseek_dspark.weight_spec import (  # noqa: PLC0415
             DSPARK_EXPERT_MISSING_ERROR,
             DSPARK_LAYER_RULES,
+            DSPARK_PREFILL_LAYER_RULES,
             DSPARK_SOURCE_MISSING_ERROR,
             dspark_expert_parallel,
             dspark_factories,
@@ -173,7 +196,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
             include_gate_bias=bool(include_gate_bias),
         )
         tensors = pack_layer(
-            DSPARK_LAYER_RULES,
+            (*DSPARK_LAYER_RULES, *DSPARK_PREFILL_LAYER_RULES),
             raw,
             context,
             policy=dspark_shard_policy(int(ranks)),
@@ -182,6 +205,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
             destinations=destinations,
             missing_source_error=DSPARK_SOURCE_MISSING_ERROR,
             missing_expert_error=DSPARK_EXPERT_MISSING_ERROR,
+            nz_pack=pack_nz,
         )
         return DeepSeekV4PackedLayerWeights(layer_id=layer_id, tensors=tensors)
 
@@ -206,6 +230,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         from pypto_serving.model.deepseek_dspark.weight_spec import (  # noqa: PLC0415
             DSPARK_HC_FN_STORAGE_ROWS,
             DSPARK_MIX_HC,
+            DSPARK_NEW_AXIS_STACKED_WEIGHT_NAMES,
             DSPARK_RANK_ERROR,
             DSPARK_STACK_MISMATCH_ERROR,
             DSPARK_STAGING_POLICY,
@@ -252,6 +277,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
             template_layer_id=0,
             on_layer_done=log_progress,
             policy=DSPARK_STAGING_POLICY,
+            new_axis_members=DSPARK_NEW_AXIS_STACKED_WEIGHT_NAMES,
             rank_error=DSPARK_RANK_ERROR,
             mismatch_error=DSPARK_STACK_MISMATCH_ERROR,
         )
@@ -265,6 +291,19 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
             )
             for name in ("hc_attn_fn", "hc_ffn_fn")
         }
+        # Pop, not copy: the runner uploads ``tensors`` and ``prefill_tensors``
+        # independently, so a prefill-only slab left in ``stacked`` would be
+        # uploaded twice (~1 GiB per device at production dimensions). The slabs
+        # re-key to the kernel arg names the prefill dispatch binds them by.
+        prefill_tensors.update(
+            (kernel_name, stacked.pop(rule_name))
+            for kernel_name, rule_name in (
+                ("wo_a", "prefill_wo_a"),
+                ("wo_b", "prefill_wo_b"),
+                ("csa_weights_proj", "prefill_csa_weights_proj"),
+            )
+            if rule_name in stacked
+        )
         return DSparkStackedLayerWeights(tensors=stacked, prefill_tensors=prefill_tensors)
 
     def validate_drafter_startup_contract(self, *, n_routed_experts: int) -> None:
@@ -303,13 +342,11 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
 
         if ranks <= 0 or ranks % DSPARK_TP_SIZE:
             raise ValueError(
-                f"DSpark drafter packing needs a rank count divisible by TP={DSPARK_TP_SIZE}, "
-                f"got {ranks}"
+                f"DSpark drafter packing needs a rank count divisible by TP={DSPARK_TP_SIZE}, got {ranks}"
             )
         if n_routed_experts % ranks:
             raise ValueError(
-                f"DSpark drafter needs experts divisible by ranks={ranks}, "
-                f"got {n_routed_experts}"
+                f"DSpark drafter needs experts divisible by ranks={ranks}, got {n_routed_experts}"
             )
         self.validate_drafter_startup_contract(n_routed_experts=n_routed_experts)
 
@@ -347,8 +384,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         vocab, markov_rank = (int(dim) for dim in markov_w1.shape)
         if tuple(confidence.shape) != (1, hidden + markov_rank):
             raise ValueError(
-                f"DSpark confidence head must be [1, {hidden + markov_rank}], "
-                f"got {tuple(confidence.shape)}"
+                f"DSpark confidence head must be [1, {hidden + markov_rank}], got {tuple(confidence.shape)}"
             )
 
         # ---- per-layer tensors, one shard-grouped read per draft layer ----
@@ -410,9 +446,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         head_dim = int(wkv0.shape[0])
         n_heads = int(sink0.shape[0])
         if q_width != n_heads * head_dim:
-            raise ValueError(
-                f"DSpark wq_b width {q_width} != heads*head_dim {n_heads * head_dim}"
-            )
+            raise ValueError(f"DSpark wq_b width {q_width} != heads*head_dim {n_heads * head_dim}")
         if int(tensor(0, "attn.q_norm.weight").shape[0]) != q_lora:
             raise ValueError("DSpark q_norm length disagrees with the q-lora dim")
         if int(tensor(0, "attn.kv_norm.weight").shape[0]) != head_dim:
@@ -422,9 +456,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         o_lora = q_lora
         o_groups = int(wo_a0.shape[0]) // o_lora
         if int(wo_a0.shape[0]) % o_lora or o_groups <= 0:
-            raise ValueError(
-                f"DSpark wo_a shape {tuple(wo_a0.shape)} disagrees with the o-lora dim {o_lora}"
-            )
+            raise ValueError(f"DSpark wo_a shape {tuple(wo_a0.shape)} disagrees with the o-lora dim {o_lora}")
         # wo_a is block-diagonal: each of its O_GROUPS row groups reads its own
         # q_width/O_GROUPS-wide input slice, so the column count is the per-group
         # input, not the full projection width.
@@ -440,15 +472,10 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
                 f"got {tuple(wo_b0.shape)}"
             )
         if o_groups % DSPARK_TP_SIZE:
-            raise ValueError(
-                f"DSpark o-groups {o_groups} must divide by TP={DSPARK_TP_SIZE}"
-            )
+            raise ValueError(f"DSpark o-groups {o_groups} must divide by TP={DSPARK_TP_SIZE}")
         local_o_groups = o_groups // DSPARK_TP_SIZE
-        local_o_width = local_o_groups * o_lora
         if int(gate0.shape[0]) != n_routed_experts or gate0.shape[1] != hidden:
-            raise ValueError(
-                f"DSpark gate must be [{n_routed_experts}, {hidden}], got {tuple(gate0.shape)}"
-            )
+            raise ValueError(f"DSpark gate must be [{n_routed_experts}, {hidden}], got {tuple(gate0.shape)}")
         moe_inter = int(shared_w1_0.shape[0])
         if tuple(shared_w2_0.shape) != (hidden, moe_inter):
             raise ValueError(
@@ -464,12 +491,22 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         tensors: dict[str, torch.Tensor] = {}
 
         def bank(
-            name: str, per_layer_shape: tuple[int, ...], dtype: torch.dtype
+            name: str,
+            per_layer_shape: tuple[int, ...],
+            dtype: torch.dtype,
+            *,
+            new_axis: bool = False,
         ) -> torch.Tensor:
-            rows = per_layer_shape[0]
-            destination = torch.empty(
-                (ranks, DSPARK_DRAFT_LAYERS * rows, *per_layer_shape[1:]), dtype=dtype
-            )
+            if new_axis:
+                # An NZ row-stacked weight cannot flatten its draft layers onto the
+                # row axis (a fractal-blocked row axis admits no row window), so the
+                # bank carries a dedicated draft-layer axis instead.
+                destination = torch.empty((ranks, DSPARK_DRAFT_LAYERS, *per_layer_shape), dtype=dtype)
+            else:
+                rows = per_layer_shape[0]
+                destination = torch.empty(
+                    (ranks, DSPARK_DRAFT_LAYERS * rows, *per_layer_shape[1:]), dtype=dtype
+                )
             tensors[name] = destination
             return destination
 
@@ -543,22 +580,23 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         ]
         banks: dict[str, torch.Tensor] = {}
         for name, _, dtype, shape, _ in flat_specs:
-            banks[name] = bank(name, shape, dtype)
+            banks[name] = bank(name, shape, dtype, new_axis=name in _DRAFTER_NZ_NEW_AXIS_NAMES)
         for layer in range(DSPARK_DRAFT_LAYERS):
             for name, suffix, dtype, shape, transform in flat_specs:
                 source = tensor(layer, suffix)
                 prepared = transform(source) if transform is not None else source
                 if tuple(prepared.shape) != shape:
                     raise ValueError(
-                        f"DSpark drafter {name} layer {layer} must be {shape}, "
-                        f"got {tuple(prepared.shape)}"
+                        f"DSpark drafter {name} layer {layer} must be {shape}, got {tuple(prepared.shape)}"
                     )
                 if prepared.dtype is not dtype:
                     raise ValueError(
-                        f"DSpark drafter {name} layer {layer} must be {dtype}, "
-                        f"got {prepared.dtype}"
+                        f"DSpark drafter {name} layer {layer} must be {dtype}, got {prepared.dtype}"
                     )
-                fill_flat(name, banks[name], shape[0], layer).copy_(prepared)
+                if name in _DRAFTER_NZ_NEW_AXIS_NAMES:
+                    banks[name][:, layer].copy_(prepared)
+                else:
+                    fill_flat(name, banks[name], shape[0], layer).copy_(prepared)
         del banks
 
         # Router gate: the checkpoint stores BF16 weights; the bank is FP32.
@@ -568,9 +606,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
             fill_flat("gate_w", gate_w, n_routed_experts, layer).copy_(
                 tensor(layer, "ffn.gate.weight").to(torch.float32)
             )
-            fill_flat("gate_bias", gate_bias, n_routed_experts, layer).copy_(
-                tensor(layer, "ffn.gate.bias")
-            )
+            fill_flat("gate_bias", gate_bias, n_routed_experts, layer).copy_(tensor(layer, "ffn.gate.bias"))
 
         # tid2eid: the target hash layers' routing tables, INT32, every rank.
         tid2eid = torch.cat(
@@ -582,15 +618,14 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         ).contiguous()
         if int(tid2eid.shape[0]) != DSPARK_DRAFT_LAYERS * vocab:
             raise ValueError(
-                f"DSpark tid2eid covers {int(tid2eid.shape[0])} rows, "
-                f"expected {DSPARK_DRAFT_LAYERS * vocab}"
+                f"DSpark tid2eid covers {int(tid2eid.shape[0])} rows, expected {DSPARK_DRAFT_LAYERS * vocab}"
             )
-        tensors["tid2eid"] = (
-            tid2eid.unsqueeze(0).expand(ranks, *tid2eid.shape).contiguous()
-        )
+        tensors["tid2eid"] = tid2eid.unsqueeze(0).expand(ranks, *tid2eid.shape).contiguous()
         del tid2eid
 
-        # O-projection: TP group shard of wo_a, column slice of wo_b.
+        # O-projection: both names shard whole leading groups per TP rank. wo_b is
+        # group-major [O_GROUPS, D, O_LORA] (pypto-lib #1359), so its checkpoint
+        # [D, O_GROUPS*O_LORA] is reoriented here rather than column-sliced.
         wo_a = bank(
             "wo_a",
             (local_o_groups, o_lora, int(wo_a0.shape[1])),
@@ -598,7 +633,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         )
         wo_b = bank(
             "wo_b",
-            (hidden, local_o_width),
+            (local_o_groups, hidden, o_lora),
             torch.int8,
         )
         wo_a_sources = [
@@ -609,20 +644,19 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         ]
         wo_b_sources = [
             self.load_tensor(f"mtp.{layer}.attn.wo_b.weight")
+            .reshape(hidden, o_groups, o_lora)
+            .permute(1, 0, 2)
+            .contiguous()
             for layer in DSPARK_DRAFTER_LAYERS
         ]
         for rank in range(ranks):
             tp_rank = rank % DSPARK_TP_SIZE
             for layer in range(DSPARK_DRAFT_LAYERS):
                 wo_a[rank, layer * local_o_groups : (layer + 1) * local_o_groups].copy_(
-                    wo_a_sources[layer][
-                        tp_rank * local_o_groups : (tp_rank + 1) * local_o_groups
-                    ]
+                    wo_a_sources[layer][tp_rank * local_o_groups : (tp_rank + 1) * local_o_groups]
                 )
-                wo_b[rank, layer * hidden : (layer + 1) * hidden].copy_(
-                    wo_b_sources[layer][
-                        :, tp_rank * local_o_width : (tp_rank + 1) * local_o_width
-                    ]
+                wo_b[rank, layer * local_o_groups : (layer + 1) * local_o_groups].copy_(
+                    wo_b_sources[layer][tp_rank * local_o_groups : (tp_rank + 1) * local_o_groups]
                 )
         del wo_a_sources, wo_b_sources
 
@@ -639,9 +673,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         )
         expert_banks: dict[str, torch.Tensor] = {}
         for name, _, tail, dtype in routed_specs:
-            destination = torch.empty(
-                (ranks, DSPARK_DRAFT_LAYERS * n_local, *tail), dtype=dtype
-            )
+            destination = torch.empty((ranks, DSPARK_DRAFT_LAYERS * n_local, *tail), dtype=dtype)
             tensors[name] = destination
             expert_banks[name] = destination
         for layer in range(DSPARK_DRAFT_LAYERS):
@@ -671,13 +703,19 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
             del raw
         del expert_banks
 
+        # The NZ pass runs last, on the fully assembled banks: every layer/group/
+        # expert axis is a leading axis by then, which is what makes one whole-bank
+        # blocking equal to packing each layer's slice.
+        from pypto_serving.model.common.weights.nz import pack_nz  # noqa: PLC0415
+
+        for name in _DRAFTER_NZ_BANK_NAMES:
+            tensors[name] = pack_nz(tensors[name])
+
         # Replicated heads.
         def replicate(name: str, source: torch.Tensor, dtype: torch.dtype) -> None:
             if source.dtype is not dtype:
                 source = source.to(dtype=dtype)
-            tensors[name] = (
-                source.contiguous().unsqueeze(0).expand(ranks, *source.shape).contiguous()
-            )
+            tensors[name] = source.contiguous().unsqueeze(0).expand(ranks, *source.shape).contiguous()
 
         replicate("main_proj_weight", main_proj, torch.bfloat16)
         replicate("main_norm_weight", main_norm, torch.bfloat16)

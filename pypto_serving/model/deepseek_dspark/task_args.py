@@ -178,8 +178,12 @@ def _prefill_scratch_sources(runner: DSparkModelRunner) -> dict[str, Any]:
         "o_proj_wo_a_full": (
             (ranks, DSPARK_O_GROUPS, DSPARK_O_LORA, 4096), torch.bfloat16,
         ),
+        # Group-major like the kernel's own window (prefill_o_proj.py): whole local
+        # groups per rank, not a folded [D, O_GROUPS*O_LORA] column range. The element
+        # count matches either spelling, so a stale folded shape would pass
+        # numel-only checks and corrupt the TP gather silently.
         "o_proj_wo_b_full": (
-            (ranks, hidden, DSPARK_O_GROUPS * DSPARK_O_LORA), torch.int8,
+            (ranks, DSPARK_O_GROUPS, hidden, DSPARK_O_LORA), torch.int8,
         ),
         "attn_stage": ((ranks, tokens, DSPARK_HC_MULT, hidden), torch.float32),
         "x_mixed": ((ranks, tokens, hidden), torch.bfloat16),
@@ -219,7 +223,10 @@ def prefill_task_args(runner: DSparkModelRunner) -> TaskArgs:
         if name in slot_specs:
             dtype, shape = slot_specs[name]
             ta.add_slot(Slot(name, Placement.HOST_SHARED, dtype, lambda _, s=shape: s))
-        elif name == "hc_attn_fn" or name == "hc_ffn_fn":
+        elif name in ("hc_attn_fn", "hc_ffn_fn", "wo_a", "wo_b", "csa_weights_proj"):
+            # The prefill-only slabs: unpadded HC derivatives plus the layout-divergent
+            # copies (ND o-projection pair, NZ CSA indexer projection) that decode
+            # reads the opposite way.
             ta.add_arg(name, lambda n=name: runner._require_stacked_weights(prefill=True)[n])
         elif name in static_weights:
             ta.add_arg(name, lambda n=name: runner._static_weight(n))

@@ -102,7 +102,7 @@ _DEEPSEEK_V4_ATTENTION_OUT = 64 * 512
 _DEEPSEEK_V4_N_ROUTED_EXPERTS = 256
 _DEEPSEEK_V4_TOPK = 6
 _DEEPSEEK_V4_VOCAB_SIZE = 129280
-DEEPSEEK_V4_PACKED_FORMAT = "pypto-deepseek-v4-stacked-v1"
+DEEPSEEK_V4_PACKED_FORMAT = "pypto-deepseek-v4-stacked-v3-nz"
 _PREPACKED_CACHE_SAMPLE_WINDOWS = 64
 _PREPACKED_CACHE_SAMPLE_BYTES = 4 * 1024 * 1024
 _PREPACKED_MIN_CACHE_RESIDENCY = 0.95
@@ -330,8 +330,7 @@ def _sample_file_page_cache_residency(fd: int, path: Path) -> float | None:
             else:
                 last_offset = size - sample_bytes
                 offsets = tuple(
-                    ((index * last_offset // (_PREPACKED_CACHE_SAMPLE_WINDOWS - 1)) // page_size)
-                    * page_size
+                    ((index * last_offset // (_PREPACKED_CACHE_SAMPLE_WINDOWS - 1)) // page_size) * page_size
                     for index in range(_PREPACKED_CACHE_SAMPLE_WINDOWS)
                 )
 
@@ -432,7 +431,13 @@ def pack_deepseek_v4_lm_head_weight(
     ranks: int,
     vocab_chunk: int = _LM_HEAD_VOCAB_CHUNK,
 ) -> tuple[torch.Tensor, DeepSeekV4LmHeadLayout]:
-    """Pack flat ``head.weight`` into contiguous TP vocab shards."""
+    """Pack flat ``head.weight`` into contiguous TP vocab shards.
+
+    Row-major still, not NZ: the padded rows this adds get sliced back off before the kernel
+    sees this weight (``DeepSeekV4ModelRunner.load_packed_global_weights``), and NZ-blocking
+    only commutes with a leading-axis slice, never with one that cuts into the row axis
+    NZ packs. NZ packing happens after that slice, right before the device upload.
+    """
     if weight.ndim != 2:
         raise ValueError(f"lm_head weight must be rank-2, got shape={tuple(weight.shape)}")
     vocab_size, hidden_size = (int(dim) for dim in weight.shape)
@@ -806,9 +811,7 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
     ) -> DeepSeekV4StackedLayerWeights | None:
         """Map a valid prepacked sidecar, or return ``None`` when none is usable."""
         packed_path = (
-            deepseek_v4_packed_weights_path(self.model_dir, ranks=ranks)
-            if path is None
-            else Path(path)
+            deepseek_v4_packed_weights_path(self.model_dir, ranks=ranks) if path is None else Path(path)
         )
         if not packed_path.is_file():
             return None
@@ -936,12 +939,12 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
         from pypto_serving.model.common.weights.stacker import stack_layers  # noqa: PLC0415
 
         from .weight_spec import (  # noqa: PLC0415
+            DEEPSEEK_V4_NZ_ROW_STACKED_NAMES,
             DEEPSEEK_V4_RANK_ERROR,
             DEEPSEEK_V4_STACK_MISMATCH_ERROR,
             DEEPSEEK_V4_STAGING_POLICY,
             deepseek_v4_stack_groups,
         )
-
 
         def pack_into(layer_id: int, destinations: Mapping[str, torch.Tensor]) -> None:
             self.load_packed_layer_weights(
@@ -972,6 +975,7 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
             template_layer_id=0,
             on_layer_done=log_progress,
             policy=DEEPSEEK_V4_STAGING_POLICY,
+            new_axis_members=DEEPSEEK_V4_NZ_ROW_STACKED_NAMES,
             rank_error=DEEPSEEK_V4_RANK_ERROR,
             mismatch_error=DEEPSEEK_V4_STACK_MISMATCH_ERROR,
         )
@@ -1018,6 +1022,7 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
             prefix=prefix,
         )
 
+        from pypto_serving.model.common.weights.nz import pack_nz  # noqa: PLC0415
         from pypto_serving.model.common.weights.packer import pack_layer  # noqa: PLC0415
         from pypto_serving.model.common.weights.spec import LayerContext  # noqa: PLC0415
 
@@ -1037,6 +1042,7 @@ class DeepSeekV4WeightStore(LazySafetensorsStore):
             policy=deepseek_v4_replicate(int(ranks)),
             factories=deepseek_v4_factories(),
             missing_source_error=DEEPSEEK_V4_SOURCE_MISSING_ERROR,
+            nz_pack=pack_nz,
         )
         return DeepSeekV4MtpWeights(tensors={**packed_layer.tensors, **extras})
 
@@ -1066,6 +1072,7 @@ def pack_deepseek_v4_layer_weights(
     The rules themselves live in ``weight_spec.py``; what is here is the argument surface the
     rest of the DeepSeekV4 code already calls.
     """
+    from pypto_serving.model.common.weights.nz import pack_nz  # noqa: PLC0415
     from pypto_serving.model.common.weights.packer import pack_layer  # noqa: PLC0415
     from pypto_serving.model.common.weights.spec import LayerContext  # noqa: PLC0415
 
@@ -1097,7 +1104,6 @@ def pack_deepseek_v4_layer_weights(
         destinations=destinations,
         missing_source_error=DEEPSEEK_V4_SOURCE_MISSING_ERROR,
         missing_expert_error=DEEPSEEK_V4_EXPERT_MISSING_ERROR,
+        nz_pack=pack_nz,
     )
     return DeepSeekV4PackedLayerWeights(layer_id=layer_id, tensors=tensors)
-
-

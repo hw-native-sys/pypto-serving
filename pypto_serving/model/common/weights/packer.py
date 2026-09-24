@@ -6,7 +6,11 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Generic per-layer evaluator: rules plus raw tensors in, packed kernel weights out."""
+"""Generic per-layer evaluator: rules plus raw tensors in, packed kernel weights out.
+
+``nz_pack`` stays a caller-supplied callback rather than an import here, so this module keeps
+no opinion on where NZ blocking comes from — see ``weights/nz.py`` for the one this family uses.
+"""
 
 from collections.abc import Callable, Mapping, Sequence
 
@@ -36,6 +40,16 @@ def _reshaped_groups(name: str, weight: torch.Tensor, groups: int) -> torch.Tens
     return weight.reshape(groups, rows // groups, int(weight.shape[1]))
 
 
+def _reshaped_column_groups(name: str, weight: torch.Tensor, groups: int) -> torch.Tensor:
+    """Split a flattened trailing dimension into ``[groups, rows, cols // groups]``."""
+    if weight.ndim != 2:
+        raise ValueError(f"{name} weight must be rank-2, got shape={tuple(weight.shape)}")
+    rows, cols = int(weight.shape[0]), int(weight.shape[1])
+    if cols % groups != 0:
+        raise ValueError(f"{name} second dimension {cols} must divide by {groups}")
+    return weight.reshape(rows, groups, cols // groups).permute(1, 0, 2).contiguous()
+
+
 def pack_layer(
     rules: Sequence[LayerRule],
     raw: Mapping[str, torch.Tensor],
@@ -47,6 +61,7 @@ def pack_layer(
     destinations: Mapping[str, torch.Tensor] | None = None,
     missing_source_error: str = "missing raw layer tensor: {name}",
     missing_expert_error: str = "missing raw expert tensor: {name}",
+    nz_pack: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Evaluate ``rules`` against ``raw``, writing into ``destinations`` when given.
 
@@ -67,13 +82,19 @@ def pack_layer(
         if isinstance(rule, ExpertWeightRule):
             if expert_policy is None:
                 raise ValueError(f"{rule.name} needs an expert policy but none was given")
+            if rule.pack_nz and nz_pack is None:
+                raise ValueError(f"{rule.name} needs nz_pack but none was given")
 
             def _expert(expert_id: int, rule: ExpertWeightRule = rule) -> torch.Tensor:
                 name = context.source_name(f"ffn.experts.{expert_id}.{rule.source}")
                 try:
-                    return raw[name]
+                    tensor = raw[name]
                 except KeyError as exc:
                     raise KeyError(missing_expert_error.format(name=name)) from exc
+                if rule.pack_nz:
+                    assert nz_pack is not None
+                    tensor = nz_pack(tensor.to(dtype=rule.dtype))
+                return tensor
 
             packed[rule.name] = expert_policy.apply(
                 rule.name, _expert, dtype=rule.dtype, destination=destination
@@ -84,9 +105,7 @@ def pack_layer(
             factory = (factories or {}).get(rule.factory)
             if factory is None:
                 raise ValueError(f"{rule.name} needs the {rule.factory!r} factory but none was given")
-            packed[rule.name] = policy.apply(
-                rule.name, factory(), dtype=rule.dtype, destination=destination
-            )
+            packed[rule.name] = policy.apply(rule.name, factory(), dtype=rule.dtype, destination=destination)
             continue
 
         if isinstance(rule, OptionalWeightRule):
@@ -107,9 +126,11 @@ def pack_layer(
                 continue
             if rule.transpose:
                 tensor = tensor.transpose(0, 1)
-            packed[rule.name] = policy.apply(
-                rule.name, tensor, dtype=rule.dtype, destination=destination
-            )
+            if rule.pack_nz:
+                if nz_pack is None:
+                    raise ValueError(f"{rule.name} needs nz_pack but none was given")
+                tensor = nz_pack(tensor.to(dtype=rule.dtype))
+            packed[rule.name] = policy.apply(rule.name, tensor, dtype=rule.dtype, destination=destination)
             continue
 
         if isinstance(rule, DefaultedWeightRule):
@@ -126,9 +147,7 @@ def pack_layer(
                     raise ValueError(f"{rule.name} has unsupported default fill {rule.default_fill!r}")
             if rule.flatten_to_row:
                 tensor = tensor.reshape(1, -1)
-            packed[rule.name] = policy.apply(
-                rule.name, tensor, dtype=rule.dtype, destination=destination
-            )
+            packed[rule.name] = policy.apply(rule.name, tensor, dtype=rule.dtype, destination=destination)
             continue
 
         if not isinstance(rule, LayerWeightRule):  # pragma: no cover - guards a new rule kind
@@ -141,15 +160,19 @@ def pack_layer(
             raise KeyError(missing_source_error.format(name=source_name)) from exc
         if rule.reshape_groups is not None:
             tensor = _reshaped_groups(rule.name, tensor, rule.reshape_groups)
+        if rule.column_reshape_groups is not None:
+            tensor = _reshaped_column_groups(rule.name, tensor, rule.column_reshape_groups)
         if rule.transpose:
             tensor = tensor.transpose(0, 1)
         if rule.flatten_to_row:
             # reshape, not view: a gamma is 1-D contiguous today, but reshape also handles a
             # non-contiguous source instead of raising.
             tensor = tensor.reshape(1, -1)
-        packed[rule.name] = policy.apply(
-            rule.name, tensor, dtype=rule.dtype, destination=destination
-        )
+        if rule.pack_nz:
+            if nz_pack is None:
+                raise ValueError(f"{rule.name} needs nz_pack but none was given")
+            tensor = nz_pack(tensor.to(dtype=rule.dtype))
+        packed[rule.name] = policy.apply(rule.name, tensor, dtype=rule.dtype, destination=destination)
     return packed
 
 
