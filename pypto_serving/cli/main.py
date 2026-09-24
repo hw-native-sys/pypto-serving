@@ -277,6 +277,8 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
+    if model_family == "deepseek_v41":
+        return _build_v41_engine_config(args, model_dir, model_config_data, devices)
     model_variant = _resolve_model_variant(args)
     _validate_prefill_chunk_size(
         model_family,
@@ -346,6 +348,78 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         max_num_scheduled_tokens=args.max_num_batched_tokens,
         long_prefill_token_threshold=args.long_prefill_token_threshold,
         enable_prefix_cache=enable_prefix_cache,
+        enable_chunk_prefill=args.enable_chunked_prefill,
+    )
+
+
+def _build_v41_engine_config(args, model_dir, raw, devices):
+    """Resolve the V4.1 worker boundary before starting any device resources.
+
+    Like DSpark placement, TP/DP are internal to one overlapped EP worker.
+    The scheduler uses two cache partitions instead of creating DP replicas.
+    """
+    from pypto_serving.config.types import KVCacheGroupSpec
+    from pypto_serving.model.deepseek_v41.composite import (
+        MissingCompositeInterface, load_composite_bindings,
+    )
+    from pypto_serving.model.deepseek_v41.config import V41TextConfig
+    from pypto_serving.model.deepseek_v41.execution_plan import RankPlacement, plan_layers
+    from pypto_serving.serving.engine.async_engine import EngineConfig
+
+    text = V41TextConfig.from_dict(raw)
+    if getattr(args, "speculative_config", None) is not None or getattr(args, "num_speculative_tokens", 0):
+        raise ValueError("V4.1 text serving does not support DSpark or MTP")
+    if args.platform != "a5":
+        raise ValueError("V4.1 M0 serving requires --platform a5")
+    topology = (args.tensor_parallel_size, args.data_parallel_size, args.expert_parallel_size)
+    if topology != (4, 2, 8) or len(devices) != 8:
+        raise ValueError("V4.1 serving requires --tp 4 --dp 2 --ep 8 and exactly eight device IDs")
+    if args.block_size != 128:
+        raise ValueError("V4.1 serving requires --block-size 128")
+    if not 0 < args.max_model_len <= text.max_position_embeddings:
+        raise ValueError("V4.1 --max-model-len must fit the checkpoint position capacity")
+    if args.max_num_seqs <= 0 or args.max_num_batched_tokens <= 0:
+        raise ValueError("V4.1 batch and token capacities must be positive")
+
+    parallel = ParallelConfig(
+        data_parallel_size=1, tensor_parallel_size=1, expert_parallel_size=8,
+        enable_expert_parallel=True, placement_mode="overlapped", devices=devices,
+        data_parallel_routing=args.data_parallel_routing,
+    )
+    # This resolver intentionally raises while the lib adapter is missing.
+    # No default generic KV layout may be substituted for the V4.1 pools.
+    bindings = load_composite_bindings()
+    bindings.require(plan_layers(raw), RankPlacement(0))
+    groups = tuple(bindings.cache_groups)
+    if not groups or any(not isinstance(group, KVCacheGroupSpec) for group in groups):
+        raise MissingCompositeInterface("V4.1 bindings must provide concrete grouped cache specifications")
+    if any(group.num_partitions != 2 for group in groups):
+        raise ValueError("V4.1 cache groups must use two logical DP partitions")
+    if len({group.name for group in groups}) != len(groups):
+        raise ValueError("V4.1 cache group names must be unique")
+    runtime = dataclasses.replace(
+        _build_runtime_config(args),
+        kv_cache_groups=groups,
+        requires_homogeneous_prefill_decode=True,
+    )
+    return EngineConfig(
+        model_id=args.served_model_name or Path(model_dir).name,
+        model_dir=model_dir,
+        platform=args.platform,
+        device_id=devices[0],
+        device_ids=devices,
+        parallel_config=parallel,
+        executor_cls=_executor_cls_for_model_family("deepseek_v41"),
+        executor_kwargs={"use_compile_cache": args.use_compile_cache},
+        runtime_config=runtime,
+        profile_config=_build_profile_config(args),
+        max_num_running_reqs=args.max_num_seqs,
+        max_num_scheduled_tokens=args.max_num_batched_tokens,
+        long_prefill_token_threshold=args.long_prefill_token_threshold,
+        # Prefix restore needs both KV pages and matching compressor state.
+        # Pipelining needs independently owned mutable snapshots and tickets.
+        enable_prefix_cache=False,
+        async_scheduling=False,
         enable_chunk_prefill=args.enable_chunked_prefill,
     )
 
@@ -637,6 +711,8 @@ def _warn_deprecated_serving_profile_env(args: argparse.Namespace) -> None:
 
 def _executor_cls_for_model_family(model_family: str, *, variant: str = "") -> str:
     """Map model family metadata to the worker executor class id."""
+    if model_family == "deepseek_v41":
+        return "PyptoDeepSeekV41Executor"
     if model_family == "deepseek_v4":
         if variant == "dspark":
             return "PyptoDeepSeekV4DSparkExecutor"

@@ -31,6 +31,10 @@ class SafeTensorReader(Protocol):
         """Return one tensor by name."""
         raise NotImplementedError
 
+    def get_slice(self, name: str):
+        """Return a lazy handle exposing shape/dtype and bounded slicing."""
+        raise NotImplementedError
+
 
 class SafeOpenFn(Protocol):
     """Callable shape for injectable safetensors openers."""
@@ -109,6 +113,33 @@ class LazySafetensorsStore:
     def load_tensor(self, name: str) -> torch.Tensor:
         """Load one tensor by name, leaving all unrelated shard tensors untouched."""
         return self.load_many([name])[name]
+
+    def load_slice(
+        self, name: str, ranges: tuple[slice, ...], *, shape: tuple[int, ...], dtype: str,
+    ) -> torch.Tensor:
+        """Validate metadata before reading an owned contiguous slice.
+
+        The caller supplies the expected physical storage shape and safetensors
+        dtype, and is responsible for its allocation budget. Existing whole-tensor
+        staging paths continue to use load_many.
+        """
+        if len(ranges) != len(shape) or any(
+            not isinstance(part, slice) or part.step not in (None, 1)
+            or type(part.start) is not int or type(part.stop) is not int
+            or not 0 <= part.start < part.stop <= size
+            for part, size in zip(ranges, shape)
+        ):
+            raise ValueError(f"invalid tensor slice: {name}")
+        path = self.path_for(name)
+        if not path.exists():
+            raise FileNotFoundError(self.missing_shard_error.format(path=path))
+        with self._safe_open_fn(path, self.device) as reader:
+            source = reader.get_slice(name)
+            if tuple(source.get_shape()) != shape or source.get_dtype() != dtype:
+                raise ValueError(f"checkpoint shape/dtype mismatch: {name}; expected {shape}/{dtype}")
+            # Clone even contiguous slices: do not retain mmap storage or a
+            # full source-row stride after the reader is closed.
+            return source[ranges].clone(memory_format=torch.contiguous_format)
 
     def load_many(self, names: Sequence[str]) -> dict[str, torch.Tensor]:
         """Load a set of named tensors grouped by shard file.

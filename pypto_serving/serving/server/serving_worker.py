@@ -198,6 +198,10 @@ class WorkerProcess:
             return num_pages
 
     def _resolve_executor_cls(self):
+        if self.config.executor_cls == "PyptoDeepSeekV41Executor":
+            from pypto_serving.model.deepseek_v41.npu_executor import DeepSeekV41PyptoExecutor
+
+            return DeepSeekV41PyptoExecutor
         if self.config.executor_cls == "PyptoQwen14BExecutor":
             from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor
 
@@ -784,6 +788,7 @@ class WorkerProcess:
                     block_ids=block_ids_list,
                     block_ids_by_group=[pr.block_ids_by_group for pr in scheduled],
                     cache_partitions=[pr.cache_partition for pr in scheduled],
+                    prompt_lens=[len(self._req_cache[pr.request_id].prompt_token_ids) for pr in scheduled],
                 ),
             )
 
