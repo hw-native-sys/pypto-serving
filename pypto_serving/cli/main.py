@@ -59,6 +59,21 @@ def build_parser() -> argparse.ArgumentParser:
     # Model
     parser.add_argument("--model", required=True, help="Path to the model directory.")
     parser.add_argument("--served-model-name", default=None, help="Model name used in the API. Defaults to the model directory name.")
+    parser.add_argument(
+        "--engram-checkpoint",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Original DeepSeek V4.1-Flash checkpoint directory holding the engram "
+            "embed tables (layers.<L>.engram.embed.{weight,scale}) plus its "
+            "tokenizer.json, which the compressed token map is rebuilt from at "
+            "startup. Optional: the engram is a V4.1-Flash module, so the flag "
+            "applies only when the served model's config declares engram layers "
+            "and is rejected otherwise. DSpark serving keeps the tables "
+            "host-resident and gathers zero-padded TP partials per step; without "
+            "the flag the engram path stays off."
+        ),
+    )
 
     # Backend and device
     parser.add_argument("--backend", default="npu", choices=sorted(_VALID_BACKENDS), help="Inference backend (default: npu).")
@@ -302,6 +317,10 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         # executor freezes the kernel layout (import arguments, cache
         # partitions, packed-prefill capacity) from it.
         executor_kwargs["cache_ranks"] = args.expert_parallel_size
+        if args.engram_checkpoint:
+            executor_kwargs["engram_checkpoint"] = str(Path(args.engram_checkpoint).resolve())
+    elif args.engram_checkpoint:
+        raise ValueError("--engram-checkpoint is only supported for DeepSeek V4 DSpark serving")
     parallel_config = ParallelConfig(
         data_parallel_size=1 if dspark_variant else args.data_parallel_size,
         tensor_parallel_size=1 if dspark_variant else args.tensor_parallel_size,

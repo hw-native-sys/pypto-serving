@@ -32,7 +32,7 @@ import logging
 import math
 import os
 import threading
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -58,6 +58,10 @@ from pypto_serving.config.types import (
 from pypto_serving.model.common.runner.buffer_set import copy_shared
 from pypto_serving.model.common.runner.l3_dispatch import L3DispatchMixin, PendingL3Dispatch
 from pypto_serving.model.common.runner.model_runner import ModelRunner
+from pypto_serving.model.deepseek.engram_runner import (
+    EngramEmbedSource,
+    EngramModelRunner,
+)
 from pypto_serving.model.deepseek_dspark.weight_loader import (
     DSparkStackedLayerWeights,
     DSparkWeightStore,
@@ -1062,6 +1066,9 @@ class DSparkCompiledKernels:
     n_routed_experts: int = 256
     num_hash_layers: int = 3
     embedding_weight: torch.Tensor | None = None
+    # Original-checkpoint engram embed tables, row-sharded over the TP ranks
+    # and host-resident; ``None`` when serving without the engram.
+    engram_embed: EngramEmbedSource | None = None
 
     def l3_callables(self) -> tuple[Any, ...]:
         """Return every compiled L3 program the shared worker may run."""
@@ -1131,6 +1138,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._drafter_host_weights: dict[str, torch.Tensor] | None = None
         self._drafter_device_weights: dict[str, StackedDeviceTensor] | None = None
         self._embedding_device_weight: StackedDeviceTensor | None = None
+        # Engram embed lookup state: the standalone host-side runner owning
+        # the n-gram hasher and the mapped original checkpoint, built only
+        # when the compiled model carries an engram source. Tables never land
+        # on the device; every step gathers zero-padded TP partials for the
+        # kernel to dequantize and all-reduce.
+        self._engram_runner: EngramModelRunner | None = None
         self._device_scratch: dict[tuple[str, str], StackedDeviceTensor] = {}
         self._prefill_task_args: TaskArgs | None = None
         self._decode_task_args: list[TaskArgs] = []
@@ -1976,6 +1989,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             self._drafter_host_weights = None
         self._materialize_embedding_device_weight()
         self._materialize_lm_head_device_weight(worker)
+        if self._compiled.engram_embed is not None:
+            # Host-resident lookup: map the tables and rebuild the hash
+            # constants once; no device allocation is involved.
+            self._require_engram_runner().prepare()
         if self._compiled.decode_full_fused:
             self._materialize_dspark_rope_tables()
         for task_args in (self._prefill_task_args, *self._decode_task_args):
@@ -2047,6 +2064,36 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         )
         self._embedding_device_weight = stacked
         return stacked
+
+    def _require_engram_runner(self) -> EngramModelRunner:
+        """Build (once) the standalone engram runner around the compiled source.
+
+        The tables stay host-resident as read-only shared mappings of the
+        original checkpoint -- each layer is close to a hundred gigabytes, so
+        nothing is ever uploaded wholesale.
+        """
+        if self._engram_runner is not None:
+            return self._engram_runner
+        source = self._compiled.engram_embed
+        if source is None:
+            raise RuntimeError("DSpark engram lookup requested without an engram source")
+        self._engram_runner = EngramModelRunner(source)
+        return self._engram_runner
+
+    def engram_hasher(self):
+        """Return the host-side n-gram hasher for input preparation."""
+        return self._require_engram_runner().hasher()
+
+    def gather_engram_partials(
+        self,
+        hash_ids: Mapping[int, torch.Tensor],
+    ) -> dict[int, dict[int, Any]]:
+        """Gather every engram layer's zero-padded partial for every TP rank.
+
+        Thin wrapper over the standalone engram runner; see
+        :meth:`EngramModelRunner.gather_partials` for the contract.
+        """
+        return self._require_engram_runner().gather_partials(hash_ids)
 
     def _materialize_dspark_rope_tables(self) -> dict[str, StackedDeviceTensor]:
         """Upload the three full RoPE profiles consumed by device-side prepare."""
