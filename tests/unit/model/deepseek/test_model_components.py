@@ -2528,7 +2528,7 @@ def _mtp_capture_inputs(
         ori_block_table=torch.zeros((layout.ranks, layout.prefill_ori_max_blocks), dtype=torch.int32),
         ori_slot_mapping=torch.full((layout.ranks, extent), -1, dtype=torch.long),
     )
-    pre_hc = torch.zeros((layout.ranks, layout.prefill_seq, 4, 1), dtype=torch.float32)
+    pre_hc = torch.zeros((layout.ranks, extent, 4, 1), dtype=torch.float32)
     for _request_id, rank, actual_tokens, start, token_base, hidden_base in owners:
         token_values = torch.arange(actual_tokens)
         positions = start + token_values
@@ -2536,8 +2536,7 @@ def _mtp_capture_inputs(
         inputs.input_ids[rank, :actual_tokens] = token_base + token_values
         inputs.position_ids[rank, :actual_tokens] = positions
         inputs.ori_slot_mapping[rank, :actual_tokens] = positions
-        tail_tokens = min(actual_tokens, layout.prefill_seq)
-        pre_hc[rank, :tail_tokens, 0, 0] = hidden_base + torch.arange(tail_tokens)
+        pre_hc[rank, :actual_tokens, 0, 0] = hidden_base + torch.arange(actual_tokens)
     return inputs, pre_hc
 
 
@@ -2572,14 +2571,13 @@ def test_deepseek_mtp_prefill_advances_one_row_behind_chunked_main_prefill():
     ("actual_tokens", "has_pending"),
     [(127, False), (128, True), (129, False)],
 )
-def test_deepseek_mtp_prefill_capture_uses_fixed_tail_window_at_boundaries(
+def test_deepseek_mtp_prefill_capture_preserves_all_rows_at_boundaries(
     actual_tokens,
     has_pending,
 ):
     runner, layout, calls = _mtp_prefill_capture_harness()
     start = int(has_pending)
-    tail_start = max(actual_tokens - layout.prefill_seq, 0)
-    expected_rows = min(actual_tokens - 1, layout.prefill_seq - 1)
+    expected_rows = actual_tokens - 1 + int(has_pending)
     old_context = None
     if has_pending:
         pending, pending_pre_hc = _mtp_capture_inputs(layout, [("req-boundary", 0, 1, 0, 0, 9_999)])
@@ -2587,29 +2585,30 @@ def test_deepseek_mtp_prefill_capture_uses_fixed_tail_window_at_boundaries(
         old_context = runner._mtp_request_states["req-boundary"].prefill_context
 
     inputs, pre_hc = _mtp_capture_inputs(
-        layout, [("req-boundary", 0, actual_tokens, start, 200, 1_000 + tail_start)]
+        layout, [("req-boundary", 0, actual_tokens, start, 200, 1_000)]
     )
     runner._capture_mtp_prefill_context(inputs, pre_hc)
 
     assert len(calls) == 1
     call = calls[0]
-    for tensor, range_start, range_stop in (
-        (call["input_ids"], 201 + tail_start, 200 + actual_tokens),
-        (call["position_ids"], start + tail_start, start + actual_tokens - 1),
-        (call["prev_hidden_states"][:, 0, 0], 1_000 + tail_start, 999 + actual_tokens),
-    ):
-        assert tensor.numel() == expected_rows
-        _assert_tensor_range(tensor, range_start, range_stop)
+    assert call["input_ids"].numel() == expected_rows
+    _assert_tensor_range(call["input_ids"], 200 if has_pending else 201, 200 + actual_tokens)
+    _assert_tensor_range(call["position_ids"], 0, start + actual_tokens - 1)
+    previous = call["prev_hidden_states"][:, 0, 0]
+    if has_pending:
+        assert previous[0].item() == 9_999
+        previous = previous[1:]
+    _assert_tensor_range(previous, 1_000, 999 + actual_tokens)
     context = runner._mtp_request_states["req-boundary"].prefill_context
     assert context.position_id == start + actual_tokens - 1
     assert context.slot_mapping == start + actual_tokens - 1
     assert context.prev_hidden_state[0, 0].item() == 999 + actual_tokens
     if has_pending:
-        assert 9_999 not in call["prev_hidden_states"][:, 0, 0]
+        assert 9_999 in call["prev_hidden_states"][:, 0, 0]
         assert context is not old_context
 
 
-def test_deepseek_mtp_prefill_rebuilds_fixed_tail_window_for_mixed_long_chunks():
+def test_deepseek_mtp_prefill_persists_every_row_for_mixed_long_chunks():
     runner, layout, calls = _mtp_prefill_capture_harness(
         ranks=2,
         prefill_seq=128,
@@ -2628,20 +2627,33 @@ def test_deepseek_mtp_prefill_rebuilds_fixed_tail_window_for_mixed_long_chunks()
     )
     runner._capture_mtp_prefill_context(inputs, pre_hc)
 
-    assert [call["rank"] for call in calls] == [0, 1]
-    _assert_tensor_range(calls[0]["input_ids"], 28_065, 28_192)
-    _assert_tensor_range(calls[0]["position_ids"], 8_064, 8_191)
-    _assert_tensor_range(calls[0]["prev_hidden_states"][:, 0, 0], 30_000, 30_127)
-    _assert_tensor_range(calls[1]["input_ids"], 50_001, 50_065)
-    _assert_tensor_range(calls[1]["position_ids"], 0, 64)
-    _assert_tensor_range(calls[1]["prev_hidden_states"][:, 0, 0], 60_000, 60_064)
+    assert [call["rank"] for call in calls] == [0] * 64 + [1]
+    assert all(call["position_ids"].numel() <= layout.prefill_seq for call in calls)
+    long_calls = calls[:64]
+    _assert_tensor_range(torch.cat([call["input_ids"] for call in long_calls]), 20_001, 28_192)
+    _assert_tensor_range(torch.cat([call["position_ids"] for call in long_calls]), 0, 8_191)
+    _assert_tensor_range(torch.cat([call["prev_hidden_states"][:, 0, 0] for call in long_calls]), 30_000, 38_191)
+    _assert_tensor_range(calls[-1]["input_ids"], 50_001, 50_065)
+    _assert_tensor_range(calls[-1]["position_ids"], 0, 64)
+    _assert_tensor_range(calls[-1]["prev_hidden_states"][:, 0, 0], 60_000, 60_064)
 
     long_context = runner._mtp_request_states["req-long"].prefill_context
     short_context = runner._mtp_request_states["req-short"].prefill_context
     assert long_context.position_id == 8191
-    assert long_context.prev_hidden_state[0, 0].item() == 30_127
+    assert long_context.prev_hidden_state[0, 0].item() == 38_191
     assert short_context.position_id == 64
     assert short_context.prev_hidden_state[0, 0].item() == 60_064
+
+
+def test_deepseek_mtp_prefill_fills_published_page_across_chunks():
+    runner, layout, calls = _mtp_prefill_capture_harness(prefill_ori_max_blocks=16)
+    for count, start in ((1024, 0), (178, 1024)):
+        inputs, pre_hc = _mtp_capture_inputs(layout, [("prefix", 0, count, start, start, start)])
+        runner._capture_mtp_prefill_context(inputs, pre_hc)
+    positions = torch.cat([call["position_ids"] for call in calls])
+    _assert_tensor_range(positions, 0, 1201)
+    assert set(range(1024, 1152)).issubset(positions.tolist())
+    assert all(call["position_ids"].numel() <= 128 for call in calls)
 
 
 def test_deepseek_run_decode_dispatches_active_token_count():
@@ -2977,14 +2989,18 @@ def test_deepseek_dynamic_prefill_views_reuse_pre_fork_shared_storage():
     task_args.build = lambda: tuple(task_args.tensors.get(name, shared_scalar) for name in task_args.names)
     dispatch_values = dict(zip(task_args.names, task_args.build_for_tokens(kernel_tokens), strict=True))
 
-    for name in dynamic_inputs | {"hidden_out"}:
+    for name in dynamic_inputs | {"hidden_out", "pre_hc_hidden_out"}:
         active = dispatch_values[name]
         assert active.shape[1] == kernel_tokens
         assert active.is_shared() and active.is_contiguous()
         assert active.data_ptr() == task_args.tensors[name].data_ptr()
     assert dispatch_values["x_hc"].shape == (2, 8, 1, 1)
     assert dispatch_values["hidden_out"].shape == (2, 8, 1)
-    assert dispatch_values["pre_hc_hidden_out"].shape == (2, 4, 1, 1)
+    assert dispatch_values["pre_hc_hidden_out"].shape == (2, 8, 1, 1)
+    active_pre_hc = dispatch_values["pre_hc_hidden_out"]
+    active_pre_hc[1].fill_(13)
+    assert task_args.token_view("pre_hc_hidden_out", kernel_tokens)[1].eq(13).all()
+    assert task_args.tensors["pre_hc_hidden_out"].reshape(-1)[8:16].eq(13).all()
     assert dispatch_values["logits"].shape == (2, 8, 1)
 
 
