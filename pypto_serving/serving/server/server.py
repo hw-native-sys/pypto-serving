@@ -218,6 +218,14 @@ class ServingServer:
             self.app.add_api_route("/stop_profile", self._stop_profile, methods=["POST"])
 
     async def _health(self) -> JSONResponse:
+        """Report serving readiness, not just route liveness.
+
+        A router in front of several replicas needs to stop routing to a replica
+        whose worker died or whose engine loop stopped scheduling; both look
+        identical to a healthy idle server from the outside.
+        """
+        if not self.engine.is_ready():
+            return JSONResponse({"status": "not_ready"}, status_code=503)
         return JSONResponse({"status": "ok"})
 
     async def _list_models(self) -> JSONResponse:
