@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from pypto_serving.model.common.runner.task_args import TaskArgs
 
+import numpy as np
 import torch
 from pypto.runtime import DeviceTensor, StackedDeviceTensor
 
@@ -623,8 +624,8 @@ class DSparkCacheMetadataBuilder:
     """Vectorized host lowering from scheduler block IDs to kernel metadata.
 
     Mirrors the pypto-lib ``utils`` helpers (the per-kernel fixtures lower the
-    same contract with Python loops); every routine here is a plain torch
-    expression so a full 512-row decode step lowers in one pass.
+    same contract with Python loops). Batched decode builders write through
+    NumPy views so the full fixed tile lands directly in shared staging.
     """
 
     def __init__(self, layout: DSparkCacheLayout = DSparkCacheLayout()) -> None:
@@ -645,6 +646,39 @@ class DSparkCacheMetadataBuilder:
             raise ValueError("ring table block IDs must not be negative")
         index = torch.arange(depth) % ids.numel()
         return ids.index_select(0, index).to(dtype)
+
+    @staticmethod
+    def ring_tables(
+        block_ids_by_row: Sequence[Sequence[int]],
+        *,
+        depth: int,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Expand multiple compact rings directly into an int32 output table."""
+        table = DSparkCacheMetadataBuilder._table_output(
+            out,
+            rows=len(block_ids_by_row),
+            depth=depth,
+        )
+        table_array = table.numpy()
+        buckets: dict[int, list[tuple[int, tuple[int, ...]]]] = {}
+        for row, block_ids in enumerate(block_ids_by_row):
+            ids = tuple(int(block_id) for block_id in block_ids)
+            if not ids:
+                raise ValueError(f"ring table row {row} needs at least one allocated block")
+            if any(block_id < 0 for block_id in ids):
+                raise ValueError("ring table block IDs must not be negative")
+            buckets.setdefault(len(ids), []).append((row, ids))
+        for width, rows in buckets.items():
+            repeats, tail = divmod(depth, width)
+            repeated_depth = repeats * width
+            for row, ids in rows:
+                values = np.asarray(ids, dtype=np.int32)
+                if repeats:
+                    table_array[row, :repeated_depth].reshape(repeats, width)[:] = values
+                if tail:
+                    table_array[row, repeated_depth:] = values[:tail]
+        return table
 
     @staticmethod
     def trailing_ring_table(
@@ -687,6 +721,63 @@ class DSparkCacheMetadataBuilder:
         table = torch.full((depth,), -1, dtype=dtype)
         table[: ids.numel()] = ids.to(dtype)
         return table
+
+    @staticmethod
+    def absolute_tables(
+        block_ids_by_row: Sequence[Sequence[int]],
+        *,
+        depth: int,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Write multiple absolute block tables directly into an int32 output."""
+        table = DSparkCacheMetadataBuilder._table_output(
+            out,
+            rows=len(block_ids_by_row),
+            depth=depth,
+        )
+        table_array = table.numpy()
+        table_array.fill(-1)
+        buckets: dict[int, list[tuple[int, tuple[int, ...]]]] = {}
+        for row, block_ids in enumerate(block_ids_by_row):
+            ids = tuple(int(block_id) for block_id in block_ids)
+            if len(ids) > depth:
+                raise ValueError(f"row {row} owns {len(ids)} pages, table depth is {depth}")
+            if any(block_id < 0 for block_id in ids):
+                raise ValueError("absolute table block IDs must not be negative")
+            if ids:
+                buckets.setdefault(len(ids), []).append((row, ids))
+        for width, rows in buckets.items():
+            row_indices = np.fromiter(
+                (row for row, _ids in rows),
+                dtype=np.intp,
+                count=len(rows),
+            )
+            values = np.asarray([ids for _row, ids in rows], dtype=np.int32)
+            table_array[row_indices[:, None], np.arange(width)] = values
+        return table
+
+    @staticmethod
+    def _table_output(
+        out: torch.Tensor | None,
+        *,
+        rows: int,
+        depth: int,
+    ) -> torch.Tensor:
+        expected = (rows, depth)
+        if out is None:
+            return torch.empty(expected, dtype=torch.int32)
+        if (
+            out.device.type != "cpu"
+            or out.dtype != torch.int32
+            or tuple(out.shape) != expected
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "block-table output must be a contiguous CPU int32 tensor with "
+                f"shape {expected}, got shape={tuple(out.shape)} dtype={out.dtype} "
+                f"device={out.device} contiguous={out.is_contiguous()}"
+            )
+        return out
 
     @staticmethod
     def _gather_table(table: torch.Tensor, logical: torch.Tensor) -> torch.Tensor:
@@ -3645,7 +3736,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         *,
         buffer_slot: int,
     ) -> DSparkPreparedDecodePlan:
-        """Build immutable Host-only metadata that does not depend on prior output."""
+        """Build position-independent metadata in the selected ping-pong slot."""
         if buffer_slot < 0 or buffer_slot >= len(self._decode_task_args):
             raise ValueError(
                 f"DSpark decode buffer_slot must be in [0, {len(self._decode_task_args)}), "
@@ -3667,72 +3758,85 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         group_plans: list[_DSparkDecodeGroupPlan] = []
         owner_ranks = [-1] * actual_batch
         owner_rows = [-1] * actual_batch
-        state_slot_ids = torch.full(
-            (layout.ranks, layout.decode_local_batch), -1, dtype=torch.int32
+        direct_shared = bool(
+            self._compiled.decode_full_fused and self._dspark_state_buffers
         )
-        state_generations = torch.full_like(state_slot_ids, -1)
-        group_state_slot_ids = torch.full(
-            (layout.ranks, layout.decode_batch), -1, dtype=torch.int32
-        )
-        group_state_generations = torch.full_like(group_state_slot_ids, -1)
-        group_ori_block_tables = torch.full(
-            (
-                layout.ranks,
-                layout.decode_batch,
-                DSPARK_DECODE_ORI_TABLE_BLOCKS,
-            ),
-            -1,
-            dtype=torch.int32,
-        )
-        group_hca_cmp_block_tables = torch.full(
-            (
-                layout.ranks,
-                layout.decode_batch,
-                DSPARK_DECODE_HCA_CMP_TABLE_BLOCKS,
-            ),
-            -1,
-            dtype=torch.int32,
-        )
-        group_csa_cmp_block_tables = torch.full(
-            (
-                layout.ranks,
-                layout.decode_batch,
-                DSPARK_DECODE_CMP_C4_TABLE_BLOCKS,
-            ),
-            -1,
-            dtype=torch.int32,
-        )
-        group_idx_block_tables = torch.full(
-            (
-                layout.ranks,
-                layout.decode_batch,
-                DSPARK_DECODE_IDX_TABLE_BLOCKS,
-            ),
-            -1,
-            dtype=torch.int32,
-        )
-        group_hca_state_block_tables = torch.full(
-            (
-                layout.ranks,
-                layout.decode_batch,
-                self._decode_state_table_depth("hca_state"),
-            ),
-            -1,
-            dtype=torch.int32,
-        )
-        group_csa_state_block_tables = torch.full(
-            (
-                layout.ranks,
-                layout.decode_batch,
-                self._decode_state_table_depth("csa_state"),
-            ),
-            -1,
-            dtype=torch.int32,
-        )
-        group_csa_inner_state_block_tables = torch.full_like(
-            group_csa_state_block_tables,
-            -1,
-        )
+        state_buffers = self._dspark_state_buffers[buffer_slot] if direct_shared else None
+        if state_buffers is not None:
+            required_group_buffers = (
+                state_buffers.group_state_slot_ids,
+                state_buffers.group_state_generations,
+                state_buffers.group_ori_block_tables,
+                state_buffers.group_hca_cmp_block_tables,
+                state_buffers.group_csa_cmp_block_tables,
+                state_buffers.group_idx_block_tables,
+                state_buffers.group_hca_state_block_tables,
+                state_buffers.group_csa_state_block_tables,
+                state_buffers.group_csa_inner_state_block_tables,
+            )
+            if any(value is None for value in required_group_buffers):
+                raise RuntimeError("DSpark group device-state descriptors are unavailable")
+            state_slot_ids = state_buffers.state_slot_ids
+            state_generations = state_buffers.state_generations
+            group_state_slot_ids = state_buffers.group_state_slot_ids
+            group_state_generations = state_buffers.group_state_generations
+            group_ori_block_tables = state_buffers.group_ori_block_tables
+            group_hca_cmp_block_tables = state_buffers.group_hca_cmp_block_tables
+            group_csa_cmp_block_tables = state_buffers.group_csa_cmp_block_tables
+            group_idx_block_tables = state_buffers.group_idx_block_tables
+            group_hca_state_block_tables = state_buffers.group_hca_state_block_tables
+            group_csa_state_block_tables = state_buffers.group_csa_state_block_tables
+            group_csa_inner_state_block_tables = (
+                state_buffers.group_csa_inner_state_block_tables
+            )
+            state_slot_ids.fill_(-1)
+            state_generations.fill_(-1)
+            group_state_slot_ids.fill_(-1)
+            group_state_generations.fill_(-1)
+        else:
+            state_slot_ids = torch.full(
+                (layout.ranks, layout.decode_local_batch), -1, dtype=torch.int32
+            )
+            state_generations = torch.full_like(state_slot_ids, -1)
+            group_state_slot_ids = torch.full(
+                (layout.ranks, layout.decode_batch), -1, dtype=torch.int32
+            )
+            group_state_generations = torch.full_like(group_state_slot_ids, -1)
+            group_ori_block_tables = torch.empty(
+                (layout.ranks, layout.decode_batch, DSPARK_DECODE_ORI_TABLE_BLOCKS),
+                dtype=torch.int32,
+            )
+            group_hca_cmp_block_tables = torch.empty(
+                (layout.ranks, layout.decode_batch, DSPARK_DECODE_HCA_CMP_TABLE_BLOCKS),
+                dtype=torch.int32,
+            )
+            group_csa_cmp_block_tables = torch.empty(
+                (layout.ranks, layout.decode_batch, DSPARK_DECODE_CMP_C4_TABLE_BLOCKS),
+                dtype=torch.int32,
+            )
+            group_idx_block_tables = torch.empty(
+                (layout.ranks, layout.decode_batch, DSPARK_DECODE_IDX_TABLE_BLOCKS),
+                dtype=torch.int32,
+            )
+            group_hca_state_block_tables = torch.empty(
+                (
+                    layout.ranks,
+                    layout.decode_batch,
+                    self._decode_state_table_depth("hca_state"),
+                ),
+                dtype=torch.int32,
+            )
+            group_csa_state_block_tables = torch.empty(
+                (
+                    layout.ranks,
+                    layout.decode_batch,
+                    self._decode_state_table_depth("csa_state"),
+                ),
+                dtype=torch.int32,
+            )
+            group_csa_inner_state_block_tables = torch.empty_like(
+                group_csa_state_block_tables
+            )
         sampled_row_offsets = torch.full_like(state_slot_ids, -1)
         hidden_row_offsets = torch.full_like(state_slot_ids, -1)
         for group in range(layout.partitions):
@@ -3774,125 +3878,126 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     return (scratch[name][row],)
                 return request_blocks[request_index][name]
 
+            blocks_by_name = {
+                name: tuple(blocks(row, name) for row in range(group_batch))
+                for name in DSPARK_CACHE_GROUP_NAMES
+            }
             host_state_tables = not self._compiled.decode_full_fused
+            group_rank_begin = group * layout.tp_size
+            group_rank_end = group_rank_begin + layout.tp_size
             group_plan = _DSparkDecodeGroupPlan(
                 request_indices=tuple(request_indices),
                 anchor_flags=anchor_flags,
-                ori_tables=torch.stack(
-                    [
-                        builder.ring_table(
-                            blocks(row, "ori"),
-                            depth=DSPARK_DECODE_ORI_TABLE_BLOCKS,
-                        )
-                        for row in range(group_batch)
-                    ]
+                ori_tables=builder.ring_tables(
+                    blocks_by_name["ori"],
+                    depth=DSPARK_DECODE_ORI_TABLE_BLOCKS,
+                    out=(
+                        group_ori_block_tables[group_rank_begin]
+                        if direct_shared
+                        else None
+                    ),
                 ),
-                hca_cmp_tables=torch.stack(
-                    [
-                        builder.absolute_table(
-                            blocks(row, "cmp_c128"),
-                            depth=DSPARK_DECODE_HCA_CMP_TABLE_BLOCKS,
-                        )
-                        for row in range(group_batch)
-                    ]
+                hca_cmp_tables=builder.absolute_tables(
+                    blocks_by_name["cmp_c128"],
+                    depth=DSPARK_DECODE_HCA_CMP_TABLE_BLOCKS,
+                    out=(
+                        group_hca_cmp_block_tables[group_rank_begin]
+                        if direct_shared
+                        else None
+                    ),
                 ),
-                csa_cmp_tables=torch.stack(
-                    [
-                        builder.absolute_table(
-                            blocks(row, "cmp_c4"),
-                            depth=DSPARK_DECODE_CMP_C4_TABLE_BLOCKS,
-                        )
-                        for row in range(group_batch)
-                    ]
+                csa_cmp_tables=builder.absolute_tables(
+                    blocks_by_name["cmp_c4"],
+                    depth=DSPARK_DECODE_CMP_C4_TABLE_BLOCKS,
+                    out=(
+                        group_csa_cmp_block_tables[group_rank_begin]
+                        if direct_shared
+                        else None
+                    ),
                 ),
-                idx_tables=torch.stack(
-                    [
-                        builder.absolute_table(
-                            blocks(row, "idx"),
-                            depth=DSPARK_DECODE_IDX_TABLE_BLOCKS,
-                        )
-                        for row in range(group_batch)
-                    ]
+                idx_tables=builder.absolute_tables(
+                    blocks_by_name["idx"],
+                    depth=DSPARK_DECODE_IDX_TABLE_BLOCKS,
+                    out=(
+                        group_idx_block_tables[group_rank_begin]
+                        if direct_shared
+                        else None
+                    ),
                 ),
-                hca_state_tables=torch.stack(
-                    [
-                        builder.ring_table(
-                            blocks(row, "hca_state"),
-                            depth=DSPARK_DECODE_HCA_STATE_TABLE_BLOCKS,
-                        )
-                        for row in range(group_batch)
-                    ]
-                ) if host_state_tables else None,
-                csa_state_tables=torch.stack(
-                    [
-                        builder.ring_table(
-                            blocks(row, "csa_state"),
-                            depth=DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS,
-                        )
-                        for row in range(group_batch)
-                    ]
-                ) if host_state_tables else None,
-                csa_inner_state_tables=torch.stack(
-                    [
-                        builder.ring_table(
-                            blocks(row, "csa_inner_state"),
-                            depth=DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS,
-                        )
-                        for row in range(group_batch)
-                    ]
-                ) if host_state_tables else None,
+                hca_state_tables=(
+                    builder.ring_tables(
+                        blocks_by_name["hca_state"],
+                        depth=DSPARK_DECODE_HCA_STATE_TABLE_BLOCKS,
+                    )
+                    if host_state_tables
+                    else None
+                ),
+                csa_state_tables=(
+                    builder.ring_tables(
+                        blocks_by_name["csa_state"],
+                        depth=DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS,
+                    )
+                    if host_state_tables
+                    else None
+                ),
+                csa_inner_state_tables=(
+                    builder.ring_tables(
+                        blocks_by_name["csa_inner_state"],
+                        depth=DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS,
+                    )
+                    if host_state_tables
+                    else None
+                ),
             )
             group_plans.append(group_plan)
-            group_rank_begin = group * layout.tp_size
-            group_rank_end = group_rank_begin + layout.tp_size
-            group_ori_block_tables[group_rank_begin:group_rank_end] = (
-                group_plan.ori_tables.unsqueeze(0)
+            for target, values in (
+                (group_ori_block_tables, group_plan.ori_tables),
+                (group_hca_cmp_block_tables, group_plan.hca_cmp_tables),
+                (group_csa_cmp_block_tables, group_plan.csa_cmp_tables),
+                (group_idx_block_tables, group_plan.idx_tables),
+            ):
+                source = target[group_rank_begin]
+                if not direct_shared:
+                    source.copy_(values)
+                for rank in range(group_rank_begin + 1, group_rank_end):
+                    target[rank].copy_(source)
+            group_hca_state_tables = builder.ring_tables(
+                blocks_by_name["hca_state"],
+                depth=self._decode_state_table_depth("hca_state"),
+                out=(
+                    group_hca_state_block_tables[group_rank_begin]
+                    if direct_shared
+                    else None
+                ),
             )
-            group_hca_cmp_block_tables[group_rank_begin:group_rank_end] = (
-                group_plan.hca_cmp_tables.unsqueeze(0)
+            group_csa_state_tables = builder.ring_tables(
+                blocks_by_name["csa_state"],
+                depth=self._decode_state_table_depth("csa_state"),
+                out=(
+                    group_csa_state_block_tables[group_rank_begin]
+                    if direct_shared
+                    else None
+                ),
             )
-            group_csa_cmp_block_tables[group_rank_begin:group_rank_end] = (
-                group_plan.csa_cmp_tables.unsqueeze(0)
+            group_csa_inner_state_tables = builder.ring_tables(
+                blocks_by_name["csa_inner_state"],
+                depth=self._decode_state_table_depth("csa_state"),
+                out=(
+                    group_csa_inner_state_block_tables[group_rank_begin]
+                    if direct_shared
+                    else None
+                ),
             )
-            group_idx_block_tables[group_rank_begin:group_rank_end] = (
-                group_plan.idx_tables.unsqueeze(0)
-            )
-            group_hca_state_tables = torch.stack(
-                [
-                    builder.ring_table(
-                        blocks(row, "hca_state"),
-                        depth=self._decode_state_table_depth("hca_state"),
-                    )
-                    for row in range(group_batch)
-                ]
-            )
-            group_csa_state_tables = torch.stack(
-                [
-                    builder.ring_table(
-                        blocks(row, "csa_state"),
-                        depth=self._decode_state_table_depth("csa_state"),
-                    )
-                    for row in range(group_batch)
-                ]
-            )
-            group_csa_inner_state_tables = torch.stack(
-                [
-                    builder.ring_table(
-                        blocks(row, "csa_inner_state"),
-                        depth=self._decode_state_table_depth("csa_state"),
-                    )
-                    for row in range(group_batch)
-                ]
-            )
-            group_hca_state_block_tables[group_rank_begin:group_rank_end] = (
-                group_hca_state_tables.unsqueeze(0)
-            )
-            group_csa_state_block_tables[group_rank_begin:group_rank_end] = (
-                group_csa_state_tables.unsqueeze(0)
-            )
-            group_csa_inner_state_block_tables[group_rank_begin:group_rank_end] = (
-                group_csa_inner_state_tables.unsqueeze(0)
-            )
+            for target, values in (
+                (group_hca_state_block_tables, group_hca_state_tables),
+                (group_csa_state_block_tables, group_csa_state_tables),
+                (group_csa_inner_state_block_tables, group_csa_inner_state_tables),
+            ):
+                source = target[group_rank_begin]
+                if not direct_shared:
+                    source.copy_(values)
+                for rank in range(group_rank_begin + 1, group_rank_end):
+                    target[rank].copy_(source)
         prepared = DSparkPreparedDecodePlan(
             request_ids=tuple(batch.request_ids),
             groups=assignment.groups,
@@ -3917,7 +4022,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             owner_rows=tuple(owner_rows),
             buffer_slot=buffer_slot,
         )
-        if self.speculative and self._dspark_state_buffers:
+        if self.speculative and self._dspark_state_buffers and not direct_shared:
             state_buffers = self._dspark_state_buffers[buffer_slot]
             copy_shared(
                 state_buffers.state_slot_ids,
@@ -4690,15 +4795,26 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             raise RuntimeError(
                 f"DSpark drafter block-table staging for batch {batch} is not allocated"
             )
-        filler = self._drafter_ring_rows(DSPARK_DRAFTER_FILLER_BLOCK_BASE)
+        bases = np.full(
+            (self._compiled.layout.ranks, batch),
+            DSPARK_DRAFTER_FILLER_BLOCK_BASE,
+            dtype=np.int32,
+        )
         for rank, rows in enumerate(rows_by_rank):
-            for index in range(batch):
-                if index < len(rows):
-                    base = rows[index].lease * DSPARK_DRAFTER_RING_BLOCKS
-                    ring = self._drafter_ring_rows(base)
-                else:
-                    ring = filler
-                tables[rank, :, index] = ring.to(torch.int32)
+            for index, row in enumerate(rows):
+                bases[rank, index] = row.lease * DSPARK_DRAFTER_RING_BLOCKS
+        logical = np.arange(DSPARK_DRAFTER_TABLE_BLOCKS, dtype=np.int32)
+        layer_patterns = np.stack(
+            [
+                (logical + 7 * layer) % DSPARK_DRAFTER_RING_BLOCKS
+                for layer in range(DSPARK_DRAFT_LAYERS)
+            ]
+        )
+        np.add(
+            bases[:, None, :, None],
+            layer_patterns[None, :, None, :],
+            out=tables.numpy(),
+        )
 
     @staticmethod
     def _drafter_slots_for_positions(
