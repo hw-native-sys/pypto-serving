@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import logging
 import os
 import sys
 from collections.abc import Iterable, Sequence
@@ -48,6 +49,8 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
 )
 from pypto_serving.model.deepseek_dspark.weight_loader import DSparkWeightStore
 from pypto_serving.tools.profile import profile_span
+
+logger = logging.getLogger(__name__)
 
 _DSPARK_KERNEL_DIRNAME = "deepseek_v4_flash_dspark"
 
@@ -199,6 +202,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         cache_ranks: int = DSPARK_RANKS,
         compile_kernels: bool = False,
         num_speculative_tokens: int = 0,
+        engram_checkpoint: str | None = None,
     ) -> None:
         worker_device_ids = tuple(device_ids) if device_ids is not None else (int(device_id),)
         super().__init__(
@@ -215,6 +219,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         # layout freezes every rank-derived axis (kernel import arguments,
         # scheduler cache partitions, packed-prefill capacity) from it.
         self._topology_layout = DSparkCacheLayout.for_ranks(cache_ranks)
+        self._engram_checkpoint = str(engram_checkpoint) if engram_checkpoint else None
         if self._num_speculative_tokens not in (0, DSPARK_SPECULATIVE_TOKENS):
             raise ValueError(
                 "DSpark speculation is fixed at K="
@@ -329,7 +334,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         layout.validate_runtime(model.config, model.runtime, self._device_ids)
         compress_ratios = tuple(int(ratio) for ratio in metadata["compress_ratios"])
         if len(compress_ratios) < model.config.num_hidden_layers + 1:
-            raise ValueError(
+            raise ValueError( 
                 "DSpark compress_ratios must include one entry per hidden layer plus "
                 "the drafter/final entries"
             )
@@ -355,6 +360,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             compress_ratios=compress_ratios,
             num_hash_layers=num_hash_layers,
         )
+        engram_embed = self._build_engram_embed_source(layout, config_data)
         speculative = self._num_speculative_tokens > 0
         drafter = None
         markov = None
@@ -434,6 +440,95 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             device_ids=self._device_ids,
             n_routed_experts=n_routed_experts,
             num_hash_layers=num_hash_layers,
+            engram_embed=engram_embed,
+        )
+
+    def _build_engram_embed_source(self, layout: DSparkCacheLayout, config_data: object):
+        """Validate the original-checkpoint engram tables when serving with them.
+
+        ``None`` (the default) keeps the engram path off. The engram is an
+        optional V4.1-Flash module -- plain DeepSeek V4 declares none -- so
+        the gate is config-driven: ``--engram-checkpoint`` applies only when
+        the served model's config declares the engram layers, and the
+        checkpoint's geometry must match that declaration. The checkpoint
+        must also carry both tensors of every layer and the ``tokenizer.json``
+        the compressed token map is rebuilt from; failures surface here,
+        before any serving traffic.
+        """
+        from pypto_serving.model.deepseek.engram_loader import (  # noqa: PLC0415
+            parse_engram_embed_layouts,
+        )
+
+        model_config = config_data if isinstance(config_data, dict) else {}
+        model_layouts = parse_engram_embed_layouts(model_config, tp_size=layout.tp_size)
+        if self._engram_checkpoint is None:
+            if model_layouts:
+                logger.warning(
+                    "Served model config declares engram layers %s but no "
+                    "--engram-checkpoint was given; the engram lookup stays off.",
+                    sorted(model_layouts),
+                )
+            return None
+        if not model_layouts:
+            raise ValueError(
+                "--engram-checkpoint requires a model whose config declares engram "
+                "layers (DeepSeek V4.1-Flash); this model's config declares none"
+            )
+        import json
+
+        from pypto_serving.model.deepseek.engram_hash import (  # noqa: PLC0415
+            EngramHashLayout,
+        )
+        from pypto_serving.model.deepseek.engram_loader import (
+            EngramEmbedCheckpoint,
+        )
+        from pypto_serving.model.deepseek.engram_runner import (  # noqa: PLC0415
+            EngramEmbedSource,
+        )
+
+        checkpoint_dir = Path(self._engram_checkpoint)
+        config_path = checkpoint_dir / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"Engram checkpoint has no config.json: {checkpoint_dir}"
+            )
+        checkpoint_config = json.loads(config_path.read_text())
+        layouts = parse_engram_embed_layouts(checkpoint_config, tp_size=layout.tp_size)
+        if not layouts:
+            raise ValueError(
+                f"Engram checkpoint config declares no engram layers: {config_path}"
+            )
+        if layouts != model_layouts:
+            raise ValueError(
+                "Engram checkpoint geometry does not match the served model's "
+                f"config: model declares {sorted(model_layouts)}, checkpoint "
+                f"declares {sorted(layouts)}"
+            )
+        # Rebuilds the n-gram bucket geometry and asserts the drawn primes sum
+        # to the declared table rows, so a wrong engram_vocab_size fails here.
+        hash_layout = EngramHashLayout.from_config(checkpoint_config)
+        tokenizer_path = checkpoint_dir / "tokenizer.json"
+        if not tokenizer_path.exists():
+            raise FileNotFoundError(
+                f"Engram checkpoint has no tokenizer.json: {checkpoint_dir}. The "
+                "compressed token map is rebuilt from the raw tokenizer at prepare "
+                "time, so the original release's tokenizer must ship next to "
+                "the tables."
+            )
+        checkpoint = EngramEmbedCheckpoint(checkpoint_dir)
+        checkpoint.require_layers(layouts)
+        logger.info(
+            "DSpark engram embed source: %d layers from %s (host-resident tables, "
+            "TP%s zero-padded gathers)",
+            len(layouts),
+            checkpoint_dir,
+            layout.tp_size,
+        )
+        return EngramEmbedSource(
+            checkpoint_dir=str(checkpoint_dir),
+            tp_size=layout.tp_size,
+            layouts=layouts,
+            hash_layout=hash_layout,
         )
 
     def _validate_drafter_config(self, model: RuntimeModel, config_data: object) -> None:
