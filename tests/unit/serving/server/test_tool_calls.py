@@ -165,8 +165,10 @@ class _ReplayScheduler:
         self.requests = {}
         self.replays = {}
         self.aborted = []
+        self.constraint_specs = []
 
     def add_request(self, request):
+        self.constraint_specs.append(request.constraint_spec)
         text, reason = self.scripts.popleft()
         ids = self.core.tokenizer.encode(text) if isinstance(text, str) else text
         chunks = deque(ids[i:i + self.chunk_size] for i in range(0, len(ids), self.chunk_size))
@@ -232,6 +234,19 @@ def _replay_server(*scripts, chunk_size=7, tokenizer=None):
         core_factory=lambda **kwargs: _ReplayCore(**kwargs, scripts=scripts, chunk_size=chunk_size),
     )
     return ServingServer(engine, "test", GenerateConfig(max_new_tokens=2048))
+
+
+def _enable_fake_constraints(server, monkeypatch):
+    server.engine.config.executor_cls = "PyptoDeepSeekV4DSparkExecutor"
+    monkeypatch.setattr(
+        "pypto_serving.serving.server.server.importlib.util.find_spec",
+        lambda name: object() if name == "xgrammar" else None,
+    )
+
+    async def preflight(spec):
+        assert spec.provider_id == "xgrammar"
+
+    monkeypatch.setattr(server, "_preflight_constraint", preflight)
 
 
 def _sse_events(response):
@@ -422,11 +437,18 @@ def test_parser_error_is_request_local_and_next_request_succeeds(stream, invalid
     _assert_released(server, 2)
 
 
-def test_closing_http_stream_releases_active_tool_request_once():
+@pytest.mark.parametrize("constrained", [False, True])
+def test_closing_http_stream_releases_active_tool_request_once(monkeypatch, constrained):
     async def check():
         text = TOOL_START + invoke(city="x" * 10000) + TOOL_END
         server = _replay_server((text, "FINISHED_EOS"), chunk_size=7)
-        request = _request(tools=TOOLS, stream=True)
+        if constrained:
+            _enable_fake_constraints(server, monkeypatch)
+        tools = [{"type": "function", "function": {
+            **TOOLS[0]["function"], "strict": True,
+        }}] if constrained else TOOLS
+        request = _request(tools=tools, stream=True,
+                           tool_choice="required" if constrained else "auto")
         response = await server._chat_completions(request)
         chunks = response.body_iterator
         async for chunk in chunks:
@@ -436,8 +458,58 @@ def test_closing_http_stream_releases_active_tool_request_once():
         await chunks.aclose()
         _assert_released(server, 1)
         assert len(server.engine._cores[0].scheduler.aborted) == 1
+        assert bool(server.engine._cores[0].scheduler.constraint_specs[0]) is constrained
 
     asyncio.run(check())
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("chunk_size", [1, 100000])
+def test_constrained_chat_protocol_reasoning_to_parallel_tools(monkeypatch, stream, chunk_size):
+    text = "Need both</think>" + TOOL_START + invoke(city="杭州") + invoke(city="北京") + TOOL_END + "<eos>"
+    server = _replay_server((text, "FINISHED_EOS"), chunk_size=chunk_size)
+    _enable_fake_constraints(server, monkeypatch)
+    strict_tool = {"type": "function", "function": {
+        **TOOLS[0]["function"], "strict": True,
+        "parameters": {
+            "type": "object", "properties": {"city": {"type": "string"}},
+            "required": ["city"], "additionalProperties": False,
+        },
+    }}
+    with TestClient(server.app) as client:
+        message, reason, _ = _collect_chat(client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Look up two cities"}],
+            "tools": [strict_tool], "tool_choice": "required",
+            "parallel_tool_calls": True, "reasoning_effort": "high", "stream": stream,
+        }), stream)
+    assert message["reasoning"] == "Need both"
+    assert message["content"] is None
+    assert reason == "tool_calls"
+    assert [json.loads(call["function"]["arguments"])["city"] for call in message["tool_calls"]] == [
+        "杭州", "北京",
+    ]
+    assert server.engine._cores[0].scheduler.constraint_specs[0].tool_choice == "required"
+    _assert_released(server, 1)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_constrained_chat_length_truncation_keeps_partial_call(monkeypatch, stream):
+    text = "Need a lookup</think>" + TOOL_START + invoke(city="unfinished")
+    text = text[:text.index("unfinished") + 3]
+    server = _replay_server((text, "FINISHED_LENGTH"), chunk_size=3)
+    _enable_fake_constraints(server, monkeypatch)
+    strict_tool = {"type": "function", "function": {**TOOLS[0]["function"], "strict": True}}
+    with TestClient(server.app) as client:
+        message, reason, _ = _collect_chat(client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Look up a city"}],
+            "tools": [strict_tool], "tool_choice": "required",
+            "reasoning_effort": "high", "stream": stream,
+        }), stream)
+    assert message["reasoning"] == "Need a lookup"
+    assert reason == "length"
+    assert message["tool_calls"][0]["function"]["arguments"] == '{"city":"unf'
+    assert server.engine._cores[0].scheduler.constraint_specs[0] is not None
+    _assert_released(server, 1)
 
 
 @pytest.mark.parametrize("stream", [False, True])

@@ -58,7 +58,7 @@ The server converts chat messages to a prompt with the tokenizer's `apply_chat_t
 
 ## DeepSeek V4 Function Tools
 
-Tool calling is selected by the model tokenizer; no extra launcher flag or vLLM dependency is required. Serving encodes tool definitions and parses model output. **The client executes tools**, then sends the results in a new chat request.
+Tool calling is selected by the model tokenizer; no extra launcher flag or vLLM dependency is required. Serving encodes tool definitions and parses model output. **The client executes tools**, then sends the results in a new chat request. Constrained generation for DeepSeek V4 DSpark K7 additionally requires XGrammar; see [deployment and compatibility](deepseek-v4-dspark-tool-constraints.md).
 
 Send this request to a **DeepSeek V4** server, not the Qwen server in the examples above. Set `DEEPSEEK_BASE_URL` to that server's host and port (8000 is the default serving port).
 
@@ -84,7 +84,7 @@ curl --noproxy "*" "$DEEPSEEK_BASE_URL/v1/chat/completions" \
 
 `auto` is the default when non-empty `tools` are supplied. The model can answer normally or return `message.tool_calls`, with each call containing `id`, `type: "function"`, and `function: {name, arguments}`. `arguments` is a **JSON string**, not a JSON object. `content` can be null; `reasoning`, when enabled, remains separate from both content and tools.
 
-The parser returns a model-generated function name even if that name is absent from this request's `tools`, matching vLLM's default DeepSeek V4 behavior. Serving does not provide built-in functions such as `read_file`; the client decides which calls it can execute. Check the returned name against the client's available tools before executing it.
+In ordinary unconstrained `auto` mode, the parser returns a model-generated function name even if that name is absent from this request's `tools`, matching vLLM's default DeepSeek V4 behavior. Serving does not provide built-in functions such as `read_file`; the client decides which calls it can execute. Check the returned name against the client's available tools before executing it.
 
 For a successful call, the client should validate the function name and arguments against its schema before execution. Append the returned assistant message and a tool result that references the same call ID:
 
@@ -109,8 +109,8 @@ Send that history to the same chat endpoint, including `tools` again if another 
 Supported controls and limits:
 
 - `tool_choice: "none"` suppresses tool-call output. Recognized tool blocks are consumed when tools are supplied; ordinary no-tools chat keeps its existing parser behavior.
-- Multiple calls are supported. `parallel_tool_calls: false` exposes only the first call; it does not constrain sampling or execute tools serially.
-- `required`, named tool choices, and `strict: true` return HTTP 400 because constrained tool decoding is not implemented. Non-function tool types are rejected during request validation.
+- Multiple calls are supported. In unconstrained `auto`, `parallel_tool_calls: false` exposes only the first parsed call; in constrained DSpark K7 generation, the flag also enters the structural grammar. It never executes tools on the server.
+- DeepSeek V4 DSpark K7 supports structural constraints for `required`, a named tool choice, and `auto` when at least one tool has `strict: true`. These modes require XGrammar and the matching PyPTO-Lib kernel ABI. Ordinary `auto` with no strict tool remains unconstrained. Unsupported model paths or unavailable XGrammar reject constrained requests before generation. Non-function tool types are rejected during request validation.
 - Tools on a model without a registered tool parser are rejected. DSML formatting stays in the DeepSeek implementation, not the HTTP server or scheduler.
 - Tool-history argument values cannot contain the reserved `</｜DSML｜parameter>` delimiter, including inside nested JSON values. Tool-result content cannot contain `</tool_result>`. These inputs return HTTP 400 before generation rather than breaking the history encoding.
 - The parser preserves DSML parameter types without schema-based coercion or guessed JSON repairs. A length-truncated call can have incomplete arguments: do not execute it as a successful call.

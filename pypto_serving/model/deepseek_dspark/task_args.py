@@ -9,8 +9,8 @@
 """DSpark per-dispatch-class :class:`TaskArgs` builders.
 
 The ``_PREFILL_TENSOR_ORDER`` / ``_DECODE_TENSOR_ORDER`` tuples below ARE the
-positional contracts of ``l3_prefill_fwd`` (101 args) and ``l3_decode_fwd``
-(109 args) -- register them in exactly this order.  Every argument declares its
+positional contracts of ``l3_prefill_fwd`` (102 args) and ``l3_decode_fwd``
+(110 args) -- register them in exactly this order.  Every argument declares its
 kind at registration: host-shared slots (per-step metadata), static weights
 (upload-once), worker-resident cache pools and scratch (runner materializers),
 and the stacked layer-weight banks.
@@ -46,6 +46,8 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_DRAFTER_QUERY_WIDTH,
     DSPARK_DRAFT_LAYERS,
     DSPARK_HEAD_DIM,
+    DSPARK_GRAMMAR_SEGMENTS,
+    DSPARK_GRAMMAR_SEGMENT_WORDS,
     DSPARK_HC_MULT,
     DSPARK_HIDDEN_SIZE,
     DSPARK_MAIN_HIDDEN_DIM,
@@ -160,6 +162,9 @@ def _prefill_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
         "csa_state_slot_mapping_full": (torch.int64, (ranks, tokens)),
         "csa_inner_state_slot_mapping_full": (torch.int64, (ranks, tokens)),
         "logit_row_indices": (torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS)),
+        "grammar_mask": (
+            torch.int16, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS),
+        ),
         "sampled_ids": (
             torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_SAMPLED_IDS_PAD),
         ),
@@ -304,6 +309,10 @@ def _decode_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
         "input_ids": (torch.int64, (ranks, local_tokens)),
         "num_tokens_per_owner": (torch.int32, (ranks,)),
         "logit_row_indices": (torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS)),
+        "grammar_mask": (
+            torch.int16, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS),
+        ),
+        "valid_draft_counts": (torch.int32, (ranks, DSPARK_DECODE_BATCH)),
         "sampled_ids": (
             torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_SAMPLED_IDS_PAD),
         ),
@@ -365,7 +374,12 @@ def decode_task_args(runner: DSparkModelRunner) -> TaskArgs:
     scratch = decode_scratch_specs(ranks)
 
     ta = TaskArgs(stacked=True)
-    for name in _DECODE_TENSOR_ORDER:
+    tensor_order = (
+        _FUSED_DECODE_TENSOR_ORDER
+        if runner._compiled.decode_full_fused
+        else _DECODE_TENSOR_ORDER
+    )
+    for name in tensor_order:
         if (
             runner._compiled.decode_full_fused
             and name in _DSPARK_FUSED_INTERNAL_PREPARE_NAMES
@@ -437,7 +451,7 @@ _PREFILL_TENSOR_ORDER = (
     "attn_stage", "x_mixed", "post_ffn", "comb_ffn", "ffn_out",
     "hc_head_fn", "hc_head_scale", "hc_head_base",
     "final_norm_w", "lm_head_weight", "logit_row_indices",
-    "dspark_target_hidden", "x_out", "logits", "sampled_ids",
+    "dspark_target_hidden", "x_out", "logits", "grammar_mask", "sampled_ids",
 )
 
 # Argument order for the packed ``l3_decode_fwd`` kernel (pypto-lib
@@ -484,7 +498,12 @@ _DECODE_TENSOR_ORDER = (
     "shared_w2", "shared_w2_scale",
     "hidden_workspace", "x_ping", "x_pong",
     "x_attn_active", "x_moe_next",
-    "pre_hc_hidden_out", "dspark_target_hidden", "x_out", "logits", "sampled_ids",
+    "pre_hc_hidden_out", "dspark_target_hidden", "x_out", "logits",
+    "grammar_mask", "sampled_ids",
+)
+
+_FUSED_DECODE_TENSOR_ORDER = (
+    *_DECODE_TENSOR_ORDER[:-1], "valid_draft_counts", _DECODE_TENSOR_ORDER[-1],
 )
 
 # Argument order for the speculative drafter (pypto-lib dspark_drafter.py,

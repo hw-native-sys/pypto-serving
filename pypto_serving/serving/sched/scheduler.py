@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from pypto_serving.config.types import KVCacheGroupSpec
+from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.memory.kv_cache import KVCacheCapacityError, KvCacheManager
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,7 @@ class Request:
     top_p: float = 1.0
     top_k: int | None = None
     seed: int | None = None
+    constraint_spec: ConstraintSpec | None = None
     cached_block_ids: list[int] = field(default_factory=list)
     allocated_block_ids: list[int] = field(default_factory=list)
     allocated_group_block_ids: dict[str, list[int]] = field(default_factory=dict)
@@ -992,7 +994,14 @@ class Scheduler:
         """
         if not self.running:
             return None
-        candidates = [r for r in self.running if r.request_id != exclude.request_id]
+        # The current worker can reconstruct a grammar only from an intact
+        # request lifetime. Serving's recompute preemption does not replay
+        # previously generated tokens into a fresh prefill, so never silently
+        # restart a constrained request at the wrong grammar position.
+        candidates = [
+            r for r in self.running
+            if r.request_id != exclude.request_id and r.constraint_spec is None
+        ]
         if self.kv_cache_manager.has_groups and exclude.cache_partition is not None:
             same_partition = [
                 request

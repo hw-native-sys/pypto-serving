@@ -94,6 +94,7 @@ nav:
       - Inference and Serving:
           - Offline Inference: user-guide/offline-inference.md
           - Online Serving: user-guide/online-serving.md
+          - DSpark Tool Constraints: user-guide/deepseek-v4-dspark-tool-constraints.md
           - Parallelism and Scaling: user-guide/parallel.md
           - Benchmarking: user-guide/benchmarking.md
           - Profiling: user-guide/profile.md

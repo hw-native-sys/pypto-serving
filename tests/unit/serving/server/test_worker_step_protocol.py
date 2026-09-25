@@ -18,6 +18,7 @@ import pytest
 from pypto_serving.serving.engine.async_engine import (
     ReplicaEngineCore,
 )
+from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.sched.scheduler import (
     Request,
@@ -185,6 +186,66 @@ def test_worker_release_does_not_remove_a_later_same_id_registration():
     assert released == ["req"]
     assert worker._req_cache["req"] is replacement
     assert worker._last_tokens["req"] == [7]
+
+
+def test_constrained_worker_error_releases_matcher_and_next_request_is_healthy(monkeypatch):
+    states = []
+    released = []
+
+    class State:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class Provider:
+        def __init__(self, tokenizer):
+            pass
+
+        def compile(self, spec):
+            state = State()
+            states.append(state)
+            return state
+
+    monkeypatch.setattr(serving_worker, "XGrammarProvider", Provider)
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.executor = SimpleNamespace(release_finished_requests=released.extend)
+    worker.sampler = SimpleNamespace(release_requests=lambda ids: None)
+    worker.model_record = SimpleNamespace(tokenizer=object())
+    worker._req_cache = {}
+    worker._last_tokens = {}
+    worker._constraint_states = {}
+    worker._xgrammar_provider = None
+    spec = ConstraintSpec(
+        provider_id="xgrammar", format_id="deepseek_v4",
+        tools=({"type": "function", "function": {"name": "shell"}},),
+        tool_choice="required", reasoning=False,
+    )
+
+    def command(request_id, *, finished=()):
+        return StepCommand(
+            new_requests=[NewRequestData(request_id, [1], 0.0, 1.0, None,
+                                         constraint_spec=spec.to_wire())] if request_id else [],
+            prefill_requests=[], decode_requests=[], finished_request_ids=list(finished),
+        )
+
+    def fail(_cmd, prepared_decode=None):
+        raise ValueError("invalid generated token")
+
+    worker._execute_step = fail
+    assert worker._run_step_command(command("failed"), None).error == "invalid generated token"
+    assert "failed" in worker._constraint_states
+    worker._execute_step = lambda cmd, prepared_decode=None: StepResult(new_tokens={})
+    assert worker._run_step_command(command(None, finished=("failed",)), None).error is None
+    assert states[0].closed
+    assert "failed" not in worker._constraint_states
+    assert "failed" not in worker._req_cache
+    assert released == ["failed"]
+
+    assert worker._run_step_command(command("next"), None).error is None
+    assert "next" in worker._constraint_states
+    assert not states[1].closed
 
 
 def test_serving_worker_packs_variable_length_prefill_chunks():
