@@ -12,6 +12,56 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run-tests: ${{ steps.classify.outputs.run-tests }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect skill-only changes
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+
+          # Manual runs and unavailable diff bases always run the full gates.
+          run_tests = True
+          event = os.environ["EVENT_NAME"]
+          base = os.environ["BASE_SHA"]
+          head = os.environ["HEAD_SHA"]
+          # An all-zero before SHA marks a newly created ref with no diff base.
+          if event in {"pull_request", "push"} and base and set(base) != {"0"}:
+              separator = "..." if event == "pull_request" else ".."
+              result = subprocess.run(
+                  ["git", "diff", "--name-only", "--no-renames", "-z", f"{base}{separator}{head}"],
+                  stdout=subprocess.PIPE,
+                  check=False,
+              )
+              if result.returncode == 0:
+                  paths = result.stdout.split(b"\0")[:-1]
+                  # Keep the canonical path and both aliases in sync with AGENTS.md.
+                  skill_roots = (b".agents/skills", b".claude/skills", b".codex/skills")
+                  skills_only = bool(paths) and all(
+                      any(path == root or path.startswith(root + b"/") for root in skill_roots)
+                      for path in paths
+                  )
+                  run_tests = not skills_only
+          value = str(run_tests).lower()
+          print(f"Run test and build gates: {value}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"run-tests={value}\n")
+          PY
+
   pre-commit:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -27,6 +77,10 @@ jobs:
           extra_args: --all-files
 
   unit-tests:
+    needs: changes
+    # Override implicit success(): only a successful skill-only classification skips tests.
+    # Respect workflow cancellation so superseded runs do not claim NPU resources.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run-tests != 'false') }}
     runs-on: [self-hosted, linux, arm64, npu]
     # The DeepSeek matrix client waits up to 2400 seconds while the daemon caps
     # the task at 3600 seconds. The venv no longer inherits a base env's torch,
@@ -170,6 +224,9 @@ jobs:
           checkout-path: dist-checkout
 
   platform-build:
+    needs: changes
+    # Run on classification failure or missing output, unless the workflow was cancelled.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run-tests != 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
