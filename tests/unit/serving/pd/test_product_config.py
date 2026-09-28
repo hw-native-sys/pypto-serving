@@ -58,6 +58,8 @@ def test_minimal_config_resolves_shared_identity_and_default_paths(tmp_path) -> 
     assert router.policy == "round_robin"
     assert document.runtime.enable_chunk_overlap
     assert prefill.enable_chunk_overlap and decode.enable_chunk_overlap
+    assert document.runtime.prefix_cache_mode is PDPrefixCacheMode.INDEPENDENT
+    assert prefill.prefix_cache_enabled and decode.prefix_cache_enabled
     assert prefill.node_id.startswith("prefill-")
     assert decode.node_id.startswith("decode-")
     assert Path(prefill.journal_path).parent.is_dir()
