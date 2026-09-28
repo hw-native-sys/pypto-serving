@@ -296,6 +296,7 @@ class Scheduler:
         seed: int | None = None,
         stop_strings: tuple[str, ...] = (),
         eos_token_id: int | None = None,
+        constraint_spec: ConstraintSpec | None = None,
     ) -> tuple[Request, RequestOutput]:
         """Admit an externally populated cache lease without replaying Prefill."""
         if request_id in self.requests:
@@ -321,6 +322,7 @@ class Scheduler:
             top_p=top_p,
             top_k=top_k,
             seed=seed,
+            constraint_spec=constraint_spec,
             allocated_group_block_ids={
                 name: list(block_ids)
                 for name, block_ids in reservation.block_ids_by_group.items()

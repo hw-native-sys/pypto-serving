@@ -11,10 +11,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import socket
 import struct
-from typing import Union
+from typing import Any, Union
 
 import msgspec
 
@@ -31,6 +32,7 @@ MAX_CONTROL_MESSAGE_BYTES = 16 << 20
 MAX_ID_BYTES = 256
 PREFIX_MATCH_SCHEMA_VERSION = 1
 MAX_PREFIX_MATCH_SPEC_BYTES = 2 << 20
+MAX_CONSTRAINT_SPEC_BYTES = 2 << 20
 
 
 def _identifier(value: str, name: str) -> None:
@@ -166,6 +168,7 @@ class ReserveRequest(msgspec.Struct, tag="reserve", frozen=True):
     requested_partition: int | None = None
     prepared_digest: str = ""
     prefix_match_spec: PrefixMatchSpec | None = None
+    constraint_digest: str = ""
 
 
 class ReserveAccepted(msgspec.Struct, tag="reserve_ok", frozen=True):
@@ -227,6 +230,7 @@ class ContinuationMetadata(msgspec.Struct, frozen=True):
     eos_token_id: int | None
     stream: bool = True
     output_parser_spec: OutputParserSpec | None = None
+    constraint_spec: dict[str, Any] | None = None
 
 
 class ChunkManifest(msgspec.Struct, tag="chunk_manifest", frozen=True):
@@ -410,6 +414,17 @@ def continuation_metadata_hash(metadata: ContinuationMetadata) -> str:
     if not isinstance(metadata, ContinuationMetadata):
         raise TypeError("metadata must be ContinuationMetadata")
     return hashlib.sha256(_message_encoder.encode(metadata)).hexdigest()
+
+
+def constraint_spec_hash(spec: dict[str, Any] | None) -> str:
+    """Canonical identity for the optional request grammar sent before Prefill."""
+    if spec is None:
+        return ""
+    payload = json.dumps(spec, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                         allow_nan=False).encode("utf-8")
+    if len(payload) > MAX_CONSTRAINT_SPEC_BYTES:
+        raise ValueError("constraint spec exceeds the PD control limit")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def make_prefix_match_spec(

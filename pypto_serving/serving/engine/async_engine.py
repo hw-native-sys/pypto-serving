@@ -659,6 +659,7 @@ class ReplicaEngineCore:
         eos_token_id: int | None = None,
         stream: bool = True,
         output_parser_spec: OutputParserSpec | None = None,
+        constraint_spec: ConstraintSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Continue from an initialized cache lease using normal output delivery."""
         parser = create_output_parser(output_parser_spec, self.tokenizer)
@@ -674,6 +675,7 @@ class ReplicaEngineCore:
             seed=seed,
             stop_strings=stop_strings,
             eos_token_id=eos_token_id,
+            constraint_spec=constraint_spec,
         )
         ctx = _RequestContext(
             request=request,
@@ -946,6 +948,9 @@ class ReplicaEngineCore:
                     seed=req.seed,
                     constraint_spec=req.constraint_spec.to_wire() if req.constraint_spec else None,
                     initialize_from_cache=req.requires_initial_step,
+                    initial_output_token_ids=(
+                        (int(req.output_token_ids[0]),) if req.requires_initial_step else ()
+                    ),
                 ))
                 self._worker_known_req_ids.add(req_id)
 

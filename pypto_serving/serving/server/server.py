@@ -205,6 +205,8 @@ class ServingServer:
 
     def prepare_chat(self, request: ChatCompletionRequest):
         """Share chat templating, defaults and parser selection across entry points."""
+        output_parser_spec = self._output_parser_spec(request)
+        constraint_spec = self._constraint_spec(request, output_parser_spec)
         prompt = self._apply_chat_template(
             request.messages,
             request.chat_template_kwargs,
@@ -218,9 +220,7 @@ class ServingServer:
             self._resolve_generate_config(request),
             ignore_eos=self.generate_config.ignore_eos,
         )
-        output_parser_spec = self._output_parser_spec(request)
-
-        return prompt, None, config, output_parser_spec
+        return prompt, None, config, output_parser_spec, constraint_spec
 
     def resolve_prompt_tokens(self, prompt, tokens):
         return self.engine.resolve_prompt_tokens(prompt, tokens)
@@ -283,8 +283,7 @@ class ServingServer:
 
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-        prompt, _, config, output_parser_spec = self.prepare_chat(request)
-        constraint_spec = self._constraint_spec(request, output_parser_spec)
+        prompt, _, config, output_parser_spec, constraint_spec = self.prepare_chat(request)
         if constraint_spec is not None:
             await self._preflight_constraint(constraint_spec)
 

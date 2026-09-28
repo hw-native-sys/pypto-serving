@@ -378,6 +378,7 @@ class RouterCoordinator:
                         prefill_node_id=pair.prefill.node_id,
                         prefill_endpoint_generation=pair.prefill.endpoint_generation,
                         prefix_match_spec=prepared.prefix_match_spec,
+                        constraint_spec=prepared.continuation.constraint_spec,
                     ),
                     ReservePlacementResult,
                 )

@@ -32,6 +32,7 @@ from .protocol import (
     ReserveRejected,
     ReserveRequest,
     TransferResult,
+    constraint_spec_hash,
     validate_prefix_match_spec,
     validate_rank_mapping,
 )
@@ -80,6 +81,8 @@ class DecodeConnector:
             return ReserveRejected(request.key, "INVALID_LENGTH", False)
         if request.prepared_digest and len(request.prepared_digest) != 64:
             return ReserveRejected(request.key, "INVALID_PREPARED_DIGEST", False)
+        if request.constraint_digest and len(request.constraint_digest) != 64:
+            return ReserveRejected(request.key, "INVALID_CONSTRAINT_DIGEST", False)
         prefix_spec = request.prefix_match_spec
         if self.capabilities.prefix_cache_mode == "disabled":
             if prefix_spec is not None:
@@ -126,6 +129,7 @@ class DecodeConnector:
             request.requested_partition,
             request.prepared_digest,
             "" if prefix_spec is None else prefix_spec.identity_digest,
+            request.constraint_digest,
         )
         existing_id = self._reservation_by_key.get(request.key)
         if existing_id is not None:
@@ -315,6 +319,12 @@ class DecodeConnector:
         expected_digest = self._reservation_specs[manifest.key][4]
         if manifest.prepared_digest != expected_digest:
             raise ValueError("chunk manifest prepared-request digest mismatch")
+        if manifest.final:
+            continuation = manifest.continuation
+            if continuation is None or constraint_spec_hash(continuation.constraint_spec) != (
+                self._reservation_specs[manifest.key][6]
+            ):
+                raise ValueError("final continuation changed the reserved constraint")
         reservation = self.cache_manager.group_cache_reservation(tracker.reservation_id)
         if reservation is None:
             raise RuntimeError("D completion tracker lost its cache reservation")

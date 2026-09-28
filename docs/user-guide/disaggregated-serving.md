@@ -50,7 +50,7 @@ Optional runtime settings include:
 | --- | --- | --- |
 | `provider` | `mooncake` | Select the supported transfer implementation. |
 | `policy` | `round_robin` | Select compatible P/D nodes. |
-| `prefix_cache_mode` | `disabled` | Use `d_only` for Decode reuse or `independent` for separate P/D reuse. |
+| `prefix_cache_mode` | `independent` | Enable separate P/D reuse by default; use `d_only` for Decode-only reuse or `disabled` to turn it off. |
 | `run_id` | Derived from the endpoints | Share an explicit deployment identity when needed. |
 | `enable_chunk_overlap` | `true` | Overlap closed-page transfer with later Prefill work. |
 
@@ -133,11 +133,15 @@ curl http://router.example.internal:8110/v1/chat/completions \
 `/v1/completions` is also supported. P/D nodes expose internal control APIs
 instead of public generation endpoints.
 
-For DeepSeek V4, the Router accepts the same function-tool request fields as
-ordinary Serving: `tools`, `tool_choice` (`auto` or `none`),
-`parallel_tool_calls`, and assistant/tool history. Structured tool-call
-deltas and final calls travel from D to the Router alongside text and
-reasoning. Constrained `tool_choice` and strict tool schemas are not supported.
+For DeepSeek V4, the Router accepts `tools`, `tool_choice`,
+`parallel_tool_calls`, and assistant/tool history. Structured tool-call deltas
+and final calls travel from D to the Router alongside text and reasoning.
+The XGrammar integration branch also accepts strict `auto`, `required`, and a
+named function choice. These requests require matching Serving/Lib grammar
+ABIs and XGrammar on both model nodes; they are not yet device-validated for
+PD. Ordinary non-strict `auto` remains unconstrained. Until Router preflight
+is moved ahead of SSE headers, an invalid constrained schema on a streaming
+PD request can surface as an SSE error after HTTP 200.
 
 | Endpoint | Process | Contents |
 | --- | --- | --- |

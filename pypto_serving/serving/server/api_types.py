@@ -148,22 +148,28 @@ class ChatCompletionResponse(BaseModel):
     usage: ResponseUsage | None = None
 
 
-def validate_chat_request(request: ChatCompletionRequest) -> str:
+def validate_chat_request(request: ChatCompletionRequest) -> str | dict:
     """Validate tool semantics before an HTTP stream starts."""
     if "tools" in (request.chat_template_kwargs or {}):
         raise ValueError("tools must be supplied as a top-level request field")
     choice = request.tool_choice
     if choice is None:
         choice = "auto" if request.tools else "none"
-    if choice not in ("none", "auto"):
-        raise ValueError("only tool_choice 'auto' and 'none' are supported; constrained tool choice is unavailable")
-    if choice == "auto" and not request.tools:
-        raise ValueError("tool_choice 'auto' requires non-empty tools")
-    names = []
-    for tool in request.tools or ():
-        if tool.function.strict:
-            raise ValueError("strict tool schemas require constrained decoding, which is not supported")
-        names.append(tool.function.name)
+    names = [tool.function.name for tool in request.tools or ()]
+    if isinstance(choice, dict):
+        function = choice.get("function")
+        if (
+            set(choice) != {"type", "function"}
+            or choice.get("type") != "function"
+            or not isinstance(function, dict)
+            or set(function) != {"name"}
+            or function.get("name") not in names
+        ):
+            raise ValueError("named tool_choice must select a declared function")
+    elif choice not in ("none", "auto", "required"):
+        raise ValueError("tool_choice must be none, auto, required, or a declared function")
+    if choice != "none" and not request.tools:
+        raise ValueError("enabled tool_choice requires non-empty tools")
     if len(set(names)) != len(names):
         raise ValueError("tool function names must be unique")
     for message in request.messages:

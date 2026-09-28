@@ -57,6 +57,8 @@ class NewRequestData(msgspec.Struct):
     # The target cache was adopted from a preinitialized cache lease.  This is
     # request metadata only; no device address or provider envelope crosses IPC.
     initialize_from_cache: bool = False
+    # Tokens committed before this worker request was registered (PD adoption).
+    initial_output_token_ids: tuple[int, ...] = ()
 
 
 class PrefillRequest(msgspec.Struct):
