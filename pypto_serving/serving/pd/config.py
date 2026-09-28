@@ -22,7 +22,7 @@ from .adapter import ModelPDAdapter
 from .contracts import RuntimeLayoutDescriptor
 
 
-PD_SCHEMA_VERSION = 6
+PD_SCHEMA_VERSION = 7
 SUPPORTED_PD_PROVIDERS = frozenset({"mooncake"})
 
 
@@ -107,7 +107,7 @@ class PDRuntimeConfig:
     max_active_handoffs: int = 4
     max_pending_handoffs: int = 8
     enable_chunk_overlap: bool = True
-    prefix_cache_mode: PDPrefixCacheMode = PDPrefixCacheMode.DISABLED
+    prefix_cache_mode: PDPrefixCacheMode = PDPrefixCacheMode.INDEPENDENT
 
     def __post_init__(self) -> None:
         mode = (
@@ -254,7 +254,7 @@ def load_pd_document(path: str | os.PathLike[str]) -> PDDocument:
         max_active_handoffs=runtime.get("max_active_handoffs", 4),
         max_pending_handoffs=runtime.get("max_pending_handoffs", 8),
         enable_chunk_overlap=runtime.get("enable_chunk_overlap", True),
-        prefix_cache_mode=runtime.get("prefix_cache_mode", "disabled"),
+        prefix_cache_mode=runtime.get("prefix_cache_mode", "independent"),
     )
     observability = raw.get("observability", {})
     if not isinstance(observability, dict):

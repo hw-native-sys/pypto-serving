@@ -13,11 +13,15 @@ import asyncio
 import pickle
 from types import SimpleNamespace
 
+import msgspec
 import pytest
+from fastapi import FastAPI
+from starlette.requests import Request
 
 from pypto_serving.config.types import DecodeBatch
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_ADAPTER, DSparkPDWorker
 from pypto_serving.serving.pd.integration import PDNodeRuntime
+from pypto_serving.serving.pd.http_api import PDHTTPRoutes, PrepareRequestHTTP
 from pypto_serving.serving.pd.worker import PDWorkerServices
 
 
@@ -135,3 +139,41 @@ def test_pd_worker_services_wrap_only_cache_initialized_requests():
     assert events == [True]
     with pytest.raises(ValueError, match="one model"):
         PDWorkerServices((), flags.__getitem__)
+
+
+def test_pd_chat_prepare_runs_injected_constraint_preflight():
+    async def exercise():
+        spec = object()
+        seen = []
+
+        async def preflight(value):
+            seen.append(value)
+
+        routes = PDHTTPRoutes(
+            FastAPI(),
+            SimpleNamespace(prepare_request=lambda *args, **kwargs: {"prepared": True}),
+            SimpleNamespace(),
+            prepare_completion=lambda request: None,
+            prepare_chat=lambda request: ("prompt", (1,), object(), None, spec),
+            preflight_constraint=preflight,
+            resolve_prompt_tokens=lambda prompt, tokens: tokens,
+            start_profile=lambda: None,
+            stop_profile=lambda: None,
+        )
+        payload = PrepareRequestHTTP(
+            request_id="chat-1",
+            request_kind="chat",
+            request_json=b'{"messages":[{"role":"user","content":"hello"}]}',
+        )
+        body = msgspec.json.encode(payload)
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request = Request({"type": "http", "method": "POST", "path": "/", "headers": []}, receive)
+        response = await routes._pd_prepare(request)
+        assert response.status_code == 200
+        assert msgspec.json.decode(response.body) == {"prepared": True}
+        assert seen == [spec]
+
+    asyncio.run(exercise())

@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import hashlib
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import msgspec
 from fastapi import Request
@@ -83,6 +83,7 @@ class ReservePlacementHTTP(msgspec.Struct, frozen=True):
     prefill_node_id: str
     prefill_endpoint_generation: int
     prefix_match_spec: PrefixMatchSpec | None = None
+    constraint_spec: dict[str, Any] | None = None
 
 
 class PlacementReservation(msgspec.Struct, frozen=True):
@@ -218,6 +219,7 @@ class PDHTTPRoutes:
         *,
         prepare_completion,
         prepare_chat,
+        preflight_constraint,
         resolve_prompt_tokens,
         start_profile,
         stop_profile,
@@ -228,6 +230,7 @@ class PDHTTPRoutes:
         self.config = config
         self.prepare_completion = prepare_completion
         self.prepare_chat = prepare_chat
+        self.preflight_constraint = preflight_constraint
         self.resolve_prompt_tokens = resolve_prompt_tokens
         self.start_profile = start_profile
         self.stop_profile = stop_profile
@@ -354,9 +357,12 @@ class PDHTTPRoutes:
         if payload.request_kind == "completion":
             public = CompletionRequest.model_validate_json(payload.request_json)
             prompt, tokens, config, output_parser_spec = self.prepare_completion(public)
+            constraint_spec = None
         elif payload.request_kind == "chat":
             public = ChatCompletionRequest.model_validate_json(payload.request_json)
-            prompt, tokens, config, output_parser_spec = self.prepare_chat(public)
+            prompt, tokens, config, output_parser_spec, constraint_spec = self.prepare_chat(public)
+            if constraint_spec is not None:
+                await self.preflight_constraint(constraint_spec)
         else:
             raise ValueError("unsupported PD public request kind")
         prompt_token_ids = self.resolve_prompt_tokens(prompt, tokens)
@@ -366,6 +372,7 @@ class PDHTTPRoutes:
             config,
             prompt_token_ids,
             output_parser_spec=output_parser_spec,
+            constraint_spec=constraint_spec,
         )
         return Response(encode_json(prepared), media_type="application/json")
 

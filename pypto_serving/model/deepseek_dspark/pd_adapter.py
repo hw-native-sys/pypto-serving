@@ -14,6 +14,8 @@ from dataclasses import replace
 from functools import partial
 import logging
 
+from pypto_serving.serving.constraints import ConstraintSpec
+
 from pypto_serving.config.types import DecodeBatch
 from pypto_serving.model.deepseek.transfer_layout import BlockCopy, COMPONENTS, ComponentLayout, DSV4Registry
 from pypto_serving.serving.pd.adapter import ModelRuntimeFacts
@@ -31,11 +33,11 @@ from pypto_serving.serving.pd.protocol import (
 
 DSV4_DSPARK_K7_CONTRACT = ModelPDContract(
     adapter_id="deepseek-v4-dspark-k7",
-    version=6,
+    version=7,
     model_family="deepseek_v4",
     model_variant="dspark",
     transfer_granularity="chunk-after-prefill",
-    continuation_schema="deepseek-v4-dspark-k7/v2",
+    continuation_schema="deepseek-v4-dspark-k7/v3",
     components=(
         TransferComponent("ori", "ori", "ori"),
         TransferComponent("hca_cmp", "cmp_c128", "hca_cmp"),
@@ -132,6 +134,7 @@ class DeepSeekV4DSparkK7Adapter:
         prompt_token_ids,
         eos_token_id: int | None,
         output_parser_spec=None,
+        constraint_spec: ConstraintSpec | None = None,
     ) -> ContinuationMetadata:
         return ContinuationMetadata(
             prompt_token_ids=tuple(int(token) for token in prompt_token_ids),
@@ -144,7 +147,13 @@ class DeepSeekV4DSparkK7Adapter:
             eos_token_id=None if config.ignore_eos else eos_token_id,
             stream=bool(getattr(config, "stream", True)),
             output_parser_spec=output_parser_spec,
+            constraint_spec=constraint_spec.to_wire() if constraint_spec else None,
         )
+
+    @staticmethod
+    def validate_constraint_spec(spec: ConstraintSpec) -> None:
+        if spec.provider_id != "xgrammar" or spec.format_id != "deepseek_v4":
+            raise ValueError("DeepSeek V4 DSpark PD does not support this constraint format")
 
     def build_prefix_match_spec(self, prompt_token_ids, cache_manager):
         hashes = cache_manager.compute_group_block_hashes(
@@ -193,6 +202,14 @@ class DeepSeekV4DSparkK7Adapter:
             raise ValueError("DeepSeek V4 DSpark continuation requires Decode tokens")
         if continuation.temperature != 0.0 or continuation.top_p != 1.0 or continuation.top_k is not None:
             raise ValueError("DeepSeek V4 DSpark continuation must use greedy sampling")
+        if continuation.constraint_spec is not None:
+            spec = ConstraintSpec.from_wire(continuation.constraint_spec)
+            DeepSeekV4DSparkK7Adapter.validate_constraint_spec(spec)
+            parser = continuation.output_parser_spec
+            if parser is None or parser.parser_id != "deepseek_v4":
+                raise ValueError("constrained continuation requires the DeepSeek V4 parser")
+            if spec.reasoning != (parser.initial_state == "reasoning"):
+                raise ValueError("constraint and output parser disagree on reasoning state")
 
     @staticmethod
     def adopt_decode(
@@ -217,6 +234,10 @@ class DeepSeekV4DSparkK7Adapter:
             eos_token_id=continuation.eos_token_id,
             stream=continuation.stream,
             output_parser_spec=continuation.output_parser_spec,
+            constraint_spec=(
+                ConstraintSpec.from_wire(continuation.constraint_spec)
+                if continuation.constraint_spec is not None else None
+            ),
         )
 
 

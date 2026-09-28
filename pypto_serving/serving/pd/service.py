@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import secrets
 import time
@@ -20,6 +21,7 @@ from contextlib import aclosing, suppress
 from dataclasses import dataclass
 
 from pypto_serving.config.types import GenerateConfig
+from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.engine.async_engine import TokenOutput
 from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.tools.profile import profile_instant
@@ -66,6 +68,7 @@ from .protocol import (
     RouteOpened,
     CapabilityWire,
     TransferResult,
+    constraint_spec_hash,
     prepared_request_hash,
 )
 from .session import (
@@ -339,10 +342,16 @@ class PDServingService:
         prompt_token_ids: Sequence[int],
         *,
         output_parser_spec: OutputParserSpec | None = None,
+        constraint_spec: ConstraintSpec | None = None,
     ) -> PreparedRequest:
         """Normalize once on P and retain the immutable execution input."""
         self._require_external_role(PDRole.PREFILL)
         self.config.model_adapter.validate_generate_config(config)
+        if constraint_spec is not None:
+            validator = getattr(self.config.model_adapter, "validate_constraint_spec", None)
+            if not callable(validator):
+                raise ValueError("the PD model adapter does not support constraints")
+            validator(constraint_spec)
         now_ns = time.time_ns()
         self._expire_prepared(now_ns)
         continuation = self.config.model_adapter.build_continuation(
@@ -350,6 +359,7 @@ class PDServingService:
             prompt_token_ids=prompt_token_ids,
             eos_token_id=self.eos_token_id,
             output_parser_spec=output_parser_spec,
+            **({"constraint_spec": constraint_spec} if constraint_spec else {}),
         )
         prefix_match_spec = None
         if self.config.prefix_cache_mode.value != "disabled":
@@ -403,6 +413,25 @@ class PDServingService:
             or request.prefill_endpoint_generation < 1
         ):
             raise ValueError("D reservation contains an invalid P/prepared identity")
+        constraint_digest = ""
+        if request.constraint_spec is not None:
+            try:
+                constraint = ConstraintSpec.from_wire(request.constraint_spec)
+                validator = getattr(self.config.model_adapter, "validate_constraint_spec", None)
+                if not callable(validator):
+                    raise ValueError("the PD model adapter does not support constraints")
+                validator(constraint)
+                constraint_digest = constraint_spec_hash(request.constraint_spec)
+            except (KeyError, TypeError, ValueError) as exc:
+                return PlacementRejection(
+                    request.key, self.config.node_id, self.config.generation,
+                    f"INVALID_CONSTRAINT_{type(exc).__name__}", False,
+                )
+            if importlib.util.find_spec("xgrammar") is None:
+                return PlacementRejection(
+                    request.key, self.config.node_id, self.config.generation,
+                    "CONSTRAINT_PROVIDER_UNAVAILABLE", True,
+                )
         result = self.decode_connector.reserve(
             ReserveRequest(
                 key=request.key,
@@ -411,6 +440,7 @@ class PDServingService:
                 layout_fingerprint=request.layout_fingerprint,
                 prepared_digest=request.prepared_digest,
                 prefix_match_spec=request.prefix_match_spec,
+                constraint_digest=constraint_digest,
             )
         )
         if isinstance(result, ReserveRejected):
@@ -717,6 +747,10 @@ class PDServingService:
             output_parser_spec=(
                 prepared.public.continuation.output_parser_spec
             ),
+            constraint_spec=(
+                ConstraintSpec.from_wire(prepared.public.continuation.constraint_spec)
+                if prepared.public.continuation.constraint_spec is not None else None
+            ),
         )
         return self._prefill_results[request.key]
 
@@ -863,6 +897,7 @@ class PDServingService:
         *,
         external_request: ExecutePrefillHTTP | None = None,
         output_parser_spec: OutputParserSpec | None = None,
+        constraint_spec: ConstraintSpec | None = None,
     ) -> None:
         """Run P Prefill, push each chunk, then relay D Decode output."""
         if self.config.role is not PDRole.PREFILL:
@@ -945,6 +980,7 @@ class PDServingService:
                     prompt,
                     config,
                     prompt_token_ids,
+                    constraint_spec,
                 )
             )
             guard = None
@@ -1029,6 +1065,7 @@ class PDServingService:
                             prompt_token_ids=prompt_token_ids,
                             eos_token_id=self.eos_token_id,
                             output_parser_spec=output_parser_spec,
+                            **({"constraint_spec": constraint_spec} if constraint_spec else {}),
                         )
                         if chunk.final
                         else None
@@ -1301,12 +1338,14 @@ class PDServingService:
         prompt: str,
         config,
         prompt_token_ids: Sequence[int],
+        constraint_spec: ConstraintSpec | None = None,
     ):
         stream = self.core.add_request(
             request_id,
             prompt,
             config,
             prompt_token_ids=prompt_token_ids,
+            **({"constraint_spec": constraint_spec} if constraint_spec else {}),
         )
 
         async def drain():

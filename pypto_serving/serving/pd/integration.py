@@ -218,6 +218,7 @@ class PDApplication:
             config,
             prepare_completion=server.prepare_completion,
             prepare_chat=server.prepare_chat,
+            preflight_constraint=server._preflight_constraint,
             resolve_prompt_tokens=server.resolve_prompt_tokens,
             start_profile=server.start_profile,
             stop_profile=server.stop_profile,

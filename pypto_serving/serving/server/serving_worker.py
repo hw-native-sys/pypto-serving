@@ -730,7 +730,14 @@ class WorkerProcess:
                         self.model_record.tokenizer, self.model_record.config.vocab_size
                     )
                 with profile_span("WorkerProcess.constraint_compile", cat="constraints"):
-                    self._constraint_states[new_request.request_id] = self._xgrammar_provider.compile(spec)
+                    state = self._xgrammar_provider.compile(spec)
+                try:
+                    if new_request.initial_output_token_ids:
+                        state.accept(new_request.initial_output_token_ids)
+                except BaseException:
+                    state.close()
+                    raise
+                self._constraint_states[new_request.request_id] = state
             self._req_cache[new_request.request_id] = new_request
 
     def _release_finished_request_state(
