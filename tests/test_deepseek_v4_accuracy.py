@@ -139,8 +139,9 @@ def _server_command(
     enable_prefix_caching: bool = False,
 ) -> list[str]:
     # CI substitutes only the checkpoint, task-submit devices, and free port.
-    # Scalar ring values are broadcast to all four levels, prewarming the same
-    # 4 GiB arena used by later dispatches.
+    # Prefix-cache continuation prefill exhausts ring 1's 1 GiB heap before
+    # its oldest consumers finish. Give that ring 2 GiB and retain 1 GiB for
+    # the others. The same per-dispatch sizes are prewarmed before KV sizing.
     return [
         sys.executable,
         "-m",
@@ -179,7 +180,7 @@ def _server_command(
         "--ring-task-window",
         "16384",
         "--ring-heap",
-        "1073741824",
+        "1073741824,2147483648,1073741824,1073741824" if enable_prefix_caching else "1073741824",
         "--port",
         str(port),
         "--show-startup-logs",
