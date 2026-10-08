@@ -46,8 +46,18 @@ ruff check --config ruff.toml .
 
 Use Python 3.10-compatible code. Ruff is configured in `ruff.toml` with line
 length 110, `target-version = "py310"`, `F` checks enabled, and `F841` ignored.
-GitHub CI runs pre-commit plus the CLI and batching unit tests. Keep generated
-artifacts such as `build_output/`, caches, and compiled files out of commits.
+GitHub CI always runs pre-commit static checks. Pull requests and pushes that
+only change `.agents/skills/` or the `.claude/skills` and `.codex/skills` aliases
+skip the NPU test and platform build jobs. Mixed changes, manual workflow runs,
+and failed or missing change classifications still run the full gates unless
+the workflow is cancelled. Keep generated artifacts such as `build_output/`,
+caches, and compiled files out of commits.
+
+This exemption assumes skill helper scripts are standalone tools that are not
+imported or executed by the serving runtime or its test suites. If that boundary
+changes, update the CI path classification before relying on those scripts.
+Keep the canonical skill path and its aliases above in sync with `skill_roots`
+in `.github/workflows/ci.yml`.
 
 ## NPU Verification
 
