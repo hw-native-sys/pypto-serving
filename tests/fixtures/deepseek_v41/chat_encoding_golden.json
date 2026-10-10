@@ -1,0 +1,337 @@
+{
+  "source": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/encoding/encoding.py",
+  "revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+  "source_sha256": "502bdaec8a3fd88ebc24c4721a7038fbe42f2063c664638127056107920035c1",
+  "cases": [
+    {
+      "name": "basic",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        }
+      ],
+      "options": {
+        "thinking_mode": "chat"
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c></think>"
+    },
+    {
+      "name": "first_system",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be concise."
+        },
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        }
+      ],
+      "options": {
+        "thinking_mode": "chat"
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cSystem\uff5c>Be concise.<\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c></think>"
+    },
+    {
+      "name": "multi_turn",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        },
+        {
+          "role": "assistant",
+          "content": "4",
+          "reasoning_content": "Add two and two."
+        },
+        {
+          "role": "user",
+          "content": "And +1?"
+        }
+      ],
+      "options": {
+        "thinking_mode": "chat"
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c></think>4<\uff5cend\u2581of\u2581sentence\uff5c><\uff5cUser\uff5c>And +1?<\uff5cAssistant\uff5c></think>"
+    },
+    {
+      "name": "mid_system",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        },
+        {
+          "role": "assistant",
+          "content": "4",
+          "reasoning_content": "Add two and two."
+        },
+        {
+          "role": "system",
+          "content": "Now use French."
+        }
+      ],
+      "options": {
+        "thinking_mode": "chat"
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c></think>4<\uff5cend\u2581of\u2581sentence\uff5c><\uff5cSystem\uff5c>Now use French.<\uff5cAssistant\uff5c></think>"
+    },
+    {
+      "name": "mid_system_answer",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        },
+        {
+          "role": "assistant",
+          "content": "4",
+          "reasoning_content": "Add two and two."
+        },
+        {
+          "role": "system",
+          "content": "Now use French."
+        },
+        {
+          "role": "assistant",
+          "content": "D accord."
+        }
+      ],
+      "options": {
+        "thinking_mode": "chat"
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c></think>4<\uff5cend\u2581of\u2581sentence\uff5c><\uff5cSystem\uff5c>Now use French.<\uff5cAssistant\uff5c></think>D accord.<\uff5cend\u2581of\u2581sentence\uff5c>"
+    },
+    {
+      "name": "thinking_default",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        }
+      ],
+      "options": {
+        "thinking_mode": "thinking"
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cSystem\uff5c>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c><think>"
+    },
+    {
+      "name": "thinking_system_low",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be concise."
+        },
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        }
+      ],
+      "options": {
+        "thinking_mode": "thinking",
+        "reasoning_effort": "low"
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cSystem\uff5c>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\nBe concise.<\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c><think>"
+    },
+    {
+      "name": "thinking_numeric",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        }
+      ],
+      "options": {
+        "thinking_mode": "thinking",
+        "reasoning_effort": 64
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cSystem\uff5c>Reasoning Effort: 64 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c><think>"
+    },
+    {
+      "name": "thinking_max",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        }
+      ],
+      "options": {
+        "thinking_mode": "thinking",
+        "reasoning_effort": "max"
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cSystem\uff5c>Reasoning Effort: 100 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c><think>"
+    },
+    {
+      "name": "thinking_drop_old",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        },
+        {
+          "role": "assistant",
+          "content": "4",
+          "reasoning_content": "Add two and two."
+        },
+        {
+          "role": "user",
+          "content": "Why?"
+        }
+      ],
+      "options": {
+        "thinking_mode": "thinking"
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cSystem\uff5c>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c></think>4<\uff5cend\u2581of\u2581sentence\uff5c><\uff5cUser\uff5c>Why?<\uff5cAssistant\uff5c><think>"
+    },
+    {
+      "name": "thinking_retain_old",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        },
+        {
+          "role": "assistant",
+          "content": "4",
+          "reasoning_content": "Add two and two."
+        },
+        {
+          "role": "user",
+          "content": "Why?"
+        }
+      ],
+      "options": {
+        "thinking_mode": "thinking",
+        "drop_thinking": false
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cSystem\uff5c>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c><think>Add two and two.</think>4<\uff5cend\u2581of\u2581sentence\uff5c><\uff5cUser\uff5c>Why?<\uff5cAssistant\uff5c><think>"
+    },
+    {
+      "name": "thinking_final_answer",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        },
+        {
+          "role": "assistant",
+          "content": "4",
+          "reasoning_content": "Add two and two."
+        }
+      ],
+      "options": {
+        "thinking_mode": "thinking"
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cSystem\uff5c>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c><think>Add two and two.</think>4<\uff5cend\u2581of\u2581sentence\uff5c>"
+    },
+    {
+      "name": "reminder",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        },
+        {
+          "role": "latest_reminder",
+          "content": "Today is Friday."
+        }
+      ],
+      "options": {
+        "thinking_mode": "chat"
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c></think><\uff5clatest_reminder\uff5c>Today is Friday."
+    },
+    {
+      "name": "without_eos",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        },
+        {
+          "role": "assistant",
+          "content": "4",
+          "reasoning_content": "Add two and two.",
+          "wo_eos": true
+        }
+      ],
+      "options": {
+        "thinking_mode": "chat"
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c></think>4"
+    },
+    {
+      "name": "system_only",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be concise."
+        }
+      ],
+      "options": {
+        "thinking_mode": "chat"
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cSystem\uff5c>Be concise."
+    },
+    {
+      "name": "multiple_systems",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be concise."
+        },
+        {
+          "role": "system",
+          "content": "Also be precise."
+        },
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        }
+      ],
+      "options": {
+        "thinking_mode": "chat"
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cSystem\uff5c>Be concise.<\uff5cSystem\uff5c>Also be precise.<\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c></think>"
+    },
+    {
+      "name": "adjacent_users",
+      "messages": [
+        {
+          "role": "user",
+          "content": "A"
+        },
+        {
+          "role": "user",
+          "content": "B"
+        }
+      ],
+      "options": {
+        "thinking_mode": "chat"
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cUser\uff5c>A\n\nB<\uff5cAssistant\uff5c></think>"
+    },
+    {
+      "name": "adjacent_users_thinking",
+      "messages": [
+        {
+          "role": "user",
+          "content": "A"
+        },
+        {
+          "role": "user",
+          "content": ""
+        },
+        {
+          "role": "user",
+          "content": "B"
+        }
+      ],
+      "options": {
+        "thinking_mode": "thinking"
+      },
+      "expected": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cSystem\uff5c>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<\uff5cUser\uff5c>A\n\n\n\nB<\uff5cAssistant\uff5c><think>"
+    }
+  ]
+}

@@ -26,3 +26,6 @@ pypto-prepack-deepseek-v4 = "pypto_serving.tools.prepack_deepseek_v4:main"
 where = ["."]
 include = ["pypto_serving*"]
 namespaces = false
+
+[tool.setuptools.package-data]
+"pypto_serving.model.deepseek_v41" = ["encoding.LICENSE"]

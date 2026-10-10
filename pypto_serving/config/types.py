@@ -304,6 +304,9 @@ class PrefillBatch:
     block_ids: list[list[int]] = field(default_factory=list)
     block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
     cache_partitions: list[int | None] = field(default_factory=list)
+    # Total original prompt lengths, distinct from seq_lens (this chunk's end).
+    # Required by integrations that own prefill-to-decode persistent state.
+    prompt_lens: list[int] = field(default_factory=list)
 
 
 @dataclass
