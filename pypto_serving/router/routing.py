@@ -1,0 +1,367 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Where a conversation goes, and whether its replica is still alive.
+
+The serving prefix cache is per replica, and its block hashes cover the prompt
+at admission, so turn N's answer enters the cache as part of turn N+1's prompt.
+Sending consecutive turns to the same replica is what makes turn N+1 re-prefill
+only the new text.
+
+Session expiry drops the *pin*, never KV: blocks are keyed by content and shared
+between conversations, so there is nothing per-session to evict.
+
+Load is counted as outstanding requests the router itself dispatched -- it never
+tokenizes, so it has no token estimate, and it sees every request.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import time
+import uuid
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Callable
+
+from pypto_serving.router.config import ReplicaSpec, RouterConfig
+
+logger = logging.getLogger(__name__)
+
+# Consecutive failed probes before a replica leaves rotation. One blip should not
+# depin every session; recovery is immediate on the first success.
+UNHEALTHY_THRESHOLD = 2
+
+# Session ids are client-supplied, so the directory is an unbounded map keyed by
+# untrusted input until its entries expire. Cap it and evict least-recently-used
+# pins: losing a pin costs one prefill, unbounded growth costs the process.
+DEFAULT_MAX_SESSIONS = 100_000
+
+
+class NoReplicaAvailable(RuntimeError):
+    """Raised when every replica in the table is unroutable."""
+
+
+def new_session_id() -> str:
+    return uuid.uuid4().hex
+
+
+class SessionDirectory:
+    """Maps a conversation id to the replica holding its KV.
+
+    The clock is injectable so expiry is testable without sleeping.
+    """
+
+    def __init__(self, ttl_seconds: float, *, clock: Callable[[], float] = time.monotonic,
+                 max_sessions: int = DEFAULT_MAX_SESSIONS) -> None:
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+        if max_sessions < 1:
+            raise ValueError("max_sessions must be positive")
+        self._ttl = ttl_seconds
+        self._clock = clock
+        self._max = max_sessions
+        # Ordered by recency of pin, so eviction is a popitem from the front.
+        self._pins: OrderedDict[str, tuple[str, float]] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self._pins)
+
+    def lookup(self, session_id: str) -> str | None:
+        """Return the pinned replica name, dropping the pin if it has expired."""
+        pin = self._pins.get(session_id)
+        if pin is None:
+            return None
+        name, last_seen = pin
+        if self._clock() - last_seen > self._ttl:
+            del self._pins[session_id]
+            return None
+        return name
+
+    def pin(self, session_id: str, replica_name: str) -> None:
+        self._pins[session_id] = (replica_name, self._clock())
+        self._pins.move_to_end(session_id)
+        if len(self._pins) > self._max:
+            self.sweep()
+        while len(self._pins) > self._max:
+            evicted, _ = self._pins.popitem(last=False)
+            logger.debug("session directory full; evicted the least-recent pin %s", evicted)
+
+    def forget(self, session_id: str) -> None:
+        self._pins.pop(session_id, None)
+
+    def forget_replica(self, replica_name: str) -> int:
+        """Drop every pin to one replica, returning how many were dropped.
+
+        Used when a replica starts draining: its sessions should re-route on
+        their next turn instead of waiting out the TTL pointing at something
+        that is going away.
+        """
+        stale = [sid for sid, (name, _) in self._pins.items() if name == replica_name]
+        for session_id in stale:
+            del self._pins[session_id]
+        return len(stale)
+
+    def sweep(self) -> int:
+        """Drop every expired pin. Lookup only expires pins it touches, so this
+        bounds the memory held by sessions that are never seen again."""
+        now = self._clock()
+        expired = [sid for sid, (_, seen) in self._pins.items() if now - seen > self._ttl]
+        for session_id in expired:
+            del self._pins[session_id]
+        return len(expired)
+
+
+@dataclass
+class ReplicaState:
+    """Mutable routing state for one replica."""
+
+    spec: ReplicaSpec
+    # Carried explicitly: the rotating tiebreak needs it, and looking it up by
+    # value would rely on dataclass equality.
+    index: int = 0
+    outstanding: int = 0
+    routed: int = 0
+    # Statically configured replicas start routable: one that is still loading
+    # refuses the connection anyway, and the first probe corrects an optimistic
+    # guess quickly. A replica the router launches is added with ready=False,
+    # because it provably cannot serve for the minutes its model takes to load.
+    ready: bool = True
+    failures: int = 0
+    # Excluded from routing while it finishes what it already has.
+    draining: bool = False
+    # True only for replicas this router started, and so may stop.
+    owned: bool = False
+
+    @property
+    def name(self) -> str:
+        return self.spec.name
+
+    @property
+    def routable(self) -> bool:
+        return self.ready and not self.draining
+
+
+@dataclass
+class RoutingDecision:
+    replica: ReplicaSpec
+    affinity_hit: bool
+
+
+class ReplicaRegistry:
+    """Owns replica state, picks a replica per request, and counts what happened."""
+
+    def __init__(self, config: RouterConfig, sessions: SessionDirectory) -> None:
+        self._config = config
+        self._sessions = sessions
+        self._states = [ReplicaState(spec=spec, index=i) for i, spec in enumerate(config.replicas)]
+        self._by_name = {state.name: state for state in self._states}
+        # Rotating tiebreak, matching AsyncLLMEngine._select_replica: equal-load
+        # replicas are taken in turn instead of always the lowest index.
+        self._route_counter = 0
+        self.affinity_hits = 0
+        self.rejected = 0
+
+    @property
+    def states(self) -> tuple[ReplicaState, ...]:
+        return tuple(self._states)
+
+    def state(self, name: str) -> ReplicaState | None:
+        return self._by_name.get(name)
+
+    def ready_count(self) -> int:
+        return sum(1 for state in self._states if state.routable)
+
+    def total_routed(self) -> int:
+        return sum(state.routed for state in self._states)
+
+    def add(self, spec: ReplicaSpec, *, ready: bool = False, owned: bool = False) -> ReplicaState:
+        """Register a replica at runtime.
+
+        Appending keeps the rotating tiebreak honest for free: both sites that
+        use ``index`` recompute the modulus from the live list, so an index of
+        ``len(states)`` stays inside it.
+
+        Defaults to ``ready=False`` — a launched replica cannot serve until its
+        model is loaded, and the health poller is what promotes it.
+        """
+        if spec.name in self._by_name:
+            raise ValueError(f"replica {spec.name!r} is already registered")
+        state = ReplicaState(
+            spec=spec, index=len(self._states), ready=ready, owned=owned,
+        )
+        self._states.append(state)
+        self._by_name[state.name] = state
+        logger.info(
+            "registered replica %s at %s (%s, %s)",
+            state.name, spec.base_url,
+            "ready" if ready else "starting",
+            "owned" if owned else "external",
+        )
+        return state
+
+    def remove(self, name: str) -> ReplicaState | None:
+        """Drop a replica and reindex the rest.
+
+        Reindexing is the point: leaving gaps makes ``(index - counter) % count``
+        alias two replicas onto the same tiebreak slot, which is unfair rather
+        than wrong, but silently so.
+        """
+        state = self._by_name.pop(name, None)
+        if state is None:
+            return None
+        self._states = [existing for existing in self._states if existing.name != name]
+        for position, existing in enumerate(self._states):
+            existing.index = position
+        if self._states:
+            self._route_counter %= len(self._states)
+        else:
+            self._route_counter = 0
+        self._sessions.forget_replica(name)
+        logger.info("removed replica %s", name)
+        return state
+
+    def set_draining(self, name: str, draining: bool) -> None:
+        """Take a replica out of routing without dropping its in-flight work.
+
+        Pins are released at the same moment: a session whose replica is going
+        away should re-route on its next turn rather than wait out the TTL.
+        """
+        state = self._by_name.get(name)
+        if state is None or state.draining == draining:
+            return
+        state.draining = draining
+        if draining:
+            self._sessions.forget_replica(name)
+        logger.info("replica %s is %s", name, "draining" if draining else "routable again")
+
+    def set_ready(self, name: str, ready: bool) -> None:
+        state = self._by_name.get(name)
+        if state is None or state.ready == ready:
+            return
+        state.ready = ready
+        logger.info("replica %s is now %s", name, "routable" if ready else "unroutable")
+
+    def acquire(self, name: str) -> None:
+        state = self._by_name.get(name)
+        if state is not None:
+            state.outstanding += 1
+
+    def release(self, name: str) -> None:
+        state = self._by_name.get(name)
+        if state is not None:
+            state.outstanding = max(0, state.outstanding - 1)
+
+    def select(self, session_id: str) -> RoutingDecision:
+        """Pick a replica for this session and record the pin.
+
+        Affinity is a preference, not an invariant: prefix blocks are evictable,
+        so a hit is never guaranteed, and the one prefill it saves is worth less
+        than an unbounded wait behind a saturated replica.
+        """
+        candidates = [state for state in self._states if state.routable]
+        if not candidates:
+            self.rejected += 1
+            raise NoReplicaAvailable("no routable replica")
+
+        least = self._least_loaded(candidates)
+        pinned = self._by_name.get(self._sessions.lookup(session_id) or "")
+        chosen, affinity_hit = least, False
+
+        if pinned is not None and pinned.routable:
+            if pinned.outstanding > least.outstanding + self._config.affinity_slack:
+                logger.info(
+                    "session %s leaves %s (outstanding=%d) for %s (outstanding=%d): slack %d exceeded",
+                    session_id, pinned.name, pinned.outstanding,
+                    least.name, least.outstanding, self._config.affinity_slack,
+                )
+            else:
+                chosen, affinity_hit = pinned, True
+
+        if not affinity_hit:
+            # Only advance the rotation when load decided the route, so a stream
+            # of affine requests does not skew the tiebreak.
+            self._route_counter = (chosen.index + 1) % len(self._states)
+
+        self._sessions.pin(session_id, chosen.name)
+        chosen.routed += 1
+        self.affinity_hits += affinity_hit
+        return RoutingDecision(replica=chosen.spec, affinity_hit=affinity_hit)
+
+    def _least_loaded(self, candidates: list[ReplicaState]) -> ReplicaState:
+        count = len(self._states)
+        return min(
+            candidates,
+            key=lambda s: (s.outstanding, (s.index - self._route_counter) % count, s.index),
+        )
+
+
+class HealthMonitor:
+    """Polls each replica's /health and keeps the registry in step.
+
+    A replica still loading refuses the connection outright (uvicorn binds only
+    after the engine starts), while a 503 means the process is up but its worker
+    or engine loop is gone. Both are unroutable.
+    """
+
+    def __init__(self, config: RouterConfig, registry: ReplicaRegistry,
+                 sessions: SessionDirectory, client) -> None:
+        self._config = config
+        self._registry = registry
+        self._sessions = sessions
+        self._client = client
+        self._task: asyncio.Task | None = None
+
+    async def start(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._loop())
+
+    async def stop(self) -> None:
+        task, self._task = self._task, None
+        if task is None:
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def _loop(self) -> None:
+        while True:
+            try:
+                await self.probe_once()
+                self._sessions.sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the poller must outlive one bad cycle
+                logger.exception("health poll cycle failed")
+            await asyncio.sleep(self._config.health_interval_seconds)
+
+    async def probe_once(self) -> None:
+        await asyncio.gather(
+            *(self._probe(state) for state in self._registry.states), return_exceptions=True
+        )
+
+    async def _probe(self, state: ReplicaState) -> None:
+        healthy = False
+        try:
+            response = await self._client.get(
+                f"{state.spec.base_url}/health", timeout=self._config.connect_timeout_seconds
+            )
+            healthy = response.status_code == 200
+        except Exception as exc:  # noqa: BLE001 - refused and timeout both mean unroutable
+            logger.debug("health probe of %s failed: %s", state.name, exc)
+
+        if healthy:
+            state.failures = 0
+            self._registry.set_ready(state.name, True)
+            return
+        state.failures += 1
+        if state.failures >= UNHEALTHY_THRESHOLD:
+            self._registry.set_ready(state.name, False)

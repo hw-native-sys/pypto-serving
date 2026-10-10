@@ -4,5 +4,6 @@ transformers
 fastapi
 pydantic>=2.0
 uvicorn
+httpx
 msgspec
 prometheus-client>=0.20

@@ -96,6 +96,7 @@ nav:
           - Online Serving: user-guide/online-serving.md
           - DSpark Tool Constraints: user-guide/deepseek-v4-dspark-tool-constraints.md
           - Parallelism and Scaling: user-guide/parallel.md
+          - Multi-Node Routing: user-guide/multi-node-routing.md
           - Benchmarking: user-guide/benchmarking.md
           - Profiling: user-guide/profile.md
       - Models:
@@ -105,6 +106,7 @@ nav:
       - Overview: cli-reference/index.md
       - pypto-serving: cli-reference/pypto-serving.md
       - DeepSeek V4 Conversion: cli-reference/deepseek-v4-conversion.md
+      - pypto-serving-router: cli-reference/pypto-serving-router.md
       - pypto-prepack-deepseek-v4: cli-reference/pypto-prepack-deepseek-v4.md
   - Developer Guide:
       - Architecture: developer-guide/architecture.md
