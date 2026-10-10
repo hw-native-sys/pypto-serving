@@ -1,0 +1,103 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Automatic model-adapter selection from Serving runtime facts."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Protocol
+
+from .contracts import ModelPDContract
+
+
+@dataclass(frozen=True)
+class ModelRuntimeFacts:
+    model_family: str
+    model_variant: str
+    num_speculative_tokens: int
+
+
+class ModelPDAdapter(Protocol):
+    contract: ModelPDContract
+
+    def matches(self, facts: ModelRuntimeFacts) -> bool: ...
+
+    def worker_factory(self, config): ...
+
+    def build_registry(self, bundle): ...
+
+    def rank_mapping(self, topology, source_partition: int, destination_partition: int): ...
+
+    def make_planner(self, registry, group_specs): ...
+
+    def make_decode_connector(
+        self, cache_manager, capabilities, registry, destination_ranks
+    ): ...
+
+    def validate_generate_config(self, config) -> None: ...
+
+    def build_continuation(
+        self,
+        *,
+        config,
+        prompt_token_ids,
+        eos_token_id: int | None,
+        output_parser_spec=None,
+    ): ...
+
+    def build_prefix_match_spec(self, prompt_token_ids, cache_manager): ...
+
+    def build_manifest(
+        self,
+        *,
+        key,
+        plan,
+        chunk,
+        continuation,
+        prepared_digest: str,
+    ): ...
+
+    def validate_continuation(self, continuation) -> None: ...
+
+    def adopt_decode(
+        self,
+        core,
+        *,
+        reservation_id: str,
+        request_id: str,
+        first_token: int,
+        continuation,
+    ): ...
+
+
+class ModelPDAdapterRegistry:
+    def __init__(self, adapters: tuple[ModelPDAdapter, ...]) -> None:
+        if not adapters:
+            raise ValueError("PD adapter registry must not be empty")
+        ids = tuple(adapter.contract.adapter_id for adapter in adapters)
+        if len(ids) != len(set(ids)):
+            raise ValueError("PD adapter ids must be unique")
+        self._adapters = adapters
+
+    def select(self, facts: ModelRuntimeFacts) -> ModelPDAdapter:
+        matches = tuple(adapter for adapter in self._adapters if adapter.matches(facts))
+        if len(matches) != 1:
+            raise ValueError(
+                "Serving runtime must match exactly one PD model adapter; "
+                f"matched={tuple(adapter.contract.adapter_id for adapter in matches)}"
+            )
+        return matches[0]
+
+    def get(self, adapter_id: str) -> ModelPDAdapter:
+        matches = tuple(
+            adapter for adapter in self._adapters if adapter.contract.adapter_id == adapter_id
+        )
+        if len(matches) != 1:
+            raise ValueError(f"unknown PD model adapter {adapter_id!r}")
+        return matches[0]

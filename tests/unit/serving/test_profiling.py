@@ -106,6 +106,9 @@ def test_worker_profile_commands_ack_after_state_change(monkeypatch):
     monkeypatch.setattr(serving_worker, "get_profiler", lambda **_kwargs: profiler)
 
     worker = serving_worker.WorkerProcess.__new__(serving_worker.WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
+    worker.executor = SimpleNamespace()
     worker.input_queue = _Queue(
         [
             encode_command(ProfileCommand(active=True)),
@@ -191,8 +194,8 @@ def test_http_profile_endpoints_control_workers_and_merge(monkeypatch):
     assert "/stop_profile" in paths
 
     async def control_profile():
-        start_response = await server._start_profile()
-        stop_response = await server._stop_profile()
+        start_response = await server.start_profile()
+        stop_response = await server.stop_profile()
         return start_response, stop_response
 
     start_response, stop_response = asyncio.run(control_profile())

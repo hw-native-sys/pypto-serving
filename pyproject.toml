@@ -20,6 +20,7 @@ Issues = "https://github.com/hw-native-sys/pypto-serving/issues"
 
 [project.scripts]
 pypto-serving = "pypto_serving.cli.main:main"
+pypto-pd-router = "pypto_serving.router.__main__:main"
 pypto-prepack-deepseek-v4 = "pypto_serving.tools.prepack_deepseek_v4:main"
 
 [tool.setuptools.packages.find]

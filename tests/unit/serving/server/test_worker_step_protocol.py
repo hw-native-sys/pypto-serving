@@ -48,6 +48,7 @@ from ..device_sampling_fakes import _FixedSampler, _ImmediateEosExecutor, _model
 def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
     core._worker_known_req_ids = {"req"}
+    core._request_contexts = {}
     request = Request(
         request_id="req",
         prompt_token_ids=[1, 2],
@@ -124,6 +125,8 @@ def test_partitioned_prefill_chunks_reject_oversized_request():
 
 def test_worker_uses_executor_packed_prefill_limits():
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
     worker.model_record = SimpleNamespace(runtime_model=object())
     worker.executor = SimpleNamespace(
         max_prefill_batch_size=8,
@@ -146,6 +149,8 @@ def test_worker_releases_preempted_state_before_same_command_reregistration():
     released: list[str] = []
     results: list[bytes] = []
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
     worker.executor = SimpleNamespace(release_finished_requests=released.extend)
     # __new__ bypasses __init__, which is what normally provides sampler.
     worker.sampler = None
@@ -173,6 +178,8 @@ def test_worker_releases_preempted_state_before_same_command_reregistration():
 def test_worker_release_does_not_remove_a_later_same_id_registration():
     released: list[str] = []
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
     worker.executor = SimpleNamespace(release_finished_requests=released.extend)
     old = NewRequestData("req", [0], 0.0, 1.0, None)
     replacement = NewRequestData("req", [1], 0.0, 1.0, None)
@@ -254,6 +261,8 @@ def test_serving_worker_packs_variable_length_prefill_chunks():
     manager = KvCacheManager()
     executor = _ImmediateEosExecutor(manager)
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
     worker.executor = executor
     worker.sampler = _FixedSampler(token_id=0)
     worker.model_record = SimpleNamespace(config=model.config)
@@ -315,6 +324,8 @@ def test_worker_close_releases_executor_once():
 
     executor.close = close
     worker = serving_worker.WorkerProcess.__new__(serving_worker.WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
     worker.executor = executor
 
     worker.close()
@@ -397,6 +408,8 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs(constrained):
     input_queue: Queue = Queue()
     output_queue: Queue = Queue()
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
     worker.config = SimpleNamespace(resolve_async_scheduling=lambda: True)
     worker.input_queue = input_queue
     worker.output_queue = output_queue
@@ -484,6 +497,8 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs(constrained):
 
 def test_worker_does_not_prepare_prefill_asynchronously():
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
     command = StepCommand(
         new_requests=[],
         prefill_requests=[PrefillRequest("req", [1], 0, [])],
@@ -519,6 +534,8 @@ def test_constrained_dispatch_binds_live_state_after_early_prepare():
 
 def test_worker_does_not_prepare_host_embedding_decode_asynchronously():
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
     worker.executor = SimpleNamespace(supports_device_decode_embedding=False)
     command = StepCommand(
         new_requests=[],
@@ -533,6 +550,8 @@ def test_worker_does_not_prepare_host_embedding_decode_asynchronously():
 
 def test_worker_routes_decode_failures_through_device_fifo():
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
     worker._apply_command_lifecycle = lambda _cmd, _entries: None
     worker._can_split_decode_output = lambda _cmd, _prepared: False
     worker._execute_step = lambda cmd, prepared_decode=None: StepResult(step_id=cmd.step_id)
@@ -571,6 +590,8 @@ def test_worker_routes_decode_failures_through_device_fifo():
 def test_worker_reclaims_device_accepted_tokens_after_request_cache_release():
     """A stale fused result is self-contained and must not reread request config."""
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
     worker.executor = SimpleNamespace()
     worker._req_cache = {}
     new_tokens = {}
@@ -596,7 +617,7 @@ def test_worker_entry_always_closes_worker(monkeypatch, caplog, busy_loop_fails,
         monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
 
     class FakeWorker:
-        def __init__(self, config, input_queue, output_queue, profile_output_queue=None):
+        def __init__(self, config, input_queue, output_queue, profile_output_queue=None, services_factory=None):
             pass
 
         def init_device_and_model(self):
@@ -669,6 +690,8 @@ def test_mixed_decode_does_not_overwrite_prepared_next_step():
         assert next_prepared.wait(timeout=5)
 
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._batch_builder = worker._make_decode_batch
+    worker._services = None
     worker.config = SimpleNamespace(resolve_async_scheduling=lambda: True)
     worker.input_queue, worker.output_queue = Queue(), Queue()
     worker.profile_output_queue = None

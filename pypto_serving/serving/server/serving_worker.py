@@ -34,6 +34,8 @@ from pypto_serving.serving.server.ipc import (
     PLACEHOLDER_TOKEN,
     DecodeRequest,
     NewRequestData,
+    ControlCommand,
+    ControlResult,
     PrefillRequest,
     ProfileCommand,
     ProfileResult,
@@ -41,6 +43,7 @@ from pypto_serving.serving.server.ipc import (
     StepCommand,
     StepResult,
     decode_command,
+    encode_control_result,
     encode_profile_result,
     encode_result,
 )
@@ -103,6 +106,14 @@ class _ProfileBarrier:
     completed: threading.Event
 
 
+@dataclass(frozen=True)
+class _ControlBarrier:
+    """FIFO barrier for owner/cache control relative to device dispatch."""
+
+    command: ControlCommand
+    completed: threading.Event
+
+
 class WorkerProcess:
     """Dedicated process that owns a single NPU device and executes model inference.
 
@@ -116,12 +127,16 @@ class WorkerProcess:
         input_queue: mp.Queue,
         output_queue: mp.Queue,
         profile_output_queue: mp.Queue | None = None,
+        services_factory=None,
     ):
         self.config = config
         self.input_queue = input_queue
         self.output_queue = output_queue
         self.profile_output_queue = profile_output_queue
 
+        self._services_factory = services_factory
+        self._services = None
+        self._batch_builder = self._make_decode_batch
         self.executor = None
         self.sampler = None
         self.model_record = None
@@ -169,11 +184,12 @@ class WorkerProcess:
             self.sampler = Sampler()
 
             executor_cls = self._resolve_executor_cls()
+            executor_kwargs = dict(self.config.executor_kwargs)
             self.executor = executor_cls(
                 platform=self.config.platform,
                 device_ids=device_ids,
                 pypto_build_dir=str(pypto_build_dir) if pypto_build_dir is not None else None,
-                **self.config.executor_kwargs,
+                **executor_kwargs,
             )
 
             loaded = ModelLoader().load(
@@ -198,6 +214,11 @@ class WorkerProcess:
             else:
                 raise RuntimeError("Executor has no register_model method")
 
+            if self._services_factory is not None:
+                self._services = self._services_factory(
+                    self.executor.runtime_extensions(), self._req_cache.__getitem__,
+                )
+                self._batch_builder = self._services.wrap_batch(self._make_decode_batch)
             logger.info("Worker model loaded and ready")
             return num_pages
 
@@ -265,6 +286,10 @@ class WorkerProcess:
 
             if isinstance(cmd, ProfileCommand):
                 self._handle_profile_command(cmd)
+                continue
+
+            if isinstance(cmd, ControlCommand):
+                self._handle_control_command(cmd)
                 continue
 
             self._handle_step_command(cmd)
@@ -384,6 +409,11 @@ class WorkerProcess:
                 output_work_queue.put(barrier)
                 barrier.completed.wait()
                 continue
+            if isinstance(cmd, ControlCommand):
+                barrier = _ControlBarrier(command=cmd, completed=threading.Event())
+                output_work_queue.put(barrier)
+                barrier.completed.wait()
+                continue
             assert isinstance(cmd, StepCommand)
             try:
                 self._wait_for_pending_decode_reclaims(cmd.finished_request_ids)
@@ -465,6 +495,12 @@ class WorkerProcess:
             if isinstance(work, _ProfileBarrier):
                 try:
                     self._handle_profile_command(work.command)
+                finally:
+                    work.completed.set()
+                continue
+            if isinstance(work, _ControlBarrier):
+                try:
+                    self._handle_control_command(work.command)
                 finally:
                     work.completed.set()
                 continue
@@ -597,20 +633,53 @@ class WorkerProcess:
         """Apply a profile command and acknowledge it after the file is flushed."""
         profiler = get_profiler(initially_active=False)
         error = None
+        transfer_profile = self._services.set_profile_active if self._services is not None else None
         try:
             if cmd.active:
                 profiler.start()
+                if callable(transfer_profile):
+                    transfer_profile(True)
             else:
-                profiler.stop()
+                try:
+                    if callable(transfer_profile):
+                        transfer_profile(False)
+                finally:
+                    profiler.stop()
             if profiler.active != cmd.active:
                 error = "SA profiling is not configured in the worker process"
         except Exception as exc:
+            if cmd.active:
+                profiler.stop()
             error = str(exc)
             logger.error("Worker profile command failed: %s", exc, exc_info=True)
 
         if self.profile_output_queue is not None:
             self.profile_output_queue.put(
                 encode_profile_result(ProfileResult(active=profiler.active, error=error))
+            )
+
+    def _handle_control_command(self, cmd: ControlCommand) -> None:
+        """Run a worker-owned PD operation after all older device work settles."""
+        error = None
+        payload = b""
+        try:
+            if self._services is None:
+                raise RuntimeError("worker extension control is not configured")
+            payload = self._services.handle_command(cmd.operation, cmd.payload)
+            if not isinstance(payload, bytes):
+                raise TypeError("worker control handler must return bytes")
+        except Exception as exc:
+            error = str(exc)
+            logger.error("Worker control failed: %s", exc, exc_info=True)
+        if self.profile_output_queue is not None:
+            self.profile_output_queue.put(
+                encode_control_result(
+                    ControlResult(
+                        command_id=cmd.command_id,
+                        payload=payload,
+                        error=error,
+                    )
+                )
             )
 
     def _handle_step_command(self, cmd: StepCommand) -> None:
@@ -661,7 +730,14 @@ class WorkerProcess:
                         self.model_record.tokenizer, self.model_record.config.vocab_size
                     )
                 with profile_span("WorkerProcess.constraint_compile", cat="constraints"):
-                    self._constraint_states[new_request.request_id] = self._xgrammar_provider.compile(spec)
+                    state = self._xgrammar_provider.compile(spec)
+                try:
+                    if new_request.initial_output_token_ids:
+                        state.accept(new_request.initial_output_token_ids)
+                except BaseException:
+                    state.close()
+                    raise
+                self._constraint_states[new_request.request_id] = state
             self._req_cache[new_request.request_id] = new_request
 
     def _release_finished_request_state(
@@ -687,7 +763,11 @@ class WorkerProcess:
             constraint_state = getattr(self, "_constraint_states", {}).pop(req_id, None)
             if constraint_state is not None:
                 constraint_state.close()
-            release_sampler = getattr(self.sampler, "release_requests", None)
+            release_sampler = getattr(
+                getattr(self, "sampler", None),
+                "release_requests",
+                None,
+            )
             if callable(release_sampler):
                 release_sampler([req_id])
 
@@ -933,7 +1013,7 @@ class WorkerProcess:
         # Tokens remain placeholders during early preparation. Executors with a
         # host-token dependency may patch them on the device lane; fused MTP
         # consumes persistent state finalized by the terminal-prefill command.
-        batch = self._make_decode_batch(
+        batch = self._batch_builder(
             cmd.decode_requests,
             runtime_model,
             resolve_tokens=False,
@@ -1016,7 +1096,7 @@ class WorkerProcess:
             allow_device_greedy_sampling = self._allow_device_sampled_ids(scheduled)
             allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled)
 
-            batch = self._make_decode_batch(
+            batch = self._batch_builder(
                 scheduled,
                 runtime_model,
                 resolve_tokens=True,
@@ -1175,6 +1255,7 @@ def _worker_entry(
     ready_event,
     num_pages_value,
     profile_output_queue: mp.Queue | None = None,
+    services_factory=None,
 ):
     """Entry point for the worker subprocess."""
     import signal
@@ -1192,7 +1273,7 @@ def _worker_entry(
     )
     configure_runtime_logging()
 
-    worker = WorkerProcess(config, input_queue, output_queue, profile_output_queue)
+    worker = WorkerProcess(config, input_queue, output_queue, profile_output_queue, services_factory)
     try:
         num_pages = worker.init_device_and_model()
         num_pages_value.value = num_pages
@@ -1214,7 +1295,7 @@ def _worker_entry(
         get_profiler(initially_active=False).stop()
 
 
-def spawn_worker(config: EngineConfig):
+def spawn_worker(config: EngineConfig, *, services_factory=None):
     """Spawn a worker process and return its process, queues, and ready state.
 
     ``num_pages_value`` is a shared ``multiprocessing.Value('i')`` that the
@@ -1239,6 +1320,7 @@ def spawn_worker(config: EngineConfig):
             ready_event,
             num_pages_value,
             profile_output_queue,
+            services_factory,
         ),
         daemon=False,
     )
