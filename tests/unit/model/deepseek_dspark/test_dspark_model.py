@@ -652,6 +652,27 @@ def test_grouped_metadata_allows_shared_prefix_but_rejects_row_aliases():
         runner._normalize_group_block_ids([{**row, "ori": [0, 0]}], actual_batch=1)
 
 
+def test_sparse_sliding_tables_preserve_logical_positions_and_mask_expired_slots():
+    runner = object.__new__(DSparkModelRunner)
+    runner._cache_group_num_blocks = dict.fromkeys(DSPARK_CACHE_GROUP_NAMES, 8)
+    row = {name: [0] for name in DSPARK_CACHE_GROUP_NAMES}
+    row["ori"] = [-1, -1, 6, 7]
+    normalized = runner._normalize_group_block_ids([row], actual_batch=1)[0]
+    builder = DSparkCacheMetadataBuilder()
+    table = builder.ring_table(normalized["ori"], depth=8)
+    assert table.tolist() == [-1, -1, 6, 7, -1, -1, 6, 7]
+    positions = torch.tensor([[0, 31, 64, 127, 192]])
+    expected = torch.tensor([[-1, -1, 192, 255, 192]])
+    assert torch.equal(builder.ring_slot_mapping(positions, [normalized["ori"]], block_size=32), expected)
+    assert torch.equal(builder.paged_slot_mapping(positions, table.unsqueeze(0), block_size=32), expected)
+    trailing = builder.trailing_ring_table(normalized["ori"], position=127, page_tokens=32, depth=4)
+    assert trailing.tolist() == [-1, -1, 6, 7]
+    with pytest.raises(ValueError, match="must be in"):
+        runner._normalize_group_block_ids([{**row, "cmp_c4": [-1]}], actual_batch=1)
+    with pytest.raises(ValueError, match="must be in"):
+        runner._normalize_group_block_ids([{**row, "ori": [-2, 0]}], actual_batch=1)
+
+
 @pytest.mark.parametrize("compress_ratio", [4, 128])
 def test_compressed_slots_use_source_token_pages_and_mask_uncommitted_rows(compress_ratio):
     builder = DSparkCacheMetadataBuilder()

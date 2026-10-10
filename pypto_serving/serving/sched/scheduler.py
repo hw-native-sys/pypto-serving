@@ -788,6 +788,9 @@ class Scheduler:
                 request.num_computed_tokens += scheduled.num_new_tokens
                 self._cache_completed_blocks(request)
                 if request.num_computed_tokens < request.num_prompt_tokens:
+                    self.kv_cache_manager.release_sliding_window_blocks(
+                        request.request_id, request.num_computed_tokens,
+                    )
                     continue
                 for token_id in token_ids:
                     request.output_token_ids.append(token_id)
@@ -804,6 +807,18 @@ class Scheduler:
                         break
                 request.num_computed_tokens += retained_tokens
                 self._cache_completed_blocks(request)
+
+            # The live count can include a newer async step's speculative
+            # placeholders. Only completed prompt chunks / accepted outputs
+            # establish a safe lower bound for sliding-window reclamation.
+            confirmed_tokens = (
+                scheduled.num_computed_tokens + scheduled.num_new_tokens
+                if scheduled.is_prefill
+                else request.num_prompt_tokens + len(request.output_token_ids) - 1
+            )
+            self.kv_cache_manager.release_sliding_window_blocks(
+                request.request_id, confirmed_tokens,
+            )
 
         finished_ids: list[str] = []
         for request in self.running:
