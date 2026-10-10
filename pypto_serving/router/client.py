@@ -101,4 +101,6 @@ class NodeClient:
             return urllib.request.urlopen(request, timeout=self.timeout_seconds)
         except urllib.error.HTTPError as exc:
             detail = exc.read(4096).decode(errors="replace")
+            if exc.code in (400, 422):
+                raise ValueError(f"node {path} rejected request: {detail}") from exc
             raise RuntimeError(f"node {path} failed with HTTP {exc.code}: {detail}") from exc

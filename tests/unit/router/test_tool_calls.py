@@ -66,7 +66,9 @@ def test_pd_router_formats_tool_calls_and_roundtrips_history(tmp_path, monkeypat
     async def no_reconcile(self):
         return None
 
-    async def fake_generate(self, request_kind, request_json, request_id, publish_immediately=True):
+    async def fake_generate(self, request_kind, request_json, request_id, publish_immediately=True, _signal_prepared=False):
+        if _signal_prepared:
+            yield None
         assert request_kind == "chat"
         seen.append(json.loads(request_json))
         calls = (ParsedToolCall("call-1", "lookup", '{"city":"杭州"}'),)
@@ -126,7 +128,9 @@ def test_pd_router_forwards_required_tool_choice(tmp_path, monkeypatch):
     async def no_reconcile(self):
         return None
 
-    async def fake_generate(self, request_kind, request_json, request_id, publish_immediately=True):
+    async def fake_generate(self, request_kind, request_json, request_id, publish_immediately=True, _signal_prepared=False):
+        if _signal_prepared:
+            yield None
         assert request_kind == "chat"
         assert json.loads(request_json)["tool_choice"] == "required"
         yield _wire(request_id, sequence=1, finished=True)
@@ -149,7 +153,9 @@ def test_pd_router_respects_parallel_tool_calls_false(tmp_path, monkeypatch, str
     async def no_reconcile(self):
         return None
 
-    async def fake_generate(self, request_kind, request_json, request_id, publish_immediately=True):
+    async def fake_generate(self, request_kind, request_json, request_id, publish_immediately=True, _signal_prepared=False):
+        if _signal_prepared:
+            yield None
         assert request_kind == "chat"
         calls = (
             ParsedToolCall("call-1", "lookup", '{"city":"杭州"}'),
@@ -186,8 +192,8 @@ def test_pd_router_stream_reports_decode_parser_failure_as_sse(tmp_path, monkeyp
         return None
 
     async def failing_generate(self, *_args, **_kwargs):
+        yield None  # P preparation succeeded; the error belongs to Decode.
         raise RuntimeError("D Decode failed: invalid tool call")
-        yield
 
     monkeypatch.setattr(RouterCoordinator, "reconcile_startup", no_reconcile)
     monkeypatch.setattr(RouterCoordinator, "generate", failing_generate)
@@ -203,3 +209,22 @@ def test_pd_router_stream_reports_decode_parser_failure_as_sse(tmp_path, monkeyp
         "type": "pd_decode_error",
         "code": 503,
     }}]
+
+
+def test_pd_router_rejects_preparation_before_sse_headers(tmp_path, monkeypatch):
+    async def no_reconcile(self):
+        return None
+
+    async def failing_generate(self, *_args, **_kwargs):
+        raise ValueError("invalid tool schema")
+        yield
+
+    monkeypatch.setattr(RouterCoordinator, "reconcile_startup", no_reconcile)
+    monkeypatch.setattr(RouterCoordinator, "generate", failing_generate)
+    with TestClient(create_router_app(_config(tmp_path))) as client:
+        response = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Find a city"}],
+            "tools": TOOLS, "stream": True,
+        })
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/json")

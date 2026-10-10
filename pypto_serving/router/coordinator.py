@@ -137,7 +137,8 @@ class RouterCoordinator:
         request_id: str,
         *,
         publish_immediately: bool = True,
-    ) -> AsyncGenerator[DecodeOutputWire, None]:
+        _signal_prepared: bool = False,
+    ) -> AsyncGenerator[DecodeOutputWire | None, None]:
         started_ns = time.monotonic_ns()
         previous_output_ns: int | None = None
         self.recovery.assert_admission()
@@ -159,8 +160,12 @@ class RouterCoordinator:
                     request_kind,
                     request_json,
                     request_id,
+                    signal_prepared=_signal_prepared,
                 )
                 async for output in stream:
+                    if output is None:
+                        yield None
+                        continue
                     now_ns = time.monotonic_ns()
                     if previous_output_ns is None:
                         self.metrics.observe_ns("request.ttft", now_ns - started_ns)
@@ -263,6 +268,25 @@ class RouterCoordinator:
             if final is not None and final.finished:
                 self._replayable.pop(request_id, None)
 
+    async def start_stream(
+        self, request_kind: str, request_json: bytes, request_id: str,
+    ) -> AsyncGenerator[DecodeOutputWire | None, None]:
+        """Run admission and one-time P preparation before public SSE headers.
+
+        The same suspended iterator owns the admission slot and prepared input.
+        Resuming it starts D reservation; no Prefill or network write is primed.
+        """
+        stream = self.generate(
+            request_kind, request_json, request_id, _signal_prepared=True,
+        )
+        try:
+            if await anext(stream) is not None:
+                raise RuntimeError("Router stream missed the preparation boundary")
+        except BaseException:
+            await stream.aclose()
+            raise
+        return stream
+
     async def recover_fixed_pair(
         self,
         manager: FixedPairRuntimeManager,
@@ -324,7 +348,9 @@ class RouterCoordinator:
         request_kind: str,
         request_json: bytes,
         request_id: str,
-    ) -> AsyncGenerator[DecodeOutputWire, None]:
+        *,
+        signal_prepared: bool = False,
+    ) -> AsyncGenerator[DecodeOutputWire | None, None]:
         if not request_json or len(request_json) > self.config.max_request_bytes:
             raise ValueError("public request exceeds the Router body limit")
         pair = await self.directory.select()
@@ -333,6 +359,8 @@ class RouterCoordinator:
             PrepareRequestHTTP(request_id, request_kind, request_json),
             PreparedRequest,
         )
+        if signal_prepared:
+            yield None
         key = HandoffKey(
             request_id=request_id,
             handoff_id=uuid.uuid4().hex,
