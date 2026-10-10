@@ -458,6 +458,28 @@ def test_directory_rejects_a_stale_router_control_incarnation() -> None:
     asyncio.run(exercise())
 
 
+def test_router_stream_preparation_holds_admission_without_starting_prefill(
+    monkeypatch, tmp_path,
+) -> None:
+    async def exercise() -> None:
+        waiting = asyncio.Event()
+        p_client = _PrefillClient(waiting)
+        coordinator, journal = _coordinator(
+            monkeypatch, tmp_path, p_client, _DecodeClient(waiting),
+        )
+        stream = await coordinator.start_stream("completion", b'{"prompt":"hello"}', "request")
+        assert coordinator.admission.active == 1
+        assert p_client.execute_calls == 0
+        assert not waiting.is_set()
+        assert journal.unresolved == ()
+        await stream.aclose()
+        assert coordinator.admission.active == 0
+        assert coordinator._replayable == {}
+        journal.close()
+
+    asyncio.run(exercise())
+
+
 def test_router_fails_closed_and_aborts_both_nodes_on_output_gap(
     monkeypatch, tmp_path
 ) -> None:

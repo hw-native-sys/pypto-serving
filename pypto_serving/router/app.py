@@ -16,6 +16,7 @@ import uuid
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from pypto_serving.serving.pd.admission import PDBackpressureError
 from pypto_serving.serving.pd.observability import token_ids_sha256, write_startup_record
@@ -163,9 +164,11 @@ def create_router_app(
         request_id = f"cmpl-{uuid.uuid4().hex[:8]}"
         model = public.model
         if public.stream:
+            outputs = await coordinator.start_stream("completion", raw, request_id)
             return StreamingResponse(
-                _stream_completion(coordinator, raw, request_id, model),
+                _stream_completion(outputs, request_id, model),
                 media_type="text/event-stream",
+                background=BackgroundTask(outputs.aclose),
             )
         final = None
         async for output in coordinator.generate(
@@ -202,15 +205,16 @@ def create_router_app(
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         model = public.model
         if public.stream:
+            outputs = await coordinator.start_stream("chat", raw, request_id)
             return StreamingResponse(
                 _stream_chat(
-                    coordinator,
-                    raw,
+                    outputs,
                     request_id,
                     model,
                     parallel_tool_calls=public.parallel_tool_calls,
                 ),
                 media_type="text/event-stream",
+                background=BackgroundTask(outputs.aclose),
             )
         final = None
         async for output in coordinator.generate(
@@ -252,13 +256,12 @@ async def _bounded_body(request: Request, limit: int) -> bytes:
 
 
 async def _stream_completion(
-    coordinator: RouterCoordinator,
-    raw: bytes,
+    outputs,
     request_id: str,
     model: str,
 ):
     previous = ""
-    async for output in coordinator.generate("completion", raw, request_id):
+    async for output in outputs:
         delta = _cumulative_delta(output.text, previous, "content")
         previous = output.text or previous
         finish_reason = _map_finish_reason(output.finish_reason) if output.finished else None
@@ -286,8 +289,7 @@ async def _stream_completion(
 
 
 async def _stream_chat(
-    coordinator: RouterCoordinator,
-    raw: bytes,
+    outputs,
     request_id: str,
     model: str,
     *,
@@ -295,8 +297,7 @@ async def _stream_chat(
 ):
     try:
         async for chunk in _stream_chat_chunks(
-            coordinator,
-            raw,
+            outputs,
             request_id,
             model,
             parallel_tool_calls=parallel_tool_calls,
@@ -314,14 +315,13 @@ async def _stream_chat(
 
 
 async def _stream_chat_chunks(
-    coordinator: RouterCoordinator,
-    raw: bytes,
+    outputs,
     request_id: str,
     model: str,
     *,
     parallel_tool_calls: bool,
 ):
-    async for output in coordinator.generate("chat", raw, request_id):
+    async for output in outputs:
         finish_reason = chat_finish_reason(output) if output.finished else None
         chunk = ChatCompletionResponse(
             id=request_id,

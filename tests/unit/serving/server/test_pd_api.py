@@ -245,7 +245,7 @@ def test_router_streams_independent_reasoning_and_content_deltas() -> None:
         return [
             chunk
             async for chunk in _stream_chat(
-                _RouterCoordinator(outputs), b"{}", "request", "model"
+                _RouterCoordinator(outputs).generate("chat", b"{}", "request"), "request", "model"
             )
         ]
 
@@ -299,7 +299,7 @@ def test_router_streams_authoritative_deltas_when_cumulative_fields_change() -> 
         return [
             chunk
             async for chunk in _stream_chat(
-                _RouterCoordinator(outputs), b"{}", "request", "model"
+                _RouterCoordinator(outputs).generate("chat", b"{}", "request"), "request", "model"
             )
         ]
 
