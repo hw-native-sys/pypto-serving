@@ -184,7 +184,8 @@ class RouterCoordinator:
                         )
                         self._replayable[request_id] = replayable
                     final = output
-                    yield output
+                    if not output.finished:
+                        yield output
                 if final is None or not final.finished:
                     raise RuntimeError("Router request ended without a terminal output")
                 self.metrics.increment("requests.completed")
@@ -222,7 +223,8 @@ class RouterCoordinator:
                             )
                         previous_output_ns = now_ns
                         final = output
-                        yield output
+                        if not output.finished:
+                            yield output
                     if final is None or not final.finished:
                         raise RuntimeError(
                             "automatic re-prefill ended without terminal output"
@@ -235,7 +237,6 @@ class RouterCoordinator:
                         completion_tokens=final.completion_tokens,
                         token_ids=final.token_ids,
                     )
-                    return
                 except BaseException as recovery_exc:
                     self.metrics.increment("requests.failed")
                     self.metrics.record_terminal(
@@ -244,15 +245,16 @@ class RouterCoordinator:
                         error_code=type(recovery_exc).__name__,
                     )
                     raise recovery_exc from exc
-            self.metrics.increment("requests.failed")
-            self.metrics.record_terminal(
-                request_id=request_id,
-                state="FAILED",
-                error_code=type(exc).__name__,
-            )
-            if self.recovery.phase is RecoveryPhase.RUNNING:
-                self._replayable.pop(request_id, None)
-            raise
+            else:
+                self.metrics.increment("requests.failed")
+                self.metrics.record_terminal(
+                    request_id=request_id,
+                    state="FAILED",
+                    error_code=type(exc).__name__,
+                )
+                if self.recovery.phase is RecoveryPhase.RUNNING:
+                    self._replayable.pop(request_id, None)
+                raise
         finally:
             if "stream" in locals():
                 with suppress(Exception):
@@ -267,6 +269,10 @@ class RouterCoordinator:
             self.metrics.set_gauge("handoffs.queued", self.admission.queued)
             if final is not None and final.finished:
                 self._replayable.pop(request_id, None)
+        # Finish the handoff journal, close node streams and release admission
+        # before publishing the terminal output. A client may disconnect as
+        # soon as it receives [DONE], without resuming this iterator again.
+        yield final
 
     async def start_stream(
         self, request_kind: str, request_json: bytes, request_id: str,

@@ -458,6 +458,39 @@ def test_directory_rejects_a_stale_router_control_incarnation() -> None:
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("cancel_scope", [False, True])
+def test_terminal_output_is_completed_before_client_disconnect(
+    monkeypatch, tmp_path, cancel_scope,
+) -> None:
+    async def exercise() -> None:
+        waiting = asyncio.Event()
+        p_client = _PrefillClient(waiting)
+        d_client = _DecodeClient(waiting)
+        coordinator, journal = _coordinator(monkeypatch, tmp_path, p_client, d_client)
+        stream = coordinator.generate("completion", b'{"prompt":"hello"}', "request")
+        assert not (await anext(stream)).finished
+        assert (await anext(stream)).finished
+        assert coordinator.admission.active == 0
+        assert coordinator._replayable == {}
+        assert journal.unresolved == ()
+        if cancel_scope:
+            with anyio.CancelScope() as scope:
+                scope.cancel()
+                await stream.aclose()
+        else:
+            await stream.aclose()
+        assert p_client.abort_calls == d_client.abort_calls == 0
+        snapshot = coordinator.metrics.snapshot()
+        assert snapshot["counters"]["requests.completed"] == 1
+        assert snapshot["counters"].get("requests.failed", 0) == 0
+        assert snapshot["gauges"]["handoffs.active"] == 0
+        with open(journal.path, encoding="utf-8") as evidence:
+            assert json.loads(evidence.readlines()[-1])["event"] == "HANDOFF_COMPLETED"
+        journal.close()
+
+    anyio.run(exercise)
+
+
 def test_router_stream_preparation_holds_admission_without_starting_prefill(
     monkeypatch, tmp_path,
 ) -> None:
