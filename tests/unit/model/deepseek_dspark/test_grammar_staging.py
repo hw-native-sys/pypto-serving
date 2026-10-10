@@ -269,15 +269,15 @@ def test_failed_prefill_mask_staging_cannot_poison_next_request() -> None:
         (DSPARK_RANKS, DSPARK_MAX_LOGIT_ROWS, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS),
         -1, dtype=torch.int16,
     )
-    runner._prefill_task_args = SimpleNamespace(tensors={"grammar_mask": masks})
-    runner._prefill_grammar_rows = set()
+    runner._prefill_task_arg_slots = [SimpleNamespace(tensors={"grammar_mask": masks})]
+    runner._prefill_grammar_rows = [set(), set()]
     inputs = SimpleNamespace(request_ids=("good", "bad"), sampled_slots=((6, 40), (6, 41)))
 
     with pytest.raises(ValueError, match="no allowed token"):
         runner._stage_prefill_grammar(
             SimpleNamespace(constraint_states={"good": State(True), "bad": State(False)}), inputs
         )
-    assert runner._prefill_grammar_rows == set()
+    assert runner._prefill_grammar_rows[0] == set()
     assert int(masks[6, 40, 0, 0]) == -1
 
     runner._stage_prefill_grammar(SimpleNamespace(constraint_states={}), inputs)

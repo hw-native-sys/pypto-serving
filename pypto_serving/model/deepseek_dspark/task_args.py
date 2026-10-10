@@ -10,7 +10,8 @@
 
 The ``_PREFILL_TENSOR_ORDER`` / ``_DECODE_TENSOR_ORDER`` tuples below ARE the
 positional contracts of ``l3_prefill_fwd`` (102 args) and ``l3_decode_fwd``
-(110 args) -- register them in exactly this order.  Every argument declares its
+(110 args). Fused decode also binds K=7 draft counts and resident state.
+Every argument declares its
 kind at registration: host-shared slots (per-step metadata), static weights
 (upload-once), worker-resident cache pools and scratch (runner materializers),
 and the stacked layer-weight banks.
@@ -41,6 +42,8 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_DECODE_TOKENS,
     DSPARK_BLOCK_SIZE,
     DSPARK_DRAFTER_CONTEXT_ROWS,
+    DSPARK_DRAFTER_BATCHES,
+    DSPARK_DRAFTER_TABLE_BLOCKS,
     DSPARK_DRAFTER_KV_BLOCKS,
     DSPARK_DRAFTER_MAX_BATCH,
     DSPARK_DRAFTER_QUERY_WIDTH,
@@ -83,6 +86,7 @@ __all__ = [
     "prefill_task_args",
 ]
 
+
 # ---- shared source name sets ----
 # Stacked layer-weight bank names shared by prefill and decode.
 _PREFILL_STATIC_WEIGHT_NAMES = ("hc_head_fn", "hc_head_scale", "hc_head_base",
@@ -99,7 +103,7 @@ _CACHE_POOL_NAMES = (
 )
 
 
-def _prefill_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
+def _prefill_slots(layout, *, host_hidden: bool = False) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
     """Host-shared prefill slot name -> (dtype, full shape)."""
     ranks = layout.ranks
     tokens = layout.prefill_tokens
@@ -169,6 +173,10 @@ def _prefill_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
             torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_SAMPLED_IDS_PAD),
         ),
     }
+    if host_hidden:
+        slot_specs["dspark_target_hidden"] = (
+            torch.bfloat16, (ranks, local_tokens, DSPARK_MAIN_HIDDEN_DIM),
+        )
     return slot_specs
 
 
@@ -218,7 +226,9 @@ def _prefill_scratch_sources(runner: DSparkModelRunner) -> dict[str, Any]:
 def prefill_task_args(runner: DSparkModelRunner) -> TaskArgs:
     """Build the ``TaskArgs`` for the packed ``l3_prefill_fwd`` dispatch."""
     layout = runner._compiled.layout
-    slot_specs = _prefill_slots(layout)
+    slot_specs = _prefill_slots(
+        layout, host_hidden=runner._compiled.prefill_async and runner._compiled.prefill_capture is None,
+    )
     static_weights = set(_PREFILL_STATIC_WEIGHT_NAMES)
     cache_pools = set(_CACHE_POOL_NAMES)
     scratch = _prefill_scratch_sources(runner)
@@ -586,6 +596,29 @@ def _drafter_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
         "query_freqs_sin": (torch.bfloat16, (ranks, query, *rope)),
         "query_group_freqs_cos": (torch.bfloat16, (ranks, group_query, *rope)),
         "query_group_freqs_sin": (torch.bfloat16, (ranks, group_query, *rope)),
+    }
+
+
+def bootstrap_metadata_specs(ranks: int) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    """Ordered output ABI for the descriptor-driven bootstrap metadata program."""
+    query = DSPARK_DRAFTER_MAX_BATCH * DSPARK_DRAFTER_QUERY_WIDTH
+    return {
+        "tail_selectors": ((ranks, DSPARK_DRAFTER_BATCHES[0], 4), torch.int32),
+        "num_sampled": ((ranks, DSPARK_DRAFTER_BATCHES[0]), torch.int32),
+        "last_sampled": ((ranks, DSPARK_DRAFTER_BATCHES[0]), torch.int64),
+        "anchor_positions": ((ranks, DSPARK_DRAFTER_BATCHES[0]), torch.int32),
+        "block_tables": ((ranks, 3, DSPARK_DRAFTER_BATCHES[0], DSPARK_DRAFTER_TABLE_BLOCKS), torch.int32),
+        "context_group_position_ids": ((ranks, 4 * DSPARK_SLIDING_WINDOW), torch.int32),
+        "context_group_slot_mapping": ((ranks, 3, 4 * DSPARK_SLIDING_WINDOW), torch.int64),
+        "context_group_freqs_cos": ((ranks, 4 * DSPARK_SLIDING_WINDOW, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
+        "context_group_freqs_sin": ((ranks, 4 * DSPARK_SLIDING_WINDOW, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
+        "query_group_position_ids": ((ranks, 4 * query), torch.int32),
+        "query_group_slot_mapping": ((ranks, 3, 4 * query), torch.int64),
+        "query_freqs_cos": ((ranks, query, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
+        "query_freqs_sin": ((ranks, query, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
+        "query_group_freqs_cos": ((ranks, 4 * query, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
+        "query_group_freqs_sin": ((ranks, 4 * query, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
+        "logit_row_indices": ((ranks, 128), torch.int32),
     }
 
 

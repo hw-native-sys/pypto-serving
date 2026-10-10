@@ -96,6 +96,10 @@ _DSPARK_IMPORT_MODULES = (
     "prefill_indexer_compressor",
     "prefill_layer",
     "prefill_o_proj",
+    "prefill_state",
+    "prefill_bootstrap",
+    "prefill_bootstrap_metadata",
+    "prefill_bootstrap_one_l2",
     "prefill_sparse_attn",
     "prefill_swa",
     "qkv_proj_rope",
@@ -173,6 +177,12 @@ def _dspark_import_context(
     sys.path.insert(0, str(kernel_dir))
     sys.path.insert(0, str(pypto_lib_root))
     try:
+        # Small standalone programs must not depend on importing MoE first to
+        # replace config's default EP=8 with the requested topology.
+        sys.modules.pop("config", None)
+        config = importlib.import_module("config")
+        config.EP = int(ep)
+        config.TP = int(tp)
         yield
     finally:
         sys.argv = old_argv
@@ -367,11 +377,52 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             )
 
         prefill = None
+        prefill_capture = None
+        prefill_extract = None
+        prefill_extract_batched = None
+        prefill_publish = None
+        bootstrap_tokens = None
+        bootstrap_metadata = None
+        bootstrap_one_l2 = None
+        normal_k7 = speculative and os.environ.get("PYPTO_DSPARK_BOOTSTRAP_METADATA_DEVICE") != "0"
+        prefill_async_flag = os.environ.get("PYPTO_DSPARK_PREFILL_ASYNC")
+        prefill_async = (prefill_async_flag == "1" or (prefill_async_flag is None and normal_k7))
+        device_bootstrap_metadata = speculative and (
+            os.environ.get("PYPTO_DSPARK_BOOTSTRAP_METADATA_DEVICE") == "1" or (normal_k7 and prefill_async)
+        )
+        bootstrap_one_l2_flag = os.environ.get("PYPTO_DSPARK_BOOTSTRAP_ONE_L2")
+        bootstrap_one_l2_enabled = (
+            bootstrap_one_l2_flag == "1" or (bootstrap_one_l2_flag is None and normal_k7 and prefill_async)
+        )
+        if bootstrap_one_l2_enabled and not device_bootstrap_metadata:
+            raise ValueError("One-L2 DSpark bootstrap requires device bootstrap metadata")
+        device_bootstrap = device_bootstrap_metadata or (
+            speculative and os.environ.get("PYPTO_DSPARK_BOOTSTRAP_DEVICE") == "1"
+        )
+        prefill_device_tail = speculative and (
+            device_bootstrap or os.environ.get("PYPTO_DSPARK_PREFILL_TAIL_DEVICE") == "1"
+        )
+        if prefill_async and (not speculative or (device_bootstrap and not device_bootstrap_metadata)):
+            raise ValueError("Async DSpark prefill requires K=7 and Host metadata; device bootstrap needs metadata")
         decode = None
         rope: DSparkRopeTables | None = None
         if self._compile_kernels:
             modules = self._load_kernel_modules(layout, speculative=speculative)
-            prefill = self._compile_l3_callable("dspark_prefill", modules["prefill_fwd"].l3_prefill_fwd)
+            prefill = self._compile_l3_callable(
+                "dspark_prefill",
+                modules["prefill_fwd"].l3_prefill_fwd,
+            )
+            if prefill_device_tail:
+                prefill_capture = self._compile_l3_callable(
+                    "dspark_prefill_capture", modules["prefill_state"].l3_capture_prefill_tail
+                )
+                prefill_extract = self._compile_l3_callable(
+                    "dspark_prefill_extract", modules["prefill_state"].l3_extract_prefill_tail
+                )
+                if device_bootstrap_metadata:
+                    prefill_extract_batched = self._compile_l3_callable(
+                        "dspark_prefill_extract_batched", modules["prefill_state"].l3_extract_prefill_tails
+                    )
             if speculative:
                 decode = self._compile_l3_callable(
                     "dspark_decode_one_l2",
@@ -381,6 +432,22 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                 decode = self._compile_l3_callable(
                     "dspark_decode", modules["decode_fwd"].l3_decode_fwd
                 )
+            if device_bootstrap:
+                bootstrap_tokens = self._compile_l3_callable(
+                    "dspark_bootstrap_tokens", modules["prefill_bootstrap"].l3_prepare_bootstrap_tokens
+                )
+                prefill_publish = self._compile_l3_callable(
+                    "dspark_bootstrap_publish", modules["prefill_bootstrap"].l3_publish_bootstrap
+                )
+                if device_bootstrap_metadata:
+                    bootstrap_metadata = self._compile_l3_callable(
+                        "dspark_bootstrap_metadata", modules["prefill_bootstrap_metadata"].l3_prepare_bootstrap_metadata
+                    )
+                    if bootstrap_one_l2_enabled:
+                        bootstrap_one_l2 = self._compile_l3_callable(
+                            "dspark_bootstrap_one_l2_batched",
+                            modules["prefill_bootstrap_one_l2"].l3_bootstrap_one_l2,
+                        )
             if speculative:
                 # The fused decode program owns every recurrent decode stage,
                 # but prefill still needs one standalone draft step to seed
@@ -413,6 +480,15 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             kernel_dir=str(self._kernel_dir),
             runtime_model=model,
             prefill=prefill,
+            prefill_async=prefill_async,
+            bootstrap_one_l2_enabled=bootstrap_one_l2_enabled,
+            prefill_capture=prefill_capture,
+            prefill_extract=prefill_extract,
+            prefill_extract_batched=prefill_extract_batched,
+            prefill_publish=prefill_publish,
+            bootstrap_tokens=bootstrap_tokens,
+            bootstrap_metadata=bootstrap_metadata,
+            bootstrap_one_l2=bootstrap_one_l2,
             decode=decode,
             drafter=drafter,
             markov=markov,
@@ -477,8 +553,12 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                 "utils": utils,
                 "decode_fwd": decode_fwd,
                 "prefill_fwd": prefill_fwd,
+                "prefill_state": importlib.import_module("prefill_state"),
+                "prefill_bootstrap": importlib.import_module("prefill_bootstrap"),
+                "prefill_bootstrap_metadata": importlib.import_module("prefill_bootstrap_metadata"),
             }
             if speculative:
+                modules["prefill_bootstrap_one_l2"] = importlib.import_module("prefill_bootstrap_one_l2")
                 modules["dspark_drafter"] = importlib.import_module("dspark_drafter")
                 modules["dspark_markov"] = importlib.import_module("dspark_markov")
                 modules["decode_fwd_dspark"] = importlib.import_module(

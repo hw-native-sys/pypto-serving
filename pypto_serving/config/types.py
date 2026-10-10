@@ -298,6 +298,9 @@ class PrefillBatch:
     chunk_lens: list[int]
     chunk_offsets: list[int]
     chunk_starts: list[int]
+    # Stable full prompt lengths. Unlike seq_lens, these do not change between
+    # chunked-prefill steps and let device prepare identify the terminal chunk.
+    prompt_lens: list[int] = field(default_factory=list)
     allow_device_greedy_sampling: bool = False
     allow_device_topk_sampling: bool = False
     kv_allocations: list[KvAllocation] = field(default_factory=list)

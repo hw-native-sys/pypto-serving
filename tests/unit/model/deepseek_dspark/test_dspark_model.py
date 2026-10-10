@@ -165,6 +165,7 @@ def test_prefill_to_decode_staging_contract() -> None:
         token_ids=torch.arange(tokens * 2, dtype=torch.long),
         input_embeddings=embeddings,
         seq_lens=[tokens, 128 + tokens],
+        prompt_lens=[tokens, 128 + tokens],
         chunk_lens=[tokens, tokens],
         chunk_offsets=[0, tokens],
         chunk_starts=[0, 128],
@@ -278,9 +279,10 @@ def test_prefill_context_bound_uses_each_requests_own_length() -> None:
         return PrefillBatch(
             request_ids=["group-0", "group-2"],
             token_ids=torch.arange(tokens + short_tokens, dtype=torch.long),
-            input_embeddings=embeddings,
-            seq_lens=[tokens, chunk_start + short_tokens],
-            chunk_lens=[tokens, short_tokens],
+                input_embeddings=embeddings,
+                seq_lens=[tokens, chunk_start + short_tokens],
+                prompt_lens=[tokens, chunk_start + short_tokens],
+                chunk_lens=[tokens, short_tokens],
             chunk_offsets=[0, tokens],
             chunk_starts=[0, chunk_start],
             block_ids_by_group=_block_rows(2),
@@ -303,6 +305,7 @@ def _packed_prefill_batch(lengths=(5, 7, 6), groups=(0, 2, 0), starts=(0, 32, 64
         token_ids=torch.arange(total, dtype=torch.long),
         input_embeddings=torch.arange(total * 4, dtype=torch.float32).reshape(total, 4),
         seq_lens=[start + length for start, length in zip(starts, lengths)],
+        prompt_lens=[start + length for start, length in zip(starts, lengths)],
         chunk_lens=list(lengths),
         chunk_offsets=offsets,
         chunk_starts=list(starts),
@@ -421,7 +424,7 @@ def test_packed_prefill_tail_extraction_crosses_rank_bands():
 
 def test_prefill_seeding_uses_independent_waves_for_same_group(monkeypatch):
     runner = _runner()
-    runner._compiled = SimpleNamespace(num_speculative_tokens=7)
+    runner._compiled = SimpleNamespace(num_speculative_tokens=7, prefill_publish=None, bootstrap_metadata=None)
     for request_id, group in (("a", 0), ("b", 0), ("c", 2), ("d", 2), ("e", 0)):
         runner._drafter_states[request_id] = SimpleNamespace(group=group)
     waves = []
@@ -816,6 +819,7 @@ def test_cached_suffix_prefill_uses_absolute_positions_and_new_compressed_page(c
     batch = PrefillBatch(
         request_ids=["hit"], token_ids=torch.arange(128),
         input_embeddings=torch.ones((128, 4)), seq_lens=[cached_tokens + 128],
+        prompt_lens=[cached_tokens + 128],
         chunk_lens=[128], chunk_offsets=[0], chunk_starts=[cached_tokens],
         block_ids_by_group=[blocks], cache_partitions=[2],
     )

@@ -206,6 +206,12 @@ def main() -> None:
         label = label_by_hid.get(hid)
         if label is None:
             raise RuntimeError(f"unclassified callable hid={hid}")
+        runner = one_event_alias(events, "chip.run.runner_run", "simpler_run.runner_run")
+        if runner is None:
+            probe = one_event_alias(events, "chip.run.bind.compatibility", "simpler_run.bind.compatibility")
+            if probe is None:
+                raise RuntimeError("Host invocation lacks execution and compatibility probe")
+            label = "probe." + label
         sequence_by_pid[raw_pid][label] += 1
         sequence = sequence_by_pid[raw_pid][label]
         decode_step = sequence if label.startswith("decode") else None
@@ -243,7 +249,7 @@ def main() -> None:
                     "tid": device,
                     "ts": float(source_event["ts"]) - origin_us,
                     "dur": float(source_event["dur"]),
-                    "cname": COLORS[label] if stage == "simpler_run" else "thread_state_running",
+                    "cname": COLORS.get(label, "thread_state_iowait") if stage == "simpler_run" else "thread_state_running",
                     "args": {
                         **common_args,
                         "strace_name": source_name,

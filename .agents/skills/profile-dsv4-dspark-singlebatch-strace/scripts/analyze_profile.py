@@ -88,8 +88,36 @@ def span_by_alias(names: dict, *aliases: str):
     raise KeyError(f"missing span aliases: {aliases}")
 
 
-def classify_callables(invocations: list) -> tuple[dict[str, str], dict[str, int]]:
+def classify_callables(invocations: list, serving_spans: list | None = None) -> tuple[dict[str, str], dict[str, int]]:
     counts = Counter(invocation.hid for invocation in invocations)
+    if serving_spans is not None:
+        dispatches = sorted(
+            (event for event in serving_spans if event.get("cat") == "kernel"
+             and str(event.get("name", "")).endswith((".worker_run", ".worker_submit"))),
+            key=lambda event: float(event["ts"]),
+        )
+        ordered = sorted(invocations, key=lambda invocation: invocation.root().ts)
+        if len(dispatches) != len(ordered):
+            raise RuntimeError(
+                f"cannot align named dispatches ({len(dispatches)}) with rank invocations ({len(ordered)})"
+            )
+        names = {}
+        for event, invocation in zip(dispatches, ordered, strict=True):
+            name = event["name"].rsplit(".", 1)[0]
+            previous = names.setdefault(invocation.hid, name)
+            if previous != name:
+                raise RuntimeError(f"ambiguous callable {invocation.hid}: {previous} versus {name}")
+        known = {
+            "dspark_prefill": "prefill.dspark",
+            "dspark_decode_one_l2": "decode.main+verify+drafter+markov+state_commit",
+            "dspark_decode": "decode.main+verify",
+            "dspark_drafter_bootstrap": "dspark.drafter",
+            "dspark_markov_sample": "dspark.markov",
+        }
+        labels = {hid: known.get(name, name) for hid, name in names.items()}
+        if sum(label.startswith("decode.") for label in labels.values()) != 1:
+            raise RuntimeError(f"expected one named target decode callable, got {labels}")
+        return labels, dict(counts)
     first_ts = {
         hid: min(invocation.root().ts for invocation in invocations if invocation.hid == hid)
         for hid in counts
@@ -145,6 +173,31 @@ def classify_callables(invocations: list) -> tuple[dict[str, str], dict[str, int
     else:
         raise RuntimeError(f"cannot classify DSpark single-batch callables: {counts}")
     return labels, dict(counts)
+
+
+def split_execution_probes(invocations: list) -> tuple[list, list]:
+    executions, probes = [], []
+    for invocation in invocations:
+        names = invocation.by_name()
+        if "chip.run.runner_run" in names or "simpler_run.runner_run" in names:
+            executions.append(invocation)
+        elif "chip.run.bind.compatibility" in names or "simpler_run.bind.compatibility" in names:
+            probes.append(invocation)
+        else:
+            raise RuntimeError(f"invocation {invocation.pid}/{invocation.inv} has no execution or compatibility probe")
+
+    def run_key(invocation):
+        match = re.search(r"\brun_id=(\d+)", invocation.root().attrs)
+        if match is None:
+            raise RuntimeError("compatibility attribution requires runtime run_id")
+        return invocation.pid, invocation.hid, match.group(1)
+
+    if probes:
+        executed = {run_key(invocation) for invocation in executions}
+        for invocation in probes:
+            if run_key(invocation) not in executed:
+                raise RuntimeError("compatibility probe has no matching completed execution")
+    return executions, probes
 
 
 def main() -> None:
@@ -205,6 +258,8 @@ def main() -> None:
             selected.append(invocation)
     if not selected:
         raise RuntimeError("no Host STRACE invocation overlaps the formal serving profile")
+    all_selected = selected
+    selected, compatibility_probes = split_execution_probes(all_selected)
 
     by_pid: dict[int, list] = defaultdict(list)
     for invocation in selected:
@@ -219,7 +274,7 @@ def main() -> None:
         raise RuntimeError("profiled callable counts differ across ranks")
 
     reference_pid = min(by_pid, key=pid_to_device.get)
-    labels, callable_counts = classify_callables(by_pid[reference_pid])
+    labels, callable_counts = classify_callables(by_pid[reference_pid], serving_spans)
     decode_hid = next(hid for hid, label in labels.items() if label.startswith("decode"))
     per_rank_decode = {
         pid: sorted(
@@ -268,7 +323,7 @@ def main() -> None:
             }
         )
 
-    simpler_payload = to_chrome_trace(selected, bucket_by_hid(selected))
+    simpler_payload = to_chrome_trace(all_selected, bucket_by_hid(all_selected))
     (artifact_dir / "simpler-swimlane.json").write_text(
         json.dumps(simpler_payload, indent=2) + "\n", encoding="utf-8"
     )
@@ -304,6 +359,10 @@ def main() -> None:
         "simpler": {
             "device_effective_available": False,
             "selected_invocations": len(selected),
+            "compatibility_probes": {
+                "count": len(compatibility_probes),
+                "host_ms": sum(span_ms(item.root()) for item in compatibility_probes),
+            },
             "selected_invocations_per_rank": {
                 str(pid_to_device[pid]): len(rows) for pid, rows in by_pid.items()
             },

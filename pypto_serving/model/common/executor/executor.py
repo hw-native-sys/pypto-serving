@@ -137,6 +137,28 @@ class ModelExecutor(ABC):
         """Return whether dispatch still needs the prior host-sampled token."""
         return True
 
+    @property
+    def supports_async_prefill_reclaim(self) -> bool:
+        return False
+
+    @property
+    def prefill_tail_requires_reclaim_before_dispatch(self) -> bool:
+        return False
+
+    def prepare_prefill(self, model: RuntimeModel, batch: PrefillBatch, *, buffer_slot: int) -> object:
+        raise NotImplementedError(f"{type(self).__name__} does not support async prefill preparation")
+
+    def dispatch_prepared_prefill(self, model: RuntimeModel, batch: PrefillBatch, prepared: object) -> object:
+        raise NotImplementedError(f"{type(self).__name__} does not support split prefill dispatch")
+
+    def reclaim_prepared_prefill(self, pending: object) -> PrefillResult:
+        raise NotImplementedError(f"{type(self).__name__} does not support split prefill reclaim")
+
+    def run_prefill_in_slot(
+        self, model: RuntimeModel, batch: PrefillBatch, *, buffer_slot: int,
+    ) -> PrefillResult:
+        raise NotImplementedError(f"{type(self).__name__} does not support owned prefill slots")
+
     def lookup_embeddings(self, model: RuntimeModel, token_ids: torch.Tensor) -> torch.Tensor:
         """Return embedding rows for ``token_ids`` on the model runtime device."""
         token_ids = token_ids.to(device=model.runtime.device, dtype=torch.long)
