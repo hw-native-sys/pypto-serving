@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+import ctypes
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -507,3 +508,53 @@ class _MemoryInfoFakeWorker:
     def device_memory_info(self, worker_id=0):
         self.queried_worker_ids.append(worker_id)
         return self._info
+
+
+class _DirtyKvWorker:
+    """Model recycled device memory containing NaNs before initialization."""
+
+    def __init__(self, fail_copy=False):
+        self.fail_copy = fail_copy
+        self.freed = []
+        self.copy_sizes = []
+
+    def alloc_tensor(self, shape, dtype):
+        self.storage = torch.full(shape, float("nan"), dtype=dtype)
+        return SimpleNamespace(data_ptr=self.storage.data_ptr(), nbytes=self.storage.nbytes)
+
+    def copy_to(self, dst, src, nbytes, *, dst_offset):
+        if self.fail_copy:
+            raise RuntimeError("copy failed")
+        ctypes.memmove(dst + dst_offset, src, nbytes)
+        self.copy_sizes.append(nbytes)
+
+    def free_tensor(self, tensor):
+        self.freed.append(tensor)
+
+
+@pytest.mark.parametrize("shape", [(3, 5), (2049, 4096)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_kv_cache_allocation_clears_recycled_nan_pages(monkeypatch, shape, dtype):
+    runner = ModelRunner(compiled=None, device_id=0)
+    worker = _DirtyKvWorker()
+    monkeypatch.setattr(runner, "_shared_l3_worker", lambda: worker)
+
+    tensor = runner._alloc_kv_cache_tensor(shape, dtype)
+
+    assert torch.isfinite(worker.storage).all()
+    assert torch.count_nonzero(worker.storage) == 0
+    assert sum(worker.copy_sizes) == tensor.nbytes
+    assert max(worker.copy_sizes) <= 16 * 1024 * 1024
+    assert not worker.freed
+
+
+def test_kv_cache_allocation_frees_buffer_if_initialization_fails(monkeypatch):
+    runner = ModelRunner(compiled=None, device_id=0)
+    worker = _DirtyKvWorker(fail_copy=True)
+    monkeypatch.setattr(runner, "_shared_l3_worker", lambda: worker)
+
+    with pytest.raises(RuntimeError, match="copy failed"):
+        runner._alloc_kv_cache_tensor((3, 5), torch.bfloat16)
+
+    assert len(worker.freed) == 1
+    assert worker.freed[0].data_ptr == worker.storage.data_ptr()
