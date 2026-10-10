@@ -103,7 +103,7 @@ def test_adapter_owns_eight_region_registry_and_transfer_policy() -> None:
 
 
 def test_adapter_plans_closed_then_partial_final_pages_and_builds_manifest() -> None:
-    assert DSV4_DSPARK_K7_CONTRACT.version == 6
+    assert DSV4_DSPARK_K7_CONTRACT.version == 7
     assert DSV4_DSPARK_K7_CONTRACT.continuation_schema.endswith("/v2")
     assert not DSV4_DSPARK_K7_CONTRACT.async_scheduling_for_role("prefill")
     assert DSV4_DSPARK_K7_CONTRACT.async_scheduling_for_role("decode")
@@ -243,4 +243,5 @@ def test_adapter_validates_continuation_and_owns_k7_adoption() -> None:
         "eos_token_id": 2,
         "stream": True,
         "output_parser_spec": None,
+        "constraint_spec": None,
     }
