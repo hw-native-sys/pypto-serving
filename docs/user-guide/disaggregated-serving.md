@@ -136,12 +136,21 @@ instead of public generation endpoints.
 For DeepSeek V4, the Router accepts `tools`, `tool_choice`,
 `parallel_tool_calls`, and assistant/tool history. Structured tool-call deltas
 and final calls travel from D to the Router alongside text and reasoning.
-The XGrammar integration branch also accepts strict `auto`, `required`, and a
-named function choice. These requests require matching Serving/Lib grammar
-ABIs and XGrammar on both model nodes; they are not yet device-validated for
-PD. Ordinary non-strict `auto` remains unconstrained. Until Router preflight
-is moved ahead of SSE headers, an invalid constrained schema on a streaming
-PD request can surface as an SSE error after HTTP 200.
+Strict `auto`, `required`, and a named function choice are also supported.
+These requests require matching Serving/Lib grammar ABIs and XGrammar on both
+model nodes. Ordinary non-strict `auto` remains unconstrained. The Router
+performs the one-time P preparation and constraint preflight before returning
+SSE headers, so invalid schemas detected during preparation return HTTP 400.
+Failures during subsequent reservation, transfer, Decode or parsing occur
+after that boundary and cannot change an already-started HTTP response.
+
+The current default P/D Prefix Cache configuration has been device-validated
+with completion/chat, streaming and non-streaming output, constrained tools,
+tool history, cancellation, cold/hot prefix reuse and mixed requests. This is
+a functional check, not a claim of identical token sequences between repeated
+inferences or validation of every deployment combination and maximum length.
+The Router finalizes handoff state and cleanup before publishing the terminal
+output; intermediate outputs continue to stream immediately.
 
 | Endpoint | Process | Contents |
 | --- | --- | --- |
