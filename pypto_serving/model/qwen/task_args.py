@@ -25,9 +25,10 @@ in the builder:
   length-``total_tokens`` *slices* over the full kernel-batch slots. The slots
   own the full buffers; the runner splices the per-call slices into the built
   tuple.
-* ``qwen3_decode_host`` writes ``logits`` / ``next_hidden`` to device-resident
-  scratch under device sampling instead of the host slots. The runner splices
-  the device scratch into the built tuple when device sampling is active.
+* ``qwen3_decode_host`` receives runtime-batch prefix views over its max-capacity
+  slots. It writes ``logits`` / ``next_hidden`` to device-resident scratch under
+  device sampling instead of the host slots; the runner splices and narrows the
+  device scratch when device sampling is active.
 """
 
 from __future__ import annotations
@@ -181,10 +182,10 @@ _DECODE_ORDER = (
 def decode_task_args(runner: Qwen314BModelRunner) -> TaskArgs:
     """Build the ``TaskArgs`` for the single ``qwen3_decode_host`` dispatch.
 
-    Host-shared I/O buffers are slots; static weights are eager markers; the
-    KV-cache handles are lazy sources. The caller splices device-resident
-    ``logits`` / ``next_hidden`` scratch into the built tuple when device
-    sampling is active.
+    Host-shared I/O buffers are max-capacity slots; static weights are eager
+    markers; the KV-cache handles are lazy sources. The caller narrows all
+    batch-shaped slots to the runtime batch and splices device-resident
+    ``logits`` / ``next_hidden`` scratch when device sampling is active.
     """
     slot_specs = _decode_slot_specs(runner._compiled.layout)
     static_weights = set(_STATIC_WEIGHT_ACCESSORS)
