@@ -122,16 +122,17 @@ def test_pd_router_formats_tool_calls_and_roundtrips_history(tmp_path, monkeypat
     assert events[-1]["usage"]["completion_tokens"] == 3
 
 
-def test_pd_router_rejects_unsupported_tool_choice_before_stream(tmp_path, monkeypatch):
+def test_pd_router_forwards_required_tool_choice(tmp_path, monkeypatch):
     async def no_reconcile(self):
         return None
 
-    async def unexpected_generate(self, *_args, **_kwargs):
-        raise AssertionError("request should fail before generation")
-        yield
+    async def fake_generate(self, request_kind, request_json, request_id, publish_immediately=True):
+        assert request_kind == "chat"
+        assert json.loads(request_json)["tool_choice"] == "required"
+        yield _wire(request_id, sequence=1, finished=True)
 
     monkeypatch.setattr(RouterCoordinator, "reconcile_startup", no_reconcile)
-    monkeypatch.setattr(RouterCoordinator, "generate", unexpected_generate)
+    monkeypatch.setattr(RouterCoordinator, "generate", fake_generate)
     with TestClient(create_router_app(_config(tmp_path))) as client:
         response = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "Find a city"}],
@@ -139,8 +140,8 @@ def test_pd_router_rejects_unsupported_tool_choice_before_stream(tmp_path, monke
             "tool_choice": "required",
             "stream": True,
         })
-    assert response.status_code == 400
-    assert response.headers["content-type"].startswith("application/json")
+    assert response.status_code == 200
+    assert _sse_events(response)[-1]["choices"] == []
 
 
 @pytest.mark.parametrize("stream", [False, True])

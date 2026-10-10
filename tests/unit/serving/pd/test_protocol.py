@@ -25,6 +25,8 @@ from pypto_serving.serving.pd.protocol import (
     PrefixMatchSpec,
     QueryHandoff,
     RankMapping,
+    constraint_spec_hash,
+    continuation_metadata_hash,
     decode_message,
     encode_message,
     exchange_and_validate_hello,
@@ -231,6 +233,11 @@ def test_tool_parser_spec_and_outputs_survive_pd_wire_round_trip() -> None:
             tool_choice="auto",
             tool_names=("lookup",),
         ),
+        constraint_spec={
+            "provider_id": "xgrammar", "format_id": "deepseek_v4",
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+            "tool_choice": "required", "reasoning": True,
+        },
     )
     manifest = ChunkManifest(
         key=key,
@@ -249,6 +256,24 @@ def test_tool_parser_spec_and_outputs_survive_pd_wire_round_trip() -> None:
     decoded_manifest = decode_message(encode_message(manifest))
     assert decoded_manifest.continuation == continuation
     assert decoded_manifest.source_prefix_hit_tokens == 128
+    assert constraint_spec_hash(continuation.constraint_spec) == constraint_spec_hash({
+        "reasoning": True, "tool_choice": "required",
+        "tools": [{"function": {"name": "lookup"}, "type": "function"}],
+        "format_id": "deepseek_v4", "provider_id": "xgrammar",
+    })
+    assert continuation_metadata_hash(continuation) != continuation_metadata_hash(
+        ContinuationMetadata(
+            prompt_token_ids=continuation.prompt_token_ids,
+            max_new_tokens=continuation.max_new_tokens,
+            temperature=continuation.temperature,
+            top_p=continuation.top_p,
+            top_k=continuation.top_k,
+            seed=continuation.seed,
+            stop_strings=continuation.stop_strings,
+            eos_token_id=continuation.eos_token_id,
+            output_parser_spec=continuation.output_parser_spec,
+        )
+    )
 
     output = DecodeOutputWire(
         key=key,
