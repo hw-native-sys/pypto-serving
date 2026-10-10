@@ -52,9 +52,10 @@ def test_tools_default_to_auto_and_freeze_only_names():
 
 
 def test_shared_chat_preparation_keeps_tool_schema_for_pd_entrypoint():
-    prompt, tokens, _, spec = _server().prepare_chat(_request(tools=TOOLS))
+    prompt, tokens, _, spec, constraint = _server().prepare_chat(_request(tools=TOOLS))
     assert tokens is None
     assert spec.tool_names == ("lookup",)
+    assert constraint is None
     assert "lookup" in prompt
 
 
