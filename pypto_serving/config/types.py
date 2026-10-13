@@ -114,6 +114,9 @@ class KVCacheGroupSpec:
     # states, including the final pending row. Earlier rows in a large chunk
     # must not be published as complete prefix-cache pages.
     prefill_tail_tokens: int | None = None
+    # Runners opting in accept -1 entries for expired sliding-window pages.
+    # The logical table/ring period stays fixed while physical pages are freed.
+    supports_sparse_blocks: bool = False
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -124,6 +127,8 @@ class KVCacheGroupSpec:
             raise ValueError("KV cache num_blocks must be positive when specified")
         if self.num_partitions <= 0:
             raise ValueError("KV cache num_partitions must be positive")
+        if self.supports_sparse_blocks and self.sliding_window is None:
+            raise ValueError("Sparse KV blocks require a sliding window")
         if self.prefill_tail_tokens is not None:
             if self.prefill_tail_tokens <= 0 or not self.is_eagle_group:
                 raise ValueError("KV cache prefill_tail_tokens requires a positive EAGLE tail extent")
