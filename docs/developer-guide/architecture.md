@@ -60,3 +60,11 @@ Worker responsibilities:
 Model executors implement the model-specific bridge from serving batches to PyPTO kernels. Qwen and DeepSeek V4 have separate executors and runners because their kernel layouts, cache layouts, and parallel contracts differ.
 
 Changes to request scheduling or cache allocation should include focused unit tests under `tests/unit/serving/` and NPU validation when model behavior or device dispatch is affected.
+
+## PyPTO target configuration
+
+The serving CLI retains `--platform` (`a2a3`, `a2a3sim`, `a5`, or `a5sim`).
+The shared executor config builder translates this into PyPTO `backend_type`
+and `execution_mode`; the common kernel compiler preserves both when applying
+per-model options. PyPTO continues to derive its internal platform encoding
+for artifact metadata and caches, including the simulator suffix.
