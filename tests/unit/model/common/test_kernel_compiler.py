@@ -208,3 +208,25 @@ def test_explicit_output_base_keeps_programs_separate(tmp_path):
         compiler.compile(name, jit_fn)
         assert jit_fn.last_config.save_kernels_dir == str(tmp_path / name)
     assert config.save_kernels_dir == str(tmp_path)
+
+
+@pytest.mark.parametrize("platform, backend, mode", [
+    ("a2a3", "Ascend910B", "ONBOARD"),
+    ("a2a3sim", "Ascend910B", "SIM"),
+    ("a5", "Ascend950", "ONBOARD"),
+    ("a5sim", "Ascend950", "SIM"),
+])
+def test_compile_preserves_explicit_target_axes(platform, backend, mode):
+    config = build_pypto_run_config(platform=platform, device_ids=(3, 4))
+    jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
+    KernelCompiler(run_config=config).compile("decode", jit_fn)
+    actual = jit_fn.last_config
+    assert actual.backend_type.name == backend
+    assert actual.execution_mode.name == mode
+    assert actual.platform == platform
+    assert actual.distributed_config.device_ids == [3, 4]
+
+
+def test_build_run_config_rejects_unknown_platform():
+    with pytest.raises(ValueError, match="Invalid platform"):
+        build_pypto_run_config(platform="a5typo", device_ids=(0,))
