@@ -653,6 +653,26 @@ runs:
         retry_build "$PYPTO_SRC" || exit 1
         retry_build "$PYPTO_SRC/runtime" || exit 1
 
+    - name: Verify required PyPTO target API
+      # Older builds accept backend_type but ignore it. Check the selected
+      # target, not just imports, before borrowing devices for model tests.
+      # This requires hw-native-sys/pypto#2975 in the source built above.
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      run: |
+        source activate.sh
+        python - <<'PY'
+        from pypto.backend import BackendType
+        from pypto.runtime import ExecutionMode, RunConfig
+
+        for mode, platform in ((ExecutionMode.SIM, "a5sim"), (ExecutionMode.ONBOARD, "a5")):
+            config = RunConfig(backend_type=BackendType.Ascend950, execution_mode=mode)
+            if (config.backend_type != BackendType.Ascend950
+                    or config.execution_mode != mode or config.platform != platform):
+                raise SystemExit("Rebuild PyPTO with hw-native-sys/pypto#2975; target selection is incompatible")
+        print("PyPTO target API OK")
+        PY
+
     - name: Install pypto-serving and its dependencies
       shell: bash
       working-directory: ${{ inputs.checkout-path }}

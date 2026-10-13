@@ -40,6 +40,28 @@ For model conversion and checkpoint loading, make sure `safetensors` and `transf
 python -m pip install safetensors transformers
 ```
 
+## Required PyPTO API
+
+Build PyPTO from a revision containing [PyPTO #2975](https://github.com/hw-native-sys/pypto/pull/2975), and build `simpler` from that checkout's `runtime` submodule. Merge that PyPTO change before deploying this serving revision. The `pypto` and `simpler` packages on PyPI are unrelated projects and must not be used to satisfy this requirement.
+
+The required API is `RunConfig(backend_type=..., execution_mode=...)`, with both values honored. Some older builds accept `backend_type` but silently keep the default Ascend910B backend, so an import check alone is insufficient. After installing PyPTO, run this check in the same Python environment used for serving; CI runs the same check before model tests:
+
+```bash
+python - <<'PY'
+from pypto.backend import BackendType
+from pypto.runtime import ExecutionMode, RunConfig
+
+for mode, platform in ((ExecutionMode.SIM, "a5sim"), (ExecutionMode.ONBOARD, "a5")):
+    config = RunConfig(backend_type=BackendType.Ascend950, execution_mode=mode)
+    if (config.backend_type != BackendType.Ascend950
+            or config.execution_mode != mode or config.platform != platform):
+        raise SystemExit("Rebuild PyPTO with hw-native-sys/pypto#2975; target selection is incompatible")
+print("PyPTO target API OK")
+PY
+```
+
+If the check fails, rebuild and reinstall PyPTO and `simpler` from the compatible checkout before starting a server.
+
 ## Verify the Install
 
 After installation, confirm the CLI is available:
