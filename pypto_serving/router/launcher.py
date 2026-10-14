@@ -220,7 +220,7 @@ class SshTransport(Transport):
             payload = f"cd {shlex.quote(host.workdir)} && {payload}"
         if detach:
             target = shlex.quote(log_path) if log_path else "/dev/null"
-            payload = f"mkdir -p $(dirname {target}) 2>/dev/null; nohup {payload} >> {target} 2>&1 &"
+            payload = f'mkdir -p "$(dirname {target})" 2>/dev/null; nohup {payload} >> {target} 2>&1 &'
         await _run_and_wait([*self.ssh_argv(host), payload])
 
 

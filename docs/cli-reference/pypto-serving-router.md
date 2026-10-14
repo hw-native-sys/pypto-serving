@@ -36,7 +36,7 @@ A JSON file with `replicas` (endpoints that already exist) and/or `hosts` (machi
 
 ### `hosts` — machines the router may launch on
 
-One slot per declared device; a replica launched from a slot is owned by the router.
+One slot per group of `devices_per_replica` devices, taken from `devices` in order; a replica launched from a slot is owned by the router.
 
 | Field | Default | Description |
 | --- | --- | --- |

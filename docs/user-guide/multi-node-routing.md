@@ -143,7 +143,7 @@ Ports are derived as `port_base + device`, so two replicas on one host can never
 
 `devices` says which cards the router may use; `devices_per_replica` says how many of them one replica needs. The host's capacity is the quotient:
 
-```
+```text
 capacity = len(devices) // devices_per_replica
 ```
 

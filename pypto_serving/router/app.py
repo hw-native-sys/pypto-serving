@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import logging
+import os
 import secrets
 from collections.abc import Sequence
 from pathlib import Path
@@ -41,6 +42,9 @@ from pypto_serving.router.proxy import SESSION_HEADER, ReplicaProxy
 from pypto_serving.router.routing import HealthMonitor, ReplicaRegistry, SessionDirectory
 
 logger = logging.getLogger(__name__)
+
+# Preferred over --admin-token: argv is world-readable on the router host.
+ADMIN_TOKEN_ENV = "PYPTO_ROUTER_ADMIN_TOKEN"
 
 try:
     from fastapi import FastAPI, Request
@@ -315,9 +319,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Where to record launched replicas so a restarted router can adopt "
                              "them instead of paying for a fresh model load.")
     parser.add_argument("--admin-token", default=None, metavar="TOKEN",
-                        help="Require 'Authorization: Bearer TOKEN' on /replicas. Those routes "
-                             "start processes on other machines; without a token they are open "
-                             "to anyone who can reach the port.")
+                        help=f"Require 'Authorization: Bearer TOKEN' on /replicas. Those routes "
+                             f"start processes on other machines; without a token they are open "
+                             f"to anyone who can reach the port. Prefer {ADMIN_TOKEN_ENV}: a "
+                             f"token in argv is readable by any local user through ps.")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0).")
     parser.add_argument("--port", type=int, default=8000, help="Port (default: 8000).")
     parser.add_argument("--session-ttl", type=float, default=DEFAULT_SESSION_TTL_SECONDS,
@@ -380,13 +385,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"  Pool: launching {config.initial_replicas} of {config.pool_ceiling} slot(s) at startup")
     print(f"  Session TTL: {config.session_ttl_seconds:g}s, affinity slack: {config.affinity_slack}")
     print("  Endpoints: /v1/completions, /v1/chat/completions, /v1/models, /health, /replicas")
-    if config.hosts and args.admin_token is None:
+    # The environment wins: a token on the command line is visible to every
+    # local user through ps and /proc/<pid>/cmdline, and this one is the only
+    # thing in front of a route that launches processes on other machines.
+    admin_token = os.environ.get(ADMIN_TOKEN_ENV) or args.admin_token
+    if config.hosts and admin_token is None:
         print("  WARNING: /replicas is unauthenticated; it can start processes on other hosts")
+    elif args.admin_token is not None and not os.environ.get(ADMIN_TOKEN_ENV):
+        print(f"  NOTE: --admin-token is visible in ps; prefer {ADMIN_TOKEN_ENV}")
 
     app = create_router_app(
         config,
         state_path=Path(args.state_file) if args.state_file else None,
-        admin_token=args.admin_token,
+        admin_token=admin_token,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0

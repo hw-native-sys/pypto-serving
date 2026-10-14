@@ -192,12 +192,36 @@ class RouterConfig:
         host_names = [host.name for host in self.hosts]
         if len(set(host_names)) != len(host_names):
             raise ValueError(f"host names must be unique: {sorted(host_names)}")
+        # A launched replica is registered under its slot name, so a static
+        # replica already holding that name makes the registry reject it *after*
+        # the process is running -- the launch is lost and its devices stay
+        # taken. Caught here instead, where it is still only a config error.
+        static = set(names)
+        clashes = sorted(
+            f"{host.name}-d{group[0]}"
+            for host in self.hosts
+            for group in host.device_groups()
+            if f"{host.name}-d{group[0]}" in static
+        )
+        if clashes:
+            raise ValueError(
+                "replica names collide with the slot names these hosts generate: "
+                f"{clashes}"
+            )
         if self.session_ttl_seconds <= 0:
             raise ValueError("session_ttl_seconds must be positive")
         if self.affinity_slack < 0:
             raise ValueError("affinity_slack must be non-negative")
         if self.health_interval_seconds <= 0:
             raise ValueError("health_interval_seconds must be positive")
+        # httpx accepts zero and negative timeouts when the client is built, so
+        # nothing rejects them until a transport operation fails -- a connect
+        # timeout of zero fails the probe immediately, and a non-positive
+        # request timeout aborts a proxied upload rather than its response read.
+        if self.request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be positive")
+        if self.connect_timeout_seconds <= 0:
+            raise ValueError("connect_timeout_seconds must be positive")
         if self.launch_timeout_seconds <= 0:
             raise ValueError("launch_timeout_seconds must be positive")
         if self.drain_timeout_seconds <= 0:
@@ -228,6 +252,22 @@ class RouterConfig:
         return min(declared, self.max_replicas)
 
 
+def _parse_name(entry: dict, label: str, default: str) -> str:
+    """Return a present ``name`` once it is known to be a usable string.
+
+    An absent name falls back to the generated default. A present one that is
+    not a non-empty string would otherwise travel as far as the uniqueness
+    check, where a list raises ``TypeError: unhashable type`` -- which the CLI
+    does not catch, so an invalid file crashes instead of reporting itself.
+    """
+    if "name" not in entry:
+        return default
+    name = entry["name"]
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"{label} has an invalid name: {name!r}")
+    return name
+
+
 def _parse_replica(entry: object, index: int) -> ReplicaSpec:
     if not isinstance(entry, dict) or not {"host", "port"} <= set(entry):
         raise ValueError(f"replica {index} needs 'host' and 'port'")
@@ -241,7 +281,8 @@ def _parse_replica(entry: object, index: int) -> ReplicaSpec:
     if scheme not in ("http", "https"):
         raise ValueError(f"replica {index} has an invalid scheme: {scheme!r}")
     return ReplicaSpec(
-        name=entry.get("name") or f"{host}:{port}", host=host, port=port, scheme=scheme,
+        name=_parse_name(entry, f"replica {index}", f"{host}:{port}"),
+        host=host, port=port, scheme=scheme,
     )
 
 
@@ -289,7 +330,7 @@ def _parse_host(entry: object, index: int) -> HostSpec:
         )
 
     return HostSpec(
-        name=entry.get("name") or f"host{index}",
+        name=_parse_name(entry, f"host {index}", f"host{index}"),
         ssh=entry.get("ssh"),
         identity_file=entry.get("identity_file"),
         devices=tuple(devices),

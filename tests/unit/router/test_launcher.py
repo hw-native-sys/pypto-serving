@@ -682,3 +682,113 @@ def test_a_wide_replica_is_launched_and_stopped_as_one_unit():
         assert manager.pool.in_use == 0, "the whole group comes back, not one card"
 
     asyncio.run(check())
+
+
+# --- configuration validation ------------------------------------------------
+#
+# These cover the review findings on RouterConfig and the JSON parsers: each one
+# is a configuration that used to be accepted and then failed later, at a point
+# where the failure was either silent or unrecognisable.
+
+
+@pytest.mark.parametrize("field", ["request_timeout_seconds", "connect_timeout_seconds"])
+@pytest.mark.parametrize("value", [0, -1.0])
+def test_non_positive_transport_timeouts_are_refused(field, value):
+    """httpx builds a client happily with these, so nothing else rejects them."""
+    with pytest.raises(ValueError, match=f"{field} must be positive"):
+        RouterConfig(replicas=(ReplicaSpec(name="r", host="h", port=8001),), **{field: value})
+
+
+def test_a_static_replica_may_not_take_a_generated_slot_name():
+    """Otherwise the launch succeeds, the registry rejects it, and the slot leaks."""
+    host = HostSpec(name="node", devices=(0, 1), model="/m")
+    with pytest.raises(ValueError, match="collide with the slot names"):
+        RouterConfig(
+            replicas=(ReplicaSpec(name="node-d0", host="127.0.0.1", port=9000),),
+            hosts=(host,),
+        )
+
+
+def test_a_static_replica_named_after_an_unused_device_is_fine():
+    """The check is about real collisions, not about the naming scheme."""
+    host = HostSpec(name="node", devices=(0, 1), model="/m")
+    config = RouterConfig(
+        replicas=(ReplicaSpec(name="node-d7", host="127.0.0.1", port=9000),),
+        hosts=(host,),
+    )
+    assert config.pool_ceiling == 2
+
+
+def test_grouped_devices_only_generate_slot_names_for_group_leaders():
+    """With devices_per_replica=2 only d0 and d2 name slots, so d1 is free to use."""
+    host = HostSpec(name="node", devices=(0, 1, 2, 3), devices_per_replica=2, model="/m")
+    config = RouterConfig(
+        replicas=(ReplicaSpec(name="node-d1", host="127.0.0.1", port=9000),), hosts=(host,),
+    )
+    assert config.pool_ceiling == 2
+    with pytest.raises(ValueError, match="collide with the slot names"):
+        RouterConfig(
+            replicas=(ReplicaSpec(name="node-d2", host="127.0.0.1", port=9000),), hosts=(host,),
+        )
+
+
+@pytest.mark.parametrize("name", [["a"], 3, "", "   ", {}])
+def test_a_non_string_name_is_a_configuration_error(tmp_path, name):
+    """It used to reach the uniqueness check and raise TypeError, which the CLI
+    does not catch -- an invalid file crashed instead of reporting itself."""
+    from pypto_serving.router.config import load_fleet_file
+
+    path = tmp_path / "fleet.json"
+    path.write_text(json.dumps({"replicas": [{"name": name, "host": "h", "port": 8001}]}))
+    with pytest.raises(ValueError, match="invalid name"):
+        load_fleet_file(path)
+
+
+def test_an_absent_name_still_gets_its_generated_default(tmp_path):
+    from pypto_serving.router.config import load_fleet_file
+
+    path = tmp_path / "fleet.json"
+    path.write_text(json.dumps({"replicas": [{"host": "h", "port": 8001}]}))
+    replicas, _hosts = load_fleet_file(path)
+    assert replicas[0].name == "h:8001"
+
+
+def test_a_host_name_is_validated_the_same_way(tmp_path):
+    from pypto_serving.router.config import load_fleet_file
+
+    path = tmp_path / "fleet.json"
+    path.write_text(json.dumps({"hosts": [{"name": [], "devices": [0], "model": "/m"}]}))
+    with pytest.raises(ValueError, match="invalid name"):
+        load_fleet_file(path)
+
+
+def test_the_remote_log_directory_is_quoted(tmp_path):
+    """A log_dir with a space would otherwise split into two mkdir arguments."""
+    host = HostSpec(
+        name="node", ssh="user@host", devices=(0,), model="/m",
+        log_dir="/var/log/pypto router",
+    )
+    pool = HostPool(RouterConfig(hosts=(host,)))
+    slot = pool.allocate()
+    transport = SshTransport()
+    payload = None
+
+    async def capture(argv):
+        nonlocal payload
+        payload = argv[-1]
+
+    asyncio.run(_payload_of(transport, host, pool, slot, capture))
+    assert '"$(dirname ' in payload
+
+
+async def _payload_of(transport, host, pool, slot, capture):
+    import pypto_serving.router.launcher as launcher_module
+
+    original = launcher_module._run_and_wait
+    launcher_module._run_and_wait = capture
+    try:
+        await transport.run(
+            host, pool.launch_argv(slot), {}, detach=True, log_path=slot.log_path,
+        )
+    finally:
+        launcher_module._run_and_wait = original
