@@ -18,7 +18,7 @@ from pypto_serving.router.config import RouterConfig
 from pypto_serving.router.directory import WorkerDirectory
 from pypto_serving.router.policy import RoundRobinRoutePolicy, create_route_policy
 from pypto_serving.serving.pd.config import PDCapabilities, PDRole, load_pd_document
-from pypto_serving.serving.pd.http_api import CapacitySnapshot, NodeDescriptor
+from pypto_serving.serving.pd.protocol import CapacitySnapshot, NodeDescriptor
 from pypto_serving.serving.pd.protocol import CapabilityWire
 
 
@@ -67,7 +67,7 @@ def _capacity(
         node_id=node_id,
         role=role.value,
         active_handoffs=active,
-        prepared_requests=0,
+        pending_requests=0,
         reservations=active,
         quarantined_reservations=0,
         snapshot_sequence=1,

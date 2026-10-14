@@ -13,8 +13,8 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
-from pypto_serving.serving.pd.config import PDRole
-from pypto_serving.serving.pd.http_api import CapacitySnapshot, NodeDescriptor
+from pypto_serving.serving.pd.config import PD_SCHEMA_VERSION, PDRole
+from pypto_serving.serving.pd.protocol import CapacitySnapshot, NodeDescriptor
 
 from .client import NodeClient
 from .policy import RoutePolicy
@@ -265,6 +265,8 @@ class WorkerDirectory:
     ) -> None:
         if descriptor.role != role.value:
             raise ValueError("Router endpoint role differs from its configured pool")
+        if descriptor.capabilities.schema_version != PD_SCHEMA_VERSION:
+            raise ValueError("Router and node PD generation protocols differ")
         if descriptor.run_id != self.run_id:
             raise ValueError("Router and PD node run_id differ")
         if descriptor.health != "READY":

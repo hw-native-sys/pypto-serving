@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Router-owned request transaction across a compatible P/D node pool."""
+"""Router routing/admission; node-owned handoff and public response passthrough."""
 
 from __future__ import annotations
 
@@ -17,74 +17,69 @@ import time
 import uuid
 
 import anyio
+import msgspec
 
-from pypto_serving.serving.pd.http_api import (
-    AbortHandoffHTTP,
-    AuthorizeRouteHTTP,
-    DecodeStreamFrame,
-    ExecutePrefillHTTP,
-    HandoffHTTP,
-    PlacementReservation,
-    PrefillHandoffResult,
-    PrepareRequestHTTP,
-    PreparedRequest,
-    ReservePlacementHTTP,
-    ReservePlacementResult,
-    capability_compatibility_digest,
-)
-from pypto_serving.serving.pd.protocol import (
-    DecodeOutputWire,
-    HandoffKey,
-    HandoffStatus,
-)
+from pypto_serving.serving.pd.config import PD_SCHEMA_VERSION
+from pypto_serving.serving.pd.generation import generation_body, public_document, request_fingerprint
+from pypto_serving.serving.pd.http_api import AbortHandoffHTTP, HandoffHTTP
+from pypto_serving.serving.pd.protocol import GenerationContext, HandoffKey, HandoffStatus, PrefillResult
 from pypto_serving.serving.pd.admission import FairHandoffAdmission
 from pypto_serving.serving.pd.observability import PDMetrics
 
+from .client import PublicResult
 from .config import RouterConfig
 from .directory import WorkerDirectory
 from .journal import RouterJournal
 from .recovery import (
-    FixedPairRecoveryController,
-    FixedPairRuntimeManager,
-    RecoveryPhase,
-    ReplayableRequest,
-    RuntimeGeneration,
+    FixedPairRecoveryController, FixedPairRuntimeManager, RecoveryPhase,
+    ReplayableRequest, RuntimeGeneration,
 )
 
 
-class RouterCoordinator:
-    """Router-owned route identity, intent, output, and failure decision."""
+class SourceRejected(RuntimeError):
+    def __init__(self, result: PrefillResult):
+        super().__init__(f"Prefill rejected safely: {result.error_message or result.error_code}")
+        self.result = result
 
-    def __init__(
-        self,
-        config: RouterConfig,
-        directory: WorkerDirectory,
-        journal: RouterJournal,
-        runtime_manager: FixedPairRuntimeManager | None = None,
-    ) -> None:
-        self.config = config
-        self.directory = directory
-        self.journal = journal
+
+class DecodeStreamError(RuntimeError):
+    def __init__(self, frame: bytes):
+        super().__init__("Decode returned a public SSE error")
+        self.frame = frame
+
+
+def sse_document(frame: bytes):
+    data = b"\n".join(line[5:].lstrip() for line in frame.splitlines() if line.startswith(b"data:"))
+    if data == b"[DONE]":
+        return None
+    value = msgspec.json.decode(data)
+    if not isinstance(value, dict):
+        raise ValueError("Decode SSE data is not an object")
+    return value
+
+
+def terminal_document(value) -> bool:
+    return value is None or value.get("usage") is not None or any(
+        choice.get("finish_reason") is not None for choice in value.get("choices", ())
+    )
+
+
+class RouterCoordinator:
+    def __init__(self, config: RouterConfig, directory: WorkerDirectory, journal: RouterJournal,
+                 runtime_manager: FixedPairRuntimeManager | None = None) -> None:
+        self.config, self.directory, self.journal = config, directory, journal
         self.metrics = PDMetrics("pd-router", config.run_id)
-        self.admission = FairHandoffAdmission(
-            config.max_active_handoffs,
-            config.max_pending_handoffs,
-            state_observer=self._observe_admission,
-        )
-        # Total public streams stay bounded after their transfer budget is
-        # released. D reservation remains the physical-cache authority.
+        self.admission = FairHandoffAdmission(config.max_active_handoffs, config.max_pending_handoffs,
+                                              state_observer=self._observe_admission)
         self.requests = FairHandoffAdmission(
             config.max_pending_handoffs, config.max_pending_handoffs,
             state_observer=lambda active, queued: self.metrics.set_gauge("requests.active", active),
         )
-        self.recovery = FixedPairRecoveryController(
-            generation=config.data_generation,
-            control_incarnation=config.control_incarnation,
-        )
+        self.recovery = FixedPairRecoveryController(config.data_generation, config.control_incarnation)
         self.runtime_manager = runtime_manager
         self._replayable: dict[str, ReplayableRequest] = {}
-        self._replay_results: dict[str, tuple[DecodeOutputWire, ...]] = {}
-        self._automatic_recovery_task: asyncio.Task[RuntimeGeneration] | None = None
+        self._replay_results: dict[str, tuple[bytes | PublicResult, ...]] = {}
+        self._automatic_recovery_task: asyncio.Task | None = None
 
     def _observe_admission(self, active: int, queued: int) -> None:
         self.metrics.set_gauge("handoffs.active", active)
@@ -137,576 +132,318 @@ class RouterCoordinator:
         )
 
     async def generate(
-        self,
-        request_kind: str,
-        request_json: bytes,
-        request_id: str,
-        *,
-        publish_immediately: bool = True,
-        _signal_prepared: bool = False,
-    ) -> AsyncGenerator[DecodeOutputWire | None, None]:
-        started_ns = time.monotonic_ns()
-        previous_output_ns: int | None = None
-        self.recovery.assert_admission()
+        self, request_kind: str, request_json: bytes, request_id: str, *,
+        publish_immediately: bool = True, _signal_ready: bool = False,
+    ) -> AsyncGenerator[bytes | PublicResult | None, None]:
+        started = time.monotonic_ns()
+        previous = None
+        terminal = []
+        usage = {}
+        signalled = False
         replayable = ReplayableRequest(request_id, request_kind, request_json)
+        self.recovery.assert_admission()
         self._replayable[request_id] = replayable
         self.metrics.increment("requests.total")
-        final = None
+
+        async def consume(stream):
+            nonlocal previous, replayable, usage, signalled
+            async with aclosing(stream):
+                async for output in stream:
+                    if output is None:
+                        signalled = True
+                        yield None
+                        continue
+                    value = (msgspec.json.decode(output.body) if isinstance(output, PublicResult)
+                             else sse_document(output))
+                    if value and value.get("usage") is not None:
+                        usage = value["usage"]
+                    if isinstance(output, PublicResult) or terminal_document(value):
+                        terminal.append(output)
+                        continue
+                    now = time.monotonic_ns()
+                    self.metrics.observe_ns("request.ttft" if previous is None else "request.inter_output",
+                                            now - (started if previous is None else previous))
+                    previous = now
+                    if publish_immediately:
+                        replayable = ReplayableRequest(request_id, request_kind, request_json, True)
+                        self._replayable[request_id] = replayable
+                    yield output
+
         try:
             async with self.requests.admit(), self.admission.admit() as release_handoff:
-                self.metrics.set_gauge("handoffs.active", self.admission.active)
-                self.metrics.set_gauge("handoffs.queued", self.admission.queued)
-                self.metrics.set_peak_gauge(
-                    "handoffs.active_peak", self.admission.active
-                )
-                self.metrics.set_peak_gauge(
-                    "handoffs.queued_peak", self.admission.queued
-                )
-                stream = self._generate_admitted(
-                    request_kind,
-                    request_json,
-                    request_id,
-                    signal_prepared=_signal_prepared,
-                    on_ready=release_handoff,
-                )
-                # Keep the request budget until abort/stream cleanup completes,
-                # including when a slow client closes this generator at yield.
-                async with aclosing(stream):
-                    async for output in stream:
-                        if output is None:
-                            yield None
-                            continue
-                        now_ns = time.monotonic_ns()
-                        if previous_output_ns is None:
-                            self.metrics.observe_ns("request.ttft", now_ns - started_ns)
-                        else:
-                            self.metrics.observe_ns(
-                                "request.inter_output",
-                                now_ns - previous_output_ns,
-                            )
-                        previous_output_ns = now_ns
-                        if publish_immediately and not replayable.output_published:
-                            replayable = ReplayableRequest(
-                                request_id,
-                                request_kind,
-                                request_json,
-                                output_published=True,
-                            )
-                            self._replayable[request_id] = replayable
-                        final = output
-                        if not output.finished:
-                            yield output
-                if final is None or not final.finished:
-                    raise RuntimeError("Router request ended without a terminal output")
-                self.metrics.increment("requests.completed")
-                self.metrics.record_terminal(
-                    request_id=request_id,
-                    state="COMPLETED",
-                    prompt_tokens=final.prompt_tokens,
-                    completion_tokens=final.completion_tokens,
-                    token_ids=final.token_ids,
-                )
+                consumed = consume(self._generate_admitted(
+                    request_kind, request_json, request_id, signal_ready=_signal_ready, on_ready=release_handoff,
+                ))
+                async with aclosing(consumed):
+                    async for output in consumed:
+                        yield output
+                if not terminal:
+                    raise RuntimeError("Decode response has no terminal result")
         except BaseException as exc:
-            if (
-                self.runtime_manager is not None
-                and not replayable.output_published
-                and not isinstance(exc, (GeneratorExit, asyncio.CancelledError))
-                and (
-                    self.recovery.phase is RecoveryPhase.RECOVERY_REQUIRED
-                    or request_id in self._replay_results
-                )
-            ):
-                try:
-                    if request_id not in self._replay_results:
-                        await self._ensure_automatic_recovery()
-                    replayed = self._replay_results.pop(request_id)
-                    for output in replayed:
-                        now_ns = time.monotonic_ns()
-                        if previous_output_ns is None:
-                            self.metrics.observe_ns(
-                                "request.ttft", now_ns - started_ns
-                            )
-                        else:
-                            self.metrics.observe_ns(
-                                "request.inter_output",
-                                now_ns - previous_output_ns,
-                            )
-                        previous_output_ns = now_ns
-                        final = output
-                        if not output.finished:
-                            yield output
-                    if final is None or not final.finished:
-                        raise RuntimeError(
-                            "automatic re-prefill ended without terminal output"
-                        )
-                    self.metrics.increment("requests.completed")
-                    self.metrics.record_terminal(
-                        request_id=request_id,
-                        state="COMPLETED",
-                        prompt_tokens=final.prompt_tokens,
-                        completion_tokens=final.completion_tokens,
-                        token_ids=final.token_ids,
-                    )
-                except BaseException as recovery_exc:
-                    self.metrics.increment("requests.failed")
-                    self.metrics.record_terminal(
-                        request_id=request_id,
-                        state="FAILED",
-                        error_code=type(recovery_exc).__name__,
-                    )
-                    raise recovery_exc from exc
+            if (self.runtime_manager is not None and not replayable.output_published
+                    and not isinstance(exc, (GeneratorExit, asyncio.CancelledError))
+                    and self.recovery.phase is RecoveryPhase.RECOVERY_REQUIRED):
+                await self._ensure_automatic_recovery()
+                terminal.clear()
+                if _signal_ready and not signalled:
+                    yield None
+                async def replay():
+                    for output in self._replay_results.pop(request_id):
+                        yield output
+                async with aclosing(consume(replay())) as consumed:
+                    async for output in consumed:
+                        yield output
             else:
                 self.metrics.increment("requests.failed")
-                self.metrics.record_terminal(
-                    request_id=request_id,
-                    state="FAILED",
-                    error_code=type(exc).__name__,
-                )
+                self.metrics.record_terminal(request_id=request_id, state="FAILED", error_code=type(exc).__name__)
                 if self.recovery.phase is RecoveryPhase.RUNNING:
                     self._replayable.pop(request_id, None)
                 raise
         finally:
-            self.metrics.observe_ns(
-                "request.e2e",
-                time.monotonic_ns() - started_ns,
-            )
-            # This runs after FairHandoffAdmission.__aexit__, so a quiescent
-            # Router reports zero rather than the final request's stale slot.
-            self.metrics.set_gauge("handoffs.active", self.admission.active)
-            self.metrics.set_gauge("handoffs.queued", self.admission.queued)
-            if final is not None and final.finished:
-                self._replayable.pop(request_id, None)
-        # Finish the handoff journal, close node streams and release admission
-        # before publishing the terminal output. A client may disconnect as
-        # soon as it receives [DONE], without resuming this iterator again.
-        yield final
-
-    async def start_stream(
-        self, request_kind: str, request_json: bytes, request_id: str,
-    ) -> AsyncGenerator[DecodeOutputWire | None, None]:
-        """Run admission and one-time P preparation before public SSE headers.
-
-        The same suspended iterator owns the admission slot and prepared input.
-        Resuming it starts D reservation; no Prefill or network write is primed.
-        """
-        stream = self.generate(
-            request_kind, request_json, request_id, _signal_prepared=True,
+            self.metrics.observe_ns("request.e2e", time.monotonic_ns() - started)
+        self.metrics.increment("requests.completed")
+        self.metrics.record_terminal(
+            request_id=request_id, state="COMPLETED",
+            prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0),
         )
+        self._replayable.pop(request_id, None)
+        # Release sockets, durable handoff intent and both budgets before
+        # finish/usage/[DONE] reaches a client that may immediately disconnect.
+        for output in terminal:
+            yield output
+
+    async def start_stream(self, request_kind, request_json, request_id):
+        """Wait for D to accept P's prepared input, not for P's cleanup."""
+        stream = self.generate(request_kind, request_json, request_id, _signal_ready=True)
         try:
             if await anext(stream) is not None:
-                raise RuntimeError("Router stream missed the preparation boundary")
+                raise RuntimeError("Router stream missed the Ready boundary")
         except BaseException:
             await stream.aclose()
             raise
         return stream
 
-    async def recover_fixed_pair(
-        self,
-        manager: FixedPairRuntimeManager,
-    ) -> RuntimeGeneration:
-        """Run the crash-only barrier and re-prefill unpublished requests.
-
-        A deployment supervisor supplies exact process retirement/restart.  The
-        Router owns request eligibility and new-generation route identities.
-        """
-
-        async def replay(request: ReplayableRequest) -> None:
-            self.directory.control_incarnation = (
-                self.recovery.current.control_incarnation
+    async def recover_fixed_pair(self, manager: FixedPairRuntimeManager) -> RuntimeGeneration:
+        async def replay(request: ReplayableRequest):
+            self.directory.control_incarnation = self.recovery.current.control_incarnation
+            self._replay_results[request.request_id] = tuple(
+                [output async for output in self._generate_admitted(
+                    request.request_kind, request.request_json, request.request_id,
+                ) if output is not None]
             )
-            outputs = []
-            async for output in self._generate_admitted(
-                request.request_kind,
-                request.request_json,
-                request.request_id,
-            ):
-                outputs.append(output)
-            final = outputs[-1] if outputs else None
-            if final is None or not final.finished:
-                raise RuntimeError("re-prefill replay ended without terminal Decode output")
-            self._replay_results[request.request_id] = tuple(outputs)
-            self._replayable.pop(request.request_id, None)
-
-        generation = await self.recovery.recover(
-            manager,
-            tuple(self._replayable.values()),
-            replay,
-        )
+        generation = await self.recovery.recover(manager, tuple(self._replayable.values()), replay)
         self.directory.control_incarnation = generation.control_incarnation
-        self._replayable = {
-            request_id: request
-            for request_id, request in self._replayable.items()
-            if not request.output_published
-        }
         return generation
 
-    async def _ensure_automatic_recovery(self) -> RuntimeGeneration:
-        """Join the single runtime recovery task for all affected requests."""
-        if self.runtime_manager is None:
-            raise RuntimeError("automatic recovery has no runtime manager")
+    async def _ensure_automatic_recovery(self):
         task = self._automatic_recovery_task
         if task is None or task.done():
-            task = asyncio.create_task(
-                self.recover_fixed_pair(self.runtime_manager)
-            )
+            task = asyncio.create_task(self.recover_fixed_pair(self.runtime_manager))
             self._automatic_recovery_task = task
-        try:
-            return await asyncio.shield(task)
-        finally:
-            if task.done() and self._automatic_recovery_task is task:
-                self._automatic_recovery_task = None
+        return await asyncio.shield(task)
 
-    async def _generate_admitted(
-        self,
-        request_kind: str,
-        request_json: bytes,
-        request_id: str,
-        *,
-        signal_prepared: bool = False,
-        on_ready=None,
-    ) -> AsyncGenerator[DecodeOutputWire | None, None]:
-        if not request_json or len(request_json) > self.config.max_request_bytes:
+    async def _generate_admitted(self, kind, raw, request_id, *, signal_ready=False, on_ready=None):
+        if not raw or len(raw) > self.config.max_request_bytes:
             raise ValueError("public request exceeds the Router body limit")
+        public = public_document(raw)
+        if "pd_transfer" in public:
+            raise ValueError("pd_transfer is reserved for Router assignments")
         pair = await self.directory.select()
-        prepared = await pair.prefill_client.post(
-            "/internal/pd/prepare",
-            PrepareRequestHTTP(request_id, request_kind, request_json),
-            PreparedRequest,
+        excluded = set()
+        while True:
+            try:
+                async with aclosing(self._attempt(pair, kind, raw, request_id, signal_ready, on_ready)) as attempt:
+                    async for output in attempt:
+                        yield output
+                return
+            except SourceRejected as exc:
+                if not exc.result.retryable:
+                    if exc.result.error_code in ("ValueError", "ValidationError", "TypeError", "INVALID_DECODE_SEED"):
+                        raise ValueError(str(exc)) from exc
+                    raise
+                if exc.result.state != "NOT_STARTED":
+                    raise RuntimeError("retry requires a no-compute proof") from exc
+                excluded.add(pair.decode.node_id)
+                next_pair = await self.directory.select_decode(
+                    pair.prefill.node_id, excluded_decode_node_ids=frozenset(excluded),
+                )
+                if next_pair.prefill.endpoint_generation != pair.prefill.endpoint_generation:
+                    raise RuntimeError("P incarnation changed during target reselection") from exc
+                pair = next_pair
+
+    async def _prefill(self, client, path, body):
+        response = await client.open_generation(path, body)
+        try:
+            value = await response.json()
+            result = msgspec.convert(value.get("pd_transfer"), type=PrefillResult)
+            if response.status >= 400 and result.state not in ("NOT_STARTED", "FAILED"):
+                raise RuntimeError("P failed without a bound safe-failure result")
+            return result
+        finally:
+            await response.aclose()
+
+    async def _attempt(self, pair, kind, raw, request_id, signal_ready, on_ready):
+        key = HandoffKey(request_id, uuid.uuid4().hex, self.recovery.current.data_generation,
+                         self.config.route_epoch, self.recovery.current.control_incarnation)
+        context = GenerationContext(
+            key, request_fingerprint(kind, public_document(raw)),
+            pair.prefill.node_id, pair.prefill.endpoint_generation,
+            pair.decode.node_id, pair.decode.endpoint_generation,
+            pair.decode.control_host, pair.decode.control_port, PD_SCHEMA_VERSION,
         )
-        if signal_prepared:
-            yield None
-        key = HandoffKey(
-            request_id=request_id,
-            handoff_id=uuid.uuid4().hex,
-            data_generation=self.recovery.current.data_generation,
-            route_epoch=self.config.route_epoch,
-            control_incarnation=self.recovery.current.control_incarnation,
-        )
+        body = generation_body(raw, kind, context)
+        path = "/v1/chat/completions" if kind == "chat" else "/v1/completions"
         self.journal.append(
-            "HANDOFF_CREATED",
-            key,
-            prefill_node_id=pair.prefill.node_id,
-            decode_node_id=pair.decode.node_id,
+            "HANDOFF_CREATED", key, prefill_node_id=pair.prefill.node_id, decode_node_id=pair.decode.node_id,
             prefill_endpoint_generation=pair.prefill.endpoint_generation,
             decode_endpoint_generation=pair.decode.endpoint_generation,
         )
-        reservation: PlacementReservation | None = None
-        execute_task: asyncio.Task | None = None
-        next_frame: asyncio.Task | None = None
-        decode_stream = None
-        terminal = False
-        native_may_have_started = False
-        transfer_completed = False
+        source = destination = pending_read = None
+        response = None
+        frames = None
+        ready = safe_failure = decode_started = False
+
+        async def confirm_source():
+            nonlocal ready, safe_failure
+            result = await self._prefill(pair.prefill_client, path, body)
+            if result.key != key or result.request_fingerprint != context.request_fingerprint:
+                raise RuntimeError("P returned a mismatched generation result")
+            if result.state in ("NOT_STARTED", "FAILED") and result.error_code:
+                if result.state == "FAILED" and result.retryable:
+                    raise RuntimeError("a post-compute failure cannot be a no-compute retry")
+                safe_failure = True
+                raise SourceRejected(result)
+            if result.state != "READY" or result.error_code:
+                raise RuntimeError("P did not confirm a ready handoff")
+            ready = True
+            self.journal.append("PREFILL_READY", key)
+            if on_ready is not None:
+                await on_ready()
+
+        async def supervised(read):
+            # Observe P failure even if D is waiting for its next output.
+            # A successful P reply independently releases the handoff budget.
+            nonlocal pending_read
+            pending_read = asyncio.ensure_future(read)
+            done, _ = await asyncio.wait({source, pending_read}, return_when=asyncio.FIRST_COMPLETED)
+            if source in done:
+                await source
+            result = await asyncio.shield(pending_read)
+            pending_read = None
+            return result
+
         try:
-            rejected_decode_nodes: set[str] = set()
-            while True:
-                self.journal.append(
-                    "RESERVATION_ATTEMPT",
-                    key,
-                    prefill_node_id=pair.prefill.node_id,
-                    decode_node_id=pair.decode.node_id,
-                    prefill_endpoint_generation=pair.prefill.endpoint_generation,
-                    decode_endpoint_generation=pair.decode.endpoint_generation,
-                )
-                outcome = await pair.decode_client.post(
-                    "/internal/pd/reserve",
-                    ReservePlacementHTTP(
-                        key=key,
-                        prepared_request_id=prepared.prepared_request_id,
-                        prepared_digest=prepared.prepared_digest,
-                        prompt_token_count=len(prepared.continuation.prompt_token_ids),
-                        max_new_tokens=prepared.continuation.max_new_tokens,
-                        layout_fingerprint=pair.prefill.capabilities.layout_fingerprint,
-                        prefill_node_id=pair.prefill.node_id,
-                        prefill_endpoint_generation=pair.prefill.endpoint_generation,
-                        prefix_match_spec=prepared.prefix_match_spec,
-                        constraint_spec=prepared.continuation.constraint_spec,
-                    ),
-                    ReservePlacementResult,
-                )
-                if outcome.rejection is None:
-                    reservation = outcome.reservation
-                    break
-                rejection = outcome.rejection
-                if (
-                    rejection.key != key
-                    or rejection.decode_node_id != pair.decode.node_id
-                    or rejection.decode_endpoint_generation
-                    != pair.decode.endpoint_generation
-                ):
-                    raise RuntimeError("D returned a rejection for another route")
-                self.journal.append(
-                    "RESERVATION_REJECTED",
-                    key,
-                    error_code=rejection.reason,
-                    prefill_node_id=pair.prefill.node_id,
-                    decode_node_id=pair.decode.node_id,
-                    prefill_endpoint_generation=pair.prefill.endpoint_generation,
-                    decode_endpoint_generation=pair.decode.endpoint_generation,
-                )
-                if not rejection.retryable:
-                    raise RuntimeError(
-                        f"D deterministically rejected reservation: {rejection.reason}"
-                    )
-                rejected_decode_nodes.add(pair.decode.node_id)
-                next_pair = await self.directory.select_decode(
-                    pair.prefill.node_id,
-                    excluded_decode_node_ids=frozenset(rejected_decode_nodes),
-                )
-                if (
-                    next_pair.prefill.endpoint_generation
-                    != pair.prefill.endpoint_generation
-                ):
-                    raise RuntimeError("P endpoint changed while retrying D reservation")
-                pair = next_pair
-            if reservation is None:
-                raise RuntimeError("D returned an empty reservation outcome")
-            if (
-                reservation.key != key
-                or reservation.prepared_request_id != prepared.prepared_request_id
-                or reservation.prepared_digest != prepared.prepared_digest
-                or reservation.decode_node_id != pair.decode.node_id
-                or reservation.decode_endpoint_generation
-                != pair.decode.endpoint_generation
-                or not reservation.reservation_id
-                or not reservation.reservation_capability
-            ):
-                raise RuntimeError("D returned a reservation for another route")
-            self.journal.append(
-                "HANDOFF_RESERVED",
-                key,
-                prefill_node_id=pair.prefill.node_id,
-                decode_node_id=pair.decode.node_id,
-                prefill_endpoint_generation=pair.prefill.endpoint_generation,
-                decode_endpoint_generation=pair.decode.endpoint_generation,
-            )
-            compatibility_digest = capability_compatibility_digest(
-                pair.prefill.capabilities
-            )
-            await pair.decode_client.post(
-                "/internal/pd/authorize",
-                AuthorizeRouteHTTP(
-                    key=key,
-                    prepared_request_id=prepared.prepared_request_id,
-                    prepared_digest=prepared.prepared_digest,
-                    reservation_id=reservation.reservation_id,
-                    reservation_capability=reservation.reservation_capability,
-                    compatibility_digest=compatibility_digest,
-                    prefill_node_id=pair.prefill.node_id,
-                    prefill_endpoint_generation=pair.prefill.endpoint_generation,
-                    decode_node_id=pair.decode.node_id,
-                    decode_endpoint_generation=pair.decode.endpoint_generation,
-                ),
-            )
-            self.journal.append(
-                "ROUTE_AUTHORIZED",
-                key,
-                prefill_node_id=pair.prefill.node_id,
-                decode_node_id=pair.decode.node_id,
-                prefill_endpoint_generation=pair.prefill.endpoint_generation,
-                decode_endpoint_generation=pair.decode.endpoint_generation,
-            )
-
-            decode_stream = pair.decode_client.stream_decode(
-                "/internal/pd/await-decode",
-                HandoffHTTP(key),
-            )
-            first = await anext(decode_stream)
-            if first.event != "waiting":
-                raise RuntimeError("D did not establish output waiting before Prefill")
-
-            native_may_have_started = True
-            execute_task = asyncio.create_task(
-                pair.prefill_client.post(
-                    "/internal/pd/execute",
-                    ExecutePrefillHTTP(
-                        key=key,
-                        prepared_request_id=prepared.prepared_request_id,
-                        prepared_digest=prepared.prepared_digest,
-                        reservation_id=reservation.reservation_id,
-                        partition=reservation.partition,
-                        block_ids_by_group=reservation.block_ids_by_group,
-                        reservation_capability=reservation.reservation_capability,
-                        compatibility_digest=compatibility_digest,
-                        prefill_node_id=pair.prefill.node_id,
-                        prefill_endpoint_generation=pair.prefill.endpoint_generation,
-                        decode_node_id=pair.decode.node_id,
-                        decode_control_host=reservation.decode_control_host,
-                        decode_control_port=reservation.decode_control_port,
-                        decode_endpoint_generation=reservation.decode_endpoint_generation,
-                        prefix_hit_tokens=reservation.prefix_hit_tokens,
-                    ),
-                    PrefillHandoffResult,
-                )
-            )
-            expected_sequence = 1
-            prefill_result: PrefillHandoffResult | None = None
-            next_frame = asyncio.create_task(anext(decode_stream))
-            while True:
-                wait_set = {next_frame}
-                if execute_task is not None:
-                    wait_set.add(execute_task)
-                done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
-                if execute_task in done:
-                    prefill_result = execute_task.result()
-                    execute_task = None
-                    if (prefill_result.key == key
-                            and prefill_result.reservation_id == reservation.reservation_id
-                            and prefill_result.state == "NOT_STARTED"
-                            and not prefill_result.manifest_hash
-                            and prefill_result.error_code
-                            and next_frame not in done
-                            and not transfer_completed):
-                        native_may_have_started = False
-                        raise RuntimeError(f"P rejected before transfer: {prefill_result.error_code}")
-                    self._validate_prefill_result(prefill_result, key, reservation)
-                    self.journal.append("PREFILL_READY", key)
-                    transfer_completed = True
-                    if on_ready is not None:
-                        await on_ready()
-                        on_ready = None
-                    if next_frame not in done:
-                        continue
-                if next_frame not in done:
-                    continue
-                try:
-                    frame = next_frame.result()
-                except StopAsyncIteration as exc:
-                    raise EOFError("D Decode stream ended without a terminal output") from exc
-                if frame.event == "error":
-                    raise RuntimeError(f"D Decode failed: {frame.error_code}")
-                output = self._validate_output(frame, key, expected_sequence)
-                # Any Decode output is downstream of a committed final
-                # manifest, even if the Prefill HTTP reply races behind it.
-                transfer_completed = True
-                # Wait for P's reply before admitting more P work: D output
-                # proves commit, but P may still be retiring its source pins.
-                expected_sequence += 1
-                yield output
-                if frame.event == "finished":
-                    if execute_task is not None:
-                        prefill_result = await execute_task
-                        execute_task = None
-                        self._validate_prefill_result(prefill_result, key, reservation)
-                        self.journal.append("PREFILL_READY", key)
-                        if on_ready is not None:
-                            await on_ready()
-                            on_ready = None
-                    if prefill_result is None:
-                        raise RuntimeError("D completed before P reported ReadyAck")
-                    terminal = True
-                    self.journal.append("HANDOFF_COMPLETED", key)
-                    return
-                next_frame = asyncio.create_task(anext(decode_stream))
+            # These are the only generation HTTP calls. Physical reservation,
+            # normalized metadata and chunk/commit messages never visit Router.
+            source = asyncio.create_task(confirm_source())
+            destination = asyncio.create_task(pair.decode_client.open_generation(path, body))
+            response = await supervised(destination)
+            if response.status >= 400:
+                # Prefer a bound no-compute rejection over a secondary D error.
+                await source
+                raise RuntimeError(f"D failed with HTTP {response.status}")
+            # D sends headers only after accepting P's normalized continuation.
+            # This proves one-time preparation succeeded. Source-pin retirement
+            # may still be pending, but must not delay already available output.
+            if signal_ready:
+                yield None
+            streaming = public_document(raw).get("stream", False)
+            if streaming:
+                if "text/event-stream" not in response.headers.get("content-type", ""):
+                    raise ValueError("D did not return a standard SSE response")
+                finished = used = False
+                frames = response.frames()
+                while True:
+                    frame = await supervised(anext(frames))
+                    value = sse_document(frame)
+                    if value is None:
+                        if not finished or not used:
+                            raise EOFError("D completed SSE without finish and usage")
+                        yield frame
+                        break
+                    if "error" in value:
+                        # D can reject the seed just before P returns its bound
+                        # safe-failure proof. Do not mistake that response race
+                        # for uncertain native writes; timeout remains uncertain.
+                        with suppress(TimeoutError):
+                            await asyncio.wait_for(asyncio.shield(source), timeout=15)
+                        raise DecodeStreamError(frame)
+                    if value.get("id") != request_id:
+                        raise ValueError("D returned SSE for another request")
+                    decode_started = True
+                    if value.get("usage") is not None:
+                        if used:
+                            raise ValueError("D duplicated terminal usage")
+                        used = True
+                    for choice in value.get("choices", ()):
+                        if choice.get("finish_reason") is not None:
+                            if finished:
+                                raise ValueError("D duplicated finish")
+                            finished = True
+                        elif finished:
+                            raise ValueError("D returned content after finish")
+                    yield frame
+            else:
+                result = await supervised(response.result())
+                value = msgspec.json.decode(result.body)
+                if (value.get("id") != request_id or not value.get("choices")
+                        or value["choices"][0].get("finish_reason") is None or not value.get("usage")):
+                    raise ValueError("D returned an invalid public JSON result")
+                yield result
+            # Keep terminal publication, sockets and ownership tied to P's
+            # matching READY even when D finishes first.
+            await source
+            self.journal.append("HANDOFF_COMPLETED", key)
         except BaseException as exc:
-            deterministic_abort = not native_may_have_started or (
-                isinstance(exc, (GeneratorExit, asyncio.CancelledError))
-                and transfer_completed
-            )
-            # Starlette runs StreamingResponse bodies inside an AnyIO cancel
-            # scope.  Once the client disconnects, every checkpoint remains
-            # cancelled unless cleanup is explicitly shielded.  The P/D abort
-            # acknowledgements are part of the safety decision, not optional
-            # response work, so complete this bounded convergence before
-            # propagating the original cancellation.
+            cancelled = isinstance(exc, (GeneratorExit, asyncio.CancelledError))
             with anyio.CancelScope(shield=True):
-                abort_confirmed = await self._abort_pair(
-                    pair,
-                    key,
-                    type(exc).__name__,
-                    deterministic=deterministic_abort,
-                )
-                recovery_required = reservation is not None and (
-                    not deterministic_abort or not abort_confirmed
-                )
-                self.journal.append(
-                    "RECOVERY_REQUIRED" if recovery_required else "HANDOFF_FAILED",
-                    key,
-                    error_code=type(exc).__name__,
-                )
-                if recovery_required:
+                if cancelled and decode_started and not ready:
+                    # D output can precede P's source-pin cleanup. Give that
+                    # already-started confirmation a bounded chance to finish;
+                    # client cancellation alone never proves native retirement.
+                    with suppress(Exception):
+                        await asyncio.wait_for(asyncio.shield(source), timeout=15)
+                deterministic = safe_failure or (ready and cancelled)
+                confirmed = await self._abort_pair(pair, key, type(exc).__name__, deterministic=deterministic)
+                unsafe = not deterministic or not confirmed
+                self.journal.append("RECOVERY_REQUIRED" if unsafe else "HANDOFF_FAILED",
+                                    key, error_code=type(exc).__name__)
+                if unsafe:
                     self.recovery.require(type(exc).__name__, (key,))
+                if isinstance(exc, SourceRejected) and unsafe:
+                    raise RuntimeError("no-compute abort was not confirmed") from exc
             raise
         finally:
-            if next_frame is not None and not next_frame.done():
-                next_frame.cancel()
-                with suppress(asyncio.CancelledError, Exception):
-                    await next_frame
-            if execute_task is not None and not execute_task.done():
-                execute_task.cancel()
-                with suppress(asyncio.CancelledError, Exception):
-                    await execute_task
-            if decode_stream is not None:
-                with suppress(Exception):
-                    await decode_stream.aclose()
-            if not terminal:
-                # The journal entry above is the durable recovery decision. No
-                # timeout-based allocator release is performed in the Router.
-                pass
+            with anyio.CancelScope(shield=True):
+                # Abort must precede draining a pending HTTP open/read. D may
+                # need that abort to unblock the response thread itself.
+                tasks = {task for task in (source, destination, pending_read) if task is not None}
+                for task in tasks:
+                    if task is not None and not task.done():
+                        task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                if response is None and destination is not None and not destination.cancelled():
+                    with suppress(Exception):
+                        response = destination.result()
+                if frames is not None:
+                    await frames.aclose()
+                if response is not None:
+                    await response.aclose()
 
     @staticmethod
-    def _validate_prefill_result(
-        result: PrefillHandoffResult,
-        key: HandoffKey,
-        reservation: PlacementReservation,
-    ) -> None:
-        if result.key != key or result.reservation_id != reservation.reservation_id:
-            raise RuntimeError("P returned a mismatched handoff result")
-        if result.state != "READY":
-            raise RuntimeError("P did not confirm a ready handoff")
-
-    @staticmethod
-    def _validate_output(
-        frame: DecodeStreamFrame,
-        key: HandoffKey,
-        expected_sequence: int,
-    ) -> DecodeOutputWire:
-        output = frame.output
-        if output is None or output.key != key:
-            raise RuntimeError("D returned an output for another handoff")
-        if output.output_sequence != expected_sequence:
-            raise RuntimeError("D Decode output sequence is stale or discontinuous")
-        if (frame.event == "finished") != output.finished:
-            raise RuntimeError("D Decode terminal frame and output disagree")
-        return output
-
-    @staticmethod
-    async def _abort_pair(
-        pair,
-        key: HandoffKey,
-        reason: str,
-        *,
-        deterministic: bool,
-    ) -> bool:
-        payload = AbortHandoffHTTP(
-            key=key,
-            reason=reason[:128],
-            deterministic=deterministic,
-        )
+    async def _abort_pair(pair, key: HandoffKey, reason: str, *, deterministic: bool) -> bool:
+        payload = AbortHandoffHTTP(key, reason[:128], deterministic)
         try:
-            results = await asyncio.wait_for(
-                asyncio.gather(
-                    pair.prefill_client.post(
-                        "/internal/pd/abort", payload, HandoffStatus
-                    ),
-                    pair.decode_client.post(
-                        "/internal/pd/abort", payload, HandoffStatus
-                    ),
-                    return_exceptions=True,
-                ),
-                timeout=15,
-            )
+            results = await asyncio.wait_for(asyncio.gather(
+                pair.prefill_client.post("/internal/pd/abort", payload, HandoffStatus),
+                pair.decode_client.post("/internal/pd/abort", payload, HandoffStatus),
+                return_exceptions=True,
+            ), timeout=15)
         except TimeoutError:
-            # The durable recovery decision is already recorded.  Abort is a
-            # convergence hint and must not keep the public request open for
-            # the full node HTTP timeout when a peer is unhealthy.
             return False
-        if not deterministic or any(
-            isinstance(result, BaseException) for result in results
-        ):
-            return False
-        safe_terminal = {"ABORTED", "FAILED", "RELEASED", "COMPLETED"}
-        return all(
-            isinstance(result, HandoffStatus) and result.state in safe_terminal
+        return deterministic and all(
+            isinstance(result, HandoffStatus) and result.key == key
+            and result.state in {"ABORTED", "FAILED", "RELEASED", "COMPLETED"}
             for result in results
         )

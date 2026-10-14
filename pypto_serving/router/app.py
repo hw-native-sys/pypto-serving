@@ -11,33 +11,20 @@
 from __future__ import annotations
 
 import json
-import time
 import uuid
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from pypto_serving.serving.pd.admission import PDBackpressureError
-from pypto_serving.serving.pd.observability import token_ids_sha256, write_startup_record
-from pypto_serving.serving.server.api_types import (
-    ChatCompletionChoice,
-    ChatCompletionRequest,
-    ChatCompletionResponse,
-    CompletionRequest,
-    ResponseUsage,
-    validate_chat_request,
-)
-from pypto_serving.serving.server.chat_format import (
-    chat_delta,
-    chat_finish_reason,
-    chat_message,
-    map_finish_reason,
-)
+from pypto_serving.serving.pd.observability import write_startup_record
+from pypto_serving.serving.pd.generation import public_document
+from pypto_serving.serving.server.api_types import ChatCompletionRequest, CompletionRequest, validate_chat_request
 
-from .client import NodeClient
+from .client import NodeClient, PublicResult
 from .config import RouterConfig
-from .coordinator import RouterCoordinator
+from .coordinator import DecodeStreamError, RouterCoordinator
 from .directory import WorkerDirectory
 from .journal import RouterJournal
 from .policy import create_route_policy
@@ -149,101 +136,38 @@ def create_router_app(
     @app.get("/v1/models")
     async def list_models() -> JSONResponse:
         pair = await directory.select()
-        model = pair.prefill.capabilities.model_revision
-        return JSONResponse(
-            {
-                "object": "list",
-                "data": [{"id": model, "object": "model", "owned_by": "pypto"}],
-            }
-        )
+        return JSONResponse(await pair.prefill_client.get("/v1/models", dict))
+
+    async def generate(request, kind):
+        raw = await _bounded_body(request, config.max_request_bytes)
+        if "pd_transfer" in public_document(raw):
+            raise ValueError("pd_transfer is reserved for Router assignments")
+        if kind == "chat":
+            public = ChatCompletionRequest.model_validate_json(raw)
+            validate_chat_request(public)
+        else:
+            public = CompletionRequest.model_validate_json(raw)
+        request_id = ("chatcmpl-" if kind == "chat" else "cmpl-") + uuid.uuid4().hex[:8]
+        if public.stream:
+            outputs = await coordinator.start_stream(kind, raw, request_id)
+            return StreamingResponse(
+                _forward_stream(outputs), media_type="text/event-stream",
+                background=BackgroundTask(outputs.aclose),
+            )
+        final = None
+        async for output in coordinator.generate(kind, raw, request_id, publish_immediately=False):
+            final = output
+        if not isinstance(final, PublicResult):
+            raise RuntimeError("D returned no public JSON result")
+        return Response(final.body, media_type="application/json", headers=final.headers)
 
     @app.post("/v1/completions")
-    async def completions(request: Request):  # noqa: ANN202
-        raw = await _bounded_body(request, config.max_request_bytes)
-        public = CompletionRequest.model_validate_json(raw)
-        request_id = f"cmpl-{uuid.uuid4().hex[:8]}"
-        model = public.model
-        if public.stream:
-            outputs = await coordinator.start_stream("completion", raw, request_id)
-            return StreamingResponse(
-                _stream_completion(outputs, request_id, model),
-                media_type="text/event-stream",
-                background=BackgroundTask(outputs.aclose),
-            )
-        final = None
-        async for output in coordinator.generate(
-            "completion", raw, request_id, publish_immediately=False
-        ):
-            final = output
-        if final is None:
-            raise RuntimeError("Decode completed without output")
-        return JSONResponse(
-            {
-                "id": request_id,
-                "object": "text_completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "text": final.text,
-                        "finish_reason": _map_finish_reason(final.finish_reason),
-                    }
-                ],
-                "usage": _usage(final),
-            },
-            headers={
-                "x-pypto-token-ids-sha256": token_ids_sha256(final.token_ids)
-            },
-        )
+    async def completions(request: Request):
+        return await generate(request, "completion")
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(request: Request):  # noqa: ANN202
-        raw = await _bounded_body(request, config.max_request_bytes)
-        public = ChatCompletionRequest.model_validate_json(raw)
-        validate_chat_request(public)
-        request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-        model = public.model
-        if public.stream:
-            outputs = await coordinator.start_stream("chat", raw, request_id)
-            return StreamingResponse(
-                _stream_chat(
-                    outputs,
-                    request_id,
-                    model,
-                    parallel_tool_calls=public.parallel_tool_calls,
-                ),
-                media_type="text/event-stream",
-                background=BackgroundTask(outputs.aclose),
-            )
-        final = None
-        async for output in coordinator.generate(
-            "chat", raw, request_id, publish_immediately=False
-        ):
-            final = output
-        if final is None:
-            raise RuntimeError("Decode completed without output")
-        response = ChatCompletionResponse(
-            id=request_id,
-            created=int(time.time()),
-            model=model,
-            choices=[ChatCompletionChoice(
-                message=chat_message(
-                    final.text,
-                    final.reasoning,
-                    final.tool_calls,
-                    parallel_tool_calls=public.parallel_tool_calls,
-                ),
-                finish_reason=chat_finish_reason(final),
-            )],
-            usage=ResponseUsage(**_usage(final)),
-        )
-        return JSONResponse(
-            response.model_dump(),
-            headers={
-                "x-pypto-token-ids-sha256": token_ids_sha256(final.token_ids)
-            },
-        )
+    async def chat_completions(request: Request):
+        return await generate(request, "chat")
 
     return app
 
@@ -255,133 +179,17 @@ async def _bounded_body(request: Request, limit: int) -> bytes:
     return raw
 
 
-async def _stream_completion(
-    outputs,
-    request_id: str,
-    model: str,
-):
+async def _forward_stream(outputs):
     try:
-        async for chunk in _stream_completion_chunks(outputs, request_id, model):
-            yield chunk
-    except Exception as exc:
-        yield _stream_error(exc)
+        async for frame in outputs:
+            yield frame
+    except DecodeStreamError as exc:
+        yield exc.frame
         yield b"data: [DONE]\n\n"
-
-
-async def _stream_completion_chunks(outputs, request_id: str, model: str):
-    async for output in outputs:
-        finish_reason = _map_finish_reason(output.finish_reason) if output.finished else None
-        yield _sse(
-            {
-                "id": request_id,
-                "object": "text_completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{"index": 0, "text": output.text_delta, "finish_reason": finish_reason}],
-            }
-        )
-        if output.finished:
-            yield _sse(
-                {
-                    "id": request_id,
-                    "object": "text_completion",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [],
-                    "usage": _usage(output),
-                }
-            )
-            yield b"data: [DONE]\n\n"
-
-
-async def _stream_chat(
-    outputs,
-    request_id: str,
-    model: str,
-    *,
-    parallel_tool_calls: bool = True,
-):
-    try:
-        async for chunk in _stream_chat_chunks(
-            outputs,
-            request_id,
-            model,
-            parallel_tool_calls=parallel_tool_calls,
-        ):
-            yield chunk
     except Exception as exc:
-        # Decode/parser errors may occur after SSE headers have been sent.
-        # Keep the public stream well formed, as ordinary Serving does.
-        yield _stream_error(exc)
+        yield ("data: " + json.dumps({"error": {
+            "message": str(exc), "type": "generation_error", "code": 503,
+        }}) + "\n\n").encode()
         yield b"data: [DONE]\n\n"
-
-
-async def _stream_chat_chunks(
-    outputs,
-    request_id: str,
-    model: str,
-    *,
-    parallel_tool_calls: bool,
-):
-    async for output in outputs:
-        finish_reason = chat_finish_reason(output) if output.finished else None
-        chunk = ChatCompletionResponse(
-            id=request_id,
-            object="chat.completion.chunk",
-            created=int(time.time()),
-            model=model,
-            choices=[ChatCompletionChoice(
-                delta=chat_delta(
-                    output.text_delta,
-                    output.reasoning_delta,
-                    output.tool_call_deltas,
-                    parallel_tool_calls=parallel_tool_calls,
-                ),
-                finish_reason=finish_reason,
-            )],
-        )
-        yield _sse(chunk.model_dump())
-        if output.finished:
-            usage_chunk = ChatCompletionResponse(
-                id=request_id,
-                object="chat.completion.chunk",
-                created=int(time.time()),
-                model=model,
-                choices=[],
-                usage=ResponseUsage(**_usage(output)),
-            )
-            yield _sse(usage_chunk.model_dump())
-            yield b"data: [DONE]\n\n"
-
-
-def _sse(value: dict) -> bytes:
-    return b"data: " + json.dumps(value, ensure_ascii=False).encode() + b"\n\n"
-
-
-def _stream_error(exc: Exception) -> bytes:
-    return _sse({"error": {
-        "message": str(exc),
-        "type": "invalid_model_output" if isinstance(exc, ValueError) else "pd_decode_error",
-        "code": 400 if isinstance(exc, ValueError) else 503,
-    }})
-
-
-def _chat_message(output, *, parallel_tool_calls: bool = True) -> dict:
-    return chat_message(
-        output.text,
-        output.reasoning,
-        output.tool_calls,
-        parallel_tool_calls=parallel_tool_calls,
-    ).model_dump()
-
-
-def _usage(output) -> dict:
-    return {
-        "prompt_tokens": output.prompt_tokens,
-        "completion_tokens": output.completion_tokens,
-        "total_tokens": output.prompt_tokens + output.completion_tokens,
-    }
-
-
-def _map_finish_reason(reason: str) -> str:
-    return map_finish_reason(reason)
+    finally:
+        await outputs.aclose()

@@ -36,7 +36,10 @@ KEY = HandoffKey("request", "handoff", 1, 2, 3)
 def test_service_completion_is_durable_before_ack_and_commit(failure, tmp_path, monkeypatch):
     from .test_journal import _config
     from pypto_serving.serving.pd.journal import DurablePDJournal
-    from pypto_serving.serving.pd.protocol import OpenRoute, ControlAck, ReadyAck
+    from pypto_serving.serving.pd.config import PD_SCHEMA_VERSION
+    from pypto_serving.serving.pd.protocol import (
+        BeginHandoff, GenerationContext, ReserveAccepted, ControlAck, ReadyAck, prepared_request_hash,
+    )
     from pypto_serving.serving.pd.service import PDServingService
 
     async def exercise():
@@ -77,11 +80,19 @@ def test_service_completion_is_durable_before_ack_and_commit(failure, tmp_path, 
             validate_transfer_results=tracker.validate_results,
             query=lambda key: SimpleNamespace(reservation_id="reservation", state="TRANSFERRING"),
             record_transfer_results=apply, commit=tracker.commit,
+            committed_manifest=lambda key: tracker.final_manifest(),
         )
-        service._validate_open_route = lambda message, session: None
+        service.config = _config(tmp_path / "journal")
+        async def wait(context):
+            return None
+        service._wait_generation = wait
+        service._reserve_handoff = lambda message, session: ReserveAccepted(KEY, "reservation", 0, {}, ())
         service._record, service._stream_decode = record, stream
         queue = asyncio.Queue()
-        for message in (OpenRoute(KEY, "prepared", "reservation", "digest", "cap", "compat", "p", 1),
+        context = GenerationContext(KEY, "a" * 64, "p", 1, "d", 1, "localhost", 12345, PD_SCHEMA_VERSION)
+        continuation = _final_manifest().continuation
+        begin = BeginHandoff(KEY, context, continuation, None, prepared_request_hash(continuation, None))
+        for message in (begin,
                         bundle, _commit(_final_manifest())):
             queue.put_nowait(message)
         if failure == "fsync":

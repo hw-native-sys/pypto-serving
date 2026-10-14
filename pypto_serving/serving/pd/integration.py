@@ -52,8 +52,8 @@ def validate_engine_config(config, pd_config) -> None:
     contract = pd_config.model_contract
     if config.executor_cls != contract.executor_cls:
         raise ValueError("PD executor differs from the selected model contract")
-    if config.enable_prefix_cache != pd_config.prefix_cache_enabled:
-        raise ValueError("PD prefix-cache flag differs from the configured role/profile")
+    if config.enable_prefix_cache != pd_config.enable_prefix_cache:
+        raise ValueError("PD prefix-cache flag differs from the local engine")
     expected_async_scheduling = contract.async_scheduling_for_role(pd_config.role.value)
     if config.resolve_async_scheduling() != expected_async_scheduling:
         raise ValueError("PD scheduling mode differs from the selected model contract")
@@ -233,6 +233,7 @@ class PDApplication:
             server.app,
             self.service,
             config,
+            model_id=server.model_id,
             prepare_completion=server.prepare_completion,
             prepare_chat=server.prepare_chat,
             preflight_constraint=server._preflight_constraint,
@@ -285,6 +286,7 @@ def build_pd_launch(args, build_config, *, model_variant):
         node_id=args.pd_node_id,
         model_revision=args.served_model_name or Path(args.model).name,
         model_adapter=adapter,
+        enable_prefix_cache=config.enable_prefix_cache,
     )
     local_tokens = pd.model_contract.local_speculative_tokens(pd.role.value)
     config = replace(
@@ -295,7 +297,6 @@ def build_pd_launch(args, build_config, *, model_variant):
             "num_speculative_tokens": local_tokens,
             "runner_extension_factory": adapter.worker_factory(pd.worker_config()),
         },
-        enable_prefix_cache=pd.prefix_cache_enabled,
         async_scheduling=pd.model_contract.async_scheduling_for_role(pd.role.value),
     )
     validate_engine_config(config, pd)

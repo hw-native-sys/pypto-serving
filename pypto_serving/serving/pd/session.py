@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import socket
 import time
+import anyio
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -303,12 +304,20 @@ async def connect_control_session(
     """Lazily connect a P node to the Router-selected D control endpoint."""
     if not config.enabled or config.role is not PDRole.PREFILL:
         raise ValueError("PD control connect requires an enabled Prefill config")
-    sock = await asyncio.to_thread(
+    opening = asyncio.create_task(asyncio.to_thread(
         _connect_endpoint,
         peer_host,
         peer_port,
         config.connect_timeout_seconds,
-    )
+    ))
+    try:
+        sock = await asyncio.shield(opening)
+    except BaseException:
+        with anyio.CancelScope(shield=True):
+            result = await asyncio.gather(opening, return_exceptions=True)
+            if isinstance(result[0], socket.socket):
+                result[0].close()
+        raise
     sock.settimeout(config.request_timeout_seconds)
     return await _open_pd_socket(
         sock,
@@ -349,6 +358,8 @@ async def _open_pd_socket(
             expected_peer_role=expected_peer_role,
         )
     except BaseException:
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
         sock.close()
         raise
     # Idle serving periods are not request failures. Native transfers carry

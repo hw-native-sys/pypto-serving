@@ -22,7 +22,7 @@ from .adapter import ModelPDAdapter
 from .contracts import RuntimeLayoutDescriptor
 
 
-PD_SCHEMA_VERSION = 10
+PD_SCHEMA_VERSION = 12
 SUPPORTED_PD_PROVIDERS = frozenset({"mooncake"})
 
 
@@ -50,23 +50,6 @@ class PDRole(str, Enum):
         if self is PDRole.DECODE:
             return PDRole.PREFILL
         return PDRole.DISABLED
-
-
-class PDPrefixCacheMode(str, Enum):
-    """One shared profile from which P and D derive their local cache mode."""
-
-    DISABLED = "disabled"
-    D_ONLY = "d_only"
-    INDEPENDENT = "independent"
-
-    def enabled_for(self, role: PDRole) -> bool:
-        if role is PDRole.DISABLED:
-            return False
-        if self is PDPrefixCacheMode.DISABLED:
-            return False
-        if self is PDPrefixCacheMode.D_ONLY:
-            return role is PDRole.DECODE
-        return True
 
 
 @dataclass(frozen=True)
@@ -107,15 +90,8 @@ class PDRuntimeConfig:
     max_active_handoffs: int = 4
     max_pending_handoffs: int = 8
     enable_chunk_overlap: bool = True
-    prefix_cache_mode: PDPrefixCacheMode = PDPrefixCacheMode.INDEPENDENT
 
     def __post_init__(self) -> None:
-        mode = (
-            self.prefix_cache_mode
-            if isinstance(self.prefix_cache_mode, PDPrefixCacheMode)
-            else PDPrefixCacheMode(self.prefix_cache_mode)
-        )
-        object.__setattr__(self, "prefix_cache_mode", mode)
         if not self.prefill or not self.decode:
             raise ValueError("runtime requires at least one prefill and one decode endpoint")
         for role, endpoints in (("prefill", self.prefill), ("decode", self.decode)):
@@ -234,7 +210,6 @@ def load_pd_document(path: str | os.PathLike[str]) -> PDDocument:
             "max_active_handoffs",
             "max_pending_handoffs",
             "enable_chunk_overlap",
-            "prefix_cache_mode",
         },
         "runtime",
     )
@@ -254,7 +229,6 @@ def load_pd_document(path: str | os.PathLike[str]) -> PDDocument:
         max_active_handoffs=runtime.get("max_active_handoffs", 4),
         max_pending_handoffs=runtime.get("max_pending_handoffs", 8),
         enable_chunk_overlap=runtime.get("enable_chunk_overlap", True),
-        prefix_cache_mode=runtime.get("prefix_cache_mode", "independent"),
     )
     observability = raw.get("observability", {})
     if not isinstance(observability, dict):
@@ -293,21 +267,16 @@ class PDConfig:
     max_pending_handoffs: int = 8
     max_transfer_attempts: int = 2
     enable_chunk_overlap: bool = True
-    prepared_request_ttl_seconds: float = 300.0
     journal_path: str = ""
     log_dir: str = ""
     observability_enabled: bool = True
-    prefix_cache_mode: PDPrefixCacheMode = PDPrefixCacheMode.DISABLED
+    enable_prefix_cache: bool = True
 
     def __post_init__(self) -> None:
         role = self.role if isinstance(self.role, PDRole) else PDRole(self.role)
         object.__setattr__(self, "role", role)
-        mode = (
-            self.prefix_cache_mode
-            if isinstance(self.prefix_cache_mode, PDPrefixCacheMode)
-            else PDPrefixCacheMode(self.prefix_cache_mode)
-        )
-        object.__setattr__(self, "prefix_cache_mode", mode)
+        if type(self.enable_prefix_cache) is not bool:
+            raise ValueError("enable_prefix_cache must be boolean")
         if role is PDRole.DISABLED:
             raise ValueError("PDConfig cannot use the disabled role")
         for name in (
@@ -323,10 +292,8 @@ class PDConfig:
             )
         if self.model_adapter.contract.model_family == "" or self.model_adapter.contract.version < 1:
             raise ValueError("PD model contract is invalid")
-        if not self.model_adapter.contract.supports_prefix_cache_mode(mode.value):
-            raise ValueError(
-                f"PD model contract does not support prefix-cache mode {mode.value!r}"
-            )
+        if self.enable_prefix_cache and not self.model_adapter.contract.supports_prefix_cache(role.value):
+            raise ValueError(f"PD model contract does not support {role.value} prefix caching")
         if type(self.control_port) is not int or not 1 <= self.control_port <= 65535:
             raise ValueError("PD control_port must be in [1, 65535]")
         if self.max_active_handoffs > self.max_pending_handoffs:
@@ -339,10 +306,6 @@ class PDConfig:
     @property
     def model_contract(self):
         return self.model_adapter.contract
-
-    @property
-    def prefix_cache_enabled(self) -> bool:
-        return self.prefix_cache_mode.enabled_for(self.role)
 
     def worker_config(self) -> "PDWorkerConfig":
         return PDWorkerConfig(
@@ -364,6 +327,7 @@ def resolve_pd_config(
     model_revision: str,
     model_adapter: ModelPDAdapter,
     node_id: str = "",
+    enable_prefix_cache: bool = True,
 ) -> PDConfig:
     endpoint = document.endpoint(role, node_id)
     resolved_node_id = endpoint.node_id or (
@@ -398,7 +362,7 @@ def resolve_pd_config(
         journal_path=str(state_dir / "journal.jsonl"),
         log_dir=str(role_dir),
         observability_enabled=document.observability.enabled,
-        prefix_cache_mode=document.runtime.prefix_cache_mode,
+        enable_prefix_cache=enable_prefix_cache,
     )
 
 
@@ -428,7 +392,11 @@ class PDCapabilities:
     schema_version: int = PD_SCHEMA_VERSION
     logical_groups: tuple[str, ...] = ()
     physical_regions: tuple[str, ...] = ()
-    prefix_cache_mode: str = "disabled"
+    enable_prefix_cache: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.enable_prefix_cache) is not bool:
+            raise ValueError("enable_prefix_cache capability must be boolean")
 
     @classmethod
     def from_layout(cls, layout: RuntimeLayoutDescriptor) -> "PDCapabilities":
@@ -444,7 +412,7 @@ class PDCapabilities:
             provider=layout.provider,
             logical_groups=layout.logical_groups,
             physical_regions=layout.physical_regions,
-            prefix_cache_mode=layout.prefix_cache_mode,
+            enable_prefix_cache=layout.enable_prefix_cache,
         )
 
     def compatibility_error(self, peer: "PDCapabilities") -> str | None:
@@ -452,7 +420,6 @@ class PDCapabilities:
             "schema_version", "adapter_id", "contract_version", "contract_digest",
             "continuation_schema", "model_revision", "layout_fingerprint", "topology",
             "provider", "logical_groups", "physical_regions",
-            "prefix_cache_mode",
         ):
             if getattr(self, name) != getattr(peer, name):
                 return f"PD capability mismatch: {name}"

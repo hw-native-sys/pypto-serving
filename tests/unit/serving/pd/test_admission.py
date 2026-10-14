@@ -12,69 +12,9 @@ import asyncio
 import pytest
 
 from pypto_serving.serving.pd.admission import (
-    BoundedSerialAdmission,
     FairHandoffAdmission,
     PDBackpressureError,
 )
-
-
-def test_admission_serializes_and_bounds_active_plus_waiting() -> None:
-    async def exercise() -> None:
-        admission = BoundedSerialAdmission(2)
-        first_entered = asyncio.Event()
-        release_first = asyncio.Event()
-        second_entered = asyncio.Event()
-
-        async def first() -> None:
-            async with admission.admit():
-                first_entered.set()
-                await release_first.wait()
-
-        async def second() -> None:
-            async with admission.admit():
-                second_entered.set()
-
-        first_task = asyncio.create_task(first())
-        await first_entered.wait()
-        second_task = asyncio.create_task(second())
-        await asyncio.sleep(0)
-        assert admission.count == 2
-        assert not second_entered.is_set()
-        with pytest.raises(PDBackpressureError, match="configured limit"):
-            async with admission.admit():
-                raise AssertionError("over-limit handoff was admitted")
-
-        release_first.set()
-        await asyncio.gather(first_task, second_task)
-        assert second_entered.is_set()
-        assert admission.count == 0
-
-    asyncio.run(exercise())
-
-
-def test_cancelled_waiter_releases_its_admission_slot() -> None:
-    async def exercise() -> None:
-        admission = BoundedSerialAdmission(2)
-        release_first = asyncio.Event()
-
-        async def hold() -> None:
-            async with admission.admit():
-                await release_first.wait()
-
-        first = asyncio.create_task(hold())
-        await asyncio.sleep(0)
-        waiting = asyncio.create_task(hold())
-        await asyncio.sleep(0)
-        assert admission.count == 2
-        waiting.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await waiting
-        assert admission.count == 1
-        release_first.set()
-        await first
-        assert admission.count == 0
-
-    asyncio.run(exercise())
 
 
 def test_fair_handoff_admission_runs_up_to_active_limit_in_fifo_order() -> None:

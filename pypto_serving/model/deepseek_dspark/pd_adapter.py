@@ -51,7 +51,8 @@ DSV4_DSPARK_K7_CONTRACT = ModelPDContract(
     executor_cls="PyptoDeepSeekV4DSparkExecutor",
     prefill_speculative_tokens=0,
     decode_speculative_tokens=7,
-    supported_prefix_cache_modes=("disabled", "d_only", "independent"),
+    prefill_prefix_cache=True,
+    decode_prefix_cache=True,
     prefill_async_scheduling=False,
     decode_async_scheduling=True,
 )

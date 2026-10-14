@@ -9,6 +9,15 @@
 from pypto_serving.serving.pd.observability import PDMetrics
 
 
+def test_unknown_router_token_digest_is_not_an_empty_sequence_claim():
+    metrics = PDMetrics("router", "node")
+    metrics.record_terminal(request_id="unknown", state="COMPLETED")
+    metrics.record_terminal(request_id="known", state="COMPLETED", token_ids=(1, 2))
+    recent = metrics.snapshot()["recent_terminal"]
+    assert recent[0]["token_ids_sha256"] == ""
+    assert len(recent[1]["token_ids_sha256"]) == 64
+
+
 def test_peak_gauge_is_monotonic_and_current_gauge_can_return_to_zero() -> None:
     metrics = PDMetrics("test", "node")
     metrics.set_peak_gauge("active_peak", 2)

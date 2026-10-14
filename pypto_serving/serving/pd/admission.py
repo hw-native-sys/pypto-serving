@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Fair request and byte admission for the fixed 1P1D data path."""
+"""Bounded FIFO admission for request and handoff budgets."""
 
 from __future__ import annotations
 
@@ -17,49 +17,7 @@ from contextlib import asynccontextmanager
 
 
 class PDBackpressureError(RuntimeError):
-    """The fixed P/D pair already has its configured number of waiters."""
-
-
-class BoundedSerialAdmission:
-    """Bound the active plus queued handoffs while preserving wire ordering.
-
-    One control session has one ordered reply stream.  Concurrent transfers on
-    that stream would need request-aware demultiplexing, so the first version
-    deliberately serializes admitted handoffs.  The separate counter prevents
-    an unbounded number of HTTP coroutines from accumulating behind the lock.
-    """
-
-    def __init__(self, limit: int) -> None:
-        if type(limit) is not int or limit < 1:
-            raise ValueError("PD pending handoff limit must be a positive integer")
-        self.limit = limit
-        self._count = 0
-        self._state_lock = asyncio.Lock()
-        self._serial_lock = asyncio.Lock()
-
-    @property
-    def count(self) -> int:
-        return self._count
-
-    @asynccontextmanager
-    async def admit(self):
-        async with self._state_lock:
-            if self._count >= self.limit:
-                raise PDBackpressureError(
-                    f"PD handoff backlog reached its configured limit ({self.limit})"
-                )
-            self._count += 1
-
-        acquired = False
-        try:
-            await self._serial_lock.acquire()
-            acquired = True
-            yield
-        finally:
-            if acquired:
-                self._serial_lock.release()
-            async with self._state_lock:
-                self._count -= 1
+    """The service already has its configured number of waiters."""
 
 
 class FairHandoffAdmission:

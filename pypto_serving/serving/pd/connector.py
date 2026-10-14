@@ -85,13 +85,11 @@ class DecodeConnector:
         if request.constraint_digest and len(request.constraint_digest) != 64:
             return ReserveRejected(request.key, "INVALID_CONSTRAINT_DIGEST", False)
         prefix_spec = request.prefix_match_spec
-        if self.capabilities.prefix_cache_mode == "disabled":
-            if prefix_spec is not None:
-                return ReserveRejected(request.key, "UNEXPECTED_PREFIX_MATCH", False)
+        if prefix_spec is None:
+            if self.capabilities.enable_prefix_cache:
+                return ReserveRejected(request.key, "MISSING_PREFIX_MATCH", False)
             prefix_hashes: dict[str, list[bytes]] = {}
         else:
-            if prefix_spec is None:
-                return ReserveRejected(request.key, "MISSING_PREFIX_MATCH", False)
             try:
                 validate_prefix_match_spec(prefix_spec)
             except ValueError:
@@ -121,6 +119,8 @@ class DecodeConnector:
                     return ReserveRejected(
                         request.key, "PREFIX_MATCH_BLOCK_COUNT", False
                     )
+        if not self.capabilities.enable_prefix_cache:
+            prefix_hashes = {}
         if request.key in self._terminal_status:
             return ReserveRejected(request.key, "HANDOFF_TERMINAL", False)
         spec = (
@@ -339,12 +339,6 @@ class DecodeConnector:
             raise RuntimeError("D completion tracker lost its cache reservation")
         if manifest.end_token > reservation.token_capacity:
             raise ValueError("chunk exceeds the D-first reservation capacity")
-        if (
-            self.capabilities.prefix_cache_mode != "independent"
-            and manifest.source_prefix_hit_tokens
-        ):
-            raise ValueError("P prefix hits require independent cache mode")
-
         rank_ids = self._active_rank_ids(reservation.partition)
         validate_rank_mapping(manifest.rank_mapping)
         source_partition = min(pair.source_rank_id for pair in manifest.rank_mapping) // len(rank_ids)

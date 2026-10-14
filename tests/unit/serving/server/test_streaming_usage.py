@@ -25,8 +25,7 @@ from fastapi.testclient import TestClient
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import TokenOutput
-from pypto_serving.serving.pd.observability import token_ids_sha256
-from pypto_serving.serving.reasoning import OutputParserSpec
+from pypto_serving.observability.tokens import token_ids_sha256
 from pypto_serving.serving.server.server import (
     ChatCompletionRequest,
     ChatMessage,
@@ -142,14 +141,11 @@ def test_stream_completion_terminal_usage_chunk():
     ]
     server = _make_server(outputs)
 
-    from pypto_serving.config.types import GenerateConfig
     async def collect():
-        chunks = []
-        async for data in server._stream_completion(
-            "req-0", "hello prompt here go", GenerateConfig(max_new_tokens=3), "test-model"
-        ):
-            chunks.append(data)
-        return chunks
+        response = await server._completions(CompletionRequest(
+            model="test-model", prompt="hello prompt here go", max_tokens=3, stream=True,
+        ))
+        return [data async for data in response.body_iterator]
 
     raw = b"".join(c.encode() for c in asyncio.run(collect()))
     parsed = _parse_sse(raw)
@@ -268,22 +264,18 @@ def test_chat_stream_emits_independent_reasoning_and_content_deltas() -> None:
             ),
         ]
     )
+    class DeepSeekTokenizer(_FakeEngine._FakeTokenizer):
+        output_parser_id = "deepseek_v4"
+
+    engine.tokenizer = DeepSeekTokenizer()
     server = ServingServer(engine, "test-model", GenerateConfig())
 
     async def collect():
-        return [
-            chunk
-            async for chunk in server._stream_chat_completion(
-                "chat-0",
-                "prompt",
-                GenerateConfig(stream=True),
-                "test-model",
-                output_parser_spec=OutputParserSpec(
-                    "deepseek_v4",
-                    "reasoning",
-                ),
-            )
-        ]
+        response = await server._chat_completions(ChatCompletionRequest(
+            messages=[ChatMessage(role="user", content="prompt")], stream=True,
+            chat_template_kwargs={"enable_thinking": True},
+        ))
+        return [chunk async for chunk in response.body_iterator]
 
     parsed = _parse_sse(b"".join(chunk.encode() for chunk in asyncio.run(collect())))
     deltas = [chunk["choices"][0]["delta"] for chunk in parsed if chunk["choices"]]

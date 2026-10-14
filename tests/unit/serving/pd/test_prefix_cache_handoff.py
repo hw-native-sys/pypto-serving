@@ -42,12 +42,12 @@ from .helpers import (
 )
 
 
-def _connector(prefix_cache_mode: str = "d_only"):
-    manager = make_cache_manager(capacity_slots=3, enable_prefix_cache=True)
+def _connector(enable_prefix_cache: bool = True):
+    manager = make_cache_manager(capacity_slots=3, enable_prefix_cache=enable_prefix_cache)
     registry = make_registry(manager)
     capabilities = replace(
         make_capabilities(registry),
-        prefix_cache_mode=prefix_cache_mode,
+        enable_prefix_cache=enable_prefix_cache,
     )
     connector = DecodeConnector(
         manager,
@@ -293,7 +293,7 @@ def test_prefix_reservation_failure_rolls_back_shared_refs_without_cache_loss() 
 
 
 def test_p_hit_greater_than_d_hit_backfills_full_history_and_commits() -> None:
-    d_manager, registry, connector = _connector("independent")
+    d_manager, registry, connector = _connector()
     prompt = list(range(640))
     _warm_prefix(d_manager, prompt, 128, "d-warm")
     spec = _spec(d_manager, prompt)
@@ -389,8 +389,9 @@ def test_p_hit_greater_than_d_hit_backfills_full_history_and_commits() -> None:
     assert next_reservation.prefix_hit_tokens == len(prompt)
 
 
-def test_p_hit_is_rejected_outside_independent_mode() -> None:
-    manager, registry, connector = _connector("d_only")
+@pytest.mark.parametrize("d_enabled", [False, True])
+def test_p_hit_is_independent_of_decode_cache_setting(d_enabled) -> None:
+    manager, registry, connector = _connector(d_enabled)
     prompt = list(range(256))
     key = HandoffKey("mode", "mode-handoff", 1, 1, 1)
     accepted = _reserve(connector, key, prompt, _spec(manager, prompt))
@@ -403,5 +404,6 @@ def test_p_hit_is_rejected_outside_independent_mode() -> None:
         source_prefix_hit_tokens=128,
     )
 
-    with pytest.raises(ValueError, match="independent cache mode"):
-        connector.register_chunk(manifest)
+    assert accepted.prefix_hit_tokens == 0
+    connector.register_chunk(manifest)
+    assert connector.query(key).state == "TRANSFERRING"

@@ -19,9 +19,9 @@ from typing import Any, Union
 
 import msgspec
 
-from pypto_serving.serving.reasoning import OutputParserSpec, ParsedToolCall, ToolCallDelta
+from pypto_serving.serving.reasoning import OutputParserSpec
 
-from .config import PDCapabilities, PDRole
+from .config import PDCapabilities, PDRole, PD_SCHEMA_VERSION
 
 
 # A final handoff can carry the prompt continuation plus an expanded
@@ -40,7 +40,7 @@ def _identifier(value: str, name: str) -> None:
         raise ValueError(f"{name} must be a nonempty identifier of at most {MAX_ID_BYTES} bytes")
 
 
-class HandoffKey(msgspec.Struct, frozen=True):
+class HandoffKey(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     request_id: str
     handoff_id: str
     data_generation: int
@@ -56,6 +56,43 @@ class HandoffKey(msgspec.Struct, frozen=True):
                 raise ValueError(f"{name} must be a positive integer")
 
 
+class GenerationContext(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    key: HandoffKey
+    request_fingerprint: str
+    prefill_node_id: str
+    prefill_endpoint_generation: int
+    decode_node_id: str
+    decode_endpoint_generation: int
+    decode_control_host: str
+    decode_control_port: int
+    schema_version: int
+
+    def __post_init__(self):
+        if self.schema_version != PD_SCHEMA_VERSION:
+            raise ValueError("incompatible PD generation protocol")
+        for name in ("prefill_node_id", "decode_node_id", "decode_control_host"):
+            _identifier(getattr(self, name), name)
+        if self.prefill_node_id == self.decode_node_id:
+            raise ValueError("Prefill and Decode must be different nodes")
+        for name in ("prefill_endpoint_generation", "decode_endpoint_generation", "decode_control_port"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.decode_control_port > 65535:
+            raise ValueError("invalid Decode control port")
+        if (not isinstance(self.request_fingerprint, str) or len(self.request_fingerprint) != 64
+                or any(c not in "0123456789abcdef" for c in self.request_fingerprint)):
+            raise ValueError("invalid public request fingerprint")
+
+    def validate_node(self, config):
+        node, generation = (self.prefill_node_id, self.prefill_endpoint_generation) if (
+            config.role is PDRole.PREFILL) else (self.decode_node_id, self.decode_endpoint_generation)
+        if (node != config.node_id or generation != config.generation
+                or self.key.data_generation != config.generation
+                or self.key.route_epoch != config.route_epoch
+                or self.key.control_incarnation != config.control_incarnation):
+            raise ValueError("PD generation context targets another node incarnation")
+
+
 class CapabilityWire(msgspec.Struct, frozen=True):
     schema_version: int
     adapter_id: str
@@ -69,7 +106,7 @@ class CapabilityWire(msgspec.Struct, frozen=True):
     provider: str
     logical_groups: tuple[str, ...]
     physical_regions: tuple[str, ...]
-    prefix_cache_mode: str = "disabled"
+    enable_prefix_cache: bool = False
 
     @classmethod
     def from_capabilities(cls, value: PDCapabilities) -> "CapabilityWire":
@@ -86,7 +123,7 @@ class CapabilityWire(msgspec.Struct, frozen=True):
             value.provider,
             value.logical_groups,
             value.physical_regions,
-            value.prefix_cache_mode,
+            value.enable_prefix_cache,
         )
 
     def to_capabilities(self) -> PDCapabilities:
@@ -103,8 +140,35 @@ class CapabilityWire(msgspec.Struct, frozen=True):
             provider=self.provider,
             logical_groups=self.logical_groups,
             physical_regions=self.physical_regions,
-            prefix_cache_mode=self.prefix_cache_mode,
+            enable_prefix_cache=self.enable_prefix_cache,
         )
+
+
+class NodeDescriptor(msgspec.Struct, frozen=True):
+    node_id: str
+    role: str
+    run_id: str
+    control_host: str
+    control_port: int
+    owner_generation: int
+    endpoint_generation: int
+    control_incarnation: int
+    capabilities: CapabilityWire
+    health: str
+
+
+class CapacitySnapshot(msgspec.Struct, frozen=True):
+    node_id: str
+    role: str
+    active_handoffs: int
+    pending_requests: int
+    reservations: int
+    quarantined_reservations: int
+    snapshot_sequence: int
+    active_limit: int = 1
+    queued_handoffs: int = 0
+    inflight_transfer_bytes: int = 0
+    inflight_transfer_byte_limit: int = 0
 
 
 class Hello(msgspec.Struct, tag="hello", frozen=True):
@@ -160,7 +224,7 @@ class PrefixMatchSpec(msgspec.Struct, frozen=True):
     identity_digest: str
 
 
-class ReserveRequest(msgspec.Struct, tag="reserve", frozen=True):
+class ReserveRequest(msgspec.Struct, frozen=True):
     key: HandoffKey
     prompt_token_count: int
     max_new_tokens: int
@@ -301,37 +365,27 @@ class ControlError(msgspec.Struct, tag="control_error", frozen=True):
     deterministic: bool
 
 
-class DecodeOutputWire(msgspec.Struct, tag="decode_output", frozen=True):
+class BeginHandoff(msgspec.Struct, tag="begin_handoff", frozen=True):
     key: HandoffKey
-    token_id: int | None
-    text: str
-    finished: bool
-    finish_reason: str
-    prompt_tokens: int
-    completion_tokens: int
-    token_ids: tuple[int, ...] = ()
-    output_sequence: int = 0
-    reasoning: str = ""
-    text_delta: str = ""
-    reasoning_delta: str = ""
-    tool_call_deltas: tuple[ToolCallDelta, ...] = ()
-    tool_calls: tuple[ParsedToolCall, ...] = ()
-
-
-class OpenRoute(msgspec.Struct, tag="open_route", frozen=True):
-    key: HandoffKey
-    prepared_request_id: str
-    reservation_id: str
+    context: GenerationContext
+    continuation: ContinuationMetadata
+    prefix_match_spec: PrefixMatchSpec | None
     prepared_digest: str
-    reservation_capability: str
-    compatibility_digest: str
-    prefill_node_id: str
-    prefill_endpoint_generation: int
+
+    def __post_init__(self):
+        if self.key != self.context.key:
+            raise ValueError("handoff context identity mismatch")
+        if self.prepared_digest != prepared_request_hash(self.continuation, self.prefix_match_spec):
+            raise ValueError("normalized handoff digest mismatch")
 
 
-class RouteOpened(msgspec.Struct, tag="route_opened", frozen=True):
+class PrefillResult(msgspec.Struct, frozen=True):
     key: HandoffKey
-    reservation_id: str
+    request_fingerprint: str
+    state: str
+    error_code: str = ""
+    retryable: bool = False
+    error_message: str = ""
 
 
 class QueryHandoff(msgspec.Struct, tag="query", frozen=True):
@@ -353,18 +407,6 @@ class AbortHandoff(msgspec.Struct, tag="abort", frozen=True):
     deterministic: bool = True
 
 
-class ReleaseHandoff(msgspec.Struct, tag="release", frozen=True):
-    key: HandoffKey
-    reason: str
-
-
-class PoisonHandoff(msgspec.Struct, tag="poison", frozen=True):
-    key: HandoffKey
-    rank_id: int
-    attempt_id: str
-    error_code: str
-
-
 class DrainPeer(msgspec.Struct, tag="drain_peer", frozen=True):
     pass
 
@@ -383,7 +425,6 @@ ControlMessage = Union[
     SenderReleaseAck,
     Hello,
     RegistryAdvertisement,
-    ReserveRequest,
     ReserveAccepted,
     ReserveRejected,
     ChunkManifest,
@@ -392,14 +433,10 @@ ControlMessage = Union[
     ReadyAck,
     ControlAck,
     ControlError,
-    DecodeOutputWire,
-    OpenRoute,
-    RouteOpened,
+    BeginHandoff,
     QueryHandoff,
     HandoffStatus,
     AbortHandoff,
-    ReleaseHandoff,
-    PoisonHandoff,
 ]
 
 

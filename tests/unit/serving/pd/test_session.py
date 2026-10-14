@@ -9,6 +9,7 @@
 
 import asyncio
 import socket
+import threading
 
 import pytest
 
@@ -38,6 +39,52 @@ def _free_port() -> int:
     port = sock.getsockname()[1]
     sock.close()
     return port
+
+
+def test_cancelled_connect_closes_socket_returned_later_by_worker(monkeypatch):
+    async def exercise():
+        started, release = threading.Event(), threading.Event()
+        local, peer = socket.socketpair()
+        def connect(*args):
+            started.set()
+            assert release.wait(2)
+            return local
+        monkeypatch.setattr("pypto_serving.serving.pd.session._connect_endpoint", connect)
+        task = asyncio.create_task(connect_control_session(
+            _config(PDRole.PREFILL, 12345), _capabilities(),
+            peer_node_id="d", peer_host="localhost", peer_port=12345,
+        ))
+        try:
+            assert await asyncio.to_thread(started.wait, 1)
+            task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert local.fileno() == -1
+        finally:
+            local.close()
+            peer.close()
+    asyncio.run(exercise())
+
+
+def test_cancelled_handshake_interrupts_blocked_reader_and_closes_socket():
+    from pypto_serving.serving.pd.session import _open_pd_socket
+    async def exercise():
+        local, peer = socket.socketpair()
+        task = asyncio.create_task(_open_pd_socket(
+            local, _config(PDRole.PREFILL, 12345), _capabilities(),
+            expected_peer_node_id="d", expected_peer_role=PDRole.DECODE,
+        ))
+        try:
+            assert await asyncio.to_thread(peer.recv, 1)  # Hello was sent; receive now waits.
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert local.fileno() == -1
+        finally:
+            local.close()
+            peer.close()
+    asyncio.run(asyncio.wait_for(exercise(), 3))
 
 
 def _config(role: PDRole, port: int) -> PDConfig:

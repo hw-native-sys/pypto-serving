@@ -17,7 +17,10 @@ from fastapi.testclient import TestClient
 from pypto_serving.router.app import create_router_app
 from pypto_serving.router.config import RouterConfig
 from pypto_serving.router.coordinator import RouterCoordinator
-from pypto_serving.serving.pd.protocol import DecodeOutputWire, HandoffKey
+from pypto_serving.serving.engine.async_engine import TokenOutput
+from pypto_serving.serving.server.responses import output_response
+from pypto_serving.router.client import PublicResult
+from pypto_serving.serving.server.api_types import ChatCompletionRequest, CompletionRequest
 from pypto_serving.serving.reasoning import ParsedToolCall, ToolCallDelta
 
 
@@ -37,8 +40,7 @@ def _config(tmp_path):
 
 
 def _wire(request_id, *, sequence, finished=False, deltas=(), calls=()):
-    return DecodeOutputWire(
-        key=HandoffKey(request_id, "handoff", 1, 1, 1),
+    return TokenOutput(
         token_id=101,
         text="",
         reasoning="Need data",
@@ -47,11 +49,32 @@ def _wire(request_id, *, sequence, finished=False, deltas=(), calls=()):
         prompt_tokens=4,
         completion_tokens=sequence,
         token_ids=(101, 102, 103) if finished else (),
-        output_sequence=sequence,
         reasoning_delta="Need data" if sequence == 1 else "",
         tool_call_deltas=deltas,
         tool_calls=calls,
     )
+
+
+def _patch_generate(monkeypatch, fake):
+    # Fake D uses the same public formatter as both normal and PD Serving.
+    # Router receives finished JSON/SSE, never TokenOutput/private wire DTOs.
+    async def generate(self, kind, raw, request_id, publish_immediately=True, _signal_ready=False):
+        public = (ChatCompletionRequest if kind == "chat" else CompletionRequest).model_validate_json(raw)
+        outputs = fake(self, kind, raw, request_id,
+                       publish_immediately=publish_immediately, _signal_ready=_signal_ready)
+        if _signal_ready:
+            assert await anext(outputs) is None
+            yield None
+        response = await output_response(
+            outputs, request_id, public.model or "model", kind=kind, stream=public.stream,
+            parsed=True, parallel_tool_calls=getattr(public, "parallel_tool_calls", True),
+        )
+        if public.stream:
+            async for frame in response.body_iterator:
+                yield frame.encode() if isinstance(frame, str) else frame
+        else:
+            yield PublicResult(response.body, dict(response.headers))
+    monkeypatch.setattr(RouterCoordinator, "generate", generate)
 
 
 def _sse_events(response):
@@ -67,16 +90,15 @@ def test_completion_reports_execution_failure_after_headers_as_sse(tmp_path, mon
     async def no_reconcile(self):
         return None
 
-    async def fail(self, request_kind, request_json, request_id, publish_immediately=True, _signal_prepared=False):
-        if _signal_prepared:
+    async def fail(self, request_kind, request_json, request_id, publish_immediately=True, _signal_ready=False):
+        if _signal_ready:
             yield None
         if after_output:
-            yield DecodeOutputWire(HandoffKey(request_id, "handoff", 1, 1, 1), 1, "ok", False, "", 4, 1,
-                                   output_sequence=1, text_delta="ok")
+            yield TokenOutput(text="ok", text_delta="ok", prompt_tokens=4, completion_tokens=1)
         raise error_type("P rejected before transfer: HANDOFF_BACKPRESSURE")
 
     monkeypatch.setattr(RouterCoordinator, "reconcile_startup", no_reconcile)
-    monkeypatch.setattr(RouterCoordinator, "generate", fail)
+    _patch_generate(monkeypatch, fail)
     with TestClient(create_router_app(_config(tmp_path))) as client:
         events = _sse_events(client.post("/v1/completions", json={"prompt": "hello", "stream": True}))
     assert events[-1]["error"]["code"] == 503
@@ -88,17 +110,17 @@ def test_completion_stream_uses_deltas_without_repeating_terminal_summary(tmp_pa
     async def no_reconcile(self):
         return None
 
-    async def generate(self, request_kind, request_json, request_id, publish_immediately=True, _signal_prepared=False):
-        if _signal_prepared:
+    async def generate(self, request_kind, request_json, request_id, publish_immediately=True, _signal_ready=False):
+        if _signal_ready:
             yield None
-        key = HandoffKey(request_id, "handoff", 1, 1, 1)
         if publish_immediately:
-            yield DecodeOutputWire(key, 1, "", False, "", 4, 1, output_sequence=1, text_delta="city")
-        yield DecodeOutputWire(key, 2, "city\ufffd", True, "FINISHED_LENGTH", 4, 2, (1, 2),
-                               output_sequence=2, text_delta="\ufffd" if publish_immediately else "city\ufffd")
+            yield TokenOutput(text_delta="city", prompt_tokens=4, completion_tokens=1)
+        yield TokenOutput(text="city\ufffd", finished=True, finish_reason="FINISHED_LENGTH",
+                              prompt_tokens=4, completion_tokens=2, token_ids=(1, 2),
+                              text_delta="\ufffd" if publish_immediately else "city\ufffd")
 
     monkeypatch.setattr(RouterCoordinator, "reconcile_startup", no_reconcile)
-    monkeypatch.setattr(RouterCoordinator, "generate", generate)
+    _patch_generate(monkeypatch, generate)
     with TestClient(create_router_app(_config(tmp_path))) as client:
         result = client.post("/v1/completions", json={"prompt": "hello"}).json()
         events = _sse_events(client.post("/v1/completions", json={"prompt": "hello", "stream": True}))
@@ -114,8 +136,8 @@ def test_pd_router_formats_tool_calls_and_roundtrips_history(tmp_path, monkeypat
     async def no_reconcile(self):
         return None
 
-    async def fake_generate(self, request_kind, request_json, request_id, publish_immediately=True, _signal_prepared=False):
-        if _signal_prepared:
+    async def fake_generate(self, request_kind, request_json, request_id, publish_immediately=True, _signal_ready=False):
+        if _signal_ready:
             yield None
         assert request_kind == "chat"
         seen.append(json.loads(request_json))
@@ -129,7 +151,7 @@ def test_pd_router_formats_tool_calls_and_roundtrips_history(tmp_path, monkeypat
             yield _wire(request_id, sequence=3, finished=True, calls=calls)
 
     monkeypatch.setattr(RouterCoordinator, "reconcile_startup", no_reconcile)
-    monkeypatch.setattr(RouterCoordinator, "generate", fake_generate)
+    _patch_generate(monkeypatch, fake_generate)
     app = create_router_app(_config(tmp_path))
     payload = {
         "model": "model",
@@ -176,15 +198,15 @@ def test_pd_router_forwards_required_tool_choice(tmp_path, monkeypatch):
     async def no_reconcile(self):
         return None
 
-    async def fake_generate(self, request_kind, request_json, request_id, publish_immediately=True, _signal_prepared=False):
-        if _signal_prepared:
+    async def fake_generate(self, request_kind, request_json, request_id, publish_immediately=True, _signal_ready=False):
+        if _signal_ready:
             yield None
         assert request_kind == "chat"
         assert json.loads(request_json)["tool_choice"] == "required"
         yield _wire(request_id, sequence=1, finished=True)
 
     monkeypatch.setattr(RouterCoordinator, "reconcile_startup", no_reconcile)
-    monkeypatch.setattr(RouterCoordinator, "generate", fake_generate)
+    _patch_generate(monkeypatch, fake_generate)
     with TestClient(create_router_app(_config(tmp_path))) as client:
         response = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "Find a city"}],
@@ -201,8 +223,8 @@ def test_pd_router_respects_parallel_tool_calls_false(tmp_path, monkeypatch, str
     async def no_reconcile(self):
         return None
 
-    async def fake_generate(self, request_kind, request_json, request_id, publish_immediately=True, _signal_prepared=False):
-        if _signal_prepared:
+    async def fake_generate(self, request_kind, request_json, request_id, publish_immediately=True, _signal_ready=False):
+        if _signal_ready:
             yield None
         assert request_kind == "chat"
         calls = (
@@ -216,7 +238,7 @@ def test_pd_router_respects_parallel_tool_calls_false(tmp_path, monkeypatch, str
         yield _wire(request_id, sequence=1, finished=True, deltas=deltas, calls=calls)
 
     monkeypatch.setattr(RouterCoordinator, "reconcile_startup", no_reconcile)
-    monkeypatch.setattr(RouterCoordinator, "generate", fake_generate)
+    _patch_generate(monkeypatch, fake_generate)
     with TestClient(create_router_app(_config(tmp_path))) as client:
         response = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "Find cities"}],
@@ -245,7 +267,7 @@ def test_pd_router_stream_reports_decode_parser_failure_as_sse(tmp_path, monkeyp
         raise error_type("D Decode failed: invalid tool call")
 
     monkeypatch.setattr(RouterCoordinator, "reconcile_startup", no_reconcile)
-    monkeypatch.setattr(RouterCoordinator, "generate", failing_generate)
+    _patch_generate(monkeypatch, failing_generate)
     with TestClient(create_router_app(_config(tmp_path))) as client:
         response = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "Find a city"}],
@@ -255,26 +277,21 @@ def test_pd_router_stream_reports_decode_parser_failure_as_sse(tmp_path, monkeyp
     events = _sse_events(response)
     assert events == [{"error": {
         "message": "D Decode failed: invalid tool call",
-        "type": "pd_decode_error",
+        "type": "generation_error",
         "code": 503,
     }}]
 
 
-@pytest.mark.parametrize("kind", ("completion", "chat"))
-def test_public_stream_cancellation_is_not_converted_to_error_or_done(kind):
-    from pypto_serving.router.app import _stream_chat, _stream_completion
-
+def test_public_stream_cancellation_is_not_converted_to_error_or_done():
+    from pypto_serving.router.app import _forward_stream
     async def outputs():
-        yield DecodeOutputWire(HandoffKey("r", "h", 1, 1, 1), 1, "", False, "", 4, 1, text_delta="ok")
+        yield b'data: {"text":"ok"}\n\n'
         raise asyncio.CancelledError
-
     async def exercise():
-        formatter = _stream_chat if kind == "chat" else _stream_completion
-        stream = formatter(outputs(), "r", "model")
+        stream = _forward_stream(outputs())
         assert b"ok" in await anext(stream)
         with pytest.raises(asyncio.CancelledError):
             await anext(stream)
-
     asyncio.run(exercise())
 
 
@@ -287,7 +304,7 @@ def test_pd_router_rejects_preparation_before_sse_headers(tmp_path, monkeypatch)
         yield
 
     monkeypatch.setattr(RouterCoordinator, "reconcile_startup", no_reconcile)
-    monkeypatch.setattr(RouterCoordinator, "generate", failing_generate)
+    _patch_generate(monkeypatch, failing_generate)
     with TestClient(create_router_app(_config(tmp_path))) as client:
         response = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "Find a city"}],

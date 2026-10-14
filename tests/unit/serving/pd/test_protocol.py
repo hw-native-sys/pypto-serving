@@ -15,11 +15,13 @@ import pytest
 
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
 from pypto_serving.serving.pd.config import PDCapabilities, PDRole
-from pypto_serving.serving.pd.http_api import DecodeStreamFrame, decode_json, encode_json
+
 from pypto_serving.serving.pd.protocol import (
+    MAX_CONTROL_MESSAGE_BYTES,
+    MAX_CONSTRAINT_SPEC_BYTES,
+    CapabilityWire,
     ChunkManifest,
     ContinuationMetadata,
-    DecodeOutputWire,
     FramedChannel,
     HandoffKey,
     PrefixMatchSpec,
@@ -34,7 +36,7 @@ from pypto_serving.serving.pd.protocol import (
     make_prefix_match_spec,
     validate_prefix_match_spec,
 )
-from pypto_serving.serving.reasoning import OutputParserSpec, ParsedToolCall, ToolCallDelta
+from pypto_serving.serving.reasoning import OutputParserSpec
 
 
 def _capabilities(model_revision: str = "ds-v4-test") -> PDCapabilities:
@@ -161,12 +163,11 @@ def test_contract_digest_mismatch_is_rejected() -> None:
     )
 
 
-def test_prefix_cache_profile_mismatch_is_rejected() -> None:
-    local = replace(_capabilities(), prefix_cache_mode="d_only")
-    peer = replace(_capabilities(), prefix_cache_mode="disabled")
-    assert local.compatibility_error(peer) == (
-        "PD capability mismatch: prefix_cache_mode"
-    )
+def test_independent_node_cache_settings_are_compatible() -> None:
+    local = replace(_capabilities(), enable_prefix_cache=True)
+    peer = replace(_capabilities(), enable_prefix_cache=False)
+    assert local.compatibility_error(peer) is None
+    assert CapabilityWire.from_capabilities(local).to_capabilities().enable_prefix_cache
 
 
 def test_prefix_match_spec_is_canonical_bounded_and_tamper_evident() -> None:
@@ -213,6 +214,25 @@ def test_control_message_codec_rejects_empty_input() -> None:
     assert decode_message(encode_message(message)) == message
     with pytest.raises(ValueError, match="size"):
         decode_message(b"")
+
+
+def test_control_codec_rejects_oversized_and_malformed_wire() -> None:
+    from pypto_serving.serving.pd.protocol import ControlError
+
+    key = HandoffKey("request", "handoff", 1, 1, 1)
+    with pytest.raises(ValueError, match="bounded wire size"):
+        encode_message(ControlError(key, "commit", "x" * MAX_CONTROL_MESSAGE_BYTES, True))
+    with pytest.raises(ValueError, match="message size"):
+        decode_message(b"x" * (MAX_CONTROL_MESSAGE_BYTES + 1))
+    with pytest.raises(ValueError):
+        decode_message(b"not a valid control frame")
+
+
+def test_constraint_identity_rejects_oversized_and_nonfinite_documents() -> None:
+    with pytest.raises(ValueError, match="control limit"):
+        constraint_spec_hash({"description": "x" * MAX_CONSTRAINT_SPEC_BYTES})
+    with pytest.raises(ValueError):
+        constraint_spec_hash({"invalid": float("nan")})
 
 
 def test_tool_parser_spec_and_outputs_survive_pd_wire_round_trip() -> None:
@@ -274,21 +294,3 @@ def test_tool_parser_spec_and_outputs_survive_pd_wire_round_trip() -> None:
             output_parser_spec=continuation.output_parser_spec,
         )
     )
-
-    output = DecodeOutputWire(
-        key=key,
-        token_id=101,
-        text="answer",
-        reasoning="hidden on request but valid on the wire",
-        text_delta="swer",
-        reasoning_delta="valid on the wire",
-        tool_call_deltas=(ToolCallDelta(index=0, id="call-1", name="lookup", arguments='{"city":'),),
-        tool_calls=(ParsedToolCall(id="call-1", name="lookup", arguments='{"city":"杭州"}'),),
-        finished=True,
-        finish_reason="FINISHED_LENGTH",
-        prompt_tokens=3,
-        completion_tokens=2,
-    )
-    assert decode_message(encode_message(output)) == output
-    frame = DecodeStreamFrame(event="finished", output=output)
-    assert decode_json(encode_json(frame), DecodeStreamFrame) == frame

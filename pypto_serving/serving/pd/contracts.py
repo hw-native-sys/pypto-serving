@@ -35,7 +35,8 @@ class ModelPDContract:
     executor_cls: str
     prefill_speculative_tokens: int
     decode_speculative_tokens: int
-    supported_prefix_cache_modes: tuple[str, ...] = ("disabled",)
+    prefill_prefix_cache: bool = False
+    decode_prefix_cache: bool = False
     prefill_async_scheduling: bool = False
     decode_async_scheduling: bool = False
 
@@ -90,8 +91,12 @@ class ModelPDContract:
             return self.decode_async_scheduling
         raise ValueError(f"unknown PD role {role!r}")
 
-    def supports_prefix_cache_mode(self, mode: str) -> bool:
-        return mode in self.supported_prefix_cache_modes
+    def supports_prefix_cache(self, role: str) -> bool:
+        if role == "prefill":
+            return self.prefill_prefix_cache
+        if role == "decode":
+            return self.decode_prefix_cache
+        raise ValueError(f"unknown PD role {role!r}")
 
 
 @dataclass(frozen=True)
@@ -107,7 +112,7 @@ class RuntimeLayoutDescriptor:
     logical_groups: tuple[str, ...]
     physical_regions: tuple[str, ...]
     continuation_schema: str
-    prefix_cache_mode: str
+    enable_prefix_cache: bool
 
     @classmethod
     def from_runtime_bundle(
@@ -116,7 +121,7 @@ class RuntimeLayoutDescriptor:
         bundle,
         *,
         provider: str,
-        prefix_cache_mode: str,
+        enable_prefix_cache: bool,
     ) -> "RuntimeLayoutDescriptor":
         return cls(
             adapter_id=contract.adapter_id,
@@ -130,5 +135,5 @@ class RuntimeLayoutDescriptor:
             logical_groups=contract.logical_groups,
             physical_regions=contract.physical_regions,
             continuation_schema=contract.continuation_schema,
-            prefix_cache_mode=prefix_cache_mode,
+            enable_prefix_cache=enable_prefix_cache,
         )

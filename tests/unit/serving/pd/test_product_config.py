@@ -14,7 +14,6 @@ import pytest
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_ADAPTER
 from pypto_serving.router.config import RouterConfig
 from pypto_serving.serving.pd.config import (
-    PDPrefixCacheMode,
     PDRole,
     load_pd_document,
     resolve_pd_config,
@@ -58,8 +57,7 @@ def test_minimal_config_resolves_shared_identity_and_default_paths(tmp_path) -> 
     assert router.policy == "round_robin"
     assert document.runtime.enable_chunk_overlap
     assert prefill.enable_chunk_overlap and decode.enable_chunk_overlap
-    assert document.runtime.prefix_cache_mode is PDPrefixCacheMode.INDEPENDENT
-    assert prefill.prefix_cache_enabled and decode.prefix_cache_enabled
+    assert prefill.enable_prefix_cache and decode.enable_prefix_cache
     assert prefill.node_id.startswith("prefill-")
     assert decode.node_id.startswith("decode-")
     assert Path(prefill.journal_path).parent.is_dir()
@@ -138,54 +136,45 @@ def test_runtime_controls_are_shared_by_router_and_nodes(tmp_path, overlap) -> N
 
 
 @pytest.mark.parametrize(
-    ("mode", "prefill_enabled", "decode_enabled"),
+    ("prefill_enabled", "decode_enabled"),
     (
-        ("disabled", False, False),
-        ("d_only", False, True),
-        ("independent", True, True),
+        (False, False),
+        (False, True),
+        (True, False),
+        (True, True),
     ),
 )
-def test_prefix_cache_profile_is_role_specific(
-    tmp_path, mode, prefill_enabled, decode_enabled
+def test_prefix_cache_is_a_local_node_setting(
+    tmp_path, prefill_enabled, decode_enabled
 ) -> None:
     path = _write_config(tmp_path)
-    value = json.loads(path.read_text(encoding="utf-8"))
-    value["runtime"]["prefix_cache_mode"] = mode
-    path.write_text(json.dumps(value), encoding="utf-8")
     document = load_pd_document(path)
-    assert document.runtime.prefix_cache_mode is PDPrefixCacheMode(mode)
     prefill = resolve_pd_config(
         document,
         role=PDRole.PREFILL,
         model_revision="dsv4",
         model_adapter=DSV4_DSPARK_K7_ADAPTER,
+        enable_prefix_cache=prefill_enabled,
     )
     decode = resolve_pd_config(
         document,
         role=PDRole.DECODE,
         model_revision="dsv4",
         model_adapter=DSV4_DSPARK_K7_ADAPTER,
+        enable_prefix_cache=decode_enabled,
     )
-    assert prefill.prefix_cache_enabled is prefill_enabled
-    assert decode.prefix_cache_enabled is decode_enabled
+    assert prefill.enable_prefix_cache is prefill_enabled
+    assert decode.enable_prefix_cache is decode_enabled
 
 
-def test_profile_enables_independent_p_and_d_caches(tmp_path) -> None:
+@pytest.mark.parametrize("mode", ["disabled", "d_only", "independent"])
+def test_removed_shared_cache_mode_is_rejected(tmp_path, mode) -> None:
     path = _write_config(tmp_path)
     value = json.loads(path.read_text(encoding="utf-8"))
-    value["runtime"]["prefix_cache_mode"] = "independent"
+    value["runtime"]["prefix_cache_mode"] = mode
     path.write_text(json.dumps(value), encoding="utf-8")
-    document = load_pd_document(path)
-    resolved = tuple(
-        resolve_pd_config(
-            document,
-            role=role,
-            model_revision="dsv4",
-            model_adapter=DSV4_DSPARK_K7_ADAPTER,
-        )
-        for role in (PDRole.PREFILL, PDRole.DECODE)
-    )
-    assert all(config.prefix_cache_enabled for config in resolved)
+    with pytest.raises(ValueError, match="unknown runtime fields"):
+        load_pd_document(path)
 
 
 @pytest.mark.parametrize(

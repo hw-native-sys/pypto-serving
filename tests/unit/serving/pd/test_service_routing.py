@@ -6,329 +6,330 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+
 import asyncio
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
+import msgspec
+from types import SimpleNamespace
 
 from pypto_serving.config.types import GenerateConfig
+from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_ADAPTER
-from pypto_serving.serving.engine.async_engine import TokenOutput
-from pypto_serving.serving.pd.config import PDConfig, PDRole
-from pypto_serving.serving.pd.http_api import (
-    AuthorizeRouteHTTP,
-    ExecutePrefillHTTP,
-    ReservePlacementHTTP,
-    capability_compatibility_digest,
-)
-from pypto_serving.serving.pd.protocol import HandoffKey, ControlError, OpenRoute, RouteOpened
+from pypto_serving.serving.pd.config import PDConfig, PD_SCHEMA_VERSION, PDRole
+from pypto_serving.serving.pd.protocol import BeginHandoff, GenerationContext, HandoffKey
+from pypto_serving.serving.pd.admission import PDBackpressureError
 from pypto_serving.serving.pd.service import PDServingService
-from pypto_serving.serving.reasoning import ParsedToolCall, ToolCallDelta
-from pypto_serving.serving.pd.worker_api import (
-    TransferPollResponse,
-)
+from pypto_serving.serving.reasoning import OutputParserSpec, ParsedToolCall, ToolCallDelta
+from pypto_serving.serving.pd.worker_api import TransferPollResponse
+from pypto_serving.transfer.types import CompletionCertainty
 
 from .test_service import _FakeCore, _OverlapFakeCore, _free_port
 
 
-def test_decode_route_quota_uses_live_reservations_while_completed_tasks_finish_cleanup():
-    async def exercise():
-        service = object.__new__(PDServingService)
-        service.config = SimpleNamespace(max_active_handoffs=4, max_pending_handoffs=8)
-        service._external_handoff_tasks = {}
-        service._health_error = ""
-        states = {}
-        service.decode_connector = SimpleNamespace(query=lambda key: SimpleNamespace(state=states[key]))
-        incoming, replies = asyncio.Queue(), asyncio.Queue()
-        cleanup = asyncio.Event()
-
-        async def handoff(session, queue, key):
-            message = await queue.get()
-            await session.send(RouteOpened(key, message.reservation_id))
-            await cleanup.wait()
-
-        service._serve_external_handoff = handoff
-        session = SimpleNamespace(receive=incoming.get, send=replies.put)
-        runner = asyncio.create_task(service._serve_external_session(session))
-
-        async def open_route(index, state):
-            key = HandoffKey(f"request-{index}", f"handoff-{index}", 1, 1, 1)
-            states[key] = "RESERVED"
-            await incoming.put(OpenRoute(key, "prepared", "reservation", "digest", "cap", "compat", "p", 1))
-            response = await asyncio.wait_for(replies.get(), 1)
-            states[key] = state
-            return key, response
-
-        try:
-            # One completed task still owns its cleanup coroutine. Four Decode
-            # routes and four new transfers remain legal reservation owners.
-            for index, state in enumerate(("COMPLETED",) + ("IN_USE",) * 4 + ("RESERVED",) * 4):
-                key, response = await open_route(index, state)
-                assert isinstance(response, RouteOpened), response
-            assert len(service._external_handoff_tasks) == 9
-            _, response = await open_route(9, "RESERVED")
-            assert isinstance(response, ControlError) and response.error_code == "HANDOFF_BACKPRESSURE"
-            states[key] = "READY"
-            _, response = await open_route(10, "RESERVED")
-            assert isinstance(response, ControlError) and response.error_code == "HANDOFF_BACKPRESSURE"
-        finally:
-            runner.cancel()
-            await asyncio.gather(runner, return_exceptions=True)
-            tasks = tuple(service._external_handoff_tasks.values())
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-    asyncio.run(exercise())
-
-
-def test_authenticated_route_rejection_returns_no_start_proof_without_compute():
-    async def exercise():
-        port = _free_port()
-        p_core = _FakeCore(PDRole.PREFILL)
-        prefill = PDServingService(p_core, _external_config(PDRole.PREFILL, port))
-        decode = PDServingService(_FakeCore(PDRole.DECODE), _external_config(PDRole.DECODE, port))
-        original = decode._serve_external_handoff
-
-        async def reject(session, queue, key):
-            await queue.get()
-            await session.send(ControlError(key, "OpenRoute", "HANDOFF_BACKPRESSURE", True))
-
-        decode._serve_external_handoff = reject
-        await asyncio.gather(prefill.start(), decode.start())
-        stream = None
-        try:
-            key, stream, execute = await _open_test_handoff(prefill, decode, port, request_id="rejected")
-            result = await execute
-            assert result.state == "NOT_STARTED" and result.error_code == "HANDOFF_BACKPRESSURE"
-            assert not p_core.manifests and not prefill._prepared_by_id
-            await stream.aclose()
-            await decode.abort_handoff(key, "NOT_STARTED", deterministic=True)
-            decode._serve_external_handoff = original
-            _, stream, execute = await _open_test_handoff(prefill, decode, port, request_id="next")
-            assert [frame.output.token_id async for frame in stream] == [101, 102]
-            assert (await execute).state == "READY"
-            assert not prefill.health_error and not decode.health_error
-        finally:
-            if stream is not None:
-                await stream.aclose()
-            await asyncio.gather(prefill.close(), decode.close())
-
-    asyncio.run(asyncio.wait_for(exercise(), 15))
-
-
-def test_router_cancel_retires_decode_task_blocked_on_output_backpressure():
-    class SlowConsumerCore(_FakeCore):
-        def __init__(self):
-            super().__init__(PDRole.DECODE)
-            self.queue_filled = asyncio.Event()
-            self.output_closed = asyncio.Event()
-            self.scheduler_stopped = False
-
-        async def add_adopted_handoff(self, **kwargs):
-            self.kv_cache_manager.adopt_group_cache(kwargs["reservation_id"])
-            try:
-                for index in range(65):
-                    if index == 64:
-                        self.queue_filled.set()
-                    yield TokenOutput(token_id=101, text="x" * (index + 1), completion_tokens=index + 1)
-            finally:
-                self.output_closed.set()
-
-        async def abort_request(self, request_id):
-            await super().abort_request(request_id)
-            self.scheduler_stopped = True
-
-    async def exercise():
-        port = _free_port()
-        prefill = PDServingService(_FakeCore(PDRole.PREFILL), _external_config(PDRole.PREFILL, port))
-        core = SlowConsumerCore()
-        decode = PDServingService(core, _external_config(PDRole.DECODE, port))
-        await asyncio.gather(prefill.start(), decode.start())
-        stream = None
-        try:
-            key, stream, execute = await _open_test_handoff(prefill, decode, port, request_id="cancel-slow")
-            assert (await execute).state == "READY"
-            await core.queue_filled.wait()
-            task = decode._external_handoff_tasks[key]
-            assert not task.done() and decode._decode_queues[key].full()
-            status = await decode.abort_handoff(key, "CLIENT_CANCELLED", deterministic=True)
-            assert status.state == "ABORTED"
-            assert core.scheduler_stopped and core.output_closed.is_set()
-            assert task.done() and key not in decode._external_handoff_tasks
-            assert key not in decode._decode_queues and not decode.health_error
-            assert decode._admission.count == 0
-            assert not core.kv_cache_manager.group_cache_reservations
-        finally:
-            if stream is not None:
-                await stream.aclose()
-            await asyncio.gather(prefill.close(), decode.close())
-
-    asyncio.run(asyncio.wait_for(exercise(), 15))
-
-
-def _external_config(role: PDRole, port: int) -> PDConfig:
+def _external_config(role, port):
     return PDConfig(
-        role=role,
-        node_id="p" if role is PDRole.PREFILL else "d",
-        run_id="external-run",
-        control_host="127.0.0.1",
-        control_advertise_host="127.0.0.1",
-        control_port=port,
-        transfer_hostname="127.0.0.1",
-        model_revision="ds-v4-test",
-        model_adapter=DSV4_DSPARK_K7_ADAPTER,
-        connect_timeout_seconds=3,
-        prepared_request_ttl_seconds=30,
+        role=role, node_id="p" if role is PDRole.PREFILL else "d", run_id="run",
+        control_host="127.0.0.1", control_advertise_host="127.0.0.1", control_port=port,
+        transfer_hostname="127.0.0.1", model_revision="ds-v4-test",
+        model_adapter=DSV4_DSPARK_K7_ADAPTER, connect_timeout_seconds=3, request_timeout_seconds=5,
+        observability_enabled=False,
     )
 
 
+def _context(port, request_id="request"):
+    return GenerationContext(HandoffKey(request_id, f"handoff-{request_id}", 1, 1, 1),
+                             "a" * 64, "p", 1, "d", 1, "127.0.0.1", port, PD_SCHEMA_VERSION)
+
+
+async def _open_test_handoff(prefill, decode, port, *, request_id="overlap", prompt_tokens=257):
+    context = _context(port, request_id)
+    local = decode.register_generation(context)
+    async def execute():
+        prefill.register_generation(context)
+        prepared = prefill.prepare_input(
+            "prompt", GenerateConfig(max_new_tokens=2, stream=True, ignore_eos=True), tuple(range(prompt_tokens)),
+        )
+        return await prefill.prefill(context, prepared)
+    task = asyncio.create_task(execute())
+    return context.key, decode.decode_outputs(local), task
+
+
 @pytest.mark.parametrize("source_partition", range(4))
-def test_external_nodes_start_independently_and_d_streams_directly(source_partition) -> None:
-    port = _free_port()
+def test_nodes_own_reservation_and_direct_outputs(source_partition):
+    async def exercise():
+        port = _free_port()
+        prefill = PDServingService(_FakeCore(PDRole.PREFILL, source_partition=source_partition),
+                                   _external_config(PDRole.PREFILL, port))
+        decode = PDServingService(_FakeCore(PDRole.DECODE, capacity_slots=1), _external_config(PDRole.DECODE, port))
+        await asyncio.gather(prefill.start(), decode.start())
+        try:
+            key, stream, task = await _open_test_handoff(prefill, decode, port)
+            outputs = [output async for output in stream]
+            result = await task
+            assert result.state == "READY"
+            assert [output.token_id for output in outputs] == [101, 102]
+            assert outputs[-1].finished
+            assert prefill.core.source_released
+            assert decode.query_handoff(key).state == "COMPLETED"
+            partition = prefill.core.manifests[0].rank_mapping[0].destination_rank_id // 4
+            assert prefill.core.manifests[0].rank_mapping == DSV4_DSPARK_K7_ADAPTER.rank_mapping(
+                (16, 4), source_partition, partition,
+            )
+            assert not prefill._requests and not decode._requests
+        finally:
+            await asyncio.gather(prefill.close(), decode.close())
+    asyncio.run(asyncio.wait_for(exercise(), 15))
 
-    async def exercise() -> None:
-        p_core = _FakeCore(PDRole.PREFILL, source_partition=source_partition)
-        d_core = _FakeCore(PDRole.DECODE, capacity_slots=1)
-        prefill = PDServingService(
-            p_core,
-            _external_config(PDRole.PREFILL, port),
-        )
-        decode = PDServingService(
-            d_core,
-            _external_config(PDRole.DECODE, port),
-        )
-        # Neither start waits for a configured peer.
-        await prefill.start()
-        await decode.start()
-        assert prefill.session is None
-        assert decode.session is None
 
-        config = GenerateConfig(max_new_tokens=2, stream=True, ignore_eos=True)
-        prepared = prefill.prepare_request("request", "prompt", config, tuple(range(33)))
-        key = HandoffKey("request", "handoff", 1, 1, 1)
-        placement = decode.reserve_placement(
-            ReservePlacementHTTP(
-                key=key,
-                prepared_request_id=prepared.prepared_request_id,
-                prepared_digest=prepared.prepared_digest,
-                prompt_token_count=33,
-                max_new_tokens=2,
-                layout_fingerprint=prefill.descriptor().capabilities.layout_fingerprint,
-                prefill_node_id="p",
-                prefill_endpoint_generation=1,
-            )
+@pytest.mark.parametrize("valid,budget", [(True, 2), (False, 2), (False, 1)])
+def test_decode_seed_validation_precedes_ready_and_public_output(valid, budget, monkeypatch):
+    monkeypatch.setattr("pypto_serving.serving.pd.service.importlib.util.find_spec", lambda _: object())
+    async def exercise():
+        port = _free_port()
+        prefill = PDServingService(_FakeCore(PDRole.PREFILL), _external_config(PDRole.PREFILL, port))
+        d_core = _FakeCore(PDRole.DECODE)
+        decode = PDServingService(d_core, _external_config(PDRole.DECODE, port))
+        events = []
+        original_prefill = prefill.core.add_request
+
+        def constrained_prefill(*args, constraint_spec=None, **kwargs):
+            assert constraint_spec is not None
+            return original_prefill(*args, **kwargs)
+
+        prefill.core.add_request = constrained_prefill
+        original_adopt = d_core.add_adopted_handoff
+
+        async def adopt(**kwargs):
+            events.append("adopt")
+            async for output in original_adopt(**kwargs):
+                yield output
+
+        async def validate(spec, initial_tokens):
+            assert spec.format_id == "deepseek_v4" and initial_tokens == (101,)
+            events.append("validate")
+            if not valid:
+                raise ValueError("invalid first token")
+
+        d_core.add_adopted_handoff = adopt
+        decode.preflight_constraint = validate
+        await asyncio.gather(prefill.start(), decode.start())
+        context = _context(port, "constrained")
+        local = decode.register_generation(context)
+        prefill.register_generation(context)
+        spec = ConstraintSpec(
+            provider_id="xgrammar", format_id="deepseek_v4",
+            tools=({"type": "function", "function": {"name": "lookup"}},),
+            tool_choice="required", reasoning=False,
         )
-        with pytest.raises(ValueError, match="different P binding"):
-            decode.reserve_placement(
-                ReservePlacementHTTP(
-                    key=key,
-                    prepared_request_id=prepared.prepared_request_id,
-                    prepared_digest=prepared.prepared_digest,
-                    prompt_token_count=33,
-                    max_new_tokens=2,
-                    layout_fingerprint=(
-                        prefill.descriptor().capabilities.layout_fingerprint
-                    ),
-                    prefill_node_id="other-p",
-                    prefill_endpoint_generation=1,
-                )
+        try:
+            prepared = prefill.prepare_input(
+                "prompt", GenerateConfig(max_new_tokens=budget, ignore_eos=True), tuple(range(257)),
+                output_parser_spec=OutputParserSpec("deepseek_v4", "content"), constraint_spec=spec,
             )
-        with pytest.raises(ValueError, match="control incarnation is stale"):
-            decode.reserve_placement(
-                ReservePlacementHTTP(
-                    key=HandoffKey("request-2", "handoff-2", 1, 1, 2),
-                    prepared_request_id="prepared-stale",
-                    prepared_digest="e" * 64,
-                    prompt_token_count=33,
-                    max_new_tokens=2,
-                    layout_fingerprint=(
-                        prefill.descriptor().capabilities.layout_fingerprint
-                    ),
-                    prefill_node_id="p",
-                    prefill_endpoint_generation=1,
-                )
-            )
-        compatibility_digest = capability_compatibility_digest(
-            prefill.descriptor().capabilities
-        )
-        decode.authorize_route(
-            AuthorizeRouteHTTP(
-                key=key,
-                prepared_request_id=prepared.prepared_request_id,
-                prepared_digest=prepared.prepared_digest,
-                reservation_id=placement.reservation_id,
-                reservation_capability=placement.reservation_capability,
-                compatibility_digest=compatibility_digest,
-                prefill_node_id="p",
-                prefill_endpoint_generation=1,
-                decode_node_id="d",
-                decode_endpoint_generation=1,
-            )
-        )
-        stream = decode.open_decode_stream(key)
-        waiting = await anext(stream)
-        assert waiting.event == "waiting"
-        execute = asyncio.create_task(
-            prefill.execute_prefill(
-                ExecutePrefillHTTP(
-                    key=key,
-                    prepared_request_id=prepared.prepared_request_id,
-                    prepared_digest=prepared.prepared_digest,
-                    reservation_id=placement.reservation_id,
-                    partition=placement.partition,
-                    block_ids_by_group=placement.block_ids_by_group,
-                    reservation_capability=placement.reservation_capability,
-                    compatibility_digest=compatibility_digest,
-                    prefill_node_id="p",
-                    prefill_endpoint_generation=1,
-                    decode_node_id="d",
-                    decode_control_host="127.0.0.1",
-                    decode_control_port=port,
-                    decode_endpoint_generation=1,
-                )
-            )
-        )
-        outputs = []
-        async for frame in stream:
-            assert frame.output is not None
-            outputs.append(frame.output)
-        result = await execute
-        assert result.state == "READY"
-        assert [output.token_id for output in outputs] == [101, 102]
-        assert [output.output_sequence for output in outputs] == [1, 2]
-        assert outputs[-1].finished
-        assert p_core.source_released
-        assert p_core.manifests[0].rank_mapping == DSV4_DSPARK_K7_ADAPTER.rank_mapping(
-            (16, 4), source_partition, placement.partition,
-        )
-        await asyncio.gather(prefill.close(), decode.close())
+            task = asyncio.create_task(prefill.prefill(context, prepared))
+            if valid:
+                outputs = [output async for output in decode.decode_outputs(local)]
+                assert (await task).state == "READY"
+                assert outputs[0].token_id == 101 and events == ["validate", "adopt"]
+            else:
+                result = await task
+                assert result.state == "FAILED" and result.error_code == "INVALID_DECODE_SEED"
+                assert not result.retryable
+                with pytest.raises(RuntimeError, match="INVALID_DECODE_SEED"):
+                    _ = [output async for output in decode.decode_outputs(local)]
+                assert events == ["validate"]
+                assert decode.query_handoff(context.key).state == "ABORTED"
+                assert not decode.health_error and not prefill.health_error
+                assert not decode._requests and not prefill._requests
+                assert prefill.core.kv_cache_manager.group_request_partition(context.key.request_id) is None
+        finally:
+            await asyncio.gather(prefill.close(), decode.close())
 
     asyncio.run(asyncio.wait_for(exercise(), 15))
 
 
-async def _open_test_handoff(prefill, decode, port, *, request_id="overlap", prompt_tokens=257):
-    config = GenerateConfig(max_new_tokens=2, stream=True, ignore_eos=True)
-    prepared = prefill.prepare_request(request_id, "prompt", config, tuple(range(prompt_tokens)))
-    key = HandoffKey(request_id, f"handoff-{request_id}", 1, 1, 1)
-    placement = decode.reserve_placement(ReservePlacementHTTP(
-        key, prepared.prepared_request_id, prepared.prepared_digest, prompt_tokens, 2,
-        prefill.descriptor().capabilities.layout_fingerprint, "p", 1,
-    ))
-    digest = capability_compatibility_digest(prefill.descriptor().capabilities)
-    decode.authorize_route(AuthorizeRouteHTTP(
-        key, prepared.prepared_request_id, prepared.prepared_digest,
-        placement.reservation_id, placement.reservation_capability, digest, "p", 1, "d", 1,
-    ))
-    stream = decode.open_decode_stream(key)
-    assert (await anext(stream)).event == "waiting"
-    execute = asyncio.create_task(prefill.execute_prefill(ExecutePrefillHTTP(
-        key, prepared.prepared_request_id, prepared.prepared_digest,
-        placement.reservation_id, placement.partition, placement.block_ids_by_group,
-        placement.reservation_capability, digest, "p", 1, "d", "127.0.0.1", port, 1,
-    )))
-    return key, stream, execute
+@pytest.mark.parametrize("certainty", (CompletionCertainty.NOT_SUBMITTED, CompletionCertainty.UNKNOWN))
+def test_transfer_failure_preserves_certainty_and_shared_page_safety(certainty):
+    async def exercise():
+        port = _free_port()
+        p_core = _FakeCore(PDRole.PREFILL, transfer_certainties=(certainty, certainty))
+        prefill = PDServingService(p_core, _external_config(PDRole.PREFILL, port))
+        decode = PDServingService(_FakeCore(PDRole.DECODE), _external_config(PDRole.DECODE, port))
+        await asyncio.gather(prefill.start(), decode.start())
+        try:
+            key, stream, task = await _open_test_handoff(prefill, decode, port)
+            with pytest.raises(RuntimeError, match="transfer failed"):
+                await task
+            state = decode.query_handoff(key).state
+            assert state == ("QUARANTINED" if certainty is CompletionCertainty.UNKNOWN else "ABORTED")
+            assert bool(prefill.health_error) == (certainty is CompletionCertainty.UNKNOWN)
+            await stream.aclose()
+        finally:
+            await asyncio.gather(prefill.close(), decode.close(), return_exceptions=True)
+    asyncio.run(asyncio.wait_for(exercise(), 15))
+
+
+def test_late_generation_after_abort_is_rejected_without_reservation():
+    async def exercise():
+        service = PDServingService(_FakeCore(PDRole.DECODE), _external_config(PDRole.DECODE, 12345))
+        await service.start()
+        context = _context(12345)
+        status = await service.abort_handoff(context.key, "client cancelled", deterministic=True)
+        assert status.state == "ABORTED"
+        with pytest.raises(ValueError, match="already used"):
+            service.register_generation(context)
+        assert not service.core.kv_cache_manager.group_cache_reservations
+        await service.close()
+    asyncio.run(exercise())
+
+
+def test_decode_request_rejects_stale_or_duplicate_bindings():
+    async def exercise():
+        service = PDServingService(_FakeCore(PDRole.DECODE), _external_config(PDRole.DECODE, 12345))
+        await service.start()
+        context = _context(12345)
+        service.register_generation(context)
+        with pytest.raises(ValueError, match="already used"):
+            service.register_generation(context)
+        with pytest.raises(ValueError, match="incarnation"):
+            service.register_generation(msgspec.structs.replace(context, decode_endpoint_generation=2))
+        await service.abort_handoff(context.key, "test", deterministic=True)
+        await service.close()
+    asyncio.run(exercise())
+
+
+def test_reused_session_allows_control_to_arrive_before_decode_http():
+    async def exercise():
+        port = _free_port()
+        prefill = PDServingService(_FakeCore(PDRole.PREFILL), _external_config(PDRole.PREFILL, port))
+        decode = PDServingService(_FakeCore(PDRole.DECODE), _external_config(PDRole.DECODE, port))
+        await asyncio.gather(prefill.start(), decode.start())
+        try:
+            _, stream, task = await _open_test_handoff(prefill, decode, port, request_id="first")
+            assert [out async for out in stream][-1].finished
+            await task
+            context = _context(port, "second")
+            async def source():
+                prefill.register_generation(context)
+                return await prefill.prefill(context, prefill.prepare_input(
+                    "prompt", GenerateConfig(max_new_tokens=2, stream=True), (1, 2, 3),
+                ))
+            task = asyncio.create_task(source())
+            await asyncio.sleep(0.03)
+            assert not task.done()
+            local = decode.register_generation(context)
+            assert [out async for out in decode.decode_outputs(local)][-1].finished
+            assert (await task).state == "READY"
+        finally:
+            await asyncio.gather(prefill.close(), decode.close())
+    asyncio.run(asyncio.wait_for(exercise(), 15))
+
+
+@pytest.mark.parametrize("mismatch", ("peer", "context"))
+def test_reservation_requires_the_matching_http_request_and_source_peer(mismatch):
+    async def exercise():
+        port = _free_port()
+        service = PDServingService(_FakeCore(PDRole.DECODE), _external_config(PDRole.DECODE, port))
+        await service.start()
+        context = _context(port)
+        local = service.register_generation(context)
+        source = PDServingService(_FakeCore(PDRole.PREFILL), _external_config(PDRole.PREFILL, port))
+        prepared = source.prepare_input("prompt", GenerateConfig(max_new_tokens=2), (1, 2, 3))
+        sent = msgspec.structs.replace(context, prefill_endpoint_generation=2) if mismatch == "context" else context
+        begin = BeginHandoff(context.key, sent, prepared.continuation, prepared.prefix_match_spec, prepared.digest)
+        peer = SimpleNamespace(peer_hello=SimpleNamespace(
+            node_id="foreign" if mismatch == "peer" else "p", endpoint_generation=1,
+        ))
+        try:
+            with pytest.raises(ValueError):
+                service._reserve_handoff(begin, peer)
+            assert not local.accepted.done()
+            assert not service.core.kv_cache_manager.group_cache_reservations
+        finally:
+            await service.abort_handoff(context.key, "test", deterministic=True)
+            await service.close()
+    asyncio.run(exercise())
+
+
+def test_unpaired_context_deadline_and_pending_bound_do_not_allocate_pages():
+    async def exercise():
+        config = replace(_external_config(PDRole.DECODE, 12345), request_timeout_seconds=0.02)
+        service = PDServingService(_FakeCore(PDRole.DECODE), config)
+        with pytest.raises(TimeoutError):
+            await service._wait_generation(_context(12345))
+        for index in range(config.max_pending_handoffs):
+            service.register_generation(_context(12345, f"request-{index}"))
+        with pytest.raises(PDBackpressureError):
+            service.register_generation(_context(12345, "over-limit"))
+        assert not service.core.kv_cache_manager.group_cache_reservations
+    asyncio.run(exercise())
+
+
+def test_drain_retires_unreserved_waiters_before_owner_release():
+    async def exercise():
+        port = _free_port()
+        service = PDServingService(_FakeCore(PDRole.DECODE), _external_config(PDRole.DECODE, port))
+        await service.start()
+        context = _context(port)
+        local = service.register_generation(context)
+        assert not service.lifecycle.idle()
+        await service.close()
+        assert service._closed and not service._requests
+        assert service.query_handoff(context.key).state == "ABORTED"
+        assert isinstance(await local.accepted, RuntimeError)
+    asyncio.run(exercise())
+
+
+def test_uncertain_abort_stops_prefill_orchestration_but_retains_recovery_gate():
+    async def exercise():
+        service = PDServingService(_FakeCore(PDRole.PREFILL), _external_config(PDRole.PREFILL, 12345))
+        context = _context(12345)
+        entered, stopped = asyncio.Event(), asyncio.Event()
+        async def source():
+            service.register_generation(context)
+            entered.set()
+            try:
+                await asyncio.Future()
+            finally:
+                stopped.set()
+        task = asyncio.create_task(source())
+        await entered.wait()
+        status = await service.abort_handoff(context.key, "source unknown", deterministic=False)
+        assert status.state == "RECOVERY_REQUIRED"
+        assert task.cancelled() and stopped.is_set()
+        assert context.key in service._active_keys and not service.lifecycle.idle()
+        assert service.health_error and service.core.transfer_calls == 0
+    asyncio.run(exercise())
+
+
+def test_cancel_stops_producer_blocked_on_output_backpressure():
+    class SlowCore(_FakeCore):
+        async def add_adopted_handoff(self, **kwargs):
+            self.kv_cache_manager.adopt_group_cache(kwargs["reservation_id"])
+            for _ in range(1000):
+                yield replace_token()
+    def replace_token():
+        from pypto_serving.serving.engine.async_engine import TokenOutput
+        return TokenOutput(text="token")
+    async def exercise():
+        port = _free_port()
+        prefill = PDServingService(_FakeCore(PDRole.PREFILL), _external_config(PDRole.PREFILL, port))
+        decode = PDServingService(SlowCore(PDRole.DECODE), _external_config(PDRole.DECODE, port))
+        await asyncio.gather(prefill.start(), decode.start())
+        try:
+            key, stream, task = await _open_test_handoff(prefill, decode, port)
+            await task
+            await asyncio.sleep(0.03)
+            status = await decode.abort_handoff(key, "cancel", deterministic=True)
+            assert status.state == "ABORTED"
+            assert key not in decode._external_handoff_tasks
+            assert not decode._requests
+            await stream.aclose()
+        finally:
+            await asyncio.gather(prefill.close(), decode.close())
+    asyncio.run(asyncio.wait_for(exercise(), 15))
 
 
 def test_decode_node_stream_preserves_tool_call_deltas_and_final_calls():
@@ -363,7 +364,7 @@ def test_decode_node_stream_preserves_tool_call_deltas_and_final_calls():
         await asyncio.gather(prefill.start(), decode.start())
         try:
             _, stream, execute = await _open_test_handoff(prefill, decode, port, request_id="tool-call")
-            outputs = [frame.output async for frame in stream]
+            outputs = [output async for output in stream]
             assert (await execute).state == "READY"
             assert outputs[0].tool_call_deltas[0].id == "call-1"
             assert outputs[-1].tool_call_deltas[0].arguments == '{"city":"杭州"}'
@@ -402,7 +403,7 @@ def test_external_chunk_transfer_keeps_source_pinned_and_overlaps_when_enabled(o
             assert prefill.source_lifecycle._in_flight[key.request_id].partition == source_partition
             assert decode.query_handoff(key).state == "TRANSFERRING"
             p_core.allow_completion.set()
-            outputs = [frame.output async for frame in stream]
+            outputs = [output async for output in stream]
             assert (await execute).state == "READY"
             assert outputs[-1].finished
             assert p_core.source_released
@@ -451,13 +452,13 @@ def test_slow_final_transfer_does_not_block_another_handoff():
             )
             streams.append(fast_stream)
             tasks.append(fast_task)
-            fast_outputs = [frame.output async for frame in fast_stream]
+            fast_outputs = [output async for output in fast_stream]
             assert (await fast_task).state == "READY"
             assert fast_outputs[-1].finished
             assert not task.done()
             assert key.request_id in prefill.source_lifecycle._in_flight
             release.set()
-            assert [frame.output async for frame in stream][-1].finished
+            assert [output async for output in stream][-1].finished
             assert (await task).state == "READY"
             assert not prefill.source_lifecycle._in_flight
         finally:
@@ -473,96 +474,23 @@ def test_slow_final_transfer_does_not_block_another_handoff():
     asyncio.run(asyncio.wait_for(exercise(), 15))
 
 
-def test_external_control_session_multiplexes_two_handoffs() -> None:
-    port = _free_port()
-
-    async def exercise() -> None:
-        p_core = _FakeCore(PDRole.PREFILL, capacity_slots=4)
-        d_core = _FakeCore(PDRole.DECODE, capacity_slots=4)
-        prefill = PDServingService(
-            p_core,
-            _external_config(PDRole.PREFILL, port),
-        )
-        decode = PDServingService(
-            d_core,
-            _external_config(PDRole.DECODE, port),
-        )
+def test_external_control_session_multiplexes_two_handoffs():
+    async def exercise():
+        port = _free_port()
+        prefill = PDServingService(_FakeCore(PDRole.PREFILL, capacity_slots=4), _external_config(PDRole.PREFILL, port))
+        decode = PDServingService(_FakeCore(PDRole.DECODE, capacity_slots=4), _external_config(PDRole.DECODE, port))
         await asyncio.gather(prefill.start(), decode.start())
-
-        async def run(index: int):
-            request_id = f"request-{index}"
-            prepared = prefill.prepare_request(
-                request_id,
-                "prompt",
-                GenerateConfig(max_new_tokens=2, stream=True, ignore_eos=True),
-                tuple(range(33)),
-            )
-            key = HandoffKey(request_id, f"handoff-{index}", 1, 1, 1)
-            placement = decode.reserve_placement(
-                ReservePlacementHTTP(
-                    key=key,
-                    prepared_request_id=prepared.prepared_request_id,
-                    prepared_digest=prepared.prepared_digest,
-                    prompt_token_count=33,
-                    max_new_tokens=2,
-                    layout_fingerprint=(
-                        prefill.descriptor().capabilities.layout_fingerprint
-                    ),
-                    prefill_node_id="p",
-                    prefill_endpoint_generation=1,
-                )
-            )
-            compatibility_digest = capability_compatibility_digest(
-                prefill.descriptor().capabilities
-            )
-            decode.authorize_route(
-                AuthorizeRouteHTTP(
-                    key,
-                    prepared.prepared_request_id,
-                    prepared.prepared_digest,
-                    placement.reservation_id,
-                    placement.reservation_capability,
-                    compatibility_digest,
-                    "p",
-                    1,
-                    "d",
-                    1,
-                )
-            )
-            stream = decode.open_decode_stream(key)
-            assert (await anext(stream)).event == "waiting"
-            execute = asyncio.create_task(
-                prefill.execute_prefill(
-                    ExecutePrefillHTTP(
-                        key,
-                        prepared.prepared_request_id,
-                        prepared.prepared_digest,
-                        placement.reservation_id,
-                        placement.partition,
-                        placement.block_ids_by_group,
-                        placement.reservation_capability,
-                        compatibility_digest,
-                        "p",
-                        1,
-                        "d",
-                        "127.0.0.1",
-                        port,
-                        1,
-                    )
-                )
-            )
-            outputs = [frame.output async for frame in stream]
-            result = await execute
-            return key, result, outputs
-
-        results = await asyncio.gather(run(1), run(2))
-        assert {result[0].request_id for result in results} == {
-            "request-1",
-            "request-2",
-        }
-        assert all(result[1].state == "READY" for result in results)
-        assert all(result[2][-1].finished for result in results)
-        assert p_core.transfer_calls == 2
-        await asyncio.gather(prefill.close(), decode.close())
-
+        async def run(index):
+            key, stream, task = await _open_test_handoff(prefill, decode, port, request_id=f"request-{index}")
+            outputs = [output async for output in stream]
+            assert (await task).state == "READY"
+            assert outputs[-1].finished
+            return key
+        try:
+            keys = await asyncio.gather(run(1), run(2))
+            assert {key.request_id for key in keys} == {"request-1", "request-2"}
+            assert prefill.core.transfer_calls == 2
+            assert not prefill._requests and not decode._requests
+        finally:
+            await asyncio.gather(prefill.close(), decode.close())
     asyncio.run(asyncio.wait_for(exercise(), 15))

@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import logging
-import secrets
 import time
 import msgspec
 from collections import OrderedDict
@@ -28,7 +27,7 @@ from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.tools.profile import profile_instant
 from pypto_serving.transfer.types import CompletionCertainty
 
-from .admission import FairHandoffAdmission
+from .admission import FairHandoffAdmission, PDBackpressureError
 from .config import PDCapabilities, PDConfig, PDRole
 from .contracts import RuntimeLayoutDescriptor
 from .connector import DecodeConnector
@@ -37,20 +36,6 @@ from .journal import DurablePDJournal
 from .lifecycle import TransferLifecycle
 from .progress import TransferProgress
 from .observability import PDMetrics, write_startup_record
-from .output import DecodeOutputEncoder
-from .http_api import (
-    AuthorizeRouteHTTP,
-    CapacitySnapshot,
-    DecodeStreamFrame,
-    ExecutePrefillHTTP,
-    NodeDescriptor,
-    PlacementReservation,
-    PlacementRejection,
-    PrefillHandoffResult,
-    PreparedRequest,
-    ReservePlacementHTTP,
-    capability_compatibility_digest,
-)
 from .planner import ChunkTransferPlanner, PChunkLifecycle
 from .protocol import (
     AbortHandoff,
@@ -58,18 +43,21 @@ from .protocol import (
     CommitRequest,
     ControlAck,
     ControlError,
-    DecodeOutputWire,
     HandoffKey,
     HandoffStatus,
-    OpenRoute,
+    BeginHandoff,
+    ContinuationMetadata,
+    GenerationContext,
+    PrefixMatchSpec,
+    PrefillResult,
+    CapacitySnapshot,
+    NodeDescriptor,
     QueryHandoff,
     ReadyAck,
     RegistryAdvertisement,
-    ReleaseHandoff,
     ReserveAccepted,
     ReserveRejected,
     ReserveRequest,
-    RouteOpened,
     CapabilityWire,
     TransferResult,
     TransferResultBundle,
@@ -109,27 +97,30 @@ from .worker_api import (
 logger = logging.getLogger(__name__)
 
 
-class _PrefillNotStarted(RuntimeError):
-    """An authenticated D rejection before P schedules compute or native work."""
+class PrefillRejected(RuntimeError):
+    """Positive P-local proof of no work or a safely settled failure."""
 
-    def __init__(self, error_code: str):
-        super().__init__(f"D rejected route before Prefill: {error_code}")
-        self.error_code = error_code
+    def __init__(self, result: PrefillResult):
+        self.result = result
+        super().__init__(result.error_code)
 
 
 @dataclass(frozen=True)
-class _PreparedLocal:
-    public: PreparedRequest
+class PreparedInput:
     prompt: str
     config: GenerateConfig
     prompt_token_ids: tuple[int, ...]
+    continuation: ContinuationMetadata
+    prefix_match_spec: PrefixMatchSpec | None
+    digest: str
 
 
-@dataclass(frozen=True)
-class _AuthorizedRoute:
-    request: AuthorizeRouteHTTP
-    prefill_node_id: str
-    prefill_endpoint_generation: int
+@dataclass
+class NodeRequest:
+    context: GenerationContext
+    accepted: asyncio.Future
+    outputs: asyncio.Queue
+    task: asyncio.Task | None = None
 
 
 class PDServingService:
@@ -137,6 +128,7 @@ class PDServingService:
 
     def __init__(self, core, config: PDConfig, *, eos_token_id: int | None = None) -> None:
         self.eos_token_id = eos_token_id
+        self.preflight_constraint = None
         self.config = config
         self.core = core
         self.session: PDControlSession | None = None
@@ -164,16 +156,10 @@ class PDServingService:
             else None
         )
         self._active_keys = set()
-        self._prepared_by_id: dict[str, _PreparedLocal] = {}
-        self._prepared_by_request: dict[str, str] = {}
-        self._prefill_results: OrderedDict[HandoffKey, PrefillHandoffResult] = OrderedDict()
-        self._prefill_result_limit = 1024
-        self._reservation_capabilities: dict[HandoffKey, str] = {}
-        self._reservation_bindings: dict[HandoffKey, tuple[object, ...]] = {}
-        self._authorized_routes: dict[HandoffKey, _AuthorizedRoute] = {}
-        self._route_authorized = asyncio.Event()
-        self._decode_queues: dict[HandoffKey, asyncio.Queue[DecodeStreamFrame]] = {}
-        self._decode_waiter_claimed: set[HandoffKey] = set()
+        self._requests: dict[HandoffKey, NodeRequest] = {}
+        self._request_available = asyncio.Event()
+        self._retired: OrderedDict[HandoffKey, HandoffStatus] = OrderedDict()
+        self._history_limit = 1024
         self._router_cancelled_keys: set[HandoffKey] = set()
         self._session_peer_node_id = ""
         self._session_peer_generation = 0
@@ -192,7 +178,7 @@ class PDServingService:
         self._close_task: asyncio.Task | None = None
         self.lifecycle = TransferLifecycle(
             config.role,
-            idle=lambda: not self._active_keys and self._admission.count == 0,
+            idle=lambda: not self._requests and not self._active_keys and self._admission.count == 0,
             release=lambda: self.core.call_pd_worker(OP_RELEASE_TRANSFER),
             timeout=min(config.request_timeout_seconds, 60),
         )
@@ -225,7 +211,7 @@ class PDServingService:
                 self.config.model_contract,
                 bundle,
                 provider=self.config.provider,
-                prefix_cache_mode=self.config.prefix_cache_mode.value,
+                enable_prefix_cache=self.config.enable_prefix_cache,
             )
         )
         local_advertisement = RegistryAdvertisement(
@@ -270,6 +256,12 @@ class PDServingService:
 
     async def _close(self) -> None:
         try:
+            self.lifecycle.begin()
+            # Pending HTTP/control rendezvous has no write grant. Retire it
+            # explicitly; in-flight/adopted work still owns the drain barrier.
+            for key in tuple(self._requests):
+                if self.query_handoff(key).state == "REGISTERED":
+                    await self.abort_handoff(key, "NODE_DRAINING", deterministic=True)
             await self.lifecycle.close()
             await self.progress.close()
             await self.core.call_pd_worker(OP_FINALIZE_TRANSFER)
@@ -342,7 +334,7 @@ class PDServingService:
             node_id=self.config.node_id,
             role=self.config.role.value,
             active_handoffs=len(self._active_keys),
-            prepared_requests=len(self._prepared_by_id),
+            pending_requests=len(self._requests),
             reservations=len(reservations),
             quarantined_reservations=sum(
                 reservation.state.value == "QUARANTINED"
@@ -359,7 +351,7 @@ class PDServingService:
     def _refresh_metrics_gauges(self, reservations) -> None:
         self.metrics.set_gauge("active_handoffs", len(self._active_keys))
         self.metrics.set_gauge("queued_handoffs", self._admission.queued)
-        self.metrics.set_gauge("prepared_requests", len(self._prepared_by_id))
+        self.metrics.set_gauge("pending_requests", len(self._requests))
         self.metrics.set_gauge("reservations", len(reservations))
         self.metrics.set_gauge(
             "inflight_transfer_bytes",
@@ -380,370 +372,213 @@ class PDServingService:
             snapshot["worker_error"] = type(exc).__name__
         return snapshot
 
-    def prepare_request(
-        self,
-        request_id: str,
-        prompt: str,
-        config: GenerateConfig,
-        prompt_token_ids: Sequence[int],
-        *,
+    def register_generation(self, context: GenerationContext) -> NodeRequest:
+        """Bind the original HTTP request before accepting P control messages."""
+        self._assert_accepting()
+        self._require_external_role(self.config.role)
+        context.validate_node(self.config)
+        key = context.key
+        if key in self._requests or key in self._retired:
+            raise ValueError("generation identity was already used")
+        if len(self._requests) >= self.config.max_pending_handoffs:
+            raise PDBackpressureError("node generation request limit reached")
+        request = NodeRequest(
+            context, asyncio.get_running_loop().create_future(), asyncio.Queue(maxsize=64),
+            asyncio.current_task() if self.config.role is PDRole.PREFILL else None,
+        )
+        self._requests[key] = request
+        self._request_available.set()
+        return request
+
+    def prepare_input(
+        self, prompt: str, config: GenerateConfig, prompt_token_ids: Sequence[int], *,
         output_parser_spec: OutputParserSpec | None = None,
         constraint_spec: ConstraintSpec | None = None,
-    ) -> PreparedRequest:
-        """Normalize once on P and retain the immutable execution input."""
-        self._assert_accepting()
+    ) -> PreparedInput:
+        """Normalize once on P; no prepared-ID store or expiration protocol."""
         self._require_external_role(PDRole.PREFILL)
         self.config.model_adapter.validate_generate_config(config)
         if constraint_spec is not None:
-            validator = getattr(self.config.model_adapter, "validate_constraint_spec", None)
-            if not callable(validator):
-                raise ValueError("the PD model adapter does not support constraints")
-            validator(constraint_spec)
-        now_ns = time.time_ns()
-        self._expire_prepared(now_ns)
+            self.config.model_adapter.validate_constraint_spec(constraint_spec)
         continuation = self.config.model_adapter.build_continuation(
-            config=config,
-            prompt_token_ids=prompt_token_ids,
-            eos_token_id=self.eos_token_id,
+            config=config, prompt_token_ids=prompt_token_ids, eos_token_id=self.eos_token_id,
             output_parser_spec=output_parser_spec,
             **({"constraint_spec": constraint_spec} if constraint_spec else {}),
         )
-        prefix_match_spec = None
-        if self.config.prefix_cache_mode.value != "disabled":
-            prefix_match_spec = self.config.model_adapter.build_prefix_match_spec(
-                prompt_token_ids,
-                self.core.kv_cache_manager,
+        prefix = None
+        if self.config.model_contract.supports_prefix_cache(PDRole.DECODE.value):
+            prefix = self.config.model_adapter.build_prefix_match_spec(
+                prompt_token_ids, self.core.kv_cache_manager,
             )
-        digest = prepared_request_hash(continuation, prefix_match_spec)
-        existing_id = self._prepared_by_request.get(request_id)
-        if existing_id is not None:
-            existing = self._prepared_by_id[existing_id]
-            if existing.public.prepared_digest != digest or existing.prompt != prompt:
-                raise ValueError("prepared request id was replayed with different input")
-            return existing.public
-        prepared_request_id = f"prepared-{secrets.token_hex(16)}"
-        public = PreparedRequest(
-            request_id=request_id,
-            prepared_request_id=prepared_request_id,
-            prepared_digest=digest,
-            continuation=continuation,
-            expires_at_ns=now_ns
-            + int(self.config.prepared_request_ttl_seconds * 1_000_000_000),
-            prefix_match_spec=prefix_match_spec,
+        return PreparedInput(
+            prompt, config, tuple(int(token) for token in prompt_token_ids),
+            continuation, prefix, prepared_request_hash(continuation, prefix),
         )
-        self._prepared_by_id[prepared_request_id] = _PreparedLocal(
-            public=public,
-            prompt=prompt,
-            config=config,
-            prompt_token_ids=tuple(int(token) for token in prompt_token_ids),
-        )
-        self._prepared_by_request[request_id] = prepared_request_id
-        return public
 
-    def reserve_placement(
-        self,
-        request: ReservePlacementHTTP,
-    ) -> PlacementReservation | PlacementRejection:
-        """Reserve D cache before Prefill and return only logical placement data."""
-        self._assert_accepting()
+    def _reserve_handoff(self, message: BeginHandoff, session) -> ReserveAccepted | ReserveRejected:
+        """Only the matched P session can reserve and learn writable D pages."""
         self._require_external_role(PDRole.DECODE)
         assert self.decode_connector is not None
-        if (
-            request.key.route_epoch != self.config.route_epoch
-            or request.key.control_incarnation != self.config.control_incarnation
-        ):
-            raise ValueError("D reservation route epoch or control incarnation is stale")
-        if (
-            not request.prepared_request_id
-            or len(request.prepared_request_id) > 256
-            or not request.prefill_node_id
-            or len(request.prefill_node_id) > 256
-            or request.prefill_endpoint_generation < 1
-        ):
-            raise ValueError("D reservation contains an invalid P/prepared identity")
+        request = self._requests.get(message.key)
+        if request is None or request.context != message.context:
+            raise ValueError("P normalization has no matching Decode HTTP request")
+        context = request.context
+        context.validate_node(self.config)
+        if (session.peer_hello.node_id != context.prefill_node_id
+                or session.peer_hello.endpoint_generation != context.prefill_endpoint_generation):
+            raise ValueError("P session differs from the assigned source")
+        if request.accepted.done():
+            raise ValueError("handoff was already accepted")
+        continuation = message.continuation
+        self.config.model_adapter.validate_continuation(continuation)
         constraint_digest = ""
-        if request.constraint_spec is not None:
+        if continuation.constraint_spec is not None:
             try:
-                constraint = ConstraintSpec.from_wire(request.constraint_spec)
-                validator = getattr(self.config.model_adapter, "validate_constraint_spec", None)
-                if not callable(validator):
-                    raise ValueError("the PD model adapter does not support constraints")
-                validator(constraint)
-                constraint_digest = constraint_spec_hash(request.constraint_spec)
+                constraint = ConstraintSpec.from_wire(continuation.constraint_spec)
+                self.config.model_adapter.validate_constraint_spec(constraint)
+                constraint_digest = constraint_spec_hash(continuation.constraint_spec)
             except (KeyError, TypeError, ValueError) as exc:
-                return PlacementRejection(
-                    request.key, self.config.node_id, self.config.generation,
-                    f"INVALID_CONSTRAINT_{type(exc).__name__}", False,
-                )
+                return ReserveRejected(message.key, f"INVALID_CONSTRAINT_{type(exc).__name__}", False)
             if importlib.util.find_spec("xgrammar") is None:
-                return PlacementRejection(
-                    request.key, self.config.node_id, self.config.generation,
-                    "CONSTRAINT_PROVIDER_UNAVAILABLE", True,
-                )
-        result = self.decode_connector.reserve(
-            ReserveRequest(
-                key=request.key,
-                prompt_token_count=request.prompt_token_count,
-                max_new_tokens=request.max_new_tokens,
-                layout_fingerprint=request.layout_fingerprint,
-                prepared_digest=request.prepared_digest,
-                prefix_match_spec=request.prefix_match_spec,
-                constraint_digest=constraint_digest,
-            )
-        )
-        if isinstance(result, ReserveRejected):
-            descriptor = self.descriptor()
-            return PlacementRejection(
-                key=request.key,
-                decode_node_id=self.config.node_id,
-                decode_endpoint_generation=descriptor.endpoint_generation,
-                reason=result.reason,
-                retryable=result.retryable,
-            )
-        binding = (
-            request.prepared_request_id,
-            request.prepared_digest,
-            request.prefill_node_id,
-            request.prefill_endpoint_generation,
-            result.reservation_id,
-        )
-        existing_binding = self._reservation_bindings.get(request.key)
-        if existing_binding is not None and existing_binding != binding:
-            raise ValueError("D reservation was replayed with a different P binding")
-        capability = self._reservation_capabilities.get(request.key)
-        if capability is None:
+                return ReserveRejected(message.key, "CONSTRAINT_PROVIDER_UNAVAILABLE", True)
+        result = self.decode_connector.reserve(ReserveRequest(
+            key=message.key,
+            prompt_token_count=len(continuation.prompt_token_ids),
+            max_new_tokens=continuation.max_new_tokens,
+            layout_fingerprint=self.capabilities.layout_fingerprint,
+            prepared_digest=message.prepared_digest,
+            prefix_match_spec=message.prefix_match_spec,
+            constraint_digest=constraint_digest,
+        ))
+        if isinstance(result, ReserveAccepted):
+            self._active_keys.add(message.key)
             self.metrics.increment("prefix.d_requests")
             self.metrics.increment("prefix.d_hit_tokens", result.prefix_hit_tokens)
-            self.metrics.set_gauge(
-                "prefix.d_last_hit_tokens", result.prefix_hit_tokens
-            )
-            self.metrics.increment(
-                "prefix.d_hit_requests"
-                if result.prefix_hit_tokens
-                else "prefix.d_cold_requests"
-            )
-            capability = secrets.token_urlsafe(32)
-            self._reservation_capabilities[request.key] = capability
-            self._reservation_bindings[request.key] = binding
-            self._active_keys.add(request.key)
-            self._record(
-                "HANDOFF_CREATED",
-                key=request.key,
-                state="CREATED",
-            )
-            self._record(
-                "HANDOFF_RESERVED",
-                key=request.key,
-                reservation_id=result.reservation_id,
-                state="RESERVED",
-            )
-        descriptor = self.descriptor()
-        return PlacementReservation(
-            key=request.key,
-            prepared_request_id=request.prepared_request_id,
-            reservation_id=result.reservation_id,
-            partition=result.partition,
-            block_ids_by_group=result.block_ids_by_group,
-            prepared_digest=request.prepared_digest,
-            reservation_capability=capability,
-            decode_node_id=self.config.node_id,
-            decode_control_host=descriptor.control_host,
-            decode_control_port=descriptor.control_port,
-            decode_endpoint_generation=descriptor.endpoint_generation,
-            prefix_hit_tokens=result.prefix_hit_tokens,
-        )
+            self.metrics.set_gauge("prefix.d_last_hit_tokens", result.prefix_hit_tokens)
+            self.metrics.increment("prefix.d_hit_requests" if result.prefix_hit_tokens else "prefix.d_cold_requests")
+            self._record("HANDOFF_CREATED", key=message.key, state="CREATED")
+            self._record("HANDOFF_RESERVED", key=message.key,
+                         reservation_id=result.reservation_id, state="RESERVED")
+            request.accepted.set_result(continuation)
+        return result
 
-    def authorize_route(self, request: AuthorizeRouteHTTP) -> None:
-        """Bind a Router assignment to the existing destination reservation."""
-        self._require_external_role(PDRole.DECODE)
-        assert self.decode_connector is not None
-        status = self.decode_connector.query(request.key)
-        capability = self._reservation_capabilities.get(request.key)
-        binding = self._reservation_bindings.get(request.key)
-        if (
-            request.compatibility_digest
-            != capability_compatibility_digest(self.descriptor().capabilities)
-            or request.decode_node_id != self.config.node_id
-            or request.decode_endpoint_generation != self.config.generation
-            or status.reservation_id != request.reservation_id
-            or binding
-            != (
-                request.prepared_request_id,
-                request.prepared_digest,
-                request.prefill_node_id,
-                request.prefill_endpoint_generation,
-                request.reservation_id,
-            )
-            or capability is None
-            or not secrets.compare_digest(capability, request.reservation_capability)
-        ):
-            raise ValueError("route authorization does not match the D reservation")
-        existing = self._authorized_routes.get(request.key)
-        authorized = _AuthorizedRoute(
-            request=request,
-            prefill_node_id=request.prefill_node_id,
-            prefill_endpoint_generation=request.prefill_endpoint_generation,
-        )
-        if existing is not None and existing != authorized:
-            raise ValueError("route authorization was replayed with different claims")
-        self._authorized_routes[request.key] = authorized
-        self._route_authorized.set()
-        self._record(
-            "ROUTE_AUTHORIZED",
-            key=request.key,
-            reservation_id=request.reservation_id,
-            state=status.state,
-        )
-
-    def open_decode_stream(
-        self,
-        key: HandoffKey,
-    ) -> AsyncGenerator[DecodeStreamFrame, None]:
-        """Claim the single Router output stream before P starts Prefill."""
-        self._require_external_role(PDRole.DECODE)
-        if key not in self._authorized_routes:
-            raise ValueError("decode stream requires an authorized route")
-        if key in self._decode_waiter_claimed:
-            raise ValueError("decode stream was already claimed")
-        queue: asyncio.Queue[DecodeStreamFrame] = asyncio.Queue(maxsize=64)
-        self._decode_queues[key] = queue
-        self._decode_waiter_claimed.add(key)
-
-        async def stream() -> AsyncGenerator[DecodeStreamFrame, None]:
-            try:
-                yield DecodeStreamFrame(event="waiting", state="AUTHORIZED")
-                while True:
-                    frame = await queue.get()
-                    yield frame
-                    if frame.event in ("finished", "error"):
-                        return
-            finally:
-                if self._decode_queues.get(key) is queue:
-                    self._decode_queues.pop(key, None)
-
-        return stream()
+    async def decode_outputs(self, request: NodeRequest) -> AsyncGenerator[TokenOutput, None]:
+        """Expose ordinary engine outputs; public formatting stays in Serving."""
+        key = request.context.key
+        try:
+            while True:
+                output = await request.outputs.get()
+                if isinstance(output, BaseException):
+                    raise output
+                yield output
+                if output.finished:
+                    return
+        finally:
+            if key in self._requests:
+                status = self.query_handoff(key)
+                await self.abort_handoff(
+                    key, "DECODE_HTTP_CLOSED",
+                    deterministic=status.state in ("REGISTERED", "RESERVED", "READY", "IN_USE", "COMPLETED", "ABORTED"),
+                )
 
     def query_handoff(self, key: HandoffKey) -> HandoffStatus:
+        retired = self._retired.get(key)
+        if retired is not None:
+            return retired
         if self.config.role is PDRole.DECODE:
             assert self.decode_connector is not None
-            return self.decode_connector.query(key)
+            try:
+                return self.decode_connector.query(key)
+            except KeyError:
+                if key in self._requests:
+                    return HandoffStatus(key, "REGISTERED")
+                raise
         record = self.coordinator.query(key)
         if record is None:
+            if key in self._requests:
+                return HandoffStatus(key, "REGISTERED")
             raise KeyError("unknown P handoff identity")
-        return HandoffStatus(
-            key=key,
-            state=record.state.value,
-            reservation_id=record.reservation_id,
-            manifest_hash=record.manifest_hash,
-            error_code=record.error_code,
-        )
+        return HandoffStatus(key, record.state.value, record.reservation_id,
+                             record.manifest_hash, error_code=record.error_code)
 
-    async def abort_handoff(
-        self,
-        key: HandoffKey,
-        reason: str,
-        *,
-        deterministic: bool,
-    ) -> HandoffStatus:
-        """Converge a Router cancellation without weakening native certainty."""
-        if self.config.role is PDRole.DECODE:
-            assert self.decode_connector is not None
-            status = self.decode_connector.query(key)
-            if not deterministic:
-                self._health_error = reason or "ROUTER_ABORT_UNCERTAIN"
-                return HandoffStatus(
-                    key=key,
-                    state="RECOVERY_REQUIRED",
-                    reservation_id=status.reservation_id,
-                    manifest_hash=status.manifest_hash,
-                    admitted=status.admitted,
-                    error_code=reason,
-                )
-            if status.state in ("READY", "IN_USE"):
-                self._router_cancelled_keys.add(key)
-                try:
-                    if status.state == "IN_USE":
-                        await self.core.abort_request(key.request_id)
-                    current = self.decode_connector.query(key)
-                    if current.state == "COMPLETED":
-                        self._clear_decode_route(key)
-                        return current
-                    aborted = self.decode_connector.mark_decode_cancelled(
-                        key,
-                        error_code=reason,
-                    )
-                    self._record(
-                        "HANDOFF_ABORTED",
-                        key=key,
-                        reservation_id=aborted.reservation_id,
-                        manifest_hash=aborted.manifest_hash,
-                        state=aborted.state,
-                        error_code=reason,
-                    )
-                    self._clear_decode_route(key)
-                    await self._stop_decode_output_task(key)
-                    return aborted
-                finally:
-                    self._router_cancelled_keys.discard(key)
-            aborted = self.decode_connector.abort(
-                AbortHandoff(key=key, reason=reason, deterministic=deterministic),
-                deterministic=deterministic,
-            )
-            if aborted.state == "ABORTED":
-                self._record(
-                    "HANDOFF_ABORTED",
-                    key=key,
-                    reservation_id=aborted.reservation_id,
-                    manifest_hash=aborted.manifest_hash,
-                    state=aborted.state,
-                    error_code=reason,
-                )
-                self._clear_decode_route(key)
-                await self._stop_decode_output_task(key)
-            return aborted
-
-        record = self.coordinator.query(key)
+    async def abort_handoff(self, key: HandoffKey, reason: str, *, deterministic: bool) -> HandoffStatus:
+        """Retire only proven-safe work; HTTP cancellation is not native proof."""
+        try:
+            status = self.query_handoff(key)
+        except KeyError:
+            # Block a late HTTP request or BeginHandoff after abort won the race.
+            status = HandoffStatus(key, "REGISTERED")
+        if status.state in ("ABORTED", "COMPLETED", "RELEASED", "FAILED"):
+            return status
+        request = self._requests.get(key)
         if not deterministic:
             self._health_error = reason or "ROUTER_ABORT_UNCERTAIN"
-            return HandoffStatus(
-                key=key,
-                state="RECOVERY_REQUIRED",
-                reservation_id="" if record is None else record.reservation_id,
-                manifest_hash="" if record is None else record.manifest_hash,
-                error_code=reason,
-            )
-        if key in self._active_keys:
-            await self.core.abort_request(key.request_id)
-        if record is not None and record.state not in (
-            CoordinatorState.RELEASED,
-            CoordinatorState.FAILED,
-        ):
-            record = self.coordinator.fail(key, reason)
-        prepared_id = self._prepared_by_request.get(key.request_id)
-        if prepared_id is not None:
-            self._drop_prepared(prepared_id)
-        self._active_keys.discard(key)
-        status = HandoffStatus(
-            key=key,
-            state=(
-                CoordinatorState.RELEASED.value
-                if record is not None and record.state is CoordinatorState.RELEASED
-                else "ABORTED"
-            ),
-            reservation_id="" if record is None else record.reservation_id,
-            manifest_hash="" if record is None else record.manifest_hash,
-            error_code=reason,
-        )
-        if record is not None:
-            self._record(
-                "HANDOFF_ABORTED",
-                key=key,
-                reservation_id=status.reservation_id,
-                manifest_hash=status.manifest_hash,
-                state=status.state,
-                error_code=reason,
-            )
+            if self.config.role is PDRole.DECODE and status.state not in ("REGISTERED", "READY", "IN_USE"):
+                self.decode_connector.abort(AbortHandoff(key, reason, False), deterministic=False)
+            if self.config.role is PDRole.PREFILL:
+                await self._cancel_prefill_task(request)
+            self._finish_request(key, HandoffStatus(
+                key, "RECOVERY_REQUIRED", status.reservation_id, status.manifest_hash, error_code=reason,
+            ))
+            return HandoffStatus(key, "RECOVERY_REQUIRED", status.reservation_id,
+                                 status.manifest_hash, error_code=reason)
+        if self.config.role is PDRole.DECODE:
+            assert self.decode_connector is not None
+            self._router_cancelled_keys.add(key)
+            try:
+                if status.state == "IN_USE":
+                    await self.core.abort_request(key.request_id)
+                if status.state in ("READY", "IN_USE"):
+                    status = self.decode_connector.mark_decode_cancelled(key, error_code=reason)
+                elif status.state != "REGISTERED":
+                    status = self.decode_connector.abort(AbortHandoff(key, reason, True), deterministic=True)
+                else:
+                    status = HandoffStatus(key, "ABORTED", error_code=reason)
+                if status.state == "ABORTED":
+                    self._record("HANDOFF_ABORTED", key=key, reservation_id=status.reservation_id,
+                                 state=status.state, error_code=reason)
+                    self._finish_request(key, status)
+                    await self._stop_decode_output_task(key)
+                return status
+            finally:
+                self._router_cancelled_keys.discard(key)
+        await self._cancel_prefill_task(request)
+        if self._health_error:
+            return HandoffStatus(key, "RECOVERY_REQUIRED", status.reservation_id,
+                                 status.manifest_hash, error_code=self._health_error)
+        record = self.coordinator.query(key)
+        if record is not None and record.state is not CoordinatorState.RELEASED:
+            self.coordinator.fail(key, reason)
+        status = HandoffStatus(key, "RELEASED" if record is not None and
+                               record.state is CoordinatorState.RELEASED else "ABORTED",
+                               status.reservation_id, status.manifest_hash, error_code=reason)
+        self._finish_request(key, status)
         return status
+
+    @staticmethod
+    async def _cancel_prefill_task(request: NodeRequest | None) -> None:
+        if request is not None and request.task is not None and request.task is not asyncio.current_task():
+            request.task.cancel()
+            await asyncio.gather(request.task, return_exceptions=True)
+
+    def _finish_request(self, key: HandoffKey, status: HandoffStatus) -> None:
+        request = self._requests.pop(key, None)
+        self._request_available.set()
+        if status.state in ("QUARANTINED", "RECOVERY_REQUIRED"):
+            self._active_keys.add(key)
+            self._health_error = status.error_code or status.state
+        else:
+            self._active_keys.discard(key)
+        self._retired[key] = status
+        self._retired.move_to_end(key)
+        while len(self._retired) > self._history_limit:
+            self._retired.popitem(last=False)
+        if request is not None and status.state != "COMPLETED":
+            error = RuntimeError(status.error_code or status.state)
+            if not request.accepted.done():
+                request.accepted.set_result(error)
+            with suppress(asyncio.QueueFull):
+                request.outputs.put_nowait(error)
 
     def _assert_accepting(self):
         if self._closed or self.lifecycle.draining:
@@ -757,64 +592,30 @@ class PDServingService:
                 f"PD serving is fail-closed and requires restart: {self._health_error}"
             )
 
-    def _expire_prepared(self, now_ns: int) -> None:
-        expired = [
-            prepared_id
-            for prepared_id, prepared in self._prepared_by_id.items()
-            if prepared.public.expires_at_ns < now_ns
-        ]
-        for prepared_id in expired:
-            request_id = self._prepared_by_id.pop(prepared_id).public.request_id
-            self._prepared_by_request.pop(request_id, None)
-
-    async def execute_prefill(
-        self,
-        request: ExecutePrefillHTTP,
-    ) -> PrefillHandoffResult:
-        """Execute one Router-selected, D-first handoff on P."""
-        self._assert_accepting()
-        self._require_external_role(PDRole.PREFILL)
-        self._expire_prepared(time.time_ns())
-        completed = self._prefill_results.get(request.key)
-        if completed is not None:
-            if completed.reservation_id != request.reservation_id:
-                raise ValueError("completed Prefill was replayed with another reservation")
-            self._prefill_results.move_to_end(request.key)
-            return completed
+    async def prefill(self, context: GenerationContext, prepared: PreparedInput) -> PrefillResult:
         try:
-            prepared = self._prepared_by_id[request.prepared_request_id]
-        except KeyError as exc:
-            raise ValueError("unknown or expired prepared request") from exc
-        if (
-            prepared.public.request_id != request.key.request_id
-            or prepared.public.prepared_digest != request.prepared_digest
-            or prepared.public.expires_at_ns < time.time_ns()
-        ):
-            raise ValueError("Prefill execution does not match the prepared request")
-        if request.decode_endpoint_generation < 1:
-            raise ValueError("Decode endpoint generation must be positive")
-        try:
-            await self.run_prefill_handoff(
-                prepared.public.request_id,
-                prepared.prompt,
-                prepared.config,
-                prepared.prompt_token_ids,
-                external_request=request,
-                output_parser_spec=prepared.public.continuation.output_parser_spec,
-                constraint_spec=(
-                    ConstraintSpec.from_wire(prepared.public.continuation.constraint_spec)
-                    if prepared.public.continuation.constraint_spec is not None else None
-                ),
+            return await self.run_prefill_handoff(
+                context.key.request_id, prepared.prompt, prepared.config, prepared.prompt_token_ids,
+                context=context, prepared=prepared,
+                output_parser_spec=prepared.continuation.output_parser_spec,
+                constraint_spec=(ConstraintSpec.from_wire(prepared.continuation.constraint_spec)
+                                 if prepared.continuation.constraint_spec is not None else None),
             )
-        except _PrefillNotStarted as exc:
-            result = PrefillHandoffResult(
-                request.key, request.reservation_id, "", "NOT_STARTED", exc.error_code,
-            )
-            self._remember_prefill_result(result)
-            self._drop_prepared(request.prepared_request_id)
-        return self._prefill_results[request.key]
+        except PrefillRejected as exc:
+            self._finish_request(context.key, HandoffStatus(context.key, "FAILED", error_code=exc.result.error_code))
+            return exc.result
+        except PDBackpressureError as exc:
+            result = PrefillResult(context.key, context.request_fingerprint, "NOT_STARTED", type(exc).__name__)
+            self._finish_request(context.key, HandoffStatus(context.key, "FAILED", error_code=result.error_code))
+            return result
+        except BaseException as exc:
+            if not self._health_error:
+                self._finish_request(context.key, HandoffStatus(
+                    context.key, "FAILED", error_code=type(exc).__name__,
+                ))
+            raise
 
-    async def _ensure_external_session(self, request: ExecutePrefillHTTP) -> None:
+    async def _ensure_external_session(self, request: GenerationContext) -> None:
         assert self.capabilities is not None
         async with self._session_connect_lock:
             cached = self._session_pool.lookup(
@@ -825,6 +626,8 @@ class PDServingService:
                 self._multiplex_session = cached.session
                 self.peer_registry = cached.registry
                 return
+            if self._active_keys or self._admission.count:
+                raise RuntimeError("a live handoff owns the current peer registration")
             if self._multiplex_session is not None:
                 with suppress(Exception):
                     await self._multiplex_session.close()
@@ -899,20 +702,6 @@ class PDServingService:
             ),
         )
 
-    def _peer_partition_ranks(self, partition: int):
-        if self.peer_registry is None:
-            raise RuntimeError("Decode owner registry is unavailable")
-        topology = self.peer_registry.topology
-        group_size = topology[1] if len(topology) > 1 else 1
-        rank_count = topology[0]
-        if rank_count % group_size:
-            raise ValueError("Decode topology has an invalid cache-replica group")
-        partition_count = rank_count // group_size
-        if not 0 <= partition < partition_count:
-            raise ValueError("reservation partition is outside the Decode topology")
-        start = partition * group_size
-        return tuple(self.peer_registry.ranks[start : start + group_size])
-
     def _record(
         self,
         event: str,
@@ -958,11 +747,12 @@ class PDServingService:
         config,
         prompt_token_ids: Sequence[int],
         *,
-        external_request: ExecutePrefillHTTP | None = None,
+        context: GenerationContext,
+        prepared: PreparedInput,
         output_parser_spec: OutputParserSpec | None = None,
         constraint_spec: ConstraintSpec | None = None,
-    ) -> None:
-        """Run P Prefill, push each chunk, then relay D Decode output."""
+    ) -> PrefillResult:
+        """Run P Prefill and push chunks; D owns the public Decode response."""
         if self.config.role is not PDRole.PREFILL:
             raise ValueError("external generation is accepted only by the PD Prefill role")
         if self._health_error:
@@ -973,54 +763,43 @@ class PDServingService:
         if self.planner is None or self.source_lifecycle is None:
             raise RuntimeError("PD Prefill service has not started")
 
-        if external_request is None:
-            raise ValueError("send generation requests through the external PD Router")
-        await self._ensure_external_session(external_request)
+        try:
+            await self._ensure_external_session(context)
+        except Exception as exc:
+            # No request compute or native write has been submitted here.
+            raise PrefillRejected(PrefillResult(
+                context.key, context.request_fingerprint, "NOT_STARTED", type(exc).__name__,
+            )) from exc
         if self._multiplex_session is None:
             raise RuntimeError("PD Prefill has no Decode session")
 
         async with self._admission.admit():
             record = self.coordinator.register_handoff(
-                external_request.key,
+                context.key,
                 prefill_node_id=self.config.node_id,
-                decode_node_id=external_request.decode_node_id,
+                decode_node_id=context.decode_node_id,
             )
             self._multiplex_session.open_route(record.key)
             self._active_keys.add(record.key)
             self._record("HANDOFF_CREATED", key=record.key, state=record.state.value)
             try:
-                await self._send_control(
-                    OpenRoute(
-                        key=record.key,
-                        prepared_request_id=external_request.prepared_request_id,
-                        reservation_id=external_request.reservation_id,
-                        prepared_digest=external_request.prepared_digest,
-                        reservation_capability=external_request.reservation_capability,
-                        compatibility_digest=external_request.compatibility_digest,
-                        prefill_node_id=external_request.prefill_node_id,
-                        prefill_endpoint_generation=(
-                            external_request.prefill_endpoint_generation
-                        ),
-                    )
-                )
-                opened = await self._receive_control(record.key)
-                if (isinstance(opened, ControlError) and opened.key == record.key
-                        and opened.operation == "OpenRoute" and opened.deterministic):
-                    raise _PrefillNotStarted(opened.error_code)
-                if (
-                    not isinstance(opened, RouteOpened)
-                    or opened.key != record.key
-                    or opened.reservation_id != external_request.reservation_id
-                ):
-                    raise RuntimeError("D did not open the Router-authorized route")
-                reservation = ReserveAccepted(
-                    key=record.key,
-                    reservation_id=external_request.reservation_id,
-                    partition=external_request.partition,
-                    block_ids_by_group=external_request.block_ids_by_group,
-                    ranks=self._peer_partition_ranks(external_request.partition),
-                    prefix_hit_tokens=external_request.prefix_hit_tokens,
-                )
+                await self._send_control(BeginHandoff(
+                    key=record.key, context=context, continuation=prepared.continuation,
+                    prefix_match_spec=prepared.prefix_match_spec, prepared_digest=prepared.digest,
+                ))
+                reservation = await self._receive_control(record.key)
+                if isinstance(reservation, ReserveRejected) and reservation.key == record.key:
+                    raise PrefillRejected(PrefillResult(
+                        record.key, context.request_fingerprint, "NOT_STARTED",
+                        reservation.reason, reservation.retryable,
+                    ))
+                if (isinstance(reservation, ControlError) and reservation.key == record.key
+                        and reservation.operation == "BeginHandoff" and reservation.deterministic):
+                    raise PrefillRejected(PrefillResult(
+                        record.key, context.request_fingerprint, "NOT_STARTED", reservation.error_code,
+                    ))
+                if not isinstance(reservation, ReserveAccepted) or reservation.key != record.key:
+                    raise RuntimeError("D did not accept the matching handoff")
             except BaseException as exc:
                 self.coordinator.fail(record.key, type(exc).__name__)
                 self._record(
@@ -1032,6 +811,10 @@ class PDServingService:
                 self._active_keys.discard(record.key)
                 if self._multiplex_session is not None:
                     self._multiplex_session.close_route(record.key)
+                if isinstance(exc, Exception) and not isinstance(exc, PrefillRejected):
+                    raise PrefillRejected(PrefillResult(
+                        record.key, context.request_fingerprint, "NOT_STARTED", type(exc).__name__,
+                    )) from exc
                 raise
             self.coordinator.mark_reserved(record.key, reservation.reservation_id)
             self._record(
@@ -1073,11 +856,11 @@ class PDServingService:
                             tuple((pair.source_rank_id, pair.destination_rank_id) for pair in rank_mapping),
                         )
                         if (
-                            self.config.prefix_cache_mode.value != "independent"
+                            not self.config.enable_prefix_cache
                             and source_prefix_hit_tokens
                         ):
                             raise RuntimeError(
-                                "P prefix hit requires independent cache mode"
+                                "P reported a hit while local prefix caching is disabled"
                             )
                         self.metrics.increment("prefix.p_requests")
                         self.metrics.increment(
@@ -1125,23 +908,13 @@ class PDServingService:
                         chunk.block_ids_by_group,
                         chunk.cache_partition,
                     )
-                    continuation = (
-                        self.config.model_adapter.build_continuation(
-                            config=config,
-                            prompt_token_ids=prompt_token_ids,
-                            eos_token_id=self.eos_token_id,
-                            output_parser_spec=output_parser_spec,
-                            **({"constraint_spec": constraint_spec} if constraint_spec else {}),
-                        )
-                        if chunk.final
-                        else None
-                    )
+                    continuation = prepared.continuation if chunk.final else None
                     manifest = self.config.model_adapter.build_manifest(
                         key=record.key,
                         plan=plan,
                         chunk=chunk,
                         continuation=continuation,
-                        prepared_digest=external_request.prepared_digest,
+                        prepared_digest=prepared.digest,
                     )
                     self._record(
                         "CHUNK_PLANNED",
@@ -1235,6 +1008,15 @@ class PDServingService:
                     await self._send_control(commit)
                     ready = await self._receive_control(record.key)
                     if isinstance(ready, ControlError):
+                        if ready.deterministic and ready.error_code == "INVALID_DECODE_SEED":
+                            # D checked this seed only after every write completed.
+                            # Retire the source pin with that known certainty and
+                            # expose a safe failure, never a no-compute assertion.
+                            self.source_lifecycle.settle(guard, certainty)
+                            guard = None
+                            raise PrefillRejected(PrefillResult(
+                                record.key, context.request_fingerprint, "FAILED", ready.error_code,
+                            ))
                         raise RuntimeError(f"D rejected commit: {ready.error_code}")
                     if not isinstance(ready, ReadyAck) or ready.key != record.key:
                         raise RuntimeError("D did not return the matching READY acknowledgement")
@@ -1254,18 +1036,14 @@ class PDServingService:
                     self.core.acknowledge_prefill_handoff(request_id)
                     self.coordinator.release(record.key)
                     await prefill_task
-                    result = PrefillHandoffResult(
-                        key=record.key,
-                        reservation_id=ready.reservation_id,
-                        manifest_hash=ready.manifest_hash,
-                        state="READY",
-                    )
-                    self._remember_prefill_result(result)
-                    self._drop_prepared(external_request.prepared_request_id)
+                    result = PrefillResult(record.key, context.request_fingerprint, "READY")
+                    self._finish_request(record.key, HandoffStatus(
+                        record.key, "RELEASED", ready.reservation_id, ready.manifest_hash,
+                    ))
                     self._active_keys.discard(record.key)
                     if self._multiplex_session is not None:
                         self._multiplex_session.close_route(record.key)
-                    return
+                    return result
             except BaseException as exc:
                 logger.exception(
                     "PD handoff execution failed: request=%s handoff=%s error=%s",
@@ -1473,32 +1251,6 @@ class PDServingService:
         if not isinstance(reply, HandoffStatus) or reply.key != key:
             raise RuntimeError("D did not return the aborted handoff status")
 
-    async def _receive_decode_outputs(self, key) -> AsyncGenerator[TokenOutput, None]:
-        assert self.session is not None
-        while True:
-            message = await self.session.receive()
-            if isinstance(message, ControlError):
-                raise RuntimeError(f"D control failure: {message.error_code}")
-            if not isinstance(message, DecodeOutputWire) or message.key != key:
-                raise RuntimeError("P received an unexpected Decode output message")
-            output = TokenOutput(
-                token_id=message.token_id,
-                text=message.text,
-                reasoning=message.reasoning,
-                text_delta=message.text_delta,
-                reasoning_delta=message.reasoning_delta,
-                tool_call_deltas=message.tool_call_deltas,
-                tool_calls=message.tool_calls,
-                finished=message.finished,
-                finish_reason=message.finish_reason,
-                prompt_tokens=message.prompt_tokens,
-                completion_tokens=message.completion_tokens,
-                token_ids=message.token_ids,
-            )
-            yield output
-            if output.finished:
-                return
-
     async def _serve_external_connections(
         self,
         local_advertisement: RegistryAdvertisement,
@@ -1506,10 +1258,10 @@ class PDServingService:
         assert self._control_acceptor is not None
         assert self.capabilities is not None
         while True:
-            while not self._authorized_routes:
-                self._route_authorized.clear()
-                await self._route_authorized.wait()
-            expected_peer = next(iter(self._authorized_routes.values())).prefill_node_id
+            while not self._requests:
+                self._request_available.clear()
+                await self._request_available.wait()
+            expected_peer = next(iter(self._requests.values())).context.prefill_node_id
             session = await self._control_acceptor.accept(
                 self.capabilities,
                 expected_peer_node_id=expected_peer,
@@ -1544,6 +1296,7 @@ class PDServingService:
                 error = task.exception()
                 if error is not None and not self._health_error:
                     self._health_error = type(error).__name__
+                    self._finish_request(key, HandoffStatus(key, "RECOVERY_REQUIRED", error_code=self._health_error))
 
         try:
             while True:
@@ -1554,28 +1307,34 @@ class PDServingService:
                 key = getattr(message, "key", None)
                 if not isinstance(key, HandoffKey):
                     raise ValueError("external PD message has no handoff correlation")
-                if isinstance(message, OpenRoute):
+                if isinstance(message, BeginHandoff):
                     if key in tasks:
                         await session.send(
                             ControlError(
                                 key,
-                                "OpenRoute",
+                                "BeginHandoff",
                                 "ROUTE_ALREADY_OPEN",
                                 True,
                             )
                         )
                         continue
-                    states = tuple(self.decode_connector.query(active_key).state for active_key in tasks)
-                    transferring = sum(state in ("RESERVED", "TRANSFERRING") for state in states)
+                    states = []
+                    for active_key in tasks:
+                        try:
+                            states.append(self.query_handoff(active_key).state)
+                        except KeyError:
+                            states.append("WAITING_HTTP")
+                    transferring = sum(state in ("WAITING_HTTP", "REGISTERED", "RESERVED", "TRANSFERRING")
+                                       for state in states)
                     # Completed routes may still be finishing their coroutine.
                     # The reservation state, not callback scheduling, owns quota.
-                    live = sum(state not in ("COMPLETED", "ABORTED") for state in states)
+                    live = sum(state not in ("COMPLETED", "ABORTED", "FAILED", "RELEASED") for state in states)
                     if (transferring >= self.config.max_active_handoffs
                             or live >= self.config.max_pending_handoffs):
                         await session.send(
                             ControlError(
                                 key,
-                                "OpenRoute",
+                                "BeginHandoff",
                                 "HANDOFF_BACKPRESSURE",
                                 True,
                             )
@@ -1626,13 +1385,15 @@ class PDServingService:
                 try:
                     status = self.decode_connector.query(key)
                 except KeyError:
+                    self._finish_request(key, HandoffStatus(key, "ABORTED", error_code="CONTROL_SESSION_EOF"))
                     task.cancel()
+                    cancelled.append(task)
                     continue
                 if status.state in ("READY", "IN_USE", "COMPLETED", "ABORTED"):
                     continue
                 deterministic = status.state == "RESERVED"
                 with suppress(Exception):
-                    self.decode_connector.abort(
+                    aborted = self.decode_connector.abort(
                         AbortHandoff(
                             key,
                             "CONTROL_SESSION_EOF",
@@ -1640,12 +1401,24 @@ class PDServingService:
                         ),
                         deterministic=deterministic,
                     )
+                    self._finish_request(key, aborted)
                 if not deterministic:
                     self._health_error = "CONTROL_SESSION_EOF_DURING_TRANSFER"
                 task.cancel()
                 cancelled.append(task)
             if cancelled:
                 await asyncio.gather(*cancelled, return_exceptions=True)
+
+    async def _wait_generation(self, context: GenerationContext) -> None:
+        """P control and D HTTP may arrive in either order, including on reuse."""
+        async def wait():
+            while context.key not in self._requests:
+                self._require_external_role(PDRole.DECODE)
+                if context.key in self._retired:
+                    raise ValueError("generation identity was retired")
+                self._request_available.clear()
+                await self._request_available.wait()
+        await asyncio.wait_for(wait(), self.config.request_timeout_seconds)
 
     async def _serve_external_handoff(
         self,
@@ -1659,14 +1432,18 @@ class PDServingService:
         while True:
             message = await queue.get()
             try:
-                if isinstance(message, OpenRoute):
+                if isinstance(message, BeginHandoff):
                     if opened:
                         raise ValueError("route opening was replayed on an active route")
-                    self._validate_open_route(message, session)
+                    await self._wait_generation(message.context)
+                    outcome = self._reserve_handoff(message, session)
+                    await session.send(outcome)
+                    if isinstance(outcome, ReserveRejected):
+                        self._finish_request(key, HandoffStatus(key, "FAILED", error_code=outcome.reason))
+                        return
                     opened = True
-                    await session.send(RouteOpened(message.key, message.reservation_id))
                 elif not opened:
-                    raise ValueError("handoff command arrived before OpenRoute")
+                    raise ValueError("handoff command arrived before BeginHandoff")
                 elif isinstance(message, ChunkManifest):
                     self.decode_connector.register_chunk(message)
                     status = self.decode_connector.query(key)
@@ -1694,6 +1471,26 @@ class PDServingService:
                     await session.send(ControlAck(key, "transfer_results", message.chunk_id))
                 elif isinstance(message, CommitRequest):
                     ready = self.decode_connector.commit(message)
+                    try:
+                        await self._validate_decode_seed(key)
+                    except ValueError as exc:
+                        logger.warning("PD Decode seed rejected: request=%s token=%s reason=%s",
+                                       key.request_id, message.first_token, str(exc)[:512])
+                        # Commit proves all native writes completed. No Decode
+                        # was admitted yet, so a bad seed is safely recyclable.
+                        status = self.decode_connector.mark_decode_cancelled(
+                            key, error_code="INVALID_DECODE_SEED",
+                        )
+                        self._record(
+                            "DECODE_SEED_REJECTED", key=key,
+                            reservation_id=status.reservation_id,
+                            state=status.state, error_code=type(exc).__name__,
+                        )
+                        self._finish_request(key, status)
+                        await session.send(ControlError(
+                            key, "CommitRequest", "INVALID_DECODE_SEED", True,
+                        ))
+                        return
                     self._record(
                         "HANDOFF_COMMITTED",
                         key=key,
@@ -1712,15 +1509,13 @@ class PDServingService:
                         deterministic=message.deterministic,
                     )
                     await session.send(status)
-                    self._active_keys.discard(key)
+                    self._finish_request(key, status)
                     return
-                elif isinstance(message, ReleaseHandoff):
-                    await session.send(self.decode_connector.query(key))
                 else:
                     raise ValueError(
                         f"unexpected P control message {type(message).__name__}"
                     )
-            except (ValueError, KeyError, RuntimeError) as exc:
+            except (ValueError, KeyError, RuntimeError, TimeoutError) as exc:
                 status = None
                 with suppress(Exception):
                     status = self.decode_connector.query(key)
@@ -1748,43 +1543,26 @@ class PDServingService:
                     key=key,
                     error_code=type(exc).__name__,
                 )
-                self._active_keys.discard(key)
+                self._finish_request(key, HandoffStatus(
+                    key, "FAILED" if deterministic else "RECOVERY_REQUIRED",
+                    error_code=type(exc).__name__,
+                ))
                 if not deterministic:
                     self._health_error = type(exc).__name__
                 return
 
-    def _validate_open_route(
-        self,
-        message: OpenRoute,
-        session: PDControlSession,
-    ) -> None:
-        authorized = self._authorized_routes.get(message.key)
-        if authorized is None:
-            raise ValueError("P opened a route that Router did not authorize")
-        request = authorized.request
-        if (
-            message.prepared_request_id != request.prepared_request_id
-            or message.reservation_id != request.reservation_id
-            or message.prepared_digest != request.prepared_digest
-            or message.compatibility_digest != request.compatibility_digest
-            or message.prefill_node_id != request.prefill_node_id
-            or message.prefill_endpoint_generation
-            != request.prefill_endpoint_generation
-            or not secrets.compare_digest(
-                message.reservation_capability,
-                request.reservation_capability,
+    async def _validate_decode_seed(self, key) -> None:
+        manifest = self.decode_connector.committed_manifest(key)
+        continuation = manifest.continuation
+        if continuation is None or manifest.first_token is None:
+            raise ValueError("committed handoff has no continuation metadata")
+        self.config.model_adapter.validate_continuation(continuation)
+        if continuation.constraint_spec is not None:
+            if self.preflight_constraint is None:
+                raise ValueError("Decode constraint preflight is not installed")
+            await self.preflight_constraint(
+                ConstraintSpec.from_wire(continuation.constraint_spec), (manifest.first_token,),
             )
-            or session.peer_hello.node_id != authorized.prefill_node_id
-            or session.peer_hello.endpoint_generation
-            != authorized.prefill_endpoint_generation
-        ):
-            raise ValueError("P route opening differs from Router authorization")
-        if message.key not in self._decode_queues:
-            raise RuntimeError("Router must await Decode output before P starts Prefill")
-        assert self.decode_connector is not None
-        status = self.decode_connector.query(message.key)
-        if status.reservation_id != message.reservation_id or status.state != "RESERVED":
-            raise ValueError("P route opening references an unusable D reservation")
 
     async def _stream_decode(self, key) -> None:
         assert self.decode_connector is not None
@@ -1804,47 +1582,39 @@ class PDServingService:
             state="IN_USE",
         )
         admitted = True
-        encoder = DecodeOutputEncoder(
-            key, parsed=continuation.output_parser_spec is not None, streaming=continuation.stream,
-        )
+        request = self._requests[key]
         try:
-            async for output in self.config.model_adapter.adopt_decode(
+            outputs = self.config.model_adapter.adopt_decode(
                 self.core,
                 reservation_id=self.decode_connector.query(key).reservation_id,
                 request_id=key.request_id,
                 first_token=manifest.first_token,
                 continuation=continuation,
-            ):
-                wire = encoder.encode(output)
-                queue = self._decode_queues.get(key)
-                if queue is None:
-                    raise RuntimeError("Router Decode stream disappeared after admission")
-                await queue.put(
-                    DecodeStreamFrame(
-                        event="finished" if output.finished else "output",
-                        output=wire,
-                        state="COMPLETED" if output.finished else "IN_USE",
-                    )
-                )
-                if output.finished:
-                    self.decode_connector.mark_decode_completed(key)
-                    completed = self.decode_connector.query(key)
-                    self._record(
-                        "HANDOFF_COMPLETED",
-                        key=key,
-                        reservation_id=completed.reservation_id,
-                        manifest_hash=completed.manifest_hash,
-                        state="COMPLETED",
-                    )
-                    self._clear_decode_route(key)
-                    self.metrics.record_terminal(
-                        request_id=key.request_id,
-                        state="COMPLETED",
-                        prompt_tokens=output.prompt_tokens,
-                        completion_tokens=output.completion_tokens,
-                        token_ids=output.token_ids,
-                    )
-                    return
+            )
+            async with aclosing(outputs):
+                async for output in outputs:
+                    if output.finished:
+                        await outputs.aclose()
+                        self.decode_connector.mark_decode_completed(key)
+                        completed = self.decode_connector.query(key)
+                        self._record(
+                            "HANDOFF_COMPLETED",
+                            key=key,
+                            reservation_id=completed.reservation_id,
+                            manifest_hash=completed.manifest_hash,
+                            state="COMPLETED",
+                        )
+                        self._finish_request(key, completed)
+                        self.metrics.record_terminal(
+                            request_id=key.request_id,
+                            state="COMPLETED",
+                            prompt_tokens=output.prompt_tokens,
+                            completion_tokens=output.completion_tokens,
+                            token_ids=output.token_ids,
+                        )
+                        await request.outputs.put(output)
+                        return
+                    await request.outputs.put(output)
         except BaseException as exc:
             router_cancelled = key in self._router_cancelled_keys
             if not router_cancelled:
@@ -1853,8 +1623,9 @@ class PDServingService:
                 # cancellation.  Accept either side of that race as the same
                 # deterministic terminal fact.
                 with suppress(KeyError, RuntimeError):
-                    router_cancelled = (
-                        self.decode_connector.query(key).state == "ABORTED"
+                    current_state = self.decode_connector.query(key).state
+                    router_cancelled = current_state == "ABORTED" or (
+                        current_state == "COMPLETED" and isinstance(exc, (asyncio.CancelledError, GeneratorExit))
                     )
             if router_cancelled:
                 # The Router's deterministic abort endpoint owns the terminal
@@ -1881,36 +1652,9 @@ class PDServingService:
             )
             self._active_keys.discard(key)
             self._health_error = type(exc).__name__
-            queue = self._decode_queues.get(key)
-            if queue is not None:
-                with suppress(asyncio.QueueFull):
-                    queue.put_nowait(
-                        DecodeStreamFrame(
-                            event="error",
-                            state="RECOVERY_REQUIRED",
-                            error_code=type(exc).__name__,
-                        )
-                    )
+            with suppress(asyncio.QueueFull):
+                request.outputs.put_nowait(exc)
             raise
-
-    def _remember_prefill_result(self, result: PrefillHandoffResult) -> None:
-        self._prefill_results[result.key] = result
-        self._prefill_results.move_to_end(result.key)
-        while len(self._prefill_results) > self._prefill_result_limit:
-            self._prefill_results.popitem(last=False)
-
-    def _drop_prepared(self, prepared_request_id: str) -> None:
-        prepared = self._prepared_by_id.pop(prepared_request_id, None)
-        if prepared is not None:
-            self._prepared_by_request.pop(prepared.public.request_id, None)
-
-    def _clear_decode_route(self, key: HandoffKey) -> None:
-        self._active_keys.discard(key)
-        self._authorized_routes.pop(key, None)
-        self._reservation_capabilities.pop(key, None)
-        self._reservation_bindings.pop(key, None)
-        self._decode_waiter_claimed.discard(key)
-        self._decode_queues.pop(key, None)
 
     async def _stop_decode_output_task(self, key: HandoffKey) -> None:
         # Called only after scheduler cancellation and a deterministic terminal

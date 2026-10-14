@@ -12,8 +12,11 @@ from types import SimpleNamespace
 
 
 from pypto_serving.config.types import GenerateConfig
-from pypto_serving.router.app import _chat_message, _stream_chat
-from pypto_serving.serving.pd.http_api import PrepareRequestHTTP, encode_json
+from pypto_serving.serving.server.responses import stream_outputs
+from pypto_serving.serving.server.chat_format import chat_message
+from pypto_serving.serving.pd.config import PD_SCHEMA_VERSION, PDRole
+from pypto_serving.serving.pd.generation import generation_body, public_document, request_fingerprint
+from pypto_serving.serving.pd.protocol import GenerationContext, HandoffKey, PrefillResult
 from pypto_serving.serving.pd.integration import PDApplication
 from pypto_serving.serving.server.server import (
     ChatCompletionRequest,
@@ -24,21 +27,24 @@ from pypto_serving.serving.server.server import (
 
 class _ExternalConfig:
     enabled = True
+    role = PDRole.PREFILL
+    node_id = "p"
+    generation = route_epoch = control_incarnation = 1
 
 
 class _Engine:
     pd_service = SimpleNamespace()
 
 
-def test_external_node_exposes_internal_api_but_not_public_generation() -> None:
+def test_pd_node_exposes_public_generation_and_only_operational_internal_api() -> None:
     server = _pd_server(_Engine(), "model", GenerateConfig())
     paths = {route.path for route in server.app.routes}
     assert "/health" in paths
     assert "/internal/pd/descriptor" in paths
-    assert "/internal/pd/prepare" in paths
-    assert "/internal/pd/await-decode" in paths
-    assert "/v1/completions" not in paths
-    assert "/v1/chat/completions" not in paths
+    assert "/internal/pd/prepare" not in paths
+    assert "/internal/pd/await-decode" not in paths
+    assert "/v1/completions" in paths
+    assert "/v1/chat/completions" in paths
 
 
 def _pd_server(engine, model, config):
@@ -47,6 +53,15 @@ def _pd_server(engine, model, config):
             SimpleNamespace(service=engine.pd_service), server, config=_ExternalConfig()
         )
     return ServingServer(engine, model, config, route_factory=install)
+
+
+def _body(raw, request_id):
+    context = GenerationContext(
+        HandoffKey(request_id, "handoff-" + request_id, 1, 1, 1),
+        request_fingerprint("chat", public_document(raw)), "p", 1, "d", 1,
+        "127.0.0.1", 12345, PD_SCHEMA_VERSION,
+    )
+    return generation_body(raw, "chat", context)
 
 
 class _BodyRequest:
@@ -72,9 +87,19 @@ class _PDService:
     def __init__(self) -> None:
         self.prepare_calls = []
 
-    def prepare_request(self, *args, **kwargs):
+    def register_generation(self, context):
+        return SimpleNamespace(context=context)
+
+    def descriptor(self):
+        return SimpleNamespace(capabilities=SimpleNamespace(model_revision="model"))
+
+    def prepare_input(self, *args, **kwargs):
         self.prepare_calls.append((args, kwargs))
-        return {"status": "prepared"}
+        return object()
+
+    async def prefill(self, context, prepared):
+        return PrefillResult(context.key, context.request_fingerprint, "READY")
+
 
 
 class _ChatEngine(_Engine):
@@ -101,21 +126,14 @@ def test_pd_chat_streaming_prepare_tokenizes_templated_prompt() -> None:
         max_tokens=8,
         stream=True,
     )
-    wire = encode_json(
-        PrepareRequestHTTP(
-            request_id="chat-request",
-            request_kind="chat",
-            request_json=public.model_dump_json().encode(),
-        )
-    )
+    wire = _body(public.model_dump_json().encode(), "chat-request")
 
-    response = asyncio.run(engine.pd_routes._pd_prepare(_BodyRequest(wire)))
+    response = asyncio.run(engine.pd_routes._chat(_BodyRequest(wire)))
 
     assert response.status_code == 200
     assert engine.tokenize_calls == ["templated chat prompt"]
     args, kwargs = engine.pd_service.prepare_calls[0]
-    request_id, prompt, config, prompt_token_ids = args
-    assert request_id == "chat-request"
+    prompt, config, prompt_token_ids = args
     assert prompt == "templated chat prompt"
     assert config.max_new_tokens == 8
     assert config.stream is True
@@ -134,15 +152,9 @@ def test_pd_chat_prepare_preserves_include_reasoning_policy() -> None:
         chat_template_kwargs={"enable_thinking": True},
         include_reasoning=False,
     )
-    wire = encode_json(
-        PrepareRequestHTTP(
-            request_id="chat-hidden-reasoning",
-            request_kind="chat",
-            request_json=public.model_dump_json().encode(),
-        )
-    )
+    wire = _body(public.model_dump_json().encode(), "chat-hidden-reasoning")
 
-    asyncio.run(engine.pd_routes._pd_prepare(_BodyRequest(wire)))
+    asyncio.run(engine.pd_routes._chat(_BodyRequest(wire)))
 
     spec = engine.pd_service.prepare_calls[0][1]["output_parser_spec"]
     assert spec.initial_state == "reasoning"
@@ -163,13 +175,9 @@ def test_pd_chat_prepare_preserves_tools_and_tool_history() -> None:
         ],
         "tools": [{"type": "function", "function": {"name": "lookup"}}],
     })
-    wire = encode_json(PrepareRequestHTTP(
-        request_id="chat-tools",
-        request_kind="chat",
-        request_json=public.model_dump_json().encode(),
-    ))
+    wire = _body(public.model_dump_json().encode(), "chat-tools")
 
-    asyncio.run(engine.pd_routes._pd_prepare(_BodyRequest(wire)))
+    asyncio.run(engine.pd_routes._chat(_BodyRequest(wire)))
 
     messages, template_kwargs = engine.tokenizer.template_calls[0]
     assert messages[1]["content"] is None
@@ -194,8 +202,8 @@ class _RouterCoordinator:
 def _decode_sse(chunks: list[bytes]) -> list[dict]:
     decoded = []
     for chunk in chunks:
-        payload = chunk.removeprefix(b"data: ").strip()
-        if payload == b"[DONE]":
+        payload = chunk.removeprefix("data: ").strip()
+        if payload == "[DONE]":
             continue
         decoded.append(json.loads(payload))
     return decoded
@@ -244,8 +252,9 @@ def test_router_streams_independent_reasoning_and_content_deltas() -> None:
     async def collect():
         return [
             chunk
-            async for chunk in _stream_chat(
-                _RouterCoordinator(outputs).generate("chat", b"{}", "request"), "request", "model"
+            async for chunk in stream_outputs(
+                _RouterCoordinator(outputs).generate("chat", b"{}", "request"), "request", "model",
+                kind="chat", parsed=True,
             )
         ]
 
@@ -256,11 +265,9 @@ def test_router_streams_independent_reasoning_and_content_deltas() -> None:
 
 
 def test_router_non_streaming_message_preserves_both_semantic_channels() -> None:
-    message = _chat_message(
-        SimpleNamespace(reasoning="private reasoning", text="public answer", tool_calls=())
-    )
+    message = chat_message("public answer", "private reasoning", ())
 
-    assert message == {
+    assert message.model_dump(exclude_none=True) == {
         "role": "assistant",
         "reasoning": "private reasoning",
         "content": "public answer",
@@ -298,8 +305,9 @@ def test_router_streams_authoritative_deltas_when_cumulative_fields_change() -> 
     async def collect():
         return [
             chunk
-            async for chunk in _stream_chat(
-                _RouterCoordinator(outputs).generate("chat", b"{}", "request"), "request", "model"
+            async for chunk in stream_outputs(
+                _RouterCoordinator(outputs).generate("chat", b"{}", "request"), "request", "model",
+                kind="chat", parsed=True,
             )
         ]
 

@@ -31,7 +31,7 @@ def _pd_args(
     *,
     role: str,
     speculative_tokens: int,
-    prefix_cache_mode: str = "disabled",
+    enable_prefix_cache: bool = True,
 ):
     model_dir = tmp_path / f"dspark-{role}-{speculative_tokens}"
     model_dir.mkdir()
@@ -51,7 +51,6 @@ def _pd_args(
             {
                 "runtime": {
                     "run_id": "run-k7",
-                    "prefix_cache_mode": prefix_cache_mode,
                     "prefill": [
                         {"host": "127.0.0.1", "port": 8101, "node_id": "p"}
                     ],
@@ -68,6 +67,7 @@ def _pd_args(
         [
             "--model",
             str(model_dir),
+            "--enable-prefix-caching" if enable_prefix_cache else "--no-enable-prefix-caching",
             "--devices",
             ",".join(str(index) for index in range(16)),
             "--dp",
@@ -128,26 +128,27 @@ def test_pd_k7_uses_target_only_prefill_and_k7_decode(
 
 
 @pytest.mark.parametrize(
-    ("mode", "role", "expected"),
+    ("role", "expected"),
     (
-        ("d_only", "prefill", False),
-        ("d_only", "decode", True),
-        ("independent", "prefill", True),
-        ("independent", "decode", True),
+        ("prefill", False),
+        ("decode", False),
+        ("prefill", True),
+        ("decode", True),
     ),
 )
-def test_pd_prefix_cache_profile_drives_local_engine_flag(
-    tmp_path, mode, role, expected
+def test_pd_preserves_local_prefix_cache_cli_flag(
+    tmp_path, role, expected
 ) -> None:
     config, pd = _build(
         _pd_args(
             tmp_path,
             role=role,
             speculative_tokens=K7,
-            prefix_cache_mode=mode,
+            enable_prefix_cache=expected,
         )
     )
     assert config.enable_prefix_cache is expected
+    assert pd.enable_prefix_cache is expected
     if expected:
         assert config.runtime_config.speculative_prefix_cache_replay_tokens == max(
             group.sliding_window or 0

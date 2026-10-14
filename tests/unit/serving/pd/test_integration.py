@@ -21,7 +21,7 @@ from starlette.requests import Request
 from pypto_serving.config.types import DecodeBatch
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_ADAPTER, DSparkPDWorker
 from pypto_serving.serving.pd.integration import PDApplication, PDNodeRuntime
-from pypto_serving.serving.pd.http_api import PDHTTPRoutes, PrepareRequestHTTP
+from pypto_serving.serving.pd.http_api import PDHTTPRoutes
 from pypto_serving.serving.pd.worker import PDWorkerServices
 
 
@@ -173,10 +173,23 @@ def test_pd_chat_prepare_runs_injected_constraint_preflight():
         async def preflight(value):
             seen.append(value)
 
+        from pypto_serving.serving.pd.config import PD_SCHEMA_VERSION, PDRole
+        from pypto_serving.serving.pd.generation import generation_body, public_document, request_fingerprint
+        from pypto_serving.serving.pd.protocol import GenerationContext, HandoffKey, PrefillResult
+        async def prefill(context, prepared):
+            return PrefillResult(context.key, context.request_fingerprint, "READY")
+        service = SimpleNamespace(
+            register_generation=lambda context: object(),
+            prepare_input=lambda *args, **kwargs: object(),
+            prefill=prefill,
+            descriptor=lambda: SimpleNamespace(capabilities=SimpleNamespace(model_revision="model")),
+        )
         routes = PDHTTPRoutes(
             FastAPI(),
-            SimpleNamespace(prepare_request=lambda *args, **kwargs: {"prepared": True}),
-            SimpleNamespace(),
+            service,
+            SimpleNamespace(role=PDRole.PREFILL, node_id="p", generation=1,
+                            route_epoch=1, control_incarnation=1),
+            model_id="model",
             prepare_completion=lambda request: None,
             prepare_chat=lambda request: ("prompt", (1,), object(), None, spec),
             preflight_constraint=preflight,
@@ -184,20 +197,20 @@ def test_pd_chat_prepare_runs_injected_constraint_preflight():
             start_profile=lambda: None,
             stop_profile=lambda: None,
         )
-        payload = PrepareRequestHTTP(
-            request_id="chat-1",
-            request_kind="chat",
-            request_json=b'{"messages":[{"role":"user","content":"hello"}]}',
+        raw = b'{"messages":[{"role":"user","content":"hello"}]}'
+        context = GenerationContext(
+            HandoffKey("chat-1", "handoff", 1, 1, 1), request_fingerprint("chat", public_document(raw)),
+            "p", 1, "d", 1, "localhost", 12345, PD_SCHEMA_VERSION,
         )
-        body = msgspec.json.encode(payload)
+        body = generation_body(raw, "chat", context)
 
         async def receive():
             return {"type": "http.request", "body": body, "more_body": False}
 
         request = Request({"type": "http", "method": "POST", "path": "/", "headers": []}, receive)
-        response = await routes._pd_prepare(request)
+        response = await routes._chat(request)
         assert response.status_code == 200
-        assert msgspec.json.decode(response.body) == {"prepared": True}
+        assert msgspec.json.decode(response.body)["pd_transfer"]["state"] == "READY"
         assert seen == [spec]
 
     asyncio.run(exercise())

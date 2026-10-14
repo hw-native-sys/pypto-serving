@@ -294,7 +294,7 @@ class CompletionTracker:
         self.state = CompletionState.COMPLETED
 
     def mark_cancelled(self, *, error_code: str) -> None:
-        """Publish a deterministic terminal fact after scheduler-side abort."""
+        """Retire a committed handoff once Decode is stopped or was never admitted."""
         if self.state is CompletionState.ABORTED:
             return
         if self.state not in (CompletionState.READY, CompletionState.IN_USE):

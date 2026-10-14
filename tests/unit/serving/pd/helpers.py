@@ -9,7 +9,7 @@
 
 from pypto_serving.model.deepseek.transfer_layout import ComponentLayout, DSV4Registry
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
-from pypto_serving.model.deepseek_dspark.npu_runner import build_dspark_cache_group_specs
+from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.pd.config import PDCapabilities
 from pypto_serving.serving.pd.protocol import (
@@ -23,8 +23,26 @@ def make_cache_manager(
     capacity_slots: int = 2,
     enable_prefix_cache: bool = False,
 ) -> KvCacheManager:
-    ratios = tuple(4 if layer % 2 == 0 else 128 for layer in range(43))
-    specs = build_dspark_cache_group_specs(43, ratios)
+    # Host fixture, not a kernel/runtime import. Seven allocation families,
+    # four replicated partitions, compressed source-token boundaries and rings.
+    all_layers = tuple(range(43))
+    csa, hca = all_layers[::2], all_layers[1::2]
+    specs = tuple(
+        KVCacheGroupSpec(
+            name=name, layer_indices=layers,
+            spec=KVCacheSpec(tokens, len(layers) * (tokens // ratio) * 64, ratio),
+            max_blocks_per_seq=blocks, num_partitions=4, sliding_window=window,
+        )
+        for name, layers, tokens, ratio, blocks, window in (
+            ("ori", all_layers, 32, 1, 261, 128),
+            ("cmp_c128", hca, 128, 128, 8192, None),
+            ("cmp_c4", csa, 128, 4, 8192, None),
+            ("idx", csa, 128, 4, 8192, None),
+            ("hca_state", hca, 8, 1, 1041, 128),
+            ("csa_state", csa, 2, 1, 4101, 8),
+            ("csa_inner_state", csa, 2, 1, 4101, 8),
+        )
+    )
     manager = KvCacheManager(enable_prefix_cache=enable_prefix_cache)
     manager.init_groups(
         specs,

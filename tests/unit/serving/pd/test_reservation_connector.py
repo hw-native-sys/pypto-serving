@@ -9,7 +9,6 @@
 
 import pytest
 
-from pypto_serving.model.deepseek_dspark.npu_runner import DSPARK_MAX_SEQ_LEN
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_ADAPTER, DSV4_DSPARK_K7_CONTRACT
 from pypto_serving.serving.memory.reservation import GroupReservationState
 from pypto_serving.serving.pd.connector import DecodeConnector
@@ -33,6 +32,7 @@ from pypto_serving.transfer.types import CompletionCertainty
 from .helpers import make_cache_manager, make_capabilities, make_rank_registrations, make_registry
 
 
+DSPARK_MAX_SEQ_LEN = 1_048_576  # Host fixture boundary, no device-runtime import.
 KEY = HandoffKey("request", "handoff", 1, 1, 1)
 
 

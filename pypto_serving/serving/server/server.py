@@ -10,25 +10,19 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import dataclasses
 import importlib.util
-import json
 import logging
-import time
 import uuid
-from collections.abc import Sequence
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.model.model_family import read_model_config
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.constraints.provider import XGrammarProvider
-from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput
-from pypto_serving.observability.tokens import token_ids_sha256
+from pypto_serving.serving.engine.async_engine import AsyncLLMEngine
 from pypto_serving.serving.reasoning import OutputParserSpec, supports_tool_calls
 from pypto_serving.tools.profile import (
     get_profiler,
     merge_profile,
-    profile_instant,
     profile_span,
     start_profile as start_sa_profile,
     stop_profile as stop_sa_profile,
@@ -40,25 +34,20 @@ try:
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse, Response, StreamingResponse
     from .api_types import (
-        ChatCompletionChoice,
         ChatCompletionRequest,
-        ChatCompletionResponse,
         ChatDelta as ChatDelta,
         ChatMessage,
         ChatTool,
-        CompletionChoice,
         CompletionRequest,
-        CompletionResponse,
         DeltaFunctionCall as DeltaFunctionCall,
         DeltaToolCall as DeltaToolCall,
         FunctionCall as FunctionCall,
         FunctionDefinition as FunctionDefinition,
         ReasoningEffort as ReasoningEffort,
-        ResponseUsage,
         ToolCall as ToolCall,
         validate_chat_request,
     )
-    from .chat_format import chat_delta, chat_finish_reason, chat_message, map_finish_reason
+    from .responses import output_response
 except ImportError as e:
     raise ImportError(
         "Serving requires fastapi and pydantic. Install with: pip install fastapi uvicorn sse-starlette pydantic"
@@ -227,187 +216,25 @@ class ServingServer:
 
     async def _completions(self, request: CompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"cmpl-{uuid.uuid4().hex[:8]}"
-        prompt, prompt_token_ids, config, _ = self.prepare_completion(request)
-
-        with profile_span(
-            "http.completions",
-            cat="request",
-            args={"request_id": request_id, "max_tokens": config.max_new_tokens, "stream": request.stream},
-        ):
-            if request.stream:
-                return StreamingResponse(
-                    self._stream_completion(
-                        request_id,
-                        prompt,
-                        config,
-                        request.model or self.model_id,
-                        prompt_token_ids=prompt_token_ids,
-                    ),
-                    media_type="text/event-stream",
-                )
-
-            full_text = ""
-            finish_reason = ""
-            usage = None
-            final_token_ids: tuple[int, ...] = ()
-            async for output in self.engine.add_request(
-                request_id,
-                prompt,
-                config,
-                prompt_token_ids=prompt_token_ids,
-            ):
-                if output.text:
-                    full_text = output.text
-                if output.finished:
-                    final_token_ids = output.token_ids
-                    finish_reason = self._map_finish_reason(output.finish_reason)
-                    usage = ResponseUsage(
-                        prompt_tokens=output.prompt_tokens,
-                        completion_tokens=output.completion_tokens,
-                        total_tokens=output.prompt_tokens + output.completion_tokens,
-                    )
-
-            response = CompletionResponse(
-                id=request_id,
-                created=int(time.time()),
-                model=request.model or self.model_id,
-                choices=[CompletionChoice(text=full_text, finish_reason=finish_reason)],
-                usage=usage,
-            )
-            return JSONResponse(
-                response.model_dump(),
-                headers={
-                    "x-pypto-token-ids-sha256": token_ids_sha256(final_token_ids)
-                },
-            )
+        prompt, tokens, config, _ = self.prepare_completion(request)
+        return await output_response(
+            self.engine.add_request(request_id, prompt, config, prompt_token_ids=tokens),
+            request_id, request.model or self.model_id, kind="completion", stream=request.stream,
+        )
 
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-        prompt, _, config, output_parser_spec, constraint_spec = self.prepare_chat(request)
-        if constraint_spec is not None:
-            await self._preflight_constraint(constraint_spec)
-
-        with profile_span(
-            "http.chat_completions",
-            cat="request",
-            args={"request_id": request_id, "max_tokens": config.max_new_tokens, "stream": request.stream},
-        ):
-            if request.stream:
-                return StreamingResponse(
-                    self._stream_chat_completion(
-                        request_id,
-                        prompt,
-                        config,
-                        request.model or self.model_id,
-                        output_parser_spec=output_parser_spec,
-                        constraint_spec=constraint_spec,
-                        parallel_tool_calls=request.parallel_tool_calls,
-                    ),
-                    media_type="text/event-stream",
-                )
-
-            full_text = ""
-            full_reasoning = ""
-            tool_calls = ()
-            finish_reason = ""
-            usage = None
-            final_token_ids: tuple[int, ...] = ()
-            async for output in self.engine.add_request(
-                request_id,
-                prompt,
-                config,
-                output_parser_spec=output_parser_spec,
-                **({"constraint_spec": constraint_spec} if constraint_spec else {}),
-            ):
-                if output.text:
-                    full_text = output.text
-                if output.reasoning:
-                    full_reasoning = output.reasoning
-                if output.finished:
-                    final_token_ids = output.token_ids
-                    finish_reason = self._chat_finish_reason(output)
-                    tool_calls = output.tool_calls
-                    usage = ResponseUsage(
-                        prompt_tokens=output.prompt_tokens,
-                        completion_tokens=output.completion_tokens,
-                        total_tokens=output.prompt_tokens + output.completion_tokens,
-                    )
-
-            response = ChatCompletionResponse(
-                id=request_id,
-                object="chat.completion",
-                created=int(time.time()),
-                model=request.model or self.model_id,
-                choices=[ChatCompletionChoice(
-                    message=chat_message(
-                        full_text,
-                        full_reasoning,
-                        tool_calls,
-                        parallel_tool_calls=request.parallel_tool_calls,
-                    ),
-                    finish_reason=finish_reason,
-                )],
-                usage=usage,
-            )
-            return JSONResponse(
-                response.model_dump(),
-                headers={
-                    "x-pypto-token-ids-sha256": token_ids_sha256(final_token_ids)
-                },
-            )
-
-    async def _stream_completion(
-        self,
-        request_id: str,
-        prompt: str,
-        config: GenerateConfig,
-        model: str,
-        *,
-        prompt_token_ids: Sequence[int] | None = None,
-    ):
-        with profile_span("http.stream_completion", cat="request", args={"request_id": request_id}):
-            prev_text = ""
-            async for output in self.engine.add_request(
-                request_id,
-                prompt,
-                config,
-                prompt_token_ids=prompt_token_ids,
-            ):
-                delta = output.text[len(prev_text):] if output.text else ""
-                prev_text = output.text or prev_text
-                finish_reason = self._map_finish_reason(output.finish_reason) if output.finished else None
-
-                chunk = CompletionResponse(
-                    id=request_id,
-                    created=int(time.time()),
-                    model=model,
-                    choices=[CompletionChoice(text=delta, finish_reason=finish_reason)],
-                )
-                yield f"data: {json.dumps(chunk.model_dump())}\n\n"
-
-                if output.finished:
-                    # Terminal usage chunk (OpenAI stream_options.include_usage
-                    # shape): empty choices, authoritative counts from the engine.
-                    usage_chunk = CompletionResponse(
-                        id=request_id,
-                        created=int(time.time()),
-                        model=model,
-                        choices=[],
-                        usage=ResponseUsage(
-                            prompt_tokens=output.prompt_tokens,
-                            completion_tokens=output.completion_tokens,
-                            total_tokens=output.prompt_tokens + output.completion_tokens,
-                        ),
-                    )
-                    yield f"data: {json.dumps(usage_chunk.model_dump())}\n\n"
-
-                    profile_instant(
-                        "http.stream_completion.finished",
-                        cat="request",
-                        args={"request_id": request_id, "finish_reason": finish_reason},
-                    )
-                    yield "data: [DONE]\n\n"
-                    break
+        prompt, _, config, parser, constraint = self.prepare_chat(request)
+        if constraint is not None:
+            await self._preflight_constraint(constraint)
+        outputs = self.engine.add_request(
+            request_id, prompt, config, output_parser_spec=parser,
+            **({"constraint_spec": constraint} if constraint else {}),
+        )
+        return await output_response(
+            outputs, request_id, request.model or self.model_id, kind="chat", stream=request.stream,
+            parsed=parser is not None, parallel_tool_calls=request.parallel_tool_calls,
+        )
 
     def _completion_prompt(
         self,
@@ -419,108 +246,6 @@ class ServingServer:
         if not tokens or any(type(token) is not int or token < 0 for token in tokens):
             raise ValueError("Prompt token IDs must be nonempty non-negative integers.")
         return "", tokens
-
-    async def _stream_chat_completion(
-        self,
-        request_id: str,
-        prompt: str,
-        config: GenerateConfig,
-        model: str,
-        *,
-        output_parser_spec: OutputParserSpec | None = None,
-        constraint_spec: ConstraintSpec | None = None,
-        parallel_tool_calls: bool = True,
-    ):
-        # Once SSE headers have been sent, request-local parser failures must be
-        # reported in the stream. Cancellation still propagates to engine cleanup.
-        chunks = self._stream_chat_chunks(
-            request_id, prompt, config, model, output_parser_spec=output_parser_spec,
-            constraint_spec=constraint_spec,
-            parallel_tool_calls=parallel_tool_calls,
-        )
-        try:
-            async with contextlib.aclosing(chunks):
-                async for chunk in chunks:
-                    yield chunk
-        except ValueError as exc:
-            error = {"error": {"message": str(exc), "type": "invalid_model_output", "code": 400}}
-            yield f"data: {json.dumps(error)}\n\n"
-            yield "data: [DONE]\n\n"
-
-    async def _stream_chat_chunks(
-        self,
-        request_id: str,
-        prompt: str,
-        config: GenerateConfig,
-        model: str,
-        *,
-        output_parser_spec: OutputParserSpec | None,
-        constraint_spec: ConstraintSpec | None,
-        parallel_tool_calls: bool,
-    ):
-        with profile_span("http.stream_chat_completion", cat="request", args={"request_id": request_id}):
-            prev_text = ""
-            prev_reasoning = ""
-            outputs = self.engine.add_request(
-                request_id,
-                prompt,
-                config,
-                output_parser_spec=output_parser_spec,
-                **({"constraint_spec": constraint_spec} if constraint_spec else {}),
-            )
-            async with contextlib.aclosing(outputs):
-                async for output in outputs:
-                    if output_parser_spec is not None:
-                        delta = output.text_delta
-                        reasoning_delta = output.reasoning_delta
-                    else:
-                        delta = output.text[len(prev_text):] if output.text else ""
-                        prev_text = output.text or prev_text
-                        reasoning_delta = output.reasoning[len(prev_reasoning):] if output.reasoning else ""
-                        prev_reasoning = output.reasoning or prev_reasoning
-                    finish_reason = self._chat_finish_reason(output) if output.finished else None
-                    chunk = ChatCompletionResponse(
-                        id=request_id,
-                        object="chat.completion.chunk",
-                        created=int(time.time()),
-                        model=model,
-                        choices=[ChatCompletionChoice(
-                            delta=chat_delta(
-                                delta,
-                                reasoning_delta,
-                                output.tool_call_deltas,
-                                parallel_tool_calls=parallel_tool_calls,
-                            ),
-                            finish_reason=finish_reason,
-                        )],
-                    )
-                    yield f"data: {json.dumps(chunk.model_dump())}\n\n"
-
-                    if output.finished:
-                        usage_chunk = ChatCompletionResponse(
-                            id=request_id,
-                            object="chat.completion.chunk",
-                            created=int(time.time()),
-                            model=model,
-                            choices=[],
-                            usage=ResponseUsage(
-                                prompt_tokens=output.prompt_tokens,
-                                completion_tokens=output.completion_tokens,
-                                total_tokens=output.prompt_tokens + output.completion_tokens,
-                            ),
-                        )
-                        yield f"data: {json.dumps(usage_chunk.model_dump())}\n\n"
-                        profile_instant(
-                            "http.stream_chat.finished",
-                            cat="request",
-                            args={"request_id": request_id, "finish_reason": finish_reason},
-                        )
-                        yield "data: [DONE]\n\n"
-                        break
-
-    @staticmethod
-    def _chat_finish_reason(output: TokenOutput) -> str:
-        return chat_finish_reason(output)
 
     def _apply_chat_template(
         self,
@@ -588,15 +313,19 @@ class ServingServer:
             parallel_tool_calls=request.parallel_tool_calls,
         )
 
-    async def _preflight_constraint(self, spec: ConstraintSpec) -> None:
+    async def _preflight_constraint(
+        self, spec: ConstraintSpec, initial_token_ids: tuple[int, ...] = (),
+    ) -> None:
         """Reject unsupported schemas before an SSE response or worker batch starts."""
         async with self._constraint_preflight_lock:
             try:
-                await asyncio.to_thread(self._compile_constraint_for_preflight, spec)
+                await asyncio.to_thread(self._compile_constraint_for_preflight, spec, initial_token_ids)
             except (RuntimeError, ValueError) as exc:
                 raise ValueError(f"invalid tool constraint: {exc}") from exc
 
-    def _compile_constraint_for_preflight(self, spec: ConstraintSpec) -> None:
+    def _compile_constraint_for_preflight(
+        self, spec: ConstraintSpec, initial_token_ids: tuple[int, ...] = (),
+    ) -> None:
         if self._constraint_preflight_provider is None:
             model_vocab_size = int(read_model_config(self.engine.config.model_dir)["vocab_size"])
             self._constraint_preflight_provider = XGrammarProvider(
@@ -604,7 +333,11 @@ class ServingServer:
             )
         with profile_span("ServingServer.constraint_preflight", cat="constraints"):
             state = self._constraint_preflight_provider.compile(spec)
-        state.close()
+        try:
+            if initial_token_ids:
+                state.accept(initial_token_ids)
+        finally:
+            state.close()
 
     def _output_parser_spec(
         self,
@@ -629,10 +362,6 @@ class ServingServer:
             tool_choice="required" if tool_choice == "required" or isinstance(tool_choice, dict) else tool_choice,
             tool_names=tuple(tool.function.name for tool in request.tools or ()),
         )
-
-    @staticmethod
-    def _map_finish_reason(reason: str) -> str:
-        return map_finish_reason(reason)
 
 
 def create_serving_app(

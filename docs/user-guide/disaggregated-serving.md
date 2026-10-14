@@ -50,7 +50,6 @@ Optional runtime settings include:
 | --- | --- | --- |
 | `provider` | `mooncake` | Select the supported transfer implementation. |
 | `policy` | `round_robin` | Select compatible P/D nodes. |
-| `prefix_cache_mode` | `independent` | Enable separate P/D reuse by default; use `d_only` for Decode-only reuse or `disabled` to turn it off. |
 | `run_id` | Derived from the endpoints | Share an explicit deployment identity when needed. |
 | `enable_chunk_overlap` | `true` | Overlap closed-page transfer with later Prefill work. |
 
@@ -58,6 +57,12 @@ An endpoint can also specify `node_id`, `control_host`, `control_port` and
 `transfer_hostname`. The default control port is 29831. When the device RoCE
 address differs from the HTTP hostname, set `transfer_hostname` to the address
 required by Mooncake on that node.
+
+Prefix caching is enabled by default and follows each model node's ordinary
+`--enable-prefix-caching` / `--no-enable-prefix-caching` option. It is not a
+shared JSON setting: all four P/D combinations are valid. P hits reduce local
+computation; D hits independently reduce transferred bytes. Final request
+state is still transferred even when the KV prefix is a full hit.
 
 To configure multiple nodes, add endpoints to either array, give each one a
 unique `node_id`, and pass `--pd-node-id` to its model process. The Router
@@ -85,7 +90,7 @@ model_args=(
   --backend npu --platform a2a3
   --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
   --dp 4 --ep 16 --tp 4
-  --block-size 32 --max-model-len 293888
+  --block-size 32 --max-model-len 655360
   --max-num-seqs 8 --max-num-batched-tokens 8192
   --long-prefill-token-threshold 128
   --generate-config '{"max_new_tokens":131072}'
@@ -116,9 +121,11 @@ After both nodes report healthy, start the CPU-only Router in its own process:
 pypto-pd-router --pd-config examples/pd/config.json --host 0.0.0.0 --port 8110
 ```
 
-The shared prefix-cache mode is authoritative for PD nodes; a separate
-`--enable-prefix-caching` flag does not override it. To run ordinary combined
-Prefill/Decode serving, omit the PD options and use the normal model command.
+Each model process uses its own ordinary prefix-caching option; no shared
+cache-mode field is needed. The example context capacity includes a 512k-token
+prompt and 128k-token generation budget; it is not a maximum-length validation
+claim. To run ordinary combined Prefill/Decode serving, omit the PD options
+and use the normal model command.
 
 ## Send Requests and Inspect State
 
@@ -130,33 +137,56 @@ curl http://router.example.internal:8110/v1/chat/completions \
   -d '{"model":"dsv4-flash-dspark-w8a8","messages":[{"role":"user","content":"Describe the Forbidden City."}],"max_tokens":128,"temperature":0.0,"stream":true}'
 ```
 
-`/v1/completions` is also supported. P/D nodes expose internal control APIs
-instead of public generation endpoints.
+`/v1/completions` is also supported. Router sends the original request to
+both nodes in parallel through the same completion/chat endpoints. It adds
+one typed `pd_transfer` context containing the request/attempt identity and
+assigned peers. Clients do not supply this field. A PD node rejects requests
+without it; it does not silently run combined Prefill/Decode.
+
+P uses Serving's normal preparation, tokenization and constraint preflight
+once. Normalized tokens, parser/constraint specifications and prefix-match
+metadata travel to D over the existing node control session. D pairs them
+with its HTTP request, reserves cache and returns writable placement to P.
+Physical blocks, reservations and native memory addresses never pass through
+Router. The original output budget is preserved; P does not rewrite
+`max_tokens` to one. D does not template or tokenize the request again.
 
 For DeepSeek V4, the Router accepts `tools`, `tool_choice`,
 `parallel_tool_calls`, and assistant/tool history. Structured tool-call deltas
 and final calls travel from D to the Router alongside text and reasoning.
 Strict `auto`, `required`, and a named function choice are also supported.
 These requests require matching Serving/Lib grammar ABIs and XGrammar on both
-model nodes. Ordinary non-strict `auto` remains unconstrained. The Router
-performs the one-time P preparation and constraint preflight before returning
-SSE headers, so invalid schemas detected during preparation return HTTP 400.
-Failures during subsequent reservation, transfer, Decode or parsing occur
-after that boundary and cannot change an already-started HTTP response.
+model nodes. Ordinary non-strict `auto` remains unconstrained.
+P prepares each generation attempt once, including constraint preflight.
+D returns HTTP headers only after accepting that normalized continuation and
+reserving its cache. Router can then establish SSE without waiting for P's
+source-pin cleanup, and supervises P's confirmation alongside D's output.
+Preparation failures remain HTTP errors. Execution or parser failures after
+headers are reported in the stream. Handoff admission and terminal publication
+still require P's matching READY result; a client disconnect is not a native
+retirement proof.
 
-The current default P/D Prefix Cache configuration has been device-validated
-with completion/chat, streaming and non-streaming output, constrained tools,
-tool history, cancellation, cold/hot prefix reuse and mixed requests. This is
-a functional check, not a claim of identical token sequences between repeated
-inferences or validation of every deployment combination and maximum length.
+Protocol version 12 has device coverage for completion/chat, constrained tools,
+cancellation and cold/hot reuse with all four independent P/D prefix-cache
+settings. The parallel source/output boundary is covered by cancellation after
+the first public output, concurrent requests and recovery of normal admission.
+Rank/component completion and commit ordering are audited separately from
+public responses; these checks are not device-byte checksums or a complete
+native fault-injection matrix.
+This is not a claim of identical token sequences between repeated inferences
+or validation of every topology and maximum length. Router and
+nodes must use the same protocol; older nodes are explicitly rejected.
 The Router finalizes handoff state and cleanup before publishing the terminal
 output; intermediate outputs continue to stream immediately.
 
-Decode sends only content/reasoning/tool-call deltas in intermediate frames.
-The terminal frame retains the complete text, reasoning, calls and token IDs
-needed by non-streaming responses and recovery. Completion deltas include the
-final detokenization flush; already-published text cannot be rewritten. A
-non-streaming request carries its final summary without duplicate deltas.
+Decode uses the same JSON/SSE formatter as ordinary Serving. Router forwards
+that public response without a second model parser or response formatter.
+SSE frames carry content/reasoning/tool-call deltas followed by finish, usage
+and `[DONE]`; they do not carry cumulative text or token histories.
+Non-streaming JSON contains the full answer and preserves the optional token
+digest header. Completion deltas include the final detokenization flush;
+already-published text cannot be rewritten. There is no private NDJSON path
+or compatibility mode for the previous five-stage HTTP generation protocol.
 Execution and connection errors after SSE headers produce an explicit error
 event followed by `[DONE]`; client cancellation still propagates to cleanup
 and is not converted into a successful terminal response.
@@ -164,10 +194,13 @@ and is not converted into a successful terminal response.
 | Endpoint | Process | Contents |
 | --- | --- | --- |
 | `/health` | Router, P, D | Readiness and recovery gate. |
+| `/v1/models` | Router, P, D | Served model identity. |
+| `/internal/pd/descriptor` | P, D | Node identity, protocol and model/provider contract. |
 | `/metrics` | Router | Request outcomes and routing metrics. |
 | `/recovery` | Router | Recovery state and generation. |
 | `/internal/pd/metrics` | P, D | Prefix hits, transfer progress and request cleanup. |
 | `/internal/pd/capacity` | P, D | Active requests, reservations and quarantined allocations. |
+| `/internal/pd/query`, `/internal/pd/abort` | P, D | Correlated status and safe cancellation; not generation stages. |
 
 Default logs and state live under
 `serving_log/pd_disag/<run_id>/<role>/`, relative to the launch directory.
@@ -279,12 +312,16 @@ pypto_serving/
 │   ├── contracts.py          # Model and runtime layout contracts
 │   ├── service.py            # Prefill/Decode control flow
 │   ├── worker.py             # Owner registration, transfer jobs and cleanup
-│   ├── http_api.py           # Node control contracts and route installation
+│   ├── http_api.py           # Standard generation routes and operational API
+│   ├── generation.py         # Typed context and original-request binding
+│   ├── protocol.py           # Transport-neutral identity/normalized handoff
 │   ├── handoff.py            # Node-local handoff records
 │   ├── connector.py          # Decode reservation and commit
 │   ├── planner.py            # Chunk/suffix transfer plans
 │   └── observability.py      # Startup logs and metrics
 ├── transfer/                 # Backend contract, Mooncake and owner-local memory
+├── serving/server/
+│   └── responses.py          # Shared normal token-output JSON/SSE formatter
 ├── serving/memory/
 │   └── reservation.py        # Allocator-owned external-fill cache leases
 └── model/deepseek_dspark/

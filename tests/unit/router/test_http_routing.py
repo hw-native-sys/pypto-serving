@@ -15,7 +15,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import multiprocessing
 import queue
-import time
 
 from pypto_serving.router.client import NodeClient
 from pypto_serving.router.config import RouterConfig
@@ -24,26 +23,11 @@ from pypto_serving.router.directory import WorkerDirectory
 from pypto_serving.router.journal import RouterJournal
 from pypto_serving.router.policy import RoundRobinRoutePolicy
 from pypto_serving.serving.pd.config import PDCapabilities, PDRole
-from pypto_serving.serving.pd.http_api import (
-    CapacitySnapshot,
-    DecodeStreamFrame,
-    ExecutePrefillHTTP,
-    HandoffHTTP,
-    NodeDescriptor,
-    PlacementReservation,
-    PrefillHandoffResult,
-    PrepareRequestHTTP,
-    PreparedRequest,
-    ReservePlacementHTTP,
-    ReservePlacementResult,
-    decode_json,
-    encode_json,
-)
-from pypto_serving.serving.pd.protocol import (
-    CapabilityWire,
-    ContinuationMetadata,
-    DecodeOutputWire,
-)
+from pypto_serving.serving.pd.http_api import encode_json
+from pypto_serving.serving.pd.protocol import CapacitySnapshot, NodeDescriptor
+from pypto_serving.serving.pd.generation import parse_generation
+from pypto_serving.serving.pd.protocol import CapabilityWire, PrefillResult
+import msgspec
 
 
 def _capabilities(node_id: str) -> CapabilityWire:
@@ -106,7 +90,7 @@ def _serve_fake_node(node_id, role_value, ready, calls, stop) -> None:
                         node_id=node_id,
                         role=role.value,
                         active_handoffs=0,
-                        prepared_requests=0,
+                        pending_requests=0,
                         reservations=0,
                         quarantined_reservations=0,
                         snapshot_sequence=1,
@@ -119,95 +103,25 @@ def _serve_fake_node(node_id, role_value, ready, calls, stop) -> None:
         def do_POST(self) -> None:  # noqa: N802
             body = self._body()
             port = self.server.server_address[1]
-            if self.path == "/internal/pd/prepare":
-                request = decode_json(body, PrepareRequestHTTP)
-                calls.put((request.request_id, "prefill", node_id))
-                self._send(
-                    PreparedRequest(
-                        request_id=request.request_id,
-                        prepared_request_id=f"{node_id}-{request.request_id}",
-                        prepared_digest="c" * 64,
-                        continuation=ContinuationMetadata(
-                            prompt_token_ids=(1, 2, 3),
-                            max_new_tokens=1,
-                            temperature=0.0,
-                            top_p=1.0,
-                            top_k=None,
-                            seed=None,
-                            stop_strings=(),
-                            eos_token_id=None,
-                        ),
-                        expires_at_ns=time.time_ns() + 10_000_000_000,
-                    )
-                )
-                return
-            if self.path == "/internal/pd/reserve":
-                request = decode_json(body, ReservePlacementHTTP)
-                calls.put((request.key.request_id, "decode", node_id))
-                self._send(
-                    ReservePlacementResult(
-                        reservation=PlacementReservation(
-                            key=request.key,
-                            prepared_request_id=request.prepared_request_id,
-                            reservation_id=f"{node_id}-{request.key.handoff_id}",
-                            partition=0,
-                            block_ids_by_group={"kv": (1,)},
-                            prepared_digest=request.prepared_digest,
-                            reservation_capability="fake-capability",
-                            decode_node_id=node_id,
-                            decode_control_host="127.0.0.1",
-                            decode_control_port=port,
-                            decode_endpoint_generation=1,
-                        )
-                    )
-                )
-                return
-            if self.path == "/internal/pd/authorize":
-                self._send({"status": "authorized"})
-                return
-            if self.path == "/internal/pd/execute":
-                request = decode_json(body, ExecutePrefillHTTP)
-                self._send(
-                    PrefillHandoffResult(
-                        key=request.key,
-                        reservation_id=request.reservation_id,
-                        manifest_hash="d" * 64,
-                        state="READY",
-                    )
-                )
-                return
-            if self.path == "/internal/pd/await-decode":
-                request = decode_json(body, HandoffHTTP)
-                frames = (
-                    DecodeStreamFrame(event="waiting", state="AUTHORIZED"),
-                    DecodeStreamFrame(
-                        event="finished",
-                        state="COMPLETED",
-                        output=DecodeOutputWire(
-                            key=request.key,
-                            token_id=101,
-                            text="ok",
-                            finished=True,
-                            finish_reason="FINISHED_LENGTH",
-                            prompt_tokens=3,
-                            completion_tokens=1,
-                            token_ids=(101,),
-                            output_sequence=1,
-                            text_delta="ok",
-                        ),
-                    ),
-                )
-                self.send_response(200)
-                self.send_header("content-type", "application/x-ndjson")
-                self.end_headers()
-                for frame in frames:
-                    self.wfile.write(encode_json(frame) + b"\n")
-                    self.wfile.flush()
-                return
-            if self.path in ("/internal/pd/abort", "/internal/pd/query"):
-                self._send({"status": "ok"})
+            if self.path in ("/v1/completions", "/v1/chat/completions"):
+                public, context = parse_generation(body, "chat" if "chat" in self.path else "completion")
+                calls.put((context.key.request_id, role.value, node_id))
+                if role is PDRole.PREFILL:
+                    self._send({
+                        "id": context.key.request_id, "choices": [],
+                        "pd_transfer": msgspec.to_builtins(PrefillResult(
+                            context.key, context.request_fingerprint, "READY",
+                        )),
+                    })
+                else:
+                    self._send({
+                        "id": context.key.request_id, "object": "text_completion",
+                        "choices": [{"text": node_id, "finish_reason": "length"}],
+                        "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+                    })
                 return
             self.send_error(404)
+
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.timeout = 0.1
@@ -283,7 +197,7 @@ def test_two_prefill_three_decode_processes_use_formal_http_and_journal(
                         f"request-{index}",
                     )
                 ]
-                assert outputs[-1].finished
+                assert json.loads(outputs[-1].body)["choices"][0]["finish_reason"] == "length"
 
         asyncio.run(exercise())
 
@@ -302,7 +216,7 @@ def test_two_prefill_three_decode_processes_use_formal_http_and_journal(
         with open(journal.path, encoding="utf-8") as stream:
             records = [json.loads(line) for line in stream]
         bindings = [
-            record for record in records if record["event"] == "HANDOFF_RESERVED"
+            record for record in records if record["event"] == "HANDOFF_CREATED"
         ]
         assert [record["prefill_node_id"] for record in bindings] == [
             "p1", "p2", "p1", "p2", "p1", "p2"
