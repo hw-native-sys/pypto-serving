@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import TokenOutput
-from pypto_serving.serving.reasoning import OutputParserSpec
+from pypto_serving.observability.tokens import token_ids_sha256
 from pypto_serving.serving.server.server import (
     ChatCompletionRequest,
     ChatMessage,
@@ -141,14 +141,11 @@ def test_stream_completion_terminal_usage_chunk():
     ]
     server = _make_server(outputs)
 
-    from pypto_serving.config.types import GenerateConfig
     async def collect():
-        chunks = []
-        async for data in server._stream_completion(
-            "req-0", "hello prompt here go", GenerateConfig(max_new_tokens=3), "test-model"
-        ):
-            chunks.append(data)
-        return chunks
+        response = await server._completions(CompletionRequest(
+            model="test-model", prompt="hello prompt here go", max_tokens=3, stream=True,
+        ))
+        return [data async for data in response.body_iterator]
 
     raw = b"".join(c.encode() for c in asyncio.run(collect()))
     parsed = _parse_sse(raw)
@@ -184,6 +181,33 @@ def test_http_eos_uses_standard_stop_finish_reason(stream, chat):
     assert response.status_code == 200
     choices = _parse_sse(response.content) if stream else [response.json()]
     assert [item["choices"][0]["finish_reason"] for item in choices if item["choices"]][-1] == "stop"
+
+
+def test_completion_accepts_exact_prompt_token_ids() -> None:
+    engine = _FakeEngine(
+        [
+            TokenOutput(
+                text="ok",
+                token_ids=(77,),
+                finished=True,
+                finish_reason="FINISHED_LENGTH",
+                prompt_tokens=4,
+                completion_tokens=1,
+            )
+        ]
+    )
+    server = ServingServer(
+        async_engine=engine,
+        model_id="test-model",
+        generate_config=GenerateConfig(max_new_tokens=1),
+    )
+    response = asyncio.run(
+        server._completions(CompletionRequest(prompt=[100, 100, 100, 100]))
+    )
+    assert response.status_code == 200
+    assert engine.calls[0][1] == ""
+    assert engine.calls[0][2]["prompt_token_ids"] == (100, 100, 100, 100)
+    assert response.headers["x-pypto-token-ids-sha256"] == token_ids_sha256((77,))
 
 
 def test_chat_serializes_reasoning_and_freezes_parser_spec() -> None:
@@ -240,22 +264,18 @@ def test_chat_stream_emits_independent_reasoning_and_content_deltas() -> None:
             ),
         ]
     )
+    class DeepSeekTokenizer(_FakeEngine._FakeTokenizer):
+        output_parser_id = "deepseek_v4"
+
+    engine.tokenizer = DeepSeekTokenizer()
     server = ServingServer(engine, "test-model", GenerateConfig())
 
     async def collect():
-        return [
-            chunk
-            async for chunk in server._stream_chat_completion(
-                "chat-0",
-                "prompt",
-                GenerateConfig(stream=True),
-                "test-model",
-                output_parser_spec=OutputParserSpec(
-                    "deepseek_v4",
-                    "reasoning",
-                ),
-            )
-        ]
+        response = await server._chat_completions(ChatCompletionRequest(
+            messages=[ChatMessage(role="user", content="prompt")], stream=True,
+            chat_template_kwargs={"enable_thinking": True},
+        ))
+        return [chunk async for chunk in response.body_iterator]
 
     parsed = _parse_sse(b"".join(chunk.encode() for chunk in asyncio.run(collect())))
     deltas = [chunk["choices"][0]["delta"] for chunk in parsed if chunk["choices"]]

@@ -7,3 +7,11 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """Model loading and model-family integrations."""
+
+
+def builtin_pd_adapter_registry():
+    """Load built-in model contracts only when PD is explicitly selected."""
+    from pypto_serving.model.deepseek_dspark.pd_adapter import BUILTIN_PD_ADAPTERS
+    from pypto_serving.serving.pd.adapter import ModelPDAdapterRegistry
+
+    return ModelPDAdapterRegistry(BUILTIN_PD_ADAPTERS)

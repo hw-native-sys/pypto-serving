@@ -112,3 +112,28 @@ def test_preflight_rejects_invalid_schema_before_worker_registration(monkeypatch
     with pytest.raises(ValueError, match="invalid tool constraint: unsupported schema"):
         asyncio.run(server._preflight_constraint(spec))
     assert calls == [(server.engine.tokenizer, 129280)]
+
+
+@pytest.mark.parametrize("token_ids", [(), (101,), (999,)])
+def test_preflight_validates_initial_tokens_and_always_closes_state(monkeypatch, token_ids):
+    server = _server(monkeypatch)
+    request = _request(tool_choice="required")
+    spec = server._constraint_spec(request, server._output_parser_spec(request))
+    events = []
+
+    class State:
+        def accept(self, tokens):
+            events.append(("accept", tokens))
+            if tokens == (999,):
+                raise ValueError("invalid seed")
+
+        def close(self):
+            events.append(("close",))
+
+    server._constraint_preflight_provider = SimpleNamespace(compile=lambda _: State())
+    if token_ids == (999,):
+        with pytest.raises(ValueError, match="invalid seed"):
+            asyncio.run(server._preflight_constraint(spec, token_ids))
+    else:
+        asyncio.run(server._preflight_constraint(spec, token_ids))
+    assert events == ([("accept", token_ids)] if token_ids else []) + [("close",)]

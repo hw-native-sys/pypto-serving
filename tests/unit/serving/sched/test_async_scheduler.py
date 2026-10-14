@@ -905,6 +905,28 @@ def test_grouped_cache_preemption_removes_victim_from_running_queue():
     assert [request.request_id for request in scheduler.waiting] == ["newer"]
 
 
+@pytest.mark.parametrize("victim_partition,victim_arrival", [(0, 1.0), (1, 3.0)])
+def test_grouped_pressure_does_not_preempt_older_or_unrelated_partition(victim_partition, victim_arrival):
+    manager = KvCacheManager(block_size=1, enable_prefix_cache=False)
+    manager.init_groups((KVCacheGroupSpec(
+        name="test", layer_indices=(0,), spec=KVCacheSpec(block_size=1, page_size_bytes=1),
+        max_blocks_per_seq=3, num_blocks=3, num_partitions=2,
+    ),), max_batch_size=2)
+    scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=False), manager)
+    victim = Request("resident", [1], 2, arrival_time=victim_arrival, status=RequestStatus.RUNNING)
+    exclude = Request("blocked", [2], 2, arrival_time=2.0, status=RequestStatus.RUNNING)
+    for request, partition in ((victim, victim_partition), (exclude, 0)):
+        request.allocated_group_block_ids = manager.ensure_group_blocks(request.request_id, 1, partition=partition)
+        request.cache_partition = partition
+        scheduler.requests[request.request_id] = request
+    scheduler.running = [victim, exclude]
+    before = dict(victim.allocated_group_block_ids)
+    assert scheduler._preempt_lowest_priority(exclude, set(), {}, SchedulerOutput()) is None
+    assert victim.status is RequestStatus.RUNNING
+    assert victim.allocated_group_block_ids == before
+    assert not scheduler.waiting
+
+
 def test_constrained_request_is_not_recomputed_without_grammar_replay():
     manager = KvCacheManager(num_blocks=4, block_size=1, enable_prefix_cache=False)
     scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=False), manager)

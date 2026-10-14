@@ -10,25 +10,19 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import dataclasses
 import importlib.util
-import json
 import logging
-import time
 import uuid
-from typing import Literal
-
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.model.model_family import read_model_config
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.constraints.provider import XGrammarProvider
-from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput
-from pypto_serving.serving.reasoning import OutputParserSpec, ToolCallDelta, supports_tool_calls
+from pypto_serving.serving.engine.async_engine import AsyncLLMEngine
+from pypto_serving.serving.reasoning import OutputParserSpec, supports_tool_calls
 from pypto_serving.tools.profile import (
     get_profiler,
     merge_profile,
-    profile_instant,
     profile_span,
     start_profile as start_sa_profile,
     stop_profile as stop_sa_profile,
@@ -36,148 +30,28 @@ from pypto_serving.tools.profile import (
 
 logger = logging.getLogger(__name__)
 
-ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
-
 try:
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse, Response, StreamingResponse
-    from pydantic import BaseModel, Field, model_serializer
+    from .api_types import (
+        ChatCompletionRequest,
+        ChatDelta as ChatDelta,
+        ChatMessage,
+        ChatTool,
+        CompletionRequest,
+        DeltaFunctionCall as DeltaFunctionCall,
+        DeltaToolCall as DeltaToolCall,
+        FunctionCall as FunctionCall,
+        FunctionDefinition as FunctionDefinition,
+        ReasoningEffort as ReasoningEffort,
+        ToolCall as ToolCall,
+        validate_chat_request,
+    )
+    from .responses import output_response
 except ImportError as e:
     raise ImportError(
         "Serving requires fastapi and pydantic. Install with: pip install fastapi uvicorn sse-starlette pydantic"
     ) from e
-
-
-# --- Request/Response Models ---
-
-class CompletionRequest(BaseModel):
-    model: str = ""
-    prompt: str = ""
-    # Sampling fields are optional: omitted fields fall back to the server's
-    # default GenerateConfig (from --generate-config, else GenerateConfig()).
-    max_tokens: int | None = None
-    temperature: float | None = None
-    top_p: float | None = None
-    top_k: int | None = None
-    seed: int | None = None
-    stop: list[str] | None = None
-    stream: bool = False
-
-
-class FunctionDefinition(BaseModel):
-    name: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
-    description: str | None = None
-    parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}})
-    strict: bool | None = None
-
-
-class ChatTool(BaseModel):
-    type: Literal["function"] = "function"
-    function: FunctionDefinition
-
-
-class FunctionCall(BaseModel):
-    name: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
-    arguments: str
-
-
-class ToolCall(BaseModel):
-    id: str = Field(min_length=1)
-    type: Literal["function"] = "function"
-    function: FunctionCall
-
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str | None = None
-    reasoning: str | None = None
-    tool_calls: list[ToolCall] | None = None
-    tool_call_id: str | None = None
-
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        data = handler(self)
-        for key in ("tool_calls", "tool_call_id"):
-            if not data.get(key):
-                data.pop(key, None)
-        return data
-
-
-class DeltaFunctionCall(BaseModel):
-    name: str | None = None
-    arguments: str | None = None
-
-
-class DeltaToolCall(BaseModel):
-    index: int
-    id: str | None = None
-    type: Literal["function"] | None = None
-    function: DeltaFunctionCall
-
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        data = {key: value for key, value in handler(self).items() if value is not None}
-        data["function"] = {key: value for key, value in data["function"].items() if value is not None}
-        return data
-
-
-class ChatDelta(ChatMessage):
-    tool_calls: list[DeltaToolCall] | None = None
-
-
-class ChatCompletionRequest(BaseModel):
-    model: str = ""
-    messages: list[ChatMessage]
-    max_tokens: int | None = None
-    temperature: float | None = None
-    top_p: float | None = None
-    top_k: int | None = None
-    seed: int | None = None
-    stop: list[str] | None = None
-    stream: bool = False
-    reasoning_effort: ReasoningEffort | None = None
-    chat_template_kwargs: dict | None = None
-    include_reasoning: bool = True
-    tools: list[ChatTool] | None = None
-    tool_choice: str | dict | None = None
-    parallel_tool_calls: bool = True
-
-
-class CompletionChoice(BaseModel):
-    index: int = 0
-    text: str = ""
-    finish_reason: str | None = None
-
-
-class ResponseUsage(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-
-
-class CompletionResponse(BaseModel):
-    id: str
-    object: str = "text_completion"
-    created: int
-    model: str
-    choices: list[CompletionChoice]
-    usage: ResponseUsage | None = None
-
-
-class ChatCompletionChoice(BaseModel):
-    index: int = 0
-    message: ChatMessage | None = None
-    delta: ChatDelta | None = None
-    finish_reason: str | None = None
-
-
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: str = "chat.completion"
-    created: int
-    model: str
-    choices: list[ChatCompletionChoice]
-    usage: ResponseUsage | None = None
 
 
 # --- Server ---
@@ -188,6 +62,8 @@ class ServingServer:
         async_engine: AsyncLLMEngine,
         model_id: str,
         generate_config: GenerateConfig,
+        *,
+        route_factory=None,
     ) -> None:
         self.engine = async_engine
         self.model_id = model_id
@@ -199,7 +75,10 @@ class ServingServer:
         self._constraint_preflight_lock = asyncio.Lock()
         self._constraint_preflight_provider: XGrammarProvider | None = None
         self._register_exception_handlers()
-        self._register_routes()
+        if route_factory is None:
+            self._register_routes()
+        else:
+            route_factory(self)
 
     def _register_exception_handlers(self) -> None:
         # Surface scheduler/engine rejections (e.g. a prompt longer than
@@ -220,8 +99,8 @@ class ServingServer:
             self.app.add_api_route("/metrics", self._metrics, methods=["GET"])
             self.app.add_api_route("/metrics/json", self._metrics_json, methods=["GET"])
         if get_profiler(initially_active=False).enabled:
-            self.app.add_api_route("/start_profile", self._start_profile, methods=["POST"])
-            self.app.add_api_route("/stop_profile", self._stop_profile, methods=["POST"])
+            self.app.add_api_route("/start_profile", self.start_profile, methods=["POST"])
+            self.app.add_api_route("/stop_profile", self.stop_profile, methods=["POST"])
 
     async def _health(self) -> JSONResponse:
         return JSONResponse({"status": "ok"})
@@ -241,7 +120,7 @@ class ServingServer:
     async def _metrics_json(self) -> JSONResponse:
         return JSONResponse(self.engine.metrics.snapshot())
 
-    async def _start_profile(self) -> Response:
+    async def start_profile(self) -> Response:
         async with self._profile_lock:
             logger.info("Starting SA profiler...")
             main_started = start_sa_profile()
@@ -254,7 +133,7 @@ class ServingServer:
             logger.info("SA profiler started")
         return Response(status_code=200)
 
-    async def _stop_profile(self) -> Response:
+    async def stop_profile(self) -> Response:
         async with self._profile_lock:
             logger.info("Stopping SA profiler...")
             stop_error = None
@@ -307,50 +186,16 @@ class ServingServer:
             stream=request.stream if "stream" in provided else defaults.stream,
         )
 
-    async def _completions(self, request: CompletionRequest) -> StreamingResponse | JSONResponse:
-        request_id = f"cmpl-{uuid.uuid4().hex[:8]}"
+    def prepare_completion(self, request: CompletionRequest):
+        """Prepare public completion semantics without starting generation."""
+        prompt, tokens = self._completion_prompt(request.prompt)
         config = dataclasses.replace(self._resolve_generate_config(request), ignore_eos=True)
+        return prompt, tokens, config, None
 
-        with profile_span(
-            "http.completions",
-            cat="request",
-            args={"request_id": request_id, "max_tokens": config.max_new_tokens, "stream": request.stream},
-        ):
-            if request.stream:
-                return StreamingResponse(
-                    self._stream_completion(request_id, request.prompt, config, request.model or self.model_id),
-                    media_type="text/event-stream",
-                )
-
-            full_text = ""
-            finish_reason = ""
-            usage = None
-            async for output in self.engine.add_request(request_id, request.prompt, config):
-                if output.text:
-                    full_text = output.text
-                if output.finished:
-                    finish_reason = self._map_finish_reason(output.finish_reason)
-                    usage = ResponseUsage(
-                        prompt_tokens=output.prompt_tokens,
-                        completion_tokens=output.completion_tokens,
-                        total_tokens=output.prompt_tokens + output.completion_tokens,
-                    )
-
-            response = CompletionResponse(
-                id=request_id,
-                created=int(time.time()),
-                model=request.model or self.model_id,
-                choices=[CompletionChoice(text=full_text, finish_reason=finish_reason)],
-                usage=usage,
-            )
-            return JSONResponse(response.model_dump())
-
-    async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
-        request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    def prepare_chat(self, request: ChatCompletionRequest):
+        """Share chat templating, defaults and parser selection across entry points."""
         output_parser_spec = self._output_parser_spec(request)
         constraint_spec = self._constraint_spec(request, output_parser_spec)
-        if constraint_spec is not None:
-            await self._preflight_constraint(constraint_spec)
         prompt = self._apply_chat_template(
             request.messages,
             request.chat_template_kwargs,
@@ -364,232 +209,43 @@ class ServingServer:
             self._resolve_generate_config(request),
             ignore_eos=self.generate_config.ignore_eos,
         )
+        return prompt, None, config, output_parser_spec, constraint_spec
 
-        with profile_span(
-            "http.chat_completions",
-            cat="request",
-            args={"request_id": request_id, "max_tokens": config.max_new_tokens, "stream": request.stream},
-        ):
-            if request.stream:
-                return StreamingResponse(
-                    self._stream_chat_completion(
-                        request_id,
-                        prompt,
-                        config,
-                        request.model or self.model_id,
-                        output_parser_spec=output_parser_spec,
-                        constraint_spec=constraint_spec,
-                        parallel_tool_calls=request.parallel_tool_calls,
-                    ),
-                    media_type="text/event-stream",
-                )
+    def resolve_prompt_tokens(self, prompt, tokens):
+        return self.engine.resolve_prompt_tokens(prompt, tokens)
 
-            full_text = ""
-            full_reasoning = ""
-            tool_calls = ()
-            finish_reason = ""
-            usage = None
-            async for output in self.engine.add_request(
-                request_id,
-                prompt,
-                config,
-                output_parser_spec=output_parser_spec,
-                **({"constraint_spec": constraint_spec} if constraint_spec else {}),
-            ):
-                if output.text:
-                    full_text = output.text
-                if output.reasoning:
-                    full_reasoning = output.reasoning
-                if output.finished:
-                    finish_reason = self._chat_finish_reason(output)
-                    tool_calls = output.tool_calls if request.parallel_tool_calls else output.tool_calls[:1]
-                    usage = ResponseUsage(
-                        prompt_tokens=output.prompt_tokens,
-                        completion_tokens=output.completion_tokens,
-                        total_tokens=output.prompt_tokens + output.completion_tokens,
-                    )
-
-            response = ChatCompletionResponse(
-                id=request_id,
-                object="chat.completion",
-                created=int(time.time()),
-                model=request.model or self.model_id,
-                choices=[ChatCompletionChoice(
-                    message=ChatMessage(
-                        role="assistant",
-                        content=full_text or (None if tool_calls else ""),
-                        reasoning=full_reasoning or None,
-                        tool_calls=[
-                            ToolCall(id=call.id, function=FunctionCall(name=call.name, arguments=call.arguments))
-                            for call in tool_calls
-                        ] or None,
-                    ),
-                    finish_reason=finish_reason,
-                )],
-                usage=usage,
-            )
-            return JSONResponse(response.model_dump())
-
-    async def _stream_completion(
-        self, request_id: str, prompt: str, config: GenerateConfig, model: str
-    ):
-        with profile_span("http.stream_completion", cat="request", args={"request_id": request_id}):
-            prev_text = ""
-            async for output in self.engine.add_request(request_id, prompt, config):
-                delta = output.text[len(prev_text):] if output.text else ""
-                prev_text = output.text or prev_text
-                finish_reason = self._map_finish_reason(output.finish_reason) if output.finished else None
-
-                chunk = CompletionResponse(
-                    id=request_id,
-                    created=int(time.time()),
-                    model=model,
-                    choices=[CompletionChoice(text=delta, finish_reason=finish_reason)],
-                )
-                yield f"data: {json.dumps(chunk.model_dump())}\n\n"
-
-                if output.finished:
-                    # Terminal usage chunk (OpenAI stream_options.include_usage
-                    # shape): empty choices, authoritative counts from the engine.
-                    usage_chunk = CompletionResponse(
-                        id=request_id,
-                        created=int(time.time()),
-                        model=model,
-                        choices=[],
-                        usage=ResponseUsage(
-                            prompt_tokens=output.prompt_tokens,
-                            completion_tokens=output.completion_tokens,
-                            total_tokens=output.prompt_tokens + output.completion_tokens,
-                        ),
-                    )
-                    yield f"data: {json.dumps(usage_chunk.model_dump())}\n\n"
-
-                    profile_instant(
-                        "http.stream_completion.finished",
-                        cat="request",
-                        args={"request_id": request_id, "finish_reason": finish_reason},
-                    )
-                    yield "data: [DONE]\n\n"
-                    break
-
-    async def _stream_chat_completion(
-        self,
-        request_id: str,
-        prompt: str,
-        config: GenerateConfig,
-        model: str,
-        *,
-        output_parser_spec: OutputParserSpec | None = None,
-        constraint_spec: ConstraintSpec | None = None,
-        parallel_tool_calls: bool = True,
-    ):
-        # Once SSE headers have been sent, request-local parser failures must be
-        # reported in the stream. Cancellation still propagates to engine cleanup.
-        chunks = self._stream_chat_chunks(
-            request_id, prompt, config, model, output_parser_spec=output_parser_spec,
-            constraint_spec=constraint_spec,
-            parallel_tool_calls=parallel_tool_calls,
-        )
-        try:
-            async with contextlib.aclosing(chunks):
-                async for chunk in chunks:
-                    yield chunk
-        except ValueError as exc:
-            error = {"error": {"message": str(exc), "type": "invalid_model_output", "code": 400}}
-            yield f"data: {json.dumps(error)}\n\n"
-            yield "data: [DONE]\n\n"
-
-    async def _stream_chat_chunks(
-        self,
-        request_id: str,
-        prompt: str,
-        config: GenerateConfig,
-        model: str,
-        *,
-        output_parser_spec: OutputParserSpec | None,
-        constraint_spec: ConstraintSpec | None,
-        parallel_tool_calls: bool,
-    ):
-        with profile_span("http.stream_chat_completion", cat="request", args={"request_id": request_id}):
-            prev_text = ""
-            prev_reasoning = ""
-            outputs = self.engine.add_request(
-                request_id,
-                prompt,
-                config,
-                output_parser_spec=output_parser_spec,
-                **({"constraint_spec": constraint_spec} if constraint_spec else {}),
-            )
-            async with contextlib.aclosing(outputs):
-                async for output in outputs:
-                    if output_parser_spec is not None:
-                        delta = output.text_delta
-                        reasoning_delta = output.reasoning_delta
-                    else:
-                        delta = output.text[len(prev_text):] if output.text else ""
-                        prev_text = output.text or prev_text
-                        reasoning_delta = output.reasoning[len(prev_reasoning):] if output.reasoning else ""
-                        prev_reasoning = output.reasoning or prev_reasoning
-                    finish_reason = self._chat_finish_reason(output) if output.finished else None
-                    tool_deltas = [
-                        self._tool_delta(item) for item in output.tool_call_deltas
-                        if parallel_tool_calls or item.index == 0
-                    ]
-
-                    chunk = ChatCompletionResponse(
-                        id=request_id,
-                        object="chat.completion.chunk",
-                        created=int(time.time()),
-                        model=model,
-                        choices=[ChatCompletionChoice(
-                            delta=ChatDelta(
-                                role="assistant",
-                                content=delta or (None if tool_deltas else ""),
-                                reasoning=reasoning_delta or None,
-                                tool_calls=tool_deltas or None,
-                            ),
-                            finish_reason=finish_reason,
-                        )],
-                    )
-                    yield f"data: {json.dumps(chunk.model_dump())}\n\n"
-
-                    if output.finished:
-                        usage_chunk = ChatCompletionResponse(
-                            id=request_id,
-                            object="chat.completion.chunk",
-                            created=int(time.time()),
-                            model=model,
-                            choices=[],
-                            usage=ResponseUsage(
-                                prompt_tokens=output.prompt_tokens,
-                                completion_tokens=output.completion_tokens,
-                                total_tokens=output.prompt_tokens + output.completion_tokens,
-                            ),
-                        )
-                        yield f"data: {json.dumps(usage_chunk.model_dump())}\n\n"
-                        profile_instant(
-                            "http.stream_chat.finished",
-                            cat="request",
-                            args={"request_id": request_id, "finish_reason": finish_reason},
-                        )
-                        yield "data: [DONE]\n\n"
-                        break
-
-    @staticmethod
-    def _tool_delta(delta: ToolCallDelta) -> DeltaToolCall:
-        return DeltaToolCall(
-            index=delta.index, id=delta.id, type="function" if delta.id else None,
-            function=DeltaFunctionCall(name=delta.name, arguments=delta.arguments or None),
+    async def _completions(self, request: CompletionRequest) -> StreamingResponse | JSONResponse:
+        request_id = f"cmpl-{uuid.uuid4().hex[:8]}"
+        prompt, tokens, config, _ = self.prepare_completion(request)
+        return await output_response(
+            self.engine.add_request(request_id, prompt, config, prompt_token_ids=tokens),
+            request_id, request.model or self.model_id, kind="completion", stream=request.stream,
         )
 
-    @classmethod
-    def _chat_finish_reason(cls, output: TokenOutput) -> str:
-        if (
-            output.finish_reason in ("FINISHED_EOS", "FINISHED_STOP")
-            and output.tool_calls and all(call.complete for call in output.tool_calls)
-        ):
-            return "tool_calls"
-        return cls._map_finish_reason(output.finish_reason)
+    async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
+        request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        prompt, _, config, parser, constraint = self.prepare_chat(request)
+        if constraint is not None:
+            await self._preflight_constraint(constraint)
+        outputs = self.engine.add_request(
+            request_id, prompt, config, output_parser_spec=parser,
+            **({"constraint_spec": constraint} if constraint else {}),
+        )
+        return await output_response(
+            outputs, request_id, request.model or self.model_id, kind="chat", stream=request.stream,
+            parsed=parser is not None, parallel_tool_calls=request.parallel_tool_calls,
+        )
+
+    def _completion_prompt(
+        self,
+        prompt: str | list[int],
+    ) -> tuple[str, tuple[int, ...] | None]:
+        if isinstance(prompt, str):
+            return prompt, None
+        tokens = tuple(prompt)
+        if not tokens or any(type(token) is not int or token < 0 for token in tokens):
+            raise ValueError("Prompt token IDs must be nonempty non-negative integers.")
+        return "", tokens
 
     def _apply_chat_template(
         self,
@@ -630,42 +286,7 @@ class ServingServer:
 
     @staticmethod
     def _validate_chat_request(request: ChatCompletionRequest) -> str | dict:
-        if "tools" in (request.chat_template_kwargs or {}):
-            raise ValueError("tools must be supplied as a top-level request field")
-        choice = request.tool_choice
-        if choice is None:
-            choice = "auto" if request.tools else "none"
-        names = [tool.function.name for tool in request.tools or ()]
-        if isinstance(choice, dict):
-            function = choice.get("function")
-            if (
-                set(choice) != {"type", "function"}
-                or choice.get("type") != "function"
-                or not isinstance(function, dict)
-                or set(function) != {"name"}
-                or function.get("name") not in names
-            ):
-                raise ValueError("named tool_choice must select a declared function")
-        elif choice not in ("none", "auto", "required"):
-            raise ValueError("tool_choice must be none, auto, required, or a declared function")
-        if choice != "none" and not request.tools:
-            raise ValueError("enabled tool_choice requires non-empty tools")
-        if len(set(names)) != len(names):
-            raise ValueError("tool function names must be unique")
-        for message in request.messages:
-            calls = message.tool_calls or ()
-            if calls and message.role != "assistant":
-                raise ValueError("only assistant messages can contain tool_calls")
-            if message.content is None and not (message.role == "assistant" and calls):
-                raise ValueError("message content must be text, or null for an assistant tool call")
-            if message.role == "tool" and not message.tool_call_id:
-                raise ValueError("tool messages require tool_call_id")
-            if len({call.id for call in calls}) != len(calls):
-                raise ValueError("assistant tool call IDs must be unique")
-            for call in calls:
-                if not isinstance(json.loads(call.function.arguments), dict):
-                    raise ValueError("tool call arguments must encode an object")
-        return choice
+        return validate_chat_request(request)
 
     def _constraint_spec(
         self, request: ChatCompletionRequest, parser_spec: OutputParserSpec | None,
@@ -692,15 +313,19 @@ class ServingServer:
             parallel_tool_calls=request.parallel_tool_calls,
         )
 
-    async def _preflight_constraint(self, spec: ConstraintSpec) -> None:
+    async def _preflight_constraint(
+        self, spec: ConstraintSpec, initial_token_ids: tuple[int, ...] = (),
+    ) -> None:
         """Reject unsupported schemas before an SSE response or worker batch starts."""
         async with self._constraint_preflight_lock:
             try:
-                await asyncio.to_thread(self._compile_constraint_for_preflight, spec)
+                await asyncio.to_thread(self._compile_constraint_for_preflight, spec, initial_token_ids)
             except (RuntimeError, ValueError) as exc:
                 raise ValueError(f"invalid tool constraint: {exc}") from exc
 
-    def _compile_constraint_for_preflight(self, spec: ConstraintSpec) -> None:
+    def _compile_constraint_for_preflight(
+        self, spec: ConstraintSpec, initial_token_ids: tuple[int, ...] = (),
+    ) -> None:
         if self._constraint_preflight_provider is None:
             model_vocab_size = int(read_model_config(self.engine.config.model_dir)["vocab_size"])
             self._constraint_preflight_provider = XGrammarProvider(
@@ -708,7 +333,11 @@ class ServingServer:
             )
         with profile_span("ServingServer.constraint_preflight", cat="constraints"):
             state = self._constraint_preflight_provider.compile(spec)
-        state.close()
+        try:
+            if initial_token_ids:
+                state.accept(initial_token_ids)
+        finally:
+            state.close()
 
     def _output_parser_spec(
         self,
@@ -734,22 +363,13 @@ class ServingServer:
             tool_names=tuple(tool.function.name for tool in request.tools or ()),
         )
 
-    @staticmethod
-    def _map_finish_reason(reason: str) -> str:
-        mapping = {
-            "FINISHED_EOS": "stop",
-            "FINISHED_LENGTH": "length",
-            "FINISHED_STOP": "stop",
-            "FINISHED_ABORTED": "aborted",
-            "error": "error",
-        }
-        return mapping.get(reason, "stop")
-
 
 def create_serving_app(
     async_engine: AsyncLLMEngine,
     model_id: str,
     generate_config: GenerateConfig,
+    *,
+    route_factory=None,
 ) -> FastAPI:
-    server = ServingServer(async_engine, model_id, generate_config)
+    server = ServingServer(async_engine, model_id, generate_config, route_factory=route_factory)
     return server.app
