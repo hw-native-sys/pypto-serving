@@ -1146,14 +1146,16 @@ class Scheduler:
             for r in self.running
             if r.request_id != exclude.request_id and r.constraint_spec is None and not r.prefill_complete
         ]
-        if self.kv_cache_manager.has_groups and exclude.cache_partition is not None:
-            same_partition = [
+        if self.kv_cache_manager.has_groups:
+            # Grouped pools cannot borrow another partition's physical pages.
+            # Preserve FCFS progress: a younger blocked request must not evict
+            # the older request whose completion can free its required capacity.
+            candidates = [
                 request
                 for request in candidates
-                if request.cache_partition == exclude.cache_partition
+                if request.arrival_time >= exclude.arrival_time
+                and (exclude.cache_partition is None or request.cache_partition == exclude.cache_partition)
             ]
-            if same_partition:
-                candidates = same_partition
         if not candidates:
             return None
         victim = max(candidates, key=lambda r: r.arrival_time)
