@@ -260,10 +260,16 @@ async def _stream_completion(
     request_id: str,
     model: str,
 ):
-    previous = ""
+    try:
+        async for chunk in _stream_completion_chunks(outputs, request_id, model):
+            yield chunk
+    except Exception as exc:
+        yield _stream_error(exc)
+        yield b"data: [DONE]\n\n"
+
+
+async def _stream_completion_chunks(outputs, request_id: str, model: str):
     async for output in outputs:
-        delta = _cumulative_delta(output.text, previous, "content")
-        previous = output.text or previous
         finish_reason = _map_finish_reason(output.finish_reason) if output.finished else None
         yield _sse(
             {
@@ -271,7 +277,7 @@ async def _stream_completion(
                 "object": "text_completion",
                 "created": int(time.time()),
                 "model": model,
-                "choices": [{"index": 0, "text": delta, "finish_reason": finish_reason}],
+                "choices": [{"index": 0, "text": output.text_delta, "finish_reason": finish_reason}],
             }
         )
         if output.finished:
@@ -303,14 +309,10 @@ async def _stream_chat(
             parallel_tool_calls=parallel_tool_calls,
         ):
             yield chunk
-    except (ValueError, RuntimeError) as exc:
+    except Exception as exc:
         # Decode/parser errors may occur after SSE headers have been sent.
         # Keep the public stream well formed, as ordinary Serving does.
-        yield _sse({"error": {
-            "message": str(exc),
-            "type": "invalid_model_output" if isinstance(exc, ValueError) else "pd_decode_error",
-            "code": 400 if isinstance(exc, ValueError) else 503,
-        }})
+        yield _stream_error(exc)
         yield b"data: [DONE]\n\n"
 
 
@@ -356,11 +358,12 @@ def _sse(value: dict) -> bytes:
     return b"data: " + json.dumps(value, ensure_ascii=False).encode() + b"\n\n"
 
 
-def _cumulative_delta(current: str, previous: str, field: str) -> str:
-    """Validate replay-safe cumulative output and return only its new suffix."""
-    if not current.startswith(previous):
-        raise RuntimeError(f"Decode {field} output changed an already published prefix")
-    return current[len(previous) :]
+def _stream_error(exc: Exception) -> bytes:
+    return _sse({"error": {
+        "message": str(exc),
+        "type": "invalid_model_output" if isinstance(exc, ValueError) else "pd_decode_error",
+        "code": 400 if isinstance(exc, ValueError) else 503,
+    }})
 
 
 def _chat_message(output, *, parallel_tool_calls: bool = True) -> dict:

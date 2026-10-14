@@ -22,6 +22,7 @@ from .protocol import (
     HandoffStatus,
     ReadyAck,
     TransferResult,
+    TransferResultBundle,
     chunk_payload_hash,
     continuation_metadata_hash,
     validate_rank_mapping,
@@ -42,6 +43,7 @@ class CompletionState(str, Enum):
 @dataclass
 class _UnitState:
     attempts: dict[str, CompletionCertainty] = field(default_factory=dict)
+    errors: dict[str, str] = field(default_factory=dict)
     completed_attempt: str = ""
 
 
@@ -173,12 +175,19 @@ class CompletionTracker:
             raise ValueError("non-final chunks cannot carry continuation metadata")
         self.state = CompletionState.TRANSFERRING
 
-    def record_transfer(self, result: TransferResult) -> None:
+    def validate_results(self, bundle: TransferResultBundle) -> None:
+        """Validate the entire completion set before persisting or applying any fact."""
+        chunk = self._chunks.get(bundle.chunk_id)
+        if chunk is None or bundle.key != self.key:
+            raise ValueError("completion bundle references an unknown chunk")
+        if {(r.destination_rank_id, r.component_id) for r in bundle.results} != set(chunk.units):
+            raise ValueError("completion bundle differs from the expected completion set")
+        for result in bundle.results:
+            self._validate_transfer(result)
+
+    def _validate_transfer(self, result: TransferResult):
         if result.key != self.key:
             raise ValueError("transfer result handoff identity mismatch")
-        if self.state is CompletionState.QUARANTINED:
-            # Late native success cannot overwrite an UNKNOWN terminal fact.
-            return
         if self.state in (
             CompletionState.READY,
             CompletionState.IN_USE,
@@ -205,10 +214,19 @@ class CompletionTracker:
         certainty = CompletionCertainty(result.certainty)
         previous = unit.attempts.get(result.attempt_id)
         if previous is not None:
-            if previous is not certainty:
+            if previous is not certainty or unit.errors[result.attempt_id] != result.error_code:
                 raise ValueError("one transfer attempt returned conflicting terminal facts")
+        return unit, certainty
+
+    def record_transfer(self, result: TransferResult) -> None:
+        if self.state is CompletionState.QUARANTINED:
+            # Late native success cannot overwrite an UNKNOWN terminal fact.
+            return
+        unit, certainty = self._validate_transfer(result)
+        if result.attempt_id in unit.attempts:
             return
         unit.attempts[result.attempt_id] = certainty
+        unit.errors[result.attempt_id] = result.error_code
         if certainty is CompletionCertainty.COMPLETED:
             if not unit.completed_attempt:
                 unit.completed_attempt = result.attempt_id

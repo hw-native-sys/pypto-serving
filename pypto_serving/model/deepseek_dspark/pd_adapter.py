@@ -264,6 +264,7 @@ class DSparkPDWorker:
         reserve_state,
         initialize_device_state,
         metrics,
+        progress_channel=None,
     ):
         from pypto_serving.serving.pd.worker import PDWorkerRuntime
 
@@ -278,6 +279,7 @@ class DSparkPDWorker:
         self.metrics = metrics
         self.component_ids = tuple(COMPONENTS)
         self.transfer = PDWorkerRuntime(config, self)
+        self.progress_channel = progress_channel
 
     def regions(self):
         cache = self.cache()

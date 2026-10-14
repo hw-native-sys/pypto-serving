@@ -12,15 +12,17 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import asdict
-import json
 import os
 import socket
 import struct
 import threading
+import time
 import select
 from collections import deque
 from functools import partial, wraps
 from typing import Callable
+
+import msgspec
 
 from pypto_serving.tools.profile import configure_profiler, get_profiler
 
@@ -30,6 +32,27 @@ from .types import (CompletionCertainty as Certainty, OwnerRef, ProviderCapabili
                     ProviderTransferTask, RegionLease, Segment, TransferAttemptRef)
 
 MAX_MESSAGE_BYTES = 4 << 20
+OWNER_WIRE_VERSION = 2
+
+
+class _TaskWire(msgspec.Struct, array_like=True, frozen=True):
+    attempt: TransferAttemptRef
+    leases: tuple[RegionLease, ...]
+    components: tuple[str, ...]
+    segments: tuple[tuple[int, int, int, int, int, int], ...]
+
+
+def _task_wire(task: ProviderTransferTask) -> _TaskWire:
+    """Intern repeated identities within a bounded task, never across generations."""
+    leases, components = {}, {}
+    segments = []
+    for segment in task.segments:
+        source = leases.setdefault(segment.source, len(leases))
+        destination = leases.setdefault(segment.destination, len(leases))
+        component = components.setdefault(segment.component_id, len(components))
+        segments.append((component, source, destination, segment.source_offset,
+                         segment.destination_offset, segment.length))
+    return _TaskWire(task.attempt, tuple(leases), tuple(components), tuple(segments))
 
 
 def _serialized(method):
@@ -41,7 +64,7 @@ def _serialized(method):
 
 
 def _send(channel: socket.socket, message: dict) -> None:
-    wire = json.dumps(message, separators=(",", ":"), allow_nan=False).encode()
+    wire = msgspec.msgpack.encode((OWNER_WIRE_VERSION, message))
     if len(wire) > MAX_MESSAGE_BYTES:
         raise ValueError("owner command exceeds channel limit")
     channel.sendall(struct.pack("!I", len(wire)) + wire)
@@ -65,7 +88,10 @@ def _receive(channel: socket.socket, owner_fd=None) -> dict:
     length = struct.unpack("!I", exact(4))[0]
     if not 0 < length <= MAX_MESSAGE_BYTES:
         raise ValueError("invalid owner message length")
-    value = json.loads(exact(length))
+    packet = msgspec.msgpack.decode(exact(length))
+    if not isinstance(packet, list) or len(packet) != 2 or packet[0] != OWNER_WIRE_VERSION:
+        raise ValueError("incompatible owner wire version")
+    value = packet[1]
     if not isinstance(value, dict):
         raise ValueError("owner message must be an object")
     return value
@@ -75,12 +101,16 @@ def _lease(wire: dict) -> RegionLease:
     return RegionLease(**dict(wire, owner=OwnerRef(**wire["owner"])))
 
 
-def _task(wire: dict) -> ProviderTransferTask:
-    ref = wire["attempt"]
-    attempt = TransferAttemptRef(**dict(ref, source=OwnerRef(**ref["source"]),
-                                       destination=OwnerRef(**ref["destination"])))
-    return ProviderTransferTask(attempt, tuple(Segment(**dict(
-        s, source=_lease(s["source"]), destination=_lease(s["destination"]))) for s in wire["segments"]))
+def _task(wire) -> ProviderTransferTask:
+    value = msgspec.convert(wire, type=_TaskWire)
+    segments = []
+    for component, source, destination, source_offset, destination_offset, length in value.segments:
+        if not (0 <= component < len(value.components)
+                and 0 <= source < len(value.leases) and 0 <= destination < len(value.leases)):
+            raise ValueError("invalid task table reference")
+        segments.append(Segment(value.components[component], value.leases[source],
+                                value.leases[destination], source_offset, destination_offset, length))
+    return ProviderTransferTask(value.attempt, tuple(segments))
 
 
 def _descriptor_wire(descriptor) -> dict:
@@ -132,6 +162,7 @@ class OwnerBridge:
         self.commands = deque(maxlen=64)
         self._sources = {}
         self._destinations = {}
+        self.transfer_metrics = {}
 
     def factory(self, context):
         """Pass this bound method as the rank's chip_service_factory before prepare()."""
@@ -233,7 +264,20 @@ class OwnerBridge:
                 raise TransferFailure(TransferError(ErrorCode.STALE_GENERATION, Certainty.NOT_SUBMITTED))
         # After publication, lost replies cannot prove whether native submit occurred.
         on_submitted()
-        self._request("write", task=asdict(task))
+        started = time.monotonic_ns()
+        wire = _task_wire(task)
+        encoded = time.monotonic_ns()
+        reply = self._request("write", task=wire)
+        finished = time.monotonic_ns()
+        values = dict(self.transfer_metrics)
+        for name, value in {
+            "writes": 1, "segments": len(task.segments), "bytes": task.nbytes,
+            "compact_ns": encoded - started, "owner_rpc_ns": finished - encoded,
+            **reply.get("timings", {}),
+        }.items():
+            values[name] = values.get(name, 0) + value
+        # Publish a new snapshot; metrics readers never wait behind native I/O.
+        self.transfer_metrics = values
 
     @_serialized
     def set_profile_active(self, active: bool) -> None:
@@ -366,10 +410,14 @@ class _OwnerService:
                         for entry in request["entries"]:
                             provider.install_destination(_lease(entry["lease"]), entry["envelope"])
                     elif operation == "write":
+                        started = time.monotonic_ns()
                         task = _task(request["task"])
+                        decoded = time.monotonic_ns()
                         if task.attempt.source != self.owner:
                             raise ValueError("stale write owner")
                         provider.write(task)
+                        reply["timings"] = {"reconstruct_ns": decoded - started,
+                                            **provider.last_write_timings}
                     elif operation == "profile":
                         requested = request.get("active")
                         if type(requested) is not bool:

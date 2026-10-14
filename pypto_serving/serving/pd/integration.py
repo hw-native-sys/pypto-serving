@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 from functools import partial
+import multiprocessing
 from pathlib import Path
 
 from pypto_serving.model import builtin_pd_adapter_registry
@@ -28,6 +29,7 @@ from .adapter import ModelRuntimeFacts
 from .config import PDRole, load_pd_document, resolve_pd_config
 from .http_api import PDHTTPRoutes
 from .service import PDServingService
+from .progress import ProgressClient
 from .worker import PDWorkerServices
 
 
@@ -81,6 +83,7 @@ class PDNodeRuntime:
         add_prefilled_request,
         abort_request,
         call_worker,
+        call_progress,
         finish_prefilled_request,
         hold_request,
         resume_request,
@@ -90,6 +93,7 @@ class PDNodeRuntime:
         self.add_adopted_handoff = add_prefilled_request
         self.abort_request = abort_request
         self.call_pd_worker = call_worker
+        self.call_pd_progress = call_progress
         self.finish_prefilled_request = finish_prefilled_request
         self.hold_request = hold_request
         self.resume_request = resume_request
@@ -181,6 +185,18 @@ def prefill_scheduler(*, config, kv_cache_manager):
 class PDApplication:
     def __init__(self, config, pd_config, tokenizer, generate_config):
         validate_engine_config(config, pd_config)
+        self._progress_client = None
+        self._progress_worker_channel = None
+        if pd_config.role is PDRole.PREFILL:
+            parent, child = multiprocessing.get_context("spawn").Pipe(duplex=True)
+            self._progress_client = ProgressClient(parent, timeout=pd_config.request_timeout_seconds + 10)
+            self._progress_worker_channel = child
+            config = replace(config, executor_kwargs={
+                **config.executor_kwargs,
+                "runner_extension_factory": partial(
+                    config.executor_kwargs["runner_extension_factory"], progress_channel=child,
+                ),
+            })
         self.engine = AsyncLLMEngine(
             config,
             tokenizer,
@@ -197,6 +213,7 @@ class PDApplication:
             add_prefilled_request=core.add_prefilled_request,
             abort_request=core.abort_request,
             call_worker=core.call_worker,
+            call_progress=self._progress_client.call if self._progress_client is not None else None,
             finish_prefilled_request=core.finish_prefilled_request,
             hold_request=core.scheduler.hold_request,
             resume_request=core.scheduler.resume_request,
@@ -226,7 +243,15 @@ class PDApplication:
         )
 
     async def start(self):
-        await self.engine.start()
+        try:
+            await self.engine.start()
+        except BaseException:
+            if self._progress_client is not None:
+                await self._progress_client.close()
+            raise
+        finally:
+            if self._progress_worker_channel is not None:
+                self._progress_worker_channel.close()
         try:
             await self.service.start()
         except BaseException:
@@ -234,10 +259,12 @@ class PDApplication:
             raise
 
     async def stop(self):
-        try:
-            await self.service.close()
-        finally:
-            await self.engine.stop()
+        # Failed retirement is not permission to free registered device
+        # allocations. Keep the worker for explicit external recovery.
+        await self.service.close()
+        if self._progress_client is not None:
+            await self._progress_client.close()
+        await self.engine.stop()
 
 
 def build_pd_launch(args, build_config, *, model_variant):

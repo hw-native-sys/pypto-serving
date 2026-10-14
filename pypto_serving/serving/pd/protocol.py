@@ -261,6 +261,19 @@ class TransferResult(msgspec.Struct, tag="transfer_result", frozen=True):
     error_code: str = ""
 
 
+class TransferResultBundle(msgspec.Struct, tag="transfer_results", frozen=True):
+    key: HandoffKey
+    chunk_id: int
+    results: tuple[TransferResult, ...]
+
+    def __post_init__(self) -> None:
+        if not self.results or any(r.key != self.key or r.chunk_id != self.chunk_id for r in self.results):
+            raise ValueError("completion bundle must describe exactly one nonempty chunk")
+        units = {(r.destination_rank_id, r.component_id) for r in self.results}
+        if len(units) != len(self.results):
+            raise ValueError("completion bundle contains duplicate units")
+
+
 class CommitRequest(msgspec.Struct, tag="commit", frozen=True):
     key: HandoffKey
     manifest_hash: str
@@ -352,14 +365,29 @@ class PoisonHandoff(msgspec.Struct, tag="poison", frozen=True):
     error_code: str
 
 
+class DrainPeer(msgspec.Struct, tag="drain_peer", frozen=True):
+    pass
+
+
+class SenderReleased(msgspec.Struct, tag="sender_released", frozen=True):
+    pass
+
+
+class SenderReleaseAck(msgspec.Struct, tag="sender_release_ack", frozen=True):
+    pass
+
+
 ControlMessage = Union[
+    DrainPeer,
+    SenderReleased,
+    SenderReleaseAck,
     Hello,
     RegistryAdvertisement,
     ReserveRequest,
     ReserveAccepted,
     ReserveRejected,
     ChunkManifest,
-    TransferResult,
+    TransferResultBundle,
     CommitRequest,
     ReadyAck,
     ControlAck,

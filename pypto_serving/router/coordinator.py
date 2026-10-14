@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
-from contextlib import suppress
+from contextlib import aclosing, suppress
 import time
 import uuid
 
@@ -70,6 +70,12 @@ class RouterCoordinator:
             config.max_active_handoffs,
             config.max_pending_handoffs,
             state_observer=self._observe_admission,
+        )
+        # Total public streams stay bounded after their transfer budget is
+        # released. D reservation remains the physical-cache authority.
+        self.requests = FairHandoffAdmission(
+            config.max_pending_handoffs, config.max_pending_handoffs,
+            state_observer=lambda active, queued: self.metrics.set_gauge("requests.active", active),
         )
         self.recovery = FixedPairRecoveryController(
             generation=config.data_generation,
@@ -147,7 +153,7 @@ class RouterCoordinator:
         self.metrics.increment("requests.total")
         final = None
         try:
-            async with self.admission.admit():
+            async with self.requests.admit(), self.admission.admit() as release_handoff:
                 self.metrics.set_gauge("handoffs.active", self.admission.active)
                 self.metrics.set_gauge("handoffs.queued", self.admission.queued)
                 self.metrics.set_peak_gauge(
@@ -161,31 +167,35 @@ class RouterCoordinator:
                     request_json,
                     request_id,
                     signal_prepared=_signal_prepared,
+                    on_ready=release_handoff,
                 )
-                async for output in stream:
-                    if output is None:
-                        yield None
-                        continue
-                    now_ns = time.monotonic_ns()
-                    if previous_output_ns is None:
-                        self.metrics.observe_ns("request.ttft", now_ns - started_ns)
-                    else:
-                        self.metrics.observe_ns(
-                            "request.inter_output",
-                            now_ns - previous_output_ns,
-                        )
-                    previous_output_ns = now_ns
-                    if publish_immediately and not replayable.output_published:
-                        replayable = ReplayableRequest(
-                            request_id,
-                            request_kind,
-                            request_json,
-                            output_published=True,
-                        )
-                        self._replayable[request_id] = replayable
-                    final = output
-                    if not output.finished:
-                        yield output
+                # Keep the request budget until abort/stream cleanup completes,
+                # including when a slow client closes this generator at yield.
+                async with aclosing(stream):
+                    async for output in stream:
+                        if output is None:
+                            yield None
+                            continue
+                        now_ns = time.monotonic_ns()
+                        if previous_output_ns is None:
+                            self.metrics.observe_ns("request.ttft", now_ns - started_ns)
+                        else:
+                            self.metrics.observe_ns(
+                                "request.inter_output",
+                                now_ns - previous_output_ns,
+                            )
+                        previous_output_ns = now_ns
+                        if publish_immediately and not replayable.output_published:
+                            replayable = ReplayableRequest(
+                                request_id,
+                                request_kind,
+                                request_json,
+                                output_published=True,
+                            )
+                            self._replayable[request_id] = replayable
+                        final = output
+                        if not output.finished:
+                            yield output
                 if final is None or not final.finished:
                     raise RuntimeError("Router request ended without a terminal output")
                 self.metrics.increment("requests.completed")
@@ -256,9 +266,6 @@ class RouterCoordinator:
                     self._replayable.pop(request_id, None)
                 raise
         finally:
-            if "stream" in locals():
-                with suppress(Exception):
-                    await stream.aclose()
             self.metrics.observe_ns(
                 "request.e2e",
                 time.monotonic_ns() - started_ns,
@@ -356,6 +363,7 @@ class RouterCoordinator:
         request_id: str,
         *,
         signal_prepared: bool = False,
+        on_ready=None,
     ) -> AsyncGenerator[DecodeOutputWire | None, None]:
         if not request_json or len(request_json) > self.config.max_request_bytes:
             raise ValueError("public request exceeds the Router body limit")
@@ -536,16 +544,27 @@ class RouterCoordinator:
             next_frame = asyncio.create_task(anext(decode_stream))
             while True:
                 wait_set = {next_frame}
-                if execute_task is not None and not execute_task.done():
+                if execute_task is not None:
                     wait_set.add(execute_task)
                 done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
                 if execute_task in done:
                     prefill_result = execute_task.result()
                     execute_task = None
-                    if prefill_result.key != key or prefill_result.reservation_id != reservation.reservation_id:
-                        raise RuntimeError("P returned a mismatched handoff result")
+                    if (prefill_result.key == key
+                            and prefill_result.reservation_id == reservation.reservation_id
+                            and prefill_result.state == "NOT_STARTED"
+                            and not prefill_result.manifest_hash
+                            and prefill_result.error_code
+                            and next_frame not in done
+                            and not transfer_completed):
+                        native_may_have_started = False
+                        raise RuntimeError(f"P rejected before transfer: {prefill_result.error_code}")
+                    self._validate_prefill_result(prefill_result, key, reservation)
                     self.journal.append("PREFILL_READY", key)
                     transfer_completed = True
+                    if on_ready is not None:
+                        await on_ready()
+                        on_ready = None
                     if next_frame not in done:
                         continue
                 if next_frame not in done:
@@ -560,12 +579,19 @@ class RouterCoordinator:
                 # Any Decode output is downstream of a committed final
                 # manifest, even if the Prefill HTTP reply races behind it.
                 transfer_completed = True
+                # Wait for P's reply before admitting more P work: D output
+                # proves commit, but P may still be retiring its source pins.
                 expected_sequence += 1
                 yield output
                 if frame.event == "finished":
                     if execute_task is not None:
                         prefill_result = await execute_task
                         execute_task = None
+                        self._validate_prefill_result(prefill_result, key, reservation)
+                        self.journal.append("PREFILL_READY", key)
+                        if on_ready is not None:
+                            await on_ready()
+                            on_ready = None
                     if prefill_result is None:
                         raise RuntimeError("D completed before P reported ReadyAck")
                     terminal = True
@@ -617,6 +643,17 @@ class RouterCoordinator:
                 # The journal entry above is the durable recovery decision. No
                 # timeout-based allocator release is performed in the Router.
                 pass
+
+    @staticmethod
+    def _validate_prefill_result(
+        result: PrefillHandoffResult,
+        key: HandoffKey,
+        reservation: PlacementReservation,
+    ) -> None:
+        if result.key != key or result.reservation_id != reservation.reservation_id:
+            raise RuntimeError("P returned a mismatched handoff result")
+        if result.state != "READY":
+            raise RuntimeError("P did not confirm a ready handoff")
 
     @staticmethod
     def _validate_output(

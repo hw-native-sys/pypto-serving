@@ -9,6 +9,7 @@
 
 import json
 import stat
+import os
 
 import pytest
 
@@ -31,6 +32,32 @@ def _config(path) -> PDConfig:
         model_adapter=DSV4_DSPARK_K7_ADAPTER,
         journal_path=str(path),
     )
+
+
+def test_completion_bundle_uses_one_fsync_and_failed_persistence_poison_is_sticky(tmp_path, monkeypatch):
+    path = tmp_path / "bundle.jsonl"
+    journal = DurablePDJournal(str(path), _config(path))
+    syncs = []
+    original = os.fsync
+    def sync(fd):
+        syncs.append(fd)
+        original(fd)
+    monkeypatch.setattr(os, "fsync", sync)
+    facts = tuple({"destination_rank_id": rank, "component_id": component,
+                   "attempt_id": "attempt", "certainty": "COMPLETED"}
+                  for rank in range(4) for component in ("ori", "idx_k", "idx_scale"))
+    journal.append("TRANSFER_RESULTS_RECORDED", completion_facts=facts)
+    assert len(syncs) == 1
+    assert json.loads(path.read_text())["completion_facts"] == list(facts)
+    def fail(fd):
+        raise OSError("fsync failed")
+    monkeypatch.setattr(os, "fsync", fail)
+    with pytest.raises(OSError, match="fsync failed"):
+        journal.append("TRANSFER_RESULTS_RECORDED", completion_facts=facts)
+    monkeypatch.setattr(os, "fsync", sync)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        journal.append("HANDOFF_COMMITTED")
+    journal.close()
 
 
 def test_journal_round_trip_is_durable_bounded_and_address_free(tmp_path) -> None:

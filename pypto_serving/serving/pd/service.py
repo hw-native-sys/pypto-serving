@@ -15,6 +15,7 @@ import importlib.util
 import logging
 import secrets
 import time
+import msgspec
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import aclosing, suppress
@@ -33,7 +34,10 @@ from .contracts import RuntimeLayoutDescriptor
 from .connector import DecodeConnector
 from .handoff import CoordinatorState, HandoffCoordinator
 from .journal import DurablePDJournal
+from .lifecycle import TransferLifecycle
+from .progress import TransferProgress
 from .observability import PDMetrics, write_startup_record
+from .output import DecodeOutputEncoder
 from .http_api import (
     AuthorizeRouteHTTP,
     CapacitySnapshot,
@@ -68,6 +72,10 @@ from .protocol import (
     RouteOpened,
     CapabilityWire,
     TransferResult,
+    TransferResultBundle,
+    DrainPeer,
+    SenderReleased,
+    SenderReleaseAck,
     constraint_spec_hash,
     prepared_request_hash,
 )
@@ -82,15 +90,14 @@ from .session import (
 )
 from .worker_api import (
     OP_INSTALL_PEER,
+    OP_RELEASE_TRANSFER,
+    OP_FINALIZE_TRANSFER,
     OP_INSPECT_RUNTIME_METRICS,
-    OP_POLL_TRANSFER_CHUNK,
     OP_PREPARE_REGISTRY,
     OP_SUBMIT_TRANSFER_CHUNK,
     InstallPeerRequest,
     TransferChunkRequest,
     TransferChunkResponse,
-    TransferPollRequest,
-    TransferPollResponse,
     TransferSubmission,
     WorkerRegistryBundle,
     WorkerRuntimeMetrics,
@@ -100,6 +107,14 @@ from .worker_api import (
 
 
 logger = logging.getLogger(__name__)
+
+
+class _PrefillNotStarted(RuntimeError):
+    """An authenticated D rejection before P schedules compute or native work."""
+
+    def __init__(self, error_code: str):
+        super().__init__(f"D rejected route before Prefill: {error_code}")
+        self.error_code = error_code
 
 
 @dataclass(frozen=True)
@@ -165,11 +180,22 @@ class PDServingService:
         self._session_pool = PeerSessionPool()
         self._multiplex_session: MultiplexedPDControlSession | None = None
         self._session_connect_lock = asyncio.Lock()
-        self._external_handoff_tasks: set[asyncio.Task] = set()
+        self._external_handoff_tasks: dict[HandoffKey, asyncio.Task] = {}
         self._snapshot_sequence = 0
         self._health_error = ""
         self.metrics = PDMetrics(f"pd-{config.role.value}", config.node_id)
+        self.progress = TransferProgress(
+            core.call_pd_progress, interval=config.transfer_poll_interval_seconds,
+            limit=config.max_active_handoffs, metrics=self.metrics,
+        )
         self._closed = False
+        self._close_task: asyncio.Task | None = None
+        self.lifecycle = TransferLifecycle(
+            config.role,
+            idle=lambda: not self._active_keys and self._admission.count == 0,
+            release=lambda: self.core.call_pd_worker(OP_RELEASE_TRANSFER),
+            timeout=min(config.request_timeout_seconds, 60),
+        )
 
     async def start(self) -> None:
         write_startup_record(
@@ -238,6 +264,20 @@ class PDServingService:
     async def close(self) -> None:
         if self._closed:
             return
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close())
+        await asyncio.shield(self._close_task)
+
+    async def _close(self) -> None:
+        try:
+            await self.lifecycle.close()
+            await self.progress.close()
+            await self.core.call_pd_worker(OP_FINALIZE_TRANSFER)
+        except BaseException as exc:
+            self._health_error = f"OWNER_RETIREMENT_{type(exc).__name__}"
+            self._record("RECOVERY_REQUIRED", error_code=self._health_error)
+            # Do not falsely report SERVICE_STOPPED or discard owner identity.
+            raise
         self._closed = True
         if self.session is not None:
             with suppress(Exception):
@@ -253,11 +293,11 @@ class PDServingService:
             with suppress(asyncio.CancelledError, Exception):
                 await self._decode_loop_task
             self._decode_loop_task = None
-        for task in tuple(self._external_handoff_tasks):
+        for task in tuple(self._external_handoff_tasks.values()):
             task.cancel()
         if self._external_handoff_tasks:
             await asyncio.gather(
-                *self._external_handoff_tasks,
+                *tuple(self._external_handoff_tasks.values()),
                 return_exceptions=True,
             )
         self._external_handoff_tasks.clear()
@@ -290,20 +330,14 @@ class PDServingService:
             endpoint_generation=self.config.generation,
             control_incarnation=self.config.control_incarnation,
             capabilities=CapabilityWire.from_capabilities(self.capabilities),
-            health="RECOVERY_REQUIRED" if self._health_error else "READY",
+            health=("RECOVERY_REQUIRED" if self._health_error else
+                    "DRAINING" if self.lifecycle.draining else "READY"),
         )
 
     def capacity_snapshot(self) -> CapacitySnapshot:
         reservations = tuple(self.core.kv_cache_manager.group_cache_reservations)
         self._snapshot_sequence += 1
-        self.metrics.set_gauge("active_handoffs", len(self._active_keys))
-        self.metrics.set_gauge("queued_handoffs", self._admission.queued)
-        self.metrics.set_gauge("prepared_requests", len(self._prepared_by_id))
-        self.metrics.set_gauge("reservations", len(reservations))
-        self.metrics.set_gauge(
-            "inflight_transfer_bytes",
-            self._inflight_transfer_bytes,
-        )
+        self._refresh_metrics_gauges(reservations)
         return CapacitySnapshot(
             node_id=self.config.node_id,
             role=self.config.role.value,
@@ -315,14 +349,26 @@ class PDServingService:
                 for reservation in reservations
             ),
             snapshot_sequence=self._snapshot_sequence,
-            active_limit=self._admission.active_limit,
+            active_limit=(self.config.max_pending_handoffs if self.config.role is PDRole.DECODE
+                          else self._admission.active_limit),
             queued_handoffs=self._admission.queued,
             inflight_transfer_bytes=self._inflight_transfer_bytes,
             inflight_transfer_byte_limit=0,
         )
 
+    def _refresh_metrics_gauges(self, reservations) -> None:
+        self.metrics.set_gauge("active_handoffs", len(self._active_keys))
+        self.metrics.set_gauge("queued_handoffs", self._admission.queued)
+        self.metrics.set_gauge("prepared_requests", len(self._prepared_by_id))
+        self.metrics.set_gauge("reservations", len(reservations))
+        self.metrics.set_gauge(
+            "inflight_transfer_bytes",
+            self._inflight_transfer_bytes,
+        )
+
     async def metrics_snapshot(self) -> dict[str, object]:
         """Return Host metrics plus worker-resident model/transfer counters."""
+        self._refresh_metrics_gauges(self.core.kv_cache_manager.group_cache_reservations)
         snapshot = self.metrics.snapshot()
         try:
             raw = await self.core.call_pd_worker(OP_INSPECT_RUNTIME_METRICS)
@@ -345,6 +391,7 @@ class PDServingService:
         constraint_spec: ConstraintSpec | None = None,
     ) -> PreparedRequest:
         """Normalize once on P and retain the immutable execution input."""
+        self._assert_accepting()
         self._require_external_role(PDRole.PREFILL)
         self.config.model_adapter.validate_generate_config(config)
         if constraint_spec is not None:
@@ -398,6 +445,7 @@ class PDServingService:
         request: ReservePlacementHTTP,
     ) -> PlacementReservation | PlacementRejection:
         """Reserve D cache before Prefill and return only logical placement data."""
+        self._assert_accepting()
         self._require_external_role(PDRole.DECODE)
         assert self.decode_connector is not None
         if (
@@ -633,6 +681,7 @@ class PDServingService:
                         error_code=reason,
                     )
                     self._clear_decode_route(key)
+                    await self._stop_decode_output_task(key)
                     return aborted
                 finally:
                     self._router_cancelled_keys.discard(key)
@@ -650,6 +699,7 @@ class PDServingService:
                     error_code=reason,
                 )
                 self._clear_decode_route(key)
+                await self._stop_decode_output_task(key)
             return aborted
 
         record = self.coordinator.query(key)
@@ -695,6 +745,10 @@ class PDServingService:
             )
         return status
 
+    def _assert_accepting(self):
+        if self._closed or self.lifecycle.draining:
+            raise RuntimeError("PD node is draining and no longer accepts new work")
+
     def _require_external_role(self, role: PDRole) -> None:
         if self.config.role is not role:
             raise ValueError(f"operation requires a {role.value} node")
@@ -718,6 +772,7 @@ class PDServingService:
         request: ExecutePrefillHTTP,
     ) -> PrefillHandoffResult:
         """Execute one Router-selected, D-first handoff on P."""
+        self._assert_accepting()
         self._require_external_role(PDRole.PREFILL)
         self._expire_prepared(time.time_ns())
         completed = self._prefill_results.get(request.key)
@@ -738,20 +793,25 @@ class PDServingService:
             raise ValueError("Prefill execution does not match the prepared request")
         if request.decode_endpoint_generation < 1:
             raise ValueError("Decode endpoint generation must be positive")
-        await self.run_prefill_handoff(
-            prepared.public.request_id,
-            prepared.prompt,
-            prepared.config,
-            prepared.prompt_token_ids,
-            external_request=request,
-            output_parser_spec=(
-                prepared.public.continuation.output_parser_spec
-            ),
-            constraint_spec=(
-                ConstraintSpec.from_wire(prepared.public.continuation.constraint_spec)
-                if prepared.public.continuation.constraint_spec is not None else None
-            ),
-        )
+        try:
+            await self.run_prefill_handoff(
+                prepared.public.request_id,
+                prepared.prompt,
+                prepared.config,
+                prepared.prompt_token_ids,
+                external_request=request,
+                output_parser_spec=prepared.public.continuation.output_parser_spec,
+                constraint_spec=(
+                    ConstraintSpec.from_wire(prepared.public.continuation.constraint_spec)
+                    if prepared.public.continuation.constraint_spec is not None else None
+                ),
+            )
+        except _PrefillNotStarted as exc:
+            result = PrefillHandoffResult(
+                request.key, request.reservation_id, "", "NOT_STARTED", exc.error_code,
+            )
+            self._remember_prefill_result(result)
+            self._drop_prepared(request.prepared_request_id)
         return self._prefill_results[request.key]
 
     async def _ensure_external_session(self, request: ExecutePrefillHTTP) -> None:
@@ -783,7 +843,8 @@ class PDServingService:
                     raise ValueError("Router selected a stale Decode endpoint generation")
                 peer = await session.exchange_registry(self._local_advertisement())
                 await self._install_peer(peer)
-                multiplex = MultiplexedPDControlSession(session)
+                self.lifecycle.bind(session)
+                multiplex = MultiplexedPDControlSession(session, lifecycle=self.lifecycle)
                 multiplex.start()
             except BaseException:
                 await session.close()
@@ -863,6 +924,7 @@ class PDServingService:
         state: str = "",
         certainty: str = "",
         error_code: str = "",
+        completion_facts: tuple[dict, ...] = (),
     ) -> None:
         self.metrics.increment(f"event.{event}")
         if self.journal is None:
@@ -876,6 +938,7 @@ class PDServingService:
             state=state,
             certainty=certainty,
             error_code=error_code,
+            completion_facts=completion_facts,
         )
 
     def _decode_loop_done(self, task: asyncio.Task) -> None:
@@ -941,6 +1004,9 @@ class PDServingService:
                     )
                 )
                 opened = await self._receive_control(record.key)
+                if (isinstance(opened, ControlError) and opened.key == record.key
+                        and opened.operation == "OpenRoute" and opened.deterministic):
+                    raise _PrefillNotStarted(opened.error_code)
                 if (
                     not isinstance(opened, RouteOpened)
                     or opened.key != record.key
@@ -1290,33 +1356,21 @@ class PDServingService:
         try:
             if release_next_chunk:
                 self.metrics.increment("overlap.submitted")
+            submit_started = time.monotonic_ns()
             raw_submission = await self.core.call_pd_worker(
                 OP_SUBMIT_TRANSFER_CHUNK,
                 encode_worker_payload(request),
             )
             submission = decode_worker_payload(raw_submission, TransferSubmission)
+            self.metrics.observe_ns("transfer.submit_rpc", time.monotonic_ns() - submit_started)
             if release_next_chunk:
                 self.core.complete_prefill_chunk_transfer(request_id)
-            deadline = time.monotonic() + self.config.request_timeout_seconds + 10
-            while True:
-                # Yield to the engine loop before polling so the next Prefill
-                # StepCommand can reach the worker/device lane.
-                await asyncio.sleep(self.config.transfer_poll_interval_seconds)
-                raw_poll = await self.core.call_pd_worker(
-                    OP_POLL_TRANSFER_CHUNK,
-                    encode_worker_payload(TransferPollRequest(submission.job_id)),
-                )
-                poll = decode_worker_payload(raw_poll, TransferPollResponse)
-                if poll.job_id != submission.job_id:
-                    raise RuntimeError("worker returned another PD transfer job")
-                if poll.complete:
-                    if release_next_chunk:
-                        self.metrics.increment("overlap.completed")
-                    return TransferChunkResponse(poll.results), release_next_chunk
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        "PD asynchronous transfer polling exceeded its bound"
-                    )
+            poll = await self.progress.wait(
+                submission.job_id, timeout=self.config.request_timeout_seconds + 10,
+            )
+            if release_next_chunk:
+                self.metrics.increment("overlap.completed")
+            return TransferChunkResponse(poll.results), release_next_chunk
         finally:
             self._inflight_transfer_bytes -= transfer_bytes
             self.metrics.observe_ns(
@@ -1400,10 +1454,11 @@ class PDServingService:
     ) -> CompletionCertainty:
         if not results:
             raise RuntimeError("worker returned no physical-region completion facts")
-        certainties = []
-        for result in results:
-            await self._send_expect_ack(result, "transfer_result", result.chunk_id)
-            certainties.append(CompletionCertainty(result.certainty))
+        bundle = TransferResultBundle(results[0].key, results[0].chunk_id, results)
+        certainties = [CompletionCertainty(result.certainty) for result in results]
+        started = time.perf_counter_ns()
+        await self._send_expect_ack(bundle, "transfer_results", bundle.chunk_id)
+        self.metrics.observe_ns("completion_ack", time.perf_counter_ns() - started)
         if CompletionCertainty.UNKNOWN in certainties:
             return CompletionCertainty.UNKNOWN
         if CompletionCertainty.FAILED_DEFINITE in certainties:
@@ -1461,6 +1516,7 @@ class PDServingService:
             )
             try:
                 peer = await session.exchange_registry(local_advertisement)
+                self.lifecycle.bind(session)
                 self.session = session
                 self.peer_registry = peer
                 self._session_peer_node_id = peer.ranks[0].worker_id if peer.ranks else ""
@@ -1482,7 +1538,8 @@ class PDServingService:
         def finished(key: HandoffKey, task: asyncio.Task) -> None:
             queues.pop(key, None)
             tasks.pop(key, None)
-            self._external_handoff_tasks.discard(task)
+            if self._external_handoff_tasks.get(key) is task:
+                self._external_handoff_tasks.pop(key)
             if not task.cancelled():
                 error = task.exception()
                 if error is not None and not self._health_error:
@@ -1491,6 +1548,9 @@ class PDServingService:
         try:
             while True:
                 message = await session.receive()
+                if isinstance(message, (DrainPeer, SenderReleased, SenderReleaseAck)):
+                    await self.lifecycle.receive(message)
+                    continue
                 key = getattr(message, "key", None)
                 if not isinstance(key, HandoffKey):
                     raise ValueError("external PD message has no handoff correlation")
@@ -1505,7 +1565,13 @@ class PDServingService:
                             )
                         )
                         continue
-                    if len(tasks) >= self.config.max_active_handoffs:
+                    states = tuple(self.decode_connector.query(active_key).state for active_key in tasks)
+                    transferring = sum(state in ("RESERVED", "TRANSFERRING") for state in states)
+                    # Completed routes may still be finishing their coroutine.
+                    # The reservation state, not callback scheduling, owns quota.
+                    live = sum(state not in ("COMPLETED", "ABORTED") for state in states)
+                    if (transferring >= self.config.max_active_handoffs
+                            or live >= self.config.max_pending_handoffs):
                         await session.send(
                             ControlError(
                                 key,
@@ -1521,7 +1587,7 @@ class PDServingService:
                     )
                     queues[key] = queue
                     tasks[key] = task
-                    self._external_handoff_tasks.add(task)
+                    self._external_handoff_tasks[key] = task
                     task.add_done_callback(lambda done, route=key: finished(route, done))
                     queue.put_nowait(message)
                     continue
@@ -1613,19 +1679,19 @@ class PDServingService:
                         state=status.state,
                     )
                     await session.send(ControlAck(key, "chunk_manifest", message.chunk_id))
-                elif isinstance(message, TransferResult):
-                    self.decode_connector.record_transfer(message)
+                elif isinstance(message, TransferResultBundle):
+                    self.decode_connector.validate_transfer_results(message)
                     status = self.decode_connector.query(key)
                     self._record(
-                        "TRANSFER_RESULT_RECORDED",
+                        "TRANSFER_RESULTS_RECORDED",
                         key=key,
                         reservation_id=status.reservation_id,
                         chunk_id=message.chunk_id,
                         state=status.state,
-                        certainty=message.certainty,
-                        error_code=message.error_code,
+                        completion_facts=tuple(msgspec.to_builtins(result) for result in message.results),
                     )
-                    await session.send(ControlAck(key, "transfer_result", message.chunk_id))
+                    self.decode_connector.record_transfer_results(message)
+                    await session.send(ControlAck(key, "transfer_results", message.chunk_id))
                 elif isinstance(message, CommitRequest):
                     ready = self.decode_connector.commit(message)
                     self._record(
@@ -1738,7 +1804,9 @@ class PDServingService:
             state="IN_USE",
         )
         admitted = True
-        output_sequence = 0
+        encoder = DecodeOutputEncoder(
+            key, parsed=continuation.output_parser_spec is not None, streaming=continuation.stream,
+        )
         try:
             async for output in self.config.model_adapter.adopt_decode(
                 self.core,
@@ -1747,23 +1815,7 @@ class PDServingService:
                 first_token=manifest.first_token,
                 continuation=continuation,
             ):
-                output_sequence += 1
-                wire = DecodeOutputWire(
-                    key=key,
-                    token_id=output.token_id,
-                    text=output.text,
-                    finished=output.finished,
-                    finish_reason=output.finish_reason,
-                    prompt_tokens=output.prompt_tokens,
-                    completion_tokens=output.completion_tokens,
-                    token_ids=output.token_ids,
-                    output_sequence=output_sequence,
-                    reasoning=output.reasoning,
-                    text_delta=output.text_delta,
-                    reasoning_delta=output.reasoning_delta,
-                    tool_call_deltas=output.tool_call_deltas,
-                    tool_calls=output.tool_calls,
-                )
+                wire = encoder.encode(output)
                 queue = self._decode_queues.get(key)
                 if queue is None:
                     raise RuntimeError("Router Decode stream disappeared after admission")
@@ -1794,12 +1846,6 @@ class PDServingService:
                     )
                     return
         except BaseException as exc:
-            logger.exception(
-                "PD Decode continuation failed: request=%s handoff=%s error=%s",
-                key.request_id,
-                key.handoff_id,
-                type(exc).__name__,
-            )
             router_cancelled = key in self._router_cancelled_keys
             if not router_cancelled:
                 # The HTTP abort path can publish the durable ABORTED tombstone
@@ -1817,6 +1863,12 @@ class PDServingService:
                 # exception is expected convergence, not an UNKNOWN failure.
                 self._active_keys.discard(key)
                 return
+            logger.exception(
+                "PD Decode continuation failed: request=%s handoff=%s error=%s",
+                key.request_id,
+                key.handoff_id,
+                type(exc).__name__,
+            )
             if admitted:
                 await self.core.abort_request(key.request_id)
             self._record(
@@ -1859,3 +1911,11 @@ class PDServingService:
         self._reservation_bindings.pop(key, None)
         self._decode_waiter_claimed.discard(key)
         self._decode_queues.pop(key, None)
+
+    async def _stop_decode_output_task(self, key: HandoffKey) -> None:
+        # Called only after scheduler cancellation and a deterministic terminal
+        # fact. A slow/disconnected Router must not leave a producer in put().
+        task = self._external_handoff_tasks.get(key)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)

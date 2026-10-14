@@ -165,3 +165,17 @@ def test_fair_handoff_admission_observes_queue_before_it_is_admitted() -> None:
         assert states[-1] == (0, 0)
 
     asyncio.run(exercise())
+
+
+def test_handoff_budget_can_be_released_before_stream_with_idempotent_cleanup():
+    async def run():
+        admission = FairHandoffAdmission(1, 2)
+        async with admission.admit() as ready:
+            assert admission.active == 1
+            await ready()
+            await ready()
+            assert admission.active == 0
+            async with admission.admit():
+                assert admission.active == 1
+        assert admission.active == 0 and admission.queued == 0
+    asyncio.run(run())

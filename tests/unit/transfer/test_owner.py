@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Owner control channel validation without device initialization."""
 
-from dataclasses import asdict
+import msgspec
 import socket
 import struct
 import threading
@@ -16,7 +16,7 @@ import threading
 import pytest
 
 from pypto_serving.transfer.errors import TransferFailure
-from pypto_serving.transfer.owner import OwnerBridge, _receive, _send, _task
+from pypto_serving.transfer.owner import OwnerBridge, _receive, _send, _task, _task_wire
 from pypto_serving.transfer.types import (
     CompletionCertainty, OwnerRef, ProviderTransferTask, RegionLease, Segment, TransferAttemptRef,
 )
@@ -27,11 +27,39 @@ def test_task_wire_round_trip():
     ref = TransferAttemptRef("r", "p", "h", "a", 0, 0, 0, source, destination, "m")
     task = ProviderTransferTask(ref, (Segment(
         "ori", RegionLease(source, "s", 1, 64), RegionLease(destination, "d", 1, 64), 0, 0, 64),))
-    assert _task(asdict(task)) == task
-    malformed = asdict(task)
-    malformed["segments"][0]["length"] = 65
+    wire = msgspec.msgpack.decode(msgspec.msgpack.encode(_task_wire(task)))
+    assert _task(wire) == task
+    malformed = wire
+    malformed[3][0][5] = 65
     with pytest.raises(ValueError):
         _task(malformed)
+
+
+@pytest.mark.parametrize("field,value", [(0, -1), (1, 2), (2, -1), (3, -64), (5, 0)])
+def test_compact_task_rejects_invalid_table_references_and_ranges(field, value):
+    source, destination = OwnerRef("run", 0, 1, 1, "P"), OwnerRef("run", 0, 2, 2, "D")
+    ref = TransferAttemptRef("r", "p", "h", "a", 0, 0, 0, source, destination, "m")
+    task = ProviderTransferTask(ref, (Segment(
+        "ori", RegionLease(source, "s", 1, 64), RegionLease(destination, "d", 1, 64), 0, 0, 64),))
+    wire = msgspec.msgpack.decode(msgspec.msgpack.encode(_task_wire(task)))
+    wire[3][0][field] = value
+    with pytest.raises(ValueError):
+        _task(wire)
+
+
+def test_compact_task_interns_metadata_without_losing_generation():
+    source, destination = OwnerRef("run", 0, 1, 1, "P"), OwnerRef("run", 4, 2, 3, "D")
+    ref = TransferAttemptRef("r", "p", "h", "a", 2, 3, 4, source, destination, "m", 5)
+    src, dst = RegionLease(source, "s", 3, 1 << 20), RegionLease(destination, "d", 7, 1 << 20)
+    task = ProviderTransferTask(ref, tuple(Segment("ori", src, dst, i * 64, i * 128, 64)
+                                         for i in range(3014)))
+    compact = _task_wire(task)
+    assert len(compact.leases) == 2 and len(compact.components) == 1
+    encoded = msgspec.msgpack.encode(compact)
+    assert len(encoded) < len(msgspec.msgpack.encode(task)) / 10
+    restored = _task(msgspec.msgpack.decode(encoded))
+    assert restored == task
+    assert restored.segments[0].source is restored.segments[-1].source
 
 
 def test_owner_preserves_numeric_backend_error():

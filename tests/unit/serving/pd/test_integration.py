@@ -20,13 +20,36 @@ from starlette.requests import Request
 
 from pypto_serving.config.types import DecodeBatch
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_ADAPTER, DSparkPDWorker
-from pypto_serving.serving.pd.integration import PDNodeRuntime
+from pypto_serving.serving.pd.integration import PDApplication, PDNodeRuntime
 from pypto_serving.serving.pd.http_api import PDHTTPRoutes, PrepareRequestHTTP
 from pypto_serving.serving.pd.worker import PDWorkerServices
 
 
 async def _empty_request(*args, **kwargs):
     yield SimpleNamespace(finished=True)
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_application_never_stops_engine_before_confirmed_retirement(failed):
+    async def exercise():
+        events = []
+        async def retire():
+            events.append("retire")
+            if failed:
+                raise RuntimeError("retirement incomplete")
+        async def stop():
+            events.append("stop")
+        app = object.__new__(PDApplication)
+        app._progress_client = None
+        app.service, app.engine = SimpleNamespace(close=retire), SimpleNamespace(stop=stop)
+        if failed:
+            with pytest.raises(RuntimeError, match="retirement incomplete"):
+                await app.stop()
+            assert events == ["retire"]
+        else:
+            await app.stop()
+            assert events == ["retire", "stop"]
+    asyncio.run(exercise())
 
 
 def _node(events, submit=_empty_request):
@@ -36,6 +59,7 @@ def _node(events, submit=_empty_request):
         add_prefilled_request=None,
         abort_request=None,
         call_worker=None,
+        call_progress=None,
         finish_prefilled_request=lambda request: events.append(("finish", request)),
         hold_request=lambda request: events.append(("hold", request)),
         resume_request=lambda request: events.append(("resume", request)),

@@ -32,6 +32,7 @@ from .protocol import (
     ReserveRejected,
     ReserveRequest,
     TransferResult,
+    TransferResultBundle,
     constraint_spec_hash,
     validate_prefix_match_spec,
     validate_rank_mapping,
@@ -172,6 +173,14 @@ class DecodeConnector:
         tracker.record_transfer(result)
         if tracker.state is CompletionState.QUARANTINED:
             self.cache_manager.quarantine_group_cache(tracker.reservation_id)
+
+    def validate_transfer_results(self, bundle: TransferResultBundle) -> None:
+        self._require_tracker(bundle.key).validate_results(bundle)
+
+    def record_transfer_results(self, bundle: TransferResultBundle) -> None:
+        self.validate_transfer_results(bundle)
+        for result in bundle.results:
+            self.record_transfer(result)
 
     def commit(self, request: CommitRequest) -> ReadyAck:
         tracker = self._require_tracker(request.key)

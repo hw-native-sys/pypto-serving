@@ -8,11 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 import asyncio
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_ADAPTER
+from pypto_serving.serving.engine.async_engine import TokenOutput
 from pypto_serving.serving.pd.config import PDConfig, PDRole
 from pypto_serving.serving.pd.http_api import (
     AuthorizeRouteHTTP,
@@ -20,18 +22,150 @@ from pypto_serving.serving.pd.http_api import (
     ReservePlacementHTTP,
     capability_compatibility_digest,
 )
-from pypto_serving.serving.pd.protocol import HandoffKey
+from pypto_serving.serving.pd.protocol import HandoffKey, ControlError, OpenRoute, RouteOpened
 from pypto_serving.serving.pd.service import PDServingService
 from pypto_serving.serving.reasoning import ParsedToolCall, ToolCallDelta
 from pypto_serving.serving.pd.worker_api import (
-    OP_POLL_TRANSFER_CHUNK,
-    TransferPollRequest,
     TransferPollResponse,
-    decode_worker_payload,
-    encode_worker_payload,
 )
 
 from .test_service import _FakeCore, _OverlapFakeCore, _free_port
+
+
+def test_decode_route_quota_uses_live_reservations_while_completed_tasks_finish_cleanup():
+    async def exercise():
+        service = object.__new__(PDServingService)
+        service.config = SimpleNamespace(max_active_handoffs=4, max_pending_handoffs=8)
+        service._external_handoff_tasks = {}
+        service._health_error = ""
+        states = {}
+        service.decode_connector = SimpleNamespace(query=lambda key: SimpleNamespace(state=states[key]))
+        incoming, replies = asyncio.Queue(), asyncio.Queue()
+        cleanup = asyncio.Event()
+
+        async def handoff(session, queue, key):
+            message = await queue.get()
+            await session.send(RouteOpened(key, message.reservation_id))
+            await cleanup.wait()
+
+        service._serve_external_handoff = handoff
+        session = SimpleNamespace(receive=incoming.get, send=replies.put)
+        runner = asyncio.create_task(service._serve_external_session(session))
+
+        async def open_route(index, state):
+            key = HandoffKey(f"request-{index}", f"handoff-{index}", 1, 1, 1)
+            states[key] = "RESERVED"
+            await incoming.put(OpenRoute(key, "prepared", "reservation", "digest", "cap", "compat", "p", 1))
+            response = await asyncio.wait_for(replies.get(), 1)
+            states[key] = state
+            return key, response
+
+        try:
+            # One completed task still owns its cleanup coroutine. Four Decode
+            # routes and four new transfers remain legal reservation owners.
+            for index, state in enumerate(("COMPLETED",) + ("IN_USE",) * 4 + ("RESERVED",) * 4):
+                key, response = await open_route(index, state)
+                assert isinstance(response, RouteOpened), response
+            assert len(service._external_handoff_tasks) == 9
+            _, response = await open_route(9, "RESERVED")
+            assert isinstance(response, ControlError) and response.error_code == "HANDOFF_BACKPRESSURE"
+            states[key] = "READY"
+            _, response = await open_route(10, "RESERVED")
+            assert isinstance(response, ControlError) and response.error_code == "HANDOFF_BACKPRESSURE"
+        finally:
+            runner.cancel()
+            await asyncio.gather(runner, return_exceptions=True)
+            tasks = tuple(service._external_handoff_tasks.values())
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
+def test_authenticated_route_rejection_returns_no_start_proof_without_compute():
+    async def exercise():
+        port = _free_port()
+        p_core = _FakeCore(PDRole.PREFILL)
+        prefill = PDServingService(p_core, _external_config(PDRole.PREFILL, port))
+        decode = PDServingService(_FakeCore(PDRole.DECODE), _external_config(PDRole.DECODE, port))
+        original = decode._serve_external_handoff
+
+        async def reject(session, queue, key):
+            await queue.get()
+            await session.send(ControlError(key, "OpenRoute", "HANDOFF_BACKPRESSURE", True))
+
+        decode._serve_external_handoff = reject
+        await asyncio.gather(prefill.start(), decode.start())
+        stream = None
+        try:
+            key, stream, execute = await _open_test_handoff(prefill, decode, port, request_id="rejected")
+            result = await execute
+            assert result.state == "NOT_STARTED" and result.error_code == "HANDOFF_BACKPRESSURE"
+            assert not p_core.manifests and not prefill._prepared_by_id
+            await stream.aclose()
+            await decode.abort_handoff(key, "NOT_STARTED", deterministic=True)
+            decode._serve_external_handoff = original
+            _, stream, execute = await _open_test_handoff(prefill, decode, port, request_id="next")
+            assert [frame.output.token_id async for frame in stream] == [101, 102]
+            assert (await execute).state == "READY"
+            assert not prefill.health_error and not decode.health_error
+        finally:
+            if stream is not None:
+                await stream.aclose()
+            await asyncio.gather(prefill.close(), decode.close())
+
+    asyncio.run(asyncio.wait_for(exercise(), 15))
+
+
+def test_router_cancel_retires_decode_task_blocked_on_output_backpressure():
+    class SlowConsumerCore(_FakeCore):
+        def __init__(self):
+            super().__init__(PDRole.DECODE)
+            self.queue_filled = asyncio.Event()
+            self.output_closed = asyncio.Event()
+            self.scheduler_stopped = False
+
+        async def add_adopted_handoff(self, **kwargs):
+            self.kv_cache_manager.adopt_group_cache(kwargs["reservation_id"])
+            try:
+                for index in range(65):
+                    if index == 64:
+                        self.queue_filled.set()
+                    yield TokenOutput(token_id=101, text="x" * (index + 1), completion_tokens=index + 1)
+            finally:
+                self.output_closed.set()
+
+        async def abort_request(self, request_id):
+            await super().abort_request(request_id)
+            self.scheduler_stopped = True
+
+    async def exercise():
+        port = _free_port()
+        prefill = PDServingService(_FakeCore(PDRole.PREFILL), _external_config(PDRole.PREFILL, port))
+        core = SlowConsumerCore()
+        decode = PDServingService(core, _external_config(PDRole.DECODE, port))
+        await asyncio.gather(prefill.start(), decode.start())
+        stream = None
+        try:
+            key, stream, execute = await _open_test_handoff(prefill, decode, port, request_id="cancel-slow")
+            assert (await execute).state == "READY"
+            await core.queue_filled.wait()
+            task = decode._external_handoff_tasks[key]
+            assert not task.done() and decode._decode_queues[key].full()
+            status = await decode.abort_handoff(key, "CLIENT_CANCELLED", deterministic=True)
+            assert status.state == "ABORTED"
+            assert core.scheduler_stopped and core.output_closed.is_set()
+            assert task.done() and key not in decode._external_handoff_tasks
+            assert key not in decode._decode_queues and not decode.health_error
+            assert decode._admission.count == 0
+            assert not core.kv_cache_manager.group_cache_reservations
+        finally:
+            if stream is not None:
+                await stream.aclose()
+            await asyncio.gather(prefill.close(), decode.close())
+
+    asyncio.run(asyncio.wait_for(exercise(), 15))
 
 
 def _external_config(role: PDRole, port: int) -> PDConfig:
@@ -293,18 +427,16 @@ def test_slow_final_transfer_does_not_block_another_handoff():
         port = _free_port()
         core = _FakeCore(PDRole.PREFILL, capacity_slots=4)
         started, release = asyncio.Event(), asyncio.Event()
-        original_call = core.call_pd_worker
+        original_poll = core.poll_transfer
 
-        async def call(operation, payload=b""):
-            if operation == OP_POLL_TRANSFER_CHUNK:
-                poll = decode_worker_payload(payload, TransferPollRequest)
-                request, _ = core.transfer_jobs[poll.job_id]
-                if request.manifest.key.request_id == "slow" and not release.is_set():
-                    started.set()
-                    return encode_worker_payload(TransferPollResponse(poll.job_id, False))
-            return await original_call(operation, payload)
+        def poll(job_id):
+            request, _ = core.transfer_jobs[job_id]
+            if request.manifest.key.request_id == "slow" and not release.is_set():
+                started.set()
+                return TransferPollResponse(job_id, False)
+            return original_poll(job_id)
 
-        core.call_pd_worker = call
+        core.poll_transfer = poll
         prefill = PDServingService(core, _external_config(PDRole.PREFILL, port))
         decode = PDServingService(_FakeCore(PDRole.DECODE, capacity_slots=4), _external_config(PDRole.DECODE, port))
         await asyncio.gather(prefill.start(), decode.start())

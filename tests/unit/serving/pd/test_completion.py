@@ -9,6 +9,8 @@
 
 import pytest
 import msgspec
+import asyncio
+from types import SimpleNamespace
 
 from pypto_serving.serving.pd.completion import CompletionState, CompletionTracker
 from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_CONTRACT
@@ -19,6 +21,7 @@ from pypto_serving.serving.pd.protocol import (
     HandoffKey,
     RankMapping,
     TransferResult,
+    TransferResultBundle,
     TransferUnit,
     chunk_payload_hash,
     continuation_metadata_hash,
@@ -27,6 +30,107 @@ from pypto_serving.transfer.types import CompletionCertainty
 
 
 KEY = HandoffKey("request", "handoff", 1, 2, 3)
+
+
+@pytest.mark.parametrize("failure", ["none", "fsync", "ack"])
+def test_service_completion_is_durable_before_ack_and_commit(failure, tmp_path, monkeypatch):
+    from .test_journal import _config
+    from pypto_serving.serving.pd.journal import DurablePDJournal
+    from pypto_serving.serving.pd.protocol import OpenRoute, ControlAck, ReadyAck
+    from pypto_serving.serving.pd.service import PDServingService
+
+    async def exercise():
+        tracker = CompletionTracker(KEY, "reservation")
+        tracker.register_chunk(_final_manifest())
+        bundle = TransferResultBundle(KEY, 0, tuple(
+            _result(name, CompletionCertainty.COMPLETED)
+            for name in DSV4_DSPARK_K7_CONTRACT.physical_regions
+        ))
+        journal = DurablePDJournal(str(tmp_path / "journal"), _config(tmp_path / "journal"))
+        order = []
+
+        def record(event, **kwargs):
+            journal.append(event, **kwargs)
+            order.append(event)
+
+        def apply(message):
+            assert order[-1] == "TRANSFER_RESULTS_RECORDED"
+            for result in message.results:
+                tracker.record_transfer(result)
+            order.append("applied")
+
+        async def send(message):
+            if isinstance(message, ControlAck):
+                assert order[-1] == "applied"
+                if failure == "ack":
+                    raise OSError("ACK lost")
+                order.append("ack")
+            if isinstance(message, ReadyAck):
+                assert order[-1] == "HANDOFF_COMMITTED"
+                order.append("ready")
+
+        async def stream(key):
+            assert key == KEY
+
+        service = object.__new__(PDServingService)
+        service.decode_connector = SimpleNamespace(
+            validate_transfer_results=tracker.validate_results,
+            query=lambda key: SimpleNamespace(reservation_id="reservation", state="TRANSFERRING"),
+            record_transfer_results=apply, commit=tracker.commit,
+        )
+        service._validate_open_route = lambda message, session: None
+        service._record, service._stream_decode = record, stream
+        queue = asyncio.Queue()
+        for message in (OpenRoute(KEY, "prepared", "reservation", "digest", "cap", "compat", "p", 1),
+                        bundle, _commit(_final_manifest())):
+            queue.put_nowait(message)
+        if failure == "fsync":
+            def failed_sync(fd):
+                raise OSError("fsync failed")
+            monkeypatch.setattr("os.fsync", failed_sync)
+        try:
+            if failure == "none":
+                await service._serve_external_handoff(SimpleNamespace(send=send), queue, KEY)
+                assert order == ["TRANSFER_RESULTS_RECORDED", "applied", "ack", "HANDOFF_COMMITTED", "ready"]
+            else:
+                with pytest.raises(OSError):
+                    await service._serve_external_handoff(SimpleNamespace(send=send), queue, KEY)
+                assert "ready" not in order and "HANDOFF_COMMITTED" not in order
+                if failure == "fsync":
+                    assert not any(unit.attempts for unit in tracker._chunks[0].units.values())
+                else:
+                    # A lost ACK does not undo durable facts; an identical
+                    # replay is legal, with conflicting replay tested below.
+                    tracker.validate_results(bundle)
+        finally:
+            monkeypatch.undo()
+            journal.close()
+
+    asyncio.run(exercise())
+
+
+def test_bundle_validates_every_unit_before_applying_and_preserves_zero_byte_facts():
+    tracker = CompletionTracker(KEY, "reservation")
+    tracker.register_chunk(_final_manifest())
+    results = tuple(_result(name, CompletionCertainty.COMPLETED)
+                    for name in DSV4_DSPARK_K7_CONTRACT.physical_regions)
+    with pytest.raises(ValueError, match="expected completion set"):
+        tracker.validate_results(TransferResultBundle(KEY, 0, results[:-1]))
+    with pytest.raises(ValueError, match="duplicate"):
+        TransferResultBundle(KEY, 0, results + results[:1])
+    invalid = results[:-1] + (msgspec.structs.replace(results[-1], source_rank_id=4),)
+    with pytest.raises(ValueError, match="rank mapping"):
+        tracker.validate_results(TransferResultBundle(KEY, 0, invalid))
+    assert not any(unit.attempts for unit in tracker._chunks[0].units.values())
+    bundle = TransferResultBundle(KEY, 0, results)
+    tracker.validate_results(bundle)
+    for result in results:
+        tracker.record_transfer(result)
+    tracker.validate_results(bundle)
+    changed = results[:-1] + (msgspec.structs.replace(results[-1], error_code="changed"),)
+    with pytest.raises(ValueError, match="conflicting"):
+        tracker.validate_results(TransferResultBundle(KEY, 0, changed))
+    assert tracker.commit(_commit(_final_manifest())).manifest_hash == _final_manifest().manifest_hash
 
 
 def _final_manifest() -> ChunkManifest:

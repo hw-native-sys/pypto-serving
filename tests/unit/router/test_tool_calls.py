@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Public PD Router tool-call shape without loading a model or device worker."""
 
+import asyncio
 import json
 
 import pytest
@@ -58,6 +59,53 @@ def _sse_events(response):
     lines = [line[6:] for line in response.text.splitlines() if line.startswith("data: ")]
     assert lines[-1] == "[DONE]"
     return [json.loads(line) for line in lines[:-1]]
+
+
+@pytest.mark.parametrize("after_output", (False, True))
+@pytest.mark.parametrize("error_type", (RuntimeError, EOFError, TimeoutError))
+def test_completion_reports_execution_failure_after_headers_as_sse(tmp_path, monkeypatch, after_output, error_type):
+    async def no_reconcile(self):
+        return None
+
+    async def fail(self, request_kind, request_json, request_id, publish_immediately=True, _signal_prepared=False):
+        if _signal_prepared:
+            yield None
+        if after_output:
+            yield DecodeOutputWire(HandoffKey(request_id, "handoff", 1, 1, 1), 1, "ok", False, "", 4, 1,
+                                   output_sequence=1, text_delta="ok")
+        raise error_type("P rejected before transfer: HANDOFF_BACKPRESSURE")
+
+    monkeypatch.setattr(RouterCoordinator, "reconcile_startup", no_reconcile)
+    monkeypatch.setattr(RouterCoordinator, "generate", fail)
+    with TestClient(create_router_app(_config(tmp_path))) as client:
+        events = _sse_events(client.post("/v1/completions", json={"prompt": "hello", "stream": True}))
+    assert events[-1]["error"]["code"] == 503
+    assert "HANDOFF_BACKPRESSURE" in events[-1]["error"]["message"]
+    assert len(events) == (2 if after_output else 1)
+
+
+def test_completion_stream_uses_deltas_without_repeating_terminal_summary(tmp_path, monkeypatch):
+    async def no_reconcile(self):
+        return None
+
+    async def generate(self, request_kind, request_json, request_id, publish_immediately=True, _signal_prepared=False):
+        if _signal_prepared:
+            yield None
+        key = HandoffKey(request_id, "handoff", 1, 1, 1)
+        if publish_immediately:
+            yield DecodeOutputWire(key, 1, "", False, "", 4, 1, output_sequence=1, text_delta="city")
+        yield DecodeOutputWire(key, 2, "city\ufffd", True, "FINISHED_LENGTH", 4, 2, (1, 2),
+                               output_sequence=2, text_delta="\ufffd" if publish_immediately else "city\ufffd")
+
+    monkeypatch.setattr(RouterCoordinator, "reconcile_startup", no_reconcile)
+    monkeypatch.setattr(RouterCoordinator, "generate", generate)
+    with TestClient(create_router_app(_config(tmp_path))) as client:
+        result = client.post("/v1/completions", json={"prompt": "hello"}).json()
+        events = _sse_events(client.post("/v1/completions", json={"prompt": "hello", "stream": True}))
+    assert result["choices"][0]["text"] == "city\ufffd"
+    assert "".join(event["choices"][0]["text"] for event in events if event["choices"]) == "city\ufffd"
+    assert events[-2]["choices"][0]["finish_reason"] == "length"
+    assert events[-1]["usage"]["completion_tokens"] == 2
 
 
 def test_pd_router_formats_tool_calls_and_roundtrips_history(tmp_path, monkeypatch):
@@ -187,13 +235,14 @@ def test_pd_router_respects_parallel_tool_calls_false(tmp_path, monkeypatch, str
     assert choice["finish_reason"] == "tool_calls"
 
 
-def test_pd_router_stream_reports_decode_parser_failure_as_sse(tmp_path, monkeypatch):
+@pytest.mark.parametrize("error_type", (RuntimeError, EOFError, TimeoutError))
+def test_pd_router_stream_reports_decode_parser_failure_as_sse(tmp_path, monkeypatch, error_type):
     async def no_reconcile(self):
         return None
 
     async def failing_generate(self, *_args, **_kwargs):
         yield None  # P preparation succeeded; the error belongs to Decode.
-        raise RuntimeError("D Decode failed: invalid tool call")
+        raise error_type("D Decode failed: invalid tool call")
 
     monkeypatch.setattr(RouterCoordinator, "reconcile_startup", no_reconcile)
     monkeypatch.setattr(RouterCoordinator, "generate", failing_generate)
@@ -209,6 +258,24 @@ def test_pd_router_stream_reports_decode_parser_failure_as_sse(tmp_path, monkeyp
         "type": "pd_decode_error",
         "code": 503,
     }}]
+
+
+@pytest.mark.parametrize("kind", ("completion", "chat"))
+def test_public_stream_cancellation_is_not_converted_to_error_or_done(kind):
+    from pypto_serving.router.app import _stream_chat, _stream_completion
+
+    async def outputs():
+        yield DecodeOutputWire(HandoffKey("r", "h", 1, 1, 1), 1, "", False, "", 4, 1, text_delta="ok")
+        raise asyncio.CancelledError
+
+    async def exercise():
+        formatter = _stream_chat if kind == "chat" else _stream_completion
+        stream = formatter(outputs(), "r", "model")
+        assert b"ok" in await anext(stream)
+        with pytest.raises(asyncio.CancelledError):
+            await anext(stream)
+
+    asyncio.run(exercise())
 
 
 def test_pd_router_rejects_preparation_before_sse_headers(tmp_path, monkeypatch):

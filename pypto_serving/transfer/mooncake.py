@@ -14,6 +14,7 @@ from dataclasses import asdict
 import importlib
 import os
 import threading
+import time
 from typing import Callable
 
 from pypto_serving.tools.profile import profile_span
@@ -30,7 +31,7 @@ class MooncakeTransferProvider:
         self._pid = os.getpid()
         self._poisoned = False
         self._regions: dict[str, tuple[RegionLease, int]] = {}
-        self._destinations: dict[tuple[str, str, int, str], dict] = {}
+        self._destinations: dict[tuple[str, str, int, str], tuple[RegionLease, dict]] = {}
         self._last_leases: dict[str, int] = {}
         if engine_factory is None:
             engine_factory = importlib.import_module("mooncake.engine").TransferEngine
@@ -81,22 +82,23 @@ class MooncakeTransferProvider:
             raise ValueError("invalid private destination endpoint")
         previous = self._destinations.get(lease.registration_key)
         if previous is not None:
-            old = previous["lease"]
-            if (lease.owner.generation < old["owner"]["generation"]
-                    or lease.owner.endpoint_generation < old["owner"]["endpoint_generation"]
-                    or (lease.owner.generation == old["owner"]["generation"] and lease.lease < old["lease"])
-                    or (old == asdict(lease) and previous != envelope)):
+            old, previous_envelope = previous
+            if (lease.owner.generation < old.owner.generation
+                    or lease.owner.endpoint_generation < old.owner.endpoint_generation
+                    or (lease.owner.generation == old.owner.generation and lease.lease < old.lease)
+                    or (old == lease and previous_envelope != envelope)):
                 raise ValueError("stale or inconsistent destination registration")
-        self._destinations[lease.registration_key] = dict(envelope)
+        self._destinations[lease.registration_key] = (lease, dict(envelope))
 
     def write(self, task: ProviderTransferTask, on_submitted: Callable[[], None] = lambda: None) -> None:
+        started = time.monotonic_ns()
         self._check()
         task.validate(self.capabilities)
         local, remote, lengths, endpoints = [], [], [], set()
         for segment in task.segments:
             lease, address = self._regions[segment.source.region_id]
-            envelope = self._destinations[segment.destination.registration_key]
-            if lease != segment.source or envelope["lease"] != asdict(segment.destination):
+            destination_lease, envelope = self._destinations[segment.destination.registration_key]
+            if lease != segment.source or destination_lease != segment.destination:
                 raise ValueError("stale region lease")
             local.append(address + segment.source_offset)
             remote.append(envelope["address"] + segment.destination_offset)
@@ -105,6 +107,7 @@ class MooncakeTransferProvider:
         if len(endpoints) != 1:
             raise ValueError("one batch must target one endpoint")
         on_submitted()
+        native_started = time.monotonic_ns()
         try:
             # This span brackets the synchronous native Mooncake call in the
             # owner-local thread.  It carries sizes only: endpoints and native
@@ -112,7 +115,8 @@ class MooncakeTransferProvider:
             with profile_span(
                 "MooncakeTransferEngine.batch_transfer_sync_write",
                 cat="native-transfer",
-                args={"bytes": sum(lengths), "segments": len(lengths)},
+                args={"bytes": sum(lengths), "segments": len(lengths),
+                      "request_id": task.attempt.request_id, "chunk_id": task.attempt.chunk_id},
             ):
                 self._check_code(
                     self._engine.batch_transfer_sync_write(
@@ -120,6 +124,10 @@ class MooncakeTransferProvider:
                     ),
                     Certainty.UNKNOWN,
                 )
+            self.last_write_timings = {
+                "provider_lower_ns": native_started - started,
+                "native_ns": time.monotonic_ns() - native_started,
+            }
         except BaseException as exc:
             self._poisoned = True
             if isinstance(exc, TransferFailure):

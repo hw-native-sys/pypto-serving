@@ -125,12 +125,14 @@ class FairHandoffAdmission:
             self._wake_locked()
             self._observe_locked()
         acquired = False
-        try:
-            await waiter
-            acquired = True
-            yield
-        finally:
+        released = False
+
+        async def release():
+            nonlocal released
             async with self._lock:
+                if released:
+                    return
+                released = True
                 if not acquired:
                     try:
                         self._waiters.remove(waiter)
@@ -143,3 +145,10 @@ class FairHandoffAdmission:
                     self._active -= 1
                 self._wake_locked()
                 self._observe_locked()
+
+        try:
+            await waiter
+            acquired = True
+            yield release
+        finally:
+            await release()

@@ -9,6 +9,7 @@
 """Exercise the production worker's rank/lease selection without a device."""
 
 from concurrent.futures import Future
+import threading
 from types import SimpleNamespace
 
 import msgspec
@@ -18,6 +19,7 @@ from pypto_serving.model.deepseek_dspark.pd_adapter import DSV4_DSPARK_K7_ADAPTE
 from pypto_serving.serving.pd.protocol import ChunkManifest, HandoffKey, RankMapping
 from pypto_serving.serving.pd.worker import PDWorkerRuntime
 from pypto_serving.serving.pd.worker_api import InstallPeerRequest, TransferChunkRequest
+from pypto_serving.transfer.agent import TransferAgent as RealTransferAgent
 from pypto_serving.transfer.types import CompletionCertainty, OwnerRef, RegionLease
 
 from .helpers import make_cache_manager, make_registry
@@ -39,6 +41,8 @@ class _Agent:
         self.owner = owner
         self.tasks = []
         self.futures = []
+        self.released = []
+        self.status = SimpleNamespace(release=self.released.append)
 
     def submit(self, task, fence, *, timeout):
         assert fence.wait(timeout)
@@ -113,13 +117,68 @@ def test_worker_submits_all_actual_source_owners_before_any_completion(worker, s
     assert sum(len(agent.tasks) for agent in runtime._pd_transfer_agents) == 4
     for rank in active:
         runtime._pd_transfer_agents[rank].futures[0].set_result(
-            SimpleNamespace(certainty=CompletionCertainty.COMPLETED, error=None)
+            SimpleNamespace(certainty=CompletionCertainty.COMPLETED, error=None,
+                            attempt=runtime._pd_transfer_agents[rank].tasks[0].attempt)
         )
     result = runtime._poll_pd_chunk(submission.job_id)
     assert result.complete
     assert {(item.source_rank_id, item.destination_rank_id) for item in result.results} == {
         (pair.source_rank_id, pair.destination_rank_id) for pair in request.manifest.rank_mapping
     }
+    assert runtime._poll_pd_chunk(submission.job_id) == result
+    for rank in active:
+        agent = runtime._pd_transfer_agents[rank]
+        assert agent.released == [agent.tasks[0].attempt]
+
+
+@pytest.mark.parametrize("certainty", (CompletionCertainty.NOT_SUBMITTED, CompletionCertainty.UNKNOWN))
+def test_worker_retains_uncertain_status_but_releases_observed_deterministic_failure(worker, certainty):
+    from pypto_serving.transfer.errors import ErrorCode, TransferError
+
+    runtime, manager, registry = worker
+    request = _request(manager, registry, 0, 0)
+    submission = runtime._submit_pd_chunk(request)
+    for agent in runtime._pd_transfer_agents[:4]:
+        agent.futures[0].set_result(SimpleNamespace(
+            certainty=certainty, error=TransferError(ErrorCode.DEADLINE, certainty),
+            attempt=agent.tasks[0].attempt,
+        ))
+    response = runtime._poll_pd_chunk(submission.job_id)
+    assert response.complete
+    for agent in runtime._pd_transfer_agents[:4]:
+        assert agent.released == ([] if certainty is CompletionCertainty.UNKNOWN else [agent.tasks[0].attempt])
+
+
+def test_worker_continues_past_status_capacity_with_bounded_terminal_history(worker):
+    class Provider:
+        def write(self, task, on_submitted):
+            on_submitted()
+
+    runtime, manager, registry = worker
+    request = _request(manager, registry, 0, 0)
+    # Reuse the real task's capabilities and real agent status state machine.
+    from pypto_serving.transfer.owner import OwnerBridge
+    provider = Provider()
+    provider.capabilities = OwnerBridge.capabilities
+    agents = [RealTransferAgent(bridge.owner, provider, poison=lambda _: None, status_capacity=2)
+              for bridge in runtime._pd_owner_bridges[:4]]
+    runtime._pd_transfer_agents = tuple(agents) + runtime._pd_transfer_agents[4:]
+    try:
+        for index in range(1030):
+            key = msgspec.structs.replace(request.manifest.key, handoff_id=f"handoff-{index}")
+            item = msgspec.structs.replace(request, manifest=msgspec.structs.replace(request.manifest, key=key))
+            submission = runtime._submit_pd_chunk(item)
+            for rank in runtime._pd_transfer_jobs[submission.job_id]["ranks"]:
+                assert rank["submit_error"] is None
+                rank["future"].result(timeout=5)
+            response = runtime._poll_pd_chunk(submission.job_id)
+            assert response.complete
+            assert all(result.certainty == "COMPLETED" for result in response.results)
+        assert all(len(agent.status._events) <= 2 for agent in agents)
+        assert len(runtime._pd_transfer_jobs) <= 64
+    finally:
+        for agent in agents:
+            agent.close()
 
 
 def test_peer_registration_is_batched_and_reused_per_source_owner(worker):
@@ -153,3 +212,40 @@ def test_invalid_last_destination_is_rejected_before_any_rank_is_submitted(worke
     with pytest.raises(ValueError, match="byte accounting"):
         runtime._submit_pd_chunk(request)
     assert not any(agent.tasks for agent in runtime._pd_transfer_agents)
+
+
+def test_completion_reader_does_not_wait_for_another_job_lowering(worker, monkeypatch):
+    runtime, manager, registry = worker
+    request = _request(manager, registry, 0, 0)
+    submission = runtime._submit_pd_chunk(request)
+    for agent in runtime._pd_transfer_agents[:4]:
+        agent.futures[0].set_result(SimpleNamespace(
+            certainty=CompletionCertainty.COMPLETED, error=None, attempt=agent.tasks[0].attempt,
+        ))
+    entered, release = threading.Event(), threading.Event()
+    original = type(registry).lower
+    def lower(*args, **kwargs):
+        entered.set()
+        assert release.wait(2)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(type(registry), "lower", lower)
+    another = msgspec.structs.replace(request, manifest=msgspec.structs.replace(
+        request.manifest, key=msgspec.structs.replace(request.manifest.key, handoff_id="another"),
+    ))
+    errors = []
+    def submit():
+        try:
+            runtime._submit_pd_chunk(another)
+        except BaseException as exc:
+            errors.append(exc)
+    thread = threading.Thread(target=submit)
+    thread.start()
+    try:
+        assert entered.wait(1)
+        assert runtime._poll_pd_chunk(submission.job_id).complete
+        assert runtime._poll_pd_chunk(submission.job_id).complete
+    finally:
+        release.set()
+        thread.join(2)
+    assert not thread.is_alive() and not errors
+    assert all(len(agent.released) == 1 for agent in runtime._pd_transfer_agents[:4])

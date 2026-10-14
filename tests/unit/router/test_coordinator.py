@@ -458,6 +458,61 @@ def test_directory_rejects_a_stale_router_control_incarnation() -> None:
     asyncio.run(exercise())
 
 
+def test_ready_releases_handoff_but_holds_request_budget_through_abort(monkeypatch, tmp_path):
+    async def exercise():
+        waiting = asyncio.Event()
+        p_client = _PrefillClient(waiting)
+
+        class CheckedDecode(_BlockingAfterOutputDecodeClient):
+            async def post(self, path, payload, response_type=None):
+                if path == "/internal/pd/abort":
+                    assert coordinator.requests.active == 1
+                return await super().post(path, payload, response_type)
+
+        coordinator, journal = _coordinator(monkeypatch, tmp_path, p_client, CheckedDecode(waiting))
+        stream = coordinator.generate("completion", b'{}', "request")
+        assert not (await anext(stream)).finished
+        assert coordinator.admission.active == 0
+        assert coordinator.requests.active == 1
+        await stream.aclose()
+        assert coordinator.admission.active == coordinator.requests.active == 0
+        assert journal.unresolved == ()
+        journal.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("bad_state", [False, True])
+def test_delayed_p_result_is_validated_after_d_finishes(monkeypatch, tmp_path, bad_state):
+    async def exercise():
+        waiting = asyncio.Event()
+
+        class DelayedPrefill(_PrefillClient):
+            async def post(self, path, payload, response_type=None):
+                result = await super().post(path, payload, response_type)
+                if path == "/internal/pd/execute":
+                    await asyncio.sleep(0.01)
+                    return PrefillHandoffResult(
+                        result.key, result.reservation_id if bad_state else "wrong",
+                        result.manifest_hash, "FAILED" if bad_state else "READY",
+                    )
+                return result
+
+        coordinator, journal = _coordinator(monkeypatch, tmp_path, DelayedPrefill(waiting), _DecodeClient(waiting))
+        stream = coordinator.generate("completion", b'{}', "request")
+        assert not (await anext(stream)).finished
+        # D can publish while P still retires its source resources; do not admit
+        # another P handoff until the matching P READY result arrives.
+        assert coordinator.admission.active == coordinator.requests.active == 1
+        with pytest.raises(RuntimeError, match="ready handoff|mismatched handoff"):
+            await anext(stream)
+        assert coordinator.admission.active == coordinator.requests.active == 0
+        journal.close()
+        assert '"HANDOFF_COMPLETED"' not in (tmp_path / "router.jsonl").read_text()
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("cancel_scope", [False, True])
 def test_terminal_output_is_completed_before_client_disconnect(
     monkeypatch, tmp_path, cancel_scope,
@@ -674,6 +729,40 @@ def test_router_decode_eof_is_recovery_required_and_aborts_pair(
         journal.close()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("matching_identity", (True, False))
+def test_route_rejection_proof_is_deterministic_only_for_the_matching_handoff(monkeypatch, tmp_path,
+                                                                          matching_identity):
+    class RejectPrefill(_PrefillClient):
+        async def post(self, path, payload, response_type=None):
+            if path == "/internal/pd/execute":
+                key = payload.key if matching_identity else HandoffKey("other", "other", 1, 1, 1)
+                return PrefillHandoffResult(key, payload.reservation_id, "", "NOT_STARTED", "HANDOFF_BACKPRESSURE")
+            return await super().post(path, payload, response_type)
+
+    class WaitingDecode(_DecodeClient):
+        async def stream_decode(self, path, payload):
+            self.waiting.set()
+            yield DecodeStreamFrame(event="waiting", state="AUTHORIZED")
+            await asyncio.Event().wait()
+
+    async def exercise():
+        waiting = asyncio.Event()
+        p_client, d_client = RejectPrefill(waiting), WaitingDecode(waiting)
+        coordinator, journal = _coordinator(monkeypatch, tmp_path, p_client, d_client)
+        try:
+            with pytest.raises(RuntimeError, match="rejected before transfer" if matching_identity else "mismatched"):
+                _ = [output async for output in coordinator.generate(
+                    "completion", b'{"prompt":"hello","max_tokens":2}', "route-rejected")]
+            assert p_client.abort_deterministic == [matching_identity]
+            assert d_client.abort_deterministic == [matching_identity]
+            assert coordinator.requests.active == coordinator.admission.active == 0
+            assert coordinator.recovery.snapshot()["phase"] == ("RUNNING" if matching_identity else "RECOVERY_REQUIRED")
+        finally:
+            journal.close()
+
+    asyncio.run(asyncio.wait_for(exercise(), 5))
 
 
 def test_unpublished_request_is_automatically_reprefilled_on_new_generation(

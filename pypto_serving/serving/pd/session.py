@@ -110,7 +110,7 @@ class MultiplexedPDControlSession:
     always performed with the complete :class:`HandoffKey`.
     """
 
-    def __init__(self, session: PDControlSession, *, queue_size: int = 128) -> None:
+    def __init__(self, session: PDControlSession, *, queue_size: int = 128, lifecycle=None) -> None:
         if type(queue_size) is not int or queue_size < 1:
             raise ValueError("PD multiplex queue size must be a positive integer")
         self._session = session
@@ -119,6 +119,7 @@ class MultiplexedPDControlSession:
         self._closed_keys: deque[object] = deque(maxlen=1024)
         self._reader_task: asyncio.Task | None = None
         self._failure: BaseException | None = None
+        self._lifecycle = lifecycle
 
     @property
     def peer_hello(self) -> Hello:
@@ -177,7 +178,10 @@ class MultiplexedPDControlSession:
                 message = await self._session.receive()
                 key = message_handoff_key(message)
                 if key is None:
-                    raise ValueError("uncorrelated message on multiplexed PD session")
+                    if self._lifecycle is None:
+                        raise ValueError("uncorrelated message on multiplexed PD session")
+                    await self._lifecycle.receive(message)
+                    continue
                 queue = self._routes.get(key)
                 if queue is None:
                     if key in self._closed_keys:

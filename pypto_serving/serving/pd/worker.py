@@ -11,7 +11,12 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import logging
+import threading
+import time
+
+from pypto_serving.tools.profile import profile_span
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +34,31 @@ class PDWorkerRuntime:
         self._pd_attempt_sequences = [0] * model.ranks
         self._pd_peer_registration_request = None
         self._pd_rank_pairs = frozenset()
+        self._pd_registries = {}
+        self._pd_retirement_confirmed = False
+        self._pd_unregistered_ranks = set()
+        self._pd_retired_ranks = set()
+        self._pd_lower_ns = 0
+        self._pd_lower_cpu_ns = 0
+        self._pd_jobs_lock = threading.RLock()
+        self._pd_progress_server = None
+
+    def start_progress(self, channel):
+        from .progress import ProgressServer
+
+        if self._pd_progress_server is not None:
+            raise RuntimeError("transfer progress reader is already running")
+        self._pd_progress_server = ProgressServer(
+            channel, self._poll_pd_chunk, limit=self._pd_worker_config.max_active_handoffs,
+        )
+
+    def _registry(self, rank):
+        """Cache immutable geometry for this worker's resident arena generation."""
+        if rank not in self._pd_registries:
+            self._pd_registries[rank] = self.model.registry(
+                rank, model_revision=self._pd_worker_config.model_revision,
+            )
+        return self._pd_registries[rank]
 
     def worker_options(self):
         from pypto_serving.transfer.owner import OwnerBridge, OwnerBridgeGroup
@@ -58,18 +88,29 @@ class PDWorkerRuntime:
         from pypto_serving.serving.pd.worker_api import (  # noqa: PLC0415
             OP_INSPECT_REGISTRY,
             OP_INSPECT_RUNTIME_METRICS,
+            OP_RELEASE_TRANSFER,
+            OP_FINALIZE_TRANSFER,
             OP_INSTALL_PEER,
-            OP_POLL_TRANSFER_CHUNK,
             OP_PREPARE_REGISTRY,
             OP_SUBMIT_TRANSFER_CHUNK,
             InstallPeerRequest,
-            TransferPollRequest,
             TransferChunkRequest,
             WorkerRuntimeMetrics,
             decode_worker_payload,
             encode_worker_payload,
         )
 
+        if operation == OP_RELEASE_TRANSFER:
+            if payload:
+                raise ValueError("release_transfer does not accept a payload")
+            self.release()
+            return b""
+        if operation == OP_FINALIZE_TRANSFER:
+            if payload or len(self._pd_unregistered_ranks) != len(self._pd_owner_bridges):
+                raise ValueError("finalize_transfer requires all local registrations to be released")
+            self._pd_retirement_confirmed = True
+            self.close()
+            return b""
         if operation == OP_PREPARE_REGISTRY:
             if payload:
                 raise ValueError("prepare_registry does not accept a payload")
@@ -84,10 +125,17 @@ class PDWorkerRuntime:
             if payload:
                 raise ValueError("inspect_runtime_metrics does not accept a payload")
             values = self.model.metrics()
-            values["pd_transfer_jobs"] = float(len(self._pd_transfer_jobs))
-            values["pd_transfer_jobs_active"] = float(
-                sum(job["response"] is None for job in self._pd_transfer_jobs.values())
-            )
+            with self._pd_jobs_lock:
+                values["pd_transfer_jobs"] = float(len(self._pd_transfer_jobs))
+                values["pd_transfer_jobs_active"] = float(
+                    sum(job["response"] is None for job in self._pd_transfer_jobs.values())
+                )
+            values["pd_lower_ns"] = float(self._pd_lower_ns)
+            values["pd_lower_cpu_ns"] = float(self._pd_lower_cpu_ns)
+            for bridge in self._pd_owner_bridges:
+                for name, value in bridge.transfer_metrics.items():
+                    key = f"pd_owner_{name}"
+                    values[key] = values.get(key, 0) + value
             return encode_worker_payload(WorkerRuntimeMetrics(values))
         if operation == OP_INSTALL_PEER:
             request = decode_worker_payload(payload, InstallPeerRequest)
@@ -96,9 +144,6 @@ class PDWorkerRuntime:
         if operation == OP_SUBMIT_TRANSFER_CHUNK:
             request = decode_worker_payload(payload, TransferChunkRequest)
             return encode_worker_payload(self._submit_pd_chunk(request))
-        if operation == OP_POLL_TRANSFER_CHUNK:
-            request = decode_worker_payload(payload, TransferPollRequest)
-            return encode_worker_payload(self._poll_pd_chunk(request.job_id))
         raise ValueError(f"unknown PD worker operation {operation!r}")
 
     def set_transfer_profile_active(self, active: bool) -> None:
@@ -142,10 +187,7 @@ class PDWorkerRuntime:
         registrations = []
         try:
             for rank, bridge in enumerate(self._pd_owner_bridges):
-                registry = self.model.registry(
-                    rank,
-                    model_revision=self._pd_worker_config.model_revision,
-                )
+                registry = self._registry(rank)
                 leases = {}
                 regions = []
                 for component_id, tensor in cache.items():
@@ -204,10 +246,7 @@ class PDWorkerRuntime:
 
         if self._pd_worker_config is None or not self._pd_owner_envelopes:
             raise RuntimeError("PD registry has not been prepared")
-        registry = self.model.registry(
-            0,
-            model_revision=self._pd_worker_config.model_revision,
-        )
+        registry = self._registry(0)
         components = tuple(
             ComponentGeometry(
                 component_id=entry.component_id,
@@ -264,10 +303,7 @@ class PDWorkerRuntime:
                 raise ValueError("peer registration does not contain all model regions")
             leases = {}
             envelopes = {}
-            registry = self.model.registry(
-                rank,
-                model_revision=self._pd_worker_config.model_revision,
-            )
+            registry = self._registry(rank)
             for component_id in self.model.component_ids:
                 region = regions[component_id]
                 entry = registry.entry(component_id)
@@ -333,6 +369,38 @@ class PDWorkerRuntime:
         return sequence
 
     def _submit_pd_chunk(self, request):
+        with self._pd_jobs_lock:
+            replay = self._reserve_job_slot(request)
+        if replay is not None:
+            return replay
+        with profile_span("pd.worker.submit", cat="pd", args={
+            "request_id": request.manifest.key.request_id, "chunk_id": request.manifest.chunk_id,
+        }):
+            return self._lower_submit_pd_chunk(request)
+
+    def _reserve_job_slot(self, request):
+        """Bound the replay index under the short progress publication lock."""
+        from .worker_api import TransferSubmission
+
+        manifest = request.manifest
+        job_id = f"{manifest.key.handoff_id}-c{manifest.chunk_id}-a{request.attempt_ordinal}"
+        existing = self._pd_transfer_jobs.get(job_id)
+        if existing is not None:
+            if existing["request"] != request:
+                raise ValueError("PD transfer job id was replayed with different input")
+            self._pd_transfer_jobs.move_to_end(job_id)
+            return TransferSubmission(job_id)
+        job_limit = max(32, self._pd_worker_config.max_active_handoffs * 16)
+        while len(self._pd_transfer_jobs) >= job_limit:
+            completed_id = next((known_id for known_id, known in self._pd_transfer_jobs.items()
+                                 if known["response"] is not None), None)
+            if completed_id is None:
+                raise RuntimeError("PD transfer job index reached its configured bound")
+            self._pd_transfer_jobs.pop(completed_id)
+
+    def _lower_submit_pd_chunk(self, request):
+        started = time.monotonic_ns()
+        cpu_started = time.thread_time_ns()
         from pypto_serving.serving.pd.protocol import validate_rank_mapping  # noqa: PLC0415
         from pypto_serving.serving.pd.worker_api import TransferSubmission  # noqa: PLC0415
         from pypto_serving.transfer.agent import AlreadyCompletedFence  # noqa: PLC0415
@@ -352,27 +420,6 @@ class PDWorkerRuntime:
         if set(source_by_destination) != set(manifest.copies_by_destination_rank):
             raise ValueError("rank mapping differs from destination page copies")
         job_id = f"{manifest.key.handoff_id}-c{manifest.chunk_id}-a{request.attempt_ordinal}"
-        existing = self._pd_transfer_jobs.get(job_id)
-        if existing is not None:
-            if existing["request"] != request:
-                raise ValueError("PD transfer job id was replayed with different input")
-            self._pd_transfer_jobs.move_to_end(job_id)
-            return TransferSubmission(job_id)
-        job_limit = max(32, self._pd_worker_config.max_active_handoffs * 16)
-        while len(self._pd_transfer_jobs) >= job_limit:
-            completed_id = next(
-                (
-                    known_id
-                    for known_id, known in self._pd_transfer_jobs.items()
-                    if known["response"] is not None
-                ),
-                None,
-            )
-            if completed_id is None:
-                break
-            self._pd_transfer_jobs.pop(completed_id)
-        if len(self._pd_transfer_jobs) >= job_limit:
-            raise RuntimeError("PD transfer job index reached its configured bound")
         units_by_rank = {}
         for unit in manifest.expected_units:
             units_by_rank.setdefault(unit.destination_rank_id, {})[unit.component_id] = unit
@@ -383,18 +430,11 @@ class PDWorkerRuntime:
         for destination_rank in sorted(manifest.copies_by_destination_rank):
             source_rank = source_by_destination[destination_rank]
             copies = self.model.copies(manifest.copies_by_destination_rank[destination_rank])
-            registry = self.model.registry(
-                source_rank,
-                model_revision=self._pd_worker_config.model_revision,
-            )
-            actual_bytes = {
-                component_id: sum(
-                    registry.entry(component_id).block_stride_bytes
-                    for copy in copies
-                    if copy.component_id == component_id
-                )
-                for component_id in units_by_rank[destination_rank]
-            }
+            registry = self._registry(source_rank)
+            strides = {entry.component_id: entry.block_stride_bytes for entry in registry.components}
+            actual_bytes = {component_id: 0 for component_id in units_by_rank[destination_rank]}
+            for copy in copies:
+                actual_bytes[copy.component_id] += strides[copy.component_id]
             expected_bytes = {
                 component_id: unit.nbytes for component_id, unit in units_by_rank[destination_rank].items()
             }
@@ -438,6 +478,8 @@ class PDWorkerRuntime:
             )
         # Validate/lower every rank before starting any native writes. Then
         # enqueue all ranks without waiting for individual completions.
+        self._pd_lower_ns += time.monotonic_ns() - started
+        self._pd_lower_cpu_ns += time.thread_time_ns() - cpu_started
         stop_error = None
         for rank in ranks:
             task = rank.pop("task")
@@ -451,14 +493,19 @@ class PDWorkerRuntime:
                 except BaseException as exc:
                     stop_error = exc
             rank["submit_error"] = stop_error if rank["future"] is None else None
-        self._pd_transfer_jobs[job_id] = {
-            "request": request,
-            "ranks": tuple(ranks),
-            "response": None,
-        }
+        with self._pd_jobs_lock:
+            self._pd_transfer_jobs[job_id] = {
+                "request": request,
+                "ranks": tuple(ranks),
+                "response": None,
+            }
         return TransferSubmission(job_id)
 
     def _poll_pd_chunk(self, job_id):
+        with self._pd_jobs_lock:
+            return self._observe_pd_chunk(job_id)
+
+    def _observe_pd_chunk(self, job_id):
         from pypto_serving.serving.pd.protocol import TransferResult  # noqa: PLC0415
         from pypto_serving.serving.pd.worker_api import TransferPollResponse  # noqa: PLC0415
         from pypto_serving.transfer.errors import TransferFailure  # noqa: PLC0415
@@ -475,6 +522,7 @@ class PDWorkerRuntime:
             return TransferPollResponse(job_id, False)
         manifest = job["request"].manifest
         results = []
+        observed = []
         for rank in job["ranks"]:
             certainty = CompletionCertainty.COMPLETED
             error_code = ""
@@ -492,6 +540,8 @@ class PDWorkerRuntime:
                     event = future.result()
                     certainty = event.certainty
                     error_code = event.error.code.value if event.error is not None else ""
+                    if certainty is not CompletionCertainty.UNKNOWN:
+                        observed.append((self._pd_transfer_agents[rank["source_rank"]], event.attempt))
                 except BaseException as exc:
                     # A progress/supervision exception after a task was accepted
                     # cannot prove that the native writer never started.
@@ -512,42 +562,75 @@ class PDWorkerRuntime:
                 )
         response = TransferPollResponse(job_id, True, tuple(results))
         job["response"] = response
+        # The immutable job response now owns replay of these completion facts.
+        # Release only status-history retention, never leases or source pins.
+        # Otherwise every owner permanently stops after status_capacity chunks.
+        for agent, attempt in observed:
+            agent.status.release(attempt)
         self._pd_transfer_jobs.move_to_end(job_id)
         return response
 
+    def release(self) -> None:
+        """Drain and unregister, keeping owner engines alive for peer retirement."""
+        self._retire(stop=False)
+
     def close(self) -> None:
-        """Stop transfer threads and unregister arenas before allocator teardown."""
+        """Only stop owners after the peer handshake completed successfully."""
+        if self._pd_owner_envelopes and not self._pd_retirement_confirmed:
+            raise RuntimeError("owner stop requires confirmed sender and receiver retirement")
+        if self._pd_progress_server is not None:
+            self._pd_progress_server.close()
+            self._pd_progress_server = None
+        self._retire(stop=True)
+
+    def _retire(self, *, stop):
         if not self._pd_owner_bridges:
             return
-        close_error: BaseException | None = None
-        try:
-            for agent in self._pd_transfer_agents:
-                try:
-                    agent.close()
-                except BaseException as exc:
-                    if close_error is None:
-                        close_error = exc
-            for bridge in self._pd_owner_bridges:
-                try:
+
+        def retire(rank):
+            if rank in self._pd_retired_ranks:
+                return True, None
+            bridge = self._pd_owner_bridges[rank]
+            stage = "drain"
+            unregistered = rank in self._pd_unregistered_ranks
+            try:
+                if self._pd_transfer_agents:
+                    self._pd_transfer_agents[rank].close()
+                stage = "unregister"
+                if not unregistered:
                     bridge.release()
-                except BaseException as exc:
-                    if close_error is None:
-                        close_error = exc
-                try:
+                    unregistered = True
+                if stop:
+                    stage = "stop"
                     bridge.close()
-                except BaseException as exc:
-                    if close_error is None:
-                        close_error = exc
-        finally:
-            self._pd_transfer_agents = ()
-            self._pd_transfer_jobs = OrderedDict()
-            self._pd_peer_leases = ()
-            self._pd_peer_registration_request = None
-            self._pd_owner_envelopes = ()
-            self._pd_owner_leases = ()
-            self._pd_owner_bridges = ()
-        if close_error is not None:
-            raise close_error
+                return unregistered, None
+            except BaseException as exc:
+                return unregistered, (
+                    f"rank={rank} owner={bridge.owner} stage={stage} error={type(exc).__name__}: {exc}"
+                )
+
+        with ThreadPoolExecutor(max_workers=len(self._pd_owner_bridges)) as pool:
+            results = tuple(pool.map(retire, range(len(self._pd_owner_bridges))))
+        for rank, (unregistered, error) in enumerate(results):
+            if unregistered:
+                self._pd_unregistered_ranks.add(rank)
+            if error is None and stop:
+                self._pd_retired_ranks.add(rank)
+        failures = [error for _, error in results if error is not None]
+        if failures:
+            # Keep registrations, jobs, retention pins and owner handles for
+            # diagnosis/recovery. Never stop an owner whose unregister failed.
+            raise RuntimeError("PD owner retirement incomplete: " + "; ".join(failures))
+        if not stop:
+            return
+        self._pd_transfer_agents = ()
+        self._pd_transfer_jobs.clear()
+        self._pd_peer_leases = ()
+        self._pd_peer_registration_request = None
+        self._pd_owner_envelopes = ()
+        self._pd_owner_leases = ()
+        self._pd_owner_bridges = ()
+        self._pd_registries.clear()
 
 
 class PDWorkerServices:
@@ -558,6 +641,8 @@ class PDWorkerServices:
             raise ValueError("PD control requires one model runtime per worker")
         self.model = extensions[0]
         self.request_info = request_info
+        if getattr(self.model, "progress_channel", None) is not None:
+            self.model.transfer.start_progress(self.model.progress_channel)
 
     def handle_command(self, operation, payload):
         return self.model.handle_command(operation, payload)

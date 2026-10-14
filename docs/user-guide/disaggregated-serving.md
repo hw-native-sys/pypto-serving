@@ -152,6 +152,15 @@ inferences or validation of every deployment combination and maximum length.
 The Router finalizes handoff state and cleanup before publishing the terminal
 output; intermediate outputs continue to stream immediately.
 
+Decode sends only content/reasoning/tool-call deltas in intermediate frames.
+The terminal frame retains the complete text, reasoning, calls and token IDs
+needed by non-streaming responses and recovery. Completion deltas include the
+final detokenization flush; already-published text cannot be rewritten. A
+non-streaming request carries its final summary without duplicate deltas.
+Execution and connection errors after SSE headers produce an explicit error
+event followed by `[DONE]`; client cancellation still propagates to cleanup
+and is not converted into a successful terminal response.
+
 | Endpoint | Process | Contents |
 | --- | --- | --- |
 | `/health` | Router, P, D | Readiness and recovery gate. |
@@ -183,6 +192,21 @@ again when completion is recorded. No Router round trip or user-supplied rank
 map is required. A partition change during a handoff is rejected.
 
 All chunks use asynchronous worker submission and Host completion polling.
+Active handoffs share one bounded completion poller per worker; a poll batches
+their job IDs without waiting for slower jobs to finish. Completion observation uses
+an independent, bounded local pipe, so queries do
+not fence or queue behind Prefill computation. Submission, source readiness
+and resource retirement remain on the ordered worker lane. The progress reader
+only publishes terminal facts; it never accesses device tensors or releases
+source pins or destination reservations. It is created only for PD Prefill and
+closes with that worker; ordinary serving creates no PD channel or thread.
+Owner-local transfer IPC uses
+versioned MsgPack tasks with a per-task region table. Segments reference that
+table while retaining the exact owner generation, lease and byte bounds.
+Each chunk carries one complete bundle of rank/component completion facts,
+including required zero-byte units. D validates the whole bundle, persists
+it with one journal sync, and then acknowledges it; commit still requires all
+completion units and atomic groups.
 Mooncake's native call is synchronous inside an owner-local progress thread;
 it does not wait in the model worker's command loop. The overlap setting only
 controls whether the next Prefill chunk may compute before the current transfer
@@ -217,6 +241,32 @@ manually or by an external supervisor, which must confirm that the old owner
 processes have exited before starting a new arena. Use one fresh `run_id`
 shared by Router/P/D for a replacement deployment; reusing an old journal
 does not establish that the old memory is safe to reuse.
+
+## Admission and Shutdown
+
+The Router bounds total client streams separately from Prefill/transfer
+handoffs. A matching P READY reply releases the handoff slot after P has
+retired its source pins; the client-stream slot remains held through Decode
+and cancellation cleanup. D reservation remains the authority for actual KV
+capacity. This allows bounded preparation of more P work while D generates,
+without treating a completed transfer as permission to free D's allocation.
+
+For normal shutdown, stop accepting Router requests and allow active streams
+to drain, then stop both model-node processes. Either node can initiate peer
+drain, and simultaneous node shutdown is supported by the control protocol:
+both peers stop admission and drain, P unregisters its transfer memory, D
+unregisters after P's release notification, and D acknowledges completion.
+Both native engines remain alive until this exchange completes; only then
+may their owner processes and compute runtime stop.
+
+Lost peer connections are not proof of safe release. A timeout or unregister
+failure reports incomplete retirement with the retained owner identity and
+stage; it must be handled by the external supervisor. The PD application does
+not continue into compute-engine shutdown after such a failure. Do not treat
+an HTTP process exiting as proof that its device owners were released.
+
+Router and both nodes must be upgraded together. The control protocol and
+owner IPC reject incompatible versions rather than using an old-wire fallback.
 
 ## Code Organization and Extension Points
 

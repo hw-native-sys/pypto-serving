@@ -16,6 +16,8 @@ from pypto_serving.serving.pd.config import PDRole
 from pypto_serving.serving.pd.protocol import TransferResult
 from pypto_serving.serving.pd.worker_api import (
     OP_INSTALL_PEER,
+    OP_RELEASE_TRANSFER,
+    OP_FINALIZE_TRANSFER,
     OP_PREPARE_REGISTRY,
     OP_POLL_TRANSFER_CHUNK,
     OP_SUBMIT_TRANSFER_CHUNK,
@@ -87,6 +89,8 @@ class _FakeCore:
         self.manifests = []
 
     async def call_pd_worker(self, operation: str, payload: bytes = b"") -> bytes:
+        if operation in (OP_RELEASE_TRANSFER, OP_FINALIZE_TRANSFER):
+            return b""
         if operation == OP_PREPARE_REGISTRY:
             return encode_worker_payload(self.bundle)
         if operation == OP_INSTALL_PEER:
@@ -105,33 +109,30 @@ class _FakeCore:
             self.manifests.append(request.manifest)
             return encode_worker_payload(TransferSubmission(job_id))
         if operation == OP_POLL_TRANSFER_CHUNK:
-            poll = decode_worker_payload(payload, TransferPollRequest)
-            request, certainty = self.transfer_jobs[poll.job_id]
-            source_by_destination = {
-                pair.destination_rank_id: pair.source_rank_id for pair in request.manifest.rank_mapping
-            }
-            return encode_worker_payload(
-                TransferPollResponse(
-                    poll.job_id,
-                    True,
-                    tuple(
-                        TransferResult(
-                            key=request.manifest.key,
-                            chunk_id=request.manifest.chunk_id,
-                            source_rank_id=source_by_destination[unit.destination_rank_id],
-                            destination_rank_id=unit.destination_rank_id,
-                            component_id=unit.component_id,
-                            attempt_id=(
-                                f"a{request.attempt_ordinal}-"
-                                f"{unit.destination_rank_id}-{unit.component_id}"
-                            ),
-                            certainty=certainty.value,
-                        )
-                        for unit in request.manifest.expected_units
-                    )
-                )
-            )
+            polls = decode_worker_payload(payload, tuple[TransferPollRequest, ...])
+            return encode_worker_payload(tuple(self.poll_transfer(poll.job_id) for poll in polls))
         raise AssertionError(operation)
+
+    def poll_transfer(self, job_id):
+        request, certainty = self.transfer_jobs[job_id]
+        source_by_destination = {
+            pair.destination_rank_id: pair.source_rank_id for pair in request.manifest.rank_mapping
+        }
+        return TransferPollResponse(job_id, True, tuple(
+            TransferResult(
+                key=request.manifest.key,
+                chunk_id=request.manifest.chunk_id,
+                source_rank_id=source_by_destination[unit.destination_rank_id],
+                destination_rank_id=unit.destination_rank_id,
+                component_id=unit.component_id,
+                attempt_id=f"a{request.attempt_ordinal}-{unit.destination_rank_id}-{unit.component_id}",
+                certainty=certainty.value,
+            ) for unit in request.manifest.expected_units
+        ))
+
+    async def call_pd_progress(self, operation, payload):
+        assert operation == OP_POLL_TRANSFER_CHUNK
+        return await self.call_pd_worker(operation, payload)
 
     async def add_request(
         self,
@@ -251,11 +252,13 @@ class _OverlapFakeCore(_FakeCore):
     async def call_pd_worker(self, operation: str, payload: bytes = b"") -> bytes:
         if operation == OP_POLL_TRANSFER_CHUNK:
             self.poll_calls += 1
-            poll = decode_worker_payload(payload, TransferPollRequest)
-            request, _ = self.transfer_jobs[poll.job_id]
-            if not request.manifest.final and not self.allow_completion.is_set():
-                return encode_worker_payload(TransferPollResponse(poll.job_id, False))
         result = await super().call_pd_worker(operation, payload)
         if operation == OP_SUBMIT_TRANSFER_CHUNK:
             self.transfer_started.set()
         return result
+
+    def poll_transfer(self, job_id):
+        request, _ = self.transfer_jobs[job_id]
+        if not request.manifest.final and not self.allow_completion.is_set():
+            return TransferPollResponse(job_id, False)
+        return super().poll_transfer(job_id)

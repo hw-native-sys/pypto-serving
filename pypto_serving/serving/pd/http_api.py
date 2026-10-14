@@ -154,6 +154,7 @@ class PrefillHandoffResult(msgspec.Struct, frozen=True):
     reservation_id: str
     manifest_hash: str
     state: str
+    error_code: str = ""
 
 
 class HandoffHTTP(msgspec.Struct, frozen=True):

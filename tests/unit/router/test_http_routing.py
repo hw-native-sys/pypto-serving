@@ -193,6 +193,7 @@ def _serve_fake_node(node_id, role_value, ready, calls, stop) -> None:
                             completion_tokens=1,
                             token_ids=(101,),
                             output_sequence=1,
+                            text_delta="ok",
                         ),
                     ),
                 )

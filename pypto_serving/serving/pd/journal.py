@@ -63,6 +63,7 @@ class DurablePDJournal:
         self._sequence = 0
         self._last_hash = _GENESIS_HASH
         self._active: set[tuple[str, str]] = set()
+        self._failed = False
         self._load()
         if self._active:
             raise RuntimeError(
@@ -119,6 +120,7 @@ class DurablePDJournal:
         state: str = "",
         certainty: str = "",
         error_code: str = "",
+        completion_facts: tuple[dict, ...] = (),
     ) -> None:
         for name, value in (
             ("event", event),
@@ -136,6 +138,8 @@ class DurablePDJournal:
             raise ValueError("PD journal chunk_id must be -1 or a non-negative integer")
 
         with self._lock:
+            if self._failed or self._fd is None:
+                raise RuntimeError("PD recovery journal is unavailable")
             self._sequence += 1
             record: dict[str, object] = {
                 "schema_version": JOURNAL_SCHEMA_VERSION,
@@ -156,6 +160,7 @@ class DurablePDJournal:
                 "state": state,
                 "certainty": certainty,
                 "error_code": error_code,
+                "completion_facts": completion_facts,
                 "previous_hash": self._last_hash,
             }
             record_hash = hashlib.sha256(
@@ -163,10 +168,14 @@ class DurablePDJournal:
             ).hexdigest()
             record["record_hash"] = record_hash
             wire = _canonical(record) + b"\n"
-            written = os.write(self._fd, wire)
-            if written != len(wire):
-                raise OSError("short write while appending the PD recovery journal")
-            os.fsync(self._fd)
+            try:
+                written = os.write(self._fd, wire)
+                if written != len(wire):
+                    raise OSError("short write while appending the PD recovery journal")
+                os.fsync(self._fd)
+            except OSError:
+                self._failed = True
+                raise
             self._last_hash = record_hash
             self._update_active(record)
 

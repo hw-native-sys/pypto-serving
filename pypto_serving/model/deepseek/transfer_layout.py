@@ -15,6 +15,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from math import prod
+from functools import cached_property
 
 from pypto_serving.transfer.types import (
     ProviderCapabilities, ProviderTransferTask, RegionLease, Segment, TransferAttemptRef, integer,
@@ -103,9 +104,18 @@ class DSV4Registry:
             raise ValueError("index K/scale logical geometry must match")
 
     def entry(self, component_id: str) -> ComponentLayout:
-        return next(c for c in self.components if c.component_id == component_id)
+        return self._entries[component_id]
 
-    @property
+    @cached_property
+    def _entries(self):
+        return {entry.component_id: entry for entry in self.components}
+
+    @cached_property
+    def _layer_indices(self):
+        return {entry.component_id: {layer: index for index, layer in enumerate(entry.layers)}
+                for entry in self.components}
+
+    @cached_property
     def fingerprint(self) -> str:
         manifest = {
             "schema": 1, "model_revision": self.model_revision, "topology": self.topology,
@@ -114,7 +124,7 @@ class DSV4Registry:
         }
         return hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
-    @property
+    @cached_property
     def layout_fingerprint(self) -> str:
         """Identify transfer geometry without requiring equal arena capacity.
 
@@ -182,24 +192,29 @@ class DSV4Registry:
         index_groups = {}
         occupied = set()
         segments = []
-        for copy in sorted(copies, key=lambda c: (c.component_id, c.layer, c.destination_block, c.source_block)):
-            if copy.component_id not in COMPONENTS:
+        geometry = {}
+        for component_id in {copy.component_id for copy in copies}:
+            if component_id not in COMPONENTS:
                 raise ValueError("unknown component")
-            entry = self.entry(copy.component_id)
+            entry = self.entry(component_id)
+            src, dst = source_leases[component_id], destination_leases[component_id]
+            destination_blocks, remainder = divmod(dst.extent, len(entry.layers) * entry.block_stride_bytes)
+            if remainder or not destination_blocks:
+                raise ValueError("destination arena extent differs from transfer geometry")
+            if src.extent != entry.extent:
+                raise ValueError("source arena extent differs from registry")
+            geometry[component_id] = (entry, src, dst, destination_blocks, entry.block_stride_bytes,
+                                      entry.layer_stride_bytes, self._layer_indices[component_id])
+        for copy in sorted(copies, key=lambda c: (c.component_id, c.layer, c.destination_block, c.source_block)):
+            entry, src, dst, destination_blocks, block_stride, layer_stride, layer_indices = geometry[
+                copy.component_id
+            ]
             _, atomic_group, final_only = COMPONENTS[copy.component_id]
             if final_only and not final:
                 raise ValueError("mutable state is final-only")
             for name in ("layer", "source_block", "destination_block", "valid_tokens"):
                 integer(getattr(copy, name), name)
-            src, dst = source_leases[copy.component_id], destination_leases[copy.component_id]
-            destination_layer_extent = len(entry.layers) * entry.block_stride_bytes
-            destination_blocks, destination_remainder = divmod(
-                dst.extent,
-                destination_layer_extent,
-            )
-            if destination_remainder or not destination_blocks:
-                raise ValueError("destination arena extent differs from transfer geometry")
-            if (copy.layer not in entry.layers or copy.source_block >= entry.blocks_per_layer
+            if (copy.layer not in layer_indices or copy.source_block >= entry.blocks_per_layer
                     or copy.destination_block >= destination_blocks
                     or not 0 < copy.valid_tokens <= entry.block_tokens):
                 raise ValueError("logical block/layer/token out of bounds")
@@ -212,24 +227,22 @@ class DSV4Registry:
             if atomic_group == "index":
                 group = (copy.layer, copy.source_block, copy.destination_block, copy.valid_tokens)
                 index_groups.setdefault(group, set()).add(copy.component_id)
-            if src.extent != entry.extent:
-                raise ValueError("source arena extent differs from registry")
-            layer_index = entry.layers.index(copy.layer)
-            source_layer_offset = layer_index * entry.layer_stride_bytes
+            layer_index = layer_indices[copy.layer]
+            source_layer_offset = layer_index * layer_stride
             destination_layer_offset = (
-                layer_index * destination_blocks * entry.block_stride_bytes
+                layer_index * destination_blocks * block_stride
             )
             # Partial final pages are copied in full into exclusively reserved destination pages.
             # The logical manifest retains valid_tokens; padded bytes never grant semantic readiness.
             segment = Segment(copy.component_id, src, dst,
-                              source_layer_offset + copy.source_block * entry.block_stride_bytes,
+                              source_layer_offset + copy.source_block * block_stride,
                               destination_layer_offset
-                              + copy.destination_block * entry.block_stride_bytes,
-                              entry.block_stride_bytes)
+                              + copy.destination_block * block_stride,
+                              block_stride)
             if segments:
                 previous = segments[-1]
-                if (previous.component_id == segment.component_id and previous.source == segment.source
-                        and previous.destination == segment.destination
+                if (previous.component_id == segment.component_id and previous.source is segment.source
+                        and previous.destination is segment.destination
                         and previous.source_offset + previous.length == segment.source_offset
                         and previous.destination_offset + previous.length == segment.destination_offset):
                     segments[-1] = replace(previous, length=previous.length + segment.length)
@@ -246,7 +259,8 @@ class DSV4Registry:
     def manifest_hash(self, copies: tuple[BlockCopy, ...], final: bool) -> str:
         manifest = {
             "fingerprint": self.fingerprint, "final": final,
-            "copies": [asdict(c) for c in sorted(
+            "copies": [dict(component_id=c.component_id, layer=c.layer, source_block=c.source_block,
+                            destination_block=c.destination_block, valid_tokens=c.valid_tokens) for c in sorted(
                 copies, key=lambda c: (c.component_id, c.layer, c.source_block,
                                        c.destination_block, c.valid_tokens))],
         }

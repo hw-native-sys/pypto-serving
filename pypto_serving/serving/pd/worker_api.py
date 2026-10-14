@@ -23,6 +23,8 @@ OP_SUBMIT_TRANSFER_CHUNK = "submit_transfer_chunk"
 OP_POLL_TRANSFER_CHUNK = "poll_transfer_chunk"
 OP_INSPECT_REGISTRY = "inspect_registry"
 OP_INSPECT_RUNTIME_METRICS = "inspect_runtime_metrics"
+OP_RELEASE_TRANSFER = "release_transfer"
+OP_FINALIZE_TRANSFER = "finalize_transfer"
 
 # Must cover the same expanded final-chunk manifest accepted by the Host
 # control channel.  This remains independently bounded because the
@@ -90,12 +92,12 @@ class WorkerRuntimeMetrics(msgspec.Struct, frozen=True):
     values: dict[str, float]
 
 
-_encoder = msgspec.msgpack.Encoder()
 T = TypeVar("T")
 
 
 def encode_worker_payload(value: object) -> bytes:
-    return _encoder.encode(value)
+    # Ordered control and completion observation can encode on different threads.
+    return msgspec.msgpack.encode(value)
 
 
 def decode_worker_payload(wire: bytes, value_type: type[T]) -> T:
