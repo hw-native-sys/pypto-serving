@@ -106,6 +106,10 @@ def test_worker_profile_commands_ack_after_state_change(monkeypatch):
     monkeypatch.setattr(serving_worker, "get_profiler", lambda **_kwargs: profiler)
 
     worker = serving_worker.WorkerProcess.__new__(serving_worker.WorkerProcess)
+
+    worker._services = None
+
+    worker._batch_builder = worker._make_decode_batch
     worker.input_queue = _Queue(
         [
             encode_command(ProfileCommand(active=True)),

@@ -189,7 +189,8 @@ def test_constrained_abort_drops_inflight_output_and_frees_worker_before_reuse()
     request.constraint_spec = _tool_constraint()
     core.scheduler.running.append(request)
     core.scheduler.requests[request.request_id] = request
-    ctx = SimpleNamespace(queue=asyncio.Queue(), request=request, stream=True)
+    ctx = SimpleNamespace(queue=asyncio.Queue(), request=request, stream=True,
+                          worker_release_done=asyncio.Event())
     core._request_contexts[request.request_id] = ctx
 
     assert core._try_dispatch_step()
@@ -200,8 +201,9 @@ def test_constrained_abort_drops_inflight_output_and_frees_worker_before_reuse()
     asyncio.run(core._flush_pending_frees())
     assert dispatched[-1].finished_request_ids == [request.request_id]
     assert request.request_id not in core._worker_known_req_ids
+    output = asyncio.run(anext(core._iterate_request_output(ctx)))
+    assert output.finish_reason == "FINISHED_ABORTED"
     assert not core._pending_free_ids and not core._request_contexts
-    assert ctx.queue.get_nowait().finish_reason == "FINISHED_ABORTED"
 
     next_request = Request("next", [3], max_new_tokens=1)
     core.scheduler.add_request(next_request)

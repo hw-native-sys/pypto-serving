@@ -26,6 +26,7 @@ def test_worker_step_error_queues_finished_ids_for_executor_release():
     aborted: list[str] = []
     discarded: list[SimpleNamespace] = []
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._request_contexts = {}
     core.scheduler = SimpleNamespace(
         abort_request=aborted.append,
         discard_scheduled_request=discarded.append,
@@ -65,15 +66,19 @@ def test_abort_request_schedules_worker_cleanup():
     otherwise its worker-side _req_cache entry and device slots leak."""
     aborted: list[str] = []
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._request_contexts = {}
     core.scheduler = SimpleNamespace(abort_request=aborted.append)
     core._pending_free_ids = []
-    core._request_contexts = {"req-x": SimpleNamespace(queue=asyncio.Queue())}
+    core._request_contexts = {"req-x": SimpleNamespace(
+        queue=asyncio.Queue(), worker_release_done=asyncio.Event())}
 
     asyncio.run(core.abort_request("req-x"))
 
-    # Scheduler aborted, context removed.
+    # The terminal consumer still needs its context to receive the release ACK.
     assert aborted == ["req-x"]
-    assert "req-x" not in core._request_contexts
+    context = core._request_contexts["req-x"]
+    core._acknowledge_worker_frees(("req-x",))
+    assert context.worker_release_done.is_set()
     # The id is queued for worker release exactly once.
     assert core._pending_free_ids == ["req-x"]
 
@@ -86,6 +91,7 @@ def test_abort_request_schedules_worker_cleanup():
 def test_abort_request_emits_abort_token_before_scheduling_free():
     """The client-facing queue receives a FINISHED_ABORTED token on abort."""
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._request_contexts = {}
     core.scheduler = SimpleNamespace(abort_request=lambda _req_id: None)
     core._pending_free_ids = []
     queue: asyncio.Queue = asyncio.Queue()
@@ -110,6 +116,7 @@ def test_flush_pending_frees_sends_cleanup_only_step_command(monkeypatch):
 
     monkeypatch.setattr(asyncio, "to_thread", run_inline)
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._request_contexts = {}
     core.config = SimpleNamespace(executor_cls="PyptoQwen14BExecutor")
     core._worker_known_req_ids = {"aborted"}
     core._pending_free_ids = ["aborted"]

@@ -337,10 +337,16 @@ class ServingServer:
             ),
         )
 
+    def prepare_completion(self, request):
+        config = dataclasses.replace(self._resolve_generate_config(request), ignore_eos=True)
+        return request.prompt, config
+
     async def _completions(self, request: CompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"cmpl-{uuid.uuid4().hex[:8]}"
-        config = dataclasses.replace(self._resolve_generate_config(request), ignore_eos=True)
+        _, config = self.prepare_completion(request)
+        return await self.completion_response(request_id, request, config)
 
+    async def completion_response(self, request_id, request, config):
         with profile_span(
             "http.completions",
             cat="request",
@@ -375,8 +381,7 @@ class ServingServer:
             )
             return JSONResponse(response.model_dump())
 
-    async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
-        request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    async def prepare_chat(self, request):
         output_parser_spec = self._output_parser_spec(request)
         constraint_spec = self._constraint_spec(request, output_parser_spec)
         if constraint_spec is not None:
@@ -388,6 +393,15 @@ class ServingServer:
             tools=request.tools,
         )
         config = self._resolve_generate_config(request)
+
+        return prompt, config, output_parser_spec, constraint_spec
+
+    async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
+        request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        prompt, config, output_parser_spec, constraint_spec = await self.prepare_chat(request)
+        return await self.chat_response(request_id, request, prompt, config, output_parser_spec, constraint_spec)
+
+    async def chat_response(self, request_id, request, prompt, config, output_parser_spec, constraint_spec):
         with profile_span(
             "http.chat_completions",
             cat="request",
@@ -715,15 +729,15 @@ class ServingServer:
             parallel_tool_calls=request.parallel_tool_calls,
         )
 
-    async def _preflight_constraint(self, spec: ConstraintSpec) -> None:
+    async def _preflight_constraint(self, spec: ConstraintSpec, initial_tokens=()) -> None:
         """Reject unsupported schemas before an SSE response or worker batch starts."""
         async with self._constraint_preflight_lock:
             try:
-                await asyncio.to_thread(self._compile_constraint_for_preflight, spec)
+                await asyncio.to_thread(self._compile_constraint_for_preflight, spec, initial_tokens)
             except (RuntimeError, ValueError) as exc:
                 raise ValueError(f"invalid tool constraint: {exc}") from exc
 
-    def _compile_constraint_for_preflight(self, spec: ConstraintSpec) -> None:
+    def _compile_constraint_for_preflight(self, spec: ConstraintSpec, initial_tokens=()) -> None:
         if self._constraint_preflight_provider is None:
             model_vocab_size = int(read_model_config(self.engine.config.model_dir)["vocab_size"])
             self._constraint_preflight_provider = XGrammarProvider(
@@ -731,7 +745,10 @@ class ServingServer:
             )
         with profile_span("ServingServer.constraint_preflight", cat="constraints"):
             state = self._constraint_preflight_provider.compile(spec)
-        state.close()
+        try:
+            state.accept(initial_tokens)
+        finally:
+            state.close()
 
     def _output_parser_spec(
         self,

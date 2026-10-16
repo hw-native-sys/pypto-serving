@@ -2,6 +2,8 @@
 
 Start `pypto-serving` without `--prompt` to load the model in workers and expose its HTTP API. The server supports completions and chat completions for the [supported models](../models/index.md).
 
+For opt-in multi-node prefill/decode deployment, see [PD disaggregation](pd-disaggregation.md).
+
 ## Start a Server
 
 This Qwen3-14B example serves one NPU. For other checkpoints and device topologies, follow the model deployment guide.

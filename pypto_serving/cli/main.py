@@ -197,6 +197,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # Serving
+    parser.add_argument("--pd-role", choices=("prefill", "decode"), default=None)
+    parser.add_argument("--pd-config", default=None, help="Shared PD deployment JSON.")
+    parser.add_argument("--pd-node-id", default=None, help="Select a node when its role has multiple endpoints.")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind the serving server (default: 0.0.0.0).")
     parser.add_argument("--port", type=int, default=8000, help="Port for the serving server (default: 8000).")
     parser.add_argument("--max-num-seqs", type=int, default=16, help="Max concurrent requests in serving mode (default: 16).")
@@ -977,7 +980,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = build_serving_engine_config(args)
         generate_config = _build_generate_config(args.generate_config)
 
-    if args.prompt:
+    if args.pd_role:
+        from pypto_serving.pd.integration import run
+        run(args, config, generate_config)
+    elif args.pd_config or args.pd_node_id:
+        raise ValueError("PD options require --pd-role")
+    elif args.prompt:
         run_generate(config, prompts=args.prompt, generate_config=generate_config)
     else:
         run_serve(

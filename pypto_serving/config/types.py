@@ -369,6 +369,9 @@ class DecodeBatch:
     cache_partitions: list[int | None] = field(default_factory=list)
     constraint_states: dict[str, object] = field(default_factory=dict)
     stop_token_masks: dict[str, StopTokenMask] = field(default_factory=dict)
+    # Requests with preinitialized target cache that still require local model
+    # state initialization. Ordinary batches carry no additional request list.
+    initial_request_ids: tuple[str, ...] = ()
     # Optional MTP context for models (e.g. DeepSeek V4) that decode two real
     # trailing tokens per step. ``prev_token_ids`` holds the token id at absolute
     # position ``seq_len-2`` per request (shape ``[B]``) and ``prev_hidden_states``

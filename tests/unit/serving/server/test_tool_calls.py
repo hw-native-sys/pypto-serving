@@ -218,12 +218,14 @@ class _ReplayCore(ReplicaEngineCore):
         self._request_contexts = {}
         self._pending_free_ids = []
         self.freed = []
+        self._step_timeout = 1.0
         self.scheduler = _ReplayScheduler(self, scripts, chunk_size)
 
     def _record_scheduler_stats(self, output=None):
         pass
 
     def drain_frees(self):
+        self._acknowledge_worker_frees(self._pending_free_ids)
         self.freed.extend(self._pending_free_ids)
         self._pending_free_ids.clear()
 
