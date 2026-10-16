@@ -16,8 +16,8 @@ import tempfile
 import litellm
 from minisweagent.agents.interactive import InteractiveAgent
 
-from budget import BudgetedTextModel, ContextBudgetExceeded
-from runtime import VerifiedEnvironment, coding_config, shell_environment
+from client.budget import BudgetedTextModel, ContextBudgetExceeded
+from client.runtime import VerifiedEnvironment, coding_config, shell_environment
 
 
 CHAT_SYSTEM_TEMPLATE = """You are a helpful assistant that can answer questions and use a shell.

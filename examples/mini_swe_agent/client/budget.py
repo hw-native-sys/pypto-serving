@@ -14,7 +14,7 @@ from pathlib import Path
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from tokenizers import Tokenizer
 
-from smoke import CompleteTextModel
+from .model import CompleteTextModel
 
 
 class ContextBudgetExceeded(ValueError):

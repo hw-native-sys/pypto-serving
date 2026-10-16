@@ -22,11 +22,10 @@ import time
 
 from minisweagent.agents.default import DefaultAgent
 from minisweagent.environments.local import LocalEnvironment
-from minisweagent.exceptions import FormatError
-from minisweagent.models.litellm_textbased_model import LitellmTextbasedModel
+
+from client.model import CompleteTextModel
 
 
-UPSTREAM_COMMIT = "04d809ceab9df28f9adaed044884180159172930"
 FINISH_MARKER = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 SYSTEM_TEMPLATE = """You operate a shell through text actions.
 Every reply must contain exactly one command block in this format:
@@ -38,46 +37,6 @@ After reading the requested file, finish by running exactly:
 printf '%s\\n' 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT' 'THE_EXACT_FILE_CONTENT'
 Replace THE_EXACT_FILE_CONTENT with the observed single line. Do not guess the file content.
 """
-
-
-class CompleteTextModel(LitellmTextbasedModel):
-    """Reject incomplete generations and unsupported printed action wrappers."""
-
-    def _parse_actions(self, response) -> list[dict]:
-        choice = response.choices[0]
-        # LiteLLM normalizes unknown reasons (including aborted) to stop.
-        native_fields = getattr(choice, "provider_specific_fields", None) or {}
-        reason = native_fields.get("native_finish_reason", choice.finish_reason)
-        if reason not in ("eos", "stop"):
-            raise FormatError({
-                "role": "user",
-                "content": f"Generation ended with {reason!r}; no command was executed. Retry concisely.",
-                "extra": {"interrupt_type": "FormatError", "finish_reason": reason},
-            })
-        actions = super()._parse_actions(response)
-        command = actions[0]["command"]
-        try:
-            words = shlex.split(command)
-        except ValueError:
-            # This check recognizes a specific wrapper, not general shell syntax.
-            return actions
-        is_wrapper = (
-            len(words) >= 3 and words[0] == "printf" and words[2] == "RUN_SHELL_COMMAND"
-        ) or (
-            len(words) >= 2 and words[0] == "echo" and words[1] == "RUN_SHELL_COMMAND"
-        )
-        if is_wrapper:
-            raise FormatError({
-                "role": "user",
-                "content": (
-                    "Nothing was executed. RUN_SHELL_COMMAND is not a supported protocol. "
-                    "Your command would only print text, not run the printed command. "
-                    "Put the actual shell command directly in one bash code block, for example "
-                    "cat /path/to/README.md. Wait for real file contents before summarizing."
-                ),
-                "extra": {"interrupt_type": "FormatError", "rejected_command": command},
-            })
-        return actions
 
 
 class SmokeEnvironment(LocalEnvironment):
@@ -167,7 +126,6 @@ def main() -> int:
     summary = {
         "passed": passed,
         "scope": "Bounded text-action smoke test; not a general coding-agent evaluation",
-        "mini_swe_agent_commit": UPSTREAM_COMMIT,
         "versions": {name: importlib.metadata.version(name) for name in ("mini-swe-agent", "litellm")},
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "model_calls": agent.n_calls,

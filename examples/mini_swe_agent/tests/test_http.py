@@ -19,7 +19,8 @@ from unittest.mock import patch
 
 from minisweagent.agents.default import DefaultAgent
 
-from smoke import CompleteTextModel, FINISH_MARKER, SYSTEM_TEMPLATE, SmokeEnvironment
+from client.model import CompleteTextModel
+from smoke import FINISH_MARKER, SYSTEM_TEMPLATE, SmokeEnvironment
 
 
 class HttpRoundTripTests(unittest.TestCase):
@@ -67,6 +68,10 @@ class HttpRoundTripTests(unittest.TestCase):
                     },
                 )
                 environment = SmokeEnvironment(cwd=directory, timeout=5)
+                with self.assertRaises(ValueError):
+                    environment.execute({'command': 'cat input.txt; touch unexpected'})
+                self.assertFalse((workspace / 'unexpected').exists())
+                self.assertEqual(environment.commands, [])
                 agent = DefaultAgent(
                     model, environment, system_template=SYSTEM_TEMPLATE, instance_template='{{task}}',
                     step_limit=4, cost_limit=0, wall_time_limit_seconds=30,

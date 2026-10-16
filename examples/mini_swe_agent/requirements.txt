@@ -1,4 +1,4 @@
-mini-swe-agent @ git+https://github.com/SWE-agent/mini-swe-agent.git@04d809ceab9df28f9adaed044884180159172930
+mini-swe-agent==2.4.6
 litellm==1.102.1
 openai==2.54.0
 tokenizers==0.23.2

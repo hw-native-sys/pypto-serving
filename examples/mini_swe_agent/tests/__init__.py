@@ -6,17 +6,4 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Aggregate latency records from a serving access log."""
-
-
-def summarize(records):
-    records = list(records)
-    latencies = sorted(row["latency_ms"] for row in records)
-    successful = sum(row["status"] == "ok" for row in records)
-    return {
-        "requests": len(records),
-        "successful": successful,
-        "failed": len(records) - successful,
-        "mean_ms": sum(latencies) / len(latencies) if latencies else 0.0,
-        "p95_ms": latencies[int(0.95 * (len(latencies) - 1))] if latencies else 0.0,
-    }
+"""CPU checks for the optional mini-swe-agent example."""

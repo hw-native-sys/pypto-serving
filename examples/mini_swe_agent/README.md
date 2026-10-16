@@ -5,6 +5,22 @@ OpenAI-compatible Chat API. The Agent can read workspace files, execute shell
 commands after confirmation, edit code, and run tests. Model requests use HTTP;
 the frontend does not start or own the Serving engine.
 
+The example keeps entry points, implementation, and CPU checks in separate locations:
+
+```text
+mini_swe_agent/
+  interactive.py       # Interactive terminal entry point
+  smoke.py             # Bounded model/command round-trip probe
+  client/
+    model.py           # Complete text-action validation
+    budget.py          # Token counting and history selection
+    runtime.py         # Coding prompts and completion verification
+  tests/
+    test_client.py     # Action, context, and verification checks
+    test_http.py       # Scripted HTTP round trip
+  requirements.txt
+```
+
 ## Install the optional client
 
 From the repository root, create a separate client environment:
@@ -14,7 +30,7 @@ python3.10 -m venv .venvs/mini-swe-agent
 .venvs/mini-swe-agent/bin/python -m pip install -r examples/mini_swe_agent/requirements.txt
 ```
 
-The requirements pin the upstream mini-swe-agent revision and its client
+The requirements pin the published `mini-swe-agent==2.4.6` release and its client
 dependencies. They are optional example dependencies, not Serving runtime
 dependencies. No NPU runtime is needed in the client environment.
 
@@ -121,25 +137,6 @@ the read command and the bounded submission command. A passing run therefore
 checks a real model-to-command-to-observation round trip, not just API reachability.
 This is not a coding benchmark or a performance claim.
 
-## Small repair exercise
-
-```bash
-.venvs/mini-swe-agent/bin/python examples/mini_swe_agent/repair_demo.py prepare
-```
-
-This copies an intentionally broken log-report exercise to a new output
-workspace and records the expected failing baseline. Use its printed workspace
-with the interactive coding frontend, then run:
-
-```bash
-.venvs/mini-swe-agent/bin/python examples/mini_swe_agent/repair_demo.py check /path/to/printed/workspace
-```
-
-The checker runs public tests and additional boundary inputs and verifies that
-the requirements and test files are unchanged. The source fixture is
-intentionally broken; do not include its tests in a repository-wide test run as
-if it were already repaired.
-
 ## CPU checks
 
 No model weights or NPU are needed for these checks:
@@ -147,7 +144,7 @@ No model weights or NPU are needed for these checks:
 ```bash
 LITELLM_LOCAL_MODEL_COST_MAP=True \
 .venvs/mini-swe-agent/bin/python -m unittest discover \
-  -s examples/mini_swe_agent -p 'test_*.py' -v
+  -s examples/mini_swe_agent/tests -t examples/mini_swe_agent -v
 ```
 
 Checks cover action parsing, incomplete generations, context budgeting,
