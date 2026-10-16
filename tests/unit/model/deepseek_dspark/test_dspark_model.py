@@ -33,6 +33,32 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
 )
 
 
+@pytest.mark.parametrize("pd", [False, True])
+def test_persistent_worker_keeps_model_managed_windows(monkeypatch, pd):
+    # DSpark manages its communication epochs in kernels; whole-window Host
+    # clearing must remain off with and without an optional PD extension.
+    runner = DSparkModelRunner.__new__(DSparkModelRunner)
+    runner._l3_worker = None
+    runner._compiled = SimpleNamespace(l3_callables=lambda: [SimpleNamespace(compiled=object())])
+    runner._inherited_host_weights = lambda: ()
+    ready, captured = [], {}
+    runner.runtime_extension = SimpleNamespace(
+        worker_options=lambda: {"chip_service_factories": {}},
+        worker_ready=lambda: ready.append(True),
+    ) if pd else None
+
+    def prepare(programs, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("pypto.runtime.DistributedWorker", prepare)
+    worker = runner._shared_l3_worker()
+    assert captured["persistent"] is True
+    assert captured["reset_persistent_windows"] is False
+    assert runner._shared_l3_worker() is worker
+    assert ready == ([True] if pd else [])
+
+
 def _runner(*, speculative: bool = False, max_position: int = 512) -> DSparkModelRunner:
     rows = torch.arange(max_position * 64, dtype=torch.float32).reshape(max_position, 64)
     rope = DSparkRopeTables(
