@@ -28,6 +28,25 @@ def test_cli_keeps_generic_model_chunk_sizes_unrestricted():
     assert args.long_prefill_token_threshold == 128
 
 
+def test_agentinfer_config_is_explicit_and_reaches_engine(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    options = '{"resume_capacity_ratio":0.85,"force_resume_timeout_min_seconds":1,' \
+              '"force_resume_timeout_max_seconds":3}'
+    args = _parse_cli_args([
+        "--model", str(model_dir), "--agentinfer-mode", "enforce", "--agentinfer-config", options,
+    ])
+    config = cli.build_serving_engine_config(args)
+    assert config.agentinfer_config.resume_capacity_ratio == 0.85
+    assert config.agentinfer_config.force_resume_timeout_max_seconds == 3
+    args.agentinfer_mode = "disabled"
+    with pytest.raises(ValueError, match="requires --agentinfer-mode enforce"):
+        cli.build_serving_engine_config(args)
+    args.agentinfer_config = []
+    with pytest.raises(ValueError, match="JSON object"):
+        cli.build_serving_engine_config(args)
+
+
 def test_cli_keeps_dspark_chunk_sizes_under_its_kernel_contract():
     args = _parse_cli_args(
         ["--model", "model", "--long-prefill-token-threshold", "128"]
@@ -82,6 +101,22 @@ def test_build_serving_engine_config_uses_parallel_config_for_devices(tmp_path):
     assert config.parallel_config.data_parallel_size == 2
     assert config.parallel_config.tensor_parallel_size == 2
     assert config.parallel_config.replica_device_groups == ((0, 1), (2, 3))
+
+
+def test_agentinfer_mode_is_explicit_and_single_replica_only(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    assert cli.build_serving_engine_config(
+        _parse_cli_args(["--model", str(model_dir)])
+    ).agentinfer_mode == "disabled"
+    assert cli.build_serving_engine_config(
+        _parse_cli_args(["--model", str(model_dir), "--agentinfer-mode", "enforce"])
+    ).agentinfer_mode == "enforce"
+    with pytest.raises(ValueError, match="single-replica Qwen"):
+        cli.build_serving_engine_config(_parse_cli_args([
+            "--model", str(model_dir), "--agentinfer-mode", "enforce",
+            "--devices", "0,1", "--dp", "2",
+        ]))
 
 
 def test_build_serving_engine_config_rejects_invalid_parallel_topology(tmp_path):
