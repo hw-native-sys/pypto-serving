@@ -96,6 +96,7 @@ nav:
           - Online Serving: user-guide/online-serving.md
           - Tool Calling: user-guide/tool-calling.md
           - Parallelism and Scaling: user-guide/parallel.md
+          - Multi-Node Routing: user-guide/multi-node-routing.md
           - Troubleshooting: user-guide/troubleshooting.md
   - Models:
       - Overview: models/index.md
@@ -111,6 +112,7 @@ nav:
   - Reference:
       - HTTP API: api-reference/http.md
       - CLI: cli-reference/pypto-serving.md
+      - Router CLI: cli-reference/pypto-serving-router.md
   - Developer Guide:
       - Architecture: developer-guide/architecture.md
       - Profiling: developer-guide/profile.md
