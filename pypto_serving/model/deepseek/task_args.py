@@ -167,7 +167,7 @@ _PREFILL_DYNAMIC_INPUT_NAMES = frozenset(
         "csa_inner_state_slot_mapping",
     }
 )
-_PREFILL_DYNAMIC_ARG_NAMES = _PREFILL_DYNAMIC_INPUT_NAMES | {"hidden_out"}
+_PREFILL_DYNAMIC_ARG_NAMES = _PREFILL_DYNAMIC_INPUT_NAMES | {"hidden_out", "pre_hc_hidden_out"}
 
 # Argument order shared by the current standalone and fused main-decode ABIs.
 # Both entries consume the raw preamble inputs and the split HCA/CSA metadata.
@@ -504,10 +504,10 @@ def _prefill_slot_specs(
         # Outputs read back by the host are zeroed before each dispatch. The
         # kernel overwrites the active hidden_out extent, so clearing its full
         # max-sequence backing would add a large, unnecessary host memset.
-        # The main kernel exposes the final 128 valid pre-HC rows per owner.
+        # The main kernel returns every pre-HC row for MTP cache persistence.
         "pre_hc_hidden_out": (
             torch.float32,
-            (ranks, layout.prefill_seq, hc_mult, hidden),
+            (ranks, seq, hc_mult, hidden),
             zero,
         ),
         "hidden_out": (
