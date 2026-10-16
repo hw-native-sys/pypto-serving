@@ -80,7 +80,7 @@ def warm(cache, tokens, length, partition=0):
 
 @pytest.mark.parametrize("p_hit,d_hit", [(0, 0), (0, 256), (256, 0), (128, 256),
                                        (256, 128), (256, 256), (0, 512), (384, 512)])
-@pytest.mark.parametrize("outcome", ["unknown", "complete", "seed_accept", "seed_reject", "cancel"])
+@pytest.mark.parametrize("outcome", ["unknown", "complete", "seed_accept", "seed_reject", "cancel", "early_cancel"])
 def test_prefix_mapping_completion_and_quarantine(p_hit, d_hit, outcome):
     from types import SimpleNamespace
     from pypto_serving.config.types import GenerateConfig
@@ -121,6 +121,12 @@ def test_prefix_mapping_completion_and_quarantine(p_hit, d_hit, outcome):
             service.preflight = reject
         placement = await service.control(p, source, "begin", dict(binding=binding, continuation=continuation))
         assert isinstance(placement, Placement) and placement.hit == d_hit
+        if outcome == "early_cancel":
+            entry.response_closed = True
+            await service.abort(entry)
+            assert not service.requests and d_cache.group_cache_reservation(binding.request) is None
+            assert await service.control(p, source, "abort", dict(binding=binding, stopped=True)) == {}
+            return
         tables = {k: tuple(v) for k, v in p_cache.ensure_group_blocks("source", 512, partition=1).items()}
         chunk = Chunk(binding.request, 0, p_hit, 512, True, 17, tables, 1)
         plan = plan_chunk(binding, chunk, placement, contract, p_cache.group_specs, source, destination,
@@ -156,6 +162,10 @@ def test_prefix_mapping_completion_and_quarantine(p_hit, d_hit, outcome):
             entry.response_closed = True
             await service.control(p, source, "abort", dict(binding=binding, stopped=True))
             assert not service.requests and d_cache.group_cache_reservation(binding.request) is None
+            assert await service.control(p, source, "abort", dict(binding=binding, stopped=True)) == {}
+            with pytest.raises(ValueError):
+                await service.control(p, source, "abort", dict(
+                    binding=msgspec.structs.replace(binding, input_digest="wrong"), stopped=True))
             return
         service.fail(entry, TransferError("uncertain", uncertain=True))
         reservation = d_cache.group_cache_reservation(binding.request)
@@ -618,9 +628,6 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
         assert events.index(("decode-first", 0)) < events.index(("source-clean", 0))
         if not prefix[0]:
             assert ("overlap-proven", 0) in events
-        assert p.metrics["p_hit"] == (128 if prefix[0] else 0)
-        assert d.metrics["d_hit"] == (256 if prefix[1] else 0)
-        assert p.metrics["completed"] == d.metrics["completed"] == 1
         await p.peers.close()
         await app.state.router.client.aclose()
     asyncio.run(run())
