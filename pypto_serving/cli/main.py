@@ -245,6 +245,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="LEVELS",
         help="Comma-separated profile levels: e2e, kernel, or verbose (default: e2e,kernel).",
     )
+    parser.add_argument(
+        "--profile-chip-level",
+        type=int,
+        choices=(1, 2, 3, 4),
+        default=0,
+        metavar="{1,2,3,4}",
+        help="Capture PyPTO chip swimlanes during profiling (2+ includes AICPU; diagnostic only).",
+    )
 
     # Misc
     parser.add_argument(
@@ -597,13 +605,16 @@ def _validate_generate_config_options(options: dict[str, object]) -> None:
 
 
 def _build_profile_config(args: argparse.Namespace) -> ProfileConfig:
-    if not args.profile and (args.profile_output is not None or args.profile_level is not None):
-        raise ValueError("--profile-output and --profile-level require --profile")
+    if not args.profile and (
+        args.profile_output is not None or args.profile_level is not None or args.profile_chip_level
+    ):
+        raise ValueError("--profile-output, --profile-level and --profile-chip-level require --profile")
     output = Path(args.profile_output or "./profile_out").expanduser().resolve()
     return create_profile_config(
         enabled=args.profile,
         output=output,
         levels=args.profile_level or "e2e,kernel",
+        chip_swimlane_level=args.profile_chip_level,
     )
 
 
@@ -898,9 +909,11 @@ async def _run_generation(
         # engine.stop() runs even when stop_profile/merge_profile raise.
         try:
             if profile_enabled:
-                await engine.stop_profile()
-                stop_profile()
-                merge_profile()
+                try:
+                    await engine.stop_profile()
+                finally:
+                    stop_profile()
+                    merge_profile()
         finally:
             await engine.stop()
 
@@ -972,6 +985,13 @@ def _validate_backend(backend: str) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _warn_deprecated_serving_profile_env(args)
+    if args.profile_chip_level and not args.platform.endswith("sim"):
+        print(
+            "WARNING: chip profiling replays each L3 dispatch on real hardware; "
+            "mutable model state is not restored. Use a disposable diagnostic workload.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     with _startup_log_context(enabled=not args.show_startup_logs):
         config = build_serving_engine_config(args)

@@ -34,8 +34,14 @@ the values straight from ``RuntimeConfig``.
 
 from __future__ import annotations
 
+import dataclasses
+import logging
+import os
+import shutil
 import threading
+import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from pypto_serving.config.types import RuntimeConfig
@@ -44,6 +50,8 @@ from pypto_serving.tools.profile import profile_span
 from .buffer_set import resolve_l3_arg
 
 __all__ = ["L3DispatchMixin", "PendingL3Dispatch"]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -95,6 +103,9 @@ class L3DispatchMixin:
     _l3_static_tensors: dict[tuple, Any]
     _l3_stacked: bool
     _l3_run_config: Any | None
+    _chip_swimlane_level: int
+    _chip_capture_dir: Path | None
+    _chip_capture_errors: list[str]
 
     def _init_l3_dispatch(self, *, stacked: bool) -> None:
         """Initialize the shared dispatch state. Call from the runner ``__init__``."""
@@ -102,6 +113,85 @@ class L3DispatchMixin:
         self._l3_static_tensors: dict[tuple, Any] = {}
         self._l3_stacked = stacked
         self._l3_run_config = None
+        self._chip_swimlane_level = 0
+        self._chip_capture_dir = None
+        self._chip_capture_index = 0
+        self._chip_capture_errors = []
+
+    def set_chip_swimlane_level(self, level: int, output_dir: Path | None = None) -> list[str]:
+        """Set chip capture level and return errors from the session being stopped."""
+        if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= 4:
+            raise ValueError("chip swimlane level must be an integer from 0 to 4")
+        if level and output_dir is None:
+            raise ValueError("chip swimlane capture requires an output directory")
+        if level:
+            self._chip_capture_dir = Path(output_dir) / f"worker-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+            self._chip_capture_index = 0
+            self._chip_capture_errors = []
+        else:
+            self._chip_capture_dir = None
+        self._chip_swimlane_level = level
+        errors = self._chip_capture_errors if not level else []
+        if not level:
+            self._chip_capture_errors = []
+        return errors
+
+    def _chip_record_state(self, callable_spec: Any) -> dict[Path, tuple[int, int, int]] | None:
+        if self._chip_capture_dir is None:
+            return {}
+        from pypto.runtime._artifact_runtime import runtime_output_directory  # noqa: PLC0415
+
+        source = runtime_output_directory(callable_spec.compiled) / "dfx_outputs"
+        records = {}
+        try:
+            for record in source.glob("rank*/d*/chip_swimlane_records.json"):
+                stat = record.stat()
+                records[record] = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+        except OSError as exc:
+            message = f"Failed to inspect chip profiling records for {callable_spec.name}: {exc}"
+            self._chip_capture_errors.append(message)
+            logger.exception(message)
+            return None
+        return records
+
+    def _save_chip_capture(
+        self, callable_spec: Any, previous_records: dict[Path, tuple[int, int, int]] | None,
+    ) -> None:
+        if self._chip_capture_dir is None or previous_records is None:
+            return
+        from pypto.runtime._artifact_runtime import runtime_output_directory  # noqa: PLC0415
+
+        source = runtime_output_directory(callable_spec.compiled) / "dfx_outputs"
+        records = self._chip_record_state(callable_spec)
+        if records is None:
+            return
+        if not any(state != previous_records.get(path) for path, state in records.items()):
+            message = f"Chip profiling produced no new records for {callable_spec.name} at {source}"
+            self._chip_capture_errors.append(message)
+            logger.error(message)
+            return
+        self._chip_capture_index += 1
+        destination = self._chip_capture_dir / f"{self._chip_capture_index:06d}_{callable_spec.name}"
+        temporary = destination.with_name(f".{destination.name}.tmp")
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source, temporary)
+            temporary.rename(destination)
+        except OSError as exc:
+            shutil.rmtree(temporary, ignore_errors=True)
+            message = f"Failed to archive chip profiling artifacts for {callable_spec.name}: {exc}"
+            self._chip_capture_errors.append(message)
+            logger.exception(message)
+
+    def _profiled_run_config(self, config: Any) -> Any:
+        level = self._chip_swimlane_level
+        if not level:
+            return config
+        if config is None:
+            from pypto.runtime import RunConfig  # noqa: PLC0415
+
+            return RunConfig(enable_chip_swimlane=level)
+        return dataclasses.replace(config, enable_chip_swimlane=level)
 
     def _configure_l3_rings(self, runtime: RuntimeConfig) -> None:
         """Install the per-dispatch simpler ring sizing for L3 dispatches.
@@ -146,7 +236,7 @@ class L3DispatchMixin:
         span_args: dict[str, Any] = {"aicpu_thread_num": callable_spec.aicpu_thread_num}
         if callable_spec.block_dim is not None:
             span_args["block_dim"] = callable_spec.block_dim
-        run_config = self._l3_run_config if config is None else config
+        run_config = self._profiled_run_config(self._l3_run_config if config is None else config)
         with profile_span(callable_spec.name, cat="kernel", level="kernel", args=span_args):
             worker = self._shared_l3_worker()
             uploaded: list[Any] = []
@@ -168,9 +258,11 @@ class L3DispatchMixin:
                     level="kernel",
                     args=dict(span_args),
                 ):
+                    previous_records = self._chip_record_state(callable_spec)
                     worker.run(
                         callable_spec.compiled, *l3_args, config=run_config,
                     )
+                self._save_chip_capture(callable_spec, previous_records)
             finally:
                 for tensor in uploaded:
                     worker.free_tensor(tensor)
@@ -190,7 +282,7 @@ class L3DispatchMixin:
         span_args: dict[str, Any] = {"aicpu_thread_num": callable_spec.aicpu_thread_num}
         if callable_spec.block_dim is not None:
             span_args["block_dim"] = callable_spec.block_dim
-        run_config = self._l3_run_config if config is None else config
+        run_config = self._profiled_run_config(self._l3_run_config if config is None else config)
         worker = self._shared_l3_worker()
         uploaded: list[Any] = []
         try:
@@ -211,9 +303,13 @@ class L3DispatchMixin:
                 level="kernel",
                 args=dict(span_args),
             ):
+                previous_records = self._chip_record_state(callable_spec)
                 handle = worker.submit(
                     callable_spec.compiled, *l3_args, config=run_config,
                 )
+                if self._chip_swimlane_level:
+                    handle.result()
+                    self._save_chip_capture(callable_spec, previous_records)
         except BaseException:
             for tensor in uploaded:
                 worker.free_tensor(tensor)

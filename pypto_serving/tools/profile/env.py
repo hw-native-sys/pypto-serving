@@ -27,9 +27,16 @@ class ProfileConfig:
     trace_file: Path
     fragments_dir: Path
     levels: frozenset[str]
+    chip_swimlane_level: int = 0
 
     def includes(self, level: str) -> bool:
         return "verbose" in self.levels or level in self.levels
+
+    @property
+    def chip_artifacts_dir(self) -> Path:
+        if self.output.suffix == ".json":
+            return self.output.with_suffix(".chip")
+        return self.output / "chip"
 
 
 def load_profile_config(env: dict[str, str] | None = None) -> ProfileConfig:
@@ -53,10 +60,19 @@ def create_profile_config(
     enabled: bool,
     output: str | Path = _DEFAULT_OUTPUT,
     levels: str = _DEFAULT_LEVEL,
+    chip_swimlane_level: int = 0,
 ) -> ProfileConfig:
     """Build an explicit profiler configuration."""
     output = Path(output).expanduser()
     parsed_levels = _parse_levels(levels)
+    if (
+        isinstance(chip_swimlane_level, bool)
+        or not isinstance(chip_swimlane_level, int)
+        or not 0 <= chip_swimlane_level <= 4
+    ):
+        raise ValueError("chip_swimlane_level must be an integer from 0 to 4")
+    if chip_swimlane_level and not enabled:
+        raise ValueError("chip_swimlane_level requires profiling to be enabled")
     trace_file, fragments_dir = _resolve_output(output)
     return ProfileConfig(
         enabled=enabled,
@@ -64,6 +80,7 @@ def create_profile_config(
         trace_file=trace_file,
         fragments_dir=fragments_dir,
         levels=parsed_levels,
+        chip_swimlane_level=chip_swimlane_level,
     )
 
 

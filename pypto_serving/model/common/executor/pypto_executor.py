@@ -278,6 +278,13 @@ class PyptoExecutor(ModelExecutor, ABC):
                 except Exception:
                     logger.exception("Failed to close PyPTO runner for model %s", model_id)
 
+    def set_chip_swimlane_level(self, level: int, output_dir=None) -> list[str]:
+        """Apply chip capture to every runner and collect completed-session errors."""
+        errors: list[str] = []
+        for runner in self._runners.values():
+            errors.extend(runner.set_chip_swimlane_level(level, output_dir))
+        return errors
+
     @abstractmethod
     def _compile_model(self, model: RuntimeModel) -> object:
         """Compile model-specific PyPTO kernels and return runtime artifacts."""
