@@ -63,9 +63,8 @@ class Service:
         self.gated = False
         self.closing = False
         self.listener = None
-        self.connections, self.handlers = set(), set()
+        self.connections = set()
         self.preflight = None
-        self.metrics = dict(completed=0, failed=0, bytes=0, p_hit=0, d_hit=0)
 
     async def worker(self, operation, value=None):
         payload = msgspec.msgpack.encode(value) if value is not None else b""
@@ -113,13 +112,9 @@ class Service:
     def finish(self, entry):
         if self.requests.pop(entry.binding.request, None) is None:
             return
-        self.terminal[entry.binding.request] = True
+        self.terminal[entry.binding.request] = entry.binding
         while len(self.terminal) > self.config.capacity * 8:
             self.terminal.popitem(last=False)
-        if entry.error is None and not entry.cancelled:
-            self.metrics["completed"] += 1
-        else:
-            self.metrics["failed"] += 1
         logger.info("finished request=%s cancelled=%s error=%s p_hit=%d d_hit=%d", entry.binding.request,
                     entry.cancelled, entry.error, entry.p_hit,
                     entry.reservation.prefix_hit_tokens if entry.reservation is not None else 0)
@@ -172,9 +167,7 @@ class Service:
                     await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 task = asyncio.create_task(dispatch(message))
                 tasks.add(task)
-                self.handlers.add(task)
                 task.add_done_callback(tasks.discard)
-                task.add_done_callback(self.handlers.discard)
         except (EOFError, asyncio.IncompleteReadError, ConnectionError):
             pass
         except Exception:
@@ -193,6 +186,9 @@ class Service:
         binding = decode(payload["binding"], Binding)
         if binding.prefill != peer.key:
             raise ValueError("control sender differs from binding")
+        if (operation == "abort" and payload.get("stopped") is True
+                and self.terminal.get(binding.request) == binding):
+            return {}
         entry = self.entry(binding)
         request = binding.request
         if operation == "begin":
@@ -217,7 +213,6 @@ class Service:
                                          for k, hashes in prefix.hashes.items()},
                     shareable_group_names=tuple(prefix.hashes))
                 entry.reservation = reservation
-                self.metrics["d_hit"] += reservation.prefix_hit_tokens
                 entry.prepared.set()
                 return Placement(request, reservation.prefix_hit_tokens, reservation.partition,
                                  reservation.block_ids_by_group)
@@ -401,7 +396,6 @@ class Service:
                     if p_hit is None:
                         p_hit = chunk.start
                         entry.p_hit = p_hit
-                        self.metrics["p_hit"] += p_hit
                     if inflight is not None:
                         await inflight
                     if entry.cancelled:
@@ -428,7 +422,6 @@ class Service:
                         completion.check(plan)
                         self.pins.release(request)
                         await self.worker("forget", job)
-                        self.metrics["bytes"] += sum(c.length for c in plan.copies)
                         response = await call("complete", completion=completion)
                         if response.get("error"):
                             raise ValueError(response["error"])
@@ -460,6 +453,7 @@ class Service:
                 try:
                     await call("abort", stopped=not uncertain)
                 except Exception:
+                    logger.exception("sender stop confirmation failed request=%s", request)
                     self.gated = True
                 raise
             finally:
