@@ -1,0 +1,4 @@
+interface:
+  display_name: "Profile DSV4 DSpark B16 8K STRACE"
+  short_description: "Profile DSpark B16, 8K input, 256 output"
+  default_prompt: "Use $profile-dsv4-dspark-b16-8k-strace to run the fixed DSV4 DSpark B16/8K/256 profile and generate its combined serving and Host STRACE swimlane."
