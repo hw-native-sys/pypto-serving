@@ -43,7 +43,8 @@ cases = [
 ]
 for name, records, target in cases:
     actual = summarize(iter(records))
-    assert actual == target, (name, actual, target)
+    if actual != target:
+        raise AssertionError((name, actual, target))
     print("PASS", name)
 with tempfile.TemporaryDirectory() as directory:
     path = Path(directory) / "access.jsonl"
@@ -55,15 +56,27 @@ with tempfile.TemporaryDirectory() as directory:
     ]:
         result = subprocess.run([sys.executable, "cli.py", str(path), *flags], text=True, capture_output=True, check=True)
         actual = json.loads(result.stdout)
-        assert actual == target, (name, actual, target)
+        if actual != target:
+            raise AssertionError((name, actual, target))
         print("PASS", name)
 """
 
 
 def run_tests(workspace, extra=False):
     command = [sys.executable, "-c", EXTRA_CHECKS] if extra else [sys.executable, "-m", "unittest", "-v"]
-    result = subprocess.run(command, cwd=workspace, text=True, capture_output=True, timeout=30)
+    try:
+        result = subprocess.run(command, cwd=workspace, text=True, capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired as error:
+        output = "".join(part.decode("utf-8", errors="replace") if isinstance(part, bytes) else (part or "")
+                         for part in (error.stdout, error.stderr))
+        return {"returncode": 124, "output": output + f"\nCheck timed out after {error.timeout} seconds.\n"}
     return {"returncode": result.returncode, "output": result.stdout + result.stderr}
+
+
+def source_files(directory):
+    return {path.relative_to(directory) for path in directory.rglob("*")
+            if path.is_file() and "__pycache__" not in path.relative_to(directory).parts
+            and path.suffix != ".pyc"}
 
 
 def main():
@@ -85,13 +98,17 @@ def main():
         print(baseline["output"])
         return 0 if baseline["returncode"] == 1 else 1
     workspace = args.workspace.resolve()
-    unchanged = all((workspace / name).read_bytes() == (FIXTURE / name).read_bytes()
-                    for name in ("README.md", "test_report.py"))
     public = run_tests(workspace)
     extra = run_tests(workspace, extra=True)
+    fixture_files = source_files(FIXTURE)
+    unchanged = (
+        source_files(workspace) == fixture_files
+        and all((workspace / name).read_bytes() == (FIXTURE / name).read_bytes()
+                for name in fixture_files - {Path("report.py"), Path("cli.py")})
+    )
     patch = "".join("".join(difflib.unified_diff(
         (FIXTURE / name).read_text().splitlines(keepends=True),
-        (workspace / name).read_text().splitlines(keepends=True),
+        ((workspace / name).read_text() if (workspace / name).is_file() else "").splitlines(keepends=True),
         fromfile=f"before/{name}", tofile=f"after/{name}",
     )) for name in ("report.py", "cli.py"))
     summary = {"passed": unchanged and public["returncode"] == 0 and extra["returncode"] == 0,
