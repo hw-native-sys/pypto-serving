@@ -1,0 +1,118 @@
+{
+  "Name": "Basic Deployment",
+  "Settings": {
+    "Heartbeat": {
+      "Enabled": true,
+      "Visible": false,
+      "Interval": 500,
+      "Tolerance": 1000
+    },
+    "Control Buffer": {
+      "Capacity": 32,
+      "Size": 16384
+    }
+  },
+  "Request Manager": {
+    "Input": "",
+    "Output": ""
+  },
+  "Partitions": [
+    {
+      "Name": "P0",
+      "Tasks": [
+        {
+          "Function Name": "T0",
+          "Inputs": [
+            "Channel 0"
+          ],
+          "Outputs": [
+            "Channel 1"
+          ],
+          "Dependencies": []
+        }
+      ]
+    },
+    {
+      "Name": "P1",
+      "Tasks": [
+        {
+          "Function Name": "T1",
+          "Inputs": [
+            "Channel 1"
+          ],
+          "Outputs": [
+            "Channel 2"
+          ],
+          "Dependencies": []
+        }
+      ]
+    },
+    {
+      "Name": "P2",
+      "Tasks": [
+        {
+          "Function Name": "T2",
+          "Inputs": [
+            "Channel 2"
+          ],
+          "Outputs": [
+            "Channel 3"
+          ],
+          "Dependencies": []
+        }
+      ]
+    },
+    {
+      "Name": "P3",
+      "Tasks": [
+        {
+          "Function Name": "T3",
+          "Inputs": [
+            "Channel 3"
+          ],
+          "Outputs": [
+            "Channel 4"
+          ],
+          "Dependencies": []
+        }
+      ]
+    },
+    {
+      "Name": "P4",
+      "Tasks": [
+        {
+          "Function Name": "T4",
+          "Inputs": [
+            "Channel 4"
+          ],
+          "Outputs": [
+            "Channel 0"
+          ],
+          "Dependencies": []
+        }
+      ]
+    }
+  ],
+  "Edges": [
+    {
+      "Name": "Channel 0",
+      "Buffer Size": 4096
+    },
+    {
+      "Name": "Channel 1",
+      "Buffer Size": 4096
+    },
+    {
+      "Name": "Channel 2",
+      "Buffer Size": 4096
+    },
+    {
+      "Name": "Channel 3",
+      "Buffer Size": 4096
+    },
+    {
+      "Name": "Channel 4",
+      "Buffer Size": 4096
+    }
+  ]
+}
