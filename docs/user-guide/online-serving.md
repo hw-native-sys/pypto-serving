@@ -161,3 +161,11 @@ Scheduler and engine rejections are returned as HTTP 400 with:
 ## Shutdown
 
 Stop the server with the normal process signal for your environment. On a graceful shutdown, the server attempts to stop active profile recorders and merge available profile fragments when profiling is enabled.
+
+## Interactive coding frontend
+
+The optional [mini-swe-agent HTTP frontend](../../examples/mini_swe_agent/README.md)
+connects to the Chat API for coding tasks and file-based conversation. It
+supports command confirmation, context budgeting, execution records, and optional
+completion checks. Install its dependencies in a separate client environment;
+the frontend does not start or stop the server.
