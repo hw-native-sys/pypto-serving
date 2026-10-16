@@ -14,6 +14,11 @@ authors = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+agentinfer = [
+    "agentinfer @ git+https://github.com/openJiuwen-ai/agent-infer.git@9b8e3c473c83dba1a73aefd33ba081c83c3c3bdd",
+]
+
 [project.urls]
 Repository = "https://github.com/hw-native-sys/pypto-serving"
 Issues = "https://github.com/hw-native-sys/pypto-serving/issues"

@@ -34,6 +34,10 @@ def test_async_llm_engine_generates_structured_offline_batch():
     asyncio.run(_check_async_llm_engine_generates_structured_offline_batch())
 
 
+def test_async_llm_engine_forwards_agent_identity_to_selected_replica():
+    asyncio.run(_check_async_llm_engine_forwards_agent_identity_to_selected_replica())
+
+
 def test_engine_config_resolves_model_runtime_requirements():
     default_runtime = EngineConfig().resolve_runtime_config()
     assert default_runtime.requires_homogeneous_prefill_decode is False
@@ -42,6 +46,19 @@ def test_engine_config_resolves_model_runtime_requirements():
         executor_cls="PyptoDeepSeekV4Executor"
     ).resolve_runtime_config()
     assert deepseek_runtime.requires_homogeneous_prefill_decode is True
+
+
+def test_agentinfer_enforce_rejects_multi_replica_engine_config():
+    with pytest.raises(ValueError, match="single-replica"):
+        AsyncLLMEngine(
+            EngineConfig(
+                agentinfer_mode="enforce",
+                parallel_config=ParallelConfig(
+                    data_parallel_size=2, tensor_parallel_size=1, devices=(0, 1),
+                ),
+            ),
+            tokenizer=_Tokenizer(),
+        )
 
 
 async def _check_async_llm_engine_routes_to_least_pending_tokens():
@@ -191,6 +208,22 @@ async def _check_async_llm_engine_generates_structured_offline_batch():
         await engine.generate_result("streaming", GenerateConfig(stream=True))
 
 
+async def _check_async_llm_engine_forwards_agent_identity_to_selected_replica():
+    engine = AsyncLLMEngine(
+        EngineConfig(model_id="model", parallel_config=ParallelConfig(devices=(0,))),
+        tokenizer=_Tokenizer(), core_factory=_FakeCore,
+    )
+    for request_id, session_id in (("round-1", "session-a"), ("round-2", "session-a"),
+                                   ("other", "session-b")):
+        await _collect_outputs(engine.add_request(
+            request_id, "hello", GenerateConfig(max_new_tokens=1),
+            agent_session_id=session_id,
+        ))
+    await _collect_outputs(engine.add_request("plain", "hello", GenerateConfig(max_new_tokens=1)))
+    assert engine._cores[0].session_ids == ["session-a", "session-a", "session-b", None]
+    assert engine._request_to_replica == {}
+
+
 async def _collect_outputs(outputs):
     return [output async for output in outputs]
 
@@ -212,6 +245,7 @@ class _FakeCore:
         self.load = 0
         self.requests: list[str] = []
         self.prompt_token_ids: list[list[int] | None] = []
+        self.session_ids: list[str | None] = []
 
     async def start(self) -> None:
         return None
@@ -223,10 +257,12 @@ class _FakeCore:
         return self.load
 
     async def add_request(
-        self, request_id: str, prompt: str, config, *, on_queued=None, prompt_token_ids=None
+        self, request_id: str, prompt: str, config, *, on_queued=None, prompt_token_ids=None,
+        agent_session_id=None,
     ):
         self.requests.append(request_id)
         self.prompt_token_ids.append(list(prompt_token_ids) if prompt_token_ids is not None else None)
+        self.session_ids.append(agent_session_id)
         if on_queued is not None:
             on_queued()
         yield TokenOutput(finished=True, finish_reason="FINISHED_LENGTH")

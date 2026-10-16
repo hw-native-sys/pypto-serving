@@ -18,7 +18,7 @@ from enum import Enum, auto
 
 from pypto_serving.config.types import KVCacheGroupSpec
 from pypto_serving.serving.constraints import ConstraintSpec
-from pypto_serving.serving.memory.kv_cache import KVCacheCapacityError, KvCacheManager
+from pypto_serving.serving.memory.kv_cache import KVCacheCapacityError, KvCacheManager, PrefixCacheObservation
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +141,8 @@ class Request:
     # prefill chunk. Keep this across decode so partial pages stay unpublished.
     group_cache_valid_from: dict[str, int] = field(default_factory=dict)
     prefix_cache_metrics_recorded: bool = False
+    observe_prefix_cache: bool = False
+    prefix_cache_observation: PrefixCacheObservation | None = None
     # Async scheduling: tokens scheduled optimistically but not yet sampled.
     # Stands in for output tokens still in flight so the next schedule() advances
     # correctly; decremented as real tokens are applied in update_from_output.
@@ -475,6 +477,12 @@ class Scheduler:
                         )
                     cached_blocks = []
                 else:
+                    if request.observe_prefix_cache:
+                        # Capture ownership before get_computed_blocks acquires
+                        # this request's references. No await occurs between lookups.
+                        request.prefix_cache_observation = self.kv_cache_manager.observe_prefix(
+                            request.prompt_token_ids,
+                        )
                     cached_blocks = self.kv_cache_manager.get_computed_blocks(
                         request.prompt_token_ids
                     )
@@ -586,6 +594,7 @@ class Scheduler:
         request.num_computed_tokens = 0
         request.num_blocks_cached = 0
         request.num_group_blocks_cached = {}
+        request.prefix_cache_observation = None
 
     def _prefill_chunk_limit(self) -> int | None:
         """Return the configured per-request prefill limit before step budget."""

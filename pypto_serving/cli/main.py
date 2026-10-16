@@ -223,6 +223,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Enable chunked prefill (default: True). Use --no-enable-chunked-prefill to disable.",
     )
+    parser.add_argument(
+        "--agentinfer-mode",
+        choices=("disabled", "enforce"),
+        default="disabled",
+        help="AgentInfer mode (default: disabled). Enforce needs a pinned agentinfer.scheduling installation.",
+    )
+    parser.add_argument(
+        "--agentinfer-config", type=json.loads, default={},
+        help="Experimental AgentInfer controls as a JSON object; requires --agentinfer-mode enforce.",
+    )
 
     # Profiling
     parser.add_argument(
@@ -259,6 +269,11 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     _validate_backend(args.backend)
 
     from pypto_serving.serving.engine.async_engine import EngineConfig
+    from pypto_serving.serving.agentinfer_admission import AgentInferOptions
+
+    agentinfer_config = AgentInferOptions.from_mapping(args.agentinfer_config)
+    if args.agentinfer_config and args.agentinfer_mode != "enforce":
+        raise ValueError("--agentinfer-config requires --agentinfer-mode enforce")
 
     model_dir = str(Path(args.model).resolve())
     executor_kwargs: dict[str, object] = {}
@@ -305,6 +320,10 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         config_data=model_config_data,
         variant=model_variant,
     )
+    if args.agentinfer_mode != "disabled" and (
+        model_family != "qwen" or parallel_config.num_replicas != 1
+    ):
+        raise ValueError("AgentInfer currently supports only single-replica Qwen serving")
     first_group = parallel_config.replica_device_groups[0]
     worker_device_ids = first_group if parallel_config.num_replicas == 1 else ()
     # DSpark rebuilds its private drafter context from a prefilled suffix.
@@ -334,6 +353,8 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         long_prefill_token_threshold=args.long_prefill_token_threshold,
         enable_prefix_cache=enable_prefix_cache,
         enable_chunk_prefill=args.enable_chunked_prefill,
+        agentinfer_mode=args.agentinfer_mode,
+        agentinfer_config=agentinfer_config,
     )
 
 
