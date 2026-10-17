@@ -1,6 +1,8 @@
 # PyPTO and its simpler runtime are NOT published on PyPI: the "pypto" and
 # "simpler" names there are unrelated packages without the persistent JIT
-# cache API. Provide both from a current source build (see
-# docs/get-started/installation.md) -- do not pip-resolve them from PyPI.
+# cache API. PyPTO must include hw-native-sys/pypto#2975 so RunConfig honors
+# backend_type and execution_mode. Build simpler from that PyPTO checkout's
+# runtime submodule. See docs/get-started/installation.md for the required
+# compatibility check -- do not pip-resolve these packages from PyPI.
 torch>=2.6.0
 -r requirements-runtime.txt
