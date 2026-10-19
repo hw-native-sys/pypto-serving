@@ -61,6 +61,7 @@ def test_build_serving_engine_config_rejects_unsupported_deepseek_chunk_size(
 def test_build_serving_engine_config_uses_parallel_config_for_devices(tmp_path):
     model_dir = tmp_path / "model"
     model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type":"qwen3"}')
     args = _parse_cli_args(
         [
             "--model",
@@ -87,6 +88,7 @@ def test_build_serving_engine_config_uses_parallel_config_for_devices(tmp_path):
 def test_build_serving_engine_config_rejects_invalid_parallel_topology(tmp_path):
     model_dir = tmp_path / "model"
     model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type":"qwen3"}')
     args = _parse_cli_args(
         [
             "--model",

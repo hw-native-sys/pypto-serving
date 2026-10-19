@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 
-ModelFamily = Literal["deepseek_v4", "qwen"]
+ModelFamily = Literal["deepseek_v4", "qwen", "qwen3_5"]
 
 
 def read_model_config(model_dir: str | Path) -> dict[str, object]:
@@ -43,4 +43,14 @@ def is_deepseek_v4_config(config_data: dict[str, object]) -> bool:
 
 def detect_model_family(config_data: dict[str, object]) -> ModelFamily:
     """Return the serving model family inferred from config metadata."""
-    return "deepseek_v4" if is_deepseek_v4_config(config_data) else "qwen"
+    if is_deepseek_v4_config(config_data):
+        return "deepseek_v4"
+    model_type = str(config_data.get("model_type") or "").lower()
+    architectures = config_data.get("architectures") or ()
+    if model_type == "qwen3_5" and "qwen3_5forconditionalgeneration" in {
+        str(name).lower() for name in architectures
+    }:
+        return "qwen3_5"
+    if model_type in {"qwen2", "qwen3"}:
+        return "qwen"
+    raise ValueError(f"Unsupported model family: model_type={model_type!r}")

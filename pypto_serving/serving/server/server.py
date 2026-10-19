@@ -15,6 +15,7 @@ import dataclasses
 import importlib.util
 import json
 import logging
+import math
 import time
 import uuid
 from typing import Literal
@@ -89,7 +90,7 @@ class ToolCall(BaseModel):
 
 class ChatMessage(BaseModel):
     role: str
-    content: str | None = None
+    content: str | list[dict[str, object]] | None = None
     reasoning: str | None = None
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
@@ -293,7 +294,7 @@ class ServingServer:
         else:
             stop = defaults.stop
 
-        return GenerateConfig(
+        config = GenerateConfig(
             max_new_tokens=request.max_tokens
             if "max_tokens" in provided
             else defaults.max_new_tokens,
@@ -306,6 +307,16 @@ class ServingServer:
             stop=stop,
             stream=request.stream if "stream" in provided else defaults.stream,
         )
+        if isinstance(config.max_new_tokens, bool) or not isinstance(config.max_new_tokens, int) \
+                or config.max_new_tokens <= 0:
+            raise ValueError("max_tokens must be a positive integer")
+        if config.temperature is None or not math.isfinite(config.temperature) or config.temperature < 0:
+            raise ValueError("temperature must be finite and non-negative")
+        if config.top_p is None or not math.isfinite(config.top_p) or not 0 < config.top_p <= 1:
+            raise ValueError("top_p must be in (0, 1]")
+        if config.top_k is not None and (isinstance(config.top_k, bool) or config.top_k <= 0):
+            raise ValueError("top_k must be positive")
+        return config
 
     async def _completions(self, request: CompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -347,6 +358,14 @@ class ServingServer:
 
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        if getattr(getattr(self.engine, "config", None), "executor_cls", None) == "PyptoQwen35Executor":
+            for message in request.messages:
+                if isinstance(message.content, list):
+                    kinds = {str(part.get("type", "")).lower() for part in message.content}
+                    media = "image" if "image_url" in kinds or "image" in kinds else (
+                        "video" if "video_url" in kinds or "video" in kinds else "structured content"
+                    )
+                    raise ValueError(f"{media} input is unsupported for this text-only endpoint")
         output_parser_spec = self._output_parser_spec(request)
         constraint_spec = self._constraint_spec(request, output_parser_spec)
         if constraint_spec is not None:

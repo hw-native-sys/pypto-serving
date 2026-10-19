@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -383,6 +384,66 @@ class DeepSeekV4W8A8DirectoryLoader(SafetensorsDirectoryLoader):
         )
 
 
+class Qwen35DirectoryLoader(SafetensorsDirectoryLoader):
+    """Strict text-only loader for the pinned Qwen3.8-27B checkpoint."""
+
+    format_names = ("qwen3_5", "qwen3.8")
+    _hashes = {
+        "config.json": "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab",
+        "model.safetensors.index.json": "77042094076611b69791a610065f28b7013b8c621795fa86ddccc8bac7d1b9df",
+        "tokenizer.json": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    }
+    _revision = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+
+    def _recognises(self, model_path: Path) -> bool:
+        config = read_model_config(model_path)
+        return config.get("model_type") == "qwen3_5"
+
+    def load(self, request: ModelLoadRequest) -> LoadedModel:
+        from pypto_serving.model.qwen3_5.weight_spec import validate_qwen35_weight_index
+
+        root = Path(request.model_dir)
+        for name, expected in self._hashes.items():
+            path = root / name
+            if not path.is_file():
+                raise FileNotFoundError(f"Qwen3.8 checkpoint is missing {name}")
+            if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                raise ValueError(f"Qwen3.8 checkpoint {name} differs from revision {self._revision}")
+        metadata = root / ".cache/huggingface/download/config.json.metadata"
+        if metadata.exists() and metadata.read_text().splitlines()[0] != self._revision:
+            raise ValueError("Qwen3.8 checkpoint revision differs from the accepted model")
+        config_data = json.loads((root / "config.json").read_text())
+        index = _load_safetensors_weight_map(root)
+        validate_qwen35_weight_index(index, config_data)
+        for filename in _safetensors_shard_filenames(index):
+            if not (root / filename).is_file():
+                raise FileNotFoundError(f"Qwen3.8 checkpoint shard is missing: {filename}")
+        tokenizer = load_tokenizer(root, trust_remote_code=False)
+        text = config_data["text_config"]
+        config = _build_model_config(request.model_id, {
+            **text,
+            "architectures": config_data["architectures"],
+            "rope_theta": text["rope_parameters"]["rope_theta"],
+            "torch_dtype": text["dtype"],
+        }, tokenizer)
+        # The text head dimension is explicit; 5120 / 24 is not its head size.
+        config = ModelConfig(**{**config.__dict__, "head_dim": int(text["head_dim"])})
+        runtime = request.runtime_config or RuntimeConfig(max_seq_len=128)
+        if runtime.max_seq_len > 128 or runtime.max_batch_size != 1:
+            raise ValueError("Qwen3.8 text requires one request and at most 128 positions")
+        placeholder = torch.empty(0, dtype=torch.bfloat16)
+        model = RuntimeModel(
+            config=config, runtime=runtime, embed_tokens=placeholder,
+            final_norm_weight=placeholder, lm_head=placeholder,
+            extra={"family": "qwen3_5", "model_dir": str(root),
+                   "weight_map": index, "config_data": config_data},
+        )
+        return LoadedModel(
+            model_id=request.model_id, model_dir=str(root), config=config,
+            tokenizer=tokenizer, layer_specs=_build_layer_specs(config), runtime_model=model,
+        )
+
+
 def _build_deepseek_v4_model_config(
     model_id: str,
     config_data: dict,
@@ -442,7 +503,9 @@ class ModelLoader:
 
     def __init__(self, format_loaders: list[ModelFormatLoader] | None = None) -> None:
         """Create a loader registry with optional custom format loaders."""
-        self._format_loaders = format_loaders or [DeepSeekV4W8A8DirectoryLoader(), HuggingFaceDirectoryLoader()]
+        self._format_loaders = format_loaders or [
+            Qwen35DirectoryLoader(), DeepSeekV4W8A8DirectoryLoader(), HuggingFaceDirectoryLoader(),
+        ]
 
     def register(self, format_loader: ModelFormatLoader) -> None:
         """Register an additional model format loader."""

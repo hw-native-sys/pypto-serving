@@ -214,6 +214,10 @@ class WorkerProcess:
             return num_pages
 
     def _resolve_executor_cls(self):
+        if self.config.executor_cls == "PyptoQwen35Executor":
+            from pypto_serving.model.qwen3_5.npu_executor import Qwen35PyptoExecutor
+
+            return Qwen35PyptoExecutor
         if self.config.executor_cls == "PyptoQwen14BExecutor":
             from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor
 

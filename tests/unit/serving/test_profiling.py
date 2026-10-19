@@ -47,6 +47,7 @@ class _Queue:
 def test_profile_cli_config_reaches_engine_workers(tmp_path):
     model_dir = tmp_path / "model"
     model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type":"qwen3"}')
     output = tmp_path / "profile"
     args = cli.build_parser().parse_args(
         [

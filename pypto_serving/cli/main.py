@@ -381,6 +381,9 @@ def _build_runtime_config(
         )
         if num_speculative_tokens:
             speculative_prefix_cache_replay_tokens = DSPARK_SLIDING_WINDOW
+    elif model_family == "qwen3_5":
+        max_prefill_tokens_per_request = min(128, args.max_num_batched_tokens)
+        requires_homogeneous_prefill_decode = True
     elif model_family == "deepseek_v4":
         from pypto_serving.model.deepseek.npu_executor import (
             load_deepseek_v4_serving_contract,
@@ -628,6 +631,8 @@ def _executor_cls_for_model_family(model_family: str, *, variant: str = "") -> s
         if variant == "dspark":
             return "PyptoDeepSeekV4DSparkExecutor"
         return "PyptoDeepSeekV4Executor"
+    if model_family == "qwen3_5":
+        return "PyptoQwen35Executor"
     return "PyptoQwen14BExecutor"
 
 
@@ -661,6 +666,21 @@ def _validate_model_topology(
     variant: str = "",
 ) -> None:
     """Validate model-specific serving topology constraints."""
+    if model_family == "qwen3_5":
+        if (parallel_config.data_parallel_size != 1
+                or parallel_config.tensor_parallel_size != 1
+                or parallel_config.expert_parallel_size != 1
+                or len(parallel_config.devices) != 1
+                or args.max_num_seqs != 1):
+            raise ValueError("Qwen3.8 text requires --dp 1 --tp 1 --ep 1 with one NPU and one request")
+        if (not 1 <= args.max_model_len <= 128 or args.max_num_batched_tokens > 128
+                or args.block_size != 128):
+            raise ValueError("Qwen3.8 text requires at most 128 positions and --block-size 128")
+        if args.enable_prefix_caching or args.enable_chunked_prefill:
+            raise ValueError("Qwen3.8 text does not support prefix caching or chunked prefill")
+        if args.dtype != "bfloat16" or args.kv_cache_dtype not in {"auto", "bfloat16"}:
+            raise ValueError("Qwen3.8 text requires BF16 weights and KV state")
+        return
     if model_family != "deepseek_v4":
         return
     if variant == "dspark":
