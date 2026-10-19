@@ -24,6 +24,10 @@ class Session:
         self.slots = asyncio.Semaphore(capacity)
         self.task = asyncio.create_task(self._read())
 
+    @property
+    def closed(self):
+        return self.task.done()
+
     async def _read(self):
         error = ConnectionError("peer control session closed")
         try:
@@ -98,24 +102,43 @@ class PeerPool:
     async def use(self, key, connect):
         async with self.lock:
             entry = self.entries.get(key)
+            if entry is not None and entry.retired:
+                raise ValueError("peer identity has retired")
+            for old_key, old in tuple(self.entries.items()):
+                if old_key != key and old_key[0] == key[0]:
+                    old.retired = True
+                    if not old.users:
+                        await self._remove(old_key, old)
+            if entry is not None and not entry.users and self._failed(entry):
+                await self._remove(key, entry)
+                entry = None
             if entry is None:
                 if len(self.entries) >= self.capacity:
                     raise RuntimeError("peer session capacity exhausted")
                 entry = self.entries[key] = Entry(asyncio.create_task(connect()))
-            if entry.retired:
-                raise ValueError("peer identity has retired")
             entry.users += 1
         try:
             yield await asyncio.shield(entry.value)
         finally:
             async with self.lock:
                 entry.users -= 1
-                failed = entry.value.done() and (entry.value.cancelled() or entry.value.exception() is not None)
-                if failed and not entry.users:
-                    self.entries.pop(key)
-                elif entry.retired and not entry.users:
-                    await (await entry.value).close()
-                    self.entries.pop(key)
+                if not entry.users and (entry.retired or self._failed(entry)):
+                    await self._remove(key, entry)
+
+    @staticmethod
+    def _failed(entry):
+        return entry.value.done() and (entry.value.cancelled() or entry.value.exception() is not None
+                                       or entry.value.result().closed)
+
+    async def _remove(self, key, entry):
+        if not entry.value.done():
+            entry.value.cancel()
+        value, = await asyncio.gather(entry.value, return_exceptions=True)
+        try:
+            if not isinstance(value, BaseException):
+                await value.close()
+        finally:
+            self.entries.pop(key)
 
     async def retire(self, key):
         async with self.lock:
@@ -123,12 +146,10 @@ class PeerPool:
             if entry is not None:
                 entry.retired = True
                 if not entry.users:
-                    await (await entry.value).close()
-                    self.entries.pop(key)
+                    await self._remove(key, entry)
 
     async def close(self):
         if any(e.users for e in self.entries.values()):
             raise RuntimeError("cannot close sessions with active handoffs")
-        values = await asyncio.gather(*(e.value for e in self.entries.values()))
-        await asyncio.gather(*(value.close() for value in values))
-        self.entries.clear()
+        for key, entry in tuple(self.entries.items()):
+            await self._remove(key, entry)

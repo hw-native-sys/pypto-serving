@@ -10,8 +10,12 @@
 from __future__ import annotations
 
 import asyncio
+import queue
+import threading
 from types import SimpleNamespace
 
+import msgspec
+import pytest
 
 import pypto_serving.cli.main as cli
 from pypto_serving.config.types import GenerateConfig
@@ -21,11 +25,14 @@ from pypto_serving.serving.server import serving_worker
 from pypto_serving.serving.server.ipc import (
     ProfileCommand,
     ProfileResult,
+    ControlCommand,
+    ControlResult,
     ShutdownCommand,
     decode_command,
     decode_profile_result,
     encode_command,
     encode_profile_result,
+    encode_control_result,
 )
 from pypto_serving.tools.profile.env import load_profile_config
 from pypto_serving.tools.profile.merge import merge_fragments
@@ -135,8 +142,8 @@ def test_replica_core_waits_for_profile_ack(monkeypatch):
     sent = _Queue()
     acknowledgements = _Queue(
         [
-            encode_profile_result(ProfileResult(active=True)),
-            encode_profile_result(ProfileResult(active=False)),
+            encode_profile_result(ProfileResult(active=True, command_id=1)),
+            encode_profile_result(ProfileResult(active=False, command_id=2)),
         ]
     )
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
@@ -144,6 +151,7 @@ def test_replica_core_waits_for_profile_ack(monkeypatch):
     core._input_queue = sent
     core._profile_output_queue = acknowledgements
     core._step_timeout = 1.0
+    core._control_counter = 0
 
     async def control_profile():
         await core.start_profile()
@@ -153,9 +161,105 @@ def test_replica_core_waits_for_profile_ack(monkeypatch):
 
     commands = [decode_command(raw) for raw in sent.values]
     assert commands == [
-        ProfileCommand(active=True),
-        ProfileCommand(active=False),
+        ProfileCommand(active=True, command_id=1),
+        ProfileCommand(active=False, command_id=2),
     ]
+
+
+def _control_core(replies):
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._profile_lock = asyncio.Lock()
+    core._input_queue = _Queue()
+    core._profile_output_queue = replies
+    core._step_timeout = .2
+    core._control_counter = 0
+    return core
+
+
+def test_worker_control_and_profile_drain_each_others_late_replies():
+    async def run():
+        replies = _Queue([
+            encode_control_result(ControlResult(command_id=0)),
+            encode_profile_result(ProfileResult(active=True, command_id=1)),
+            encode_profile_result(ProfileResult(active=False, command_id=1)),
+            encode_control_result(ControlResult(command_id=2, payload=b"ok")),
+        ])
+        core = _control_core(replies)
+        await core.start_profile()
+        assert await core.call_worker("registry") == b"ok"
+        assert not replies.values
+        commands = [decode_command(raw) for raw in core._input_queue.values]
+        assert isinstance(commands[0], ProfileCommand) and commands[0].command_id == 1
+        assert isinstance(commands[1], ControlCommand) and commands[1].command_id == 2
+    asyncio.run(run())
+
+
+def test_worker_control_rejects_future_reply():
+    async def run():
+        core = _control_core(_Queue([encode_control_result(ControlResult(command_id=2))]))
+        with pytest.raises(RuntimeError, match="ordering mismatch"):
+            await core.call_worker("registry")
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("profile", [False, True])
+def test_worker_control_validates_matching_reply_type(profile):
+    async def run():
+        raw = (encode_control_result(ControlResult(command_id=1)) if profile
+               else encode_profile_result(ProfileResult(active=True, command_id=1)))
+        core = _control_core(_Queue([raw]))
+        with pytest.raises(msgspec.ValidationError):
+            if profile:
+                await core.start_profile()
+            else:
+                await core.call_worker("registry")
+    asyncio.run(run())
+
+
+def test_cancelled_worker_call_drains_before_releasing_shared_queue():
+    async def run():
+        entered = threading.Event()
+        class Replies(queue.Queue):
+            def get(self, *args, **kwargs):
+                entered.set()
+                return super().get(*args, **kwargs)
+        replies = Replies()
+        core = _control_core(replies)
+        first = asyncio.create_task(core.call_worker("first"))
+        assert await asyncio.to_thread(entered.wait, 1)
+        first.cancel()
+        second = asyncio.create_task(core.call_worker("second"))
+        await asyncio.sleep(0)
+        assert len(core._input_queue.values) == 1
+        replies.put(encode_control_result(ControlResult(command_id=1)))
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        replies.put(encode_control_result(ControlResult(command_id=2, payload=b"second")))
+        assert await second == b"second"
+    asyncio.run(run())
+
+
+def test_worker_control_timeout_can_be_followed_by_profile():
+    async def run():
+        replies = queue.Queue()
+        core = _control_core(replies)
+        core._step_timeout = .01
+        with pytest.raises(RuntimeError, match="timed out"):
+            await core.call_worker("registry")
+        replies.put(encode_control_result(ControlResult(command_id=1)))
+        replies.put(encode_profile_result(ProfileResult(active=True, command_id=2)))
+        await core.start_profile()
+        assert replies.empty()
+    asyncio.run(run())
+
+
+def test_worker_control_rejects_missing_response_queue_before_enqueue():
+    async def run():
+        core = _control_core(None)
+        with pytest.raises(RuntimeError, match="not running"):
+            await core.call_worker("registry")
+        assert not core._input_queue.values
+    asyncio.run(run())
 
 
 def test_http_profile_endpoints_control_workers_and_merge(monkeypatch):

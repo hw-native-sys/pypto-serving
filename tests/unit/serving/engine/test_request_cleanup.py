@@ -9,7 +9,10 @@
 
 import asyncio
 from collections import deque
+import queue
 from types import SimpleNamespace
+
+import pytest
 
 from pypto_serving.serving.engine.async_engine import (
     ReplicaEngineCore,
@@ -35,8 +38,8 @@ def test_worker_step_error_queues_finished_ids_for_executor_release():
     core._batch_queue = deque()
     core._discard_result_step_ids = set()
     contexts = {
-        "req-a": SimpleNamespace(queue=asyncio.Queue()),
-        "req-b": SimpleNamespace(queue=asyncio.Queue()),
+        name: SimpleNamespace(queue=asyncio.Queue(), worker_release_done=asyncio.Event())
+        for name in ("req-a", "req-b")
     }
     core._request_contexts = dict(contexts)
     scheduler_output = SimpleNamespace(
@@ -53,12 +56,15 @@ def test_worker_step_error_queues_finished_ids_for_executor_release():
     assert aborted == ["req-a", "req-b"]
     assert discarded == scheduler_output.scheduled_requests
     assert core._pending_free_ids == ["req-a", "req-b"]
-    assert not core._request_contexts
+    assert core._request_contexts == contexts
     for request_id in ("req-a", "req-b"):
         token = contexts[request_id].queue.get_nowait()
         assert isinstance(token, TokenOutput)
         assert token.finished is True
         assert token.finish_reason == "error"
+        assert contexts[request_id].terminal_output_queued
+    core._acknowledge_worker_frees(("req-a", "req-b"))
+    assert all(ctx.worker_release_done.is_set() for ctx in contexts.values())
 
 
 def test_abort_request_schedules_worker_cleanup():
@@ -128,7 +134,7 @@ def test_flush_pending_frees_sends_cleanup_only_step_command(monkeypatch):
     sent: list[bytes] = []
     core._input_queue = SimpleNamespace(put=sent.append)
     # Worker replies with an empty StepResult for the cleanup-only step.
-    core._output_queue = SimpleNamespace(get=lambda timeout=None: encode_result(StepResult(new_tokens={})))
+    core._output_queue = SimpleNamespace(get=lambda timeout=None: encode_result(StepResult(new_tokens={}, step_id=1)))
 
     asyncio.run(core._flush_pending_frees())
 
@@ -142,3 +148,62 @@ def test_flush_pending_frees_sends_cleanup_only_step_command(monkeypatch):
     # Pending list drained; known-set no longer tracks the released id.
     assert core._pending_free_ids == []
     assert "aborted" not in core._worker_known_req_ids
+
+
+@pytest.mark.parametrize("failure", ["timeout", "error", "wrong_step", "send"])
+def test_cleanup_failure_preserves_release_until_matching_ack(failure):
+    async def run():
+        core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+        context = SimpleNamespace(worker_release_done=asyncio.Event())
+        core._request_contexts = {"finished": context}
+        core._worker_known_req_ids = {"finished"}
+        core._pending_free_ids = ["finished"]
+        core._batch_queue = deque()
+        core._discard_result_step_ids = set()
+        core._step_counter = 0
+        core._step_timeout = .1
+        sent = []
+        def send(raw):
+            if failure == "send" and not sent:
+                sent.append(raw)
+                raise OSError("closed queue")
+            sent.append(raw)
+        core._input_queue = SimpleNamespace(put=send)
+        calls = 0
+        def receive(timeout=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                if failure == "timeout":
+                    raise queue.Empty
+                if failure == "error":
+                    return encode_result(StepResult({}, error="release failed", step_id=1))
+                if failure == "wrong_step":
+                    return encode_result(StepResult({}, step_id=99))
+            # A timed-out reply must be drained, not used as the retry's ACK.
+            if failure == "timeout" and calls == 2:
+                return encode_result(StepResult({}, step_id=1))
+            return encode_result(StepResult({}, step_id=2))
+        core._output_queue = SimpleNamespace(get=receive)
+        await core._flush_pending_frees()
+        assert core._pending_free_ids == ["finished"]
+        assert not context.worker_release_done.is_set()
+        await core._flush_pending_frees()
+        assert not core._pending_free_ids
+        assert context.worker_release_done.is_set()
+        assert not core._discard_result_step_ids
+    asyncio.run(run())
+
+
+def test_failed_pipeline_preserves_piggybacked_release_ids():
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._request_contexts = {}
+    core.scheduler = SimpleNamespace()
+    core._pending_free_ids = []
+    batch = SimpleNamespace(scheduled_requests=[])
+    core._batch_queue = deque([(8, batch)])
+    core._worker_free_ids_by_step = {8: ("finished-b",)}
+    core._discard_result_step_ids = set()
+    core._handle_step_error(7, batch, result_pending=True, finished_ids=("finished-a",))
+    assert core._pending_free_ids == ["finished-a", "finished-b"]
+    assert core._discard_result_step_ids == {7, 8}

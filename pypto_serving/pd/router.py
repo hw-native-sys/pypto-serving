@@ -30,8 +30,11 @@ class Router:
     def __init__(self, config, transport=None):
         self.config = config
         self.directory = Directory(config.prefill + config.decode)
+        nodes = len(config.prefill) + len(config.decode)
+        # Streams, handoffs, per-request refresh/abort calls and one health refresh.
+        connections = config.capacity * (len(config.decode) * (nodes + 3) + len(config.prefill)) + nodes
         self.client = httpx.AsyncClient(transport=transport, timeout=config.request_timeout,
-                                       limits=httpx.Limits(max_connections=config.capacity * 8))
+                                       limits=httpx.Limits(max_connections=connections))
         self.requests = asyncio.Semaphore(config.capacity * len(config.decode))
         self.handoffs = asyncio.Semaphore(config.capacity * len(config.prefill))
 

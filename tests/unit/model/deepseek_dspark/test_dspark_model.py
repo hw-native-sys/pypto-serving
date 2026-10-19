@@ -152,6 +152,31 @@ def _block_rows(count: int) -> list[dict[str, list[int]]]:
     return rows
 
 
+@pytest.mark.parametrize("failure", ["extension", "worker", None])
+def test_close_preserves_owner_and_buffers_until_retirement_succeeds(failure):
+    runner = _runner()
+    events = []
+    def close(name):
+        events.append(name)
+        if name == failure:
+            raise RuntimeError("retirement failed")
+    worker = SimpleNamespace(close=lambda: close("worker"))
+    runner._l3_worker = worker
+    runner.runtime_extension = SimpleNamespace(close=lambda: close("extension"))
+    retained = runner._decode_task_args[0]
+    if failure:
+        with pytest.raises(RuntimeError, match="retirement failed"):
+            runner.close()
+        assert runner._l3_worker is worker
+        assert runner._decode_task_args[0] is retained
+        assert runner._cache_group_num_blocks
+    else:
+        runner.close()
+        assert runner._l3_worker is None
+        assert not runner._decode_task_args and not runner._cache_group_num_blocks
+    assert events == (["extension"] if failure == "extension" else ["extension", "worker"])
+
+
 @pytest.mark.parametrize("max_batch_size, per_group", [(1, 1), (32, 32), (256, 64)])
 def test_packed_prefill_executor_limits_follow_runtime(monkeypatch, max_batch_size, per_group):
     # A stale environment toggle must not override the runtime batch capacity.

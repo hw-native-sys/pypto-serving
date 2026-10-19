@@ -32,8 +32,7 @@ def hash_block_tokens(parent_hash: bytes, token_ids: tuple[int, ...]) -> bytes:
     digest = hashlib.sha256()
     digest.update(parent_hash)
     digest.update(struct.pack(">I", len(token_ids)))
-    for token_id in token_ids:
-        digest.update(struct.pack(">q", int(token_id)))
+    digest.update(struct.pack(f">{len(token_ids)}q", *map(int, token_ids)))
     return digest.digest()
 
 

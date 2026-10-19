@@ -23,7 +23,7 @@ Install `python -m pip install -e '.[pd]'` in each environment. The Router only 
 
 ## Configure and start
 
-Copy [the minimal configuration](../../examples/pd.json), replace the example IPs, and use the same configuration on all processes. Each service/model has its own Router and node pools. Add entries to either list for multiple nodes; the policy defaults to round-robin over compatible healthy pairs. With multiple entries in one role, select the node using `--pd-node-id host:port` (or an explicit entry `node_id`).
+Copy [the minimal configuration](https://github.com/hw-native-sys/pypto-serving/blob/main/examples/pd.json), replace the example IPs, and use the same configuration on all processes. Each service/model has its own Router and node pools. Add entries to either list for multiple nodes; the policy defaults to round-robin over compatible healthy pairs. With multiple entries in one role, select the node using `--pd-node-id host:port` (or an explicit entry `node_id`).
 
 On **each** model host, start one process with its appropriate role and port:
 

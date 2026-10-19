@@ -194,7 +194,19 @@ class Service:
         if operation == "begin":
             if entry.continuation is not None or entry.cancelled:
                 raise ValueError("handoff already begun")
-            await asyncio.wait_for(entry.http.wait(), self.config.handoff_timeout)
+            http = asyncio.create_task(entry.http.wait())
+            stopped = asyncio.create_task(entry.source_done.wait())
+            try:
+                done, _ = await asyncio.wait((http, stopped), timeout=self.config.handoff_timeout,
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if not done:
+                    raise TimeoutError("generation POST did not arrive")
+                if entry.cancelled or not entry.http.is_set():
+                    raise ValueError("request cancelled before generation POST")
+            finally:
+                for task in (http, stopped):
+                    task.cancel()
+                await asyncio.gather(http, stopped, return_exceptions=True)
             continuation = decode(payload["continuation"], Continuation)
             config = GenerateConfig(**continuation.config)
             self.adapter.validate(config)
@@ -355,7 +367,7 @@ class Service:
             else:
                 self.cache.release_group_cache(entry.binding.request, confirmed_stopped=stopped)
                 self.cache.retire_group_cache_reservation(entry.binding.request)
-        if entry.response_closed and entry.source_done.is_set():
+        if (entry.response_closed or not entry.http.is_set()) and entry.source_done.is_set():
             self.finish(entry)
 
     async def prefill(self, entry, continuation, peer):

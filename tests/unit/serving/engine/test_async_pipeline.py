@@ -217,7 +217,8 @@ def test_constrained_step_error_cleans_up_before_next_request():
     request.constraint_spec = _tool_constraint()
     core.scheduler.running.append(request)
     core.scheduler.requests[request.request_id] = request
-    ctx = SimpleNamespace(queue=asyncio.Queue(), request=request, stream=True)
+    ctx = SimpleNamespace(queue=asyncio.Queue(), request=request, stream=True,
+                          worker_release_done=asyncio.Event())
     core._request_contexts[request.request_id] = ctx
     assert core._try_dispatch_step()
 
@@ -236,6 +237,7 @@ def test_constrained_step_error_cleans_up_before_next_request():
 
     core._input_queue = SimpleNamespace(put=put)
     asyncio.run(core._flush_pending_frees())
+    assert ctx.worker_release_done.is_set()
     assert dispatched[-1].finished_request_ids == [request.request_id]
     assert not core._pending_free_ids and not core._worker_known_req_ids
 
@@ -486,7 +488,8 @@ def test_async_pipeline_drains_stale_result_after_error(monkeypatch):
     req = _running_decode_request(prompt=(1, 2), first_output=50)
     core.scheduler.running.append(req)
     core.scheduler.requests[req.request_id] = req
-    ctx = SimpleNamespace(queue=asyncio.Queue(), request=req, stream=True)
+    ctx = SimpleNamespace(queue=asyncio.Queue(), request=req, stream=True,
+                          worker_release_done=asyncio.Event())
     core._request_contexts = {"r": ctx}
 
     # Two steps dispatched: both commands reached the FIFO worker, so both
@@ -513,7 +516,8 @@ def test_async_pipeline_drains_stale_result_after_error(monkeypatch):
     assert not core._batch_queue
     assert second_step_id in core._discard_result_step_ids
     tok = ctx.queue.get_nowait()
-    assert not core._request_contexts
+    assert core._request_contexts == {"r": ctx}
+    assert not ctx.worker_release_done.is_set()
     assert tok.finished is True and tok.finish_reason == "error"
 
     # Next live fetch must SKIP the stale second-step result and return step 99,

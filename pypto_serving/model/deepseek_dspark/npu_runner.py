@@ -7085,72 +7085,71 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         worker = self._l3_worker
         if worker is not None and self.runtime_extension is not None:
             self.runtime_extension.close()
-        try:
-            if worker is not None:
-                worker.close()
-        finally:
-            self._l3_worker = None
-            self._cache_group_num_blocks.clear()
-            self._stacked_host_weights = None
-            self._stacked_prefill_host_weights = None
-            self._stacked_device_weights = None
-            self._stacked_prefill_device_weights = None
-            self._embedding_device_weight = None
-            self._dspark_device_state_tokens = None
-            self._dspark_device_state_meta = None
-            self._dspark_rope_device_tables = None
-            self._device_scratch.clear()
-            self._prefill_prepared_device.clear()
-            self._prefill_descriptor_slots.clear()
-            self._prefill_prepare_buffers = None
-            self._decode_device_cache = None
-            self._global_weights = None
-            self._static_lm_head_weight = None
-            self._static_lm_head_device_weight = None
-            self._hc_head_buffers = None
-            self._l3_shared_buffers_ready = False
-            self._l3_static_tensors.clear()
-            for task_args in self._prefill_task_arg_slots:
+        # UNKNOWN/failed retirement must retain the worker and its buffers.
+        if worker is not None:
+            worker.close()
+        self._l3_worker = None
+        self._cache_group_num_blocks.clear()
+        self._stacked_host_weights = None
+        self._stacked_prefill_host_weights = None
+        self._stacked_device_weights = None
+        self._stacked_prefill_device_weights = None
+        self._embedding_device_weight = None
+        self._dspark_device_state_tokens = None
+        self._dspark_device_state_meta = None
+        self._dspark_rope_device_tables = None
+        self._device_scratch.clear()
+        self._prefill_prepared_device.clear()
+        self._prefill_descriptor_slots.clear()
+        self._prefill_prepare_buffers = None
+        self._decode_device_cache = None
+        self._global_weights = None
+        self._static_lm_head_weight = None
+        self._static_lm_head_device_weight = None
+        self._hc_head_buffers = None
+        self._l3_shared_buffers_ready = False
+        self._l3_static_tensors.clear()
+        for task_args in self._prefill_task_arg_slots:
+            task_args.close()
+        self._prefill_task_arg_slots.clear()
+        self._prefill_task_args = None
+        self._pending_prefill_dispatches.clear()
+        for task_args in self._decode_task_args:
+            task_args.close()
+        self._decode_task_args = []
+        self._default_grammar_args.clear()
+        # Speculative resources: the executor retains its runners, so
+        # every drafter-era reference must drop here or staging buffers,
+        # weights, and per-request states outlive the model.
+        self._drafter_states.clear()
+        self._drafter_dirty_leases.clear()
+        self._drafter_lease_zero = None
+        for leases in self._drafter_free_leases.values():
+            leases.clear()
+        self._drafter_context_staging.clear()
+        self._drafter_block_table_staging.clear()
+        self._drafter_rope_candidates.clear()
+        self._fused_drafter_block_tables.clear()
+        self._fused_drafter_rope_candidates.clear()
+        self._fused_drafter_batches = [None, None]
+        self._dspark_state_buffers = []
+        self._drafter_hidden_mirror = None
+        self._active_drafter_target_hidden = None
+        self._drafter_host_weights = None
+        self._drafter_device_weights = None
+        if self._fused_drafter_task_args:
+            for task_args in self._fused_drafter_task_args:
                 task_args.close()
-            self._prefill_task_arg_slots.clear()
-            self._prefill_task_args = None
-            self._pending_prefill_dispatches.clear()
-            for task_args in self._decode_task_args:
+        elif self._drafter_task_args is not None:
+            self._drafter_task_args.close()
+        self._fused_drafter_task_args = []
+        self._drafter_task_args = None
+        if self._fused_markov_task_args:
+            for task_args in self._fused_markov_task_args:
                 task_args.close()
-            self._decode_task_args = []
-            self._default_grammar_args.clear()
-            # Speculative resources: the executor retains its runners, so
-            # every drafter-era reference must drop here or staging buffers,
-            # weights, and per-request states outlive the model.
-            self._drafter_states.clear()
-            self._drafter_dirty_leases.clear()
-            self._drafter_lease_zero = None
-            for leases in self._drafter_free_leases.values():
-                leases.clear()
-            self._drafter_context_staging.clear()
-            self._drafter_block_table_staging.clear()
-            self._drafter_rope_candidates.clear()
-            self._fused_drafter_block_tables.clear()
-            self._fused_drafter_rope_candidates.clear()
-            self._fused_drafter_batches = [None, None]
-            self._dspark_state_buffers = []
-            self._drafter_hidden_mirror = None
-            self._active_drafter_target_hidden = None
-            self._drafter_host_weights = None
-            self._drafter_device_weights = None
-            if self._fused_drafter_task_args:
-                for task_args in self._fused_drafter_task_args:
-                    task_args.close()
-            elif self._drafter_task_args is not None:
-                self._drafter_task_args.close()
-            self._fused_drafter_task_args = []
-            self._drafter_task_args = None
-            if self._fused_markov_task_args:
-                for task_args in self._fused_markov_task_args:
-                    task_args.close()
-            elif self._markov_task_args is not None:
-                self._markov_task_args.close()
-            self._fused_markov_task_args = []
-            self._markov_task_args = None
-            with self._pending_decode_dispatch_lock:
-                self._pending_decode_dispatches.clear()
+        elif self._markov_task_args is not None:
+            self._markov_task_args.close()
+        self._fused_markov_task_args = []
+        self._markov_task_args = None
+        with self._pending_decode_dispatch_lock:
+            self._pending_decode_dispatches.clear()

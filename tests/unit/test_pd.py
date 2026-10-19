@@ -310,6 +310,104 @@ def test_peer_pool_preserves_inflight():
     asyncio.run(run())
 
 
+def test_peer_pool_reconnects_closed_sessions_and_retires_old_boots():
+    async def run():
+        class Peer:
+            closed = False
+            async def close(self):
+                self.closed = True
+        peers = []
+        async def connect():
+            peer = Peer()
+            peers.append(peer)
+            return peer
+        pool = PeerPool(2)
+        key = ("d0", "boot-0", "r")
+        async with pool.use(key, connect) as first:
+            pass
+        first.closed = True  # Reader task failed between requests.
+        async with pool.use(key, connect) as second:
+            assert second is not first
+            second.closed = True  # Failure during a request is evicted on exit.
+        assert not pool.entries
+        for boot in range(8):
+            async with pool.use(("d0", f"boot-{boot}", "r"), connect):
+                assert len(pool.entries) == 1
+        assert all(peer.closed for peer in peers[:-1])
+        await pool.close()
+        assert all(peer.closed for peer in peers)
+    asyncio.run(run())
+
+
+def test_peer_pool_evicts_failed_connect():
+    async def run():
+        pool = PeerPool(1)
+        async def fail():
+            raise ConnectionError("disconnected")
+        for _ in range(2):
+            with pytest.raises(ConnectionError, match="disconnected"):
+                async with pool.use(("d0", "boot", "r"), fail):
+                    pytest.fail("failed connect must not yield")
+            assert not pool.entries
+        await pool.close()
+    asyncio.run(run())
+
+
+def test_abort_before_generation_post_releases_capacity_and_rejects_late_post():
+    from pypto_serving.pd.service import Service
+    async def run():
+        config = Config((Endpoint("p", 8001, "p"),), (Endpoint("d", 8002, "d"),), capacity=1)
+        service = Service(config, config.decode[0], "decode", None,
+                          SimpleNamespace(kv_cache_manager=caches()), None)
+        p, service.node = node("p"), node("d", "decode")
+        payload = {"prompt": "hello"}
+        binding = Binding.create(p, service.node, payload)
+        pending = asyncio.create_task(service.control(p, (), "begin", dict(binding=binding)))
+        await asyncio.sleep(0)
+        assert len(service.requests) == 1
+        await service.control(p, (), "abort", dict(binding=binding, stopped=True))
+        with pytest.raises(ValueError, match="cancelled before generation POST"):
+            await asyncio.wait_for(pending, 1)
+        assert not service.requests
+        assert not service.gated
+        assert await service.control(p, (), "abort", dict(binding=binding, stopped=True)) == {}
+        with pytest.raises(ValueError, match="already terminal"):
+            service.register_http(binding, payload)
+        service.register_http(Binding.create(p, service.node, payload), payload)
+        assert len(service.requests) == 1
+    asyncio.run(run())
+
+
+def test_router_connection_budget_scales_with_all_node_pools(monkeypatch):
+    from pypto_serving.pd import router as module
+    captured = {}
+    def client(**kwargs):
+        captured.update(kwargs)
+    monkeypatch.setattr(module.httpx, "AsyncClient", client)
+    config = Config(tuple(Endpoint(f"p{i}", 8001) for i in range(3)),
+                    tuple(Endpoint(f"d{i}", 8002) for i in range(5)), capacity=16)
+    module.Router(config)
+    nodes = len(config.prefill) + len(config.decode)
+    active = config.capacity * len(config.decode)
+    # Streaming D requests and P handoffs must leave room for full-pool
+    # refreshes and P/D cancellation even when every D is saturated.
+    assert captured["limits"].max_connections >= active * (nodes + 3) + config.capacity * len(config.prefill) + nodes
+
+
+@pytest.mark.parametrize("tokens", [(), (1, -1, 0), (-(2**63), 2**63 - 1), tuple(range(1024))])
+def test_prefix_token_hash_preserves_wire_format(tokens):
+    import hashlib
+    import struct
+    from pypto_serving.serving.memory.kv_cache import hash_block_tokens
+    previous = b"parent"
+    expected = hashlib.sha256()
+    expected.update(previous)
+    expected.update(struct.pack(">I", len(tokens)))
+    for token in tokens:
+        expected.update(struct.pack(">q", token))
+    assert hash_block_tokens(previous, tokens) == expected.digest()
+
+
 def test_wire_rejects_oversize_and_wrong_type():
     async def run():
         reader = asyncio.StreamReader()
@@ -580,11 +678,12 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
 
         class Peer:
             geometry = d.geometry
+            closed = False
             async def call(self, operation, payload):
                 value = await d.control(p.node, p.geometry, operation,
                                        msgspec.msgpack.decode(msgspec.msgpack.encode(payload)))
                 return msgspec.msgpack.decode(msgspec.msgpack.encode(value))
-            async def close(self): pass
+            async def close(self): self.closed = True
         async def connect(peer): return Peer()
         p.connect = connect
         def engine(core):

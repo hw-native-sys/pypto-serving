@@ -771,7 +771,7 @@ class WorkerProcess:
 
         if self.profile_output_queue is not None:
             self.profile_output_queue.put(
-                encode_profile_result(ProfileResult(active=profiler.active, error=error))
+                encode_profile_result(ProfileResult(active=profiler.active, error=error, command_id=cmd.command_id))
             )
 
     def _handle_control_command(self, cmd: ControlCommand) -> None:

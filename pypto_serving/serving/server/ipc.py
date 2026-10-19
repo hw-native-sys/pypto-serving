@@ -131,6 +131,7 @@ class ProfileCommand(msgspec.Struct, tag="profile"):
     """Starts or stops the process-local SA profiler."""
 
     active: bool
+    command_id: int = 0
 
 
 class ControlCommand(msgspec.Struct, tag="control"):
@@ -167,14 +168,15 @@ class StepResult(msgspec.Struct):
     num_draft_tokens: dict[str, int] = msgspec.field(default_factory=dict)
 
 
-class ProfileResult(msgspec.Struct):
+class ProfileResult(msgspec.Struct, tag="profile"):
     """Acknowledges a profile command after the worker has applied it."""
 
     active: bool
     error: str | None = None
+    command_id: int = 0
 
 
-class ControlResult(msgspec.Struct):
+class ControlResult(msgspec.Struct, tag="control"):
     """Ordered result for one :class:`ControlCommand`."""
 
     command_id: int

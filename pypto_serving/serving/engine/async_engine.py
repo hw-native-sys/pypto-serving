@@ -19,6 +19,8 @@ from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Callable
 
+import msgspec
+
 from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
 from pypto_serving.observability import InMemoryStatLogger, IterationStats, SchedulerStats
@@ -405,32 +407,14 @@ class ReplicaEngineCore:
 
     async def _set_profile_active(self, active: bool) -> None:
         """Send an ordered worker profile command and wait for its acknowledgement."""
-        async with self._profile_lock:
-            input_queue = self._input_queue
-            output_queue = self._profile_output_queue
-            if input_queue is None or output_queue is None:
-                raise RuntimeError("Serving worker is not running")
-
-            input_queue.put(encode_command(ProfileCommand(active=active)))
-            try:
-                raw_result = await asyncio.to_thread(
-                    output_queue.get,
-                    timeout=self._step_timeout,
-                )
-            except queue.Empty as exc:
-                action = "start" if active else "stop"
-                raise RuntimeError(
-                    f"Worker profile {action} timed out ({self._step_timeout:g}s)"
-                ) from exc
-
-            result = decode_profile_result(raw_result)
-            if result.error:
-                raise RuntimeError(result.error)
-            if result.active != active:
-                raise RuntimeError(
-                    f"Worker profile state mismatch: requested active={active}, "
-                    f"received active={result.active}"
-                )
+        result = await self._call_worker_command(ProfileCommand(active=active), decode_profile_result)
+        if result.error:
+            raise RuntimeError(result.error)
+        if result.active != active:
+            raise RuntimeError(
+                f"Worker profile state mismatch: requested active={active}, "
+                f"received active={result.active}"
+            )
 
     async def call_worker(self, operation: str, payload: bytes = b"") -> bytes:
         """Run an ordered owner/cache operation in the spawned worker process."""
@@ -444,6 +428,15 @@ class ReplicaEngineCore:
                 "worker payload must be bytes no larger than "
                 f"{MAX_CONTROL_PAYLOAD_BYTES >> 20} MiB"
             )
+        result = await self._call_worker_command(
+            ControlCommand(command_id=0, operation=operation, payload=payload), decode_control_result,
+        )
+        if result.error:
+            raise RuntimeError(result.error)
+        return result.payload
+
+    async def _call_worker_command(self, command, decode_reply):
+        """Correlate the shared control/profile queue, including late replies."""
         async with self._profile_lock:
             input_queue = self._input_queue
             output_queue = self._profile_output_queue
@@ -451,30 +444,45 @@ class ReplicaEngineCore:
                 raise RuntimeError("Serving worker is not running")
             self._control_counter += 1
             command_id = self._control_counter
-            input_queue.put(
-                encode_command(
-                    ControlCommand(
-                        command_id=command_id,
-                        operation=operation,
-                        payload=payload,
-                    )
-                )
-            )
+            command.command_id = command_id
+            input_queue.put(encode_command(command))
+
+            def receive_reply():
+                deadline = time.monotonic() + self._step_timeout
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise queue.Empty
+                    raw = output_queue.get(timeout=remaining)
+                    reply_id = msgspec.msgpack.decode(raw)["command_id"]
+                    if type(reply_id) is not int:
+                        raise RuntimeError("Worker control response has an invalid command ID")
+                    if reply_id < command_id:
+                        continue
+                    if reply_id != command_id:
+                        raise RuntimeError("Worker control response ordering mismatch")
+                    return decode_reply(raw)
+
+            response = asyncio.create_task(asyncio.to_thread(receive_reply))
             try:
-                raw_result = await asyncio.to_thread(
-                    output_queue.get,
-                    timeout=self._step_timeout,
-                )
+                return await asyncio.shield(response)
+            except asyncio.CancelledError:
+                # A cancelled to_thread waiter cannot stop queue.get(). Keep
+                # ownership of the queue until it drains or reaches its deadline.
+                while not response.done():
+                    try:
+                        await asyncio.shield(response)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not response.cancelled():
+                    response.exception()
+                raise
             except queue.Empty as exc:
                 raise RuntimeError(
-                    f"Worker control timed out ({self._step_timeout:g}s)"
+                    f"Worker {type(command).__name__} timed out ({self._step_timeout:g}s)"
                 ) from exc
-            result = decode_control_result(raw_result)
-            if result.command_id != command_id:
-                raise RuntimeError("Worker control response ordering mismatch")
-            if result.error:
-                raise RuntimeError(result.error)
-            return result.payload
 
     def finish_prefilled_request(self, request_id):
         self.scheduler.finish_prefilled_request(request_id)
@@ -692,8 +700,6 @@ class ReplicaEngineCore:
             ctx.worker_release_done.set()
         self._request_contexts[request_id] = ctx
         self._publish_outputs([first_output], release_worker=False)
-        if first_output.finished:
-            ctx.worker_release_done.set()
         async with contextlib.aclosing(self._iterate_request_output(ctx)) as outputs:
             async for output in outputs:
                 yield output
@@ -851,7 +857,7 @@ class ReplicaEngineCore:
         except queue.Empty:
             logger.error(f"Worker response timed out ({self._step_timeout:g}s)")
             # Timeout: the failed step's own result is still in transit.
-            self._handle_step_error(step_id, scheduler_output, result_pending=True)
+            self._handle_step_error(step_id, scheduler_output, result_pending=True, finished_ids=finished_ids)
             return False
 
         step_result = decode_result(raw_output)
@@ -863,12 +869,12 @@ class ReplicaEngineCore:
                 "Pipeline desync: expected step_id=%d, got %d; aborting batch",
                 step_id, step_result.step_id,
             )
-            self._handle_step_error(step_id, scheduler_output, result_pending=False)
+            self._handle_step_error(step_id, scheduler_output, result_pending=False, finished_ids=finished_ids)
             return False
         if step_result.error:
             logger.error(f"Worker returned error: {step_result.error}")
             # This step's result was just consumed; only in-flight steps pend.
-            self._handle_step_error(step_id, scheduler_output, result_pending=False)
+            self._handle_step_error(step_id, scheduler_output, result_pending=False, finished_ids=finished_ids)
             return False
 
         self._acknowledge_worker_frees(finished_ids)
@@ -1044,19 +1050,28 @@ class ReplicaEngineCore:
             finished_request_ids=finished_ids,
             step_id=self._step_counter,
         )
-        self._input_queue.put(encode_command(cleanup_cmd))
         try:
+            self._input_queue.put(encode_command(cleanup_cmd))
             # Drains any stale results from previously-discarded steps first, so
             # the cleanup reply is not confused with a leftover in-transit result.
             raw_output = await self._get_live_result()
+            step_result = decode_result(raw_output)
+            if step_result.step_id != cleanup_cmd.step_id:
+                raise RuntimeError("Worker cleanup response ordering mismatch")
+            if step_result.error:
+                raise RuntimeError(step_result.error)
         except queue.Empty:
-            logger.error(f"Worker cleanup-step timed out ({self._step_timeout:g}s)")
+            self._discard_result_step_ids.add(cleanup_cmd.step_id)
+            logger.error("Worker cleanup-step timed out (%gs)", self._step_timeout)
+        except Exception:
+            logger.exception("Worker cleanup-step failed")
+        else:
+            self._acknowledge_worker_frees(finished_ids)
             return
-        step_result = decode_result(raw_output)
-        if step_result.error:
-            logger.error(f"Worker cleanup-step returned error: {step_result.error}")
-            return
-        self._acknowledge_worker_frees(finished_ids)
+        # Release is idempotent. Preserve IDs until a positive ACK; a late
+        # timeout reply is drained before the next attempt is acknowledged.
+        for request_id in finished_ids:
+            self._schedule_worker_free(request_id)
 
     def _handle_step_error(
         self,
@@ -1064,6 +1079,7 @@ class ReplicaEngineCore:
         scheduler_output: SchedulerOutput,
         *,
         result_pending: bool = True,
+        finished_ids: Sequence[str] = (),
     ) -> None:
         """On worker error/timeout, abort all requests in the failed batch.
 
@@ -1081,6 +1097,8 @@ class ReplicaEngineCore:
         failed step's result is still coming.
         """
         failed_batches = [scheduler_output]
+        for request_id in finished_ids:
+            self._schedule_worker_free(request_id)
         if result_pending:
             self._discard_result_step_ids.add(failed_step_id)
         # Any remaining in-flight batches depend on the failed step; drop them.
@@ -1088,7 +1106,8 @@ class ReplicaEngineCore:
         while self._batch_queue:
             sid, batch = self._batch_queue.popleft()
             getattr(self, "_initialization_steps", set()).discard(sid)
-            getattr(self, "_worker_free_ids_by_step", {}).pop(sid, None)
+            for request_id in getattr(self, "_worker_free_ids_by_step", {}).pop(sid, ()):
+                self._schedule_worker_free(request_id)
             self._discard_result_step_ids.add(sid)
             failed_batches.append(batch)
 
@@ -1100,8 +1119,9 @@ class ReplicaEngineCore:
                 if request_id in seen:
                     continue
                 seen.add(request_id)
-                ctx = self._request_contexts.pop(request_id, None)
-                if ctx is not None:
+                ctx = self._request_contexts.get(request_id)
+                if ctx is not None and not getattr(ctx, "terminal_output_queued", False):
+                    ctx.terminal_output_queued = True
                     ctx.queue.put_nowait(
                         TokenOutput(finished=True, finish_reason="error")
                     )
