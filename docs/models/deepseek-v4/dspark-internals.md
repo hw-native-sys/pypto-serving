@@ -6,7 +6,7 @@ This page describes the DSpark runner and kernel contracts. For checkpoint prepa
 
 | Layer | Interface and responsibility |
 | --- | --- |
-| CLI | `cli/main.py` selects `PyptoDeepSeekV4DSparkExecutor` in `_executor_cls_for_model_family`, validates TP4/EP topology in `_validate_dspark_topology`, and builds seven cache groups in `_build_runtime_config`. |
+| Model integration | `model/integrations/deepseek_dspark.py`: `DeepSeekV4DSparkIntegration.resolve()` validates TP4/EP topology and builds the cache groups; the worker resolves its integration ID to `DeepSeekV4DSparkPyptoExecutor`. |
 | Executor | `model/deepseek_dspark/npu_executor.py`: `DeepSeekV4DSparkPyptoExecutor._compile_model()` imports and compiles the DSpark prefill/decode programs; `_create_runner()` constructs the runner. |
 | Runner | `model/deepseek_dspark/npu_runner.py`: `DSparkModelRunner.init_kv_cache()` allocates post-weight pools; `prepare_prefill_inputs()` and `prepare_decode_inputs()` lower scheduler batches into the frozen kernel ABI. |
 | Worker | `serving/server/serving_worker.py`: `_make_prefill_batch()` and `_make_decode_batch()` pass group block IDs and cache partitions; `_batch_prefill()` calls `finalize_prefill()` for terminal chunks. |

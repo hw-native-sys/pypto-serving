@@ -16,6 +16,7 @@ import pytest
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.constraints import ConstraintSpec
+from pypto_serving.serving.sampling.capabilities import ModelCapabilities
 from pypto_serving.serving.server.ipc import NewRequestData, decode_command, encode_command, StepCommand
 from pypto_serving.serving.server.server import ChatCompletionRequest, ServingServer
 
@@ -38,7 +39,10 @@ def _server(monkeypatch):
     monkeypatch.setattr("importlib.util.find_spec", lambda name: object() if name == "xgrammar" else None)
     engine = SimpleNamespace(
         tokenizer=SimpleNamespace(output_parser_id="deepseek_v4"),
-        config=SimpleNamespace(executor_cls="PyptoDeepSeekV4DSparkExecutor", model_dir="/unused"),
+        config=SimpleNamespace(
+            capabilities=ModelCapabilities(constrained_tool_format="deepseek_v4"),
+            model_dir="/unused",
+        ),
     )
     return ServingServer(engine, "model", GenerateConfig())
 
@@ -108,7 +112,7 @@ def test_preflight_rejects_invalid_schema_before_worker_registration(monkeypatch
             raise RuntimeError("unsupported schema")
 
     monkeypatch.setattr("pypto_serving.serving.server.server.XGrammarProvider", Provider)
-    monkeypatch.setattr("pypto_serving.serving.server.server.read_model_config", lambda _: {"vocab_size": 129280})
+    monkeypatch.setattr("pypto_serving.serving.server.server.read_model_metadata", lambda _: {"vocab_size": 129280})
     with pytest.raises(ValueError, match="invalid tool constraint: unsupported schema"):
         asyncio.run(server._preflight_constraint(spec))
     assert calls == [(server.engine.tokenizer, 129280)]

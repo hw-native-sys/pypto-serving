@@ -34,16 +34,6 @@ def test_async_llm_engine_generates_structured_offline_batch():
     asyncio.run(_check_async_llm_engine_generates_structured_offline_batch())
 
 
-def test_engine_config_resolves_model_runtime_requirements():
-    default_runtime = EngineConfig().resolve_runtime_config()
-    assert default_runtime.requires_homogeneous_prefill_decode is False
-
-    deepseek_runtime = EngineConfig(
-        executor_cls="PyptoDeepSeekV4Executor"
-    ).resolve_runtime_config()
-    assert deepseek_runtime.requires_homogeneous_prefill_decode is True
-
-
 async def _check_async_llm_engine_routes_to_least_pending_tokens():
     created: list[_FakeCore] = []
     tokenizer = _Tokenizer()

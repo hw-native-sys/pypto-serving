@@ -135,7 +135,7 @@ class WorkerProcess:
         profile_output_queue: mp.Queue | None = None,
     ):
         self.config = config
-        self._sampling_capabilities = config.sampling_capabilities()
+        self._sampling_capabilities = config.capabilities.sampling
         self.input_queue = input_queue
         self.output_queue = output_queue
         self.profile_output_queue = profile_output_queue
@@ -187,7 +187,20 @@ class WorkerProcess:
 
             self.sampler = Sampler()
 
-            executor_cls = self._resolve_executor_cls()
+            from pypto_serving.model.integrations import (
+                family_for_integration, get_integration, select_model_family,
+            )
+            from pypto_serving.model.metadata import read_model_metadata
+
+            family = family_for_integration(self.config.integration_id)
+            checkpoint_family = select_model_family(read_model_metadata(self.config.model_dir))
+            if checkpoint_family.name != family.name:
+                raise ValueError(
+                    f"integration {self.config.integration_id!r} expects {family.name}, "
+                    f"but checkpoint declares {checkpoint_family.name}"
+                )
+
+            executor_cls = get_integration(self.config.integration_id).executor_class()
             self.executor = executor_cls(
                 platform=self.config.platform,
                 device_ids=device_ids,
@@ -199,6 +212,8 @@ class WorkerProcess:
                 model_id=self.config.model_id,
                 model_dir=self.config.model_dir,
                 runtime_config=self.config.runtime_config,
+                model_format=family.model_format,
+                integration_id=self.config.integration_id,
             )
 
             self.model_record = ModelRecord(
@@ -219,25 +234,6 @@ class WorkerProcess:
 
             logger.info("Worker model loaded and ready")
             return num_pages
-
-    def _resolve_executor_cls(self):
-        if self.config.executor_cls == "PyptoQwen14BExecutor":
-            from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor
-
-            return Qwen314BPyptoExecutor
-        if self.config.executor_cls == "PyptoDeepSeekV4Executor":
-            from pypto_serving.model.deepseek.npu_executor import DeepSeekV4PyptoExecutor
-
-            return DeepSeekV4PyptoExecutor
-        if self.config.executor_cls == "PyptoDeepSeekV4DSparkExecutor":
-            from pypto_serving.model.deepseek_dspark.npu_executor import (
-                DeepSeekV4DSparkPyptoExecutor,
-            )
-
-            return DeepSeekV4DSparkPyptoExecutor
-        from pypto_serving.model.common.executor.executor import ModelExecutor
-
-        return ModelExecutor
 
     def _configure_pypto_build_dir(self, device_ids: tuple[int, ...]) -> Path | None:
         """Namespace explicitly requested output without disabling JIT reuse by default."""

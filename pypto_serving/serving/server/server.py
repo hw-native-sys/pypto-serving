@@ -20,7 +20,7 @@ import uuid
 from typing import Literal
 
 from pypto_serving.config.types import GenerateConfig
-from pypto_serving.model.model_family import read_model_config
+from pypto_serving.model.metadata import read_model_metadata
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.constraints.provider import XGrammarProvider
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput
@@ -41,7 +41,7 @@ ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "
 try:
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse, Response, StreamingResponse
-    from pydantic import BaseModel, Field, model_serializer, model_validator
+    from pydantic import BaseModel, Field, model_serializer
 except ImportError as e:
     raise ImportError(
         "Serving requires fastapi and pydantic. Install with: pip install fastapi uvicorn sse-starlette pydantic"
@@ -130,7 +130,7 @@ class ChatCompletionRequest(BaseModel):
     messages: list[ChatMessage]
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
-    min_tokens: int | None = Field(default=None, ge=0)
+    min_tokens: int | None = None
     ignore_eos: bool | None = None
     temperature: float | None = None
     top_p: float | None = None
@@ -144,14 +144,6 @@ class ChatCompletionRequest(BaseModel):
     tools: list[ChatTool] | None = None
     tool_choice: str | dict | None = None
     parallel_tool_calls: bool = True
-
-    @model_validator(mode="after")
-    def _validate_selected_token_limit(self) -> ChatCompletionRequest:
-        field = "max_completion_tokens" if self.max_completion_tokens is not None else "max_tokens"
-        limit = self.max_completion_tokens if self.max_completion_tokens is not None else self.max_tokens
-        if limit is not None and limit <= 0:
-            raise ValueError(f"{field} must be a positive integer")
-        return self
 
 
 class CompletionChoice(BaseModel):
@@ -377,6 +369,7 @@ class ServingServer:
 
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        config = self._resolve_generate_config(request)
         output_parser_spec = self._output_parser_spec(request)
         constraint_spec = self._constraint_spec(request, output_parser_spec)
         if constraint_spec is not None:
@@ -387,7 +380,6 @@ class ServingServer:
             reasoning_effort=request.reasoning_effort,
             tools=request.tools,
         )
-        config = self._resolve_generate_config(request)
         with profile_span(
             "http.chat_completions",
             cat="request",
@@ -702,7 +694,8 @@ class ServingServer:
         if parser_spec is None or parser_spec.parser_id != "deepseek_v4":
             raise ValueError("the model has no DeepSeek V4 structural-tool format")
         engine_config = getattr(self.engine, "config", None)
-        if getattr(engine_config, "executor_cls", None) != "PyptoDeepSeekV4DSparkExecutor":
+        capabilities = getattr(engine_config, "capabilities", None)
+        if getattr(capabilities, "constrained_tool_format", None) != parser_spec.parser_id:
             raise ValueError("constrained tool generation currently requires DeepSeek V4 DSpark")
         if importlib.util.find_spec("xgrammar") is None:
             raise ValueError("xgrammar is required for constrained tool generation")
@@ -725,7 +718,7 @@ class ServingServer:
 
     def _compile_constraint_for_preflight(self, spec: ConstraintSpec) -> None:
         if self._constraint_preflight_provider is None:
-            model_vocab_size = int(read_model_config(self.engine.config.model_dir)["vocab_size"])
+            model_vocab_size = int(read_model_metadata(self.engine.config.model_dir)["vocab_size"])
             self._constraint_preflight_provider = XGrammarProvider(
                 self.engine.tokenizer, model_vocab_size
             )

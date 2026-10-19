@@ -14,9 +14,6 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from pypto_serving.model.model_family import detect_model_family, read_model_config
-
-
 logger = logging.getLogger(__name__)
 
 
@@ -197,12 +194,27 @@ class DeepSeekV4TokenizerAdapter(TransformersTokenizerAdapter):
         return "deepseek_v4"
 
 
-def load_tokenizer(model_dir: str | Path, *, trust_remote_code: bool = False) -> TokenizerAdapter:
+def load_tokenizer(
+    model_dir: str | Path, *, trust_remote_code: bool = False,
+    integration_id: str | None = None,
+) -> TokenizerAdapter:
     """Load a local tokenizer and select any model-specific chat encoding."""
+    from pypto_serving.model.integrations import family_for_integration, select_model_family
+    from pypto_serving.model.metadata import read_model_metadata
+
     model_path = Path(model_dir)
+    if integration_id is not None:
+        family = family_for_integration(integration_id)
+    else:
+        try:
+            family = select_model_family(read_model_metadata(model_path))
+        except ValueError:
+            # Standalone tokenizer users may have a valid tokenizer without a
+            # serving integration. The serving path always supplies its ID.
+            family = None
     adapter_cls = (
         DeepSeekV4TokenizerAdapter
-        if detect_model_family(read_model_config(model_path)) == "deepseek_v4"
+        if family is not None and family.tokenizer_kind == "deepseek_v4"
         else TransformersTokenizerAdapter
     )
     if (model_path / "tokenizer.json").exists():

@@ -110,7 +110,7 @@ def test_flush_pending_frees_sends_cleanup_only_step_command(monkeypatch):
 
     monkeypatch.setattr(asyncio, "to_thread", run_inline)
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
-    core.config = SimpleNamespace(executor_cls="PyptoQwen14BExecutor")
+    core.config = SimpleNamespace()
     core._worker_known_req_ids = {"aborted"}
     core._pending_free_ids = ["aborted"]
     core._batch_queue = deque()

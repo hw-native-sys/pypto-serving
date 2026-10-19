@@ -13,7 +13,8 @@ import asyncio
 from types import SimpleNamespace
 
 
-import pypto_serving.cli.main as cli
+from pypto_serving.cli.parser import parse_launch_options
+from pypto_serving.config.resolve import resolve_launch_options
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.engine.async_engine import ReplicaEngineCore
 from pypto_serving.serving.server import server as server_module
@@ -47,8 +48,9 @@ class _Queue:
 def test_profile_cli_config_reaches_engine_workers(tmp_path):
     model_dir = tmp_path / "model"
     model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type":"qwen3"}')
     output = tmp_path / "profile"
-    args = cli.build_parser().parse_args(
+    options = parse_launch_options(
         [
             "--model",
             str(model_dir),
@@ -60,7 +62,7 @@ def test_profile_cli_config_reaches_engine_workers(tmp_path):
         ]
     )
 
-    config = cli.build_serving_engine_config(args).profile_config
+    config = resolve_launch_options(options).engine.profile_config
 
     assert config.enabled is True
     assert config.output == output.resolve()
