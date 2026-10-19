@@ -170,6 +170,40 @@ def test_stream_completion_terminal_usage_chunk():
         assert c.get("usage") is None, f"Intermediate chunk has usage: {c}"
 
 
+def test_stream_completion_closes_engine_generator_after_terminal_chunk():
+    final = TokenOutput(
+        text="done", finished=True, finish_reason="FINISHED_LENGTH",
+        prompt_tokens=2, completion_tokens=1,
+    )
+
+    class TrackedEngine(_FakeEngine):
+        closed = False
+
+        def add_request(self, request_id, prompt, config, **kwargs):
+            async def outputs():
+                try:
+                    yield final
+                finally:
+                    self.closed = True
+
+            self.generator = outputs()
+            return self.generator
+
+    engine = TrackedEngine([final])
+    server = ServingServer(engine, "test-model", GenerateConfig())
+
+    async def collect():
+        chunks = [
+            chunk async for chunk in server._stream_completion(
+                "req-0", "hello", GenerateConfig(max_new_tokens=1), "test-model"
+            )
+        ]
+        assert engine.closed
+        return chunks
+
+    assert asyncio.run(collect())[-1] == "data: [DONE]\n\n"
+
+
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("chat", [False, True])
 def test_http_eos_uses_standard_stop_finish_reason(stream, chat):

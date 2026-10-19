@@ -1318,6 +1318,9 @@ def _worker_entry(
     """Entry point for the worker subprocess."""
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # A process-group SIGTERM targets the API process; the worker and its L3
+    # children must survive long enough to consume ShutdownCommand and close.
+    os.setsid()
 
     # Spawned workers do not inherit the parent's logging config; configure a
     # stderr handler so per-stage progress logs (weight load, preflight) are

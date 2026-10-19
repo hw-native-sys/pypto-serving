@@ -355,11 +355,16 @@ class ReplicaEngineCore:
     async def stop(self) -> None:
         """Stop engine loop and worker process."""
         self._running = False
-        if self._loop_task is not None:
-            await self._loop_task
-            self._loop_task = None
-
-        await asyncio.to_thread(self._shutdown_worker, timeout=30)
+        try:
+            if self._loop_task is not None:
+                self._loop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._loop_task
+                self._loop_task = None
+            for request_id in tuple(self._request_contexts):
+                await self.abort_request(request_id)
+        finally:
+            await asyncio.to_thread(self._shutdown_worker, timeout=30)
         logger.info("ReplicaEngineCore stopped")
 
     async def start_profile(self) -> None:
@@ -477,7 +482,6 @@ class ReplicaEngineCore:
                     self._request_contexts.pop(request_id, None)
                     raise queued
                 output: TokenOutput = queued
-                yield output
                 if output.finished:
                     finished_normally = True
                     e2e = time.time() - request.arrival_time
@@ -487,6 +491,8 @@ class ReplicaEngineCore:
                         request_id, len(prompt_token_ids), n_out, output.finish_reason,
                         e2e, (n_out / e2e) if e2e > 0 else 0.0,
                     )
+                yield output
+                if output.finished:
                     break
         finally:
             # Only cancellation/disconnect needs cleanup here. On normal
@@ -687,8 +693,17 @@ class ReplicaEngineCore:
         transit (the worker had already been sent those commands). Drain and
         drop them so a stale result is never applied to a live batch.
         """
+        deadline = time.monotonic() + self._step_timeout
         while True:
-            raw = await asyncio.to_thread(self._output_queue.get, timeout=self._step_timeout)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise queue.Empty
+            try:
+                # A cancelled engine task must not strand a 1200-second queue.get
+                # thread and delay the API process after SIGTERM.
+                raw = await asyncio.to_thread(self._output_queue.get, timeout=min(0.5, remaining))
+            except queue.Empty:
+                continue
             if not self._discard_result_step_ids:
                 return raw
             sid = decode_result(raw).step_id

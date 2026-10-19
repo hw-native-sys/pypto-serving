@@ -589,7 +589,7 @@ def test_worker_reclaims_device_accepted_tokens_after_request_cache_release():
     ("", logging.WARNING), (" debug ", logging.DEBUG), ("invalid", logging.WARNING),
 ])
 def test_worker_entry_always_closes_worker(monkeypatch, caplog, busy_loop_fails, log_level, expected_level):
-    calls = SimpleNamespace(close=0, ready=0)
+    calls = SimpleNamespace(close=0, ready=0, setsid=0)
     monkeypatch.setenv("PYPTO_SIMPLER_LOG_LEVEL", log_level)
     monkeypatch.setattr(logging, "basicConfig", lambda **_kwargs: None)
     for name in ("simpler_setup", "pypto", "simpler"):
@@ -612,6 +612,7 @@ def test_worker_entry_always_closes_worker(monkeypatch, caplog, busy_loop_fails,
 
     monkeypatch.setattr(serving_worker, "WorkerProcess", FakeWorker)
     monkeypatch.setattr(signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(serving_worker.os, "setsid", lambda: setattr(calls, "setsid", calls.setsid + 1))
     ready_event = SimpleNamespace(set=lambda: setattr(calls, "ready", calls.ready + 1))
     num_pages_value = SimpleNamespace(value=0)
 
@@ -626,6 +627,7 @@ def test_worker_entry_always_closes_worker(monkeypatch, caplog, busy_loop_fails,
     assert num_pages_value.value == 7
     assert calls.ready >= 1
     assert calls.close == 1
+    assert calls.setsid == 1
     if log_level == "invalid":
         assert "Invalid PYPTO_SIMPLER_LOG_LEVEL" in caplog.text
 

@@ -454,42 +454,44 @@ class ServingServer:
     ):
         with profile_span("http.stream_completion", cat="request", args={"request_id": request_id}):
             prev_text = ""
-            async for output in self.engine.add_request(request_id, prompt, config):
-                delta = output.text[len(prev_text):] if output.text else ""
-                prev_text = output.text or prev_text
-                finish_reason = self._map_finish_reason(output.finish_reason) if output.finished else None
+            outputs = self.engine.add_request(request_id, prompt, config)
+            async with contextlib.aclosing(outputs):
+                async for output in outputs:
+                    delta = output.text[len(prev_text):] if output.text else ""
+                    prev_text = output.text or prev_text
+                    finish_reason = self._map_finish_reason(output.finish_reason) if output.finished else None
 
-                chunk = CompletionResponse(
-                    id=request_id,
-                    created=int(time.time()),
-                    model=model,
-                    choices=[CompletionChoice(text=delta, finish_reason=finish_reason)],
-                )
-                yield f"data: {json.dumps(chunk.model_dump())}\n\n"
-
-                if output.finished:
-                    # Terminal usage chunk (OpenAI stream_options.include_usage
-                    # shape): empty choices, authoritative counts from the engine.
-                    usage_chunk = CompletionResponse(
+                    chunk = CompletionResponse(
                         id=request_id,
                         created=int(time.time()),
                         model=model,
-                        choices=[],
-                        usage=ResponseUsage(
-                            prompt_tokens=output.prompt_tokens,
-                            completion_tokens=output.completion_tokens,
-                            total_tokens=output.prompt_tokens + output.completion_tokens,
-                        ),
+                        choices=[CompletionChoice(text=delta, finish_reason=finish_reason)],
                     )
-                    yield f"data: {json.dumps(usage_chunk.model_dump())}\n\n"
+                    yield f"data: {json.dumps(chunk.model_dump())}\n\n"
 
-                    profile_instant(
-                        "http.stream_completion.finished",
-                        cat="request",
-                        args={"request_id": request_id, "finish_reason": finish_reason},
-                    )
-                    yield "data: [DONE]\n\n"
-                    break
+                    if output.finished:
+                        # Terminal usage chunk (OpenAI stream_options.include_usage
+                        # shape): empty choices, authoritative counts from the engine.
+                        usage_chunk = CompletionResponse(
+                            id=request_id,
+                            created=int(time.time()),
+                            model=model,
+                            choices=[],
+                            usage=ResponseUsage(
+                                prompt_tokens=output.prompt_tokens,
+                                completion_tokens=output.completion_tokens,
+                                total_tokens=output.prompt_tokens + output.completion_tokens,
+                            ),
+                        )
+                        yield f"data: {json.dumps(usage_chunk.model_dump())}\n\n"
+
+                        profile_instant(
+                            "http.stream_completion.finished",
+                            cat="request",
+                            args={"request_id": request_id, "finish_reason": finish_reason},
+                        )
+                        yield "data: [DONE]\n\n"
+                        break
 
     async def _stream_chat_completion(
         self,

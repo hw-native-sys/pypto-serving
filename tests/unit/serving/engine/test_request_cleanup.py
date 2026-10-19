@@ -135,3 +135,58 @@ def test_flush_pending_frees_sends_cleanup_only_step_command(monkeypatch):
     # Pending list drained; known-set no longer tracks the released id.
     assert core._pending_free_ids == []
     assert "aborted" not in core._worker_known_req_ids
+
+
+def test_stop_cancels_inflight_result_wait_before_shutting_down_worker(monkeypatch):
+    async def run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+
+    async def check():
+        entered_wait = asyncio.Event()
+        worker_shutdowns: list[float] = []
+        core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+        core._running = True
+        core._async_scheduling = True
+        core._batch_queue = deque([(1, SimpleNamespace())])
+        core._max_in_flight = 1
+        core._request_contexts = {}
+        core.scheduler = SimpleNamespace(has_work=lambda: False)
+
+        async def wait_for_result():
+            entered_wait.set()
+            await asyncio.Event().wait()
+
+        core._get_live_result = wait_for_result
+        core._shutdown_worker = lambda *, timeout: worker_shutdowns.append(timeout)
+        core._loop_task = asyncio.create_task(core._engine_loop())
+        await asyncio.wait_for(entered_wait.wait(), timeout=1)
+
+        await asyncio.wait_for(core.stop(), timeout=1)
+        assert core._loop_task is None
+        assert worker_shutdowns == [30]
+
+    asyncio.run(check())
+
+
+def test_result_wait_uses_short_queue_polls(monkeypatch):
+    async def run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._step_timeout = 1200.0
+    core._discard_result_step_ids = set()
+    timeouts: list[float] = []
+
+    def get_result(*, timeout):
+        timeouts.append(timeout)
+        return encode_result(StepResult(new_tokens={}, step_id=3))
+
+    core._output_queue = SimpleNamespace(get=get_result)
+
+    asyncio.run(core._get_live_result())
+    assert len(timeouts) == 1
+    assert 0 < timeouts[0] <= 0.5
