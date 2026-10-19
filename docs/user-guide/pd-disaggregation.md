@@ -4,7 +4,18 @@ PD is opt-in. Without `--pd-role`, Serving does not load PD or Mooncake, create 
 
 ## Requirements
 
-The initial adapter supports DeepSeek V4 Flash DSpark K7, greedy sampling, identical model weights and compatible cache layouts/topologies on P and D. Use Serving's pinned PyPTO-Lib. The tested SDK commits are PyPTO `e9c2239ec6d350a676343bae308f1ee70addcdde` and its Simpler pin `196810112eec6741923d1cb51d670541afa017a7`, with PTOAS 0.65. PyPTO must expose `chip_service_factories`, `retain_service_tensor`, and `release_service_tensor`, backed by Simpler's owner-local allocation pinning. These are required runtime interfaces, not a fallback to an older runtime.
+The initial adapter supports DeepSeek V4 Flash DSpark K7, greedy sampling, identical model weights and compatible cache layouts/topologies on P and D. Use Serving's pinned PyPTO-Lib. The tested SDK commits are PyPTO [e439c802](https://github.com/sjduan/pypto/commit/e439c8022ac19999794458bbdbe46d2062c908ee) and its Simpler pin [16cac7c8](https://github.com/sjduan/simpler/commit/16cac7c805583ff46f43362371019cd051664f0c), with PTOAS 0.65. These add minimal owner-local service and allocation-retain hooks to upstream PyPTO `176bdfab` and Simpler `84abd66f`; the hooks are not upstream APIs yet. PyPTO must expose `chip_service_factories`, `retain_service_tensor`, and `release_service_tensor`, backed by Simpler's owner-local allocation pinning. These are required runtime interfaces, not a fallback to an older runtime.
+
+Acquire the SDK sources with the matching runtime fork, then follow their normal source-build instructions:
+
+```bash
+git clone --branch feat/owner-transfer-extension https://github.com/sjduan/pypto.git
+git -C pypto checkout e439c8022ac19999794458bbdbe46d2062c908ee
+git -C pypto config submodule.simpler.url https://github.com/sjduan/simpler.git
+git -C pypto submodule update --init --recursive
+```
+
+Build from these checkouts and keep runtime revision checks enabled; a binary copied from another checkout is not a matching source installation.
 
 Model nodes require Linux Python with `os.pidfd_open` and a working Mooncake Ascend installation. Startup checks these dependencies before loading weights. Mooncake registers all regions inside their real allocation owners before the first transfer; adding regions after a peer connection is established is not supported. Transfers are device-to-device without Host staging. Deploy on a trusted network: internal control endpoints are not authenticated.
 
