@@ -26,6 +26,7 @@ from pypto_serving.model.common.compiler.l3_callable import L3Callable
 from pypto_serving.model.common.executor.pypto_executor import PyptoExecutor
 from pypto_serving.model.common.executor.utils import build_pypto_run_config
 from pypto_serving.model.common.runner.model_runner import ModelRunner
+from pypto_serving.model.qwen3_5 import host_entries
 from pypto_serving.model.qwen3_5.weight_spec import (
     MAX_SEQUENCE, VOCAB, WEIGHT_ORDER, load_qwen35_weight_banks,
 )
@@ -106,8 +107,9 @@ class Qwen35PyptoExecutor(PyptoExecutor):
         kernel_dir = _find_qwen35_kernel_dir()
         prefill = _load_kernel_module("prefill_fwd", kernel_dir)
         decode = _load_kernel_module("decode_fwd", kernel_dir)
-        compiled_prefill = self._compiler.compile("qwen35_prefill_fwd", prefill.prefill_fwd)
-        compiled_decode = self._compiler.compile("qwen35_decode_fwd", decode.decode_fwd)
+        host_entries.bind_entries(prefill_fwd=prefill.prefill_fwd, decode_fwd=decode.decode_fwd)
+        compiled_prefill = self._compiler.compile("qwen35_prefill_fwd", host_entries.prefill_host)
+        compiled_decode = self._compiler.compile("qwen35_decode_fwd", host_entries.decode_host)
         banks = load_qwen35_weight_banks(
             Path(model.extra["model_dir"]), model.extra["weight_map"], model.extra["config_data"],
         )
