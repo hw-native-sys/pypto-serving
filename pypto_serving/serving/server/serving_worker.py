@@ -716,9 +716,24 @@ class WorkerProcess:
         error = None
         try:
             if cmd.active:
+                was_active = profiler.active
                 profiler.start()
+                if not was_active and self.config.profile_config.chip_swimlane_level:
+                    self.executor.set_chip_swimlane_level(
+                        self.config.profile_config.chip_swimlane_level,
+                        self.config.profile_config.chip_artifacts_dir / "captures",
+                    )
             else:
-                profiler.stop()
+                try:
+                    if self.config.profile_config.chip_swimlane_level:
+                        capture_errors = self.executor.set_chip_swimlane_level(0)
+                        if capture_errors:
+                            error = (
+                                f"Chip profiling incomplete ({len(capture_errors)} failed capture(s)): "
+                                f"{capture_errors[0]}"
+                            )
+                finally:
+                    profiler.stop()
             if profiler.active != cmd.active:
                 error = "SA profiling is not configured in the worker process"
         except Exception as exc:

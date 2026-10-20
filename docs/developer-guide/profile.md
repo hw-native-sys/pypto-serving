@@ -20,6 +20,12 @@ The event levels are:
 - `kernel`: NPU kernel dispatch spans.
 - `verbose`: enables all levels, including any fine-grained events marked as verbose.
 
+To capture chip-level AICore and AICPU timing as well, add `--profile-chip-level 2` (or `4` for scheduler and orchestrator phases) alongside `--profile`. This enables PyPTO's chip swimlane only during the offline generation window or between HTTP `/start_profile` and `/stop_profile`. Each completed L3 dispatch is saved under `<profile-output>/chip/captures/worker-*/<dispatch>_<program>/rank*/d*/`, including `chip_swimlane_records.json` and, on supported hardware, `merged_swimlane_*.json`. For a `.json` profile output, the chip directory is the sibling path with a `.chip` suffix. PyPTO's normal JIT cache policy remains in effect.
+
+If a dispatch produces no new chip records or its capture cannot be archived, stopping the profile reports an error. The host-side trace is still flushed and merged.
+
+**Diagnostic limitation:** on real hardware, the current PyPTO L3 swimlane runs each profiled dispatch twice to collect the dependency graph and then timing. It does not restore mutable inputs or KV cache between passes. Captured requests can therefore produce different tokens or modify cache state; use a disposable profiling workload, not production traffic. Chip capture also serializes profiled async dispatches and can be expensive. Level 1 records AICore task timing, level 2 adds AICPU dispatch/finish timestamps, level 3 adds scheduler phases, and level 4 adds orchestrator phases. The regular `trace.json` remains the host-side trace; chip captures are separate files.
+
 For a directory output, the module creates:
 
 ```text

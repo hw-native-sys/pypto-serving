@@ -136,6 +136,7 @@ Prefix caching reuses KV cache state for repeated prompt prefixes when the model
 | `--profile` | off | Enable `/start_profile` and `/stop_profile`, or profile the offline generation window. |
 | `--profile-output PATH` | `./profile_out` | Profile output directory or JSON path. |
 | `--profile-level LEVELS` | `e2e,kernel` | Comma-separated profile levels. |
+| `--profile-chip-level {1,2,3,4}` | off | Capture PyPTO chip swimlanes during the profile window; level 2 adds AICPU timestamps. |
 
 ## Help Output
 
