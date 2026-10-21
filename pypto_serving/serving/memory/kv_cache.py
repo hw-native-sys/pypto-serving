@@ -1185,11 +1185,17 @@ class KvCacheManager:
             allocated = pool.request_logical_blocks[request_id]
             period = pool.spec.max_blocks_per_seq
             partition = pool.request_partitions[request_id]
-            for slot, block in enumerate(owned):
+            for expired in range(previous_start, start):
+                slot = expired % period
+                if slot >= len(owned):
+                    continue
+                block = owned[slot]
+                if block is None:
+                    continue
                 # A newer queued step may already have rotated this slot. Its
                 # most recent logical page must survive an older completion.
                 logical = slot + ((allocated - 1 - slot) // period) * period
-                if block is None or logical >= start:
+                if logical >= start:
                     continue
                 block.ref_cnt -= 1
                 if block.ref_cnt == 0:
