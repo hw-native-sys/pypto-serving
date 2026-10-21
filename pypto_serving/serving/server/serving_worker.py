@@ -32,6 +32,7 @@ from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.constraints.provider import ConstraintState, XGrammarProvider
 from pypto_serving.serving.sampling.capabilities import SamplingCapabilities
 from pypto_serving.serving.sampling.stop_rules import blocked_token_ids
+from pypto_serving.observability.decode_metrics import DecodeStepRecorder
 from pypto_serving.serving.utils.gc_utils import freeze_gc_heap
 from pypto_serving.serving.utils.env import configure_runtime_logging
 from pypto_serving.serving.server.ipc import (
@@ -90,6 +91,7 @@ class _PendingDecodeOutput:
     pending: object
     buffer_slot: int
     batch: DecodeBatch
+    started_ns: int = 0
 
 
 @dataclass(frozen=True)
@@ -138,6 +140,8 @@ class WorkerProcess:
       Main Process  --[input_queue]--> WorkerProcess --[output_queue]--> Main Process
     """
 
+    _decode_metrics: DecodeStepRecorder | None = None
+
     def __init__(
         self,
         config: EngineConfig,
@@ -151,6 +155,7 @@ class WorkerProcess:
         self.input_queue = input_queue
         self.output_queue = output_queue
         self.profile_output_queue = profile_output_queue
+        self._decode_metrics = DecodeStepRecorder.from_env()
 
         self._services_factory = services_factory
         self._services = None
@@ -509,6 +514,7 @@ class WorkerProcess:
                             prepared,
                             tuple(cmd.decode_requests),
                         )
+                        started_ns = self._decode_metrics.start() if self._decode_metrics else 0
                         pending = self.executor.dispatch_prepared_decode(
                             self.model_record.runtime_model,
                             dispatch_batch,
@@ -522,6 +528,7 @@ class WorkerProcess:
                             pending=pending,
                             buffer_slot=prepared.buffer_slot,
                             batch=dispatch_batch,
+                            started_ns=started_ns,
                         )
                     )
                 except Exception as exc:
@@ -701,6 +708,12 @@ class WorkerProcess:
                 for req_id, tokens in new_tokens.items():
                     if tokens:
                         self._record_last_tokens(req_id, tokens)
+            if self._decode_metrics:
+                self._decode_metrics.record(
+                    step_id=work.cmd.step_id, started_ns=work.started_ns,
+                    request_ids=[r.request_id for r in work.scheduled], new_tokens=new_tokens,
+                    num_draft_tokens=num_draft_tokens, mode="async",
+                )
             return StepResult(
                 new_tokens=new_tokens, step_id=work.cmd.step_id, num_draft_tokens=num_draft_tokens
             )
@@ -938,6 +951,8 @@ class WorkerProcess:
                     runtime_model,
                     new_tokens,
                     prepared_decode=prepared_decode,
+                    step_id=cmd.step_id,
+                    prefill_requests=len(cmd.prefill_requests),
                 )
 
         # Retain the tokens just sampled so a following pipelined decode step can
@@ -1255,6 +1270,8 @@ class WorkerProcess:
         runtime_model,
         new_tokens: dict[str, list[int]],
         prepared_decode: _PreparedDecodeWork | None = None,
+        step_id: int = 0,
+        prefill_requests: int = 0,
     ) -> dict[str, int]:
         with profile_span(
             "WorkerProcess.batch_decode",
@@ -1272,6 +1289,7 @@ class WorkerProcess:
                 allow_device_topk_sampling=allow_device_topk_sampling,
             )
             if prepared_decode is None:
+                started_ns = self._decode_metrics.start() if self._decode_metrics else 0
                 decode_result = self.executor.run_decode(runtime_model, batch)
             else:
                 if prepared_decode.error is not None:
@@ -1286,12 +1304,22 @@ class WorkerProcess:
                         batch,
                         buffer_slot=prepared_decode.buffer_slot,
                     )
+                started_ns = self._decode_metrics.start() if self._decode_metrics else 0
                 decode_result = self.executor.run_prepared_decode(
                     runtime_model,
                     batch,
                     prepared,
                 )
-            return self._consume_decode_result(scheduled, decode_result, new_tokens, batch=batch)
+            num_draft_tokens = self._consume_decode_result(scheduled, decode_result, new_tokens, batch=batch)
+            if self._decode_metrics:
+                self._decode_metrics.record(
+                    step_id=step_id, started_ns=started_ns,
+                    request_ids=[r.request_id for r in scheduled], new_tokens=new_tokens,
+                    num_draft_tokens=num_draft_tokens,
+                    mode="sync_prepared" if prepared_decode is not None else "sync_unprepared",
+                    prefill_requests=prefill_requests,
+                )
+            return num_draft_tokens
 
     def _consume_decode_result(
         self,

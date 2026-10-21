@@ -19,7 +19,7 @@ Build from these checkouts and keep runtime revision checks enabled; a binary co
 
 Model nodes require Linux Python with `os.pidfd_open` and a working Mooncake Ascend installation. Startup checks these dependencies before loading weights. Mooncake registers all regions inside their real allocation owners before the first transfer; adding regions after a peer connection is established is not supported. Transfers are device-to-device without Host staging. Deploy on a trusted network: internal control endpoints are not authenticated.
 
-Install `python -m pip install -e '.[pd]'` in each environment. The Router only needs this extra, not PyPTO, model weights, or NPUs. Optional constrained tools use the ordinary [XGrammar deployment requirements](deepseek-v4-dspark-tool-constraints.md).
+Install `python -m pip install -e '.[pd]'` in each environment. The Router only needs this extra, not PyPTO, model weights, or NPUs. Optional constrained tools use the ordinary [XGrammar deployment requirements](../models/deepseek-v4/tool-constraints.md).
 
 ## Configure and start
 
@@ -61,10 +61,18 @@ HTTP, control (HTTP port + 10000 by default), and Mooncake's dynamic RPC/RoCE en
 
 Logs default to `serving_log/pd_disag/<automatic-run-id>/{router,p,d}/`; node files have stable hashed names. Set a shared `runtime.run_id` to group processes under one tag. Boot identities are still regenerated at every startup. Optional `observability` fields are `enabled` and `root`. Detailed profiling uses Serving's existing profiler, not a second trace system.
 
+### Optional Decode Step Metrics
+
+Set `PYPTO_SERVING_DECODE_METRICS_DIR` before starting each model server to collect lightweight worker JSONL records. Use a fresh directory per server run. This is disabled by default and does not require profiling.
+
+Each record contains one decode batch's Host dispatch-to-result-consumption duration and per-request raw accepted-token counts, including any bonus token and before scheduler output-length clipping. Compute mean acceptance length as total accepted tokens divided by total request-verifies; count batch duration once, not once per request. The duration includes asynchronous completion waits and is not device kernel time.
+
+Prepared synchronous and asynchronous paths exclude explicit input preparation. The `sync_unprepared` path may include preparation inside the executor; analyze it separately. Records also identify commands that schedule both prefill and decode. Compare like-for-like paths and batch sizes, and enable the same collection settings on all deployments being compared. The sink records no prompt or tensor data.
+
 ## Execution, extension and shutdown
 
 The Router fixes a P/D pair per request and sends two ordinary generation POSTs concurrently. P prepares input once; D reserves shared read-only prefix and writable suffix/state. After each confirmed prefill chunk, P pins source pages and submits a rank-mapped transfer. Owner-side communication and an independent progress channel overlap subsequent computation. D validates all required regions, commits through CacheManager, accepts the grammar seed, and adopts the request into ordinary K7 decode. Final request-local state is transferred even on a complete D prefix hit; output does not wait for P's source cleanup.
 
 `pd/adapter.py` owns model-specific regions, prefix rules, mapping and decode bootstrap; register another executor in `ADAPTERS`. `pd/transfer.py` defines the owner-side provider contract; register another implementation in `config.PROVIDERS`. `pd/routing.py` owns pair selection. The Router never manages physical cache; providers never implement model semantics. New adapters/providers require their own layout, lifecycle and native validation; changing JSON alone cannot add them.
 
-To shut down normally, stop admitting requests at the Router, let active requests finish, then stop P before D. Confirm sender registrations and pins have retired before freeing receiver memory. Deterministic errors reclaim normally; uncertain native completion gates the affected node and quarantines writable suffix/state, not healthy shared prefix. Recovery is manual/external: no automatic restart, replay, retry, or fallback. Do not equate a closed HTTP connection with stopped DMA.
+To shut down normally, stop admitting requests at the Router, let active requests finish, then stop P before D. Confirm sender registrations and pins have retired before freeing receiver memory. Deterministic errors reclaim normally; uncertain native completion gates the affected node and quarantines writable suffix/state, not healthy shared prefix. Recovery is manual/external: no automatic restart, transfer replay, or backend fallback. Before write authorization, a cached placement without suffix/decode capacity can be released and retried once through normal cold allocation; this is not a transfer retry. Do not equate a closed HTTP connection with stopped DMA.
