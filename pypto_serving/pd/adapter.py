@@ -136,6 +136,18 @@ class DSparkExtension:
     def worker_ready(self):
         self.transfer.worker_ready()
 
+    def wrap_capture(self, capture):
+        if self.runner.speculative:
+            return capture
+        window = self.compiled.layout.sliding_window
+        def retain(batch, inputs, **kwargs):
+            # P only exports the final prompt tail. Keep the existing all-rank
+            # collective intact when any packed request overlaps that window.
+            if any(row.chunk_start < row.prompt_len and row.chunk_end > max(0, row.prompt_len - window)
+                   for row in inputs.descriptors):
+                return capture(batch, inputs, **kwargs)
+        return retain
+
     def wrap_prepare(self, prepare):
         def build(batch, *, buffer_slot):
             bootstrap = tuple(r for r in batch.initial_request_ids

@@ -68,7 +68,7 @@ def test_prefix_checkpoint_tests_use_the_runtime_ring_geometry():
     assert all(g.num_partitions == 4 for g in specs)
 
 
-def _runner(*, speculative: bool = False, max_position: int = 512) -> DSparkModelRunner:
+def _runner(*, speculative: bool = False, max_position: int = 512, extension_factory=None) -> DSparkModelRunner:
     rows = torch.arange(max_position * 64, dtype=torch.float32).reshape(max_position, 64)
     rope = DSparkRopeTables(
         max_position=max_position,
@@ -99,7 +99,8 @@ def _runner(*, speculative: bool = False, max_position: int = 512) -> DSparkMode
             kernel_dir="unused",
             rope=rope,
             num_speculative_tokens=7 if speculative else 0,
-        )
+        ),
+        extension_factory=extension_factory,
     )
     runner._cache_group_num_blocks = {name: 8 for name in DSPARK_CACHE_GROUP_NAMES}
     runner._prefill_task_args = task_args_module.prefill_task_args(runner)
@@ -242,6 +243,57 @@ def test_target_only_can_capture_tail_without_compiling_drafter(monkeypatch, cap
     assert calls == (["prefill", "capture", "decode"] if capture else ["prefill", "decode"])
     assert compiled.num_speculative_tokens == 0 and not compiled.prefill_async
     assert compiled.drafter is compiled.markov is compiled.bootstrap_metadata is compiled.prefill_publish is None
+
+
+@pytest.mark.parametrize("length", [1, 127, 128, 129, 512, 8193])
+@pytest.mark.parametrize("pd", [False, True])
+@pytest.mark.parametrize("chunk_tokens,cached", [(64, False), (128, False), (8192, False), (128, True)])
+def test_prefill_capture_hook_preserves_complete_tail_and_slot_reuse(monkeypatch, length, pd, chunk_tokens, cached):
+    from pypto_serving.pd.adapter import DSparkExtension
+
+    def factory(*, runner):
+        extension = DSparkExtension.__new__(DSparkExtension)
+        extension.runner, extension.compiled = runner, runner._compiled
+        extension.draft_states = runner._drafter_states
+        return extension
+    runner = _runner(speculative=not pd, extension_factory=factory if pd else None)
+    runner._compiled.prefill_capture = object()
+    runner._prefill_descriptor_slots = [torch.zeros((16, 1, 12), dtype=torch.int32) for _ in range(2)]
+    for name in ("positions", "hidden"):
+        runner._device_scratch[("prefill_state", name)] = object()
+    runner._device_scratch[("prefill", "dspark_target_hidden")] = object()
+    monkeypatch.setattr(runner, "_grant_prefill_generations", lambda ids: None)
+    monkeypatch.setattr(runner, "_materialize_dspark_device_state_meta", lambda: object())
+    monkeypatch.setattr(runner, "_stacked_device_prefix", lambda tensor, count: tensor)
+    calls = []
+    monkeypatch.setattr(runner, "_run_l3", lambda *args: calls.append(args))
+    old_lease, old_generation = -1, 0
+    replay_start = max(0, length - 128) // 128 * 128 if cached else 0
+    for request in ("first", "reused"):
+        state = runner._reserve_drafter_state(request, group=2, prompt_len=length, defer_device_clear=True)
+        if request == "reused":
+            assert state.lease == old_lease and state.generation == old_generation + 1
+            assert state.prefill_tail_positions is None
+        calls.clear()
+        for start in range(replay_start, length, chunk_tokens):
+            count = min(chunk_tokens, length - start)
+            descriptor = runner_module.DSparkStepDescriptor(
+                state.lease, state.generation, state.group, start, count, length, 0, count, 0, 0)
+            inputs = SimpleNamespace(request_ids=(request,), descriptors=(descriptor,),
+                chunk_starts=(start,), actual_tokens=(count,), physical_tokens=(count + 3) // 4 * 4,
+                query_start_loc=torch.zeros((16, 2), dtype=torch.int32))
+            runner._capture_prefill_tails(None, inputs, descriptor_slot=(start // 128) % 2)
+        expected_calls = sum(start + min(chunk_tokens, length - start) > max(0, length - 128)
+                             for start in range(replay_start, length, chunk_tokens)) if pd else (
+                                 length - replay_start + chunk_tokens - 1) // chunk_tokens
+        assert len(calls) == expected_calls
+        assert all(args[0] is runner._compiled.prefill_capture for args in calls)
+        expected = torch.arange(max(0, length - 128), length, dtype=torch.int64)
+        assert torch.equal(state.prefill_tail_positions, expected)
+        if pd:
+            assert runner.runtime_extension.handle("source_state", request) == {"bootstrap": state.lease}
+        old_lease, old_generation = state.lease, state.generation
+        runner.release_finished_requests((request,))
 
 
 @pytest.mark.parametrize("length", [1, 127, 128, 129, 512, 8064, 8192, 8193, 655359])

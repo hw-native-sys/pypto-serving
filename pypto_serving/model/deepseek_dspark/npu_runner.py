@@ -1524,6 +1524,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             self.runtime_extension = extension_factory(runner=self)
             self._plan_builder = self.runtime_extension.wrap_prepare(self._plan_builder)
             self._ready_dispatch = self.runtime_extension.wrap_dispatch(self._ready_dispatch)
+            self._capture_prefill_tails = self.runtime_extension.wrap_capture(self._capture_prefill_tails)
 
     # ------------------------------------------------------------------
     # cache topology

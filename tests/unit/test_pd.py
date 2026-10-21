@@ -68,6 +68,39 @@ def test_pd_rejects_missing_device_bootstrap_before_creating_owners(capture, boo
         DSparkExtension(settings=None, runner=runner)
 
 
+@pytest.mark.parametrize("speculative", [False, True])
+@pytest.mark.parametrize("chunks,needed", [
+    ([(0, 128, 512)], False),
+    ([(256, 128, 512)], False),
+    ([(384, 128, 512)], True),
+    ([(0, 1, 1)], True),
+    ([(0, 127, 127)], True),
+    ([(0, 128, 129)], True),
+    ([(8192, 1, 8193)], True),
+    ([(7936, 128, 8193)], False),
+    ([(8064, 128, 8193)], True),
+    ([(0, 128, 512), (8064, 128, 8193)], True),
+    ([(0, 128, 512), (7936, 128, 8193)], False),
+])
+def test_pd_capture_skips_only_whole_batches_outside_the_final_window(speculative, chunks, needed):
+    from pypto_serving.pd.adapter import DSparkExtension
+    extension = DSparkExtension.__new__(DSparkExtension)
+    extension.runner = SimpleNamespace(speculative=speculative)
+    extension.compiled = SimpleNamespace(layout=SimpleNamespace(sliding_window=128))
+    calls = []
+    def capture(*args, **kwargs):
+        calls.append((args, kwargs))
+    wrapped = extension.wrap_capture(capture)
+    inputs = SimpleNamespace(descriptors=tuple(SimpleNamespace(
+        chunk_start=start, chunk_end=start + length, prompt_len=prompt) for start, length, prompt in chunks))
+    batch, hidden = object(), object()
+    wrapped(batch, inputs, host_hidden=hidden, descriptor_slot=1)
+    assert calls == ([((batch, inputs), dict(host_hidden=hidden, descriptor_slot=1))]
+                     if speculative or needed else [])
+    if speculative:
+        assert wrapped is capture  # D keeps normal K7 capture/bootstrap semantics.
+
+
 def caches(enabled=True, slots=3):
     from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
     from pypto_serving.serving.memory.kv_cache import KvCacheManager
