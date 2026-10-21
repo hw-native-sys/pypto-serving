@@ -530,6 +530,64 @@ def test_confirmed_abort_of_unadmitted_request_does_not_need_capacity():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_terminal_output_reuses_only_actual_worker_ack(stream):
+    from pypto_serving.config.types import GenerateConfig
+    from pypto_serving.pd.service import Request, Service
+    from pypto_serving.serving.engine.async_engine import ReplicaEngineCore
+    from pypto_serving.serving.sched.scheduler import Request as EngineRequest, RequestOutput
+    async def run():
+        core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+        core.config = SimpleNamespace(resolve_min_tokens=lambda value: value)
+        core._step_timeout = 1
+        core._request_contexts, core._pending_free_ids = {}, []
+        request = EngineRequest("request", [1], max_new_tokens=2, output_token_ids=[7])
+        initial = RequestOutput("request", new_token_id=7, num_output_tokens=1)
+        core.scheduler = SimpleNamespace(admit_prefilled=lambda **kwargs: (request, initial))
+        core.kv_cache_manager = caches()
+        core.tokenizer = SimpleNamespace(eos_token_id=2, decode=lambda ids, **kwargs: str(ids))
+        calls = []
+        async def worker(*args):
+            calls.append(args)
+            raise AssertionError("normal worker ACK must replace the redundant discard barrier")
+        core.call_worker = worker
+        config = Config((Endpoint("p", 8001, "p"),), (Endpoint("d", 8002, "d"),))
+        service = Service(config, config.decode[0], "decode", None, core, None)
+        entry = Request(SimpleNamespace(request="request"))
+        entry.continuation = SimpleNamespace(config=asdict(GenerateConfig(max_new_tokens=2, stream=stream)),
+                                              tokens=(1,), parser=None, constraint=None)
+        entry.first_token = 7
+        entry.transferred.set()
+        entry.state_task = asyncio.create_task(asyncio.sleep(0, result={"bootstrap": 0}))
+        service.requests["request"] = entry
+        outputs = service.outputs("request")
+        if stream:
+            assert not (await anext(outputs)).finished
+        pending = asyncio.create_task(anext(outputs))
+        for _ in range(10):
+            if core._request_contexts:
+                break
+            await asyncio.sleep(0)
+        assert core._request_contexts["request"].worker_release_ack is entry.worker_release_ack
+        request.output_token_ids.append(8)
+        core._publish_outputs([RequestOutput("request", new_token_id=8, num_output_tokens=2,
+                                             finished=True, finish_reason="FINISHED_LENGTH")])
+        await asyncio.sleep(0)
+        assert not pending.done() and not entry.worker_release_ack.is_set()
+        assert core._pending_free_ids == ["request"]
+        core._acknowledge_worker_frees(("request",))
+        await asyncio.sleep(0)
+        assert entry.worker_release_ack.is_set() and not pending.done()
+        # Worker release does not substitute for the sender's stop confirmation.
+        entry.source_done.set()
+        result = await asyncio.wait_for(pending, 1)
+        assert result.finished and result.token_ids == (7, 8)
+        await outputs.aclose()
+        assert not service.requests and not calls and entry.state_task is None
+        assert not core._request_contexts
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("cancel_cleanup", [False, True])
 def test_terminal_output_waits_for_owned_retirement(cancel_cleanup):
     from pypto_serving.config.types import GenerateConfig
@@ -865,7 +923,7 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
                 assert kwargs["ignore_eos"] is ignore_eos
                 assert kwargs["eos_token_id"] == Tokenizer.eos_token_id
                 request, first = self.scheduler.admit_prefilled(**{k: v for k, v in kwargs.items()
-                    if k not in ("stream", "output_parser_spec")})
+                    if k not in ("stream", "output_parser_spec", "worker_release_ack")})
                 assert (request.min_tokens, request.ignore_eos) == (minimum, ignore_eos)
                 assert first.num_output_tokens == 1
                 events.append(("decode-first", 0))

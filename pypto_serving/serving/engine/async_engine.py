@@ -158,6 +158,9 @@ class _RequestContext:
     # flight when the request reaches its token limit; publishing completion
     # before that step drains leaves request-local K7 state visible to metrics.
     worker_release_done: asyncio.Event = field(default_factory=asyncio.Event)
+    # Optional receipt for externally reserved state. Unlike release_done,
+    # only an actual worker ACK sets it, never an initial terminal token.
+    worker_release_ack: asyncio.Event | None = None
     # The terminal output is queued, but its worker release may still be in
     # flight. Cancellation must not schedule a second release in that window.
     terminal_output_queued: bool = False
@@ -674,6 +677,7 @@ class ReplicaEngineCore:
         stream: bool = True,
         output_parser_spec: OutputParserSpec | None = None,
         constraint_spec: ConstraintSpec | None = None,
+        worker_release_ack: asyncio.Event | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Continue from an initialized cache lease using normal output delivery."""
         parser = create_output_parser(output_parser_spec, self.tokenizer)
@@ -697,12 +701,14 @@ class ReplicaEngineCore:
             request=request,
             stream=stream,
             output_parser=parser,
+            worker_release_ack=worker_release_ack,
         )
         self._request_contexts[request_id] = ctx
         self._publish_outputs([first_output], release_worker=False)
         if first_output.finished:
             # Publication can also finish the first token through a stop
-            # string. No Decode worker state exists in either terminal case.
+            # string. No Decode execution was scheduled; externally reserved
+            # state still needs its owner's explicit release, not a fake ACK.
             ctx.worker_release_done.set()
         async with contextlib.aclosing(self._iterate_request_output(ctx)) as outputs:
             async for output in outputs:
@@ -724,6 +730,9 @@ class ReplicaEngineCore:
             context = self._request_contexts.get(request_id)
             if context is not None:
                 context.worker_release_done.set()
+                receipt = getattr(context, "worker_release_ack", None)
+                if receipt is not None:
+                    receipt.set()
 
     async def _engine_loop(self) -> None:
         """Pipelined schedule/execute loop.
@@ -953,6 +962,9 @@ class ReplicaEngineCore:
                     # same FIFO command.  Its old-incarnation acknowledgement
                     # must not satisfy the eventual terminal release barrier.
                     release_done.clear()
+                receipt = getattr(context, "worker_release_ack", None)
+                if receipt is not None:
+                    receipt.clear()
                 new_requests.append(NewRequestData(
                     request_id=req_id,
                     prompt_token_ids=list(req.prompt_token_ids),

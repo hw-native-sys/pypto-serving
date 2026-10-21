@@ -50,6 +50,7 @@ class Request:
     state_task: object = None
     state_slots: dict = field(default_factory=dict)
     admitted: bool = False
+    worker_release_ack: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class Service:
@@ -398,7 +399,10 @@ class Service:
             # Even a failed/lost reserve reply may have allocated a local slot.
             # Drain it before the idempotent discard; cancellation must not race reuse.
             await asyncio.shield(asyncio.gather(entry.state_task, return_exceptions=True))
-            await self.worker("discard_state", entry.binding.request)
+            # Normal Decode already released the lease in its FIFO StepCommand.
+            # Early first-token termination/cancellation still needs a barrier.
+            if not entry.worker_release_ack.is_set():
+                await self.worker("discard_state", entry.binding.request)
             entry.state_task = None
 
     async def prefill(self, entry, continuation, peer):
@@ -527,7 +531,8 @@ class Service:
                 stream=config.stream, output_parser_spec=(OutputParserSpec(**continuation.parser)
                                                          if continuation.parser else None),
                 constraint_spec=(ConstraintSpec.from_wire(continuation.constraint)
-                                 if continuation.constraint else None))
+                                 if continuation.constraint else None),
+                worker_release_ack=entry.worker_release_ack)
             async with aclosing(outputs):
                 async for output in outputs:
                     if output.finished:

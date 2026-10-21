@@ -45,14 +45,17 @@ def test_prefilled_initial_terminal_token_needs_no_worker_release(stream, reason
             finish_request=lambda rid, status: finished.append(rid))
         core._record_scheduler_stats = lambda *args: None
         core.tokenizer = SimpleNamespace(decode=lambda ids, **kwargs: "Paris" if ids else "")
+        receipt = asyncio.Event()
         results = [token async for token in core.add_prefilled_request(reservation_id="initial",
             request_id="initial", prompt_token_ids=[1], first_token=2,
-            max_new_tokens=request.max_new_tokens, stop_strings=request.stop_strings, stream=stream)]
+            max_new_tokens=request.max_new_tokens, stop_strings=request.stop_strings, stream=stream,
+            worker_release_ack=receipt)]
         assert len(results) == 1 and results[0].finished
         assert results[0].completion_tokens == 1
         assert results[0].finish_reason == "FINISHED_" + reason.upper()
         assert finished == (["initial"] if reason == "stop" else [])
         assert not core._pending_free_ids and not core._request_contexts
+        assert not receipt.is_set()  # Logical first-token completion is not a worker ACK.
     asyncio.run(run())
 
 
@@ -185,7 +188,7 @@ def test_flush_pending_frees_sends_cleanup_only_step_command(monkeypatch):
 def test_cleanup_failure_preserves_release_until_matching_ack(failure):
     async def run():
         core = ReplicaEngineCore.__new__(ReplicaEngineCore)
-        context = SimpleNamespace(worker_release_done=asyncio.Event())
+        context = SimpleNamespace(worker_release_done=asyncio.Event(), worker_release_ack=asyncio.Event())
         core._request_contexts = {"finished": context}
         core._worker_known_req_ids = {"finished"}
         core._pending_free_ids = ["finished"]
@@ -219,9 +222,11 @@ def test_cleanup_failure_preserves_release_until_matching_ack(failure):
         await core._flush_pending_frees()
         assert core._pending_free_ids == ["finished"]
         assert not context.worker_release_done.is_set()
+        assert not context.worker_release_ack.is_set()
         await core._flush_pending_frees()
         assert not core._pending_free_ids
         assert context.worker_release_done.is_set()
+        assert context.worker_release_ack.is_set()
         assert not core._discard_result_step_ids
     asyncio.run(run())
 

@@ -302,7 +302,7 @@ def test_min_tokens_reaches_worker_registration(executor_cls, speculative_tokens
     assert registration.initial_output_tokens == 0
 
 
-def test_restarted_request_registers_committed_output_length():
+def test_restarted_request_registers_committed_output_length(monkeypatch):
     core, _ = _async_pipeline_core()
     request = Request(
         request_id="restarted", prompt_token_ids=[1, 2], max_new_tokens=6,
@@ -310,6 +310,10 @@ def test_restarted_request_registers_committed_output_length():
         status=RequestStatus.PREEMPTED,
     )
     core._worker_known_req_ids.add(request.request_id)
+    context = SimpleNamespace(worker_release_done=asyncio.Event(), worker_release_ack=asyncio.Event())
+    context.worker_release_done.set()
+    context.worker_release_ack.set()
+    core._request_contexts[request.request_id] = context
     scheduled = SchedulerOutput(scheduled_requests=[
         ScheduledRequest(request=request, num_new_tokens=1, is_prefill=True),
     ])
@@ -320,6 +324,15 @@ def test_restarted_request_registers_committed_output_length():
     assert len(command.new_requests) == 1
     assert command.new_requests[0].initial_output_tokens == 2
     assert command.new_requests[0].min_tokens == 3
+    assert not context.worker_release_done.is_set() and not context.worker_release_ack.is_set()
+    # A release followed by re-registration in one FIFO command only retires
+    # the old incarnation; its reply must not acknowledge the new live state.
+    monkeypatch.setattr(core.scheduler, "schedule", lambda **kwargs: scheduled)
+    core._pending_free_ids = [request.request_id]
+    assert core._try_dispatch_step()
+    assert not getattr(core, "_worker_free_ids_by_step", {})
+    assert asyncio.run(core._await_and_apply_oldest())
+    assert not context.worker_release_done.is_set() and not context.worker_release_ack.is_set()
 
 
 def test_async_pipeline_dispatches_two_steps_before_applying_first(monkeypatch):
