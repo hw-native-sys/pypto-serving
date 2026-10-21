@@ -482,6 +482,80 @@ def test_cancel_during_state_reservation_drains_and_discards(reserve_fails):
     asyncio.run(run())
 
 
+def test_confirmed_abort_of_unadmitted_request_does_not_need_capacity():
+    from pypto_serving.pd.service import Service
+    async def run():
+        config = Config((Endpoint("p", 8001, "p"),), (Endpoint("d", 8002, "d"),), capacity=1)
+        service = Service(config, config.decode[0], "decode", None,
+                          SimpleNamespace(kv_cache_manager=caches()), None)
+        p, service.node = node("p"), node("d", "decode")
+        original = Binding.create(p, service.node, {"prompt": "active"})
+        service.register_http(original, {"prompt": "active"})
+        rejected = Binding.create(p, service.node, {"prompt": "rejected"})
+        assert await service.control(p, (), "abort", dict(binding=rejected, stopped=True)) == {}
+        assert set(service.requests) == {original.request} and not service.gated
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cancel_cleanup", [False, True])
+def test_terminal_output_waits_for_owned_retirement(cancel_cleanup):
+    from pypto_serving.config.types import GenerateConfig
+    from pypto_serving.pd.service import Request, Service
+    from pypto_serving.serving.engine.async_engine import TokenOutput
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+        states = {"request"}
+        core_closed = False
+        async def worker(operation, payload):
+            assert operation == "discard_state" and core_closed
+            entered.set()
+            await release.wait()
+            states.discard(msgspec.msgpack.decode(payload))
+            return msgspec.msgpack.encode(None)
+        async def generate(**kwargs):
+            nonlocal core_closed
+            try:
+                yield TokenOutput(token_id=7, text="answer", finished=True)
+            finally:
+                core_closed = True
+        core = SimpleNamespace(kv_cache_manager=caches(), call_worker=worker,
+            tokenizer=SimpleNamespace(eos_token_id=2), add_prefilled_request=generate)
+        config = Config((Endpoint("p", 8001, "p"),), (Endpoint("d", 8002, "d"),), capacity=1)
+        service = Service(config, config.decode[0], "decode", None, core, None)
+        entry = Request(SimpleNamespace(request="request"))
+        entry.continuation = SimpleNamespace(config=asdict(GenerateConfig()), tokens=(1,),
+                                              parser=None, constraint=None)
+        entry.first_token = 7
+        entry.transferred.set()
+        entry.source_done.set()
+        entry.state_task = asyncio.create_task(asyncio.sleep(0, result={"bootstrap": 0}))
+        service.requests["request"] = entry
+        outputs = service.outputs("request")
+        pending = asyncio.create_task(anext(outputs))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+        except asyncio.TimeoutError:
+            release.set()
+            await outputs.aclose()
+            raise
+        assert not pending.done() and service.requests and states
+        if cancel_cleanup:
+            pending.cancel()
+            await asyncio.sleep(0)
+            assert not entry.task.cancelled()
+        release.set()
+        if cancel_cleanup:
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        else:
+            assert (await pending).finished
+        await outputs.aclose()
+        await entry.task
+        assert not states and not service.requests and entry.state_task is None
+        assert core_closed
+    asyncio.run(run())
+
+
 def test_router_connection_budget_scales_with_all_node_pools(monkeypatch):
     from pypto_serving.pd import router as module
     captured = {}

@@ -189,9 +189,14 @@ class Service:
         binding = decode(payload["binding"], Binding)
         if binding.prefill != peer.key:
             raise ValueError("control sender differs from binding")
-        if (operation == "abort" and payload.get("stopped") is True
-                and self.terminal.get(binding.request) == binding):
-            return {}
+        if operation == "abort" and payload.get("stopped") is True:
+            binding.check(self.node, self.role)
+            if binding.request not in self.requests and (
+                binding.request not in self.terminal or self.terminal[binding.request] == binding
+            ):
+                # Never admitted (including a capacity rejection): no write
+                # could be authorized, and abort must not allocate a new slot.
+                return {}
         entry = self.entry(binding)
         request = binding.request
         if operation == "begin":
@@ -528,22 +533,36 @@ class Service:
                     if output.finished:
                         await asyncio.wait_for(entry.source_done.wait(), self.config.handoff_timeout)
                         terminal = True
+                        # The client may disconnect as soon as it sees the
+                        # terminal event. Retire before publishing it, so the
+                        # Router cannot admit a replacement into a live slot.
+                        await outputs.aclose()
+                        await self.close_output(entry, terminal)
                     yield output
         finally:
-            # The core iterator has closed (including its worker release ACK).
-            entry.admitted = False
-            entry.response_closed = True
-            if not entry.source_done.is_set():
-                await self.abort(entry)
-                # Keep the request and lease until the sender proves native stop.
-            elif entry.error is None or not isinstance(entry.error, TransferError) or not entry.error.uncertain:
-                if not terminal:
-                    await self.abort(entry, stopped=True)
-                reservation = self.cache.group_cache_reservation(request)
-                if reservation is not None:
-                    self.cache.retire_group_cache_reservation(request)
-                await self.discard_state(entry)
-                self.finish(entry)
+            await self.close_output(entry, terminal)
+
+    async def close_output(self, entry, terminal):
+        # D uses its existing task field to own retirement independently of the
+        # HTTP cancellation scope. P uses that field for its Prefill task.
+        if entry.task is None:
+            entry.task = asyncio.create_task(self.retire_output(entry, terminal))
+        await asyncio.shield(entry.task)
+
+    async def retire_output(self, entry, terminal):
+        entry.admitted = False
+        entry.response_closed = True
+        if not entry.source_done.is_set():
+            await self.abort(entry)
+            # Keep the request and lease until the sender proves native stop.
+        elif entry.error is None or not isinstance(entry.error, TransferError) or not entry.error.uncertain:
+            if not terminal:
+                await self.abort(entry, stopped=True)
+            reservation = self.cache.group_cache_reservation(entry.binding.request)
+            if reservation is not None:
+                self.cache.retire_group_cache_reservation(entry.binding.request)
+            await self.discard_state(entry)
+            self.finish(entry)
 
     async def close(self):
         self.closing = True
