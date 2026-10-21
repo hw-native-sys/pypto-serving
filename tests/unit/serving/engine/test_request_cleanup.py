@@ -23,6 +23,37 @@ from pypto_serving.serving.server.ipc import (
     decode_command,
     encode_result,
 )
+from pypto_serving.serving.sched.scheduler import Request, RequestOutput
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("reason", ["stop", "length", "eos"])
+def test_prefilled_initial_terminal_token_needs_no_worker_release(stream, reason):
+    async def run():
+        core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+        core.config = SimpleNamespace(resolve_min_tokens=lambda value: value)
+        core._step_timeout = .05
+        core._request_contexts = {}
+        core._pending_free_ids = []
+        request = Request("initial", [1], max_new_tokens=1 if reason == "length" else 32,
+            output_token_ids=[2], stop_strings=("Paris",) if reason == "stop" else ())
+        output = RequestOutput("initial", new_token_id=2, num_output_tokens=1,
+            finished=reason != "stop",
+            finish_reason={"length": "FINISHED_LENGTH", "eos": "FINISHED_EOS"}.get(reason, ""))
+        finished = []
+        core.scheduler = SimpleNamespace(admit_prefilled=lambda **kwargs: (request, output),
+            finish_request=lambda rid, status: finished.append(rid))
+        core._record_scheduler_stats = lambda *args: None
+        core.tokenizer = SimpleNamespace(decode=lambda ids, **kwargs: "Paris" if ids else "")
+        results = [token async for token in core.add_prefilled_request(reservation_id="initial",
+            request_id="initial", prompt_token_ids=[1], first_token=2,
+            max_new_tokens=request.max_new_tokens, stop_strings=request.stop_strings, stream=stream)]
+        assert len(results) == 1 and results[0].finished
+        assert results[0].completion_tokens == 1
+        assert results[0].finish_reason == "FINISHED_" + reason.upper()
+        assert finished == (["initial"] if reason == "stop" else [])
+        assert not core._pending_free_ids and not core._request_contexts
+    asyncio.run(run())
 
 
 def test_worker_step_error_queues_finished_ids_for_executor_release():

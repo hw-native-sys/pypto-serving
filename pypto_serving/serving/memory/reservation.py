@@ -40,6 +40,7 @@ class GroupCacheReservation:
     prefix_hit_tokens: int
     published_block_counts: dict[str, int]
     state: GroupReservationState
+    shared_prefix_pinned: bool = False
     write_authorized: bool = False
     publication_valid_from: dict[str, int] = field(default_factory=dict)
     quarantined_block_ids_by_group: dict[str, tuple[int, ...]] = field(default_factory=dict)
@@ -70,6 +71,8 @@ class GroupedCacheReservations:
         used by local scheduling. Callers own request deduplication; a live
         reservation identity cannot be reused.
         """
+        from .kv_cache import KVCacheCapacityError
+
         if not self.manager._group_pools:
             raise RuntimeError("grouped cache must be initialized before reservation")
         if not isinstance(reservation_id, str) or not reservation_id:
@@ -93,6 +96,7 @@ class GroupedCacheReservations:
         # The normal allocator preflights every group before mutation. The catch
         # still rolls back an unexpected mid-allocation exception so a failed
         # reservation cannot strand a partially populated request.
+        shared_pinned = False
         try:
             shared_ids: dict[str, list[int]] = {name: [] for name in self.manager._group_pools}
             prefix_hit_tokens = 0
@@ -109,19 +113,38 @@ class GroupedCacheReservations:
                     shareable_group_names=shareable_group_names,
                     partition=partition,
                 )
-            block_ids = self.manager.ensure_group_blocks(
-                request_id,
-                prompt_tokens,
-                partition=(selected_prefix_partition if selected_prefix_partition is not None else partition),
-            )
-            selected = self.manager.group_request_partition(request_id)
-            if selected is None:
-                raise RuntimeError("grouped reservation has no selected partition")
-            self.manager._reserve_group_decode_capacity(
-                request_id,
-                token_capacity,
-                selected,
-            )
+                if prefix_hit_tokens:
+                    # A cached page may otherwise have only this request as an
+                    # owner. Keep a separate read-only reference so suffix ring
+                    # growth cannot reuse it as a remote-write destination.
+                    self.manager.retain_group_block_snapshot(shared_ids, selected_prefix_partition)
+                    shared_pinned = True
+            def allocate():
+                self.manager.ensure_group_blocks(
+                    request_id, prompt_tokens,
+                    partition=(selected_prefix_partition if selected_prefix_partition is not None else partition),
+                )
+                selected = self.manager.group_request_partition(request_id)
+                if selected is None:
+                    raise RuntimeError("grouped reservation has no selected partition")
+                self.manager._reserve_group_decode_capacity(request_id, token_capacity, selected)
+                return selected
+
+            try:
+                selected = allocate()
+            except KVCacheCapacityError:
+                if not prefix_hit_tokens:
+                    raise
+                # Like local Scheduler admission, a rank-local hit must not
+                # strand a request when cold capacity is available. No writer
+                # has been authorized: drop the read-only view and retry once
+                # through the normal allocator, never as a transfer retry.
+                self.manager.release_all_group_requests(request_id)
+                self.manager.release_group_block_snapshot(shared_ids, selected_prefix_partition)
+                shared_pinned = False
+                shared_ids = {name: [] for name in self.manager._group_pools}
+                prefix_hit_tokens, selected_prefix_partition = 0, None
+                selected = allocate()
             block_ids = {
                 name: [
                     pool.local_block_id(block)
@@ -133,6 +156,8 @@ class GroupedCacheReservations:
         except BaseException:
             if request_id in self.manager._group_request_partitions:
                 self.manager.release_all_group_requests(request_id)
+            if shared_pinned:
+                self.manager.release_group_block_snapshot(shared_ids, selected_prefix_partition)
             raise
 
         shared = {name: tuple(shared_ids.get(name, ())) for name in self.manager._group_pools}
@@ -160,6 +185,7 @@ class GroupedCacheReservations:
             prefix_hit_tokens=prefix_hit_tokens,
             published_block_counts=cached_counts,
             state=GroupReservationState.CONSTRUCTING,
+            shared_prefix_pinned=shared_pinned,
         )
         self._group_reservations[reservation_id] = reservation
         return reservation
@@ -202,11 +228,16 @@ class GroupedCacheReservations:
             current.published_block_counts,
             valid_from=publication_floor,
         )
+        # Completion proves all authorized writes stopped. Normal Decode now
+        # owns its table; detached old Prefix tails no longer need a second pin.
+        if current.shared_prefix_pinned:
+            self.manager.release_group_block_snapshot(current.shared_block_ids_by_group, current.partition)
         current = replace(
             current,
             state=GroupReservationState.READY,
             published_block_counts=published,
             publication_valid_from=publication_floor,
+            shared_prefix_pinned=False,
         )
         self._group_reservations[reservation_id] = current
         return current
@@ -266,7 +297,9 @@ class GroupedCacheReservations:
         if uncertain and not confirmed_stopped:
             raise RuntimeError("reservation may still have a native writer; keep it quarantined")
         self.manager.release_all_group_requests(current.request_id)
-        current = replace(current, state=GroupReservationState.RELEASED)
+        if current.shared_prefix_pinned:
+            self.manager.release_group_block_snapshot(current.shared_block_ids_by_group, current.partition)
+        current = replace(current, state=GroupReservationState.RELEASED, shared_prefix_pinned=False)
         self._group_reservations[reservation_id] = current
         return current
 

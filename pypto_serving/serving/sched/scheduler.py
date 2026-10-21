@@ -298,6 +298,8 @@ class Scheduler:
         prompt_token_ids: list[int],
         first_token: int,
         max_new_tokens: int,
+        min_tokens: int = 0,
+        ignore_eos: bool = False,
         temperature: float = 0.0,
         top_p: float = 1.0,
         top_k: int | None = None,
@@ -316,11 +318,15 @@ class Scheduler:
             raise ValueError("Decode request exceeds its cache reservation capacity")
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
+        if not 0 <= min_tokens <= max_new_tokens:
+            raise ValueError("min_tokens must be within the generation limit")
         reservation = self.kv_cache_manager.adopt_group_cache(reservation_id)
         request = Request(
             request_id=request_id,
             prompt_token_ids=list(prompt_token_ids),
             max_new_tokens=max_new_tokens,
+            min_tokens=min_tokens,
+            ignore_eos=ignore_eos,
             status=RequestStatus.RUNNING,
             num_computed_tokens=len(prompt_token_ids),
             output_token_ids=[int(first_token)],
@@ -346,7 +352,7 @@ class Scheduler:
         )
         self.requests[request_id] = request
         self.running.append(request)
-        output = RequestOutput(request_id=request_id, new_token_id=int(first_token))
+        output = RequestOutput(request_id=request_id, new_token_id=int(first_token), num_output_tokens=1)
         finish = self._check_finish(request)
         if finish is not None:
             request.status = finish
@@ -1049,6 +1055,7 @@ class Scheduler:
                         request.num_group_blocks_cached,
                         scheduled.block_ids_by_group,
                         scheduled.cache_partition,
+                        request_id=request.request_id,
                         valid_from=request.group_cache_valid_from,
                     )
                 )

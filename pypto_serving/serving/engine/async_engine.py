@@ -663,6 +663,8 @@ class ReplicaEngineCore:
         prompt_token_ids: Sequence[int],
         first_token: int,
         max_new_tokens: int,
+        min_tokens: int = 0,
+        ignore_eos: bool = False,
         temperature: float = 0.0,
         top_p: float = 1.0,
         top_k: int | None = None,
@@ -681,6 +683,8 @@ class ReplicaEngineCore:
             prompt_token_ids=list(prompt_token_ids),
             first_token=first_token,
             max_new_tokens=max_new_tokens,
+            min_tokens=self.config.resolve_min_tokens(min_tokens),
+            ignore_eos=ignore_eos,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
@@ -694,12 +698,12 @@ class ReplicaEngineCore:
             stream=stream,
             output_parser=parser,
         )
-        if first_output.finished:
-            # No Decode worker state was created when the initial token already
-            # satisfies the request.
-            ctx.worker_release_done.set()
         self._request_contexts[request_id] = ctx
         self._publish_outputs([first_output], release_worker=False)
+        if first_output.finished:
+            # Publication can also finish the first token through a stop
+            # string. No Decode worker state exists in either terminal case.
+            ctx.worker_release_done.set()
         async with contextlib.aclosing(self._iterate_request_output(ctx)) as outputs:
             async for output in outputs:
                 yield output

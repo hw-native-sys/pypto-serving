@@ -59,6 +59,14 @@ def test_persistent_worker_keeps_model_managed_windows(monkeypatch, pd):
     assert ready == ([True] if pd else [])
 
 
+def test_prefix_checkpoint_tests_use_the_runtime_ring_geometry():
+    from tests.unit.serving.test_grouped_prefix_cache import GEOMETRY
+    specs = build_dspark_cache_group_specs(3, (0, 4, 128), max_seq_len=655360, max_prefill_tokens=128)
+    assert tuple((g.name, g.spec.token_capacity, g.spec.compress_ratio,
+                  g.max_blocks_per_seq, g.sliding_window) for g in specs) == GEOMETRY
+    assert all(g.num_partitions == 4 for g in specs)
+
+
 def _runner(*, speculative: bool = False, max_position: int = 512) -> DSparkModelRunner:
     rows = torch.arange(max_position * 64, dtype=torch.float32).reshape(max_position, 64)
     rope = DSparkRopeTables(

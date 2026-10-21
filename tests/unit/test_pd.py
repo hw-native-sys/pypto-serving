@@ -572,6 +572,8 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
 
     async def run():
         events, jobs = [], {}
+        minimum = 2 if kind == "chat" and max_tokens > 1 else 0
+        ignore_eos = stream if kind == "chat" else True
         config = Config((Endpoint("p", 8111, "p"),), (Endpoint("d", 8112, "d"),),
                         handoff_timeout=2, request_timeout=5, log_enabled=False)
         adapter = DeepSeekDSpark()
@@ -606,6 +608,8 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
                     result = None
                 return msgspec.msgpack.encode(result)
             async def add_request(self, request, prompt, generate, **kwargs):
+                assert (generate.max_new_tokens, generate.min_tokens, generate.ignore_eos) == (
+                    max_tokens, minimum, ignore_eos)
                 cache = self.kv_cache_manager
                 hashes = cache.compute_group_block_hashes(tokens)
                 _, start, _ = cache.acquire_group_prefix_blocks(request, hashes, max_cache_hit_tokens=128,
@@ -637,8 +641,13 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
                 self.resumed.set()
                 allow_cleanup.set()
             async def add_prefilled_request(self, **kwargs):
+                assert kwargs["min_tokens"] == minimum
+                assert kwargs["ignore_eos"] is ignore_eos
+                assert kwargs["eos_token_id"] == Tokenizer.eos_token_id
                 request, first = self.scheduler.admit_prefilled(**{k: v for k, v in kwargs.items()
                     if k not in ("stream", "output_parser_spec")})
+                assert (request.min_tokens, request.ignore_eos) == (minimum, ignore_eos)
+                assert first.num_output_tokens == 1
                 events.append(("decode-first", 0))
                 allow_cleanup.set()
                 yield TokenOutput(token_id=first.new_token_id, text="answer", text_delta="answer",
@@ -700,7 +709,9 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router") as client:
             body = {"model": "test-model", "stream": stream, "max_tokens": max_tokens}
             body.update({"prompt": "hello"} if kind == "completion" else {
-                "messages": [{"role": "user", "content": "hello"}]})
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": max_tokens + 1, "max_completion_tokens": max_tokens,
+                "min_tokens": minimum, "ignore_eos": ignore_eos})
             path = "/v1/completions" if kind == "completion" else "/v1/chat/completions"
             rejected = await asyncio.wait_for(client.post(path, json={**body, "temperature": 0.5}), 4)
             assert rejected.status_code in (400, 422) and "text/event-stream" not in rejected.headers["content-type"]

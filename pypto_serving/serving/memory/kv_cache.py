@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import torch
 
 from pypto_serving.config.types import KVCacheGroupSpec, KvAllocation, ModelConfig, RuntimeConfig
+from .checkpoint import GroupPrefixCheckpoints
 from .reservation import GroupCacheReservation, GroupedCacheReservations
 
 
@@ -183,6 +184,7 @@ class KvCacheManager:
         self._group_pools: dict[str, _GroupBlockPool] = {}
         self._group_request_partitions: dict[str, int] = {}
         self._next_group_partition = 0
+        self._group_checkpoints: GroupPrefixCheckpoints | None = None
         self._reservations: GroupedCacheReservations | None = None
         self._group_request_spares: dict[
             str, dict[str, list[KVCacheBlock]]
@@ -1008,6 +1010,10 @@ class KvCacheManager:
                     )
                 self._cache_group_block(pool, partition, block, hashes[index])
             cached_counts[name] = completed
+        # Decode without newly publishable prompt pages must not replace the
+        # prompt's replay checkpoint with a later, non-reusable boundary.
+        if cached_counts != already_cached:
+            self._protect_group_checkpoint(request_id, block_hashes, num_computed_tokens, partition, valid_from)
         return cached_counts
 
     def retain_group_block_snapshot(
@@ -1070,6 +1076,7 @@ class KvCacheManager:
         block_ids_by_group: dict[str, list[int]],
         partition: int,
         *,
+        request_id: str,
         valid_from: dict[str, int] | None = None,
     ) -> dict[str, int]:
         """Publish confirmed pages using the exact table used by one step.
@@ -1114,10 +1121,22 @@ class KvCacheManager:
                 block = pool.block_from_local_id(partition, block_ids[slot])
                 self._cache_group_block(pool, partition, block, hashes[index])
             cached_counts[name] = completed
+        if cached_counts != already_cached:
+            self._protect_group_checkpoint(request_id, block_hashes, num_computed_tokens, partition, valid_from)
         return cached_counts
 
-    @staticmethod
+    def _protect_group_checkpoint(self, request_id, hashes, tokens, partition, valid_from):
+        if self._group_checkpoints is None:
+            if not any(pool.spec.sliding_window is not None for pool in self._group_pools.values()):
+                return
+            self._group_checkpoints = GroupPrefixCheckpoints()
+        owner = request_id if request_id in self._group_request_partitions else None
+        self._group_checkpoints.prune(self._group_pools)
+        self._group_checkpoints.publish(owner, self._group_pools, hashes, tokens, partition,
+                                        self.group_prefix_cache_alignment, valid_from)
+
     def _cache_group_block(
+        self,
         pool: _GroupBlockPool,
         partition: int,
         block: KVCacheBlock,
@@ -1128,17 +1147,9 @@ class KvCacheManager:
         existing = pool.hash_to_block.get(key)
         if existing is block:
             return
+        self._invalidate_group_block(pool, partition, block)
         if existing is not None:
-            if block.block_hash is not None:
-                old_key = (partition, block.block_hash)
-                if pool.hash_to_block.get(old_key) is block:
-                    del pool.hash_to_block[old_key]
-                block.block_hash = None
             return
-        if block.block_hash is not None:
-            old_key = (partition, block.block_hash)
-            if pool.hash_to_block.get(old_key) is block:
-                del pool.hash_to_block[old_key]
         block.block_hash = block_hash
         pool.hash_to_block[key] = block
 
@@ -1153,13 +1164,15 @@ class KvCacheManager:
         """Return the stable cache partition assigned to a request."""
         return self._group_request_partitions.get(request_id)
 
-    @staticmethod
     def _invalidate_group_block(
+        self,
         pool: _GroupBlockPool,
         partition: int,
         block: KVCacheBlock,
     ) -> None:
         """Remove one block's old contents from its partition hash index."""
+        if self._group_checkpoints is not None:
+            self._group_checkpoints.discard_page(pool, block)
         if block.block_hash is None:
             return
         key = (partition, block.block_hash)
@@ -1173,7 +1186,10 @@ class KvCacheManager:
         partition: int,
     ) -> KVCacheBlock:
         """Take and initialize one evictable block from a group partition."""
-        block = pool.free_queues[partition].popleft()
+        queue = pool.free_queues[partition]
+        block = (self._group_checkpoints.victim(pool, queue)
+                 if self._group_checkpoints is not None and pool.spec.sliding_window is not None
+                 else queue.head)
         if block is None:
             raise RuntimeError(
                 f"KV cache group {pool.spec.name!r} free queue became inconsistent"
@@ -1182,6 +1198,7 @@ class KvCacheManager:
             raise RuntimeError(
                 f"Free grouped KV block {block.block_id} has ref_cnt={block.ref_cnt}"
             )
+        queue.remove(block)
         self._invalidate_group_block(pool, partition, block)
         block.ref_cnt = 1
         return block
@@ -1359,18 +1376,24 @@ class KvCacheManager:
                 else target
             )
             owned.extend([None] * (table_size - len(owned)))
+            initialized = set()
             # Prefix lookup leaves irrelevant rolling slots empty. Materialize
             # them without copying any cached KV before exposing the table.
             for slot in range(table_size):
                 if owned[slot] is None:
                     owned[slot] = self._take_group_block(pool, selected)
+                    initialized.add(slot)
 
             previous = pool.request_logical_blocks.get(request_id, 0)
             if pool.spec.sliding_window is not None:
-                for logical_block in range(previous, target):
-                    if logical_block < pool.spec.max_blocks_per_seq:
-                        continue
+                # A cold external fill needs one final ring mapping, not a
+                # replay of every historical wrap. Fresh/sparse slots already
+                # have empty pages; rotate each existing destination at most once.
+                for logical_block in range(max(previous, target - table_size,
+                                               pool.spec.max_blocks_per_seq), target):
                     slot = logical_block % pool.spec.max_blocks_per_seq
+                    if slot in initialized:
+                        continue
                     block = owned[slot]
                     if block is None:
                         raise RuntimeError(
@@ -1400,6 +1423,8 @@ class KvCacheManager:
                         owned[slot] = self._take_group_block(pool, selected)
             pool.request_logical_blocks[request_id] = max(previous, target)
 
+        if self._group_checkpoints is not None:
+            self._group_checkpoints.prune(self._group_pools)
         result = {}
         for name, pool in self._group_pools.items():
             block_ids = []
@@ -1414,6 +1439,8 @@ class KvCacheManager:
 
     def release_all_group_requests(self, request_id: str) -> None:
         """Release every grouped block owned by a request."""
+        if self._group_checkpoints is not None:
+            self._group_checkpoints.release(request_id)
         spares_by_group = self._group_request_spares.pop(request_id, {})
         for pool in self._group_pools.values():
             partition = pool.request_partitions.get(request_id)
@@ -1505,6 +1532,8 @@ class KvCacheManager:
                     self._take_group_block(pool, partition)
                     for _ in range(spare_count)
                 )
+        if self._group_checkpoints is not None:
+            self._group_checkpoints.prune(self._group_pools)
 
     @property
     def reservations(self) -> GroupedCacheReservations:

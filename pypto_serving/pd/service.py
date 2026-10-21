@@ -487,8 +487,9 @@ class Service:
             outputs = self.core.add_prefilled_request(
                 reservation_id=request, request_id=request, prompt_token_ids=continuation.tokens,
                 first_token=entry.first_token, max_new_tokens=config.max_new_tokens,
+                min_tokens=config.min_tokens, ignore_eos=config.ignore_eos,
                 temperature=config.temperature, top_p=config.top_p, top_k=config.top_k, seed=config.seed,
-                stop_strings=tuple(config.stop), eos_token_id=None if config.ignore_eos else self.core.tokenizer.eos_token_id,
+                stop_strings=tuple(config.stop), eos_token_id=self.core.tokenizer.eos_token_id,
                 stream=config.stream, output_parser_spec=(OutputParserSpec(**continuation.parser)
                                                          if continuation.parser else None),
                 constraint_spec=(ConstraintSpec.from_wire(continuation.constraint)
