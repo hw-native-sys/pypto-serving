@@ -10,6 +10,7 @@
 
 import ast
 import ctypes
+from dataclasses import make_dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -212,6 +213,120 @@ def test_packed_prefill_executor_limits_follow_runtime(monkeypatch, max_batch_si
     assert executor.max_prefill_requests_per_partition == per_group
     assert executor.max_prefill_batch_size == max_batch_size
     assert executor.max_prefill_tokens_per_partition == 8192
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_target_only_can_capture_tail_without_compiling_drafter(monkeypatch, capture):
+    monkeypatch.setattr(executor_module, "DSparkWeightStore", lambda **_: SimpleNamespace(
+        validate_startup_contract=lambda **_: None))
+    executor = DeepSeekV4DSparkPyptoExecutor(
+        device_ids=range(16), compile_kernels=True, capture_prefill_tail=capture)
+    calls = []
+    modules = dict(prefill_fwd=SimpleNamespace(l3_prefill_fwd="prefill"),
+                   decode_fwd=SimpleNamespace(l3_decode_fwd="decode"),
+                   prefill_state=SimpleNamespace(l3_capture_prefill_tail="capture", l3_extract_prefill_tail="extract"),
+                   config=None, utils=None)
+    def load(layout, *, speculative):
+        assert not speculative
+        return modules
+    monkeypatch.setattr(executor, "_load_kernel_modules", load)
+    monkeypatch.setattr(executor, "_compile_l3_callable", lambda name, fn: calls.append(fn) or fn)
+    monkeypatch.setattr(executor, "_build_rope_tables", lambda *a, **kw: None)
+    model = SimpleNamespace(config=SimpleNamespace(hidden_size=4096, num_hidden_layers=43,
+        num_attention_heads=64, num_key_value_heads=1, head_dim=512, vocab_size=129280,
+        max_position_embeddings=1_048_576),
+        runtime=SimpleNamespace(max_batch_size=8, page_size=32, max_seq_len=1024),
+        extra=dict(family="deepseek_v4", checkpoint_format="w8a8-compressed-tensors",
+                   compress_ratios=(0,) * 44, weight_map={}, model_dir="unused"))
+    compiled = executor._compile_model(model)
+    assert calls == (["prefill", "capture", "decode"] if capture else ["prefill", "decode"])
+    assert compiled.num_speculative_tokens == 0 and not compiled.prefill_async
+    assert compiled.drafter is compiled.markov is compiled.bootstrap_metadata is compiled.prefill_publish is None
+
+
+@pytest.mark.parametrize("length", [1, 127, 128, 129, 512, 8064, 8192, 8193, 655359])
+def test_pd_bootstrap_reuses_normal_seed_with_local_generations(monkeypatch, length):
+    from pypto_serving.pd.adapter import DSparkExtension
+
+    runner = _runner(speculative=True, max_position=128)
+    # Use the real context ceiling without constructing large RoPE tensors.
+    monkeypatch.setattr(runner, "_require_rope_tables", lambda: SimpleNamespace(max_position=655360))
+    runner._compiled.bootstrap_metadata = object()
+    runner._compiled.prefill_publish = object()
+    runner._compiled.bootstrap_one_l2 = object()
+    events = []
+    positions = torch.full((16, 64, 128), -2, dtype=torch.int32)
+    hidden = torch.full((16, 64, 128, 2), -99, dtype=torch.bfloat16)
+    meta = torch.zeros((16, 64, 6), dtype=torch.int32)
+    sampled = torch.zeros((16, 128, 8), dtype=torch.int32)
+    def device(tensor):
+        return SimpleNamespace(shards=[SimpleNamespace(data_ptr=row.data_ptr()) for row in tensor],
+                               worker_ids=tuple(range(16)))
+    runner._device_scratch[("prefill_state", "positions")] = device(positions)
+    runner._device_scratch[("prefill_state", "hidden")] = device(hidden)
+    runner._dspark_device_state_meta = device(meta)
+    runner._prefill_prepared_device["sampled_ids"] = device(sampled)
+    runner._prefill_prepare_buffers = SimpleNamespace(
+        bootstrap_descriptors=torch.empty((16, 16, 11), dtype=torch.int32))
+    def copy_to(dst, src, count, *, dst_offset, worker_id):
+        ctypes.memmove(dst + dst_offset, src, count)
+    worker = SimpleNamespace(copy_to=copy_to)
+    monkeypatch.setattr(runner, "_shared_l3_worker", lambda: worker)
+    monkeypatch.setattr(runner, "_wait_for_pending_decode_dispatches", lambda: events.append("fence"))
+    monkeypatch.setattr(runner, "_clear_drafter_lease", lambda *key: events.append(("clear", key)))
+    extension = DSparkExtension.__new__(DSparkExtension)
+    extension.runner, extension.compiled, extension.worker = runner, runner._compiled, lambda: worker
+    extension.draft_states, extension.ranks, extension.tp = runner._drafter_states, 16, 4
+    ids = ["first", "same-group", "other-partition"]
+    for request, partition in zip(ids, (1, 1, 3)):
+        slot = extension.handle("reserve_state", dict(request=request, partition=partition, prompt_len=length))
+        assert slot == {"bootstrap": runner._drafter_state(request).lease}
+        # Model an already completed push into D's independently allocated lease.
+        state = runner._drafter_state(request)
+        payload = torch.arange(256, dtype=torch.bfloat16).reshape(128, 2) + ids.index(request)
+        hidden[partition * 4:(partition + 1) * 4, state.lease] = payload
+    first = runner._drafter_state(ids[0])
+    runner._drafter_dirty_leases.add((first.group, first.lease))
+    batch = SimpleNamespace(request_ids=ids, initial_request_ids=tuple(ids),
+                            token_ids=[torch.tensor([token]) for token in (17, 23, 31)])
+    prepared = make_dataclass("Prepared", ["bootstrap_request_ids"])(())
+    assert extension.wrap_prepare(lambda *a, **kw: prepared)(batch, buffer_slot=1).bootstrap_request_ids == tuple(ids)
+    assert not events  # Host preparation must not touch the device or wait.
+    def normal_bootstrap(requests, stage="normal-bootstrap"):
+        events.append(stage)
+        for ordinal, request in enumerate(requests):
+            state = runner._drafter_state(request)
+            assert state.current_token_id == (17, 23, 31)[ids.index(request)]
+            row = state.prefill_descriptor.block_table_row
+            expected = torch.arange(max(0, length - 128), length, dtype=torch.int64)
+            assert torch.equal(state.prefill_tail_positions, expected)
+            for rank in range(state.group * 4, (state.group + 1) * 4):
+                assert torch.equal(positions[rank, state.lease, expected % 128], expected.to(torch.int32))
+                assert meta[rank, state.lease, 1].item() == state.generation
+                assert sampled[rank, row, 0].item() == (17, 23, 31)[ids.index(request)]
+                payload = torch.arange(256, dtype=torch.bfloat16).reshape(128, 2) + ids.index(request)
+                assert torch.equal(hidden[rank, state.lease], payload)  # Grant/scrub must preserve the received tail.
+            state.device_state_initialized = True
+            state.device_draft_count = 7 if state.prefill_descriptor.bootstrap_valid else 0
+    monkeypatch.setattr(runner, "_run_one_l2_bootstrap_wave", normal_bootstrap)
+    monkeypatch.setattr(runner, "_publish_device_bootstrap",
+                        lambda requests, batch: normal_bootstrap(requests, "publish-only"))
+    dispatch = extension.wrap_dispatch(lambda *args: events.append("dispatch"))
+    dispatch(batch, None)
+    stage = "normal-bootstrap" if length + 6 < 655360 else "publish-only"
+    assert events == ["fence", ("clear", (first.group, first.lease)), stage, "dispatch"]
+    assert all(runner._drafter_state(r).device_draft_count == (7 if length + 6 < 655360 else 0) for r in ids)
+    dispatch(batch, None)
+    assert events[-2:] == ["dispatch", "dispatch"]  # No steady-state bootstrap or fence.
+    old = first.generation
+    extension.handle("discard_state", ids[0])
+    extension.handle("reserve_state", dict(request="reused", partition=1, prompt_len=length))
+    reused = runner._drafter_state("reused")
+    assert reused.lease == first.lease and reused.generation == old + 1
+    with pytest.raises(RuntimeError, match="complete prompt tail"):
+        extension.handle("source_state", "reused")
+    reused.prefill_tail_positions = torch.arange(max(0, length - 128), length, dtype=torch.int64)
+    assert extension.handle("source_state", "reused") == {"bootstrap": reused.lease}
 
 
 def test_prefill_to_decode_staging_contract() -> None:
@@ -523,6 +638,23 @@ def test_packed_prefill_captures_separate_request_tails(monkeypatch):
             range(batch.chunk_starts[index], batch.chunk_starts[index] + length)
         )
     assert runner._drafter_state("request-0").lease != runner._drafter_state("request-2").lease
+
+
+def test_target_only_capture_reserves_and_reuses_tail_slots_without_draft_kv():
+    runner = _runner()
+    runner._compiled.prefill_capture = object()
+    batch = _packed_prefill_batch()
+    model = SimpleNamespace(runtime=SimpleNamespace(max_seq_len=512))
+    first = runner.prepare_prefill_inputs(model, batch)
+    states = [runner._drafter_state(request) for request in batch.request_ids]
+    assert all(d.request_slot == s.lease and d.generation == s.generation
+               for d, s in zip(first.descriptors, states))
+    assert not runner.speculative and not runner._drafter_device_weights
+    assert ("drafter", "kv_caches") not in runner._device_scratch
+    runner.release_finished_requests(batch.request_ids)
+    second = runner.prepare_prefill_inputs(model, batch)
+    assert all(d.generation == 2 for d in second.descriptors)
+    assert not runner._drafter_dirty_leases
 
 
 def _pypto_lib_function(module_name: str, function_name: str) -> ast.FunctionDef:

@@ -10,7 +10,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 import json
 import logging
@@ -45,6 +45,7 @@ class Chunk:
     first_token: int | None
     blocks: dict[str, tuple[int, ...]]
     partition: int
+    state_slots: dict[str, int] = field(default_factory=dict)
 
 
 def prefill_scheduler(*, config, kv_cache_manager):
@@ -188,6 +189,7 @@ class Application:
         engine_config = replace(engine_config,
             runtime_config=replace(engine_config.runtime_config, num_speculative_tokens=tokens),
             executor_kwargs={**engine_config.executor_kwargs, "num_speculative_tokens": tokens,
+                "capture_prefill_tail": role == "prefill",
                 "runner_extension_factory": partial(self.adapter.worker_factory,
                                                       settings=settings, progress_channel=channel)},
             async_scheduling=role == "decode")

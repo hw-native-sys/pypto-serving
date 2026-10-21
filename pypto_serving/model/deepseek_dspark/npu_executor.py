@@ -208,6 +208,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         cache_ranks: int = DSPARK_RANKS,
         compile_kernels: bool = False,
         num_speculative_tokens: int = 0,
+        capture_prefill_tail: bool = False,
         runner_extension_factory=None,
     ) -> None:
         worker_device_ids = tuple(device_ids) if device_ids is not None else (int(device_id),)
@@ -220,6 +221,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         self._kernel_dir = _find_pypto_lib_dspark_dir()
         self._compile_kernels = bool(compile_kernels)
         self._num_speculative_tokens = int(num_speculative_tokens)
+        self._capture_prefill_tail = bool(capture_prefill_tail)
         # The serving topology is flag-driven: --ep is the rank count and this
         # layout freezes every rank-derived axis (kernel import arguments,
         # scheduler cache partitions, packed-prefill capacity) from it.
@@ -406,9 +408,9 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         device_bootstrap = device_bootstrap_metadata or (
             speculative and os.environ.get("PYPTO_DSPARK_BOOTSTRAP_DEVICE") == "1"
         )
-        prefill_device_tail = speculative and (
+        prefill_device_tail = self._capture_prefill_tail or (speculative and (
             device_bootstrap or os.environ.get("PYPTO_DSPARK_PREFILL_TAIL_DEVICE") == "1"
-        )
+        ))
         if prefill_async and (not speculative or (device_bootstrap and not device_bootstrap_metadata)):
             raise ValueError("Async DSpark prefill requires K=7 and Host metadata; device bootstrap needs metadata")
         decode = None
@@ -423,9 +425,10 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                 prefill_capture = self._compile_l3_callable(
                     "dspark_prefill_capture", modules["prefill_state"].l3_capture_prefill_tail
                 )
-                prefill_extract = self._compile_l3_callable(
-                    "dspark_prefill_extract", modules["prefill_state"].l3_extract_prefill_tail
-                )
+                if speculative:
+                    prefill_extract = self._compile_l3_callable(
+                        "dspark_prefill_extract", modules["prefill_state"].l3_extract_prefill_tail
+                    )
                 if device_bootstrap_metadata:
                     prefill_extract_batched = self._compile_l3_callable(
                         "dspark_prefill_extract_batched", modules["prefill_state"].l3_extract_prefill_tails

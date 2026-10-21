@@ -1521,14 +1521,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._plan_builder = self._prepare_decode_plan
         self._ready_dispatch = self._dispatch_ready_decode
         if extension_factory is not None:
-            self.runtime_extension = extension_factory(
-                compiled=compiled,
-                worker=self._shared_l3_worker,
-                cache=self._materialize_decode_device_cache,
-                draft_states=self._drafter_states,
-                reserve_state=self._reserve_drafter_state,
-                initialize_device_state=self._publish_dspark_device_state,
-            )
+            self.runtime_extension = extension_factory(runner=self)
             self._plan_builder = self.runtime_extension.wrap_prepare(self._plan_builder)
             self._ready_dispatch = self.runtime_extension.wrap_dispatch(self._ready_dispatch)
 
@@ -2440,7 +2433,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 ("positions", (ranks, DSPARK_DRAFTER_LEASES_PER_GROUP, DSPARK_SLIDING_WINDOW), torch.int32),
                 ("context", (ranks, DSPARK_DRAFTER_CONTEXT_ROWS, DSPARK_MAIN_HIDDEN_DIM), torch.bfloat16),
             ):
-                self._alloc_zeroed_stacked_tensor(name, shape, dtype, scope="prefill_state")
+                if name != "context" or self.speculative:
+                    self._alloc_zeroed_stacked_tensor(name, shape, dtype, scope="prefill_state")
         if self._compiled.prefill_publish is not None:
             ranks = self._compiled.layout.ranks
             for name, shape, dtype in (
@@ -2980,7 +2974,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     "DSpark packed prefill dispatch failed "
                     f"(tokens={inputs.actual_tokens}, groups={inputs.groups})"
                 ) from exc
-            if self.speculative:
+            if self.speculative or self._compiled.prefill_capture is not None:
                 if self._compiled.prefill_async:
                     if self._compiled.prefill_capture is not None:
                         self._capture_prefill_tails(batch, inputs, descriptor_slot=buffer_slot)
@@ -3270,7 +3264,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     f"exceeds prompt_len={prompt_len}"
                 )
             state = None if defer_state else self._drafter_states.get(batch.request_ids[index])
-            if self.speculative and state is None and not defer_state:
+            if (self.speculative or self._compiled.prefill_capture is not None) and (
+                state is None and not defer_state
+            ):
                 state = self._reserve_drafter_state(
                     batch.request_ids[index], group=group, prompt_len=prompt_len
                 )
@@ -5736,7 +5732,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             # Keep the lease on the free list until every rank replica has
             # been cleared.  A failed scrub therefore cannot publish a partly
             # sanitized lease to a new request.
-            self._clear_drafter_lease(group, lease)
+            if self.speculative:
+                self._clear_drafter_lease(group, lease)
             self._drafter_dirty_leases.remove(dirty_key)
         free.pop()
         self._drafter_lease_generations[group][lease] += 1

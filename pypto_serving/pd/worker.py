@@ -158,7 +158,7 @@ class WorkerRuntime:
                 owner.release()
             result = None
         else:
-            raise ValueError("unknown worker operation")
+            result = self.model.handle(operation, value)
         return msgspec.msgpack.encode(result)
 
     def close(self):

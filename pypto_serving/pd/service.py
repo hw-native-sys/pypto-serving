@@ -11,7 +11,7 @@
 import asyncio
 from collections import OrderedDict
 from contextlib import aclosing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import logging
 
 import msgspec
@@ -47,6 +47,9 @@ class Request:
     response_closed: bool = False
     mapping: tuple = ()
     normalized_digest: str = ""
+    state_task: object = None
+    state_slots: dict = field(default_factory=dict)
+    admitted: bool = False
 
 
 class Service:
@@ -225,9 +228,14 @@ class Service:
                                          for k, hashes in prefix.hashes.items()},
                     shareable_group_names=tuple(prefix.hashes))
                 entry.reservation = reservation
+                entry.state_task = asyncio.create_task(self.worker("reserve_state", dict(
+                    request=request, partition=reservation.partition, prompt_len=len(continuation.tokens))))
+                entry.state_slots = await asyncio.shield(entry.state_task)
+                if entry.cancelled:
+                    raise ValueError("request cancelled during state reservation")
                 entry.prepared.set()
                 return Placement(request, reservation.prefix_hit_tokens, reservation.partition,
-                                 reservation.block_ids_by_group)
+                                 reservation.block_ids_by_group, entry.state_slots)
             except Exception as exc:
                 self.fail(entry, exc)
                 raise
@@ -313,7 +321,10 @@ class Service:
                     or copy.destination_offset + copy.length > g.extent
                     or copy.source_offset + copy.length > src.extent):
                 raise ValueError("copy outside compatible physical layout")
-            writable = entry.reservation.writable_block_ids_by_group[component_group[copy.component]]
+            group_name = component_group[copy.component]
+            writable = (entry.reservation.writable_block_ids_by_group[group_name]
+                        if group_name in entry.reservation.writable_block_ids_by_group
+                        else (entry.state_slots[group_name],))
             for page in range(copy.destination_offset // g.page_bytes,
                               (copy.destination_offset + copy.length) // g.page_bytes):
                 key = copy.destination_rank, copy.component, page
@@ -326,11 +337,16 @@ class Service:
             for component in self.node.contract.components:
                 if component.final and not plan.final:
                     continue
-                group, g = groups[component.group], geo[component.name]
-                table = entry.reservation.block_ids_by_group[component.group]
-                for logical, _ in page_indices(group, component, plan.start, plan.end, plan.final,
-                                               table, p_hit, entry.reservation.prefix_hit_tokens):
-                    block = physical(group, table, logical)
+                g = geo[component.name]
+                if component.group in groups:
+                    group = groups[component.group]
+                    table = entry.reservation.block_ids_by_group[component.group]
+                    blocks = (physical(group, table, logical) for logical, _ in page_indices(
+                        group, component, plan.start, plan.end, plan.final,
+                        table, p_hit, entry.reservation.prefix_hit_tokens))
+                else:
+                    blocks = (entry.state_slots[component.group],)
+                for block in blocks:
                     required.update((rank, component.name, layer * g.blocks + block)
                                     for layer in range(len(g.layers)))
         if occupied != required:
@@ -367,8 +383,18 @@ class Service:
             else:
                 self.cache.release_group_cache(entry.binding.request, confirmed_stopped=stopped)
                 self.cache.retire_group_cache_reservation(entry.binding.request)
+        if not entry.admitted:
+            await self.discard_state(entry)
         if (entry.response_closed or not entry.http.is_set()) and entry.source_done.is_set():
             self.finish(entry)
+
+    async def discard_state(self, entry):
+        if entry.state_task is not None:
+            # Even a failed/lost reserve reply may have allocated a local slot.
+            # Drain it before the idempotent discard; cancellation must not race reuse.
+            await asyncio.shield(asyncio.gather(entry.state_task, return_exceptions=True))
+            await self.worker("discard_state", entry.binding.request)
+            entry.state_task = None
 
     async def prefill(self, entry, continuation, peer):
         entry.continuation = continuation
@@ -412,6 +438,8 @@ class Service:
                         await inflight
                     if entry.cancelled:
                         raise ValueError("request cancelled")
+                    if chunk.final:
+                        chunk = replace(chunk, state_slots=await self.worker("source_state", request))
                     plan = plan_chunk(entry.binding, chunk, placement, self.node.contract,
                                       self.cache.group_specs, self.geometry, peer_geometry, p_hit,
                                       self.adapter.mapping(self.node.contract.topology,
@@ -484,6 +512,7 @@ class Service:
                 raise ValueError("request cancelled")
             continuation = entry.continuation
             config = GenerateConfig(**continuation.config)
+            entry.admitted = True
             outputs = self.core.add_prefilled_request(
                 reservation_id=request, request_id=request, prompt_token_ids=continuation.tokens,
                 first_token=entry.first_token, max_new_tokens=config.max_new_tokens,
@@ -501,6 +530,8 @@ class Service:
                         terminal = True
                     yield output
         finally:
+            # The core iterator has closed (including its worker release ACK).
+            entry.admitted = False
             entry.response_closed = True
             if not entry.source_done.is_set():
                 await self.abort(entry)
@@ -511,6 +542,7 @@ class Service:
                 reservation = self.cache.group_cache_reservation(request)
                 if reservation is not None:
                     self.cache.retire_group_cache_reservation(request)
+                await self.discard_state(entry)
                 self.finish(entry)
 
     async def close(self):

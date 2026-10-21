@@ -94,15 +94,20 @@ def plan_chunk(binding, chunk, placement, contract, groups, source, destination,
         for component in contract.components:
             if component.final and not chunk.final:
                 continue
-            group, a, b = specs[component.group], src[component.name], dst[component.name]
+            a, b = src[component.name], dst[component.name]
             if a.layout != b.layout or min(a.blocks, b.blocks) <= 0:
                 raise ValueError("incompatible source/destination geometry")
             units.append((dr, component.name))
-            for logical, _ in page_indices(group, component, start, chunk.end, chunk.final,
-                                           chunk.blocks[group.name], p_hit, placement.hit):
-                sb = physical(group, chunk.blocks[group.name], logical)
-                db = physical(group, placement.blocks[group.name], logical)
-                if sb >= a.blocks or db >= b.blocks:
+            if component.group in specs:
+                group = specs[component.group]
+                pages = tuple((physical(group, chunk.blocks[group.name], logical),
+                               physical(group, placement.blocks[group.name], logical))
+                              for logical, _ in page_indices(group, component, start, chunk.end, chunk.final,
+                                  chunk.blocks[group.name], p_hit, placement.hit))
+            else:
+                pages = ((chunk.state_slots[component.group], placement.state_slots[component.group]),)
+            for sb, db in pages:
+                if min(sb, db) < 0 or sb >= a.blocks or db >= b.blocks:
                     raise ValueError("physical block outside registered region")
                 for layer in range(len(a.layers)):
                     # Final partial pages are exclusively reserved and copied whole.

@@ -96,6 +96,7 @@ class Placement(msgspec.Struct, frozen=True):
     hit: int
     partition: int
     blocks: dict[str, tuple[int, ...]]
+    state_slots: dict[str, int] = msgspec.field(default_factory=dict)
 
 
 class Copy(msgspec.Struct, frozen=True):

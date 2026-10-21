@@ -387,7 +387,7 @@ def test_prefill_compute_hit_and_decode_network_hit_are_independent(p_enabled, d
 
 
 def test_full_decode_kv_hit_still_plans_all_final_states_at_real_ring_geometry():
-    from pypto_serving.pd.adapter import COMPONENTS, DeepSeekDSpark
+    from pypto_serving.pd.adapter import CACHE_COMPONENTS, DeepSeekDSpark
     from pypto_serving.pd.integration import Chunk
     from pypto_serving.pd.planner import Geometry, plan_chunk
     from pypto_serving.pd.protocol import Binding, Node, Placement
@@ -400,7 +400,8 @@ def test_full_decode_kv_hit_still_plans_all_final_states_at_real_ring_geometry()
     adapter = DeepSeekDSpark()
     groups = {g.name: g for g in p_cache.group_specs}
     geometry = tuple(Geometry(c.name, (0,), p_cache.group_num_blocks(c.group) + 4,
-        groups[c.group].spec.storage_block_size, 64, "uint8") for c in COMPONENTS)
+        groups[c.group].spec.storage_block_size, 64, "uint8") for c in CACHE_COMPONENTS) + (
+            Geometry("bootstrap_hidden", (0,), 64, 128, 64, "uint8"),)
     contract = adapter.contract("weights", geometry, (16, 4))
     p = Node("p", "prefill", "p-boot", contract, "p-registry")
     d = Node("d", "decode", "d-boot", contract, "d-registry")
@@ -412,11 +413,12 @@ def test_full_decode_kv_hit_still_plans_all_final_states_at_real_ring_geometry()
     tables = p_cache.ensure_group_blocks(binding.request, len(tokens))
     partition = p_cache.group_request_partition(binding.request)
     chunk = Chunk(binding.request, 0, p_hit, len(tokens), True, 17,
-        {name: tuple(ids) for name, ids in tables.items()}, partition)
+        {name: tuple(ids) for name, ids in tables.items()}, partition, {"bootstrap": 3})
     placement = Placement(binding.request, lease.prefix_hit_tokens, lease.partition,
-        {name: tuple(ids) for name, ids in lease.block_ids_by_group.items()})
+        {name: tuple(ids) for name, ids in lease.block_ids_by_group.items()}, {"bootstrap": 5})
     plan = plan_chunk(binding, chunk, placement, contract, p_cache.group_specs, geometry, geometry,
         p_hit, adapter.mapping(contract.topology, partition, lease.partition), "continuation")
-    assert {copy.component for copy in plan.copies} == {"hca_state", "csa_state", "csa_inner_state"}
+    assert {copy.component for copy in plan.copies} == {
+        "hca_state", "csa_state", "csa_inner_state", "bootstrap_hidden"}
     p_cache.release_all_group_requests(binding.request)
     d_cache.release_group_cache(binding.request)

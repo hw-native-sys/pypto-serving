@@ -22,16 +22,18 @@ from pypto_serving.pd.routing import Directory
 from pypto_serving.pd.session import PeerPool
 
 
-def test_application_lifespan(monkeypatch):
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_application_lifespan(monkeypatch, role):
     from pypto_serving.pd import integration as module
-    runtime = make_dataclass("Runtime", ["num_speculative_tokens"])(7)
+    runtime = make_dataclass("Runtime", ["num_speculative_tokens", "speculative_prefix_cache_replay_tokens"])(7, 128)
     config = make_dataclass("Engine", ["runtime_config", "executor_kwargs", "async_scheduling",
                                       "executor_cls", "model_id"])(
         runtime, {}, True, "PyptoDeepSeekV4DSparkExecutor", "model")
     engine = SimpleNamespace(config=config, tokenizer=None, metrics=None,
         start_profile=None, stop_profile=None,
         single_core=lambda: SimpleNamespace(config=config, kv_cache_manager=caches()))
-    monkeypatch.setattr(module, "AsyncLLMEngine", lambda *a, **kw: engine)
+    captured = []
+    monkeypatch.setattr(module, "AsyncLLMEngine", lambda active, *a, **kw: captured.append(active) or engine)
     events = []
     async def start(self):
         events.append("start")
@@ -40,12 +42,30 @@ def test_application_lifespan(monkeypatch):
     monkeypatch.setattr(module.Application, "start", start)
     monkeypatch.setattr(module.Application, "stop", stop)
     deployment = Config((Endpoint("p", 8101),), (Endpoint("d", 8102),))
-    app = module.Application(config, deployment, "decode", deployment.decode[0], None, None)
+    app = module.Application(config, deployment, role, getattr(deployment, role)[0], None, None)
+    assert captured[0].runtime_config.num_speculative_tokens == (0 if role == "prefill" else 7)
+    assert captured[0].runtime_config.speculative_prefix_cache_replay_tokens == 128
+    assert captured[0].executor_kwargs["capture_prefill_tail"] == (role == "prefill")
+    assert captured[0].async_scheduling == (role == "decode")
     async def check():
         async with app.app.router.lifespan_context(app.app):
             assert events == ["start"]
         assert events == ["start", "stop"]
     asyncio.run(check())
+    if app.channel is not None:
+        app.channel.close()
+        app.progress.channel.close()
+
+
+@pytest.mark.parametrize("capture,bootstrap", [(None, object()), (object(), None)])
+def test_pd_rejects_missing_device_bootstrap_before_creating_owners(capture, bootstrap):
+    from pypto_serving.pd.adapter import DSparkExtension
+    runner = SimpleNamespace(speculative=True, _drafter_states={}, _shared_l3_worker=None,
+        _materialize_decode_device_cache=None, _compiled=SimpleNamespace(
+            layout=SimpleNamespace(ranks=16, tp_size=4), prefill_capture=capture,
+            bootstrap_metadata=bootstrap))
+    with pytest.raises(ValueError, match="device prompt-tail capture"):
+        DSparkExtension(settings=None, runner=runner)
 
 
 def caches(enabled=True, slots=3):
@@ -64,11 +84,12 @@ def caches(enabled=True, slots=3):
 
 
 def geometries(cache):
-    from pypto_serving.pd.adapter import COMPONENTS
+    from pypto_serving.pd.adapter import CACHE_COMPONENTS
     from pypto_serving.pd.planner import Geometry
     groups = {g.name: g for g in cache.group_specs}
     return tuple(Geometry(c.name, (0,), cache.group_num_blocks(c.group) + 4,
-        groups[c.group].spec.storage_block_size, 64, "uint8") for c in COMPONENTS)
+        groups[c.group].spec.storage_block_size, 64, "uint8") for c in CACHE_COMPONENTS) + (
+            Geometry("bootstrap_hidden", (0,), 64, 128, 64, "uint8"),)
 
 
 def warm(cache, tokens, length, partition=0):
@@ -101,7 +122,18 @@ def test_prefix_mapping_completion_and_quarantine(p_hit, d_hit, outcome):
         p = Node("p", "prefill", "p-boot", contract, "p-registry")
         d = Node("d", "decode", "d-boot", contract, "d-registry")
         config = Config((Endpoint("p", 8001, "p"),), (Endpoint("d", 8002, "d"),))
-        core = SimpleNamespace(kv_cache_manager=d_cache, config=SimpleNamespace(
+        state = set()
+        async def worker(operation, payload):
+            value = msgspec.msgpack.decode(payload)
+            if operation == "reserve_state":
+                state.add(value["request"])
+                result = {"bootstrap": 5}
+            else:
+                assert operation == "discard_state"
+                state.discard(value)
+                result = None
+            return msgspec.msgpack.encode(result)
+        core = SimpleNamespace(kv_cache_manager=d_cache, call_worker=worker, config=SimpleNamespace(
             runtime_config=SimpleNamespace(max_seq_len=1024)), scheduler=SimpleNamespace(requests={}))
         service = Service(config, config.decode[0], "decode", adapter, core, None)
         service.node, service.geometry = d, destination
@@ -125,13 +157,24 @@ def test_prefix_mapping_completion_and_quarantine(p_hit, d_hit, outcome):
             entry.response_closed = True
             await service.abort(entry)
             assert not service.requests and d_cache.group_cache_reservation(binding.request) is None
+            assert not state
             assert await service.control(p, source, "abort", dict(binding=binding, stopped=True)) == {}
             return
         tables = {k: tuple(v) for k, v in p_cache.ensure_group_blocks("source", 512, partition=1).items()}
-        chunk = Chunk(binding.request, 0, p_hit, 512, True, 17, tables, 1)
+        chunk = Chunk(binding.request, 0, p_hit, 512, True, 17, tables, 1, {"bootstrap": 3})
         plan = plan_chunk(binding, chunk, placement, contract, p_cache.group_specs, source, destination,
                           p_hit, adapter.mapping(contract.topology, 1, placement.partition), digest(continuation))
         service.validate_plan(entry, plan, source, p_hit)
+        tail = next(c for c in plan.copies if c.component == "bootstrap_hidden")
+        assert tail.source_offset == 3 * source[-1].page_bytes
+        assert tail.destination_offset == 5 * destination[-1].page_bytes
+        with pytest.raises(ValueError):
+            service.validate_plan(entry, msgspec.structs.replace(plan, copies=tuple(
+                c for c in plan.copies if c.component != "bootstrap_hidden")), source, p_hit)
+        with pytest.raises(ValueError, match="write aliases"):
+            service.validate_plan(entry, msgspec.structs.replace(plan, copies=(
+                msgspec.structs.replace(tail, destination_offset=6 * destination[-1].page_bytes),
+                *(c for c in plan.copies if c is not tail))), source, p_hit)
         with pytest.raises(ValueError):
             service.validate_plan(entry, msgspec.structs.replace(plan, copies=tuple(
                 c for c in plan.copies if c.component != plan.copies[0].component)), source, p_hit)
@@ -144,7 +187,8 @@ def test_prefix_mapping_completion_and_quarantine(p_hit, d_hit, outcome):
         assert plan.mapping == tuple((4 + slot, slot) for slot in range(4))
         assert {c.component for c in plan.copies} >= {"hca_state", "csa_state", "csa_inner_state"}
         if d_hit == 512:
-            assert {c.component for c in plan.copies} == {"hca_state", "csa_state", "csa_inner_state"}
+            assert {c.component for c in plan.copies} == {
+                "hca_state", "csa_state", "csa_inner_state", "bootstrap_hidden"}
         completion = Completion(digest(plan), plan.units)
         completion.check(plan)
         with pytest.raises(ValueError):
@@ -162,6 +206,7 @@ def test_prefix_mapping_completion_and_quarantine(p_hit, d_hit, outcome):
             entry.response_closed = True
             await service.control(p, source, "abort", dict(binding=binding, stopped=True))
             assert not service.requests and d_cache.group_cache_reservation(binding.request) is None
+            assert not state
             assert await service.control(p, source, "abort", dict(binding=binding, stopped=True)) == {}
             with pytest.raises(ValueError):
                 await service.control(p, source, "abort", dict(
@@ -176,6 +221,7 @@ def test_prefix_mapping_completion_and_quarantine(p_hit, d_hit, outcome):
         with pytest.raises(RuntimeError):
             d_cache.release_group_cache(binding.request)
         assert service.gated
+        assert state == {binding.request}
     asyncio.run(run())
 
 
@@ -375,6 +421,64 @@ def test_abort_before_generation_post_releases_capacity_and_rejects_late_post():
             service.register_http(binding, payload)
         service.register_http(Binding.create(p, service.node, payload), payload)
         assert len(service.requests) == 1
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("reserve_fails", [False, True])
+def test_cancel_during_state_reservation_drains_and_discards(reserve_fails):
+    from pypto_serving.config.types import GenerateConfig
+    from pypto_serving.pd.adapter import DeepSeekDSpark
+    from pypto_serving.pd.protocol import Continuation, digest
+    from pypto_serving.pd.service import Service
+
+    async def run():
+        cache = caches()
+        geometry = geometries(cache)
+        adapter = DeepSeekDSpark()
+        config = Config((Endpoint("p", 8001, "p"),), (Endpoint("d", 8002, "d"),))
+        entered, release = asyncio.Event(), asyncio.Event()
+        allocated = set()
+        async def worker(operation, payload):
+            value = msgspec.msgpack.decode(payload)
+            if operation == "reserve_state":
+                entered.set()
+                await release.wait()
+                allocated.add(value["request"])
+                if reserve_fails:
+                    raise RuntimeError("lost reserve reply")
+                result = {"bootstrap": 5}
+            else:
+                assert operation == "discard_state"
+                allocated.discard(value)
+                result = None
+            return msgspec.msgpack.encode(result)
+        core = SimpleNamespace(kv_cache_manager=cache, call_worker=worker,
+            config=SimpleNamespace(runtime_config=SimpleNamespace(max_seq_len=1024)),
+            scheduler=SimpleNamespace(requests={}))
+        service = Service(config, config.decode[0], "decode", adapter, core, None)
+        contract = adapter.contract("weights", geometry, (16, 4))
+        p = Node("p", "prefill", "pb", contract, "pr")
+        service.node = Node("d", "decode", "db", contract, "dr")
+        binding = Binding.create(p, service.node, {"prompt": "test"})
+        entry = service.register_http(binding, {"prompt": "test"})
+        tokens = tuple(range(256))
+        continuation = Continuation(tokens, asdict(GenerateConfig(max_new_tokens=8)), None, None,
+                                    adapter.prefix_spec(tokens, cache))
+        entry.response_closed = True
+        pending = asyncio.create_task(service.control(p, geometry, "begin", dict(
+            binding=binding, continuation=continuation)))
+        await entered.wait()
+        aborted = asyncio.create_task(service.abort(entry))
+        await asyncio.sleep(0)
+        assert not aborted.done()
+        release.set()
+        with pytest.raises((ValueError, RuntimeError)):
+            await pending
+        await aborted
+        assert not allocated and not service.requests and entry.state_task is None
+        assert cache.group_cache_reservation(binding.request) is None
+        assert not service.gated
+        assert digest(continuation) == entry.normalized_digest
     asyncio.run(run())
 
 
@@ -587,6 +691,7 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
         class Core:
             def __init__(self, role, enabled):
                 self.role, self.kv_cache_manager = role, caches(enabled)
+                self.states = set()
                 self.config = SimpleNamespace(runtime_config=RuntimeConfig(max_seq_len=1024))
                 self.tokenizer = Tokenizer()
                 self.resumed, self.finished = asyncio.Event(), asyncio.Event()
@@ -603,6 +708,14 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
                     result = dict(job=digest(plan))
                 elif operation == "forget":
                     del jobs[value]
+                    result = None
+                elif operation == "reserve_state":
+                    self.states.add(value["request"])
+                    result = {"bootstrap": 5}
+                elif operation == "source_state":
+                    result = {"bootstrap": 3}
+                elif operation == "discard_state":
+                    self.states.discard(value)
                     result = None
                 else:
                     result = None
@@ -722,6 +835,7 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
                 assert p.gated and d.gated and p.pins.active and jobs
                 assert not any(name == "decode-first" for name, _ in events)
                 assert p.requests and d.requests and p.chunks
+                assert d_core.states == set(d.requests)
                 with pytest.raises(RuntimeError):
                     await p.close()
                 await p.peers.close()
@@ -734,6 +848,7 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
             else:
                 assert response.json()["usage"]["completion_tokens"] == max_tokens
         assert not p.requests and not d.requests and not p.pins.active and not jobs
+        assert not d_core.states
         assert not p.gated and not d.gated
         assert events.index(("decode-first", 0)) < events.index(("source-clean", 0))
         if not prefix[0]:
