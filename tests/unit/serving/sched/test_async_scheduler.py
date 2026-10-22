@@ -1024,6 +1024,65 @@ def test_eagle_group_reuses_every_page_with_a_known_boundary_token():
     assert len(blocks["eagle"]) == 2
 
 
+def _sparse_window_manager(*, enable_prefix_cache=False):
+    manager = KvCacheManager(block_size=2, enable_prefix_cache=enable_prefix_cache)
+    manager.init_groups((KVCacheGroupSpec(
+        name="window", layer_indices=(0,),
+        spec=KVCacheSpec(block_size=2, page_size_bytes=1),
+        max_blocks_per_seq=4, num_blocks=8,
+        sliding_window=4, supports_sparse_blocks=True,
+    ),), max_batch_size=1)
+    return manager
+
+
+def test_sparse_window_release_preserves_inflight_ring_pages_and_snapshot():
+    manager = _sparse_window_manager()
+    snapshot = manager.ensure_group_blocks("request", 10, partition=0)
+    manager.retain_group_block_snapshot(snapshot, 0)
+    newer = manager.ensure_group_blocks("request", 12, partition=0)["window"]
+    assert newer[1] != snapshot["window"][1]
+
+    manager.release_sliding_window_blocks("request", 10)
+    current = manager.ensure_group_blocks("request", 12, partition=0)["window"]
+    assert current[0] == newer[0]
+    assert current[1] == newer[1]
+    assert current[2] == -1
+    assert current[3] == newer[3]
+
+    pool = manager._group_pools["window"]
+    expired = pool.block_from_local_id(0, snapshot["window"][2])
+    assert expired.ref_cnt == 1
+    manager.release_group_block_snapshot(snapshot, 0)
+    assert expired.ref_cnt == 0
+
+    manager.release_sliding_window_blocks("request", 12)
+    assert pool.request_blocks["request"][3] is None
+    resumed = manager.ensure_group_blocks("request", 14, partition=0)["window"]
+    assert resumed[2] != -1
+    manager.release_sliding_window_blocks("request", 14)
+    assert pool.request_blocks["request"][0] is None
+
+
+def test_sparse_window_prefix_hit_keeps_expired_slots_unmapped():
+    manager = _sparse_window_manager(enable_prefix_cache=True)
+    prompt = list(range(1, 13))
+    hashes = manager.compute_group_block_hashes(prompt)
+    manager.ensure_group_blocks("warm", 10, partition=0)
+    manager.cache_group_blocks("warm", hashes, 10, {})
+    manager.release_sliding_window_blocks("warm", 10)
+    manager.release_all_group_requests("warm")
+
+    blocks, hit_tokens, partition = manager.acquire_group_prefix_blocks(
+        "hit", hashes, max_cache_hit_tokens=10,
+    )
+    assert hit_tokens == 10
+    assert partition == 0
+    assert blocks["window"][1:3] == [-1, -1]
+    resumed = manager.ensure_group_blocks("hit", 12, partition=0)["window"]
+    assert resumed[1] != -1
+    assert resumed[2] == -1
+
+
 def test_grouped_prefix_hit_falls_back_to_an_idle_partition_when_suffix_does_not_fit():
     manager = KvCacheManager(block_size=2, enable_prefix_cache=True)
     manager.init_groups(
