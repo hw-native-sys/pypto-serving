@@ -466,6 +466,7 @@ class ReplicaEngineCore:
                 arrival_time=time.time(),
                 stop_strings=tuple(config.stop) if config.stop else (),
                 eos_token_id=self.tokenizer.eos_token_id,
+                eos_token_ids=getattr(self.tokenizer, "eos_token_ids", ()),
                 ignore_eos=config.ignore_eos,
                 temperature=config.temperature,
                 top_p=config.top_p,
@@ -768,6 +769,7 @@ class ReplicaEngineCore:
                     seed=req.seed,
                     min_tokens=req.min_tokens,
                     eos_token_id=req.eos_token_id,
+                    eos_token_ids=req.eos_token_ids,
                     initial_output_tokens=len(req.output_token_ids),
                     constraint_spec=req.constraint_spec.to_wire() if req.constraint_spec else None,
                 ))

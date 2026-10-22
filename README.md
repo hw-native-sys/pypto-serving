@@ -11,6 +11,7 @@ The external documentation lives under [`docs/`](docs/index.md). Start with:
 - [Online Serving](docs/user-guide/online-serving.md)
 - [CLI Reference](docs/cli-reference/pypto-serving.md)
 - [Models](docs/models/index.md)
+- [GLM-5.3-Flash](docs/models/glm53.md)
 
 ## Layout
 

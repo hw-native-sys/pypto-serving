@@ -123,6 +123,7 @@ class Request:
     output_token_ids: list[int] = field(default_factory=list)
     stop_strings: tuple[str, ...] = ()
     eos_token_id: int | None = None
+    eos_token_ids: tuple[int, ...] = ()
     ignore_eos: bool = False
     temperature: float = 0.0
     top_p: float = 1.0
@@ -979,7 +980,10 @@ class Scheduler:
         if not request.output_token_ids:
             return None
         last_token = request.output_token_ids[-1]
-        if not request.ignore_eos and request.eos_token_id is not None and last_token == request.eos_token_id:
+        if not request.ignore_eos and (
+            last_token in request.eos_token_ids
+            or (request.eos_token_id is not None and last_token == request.eos_token_id)
+        ):
             return RequestStatus.FINISHED_EOS
         if len(request.output_token_ids) >= request.max_new_tokens:
             return RequestStatus.FINISHED_LENGTH
