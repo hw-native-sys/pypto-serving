@@ -68,8 +68,8 @@ def test_generation_limits_and_eos_defaults():
 
     with pytest.raises(ValueError, match="min_tokens 3 exceeds max_tokens 2"):
         GenerateConfig(max_new_tokens=2, min_tokens=3)
-    with pytest.raises(ValueError, match="max_completion_tokens must be a positive integer"):
-        _chat_request(max_completion_tokens=0)
+    with pytest.raises(ValueError, match="max_new_tokens must be a positive integer"):
+        server._resolve_generate_config(_chat_request(max_completion_tokens=0))
 
     manager = KvCacheManager(num_blocks=4, block_size=2, enable_prefix_cache=False)
     scheduler = Scheduler(SchedulerConfig(max_seq_len=5, enable_prefix_cache=False), manager)

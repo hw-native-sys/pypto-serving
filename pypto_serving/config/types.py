@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -35,20 +36,40 @@ class GenerateConfig:
     ignore_eos: bool = False
 
     def __post_init__(self) -> None:
-        if (
-            not isinstance(self.max_new_tokens, int)
-            or isinstance(self.max_new_tokens, bool)
-            or self.max_new_tokens <= 0
+        for name, minimum, optional in (
+            ("max_new_tokens", 1, False),
+            ("min_tokens", 0, False),
+            ("top_k", 1, True),
+            ("seed", 0, True),
         ):
-            raise ValueError("max_new_tokens must be a positive integer")
-        if (
-            not isinstance(self.min_tokens, int)
-            or isinstance(self.min_tokens, bool)
-            or self.min_tokens < 0
-        ):
-            raise ValueError("min_tokens must be a non-negative integer")
+            value = getattr(self, name)
+            if optional and value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                expected = "a positive integer" if minimum else "a non-negative integer"
+                if optional:
+                    expected += " or None"
+                raise ValueError(f"{name} must be {expected}; got {value!r}")
         if self.min_tokens > self.max_new_tokens:
             raise ValueError(f"min_tokens {self.min_tokens} exceeds max_tokens {self.max_new_tokens}")
+        for name in ("temperature", "top_p"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or (isinstance(value, float) and not math.isfinite(value))
+            ):
+                raise ValueError(f"{name} must be a finite number; got {value!r}")
+        if self.temperature < 0:
+            raise ValueError(f"temperature must be non-negative; got {self.temperature!r}")
+        if not 0 < self.top_p <= 1:
+            raise ValueError(f"top_p must be in (0, 1]; got {self.top_p!r}")
+        if not isinstance(self.stop, tuple) or not all(isinstance(item, str) for item in self.stop):
+            raise ValueError(f"stop must be a tuple of strings; got {self.stop!r}")
+        for name in ("stream", "ignore_eos"):
+            value = getattr(self, name)
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be a boolean; got {value!r}")
 
 
 @dataclass(frozen=True)

@@ -24,7 +24,10 @@ import pytest
 import torch
 from pypto.runtime import DeviceTensor, StackedDeviceTensor
 
-import pypto_serving.cli.main as cli
+from pypto_serving.cli.parser import parse_launch_options
+from pypto_serving.config.launch_options import FeatureOptions
+from pypto_serving.config.resolve import resolve_launch_options
+from pypto_serving.model.integrations import get_integration, resolve_speculation
 from pypto_serving.config.types import (
     PREFILL_CHUNK_SIZE_CHOICES,
     DecodeBatch,
@@ -733,7 +736,7 @@ def test_deepseek_mtp_exhausted_context_verifies_single_target_column(monkeypatc
 
 def test_cli_selects_deepseek_executor_and_configures_mtp_depth(tmp_path):
     model_dir = _write_deepseek_model_dir(tmp_path)
-    args = cli.build_parser().parse_args(
+    options = parse_launch_options(
         [
             "--model",
             str(model_dir),
@@ -758,9 +761,9 @@ def test_cli_selects_deepseek_executor_and_configures_mtp_depth(tmp_path):
         ]
     )
 
-    config = cli.build_serving_engine_config(args)
+    config = resolve_launch_options(options).engine
 
-    assert config.executor_cls == "PyptoDeepSeekV4Executor"
+    assert config.integration_id == "deepseek_v4"
     assert config.device_ids == (0, 1, 2, 3, 4, 5, 6, 7)
     assert config.parallel_config.replica_device_groups == ((0, 1, 2, 3, 4, 5, 6, 7),)
     assert config.runtime_config.page_size == 128
@@ -792,7 +795,7 @@ def test_deepseek_async_decode_prepare_excludes_arbitrary_mtp_depth(
 
 def test_cli_keeps_deepseek_autoregressive_decode_when_mtp_is_disabled(tmp_path):
     model_dir = _write_deepseek_model_dir(tmp_path)
-    args = cli.build_parser().parse_args(
+    options = parse_launch_options(
         [
             "--model",
             str(model_dir),
@@ -805,7 +808,7 @@ def test_cli_keeps_deepseek_autoregressive_decode_when_mtp_is_disabled(tmp_path)
         ]
     )
 
-    config = cli.build_serving_engine_config(args)
+    config = resolve_launch_options(options).engine
 
     assert config.executor_kwargs["num_speculative_tokens"] == 0
     contract = npu_executor.load_deepseek_v4_serving_contract()
@@ -821,23 +824,16 @@ def test_cli_keeps_deepseek_autoregressive_decode_when_mtp_is_disabled(tmp_path)
     ],
 )
 def test_cli_rejects_invalid_deepseek_speculative_config(config, message):
-    args = SimpleNamespace(
-        speculative_config=config,
-        num_speculative_tokens=None,
-    )
-
+    options = parse_launch_options(["--model", "model"])
     with pytest.raises(ValueError, match=message):
-        cli._resolve_num_speculative_tokens(args)
+        get_integration("deepseek_v4").resolve(
+            options, {}, (), resolve_speculation(FeatureOptions(config, None)),
+        )
 
 
 def test_cli_rejects_speculative_config_with_num_speculative_tokens_alias():
-    args = SimpleNamespace(
-        speculative_config={"method": "mtp", "num_speculative_tokens": 3},
-        num_speculative_tokens=2,
-    )
-
     with pytest.raises(ValueError, match="cannot be combined"):
-        cli._resolve_num_speculative_tokens(args)
+        resolve_speculation(FeatureOptions({"method": "mtp", "num_speculative_tokens": 3}, 2))
 
 
 def test_tokenizer_falls_back_when_deepseek_config_fails_strict_validation(tmp_path, monkeypatch):

@@ -21,6 +21,7 @@ from pypto_serving.model.tokenizer import DeepSeekV4TokenizerAdapter
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig, ReplicaEngineCore
 from pypto_serving.serving.reasoning.deepseek_v4_tools import TOOL_END, TOOL_START
 from pypto_serving.serving.sched.scheduler import RequestOutput, RequestStatus, SchedulerOutput
+from pypto_serving.serving.sampling.capabilities import ModelCapabilities
 from pypto_serving.serving.server.server import ChatCompletionRequest, ServingServer
 from tests.unit.serving.reasoning.test_deepseek_v4_tools import SplitRootTokenizer, ToolTokenizer, invoke
 
@@ -237,7 +238,7 @@ def _replay_server(*scripts, chunk_size=7, tokenizer=None):
 
 
 def _enable_fake_constraints(server, monkeypatch):
-    server.engine.config.executor_cls = "PyptoDeepSeekV4DSparkExecutor"
+    server.engine.config.capabilities = ModelCapabilities(constrained_tool_format="deepseek_v4")
     monkeypatch.setattr(
         "pypto_serving.serving.server.server.importlib.util.find_spec",
         lambda name: object() if name == "xgrammar" else None,

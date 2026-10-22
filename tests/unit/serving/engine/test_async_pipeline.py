@@ -29,6 +29,7 @@ from pypto_serving.serving.sched.scheduler import (
     SchedulerConfig,
     SchedulerOutput,
 )
+from pypto_serving.serving.sampling.capabilities import ModelCapabilities, SamplingCapabilities
 from pypto_serving.serving.server.ipc import (
     PLACEHOLDER_TOKEN,
     StepResult,
@@ -87,7 +88,6 @@ def _async_pipeline_core(*, num_speculative_tokens: int = 0):
     core.kv_cache_manager = manager
     core.tokenizer = _Tokenizer()
     core.config = EngineConfig(
-        executor_cls="PyptoQwen14BExecutor",
         runtime_config=RuntimeConfig(num_speculative_tokens=num_speculative_tokens),
     )
     core._async_scheduling = True
@@ -263,14 +263,14 @@ def test_rejected_request_does_not_leave_an_engine_context():
     assert not core._pending_free_ids
 
 
-@pytest.mark.parametrize("executor_cls,speculative_tokens,expected_min_tokens", [
-    ("PyptoQwen14BExecutor", 0, 2),
-    ("PyptoDeepSeekV4Executor", 1, 0),
-    ("PyptoDeepSeekV4DSparkExecutor", 7, 2),
+@pytest.mark.parametrize("honor_min_tokens,speculative_tokens,expected_min_tokens", [
+    (True, 0, 2),
+    (False, 1, 0),
+    (True, 7, 2),
 ])
-def test_min_tokens_reaches_worker_registration(executor_cls, speculative_tokens, expected_min_tokens):
+def test_min_tokens_reaches_worker_registration(honor_min_tokens, speculative_tokens, expected_min_tokens):
     core, dispatched = _async_pipeline_core(num_speculative_tokens=speculative_tokens)
-    core.config.executor_cls = executor_cls
+    core.config.capabilities = ModelCapabilities(sampling=SamplingCapabilities(honor_min_tokens=honor_min_tokens))
     core.tokenizer.eos_token_id = 9
 
     class Queued(Exception):

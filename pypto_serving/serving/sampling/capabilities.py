@@ -23,13 +23,9 @@ class SamplingCapabilities:
         return getattr(self, f"{phase}_stop_mask") == "device"
 
 
-def sampling_capabilities(executor_cls: str, num_speculative_tokens: int) -> SamplingCapabilities:
-    """Declare the stop-mask path for each serving executor configuration."""
-    if executor_cls == "PyptoDeepSeekV4DSparkExecutor":
-        return SamplingCapabilities(prefill_stop_mask="device", decode_stop_mask="device")
-    if executor_cls == "PyptoDeepSeekV4Executor":
-        # The V4 MTP fused sampler does not yet accept a stop-token mask.
-        return SamplingCapabilities(honor_min_tokens=num_speculative_tokens == 0)
-    if executor_cls == "PyptoQwen14BExecutor":
-        return SamplingCapabilities()
-    raise ValueError(f"sampling capabilities are not declared for {executor_cls!r}")
+@dataclass(frozen=True)
+class ModelCapabilities:
+    """Static capabilities resolved before the API and worker processes start."""
+
+    sampling: SamplingCapabilities = SamplingCapabilities()
+    constrained_tool_format: str | None = None

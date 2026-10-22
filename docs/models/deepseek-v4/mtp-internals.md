@@ -6,13 +6,13 @@ This page covers the eight-rank MTP runner. For the command line and checkpoint 
 
 | Layer | Interface and responsibility |
 | --- | --- |
-| CLI | `pypto_serving/cli/main.py`: `_validate_model_topology()` enforces the eight-rank DP8/EP8/TP1 contract; `_build_runtime_config()` derives the cache groups and kernel prefill limits. |
+| Model integration | `pypto_serving/model/integrations/deepseek.py`: `DeepSeekV4Integration.resolve()` enforces the eight-rank DP8/EP8/TP1 contract and derives cache groups and kernel prefill limits. |
 | Executor | `pypto_serving/model/deepseek/npu_executor.py`: `DeepSeekV4PyptoExecutor._compile_model()` loads and compiles the PyPTO callables; `_create_runner()` supplies the model runner. |
 | Cache contract | `pypto_serving/model/deepseek/npu_runner.py`: `build_deepseek_v4_cache_group_specs()` describes the seven main-model groups; `DeepSeekV4ModelRunner.init_kv_cache()` allocates their device pools after weights are resident. |
 | Worker | `pypto_serving/serving/server/serving_worker.py`: `_make_prefill_batch()` and `_make_decode_batch()` carry scheduler-owned `block_ids_by_group` into the runner; `_batch_prefill()` calls `finalize_prefill()` after sampling the first output token. |
 | Runner | `DeepSeekV4ModelRunner.run_prefill()` packs and dispatches a chunk; `run_decode()` selects AR or MTP; `release_finished_requests()` frees per-request runner state. |
 
-`ParallelConfig` selects overlapped placement in the CLI, so attention DP and MoE EP reuse the same physical ranks. `ReplicaEngineCore` still owns one scheduler, cache manager, and worker for this model group; DP8 does not create eight independent HTTP serving replicas.
+`ParallelConfig` selects overlapped placement in the model integration, so attention DP and MoE EP reuse the same physical ranks. `ReplicaEngineCore` still owns one scheduler, cache manager, and worker for this model group; DP8 does not create eight independent HTTP serving replicas.
 
 ## Dynamic Prefill Extent
 
@@ -26,7 +26,7 @@ The main kernel returns each owner's final 128 valid pre-HC rows, which the stan
 
 DeepSeek V4 uses grouped cache pools instead of the generic KV cache tensor layout. The seven main-model KV/state pools are allocated during runner preflight as rank-sharded worker-resident tensors.
 
-`_build_runtime_config()` places `KVCacheGroupSpec` entries in `RuntimeConfig.kv_cache_groups`. `ReplicaEngineCore` validates them through `SchedulerConfig.validate_cache_groups()` and initializes `KvCacheManager` without a fixed page count. On worker startup, `DeepSeekV4ModelRunner.init_kv_cache()` materializes weights and persistent buffers, computes a capacity from remaining NPU memory, then returns the `ori` block count. The engine scales the other groups from the same admitted slot count. Changing a group's block size or partitioning therefore requires coordinated changes in the CLI builder, scheduler metadata, and kernel argument binding.
+`DeepSeekV4Integration.resolve()` builds the `KVCacheGroupSpec` entries, and `resolve_launch_options()` places them in `RuntimeConfig.kv_cache_groups`. `ReplicaEngineCore` validates them through `SchedulerConfig.validate_cache_groups()` and initializes `KvCacheManager` without a fixed page count. On worker startup, `DeepSeekV4ModelRunner.init_kv_cache()` materializes weights and persistent buffers, computes a capacity from remaining NPU memory, then returns the `ori` block count. The engine scales the other groups from the same admitted slot count. Changing a group's block size or partitioning therefore requires coordinated changes in the model integration, scheduler metadata, and kernel argument binding.
 
 Prefill and decode pass the same device handles and address them with scheduler-owned group block IDs. `DeepSeekV4CacheMetadataBuilder` converts those IDs and token positions into the block tables and slot mappings consumed by the PyPTO callables. There is no prefill CPU snapshot or cache handoff. Reassigned pages are cleared with targeted host-to-device copies before their new owner writes them.
 

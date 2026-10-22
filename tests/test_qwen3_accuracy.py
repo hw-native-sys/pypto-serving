@@ -51,10 +51,10 @@ def test_qwen3_output_matches_expected_tokens():
             config=EngineConfig(
                 model_id=MODEL_ID,
                 model_dir=str(MODEL_DIR),
+                integration_id="qwen3_14b",
                 platform=PLATFORM,
                 device_id=DEVICE_ID,
                 device_ids=(DEVICE_ID,),
-                executor_cls="PyptoQwen14BExecutor",
                 runtime_config=RuntimeConfig(
                     page_size=128,
                     max_batch_size=16,

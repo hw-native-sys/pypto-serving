@@ -27,7 +27,7 @@ from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.reasoning import (
     OutputParserSpec, ParsedToolCall, ToolCallDelta, create_output_parser,
 )
-from pypto_serving.serving.sampling.capabilities import SamplingCapabilities, sampling_capabilities
+from pypto_serving.serving.sampling.capabilities import ModelCapabilities
 from pypto_serving.serving.utils.env import (
     worker_init_timeout_seconds,
     worker_step_timeout_seconds,
@@ -75,7 +75,11 @@ class EngineConfig:
     device_ids: tuple[int, ...] = ()
     parallel_config: ParallelConfig | None = None
     dp_rank: int = 0
-    executor_cls: str = "PyptoQwen14BExecutor"
+    # TODO: EngineConfig is internal; before exposing direct construction, require
+    # a resolved integration and its matching capabilities. These defaults can
+    # otherwise misreport features or fail only when the worker starts.
+    integration_id: str = ""
+    capabilities: ModelCapabilities = field(default_factory=ModelCapabilities)
     executor_kwargs: dict = field(default_factory=dict)
 
     # Runtime
@@ -106,26 +110,7 @@ class EngineConfig:
 
     def resolve_min_tokens(self, min_tokens: int) -> int:
         """Return the minimum length supported by the selected decode path."""
-        return min_tokens if self.sampling_capabilities().honor_min_tokens else 0
-
-    def sampling_capabilities(self) -> SamplingCapabilities:
-        return sampling_capabilities(
-            self.executor_cls, self.resolve_runtime_config().num_speculative_tokens
-        )
-
-    def resolve_runtime_config(self) -> RuntimeConfig:
-        """Return runtime settings with executor requirements resolved."""
-        runtime = self.runtime_config or RuntimeConfig()
-        is_deepseek_v4 = self.executor_cls == "PyptoDeepSeekV4Executor"
-        homogeneous_prefill_decode = (
-            runtime.requires_homogeneous_prefill_decode or is_deepseek_v4
-        )
-        if runtime.requires_homogeneous_prefill_decode == homogeneous_prefill_decode:
-            return runtime
-        return replace(
-            runtime,
-            requires_homogeneous_prefill_decode=homogeneous_prefill_decode,
-        )
+        return min_tokens if self.capabilities.sampling.honor_min_tokens else 0
 
     def worker_device_ids(self) -> tuple[int, ...]:
         """Return the device ids this engine worker should own."""
@@ -203,7 +188,7 @@ class ReplicaEngineCore:
         config: EngineConfig,
         tokenizer
     ) -> None:
-        runtime = config.resolve_runtime_config()
+        runtime = config.runtime_config or RuntimeConfig()
         self.config = replace(config, runtime_config=runtime)
         self.tokenizer = tokenizer
         block_size = runtime.page_size
@@ -1290,7 +1275,7 @@ class AsyncLLMEngine:
         *,
         core_factory: Callable[..., ReplicaEngineCore] = ReplicaEngineCore,
     ) -> None:
-        config = replace(config, runtime_config=config.resolve_runtime_config())
+        config = replace(config, runtime_config=config.runtime_config or RuntimeConfig())
         parallel = config.parallel_config
         if parallel is None:
             worker_devices = config.worker_device_ids()

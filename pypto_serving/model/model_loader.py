@@ -24,7 +24,8 @@ from pypto_serving.config.types import (
     RuntimeModel,
 )
 
-from .model_family import is_deepseek_v4_config, read_model_config
+from .integrations import select_model_family
+from .metadata import read_model_metadata
 from .tokenizer import TokenizerAdapter, load_tokenizer
 
 
@@ -52,6 +53,7 @@ class ModelLoadRequest:
     model_dir: str
     runtime_config: RuntimeConfig | None = None
     model_format: str | None = None
+    integration_id: str | None = None
     loader_options: dict[str, object] = field(default_factory=dict)
 
 
@@ -251,7 +253,10 @@ class HuggingFaceDirectoryLoader(SafetensorsDirectoryLoader):
             raise FileNotFoundError(f"Missing config.json in {model_path}")
 
         trust_remote_code = bool(request.loader_options.get("trust_remote_code", False))
-        tokenizer = load_tokenizer(model_path, trust_remote_code=trust_remote_code)
+        tokenizer = load_tokenizer(
+            model_path, trust_remote_code=trust_remote_code,
+            integration_id=request.integration_id,
+        )
         config_data = json.loads(config_path.read_text())
         config = _build_model_config(request.model_id, config_data, tokenizer)
         runtime = request.runtime_config or RuntimeConfig(max_seq_len=config.max_position_embeddings)
@@ -324,8 +329,10 @@ class DeepSeekV4W8A8DirectoryLoader(SafetensorsDirectoryLoader):
         """
         if not (model_path / "model.safetensors.index.json").exists():
             return False
-        config_data = read_model_config(model_path)
-        return is_deepseek_v4_config(config_data)
+        try:
+            return select_model_family(read_model_metadata(model_path)).name == "deepseek_v4"
+        except ValueError:
+            return False
 
     def load(self, request: ModelLoadRequest) -> LoadedModel:
         """Load tokenizer and metadata without materializing all quantized weights."""
@@ -337,8 +344,8 @@ class DeepSeekV4W8A8DirectoryLoader(SafetensorsDirectoryLoader):
         if not index_path.exists():
             raise FileNotFoundError(f"Missing model.safetensors.index.json in {model_path}")
 
-        config_data = json.loads(config_path.read_text())
-        if not is_deepseek_v4_config(config_data):
+        config_data = read_model_metadata(model_path)
+        if select_model_family(config_data).name != "deepseek_v4":
             raise ValueError(f"{model_path} is not a DeepSeekV4 checkpoint")
         quantization = config_data.get("quantization_config", {})
         if quantization.get("quant_method") != "compressed-tensors":
@@ -348,7 +355,10 @@ class DeepSeekV4W8A8DirectoryLoader(SafetensorsDirectoryLoader):
             )
 
         trust_remote_code = bool(request.loader_options.get("trust_remote_code", False))
-        tokenizer = load_tokenizer(model_path, trust_remote_code=trust_remote_code)
+        tokenizer = load_tokenizer(
+            model_path, trust_remote_code=trust_remote_code,
+            integration_id=request.integration_id,
+        )
         config = _build_deepseek_v4_model_config(request.model_id, config_data, tokenizer)
         runtime = request.runtime_config or RuntimeConfig(max_seq_len=min(config.max_position_embeddings, 8192))
         layer_specs = _build_layer_specs(config)
@@ -454,6 +464,7 @@ class ModelLoader:
         model_dir: str,
         runtime_config: RuntimeConfig | None = None,
         model_format: str | None = None,
+        integration_id: str | None = None,
         **loader_options: object,
     ) -> LoadedModel:
         """Load a model directory using an explicit or inferred format."""
@@ -462,6 +473,7 @@ class ModelLoader:
             model_dir=model_dir,
             runtime_config=runtime_config,
             model_format=model_format,
+            integration_id=integration_id,
             loader_options=loader_options,
         )
         loader = self._select_loader(request)

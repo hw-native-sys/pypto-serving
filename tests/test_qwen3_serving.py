@@ -129,9 +129,9 @@ def harness():
     config = EngineConfig(
         model_id=MODEL_ID,
         model_dir=str(MODEL_DIR),
+        integration_id="qwen3_14b",
         platform=PLATFORM,
         device_id=DEVICE_ID,
-        executor_cls="PyptoQwen14BExecutor",
         runtime_config=RuntimeConfig(
             page_size=PAGE_SIZE,
             max_batch_size=MAX_BATCH_SIZE,
