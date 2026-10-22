@@ -24,7 +24,7 @@ from pypto_serving.config.types import (
     RuntimeModel,
 )
 
-from .model_family import is_deepseek_v4_config, read_model_config
+from .model_family import is_deepseek_v4_config, is_glm53_config, read_model_config
 from .tokenizer import TokenizerAdapter, load_tokenizer
 
 
@@ -437,12 +437,28 @@ def _validate_deepseek_v4_weight_index(weight_map: dict[str, str], config_data: 
         )
 
 
+class Glm53W8A8DirectoryLoader(SafetensorsDirectoryLoader):
+    """Load the GLM text backbone through its validated kernel-side reader."""
+
+    format_names = ("glm53_w8a8", "glm53-w8a8")
+
+    def _recognises(self, model_path: Path) -> bool:
+        return is_glm53_config(read_model_config(model_path))
+
+    def load(self, request: ModelLoadRequest) -> LoadedModel:
+        from pypto_serving.model.glm53.weight_loader import load_checkpoint
+
+        return load_checkpoint(request.model_id, request.model_dir, request.runtime_config)
+
+
 class ModelLoader:
     """Registry that selects a model-format loader and loads models."""
 
     def __init__(self, format_loaders: list[ModelFormatLoader] | None = None) -> None:
         """Create a loader registry with optional custom format loaders."""
-        self._format_loaders = format_loaders or [DeepSeekV4W8A8DirectoryLoader(), HuggingFaceDirectoryLoader()]
+        self._format_loaders = format_loaders or [
+            Glm53W8A8DirectoryLoader(), DeepSeekV4W8A8DirectoryLoader(), HuggingFaceDirectoryLoader(),
+        ]
 
     def register(self, format_loader: ModelFormatLoader) -> None:
         """Register an additional model format loader."""

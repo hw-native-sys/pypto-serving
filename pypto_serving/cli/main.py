@@ -296,7 +296,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         enable_expert_parallel=args.expert_parallel_size > 1,
         devices=devices,
         data_parallel_routing=args.data_parallel_routing,
-        placement_mode="overlapped" if model_family == "deepseek_v4" else "replica",
+        placement_mode="overlapped" if model_family in ("deepseek_v4", "glm53") else "replica",
     )
     _validate_model_topology(
         model_family,
@@ -309,7 +309,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     worker_device_ids = first_group if parallel_config.num_replicas == 1 else ()
     # DSpark rebuilds its private drafter context from a prefilled suffix.
     # Arbitrary-depth MTP still lacks a grouped prefix-cache contract.
-    enable_prefix_cache = args.enable_prefix_caching
+    enable_prefix_cache = args.enable_prefix_caching and model_family != "glm53"
     if model_family == "deepseek_v4" and (
         num_speculative_tokens > 1 and model_variant != "dspark"
     ):
@@ -333,7 +333,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         max_num_scheduled_tokens=args.max_num_batched_tokens,
         long_prefill_token_threshold=args.long_prefill_token_threshold,
         enable_prefix_cache=enable_prefix_cache,
-        enable_chunk_prefill=args.enable_chunked_prefill,
+        enable_chunk_prefill=args.enable_chunked_prefill and model_family != "glm53",
     )
 
 
@@ -354,7 +354,10 @@ def _build_runtime_config(
     supports_chunked_prefill_with_speculation = True
     speculative_prefix_cache_replay_tokens = 0
     requires_homogeneous_prefill_decode = False
-    if model_family == "deepseek_v4" and _resolve_model_variant(args) == "dspark":
+    if model_family == "glm53":
+        max_prefill_tokens_per_request = args.max_model_len
+        requires_homogeneous_prefill_decode = True
+    elif model_family == "deepseek_v4" and _resolve_model_variant(args) == "dspark":
         from pypto_serving.model.deepseek_dspark.npu_runner import (
             DSPARK_PREFILL_MAX_TOKENS,
             DSPARK_SLIDING_WINDOW,
@@ -625,6 +628,8 @@ def _warn_deprecated_serving_profile_env(args: argparse.Namespace) -> None:
 
 def _executor_cls_for_model_family(model_family: str, *, variant: str = "") -> str:
     """Map model family metadata to the worker executor class id."""
+    if model_family == "glm53":
+        return "PyptoGlm53Executor"
     if model_family == "deepseek_v4":
         if variant == "dspark":
             return "PyptoDeepSeekV4DSparkExecutor"
@@ -662,6 +667,20 @@ def _validate_model_topology(
     variant: str = "",
 ) -> None:
     """Validate model-specific serving topology constraints."""
+    if model_family == "glm53":
+        from pypto_serving.model.glm53.kernel_api import packed_capacity
+
+        if (parallel_config.tensor_parallel_size, parallel_config.expert_parallel_size,
+                parallel_config.data_parallel_size, len(parallel_config.devices)) != (16, 16, 1, 16):
+            raise ValueError("GLM-5.3-Flash requires --tp 16 --ep 16 --dp 1 and 16 device ids")
+        if args.max_num_seqs != 1:
+            raise ValueError("GLM full-prefix serving requires --max-num-seqs 1")
+        if args.block_size != 128 or args.dtype != "bfloat16":
+            raise ValueError("GLM W8A8 serving requires --block-size 128 --dtype bfloat16")
+        if args.max_num_batched_tokens < args.max_model_len:
+            raise ValueError("GLM full-prefix serving requires max-num-batched-tokens >= max-model-len")
+        packed_capacity(args.max_model_len)
+        return
     if model_family != "deepseek_v4":
         return
     if variant == "dspark":

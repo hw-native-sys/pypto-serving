@@ -101,6 +101,7 @@ nav:
   - Models:
       - Overview: models/index.md
       - Qwen3-14B: models/qwen3-14b.md
+      - GLM-5.3-Flash: models/glm53.md
       - DeepSeek V4:
           - Overview: models/deepseek-v4/index.md
           - MTP Deployment: models/deepseek-v4/mtp.md

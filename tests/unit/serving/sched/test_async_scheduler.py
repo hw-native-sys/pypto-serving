@@ -1096,3 +1096,20 @@ def test_grouped_prefix_metrics_count_reused_tokens():
     assert output.prefix_cache_queries == 4
     assert output.prefix_cache_hits == 4
     assert output.prefix_cache_query_tokens == 5
+
+
+@pytest.mark.parametrize("ignore_eos", [False, True])
+def test_scheduler_stops_on_secondary_model_eos(ignore_eos):
+    manager = KvCacheManager(num_blocks=4, block_size=2, enable_prefix_cache=False)
+    scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=False), manager)
+    request = Request(request_id="multi-eos", prompt_token_ids=[1], max_new_tokens=4,
+                      eos_token_id=7, eos_token_ids=(7, 9), num_computed_tokens=1,
+                      status=RequestStatus.RUNNING, ignore_eos=ignore_eos)
+    scheduler.running.append(request)
+    scheduler.requests[request.request_id] = request
+    scheduled = SchedulerOutput(
+        scheduled_requests=[ScheduledRequest(request=request, num_new_tokens=1, is_prefill=False)]
+    )
+    outputs = scheduler.update_from_output(scheduled, {request.request_id: 9})
+    assert request.status is (RequestStatus.RUNNING if ignore_eos else RequestStatus.FINISHED_EOS)
+    assert outputs[0].finished is (not ignore_eos)
