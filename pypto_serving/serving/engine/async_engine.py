@@ -62,6 +62,13 @@ from pypto_serving.tools.profile import (
 
 logger = logging.getLogger(__name__)
 
+# How long to wait at each stage of reaping a worker, after the cooperative
+# shutdown command has had its turn. A worker inside a device call cannot be
+# interrupted, so each stage escalates once instead of repeating a signal that
+# has already been delivered.
+WORKER_TERM_GRACE_SECONDS = 10.0
+WORKER_KILL_GRACE_SECONDS = 5.0
+
 
 @dataclass
 class EngineConfig:
@@ -250,6 +257,10 @@ class ReplicaEngineCore:
         self._input_queue = None
         self._output_queue = None
         self._profile_output_queue = None
+        # Sticky: set once a worker has outlived every signal. The handle is
+        # dropped at that point, so without it the next stop sees no process and
+        # reports a clean one.
+        self._worker_stranded = False
         self._profile_lock = asyncio.Lock()
         # Tracks which request_ids the worker has already received via
         # NewRequestData — prompt tokens are sent exactly once per request.
@@ -379,15 +390,21 @@ class ReplicaEngineCore:
             and self._worker_process.is_alive()
         )
 
-    async def stop(self) -> None:
-        """Stop engine loop and worker process."""
+    async def stop(self) -> bool:
+        """Stop engine loop and worker process.
+
+        False means the worker outlived every signal, so its devices are still
+        held and the caller must not report a clean stop.
+        """
         self._running = False
         if self._loop_task is not None:
             await self._loop_task
             self._loop_task = None
 
-        await asyncio.to_thread(self._shutdown_worker, timeout=30)
-        logger.info("ReplicaEngineCore stopped")
+        reaped = await asyncio.to_thread(self._shutdown_worker, timeout=30)
+        if reaped:
+            logger.info("ReplicaEngineCore stopped")
+        return reaped
 
     async def start_profile(self) -> None:
         """Start SA profiling in this replica's worker."""
@@ -1250,27 +1267,71 @@ class ReplicaEngineCore:
         )
         return delta
 
-    def _shutdown_worker(self, *, timeout: float) -> None:
+    def _shutdown_worker(self, *, timeout: float) -> bool:
+        """Stop the worker and reap it. Returns whether it is really gone.
+
+        Three stages, each escalating once rather than repeating itself: ask the
+        worker to stop, SIGTERM, SIGKILL. Re-sending a signal buys nothing --
+        one already pending is not queued twice, and a worker blocked in an
+        uninterruptible device call is no more reachable by the second than by
+        the first -- so what is repeated is the waiting, not the signal.
+
+        Returning before the worker is reaped is what strands device memory: the
+        HTTP endpoint closes with this process, so from the outside the replica
+        looks stopped while its cards are still held, and whatever is launched
+        onto them next fails for want of memory. If even SIGKILL leaves it
+        alive, that is reported rather than passed off as a clean stop.
+        """
         input_q = self._input_queue
         process = self._worker_process
-
-        if input_q is not None:
-            with contextlib.suppress(Exception):
-                # New protocol: send encoded ShutdownCommand bytes.
-                input_q.put(encode_command(ShutdownCommand()))
-
-        if process is not None:
-            with contextlib.suppress(Exception):
-                process.join(timeout=timeout)
-            with contextlib.suppress(Exception):
-                if process.is_alive():
-                    process.terminate()
-                    process.join(timeout=1)
-
         self._worker_process = None
         self._input_queue = None
         self._output_queue = None
         self._profile_output_queue = None
+
+        if process is None:
+            # Not necessarily "nothing to do": a worker that survived an earlier
+            # stop left its handle cleared behind it. start() shuts the worker
+            # down when initialization fails and the caller then calls stop(),
+            # so the second call must not call devices reclaimed that the first
+            # one could not reclaim.
+            return not self._worker_stranded
+
+        if input_q is not None:
+            with contextlib.suppress(Exception):
+                # Cooperative first: the worker closes its own device context.
+                input_q.put(encode_command(ShutdownCommand()))
+            if self._reap(process, timeout):
+                return True
+
+        with contextlib.suppress(Exception):
+            process.terminate()
+        if self._reap(process, WORKER_TERM_GRACE_SECONDS):
+            return True
+
+        with contextlib.suppress(Exception):
+            process.kill()
+        if self._reap(process, WORKER_KILL_GRACE_SECONDS):
+            return True
+
+        self._worker_stranded = True
+        logger.error(
+            "Worker process %s survived SIGKILL; device(s) %s may still be held. It is most "
+            "likely stuck in an uninterruptible device call, which no further signal can "
+            "reach -- the cards do not come back until it does",
+            getattr(process, "pid", "?"),
+            ",".join(str(device) for device in self.config.device_ids) or self.config.device_id,
+        )
+        return False
+
+    @staticmethod
+    def _reap(process, timeout: float) -> bool:
+        """Wait out one stage, and say whether the worker is gone."""
+        with contextlib.suppress(Exception):
+            process.join(timeout=timeout)
+        with contextlib.suppress(Exception):
+            return not process.is_alive()
+        return False
 
 
 class AsyncLLMEngine:
@@ -1350,9 +1411,18 @@ class AsyncLLMEngine:
             await self.stop()
             raise
 
-    async def stop(self) -> None:
-        """Stop all DP engine cores."""
-        await asyncio.gather(*(core.stop() for core in reversed(self._cores)))
+    async def stop(self) -> bool:
+        """Stop all DP engine cores. False if a worker could not be reaped."""
+        results = await asyncio.gather(*(core.stop() for core in reversed(self._cores)))
+        # ``is False`` rather than falsy: a core that reports nothing is not a
+        # core that reported a failure.
+        stranded = sum(1 for result in results if result is False)
+        if stranded:
+            logger.error(
+                "%d of %d worker(s) could not be reaped; their device(s) are still held",
+                stranded, len(results),
+            )
+        return not stranded
 
     def is_ready(self) -> bool:
         """Report whether every replica core can still serve requests."""

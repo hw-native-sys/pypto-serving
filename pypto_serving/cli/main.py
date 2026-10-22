@@ -27,7 +27,10 @@ from pypto_serving.config.types import (
 )
 from pypto_serving.model.model_family import detect_model_family, read_model_config
 from pypto_serving.observability.access_log import create_uvicorn_log_config
-from pypto_serving.serving.utils.env import configure_runtime_logging
+from pypto_serving.serving.utils.env import (
+    configure_runtime_logging,
+    graceful_shutdown_timeout_seconds,
+)
 from pypto_serving.tools.profile import (
     ProfileConfig,
     configure_profiler,
@@ -820,7 +823,15 @@ def run_serve(
     print(f"  Endpoints: {endpoints}")
 
     log_config = create_uvicorn_log_config(["/metrics", "/metrics/json"])
-    uvicorn.run(app, host=host, port=port, log_level="info", log_config=log_config)
+    # Bounded on purpose. uvicorn waits for in-flight requests before it runs
+    # the shutdown hook, so without a timeout one stuck request keeps the worker
+    # from ever being asked to stop -- and its devices with it.
+    uvicorn.run(
+        app, host=host, port=port, log_level="info", log_config=log_config,
+        # uvicorn takes whole seconds; max() keeps a sub-second setting from
+        # rounding down to zero, which would cancel in-flight work immediately.
+        timeout_graceful_shutdown=max(1, round(graceful_shutdown_timeout_seconds())),
+    )
 
 
 def run_generate(
