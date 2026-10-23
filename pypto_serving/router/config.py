@@ -40,6 +40,10 @@ DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
 DEFAULT_LAUNCH_TIMEOUT_SECONDS = 600.0
 # Aborting a half-finished generation to reclaim a device is worse than waiting.
 DEFAULT_DRAIN_TIMEOUT_SECONDS = 300.0
+# How long a replica has to stay unroutable before the router stops waiting for
+# it to come back and refills its slot. Long next to the ~5s it takes to leave
+# rotation, because leaving rotation costs nothing and this costs a model load.
+DEFAULT_REPLACE_AFTER_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -182,6 +186,9 @@ class RouterConfig:
     # The CLI raises this to 1 when the file declares launchable hosts.
     initial_replicas: int = 0
     max_replicas: int | None = None
+    # Refill a slot whose replica died, without waiting for an operator.
+    replace_dead: bool = True
+    replace_after_seconds: float = DEFAULT_REPLACE_AFTER_SECONDS
 
     def __post_init__(self) -> None:
         if not self.replicas and not self.hosts:
@@ -257,6 +264,8 @@ class RouterConfig:
             raise ValueError("launch_timeout_seconds must be positive")
         if self.drain_timeout_seconds <= 0:
             raise ValueError("drain_timeout_seconds must be positive")
+        if self.replace_after_seconds <= 0:
+            raise ValueError("replace_after_seconds must be positive")
         if self.initial_replicas < 0:
             raise ValueError("initial_replicas must be non-negative")
         if self.max_replicas is not None and self.max_replicas < 1:
