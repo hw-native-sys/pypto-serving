@@ -21,9 +21,16 @@ them -- uvicorn waiting out the requests already accepted.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
-from pypto_serving.serving.engine.async_engine import EngineConfig, ReplicaEngineCore
+from pypto_serving.serving.engine import async_engine
+from pypto_serving.serving.engine.async_engine import (
+    AsyncLLMEngine,
+    EngineConfig,
+    ReplicaEngineCore,
+)
 from pypto_serving.serving.utils.env import graceful_shutdown_timeout_seconds
 
 
@@ -74,6 +81,8 @@ def _core(process, queue=None) -> ReplicaEngineCore:
     core._output_queue = None
     core._profile_output_queue = None
     core._worker_stranded = False
+    core._running = True
+    core._loop_task = None
     return core
 
 
@@ -182,3 +191,88 @@ def test_an_unusable_graceful_shutdown_wait_is_refused(monkeypatch, value):
     monkeypatch.setenv("PYPTO_GRACEFUL_SHUTDOWN_TIMEOUT", value)
     with pytest.raises(ValueError, match="positive number of seconds"):
         graceful_shutdown_timeout_seconds()
+
+
+# --- the loop that runs in front of the stop ---------------------------------
+
+
+def test_a_failed_engine_loop_still_gets_its_worker_stopped():
+    """The loop dying is the case where stopping matters most.
+
+    Awaiting the loop task re-raised its exception here, so the worker was
+    never sent a command, never signalled, and kept its devices while the
+    parent exited and the endpoint closed behind it.
+    """
+    async def scenario():
+        async def loop_that_dies():
+            raise RuntimeError("the scheduler raised")
+
+        process, queue = _FakeProcess(dies_after=0), _FakeQueue()
+        core = _core(process, queue)
+        core._loop_task = asyncio.create_task(loop_that_dies())
+        await asyncio.sleep(0)
+
+        reaped = await core.stop()
+        return reaped, len(queue.sent), core._worker_process
+
+    reaped, sent, handle = asyncio.run(scenario())
+    assert reaped is True, "a dead loop must not stop the worker from being reaped"
+    assert sent == 1, "the shutdown command still went out"
+    assert handle is None
+
+
+def test_an_engine_loop_that_will_not_finish_does_not_hold_up_the_stop(monkeypatch):
+    """Clearing _running does not interrupt a read already in flight.
+
+    The loop usually sits in a worker read bounded by the worker step timeout,
+    twenty minutes by default, which is not the shutdown's budget: waiting it
+    out would put every bounded stage behind an unbounded one. The read ends
+    when the worker does, so the worker is stopped first.
+    """
+    monkeypatch.setattr(async_engine, "LOOP_DRAIN_GRACE_SECONDS", 0.05)
+
+    async def scenario():
+        async def loop_that_never_returns():
+            await asyncio.sleep(3600)
+
+        process = _FakeProcess(dies_after=0)
+        core = _core(process, _FakeQueue())
+        core._loop_task = asyncio.create_task(loop_that_never_returns())
+
+        started = asyncio.get_running_loop().time()
+        reaped = await core.stop()
+        return reaped, asyncio.get_running_loop().time() - started
+
+    reaped, elapsed = asyncio.run(scenario())
+    assert reaped is True
+    assert elapsed < 1.0, "the stop waited on the loop instead of stopping the worker"
+
+
+def test_one_core_failing_does_not_leave_its_siblings_unstopped():
+    """gather() without return_exceptions abandons the cores it has not reached.
+
+    With data parallelism that is one raised exception against several device
+    groups: the siblings never receive a command or a signal, and the tally
+    that would have reported them never runs either.
+    """
+    class _Core:
+        def __init__(self, outcome) -> None:
+            self.outcome = outcome
+            self.stopped = False
+
+        async def stop(self):
+            await asyncio.sleep(0)
+            self.stopped = True
+            if isinstance(self.outcome, BaseException):
+                raise self.outcome
+            return self.outcome
+
+    async def scenario():
+        cores = [_Core(RuntimeError("core 0 is wedged")), _Core(True), _Core(True)]
+        engine = AsyncLLMEngine.__new__(AsyncLLMEngine)
+        engine._cores = cores
+        return await engine.stop(), [core.stopped for core in cores]
+
+    reaped, stopped = asyncio.run(scenario())
+    assert stopped == [True, True, True], "a sibling was left holding its devices"
+    assert reaped is False, "a core that could not say what became of its worker counts"
