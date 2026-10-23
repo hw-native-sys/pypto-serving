@@ -235,17 +235,22 @@ def test_losing_every_replica_is_a_503_rather_than_a_hang(cluster):
     assert status == 503
 
 
-def test_a_dead_replica_is_never_removed_from_the_table(cluster):
-    """Today's behaviour, written down because the replacement work changes it.
+def test_a_dead_replica_is_kept_but_reported_as_failed(cluster):
+    """These replicas are listed in the config, so the router never stops them.
 
-    The router keeps the entry and keeps counting it, so capacity quietly drops
-    by one and nothing in the API says why. A replica that died is reported
-    exactly like one still loading its model.
+    It keeps the entry and keeps counting it, and capacity quietly drops by
+    one. What it must not do is leave that indistinguishable from a replica
+    still loading its model -- both are unroutable, and only one of them is
+    coming back on its own.
     """
     cluster.kill("alpha")
     assert _await(lambda: cluster.health()["replicas_ready"] == 1), cluster.health()
 
     health = cluster.health()
     assert health["replicas_total"] == 2, "the dead replica is still in the table"
+    assert health["replicas_failed"] == 1
     dead = [r for r in health["replicas"] if r["name"] == "alpha"]
     assert dead and dead[0]["ready"] is False
+    assert dead[0]["phase"] == "failed"
+    alive = [r for r in health["replicas"] if r["name"] == "beta"]
+    assert alive and alive[0]["phase"] == "ready"

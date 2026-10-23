@@ -36,7 +36,6 @@ from pathlib import Path
 from pypto_serving.router.config import ReplicaSpec, RouterConfig
 from pypto_serving.router.launcher import (
     HostPool,
-    LaunchError,
     PoolExhausted,
     Slot,
     transport_for,
@@ -54,6 +53,21 @@ STOP_GRACE_SECONDS = 30.0
 # capacity() so an operator can see why the fleet is smaller than the config.
 STOP_UNCONFIRMED = "stop-unconfirmed"
 UNREACHABLE_AT_STARTUP = "unreachable-at-startup"
+
+# A replica that was serving and then stopped answering is replaced on its own
+# slot. These three numbers are the whole policy.
+#
+# The wait before a replacement starts, doubling per attempt up to the cap. The
+# first one is also the grace the dead process gets to let go of its devices:
+# its socket closes before it exits, so a stop can be confirmed while the
+# process is still on its way out.
+RESTART_BACKOFF_SECONDS = 10.0
+RESTART_BACKOFF_CAP_SECONDS = 300.0
+# Consecutive replacements of one device group before the router stops spending
+# model loads on it. Three is already minutes of device time on a shared host,
+# and a slot that has eaten three replicas has something wrong with it that
+# another launch will not fix.
+MAX_RESTARTS = 3
 
 
 @dataclass
@@ -85,6 +99,18 @@ class _Reserved:
     reason: str
 
 
+@dataclass
+class _Restarts:
+    """How many replicas one slot has lost in a row, and whether we gave up.
+
+    Kept per slot rather than per instance: a crash loop is a property of the
+    device group, not of any one replica that died on it.
+    """
+
+    count: int = 0
+    given_up: bool = False
+
+
 class FleetManager:
     """Launches, drains and stops the replicas this router owns."""
 
@@ -98,6 +124,7 @@ class FleetManager:
         probe=None,
         alive_probe=None,
         stop_grace: float = STOP_GRACE_SECONDS,
+        restart_backoff: float = RESTART_BACKOFF_SECONDS,
     ) -> None:
         self._config = config
         self._registry = registry
@@ -112,6 +139,7 @@ class FleetManager:
         self._probe = probe
         self._alive_probe = alive_probe
         self._stop_grace = stop_grace
+        self._restart_backoff = restart_backoff
         # name -> instance, for every replica this router started.
         self._owned: dict[str, _Instance] = {}
         self._watchers: dict[str, asyncio.Task] = {}
@@ -122,6 +150,12 @@ class FleetManager:
         # can see why the capacity is lower than the configuration says.
         self._unconfirmed: dict[str, _Reserved] = {}
         self._generation = 0
+        # Replacement bookkeeping: how often each slot has had to be refilled,
+        # which slots are being refilled right now, and whether the router is
+        # shutting down -- a replacement must not outlive stop_all().
+        self._restarts: dict[str, _Restarts] = {}
+        self._replacing: dict[str, bool] = {}
+        self._closing = False
 
     @property
     def pool(self) -> HostPool:
@@ -140,6 +174,11 @@ class FleetManager:
             "unconfirmed": {
                 name: held.reason for name, held in sorted(self._unconfirmed.items())
             },
+            # Being refilled right now, and given up on after too many tries.
+            "replacing": sorted(self._replacing),
+            "abandoned": sorted(
+                name for name, record in self._restarts.items() if record.given_up
+            ),
         }
 
     # --- growing ----------------------------------------------------------
@@ -151,11 +190,15 @@ class FleetManager:
         not usable yet; the health poller promotes it when its model is up.
         """
         slot = self._pool.allocate()  # synchronous: no await may split this
-        try:
-            launched = await self._pool.launch(slot)
-        except LaunchError:
-            # launch() already released the slot.
-            raise
+        # An operator launch starts that slot's history over. The restart cap
+        # exists to stop the router spending model loads on its own, not to stop
+        # a human who has decided the slot is worth another try.
+        self._restarts.pop(slot.name, None)
+        return await self._launch_on(slot)
+
+    async def _launch_on(self, slot: Slot) -> ReplicaSpec:
+        """Start a replica on a slot that is already reserved."""
+        launched = await self._pool.launch(slot)  # releases the slot if it fails
         self._adopt_instance(slot, launched.spec, ready=False)
         self._write_state()
         return launched.spec
@@ -166,32 +209,65 @@ class FleetManager:
         instance = _Instance(slot=slot, generation=self._generation, spec=spec)
         self._owned[instance.name] = instance
         self._registry.add(spec, ready=ready, owned=True)
-        if not ready:
-            self._watchers[instance.name] = asyncio.create_task(
-                self._watch_launch(instance.name)
-            )
+        # Watched even when it is already serving: a replica adopted from a
+        # previous run used to get no supervisor at all, and neither did any
+        # replica once it had been promoted.
+        self._watchers[instance.name] = asyncio.create_task(
+            self._watch_instance(instance.name, instance.generation, ready=ready)
+        )
         return instance
 
-    async def _watch_launch(self, name: str) -> None:
-        """Stop a replica that never becomes ready, so its device comes back."""
+    def _poll_step(self, deadline: float) -> float:
+        """How often a watcher looks, for a deadline of this size.
+
+        Never slower than 5s (a model load is minutes), never faster than 50ms,
+        and never coarser than the deadline itself, so a short deadline is
+        honoured rather than rounded up to the next poll.
+        """
+        return max(0.05, min(5.0, self._config.health_interval_seconds, deadline))
+
+    def _is_current(self, name: str, generation: int) -> bool:
+        """Is this still the instance the watcher was started for?
+
+        A watcher asleep in its poll when its replica is replaced would wake to
+        find the replacement unready -- it is loading -- and declare *it* dead.
+        """
+        instance = self._owned.get(name)
+        return instance is not None and instance.generation == generation
+
+    async def _watch_instance(self, name: str, generation: int, *, ready: bool) -> None:
+        """Supervise one instance for as long as it is the one on its slot.
+
+        Two phases. Until it first reports ready this is the launch timeout: a
+        replica that never comes up is stopped so its devices come back, and it
+        is deliberately *not* replaced -- a launch that never succeeded is a bad
+        configuration or a bad checkpoint, and relaunching it is a crash loop by
+        construction.
+
+        After that comes the case nothing watched before: a replica that was
+        serving and stopped. That one is replaced, because capacity returning
+        without a human is the point of owning the launch at all.
+        """
+        if not ready and not await self._await_ready(name, generation):
+            return
+        await self._await_death(name, generation)
+
+    async def _await_ready(self, name: str, generation: int) -> bool:
+        """Wait for a launch to report ready. False if it never did."""
         deadline = self._config.launch_timeout_seconds
+        step = self._poll_step(deadline)
         waited = 0.0
-        # Never slower than 5s (a model load is minutes), never faster than 50ms,
-        # and never coarser than the deadline itself, so a short timeout is
-        # honoured rather than rounded up to the next poll.
-        step = max(0.05, min(5.0, self._config.health_interval_seconds, deadline))
-        try:
-            while waited < deadline:
-                state = self._registry.state(name)
-                if state is None:
-                    return  # removed by someone else
-                if state.ready:
-                    logger.info("replica %s reported ready after %.0fs", name, waited)
-                    return
-                await asyncio.sleep(step)
-                waited += step
-        except asyncio.CancelledError:
-            raise
+        while waited < deadline:
+            if not self._is_current(name, generation):
+                return False
+            state = self._registry.state(name)
+            if state is None:
+                return False  # removed by someone else
+            if state.ready:
+                logger.info("replica %s reported ready after %.0fs", name, waited)
+                return True
+            await asyncio.sleep(step)
+            waited += step
         logger.error(
             "replica %s never became ready within the %.0fs launch timeout; stopping it and "
             "freeing its device(s). If the model was still loading -- DeepSeek V4 needs well "
@@ -199,6 +275,124 @@ class FleetManager:
             name, deadline, self._pool.log_path_for(name) or "the host's log_dir",
         )
         await self.stop(name, drain=False)
+        return False
+
+    def _death_dwell(self) -> float:
+        """How long unroutable means dead rather than briefly unwell.
+
+        Floored at two probe intervals, because a dwell shorter than that cannot
+        see a recovery: it would pay a whole model load for a replica whose next
+        probe would have answered 200.
+        """
+        return max(
+            self._config.replace_after_seconds, 2 * self._config.health_interval_seconds
+        )
+
+    async def _await_death(self, name: str, generation: int) -> None:
+        """Replace this instance once it has been unroutable for the dwell.
+
+        The registry is polled rather than hooked, because the health poller is
+        not the only thing that demotes a replica: the proxy does it too, on any
+        request it could not deliver, with no threshold at all. That is the
+        earlier and more certain signal, and only the registry sees both.
+        """
+        if not self._config.replace_dead:
+            return
+        dwell = self._death_dwell()
+        step = self._poll_step(dwell)
+        unready_for = 0.0
+        ready_for = 0.0
+        while unready_for < dwell:
+            if not self._is_current(name, generation):
+                return
+            state = self._registry.state(name)
+            if state is None or state.draining:
+                return  # someone is already stopping it
+            if state.ready:
+                unready_for = 0.0
+                ready_for += step
+                if ready_for >= self._config.launch_timeout_seconds:
+                    # Up long enough to be a healthy replica rather than one
+                    # more turn of a loop. Without this, a replica that dies
+                    # once a month would eventually exhaust a cap meant to
+                    # catch a replica dying once a minute.
+                    self._restarts.pop(name, None)
+            else:
+                unready_for += step
+            await asyncio.sleep(step)
+
+        instance = self._owned.get(name)
+        if instance is None or instance.generation != generation:
+            return
+        logger.error(
+            "replica %s has been unroutable for %.0fs; retiring it and refilling slot %s. "
+            "%s holds its output",
+            name, dwell, name, instance.slot.log_path,
+        )
+        await self._replace(instance)
+
+    async def _replace(self, instance: _Instance) -> None:
+        """Retire a dead instance, then start another on its slot.
+
+        Stop first and launch second, never overlapped. A replacement started
+        before the old one is confirmed gone would need a second device group,
+        and two serving processes on one card is the thing this module exists to
+        prevent.
+        """
+        name = instance.name
+        self._replacing[name] = True
+        try:
+            if not await self.stop(name, drain=True):
+                # The stop could not be confirmed, so the slot is reserved and a
+                # human has to free it. Launching onto it could put a second
+                # process on cards the first may still hold.
+                return
+            if self._closing or not self._replacing.get(name):
+                return
+            record = self._restarts.setdefault(name, _Restarts())
+            record.count += 1
+            if record.count > MAX_RESTARTS:
+                record.given_up = True
+                logger.error(
+                    "slot %s has lost %d replicas in a row; not launching another. The slot "
+                    "is free, so POST /replicas or a restart will use it again once whatever "
+                    "is wrong with it is fixed; %s holds the last one's output",
+                    name, MAX_RESTARTS, instance.slot.log_path,
+                )
+                return
+            slot = self._pool.reserve(name)
+            if slot is None:
+                logger.warning(
+                    "slot %s was taken while its replacement was being prepared", name
+                )
+                return
+            # Reserved before the wait, so the slot is honestly accounted for --
+            # out of free_slots and reported as replacing -- rather than looking
+            # available to a concurrent launch for the whole backoff.
+            await asyncio.sleep(self._backoff(record.count))
+            if self._closing or not self._replacing.get(name):
+                self._pool.release(name)
+                return
+            await self._launch_on(slot)
+        except Exception:  # noqa: BLE001 - a failed replacement must not kill the watcher
+            logger.exception("replacing replica %s failed", name)
+        finally:
+            self._replacing.pop(name, None)
+
+    def _backoff(self, attempt: int) -> float:
+        return min(RESTART_BACKOFF_CAP_SECONDS, self._restart_backoff * 2 ** (attempt - 1))
+
+    def cancel_replacement(self, name: str) -> bool:
+        """Call off a replacement that has not launched yet.
+
+        Returns whether there was one. Without this a DELETE arriving between
+        the stop and the launch answers 404 -- the registry entry is already
+        gone -- and the replica the operator just retired comes back anyway.
+        """
+        if name not in self._replacing:
+            return False
+        self._replacing[name] = False
+        return True
 
     async def launch_initial(self) -> list[ReplicaSpec]:
         """Start the replicas the configuration asks for at boot.
@@ -381,6 +575,10 @@ class FleetManager:
 
     async def stop_all(self) -> None:
         """Stop every owned replica. Called on an explicit shutdown, not a crash."""
+        # Before anything else: a replacement between its stop and its launch is
+        # no longer in _owned, so the snapshot below cannot see it and the
+        # lifespan would exit leaving a fresh process holding a card.
+        self._closing = True
         names = list(self._owned)
         if not names:
             return
@@ -560,4 +758,4 @@ class FleetManager:
         return False
 
 
-__all__ = ["FleetManager", "PoolExhausted"]
+__all__ = ["MAX_RESTARTS", "RESTART_BACKOFF_SECONDS", "FleetManager", "PoolExhausted"]

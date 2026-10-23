@@ -31,6 +31,7 @@ from pypto_serving.router.config import (
     DEFAULT_DRAIN_TIMEOUT_SECONDS,
     DEFAULT_HEALTH_INTERVAL_SECONDS,
     DEFAULT_LAUNCH_TIMEOUT_SECONDS,
+    DEFAULT_REPLACE_AFTER_SECONDS,
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_SESSION_TTL_SECONDS,
     RouterConfig,
@@ -194,6 +195,9 @@ class ServingRouter:
             "ready": state.ready,
             "draining": state.draining,
             "owned": state.owned,
+            # starting / ready / draining / failed. "ready" alone could not say
+            # whether an unroutable replica was still loading or had died.
+            "phase": state.phase,
             "outstanding": state.outstanding,
             "routed": state.routed,
         }
@@ -239,6 +243,14 @@ class ServingRouter:
             return self._unauthorized()
         state = self.registry.state(name)
         if state is None:
+            # Checked before the 404: between a dead replica's stop and its
+            # replacement's launch there is no registry entry, and answering
+            # "no such replica" there would let the one the operator just
+            # retired come back a moment later.
+            if self.fleet.cancel_replacement(name):
+                return JSONResponse({"name": name, "stopped": True,
+                                     "message": "its replacement was called off",
+                                     "capacity": self.fleet.capacity()})
             return JSONResponse(
                 status_code=404,
                 content={"object": "error", "message": f"no replica named {name!r}"},
@@ -273,6 +285,9 @@ class ServingRouter:
         payload = {
             "status": "ok" if ready else "no_replicas",
             "replicas_ready": ready,
+            # Reported here and not only on /replicas, which needs the admin
+            # token: how many replicas died is operational, not administrative.
+            "replicas_failed": self.registry.failed_count(),
             "replicas_total": len(self.registry.states),
             "sessions": len(self.sessions),
             "routed": self.registry.total_routed(),
@@ -280,7 +295,7 @@ class ServingRouter:
             "rejected": self.registry.rejected,
             "replicas": [
                 {"name": s.name, "url": s.spec.base_url, "ready": s.ready,
-                 "outstanding": s.outstanding, "routed": s.routed}
+                 "phase": s.phase, "outstanding": s.outstanding, "routed": s.routed}
                 for s in self.registry.states
             ],
         }
@@ -357,6 +372,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--drain-timeout", type=float, default=DEFAULT_DRAIN_TIMEOUT_SECONDS,
                         help="Seconds to wait for in-flight requests before stopping a replica "
                              f"(default: {DEFAULT_DRAIN_TIMEOUT_SECONDS:g}).")
+    parser.add_argument("--replace-after", type=float, default=DEFAULT_REPLACE_AFTER_SECONDS,
+                        metavar="SECONDS",
+                        help="Seconds a replica may stay unroutable before the router retires it "
+                             "and launches another on the same device(s) "
+                             f"(default: {DEFAULT_REPLACE_AFTER_SECONDS:g}).")
+    parser.add_argument("--no-replace-dead", action="store_true",
+                        help="Leave a replica that died in place instead of replacing it. Its "
+                             "device(s) stay held, which is what you want while investigating "
+                             "one.")
     parser.add_argument("--state-file", default=None, metavar="PATH",
                         help="Where to record launched replicas so a restarted router can adopt "
                              "them instead of paying for a fresh model load.")
@@ -406,6 +430,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             connect_timeout_seconds=args.connect_timeout,
             launch_timeout_seconds=args.launch_timeout,
             drain_timeout_seconds=args.drain_timeout,
+            replace_dead=not args.no_replace_dead,
+            replace_after_seconds=args.replace_after,
             initial_replicas=initial,
             max_replicas=args.max_replicas,
         )

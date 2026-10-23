@@ -70,7 +70,8 @@ def _hosts(local_devices=(0,), remote_devices=(0, 1)) -> tuple[HostSpec, ...]:
 
 def _fleet(*, initial=0, max_replicas=None, transport=None, state_path=None,
            hosts=None, replicas=(), drain_timeout=5.0, launch_timeout=5.0, probe=None,
-           alive_probe=None, stop_grace=0.3):
+           alive_probe=None, stop_grace=0.3, replace_after=None, restart_backoff=0.01,
+           replace_dead=True):
     config = RouterConfig(
         replicas=replicas,
         hosts=_hosts() if hosts is None else hosts,
@@ -79,6 +80,8 @@ def _fleet(*, initial=0, max_replicas=None, transport=None, state_path=None,
         drain_timeout_seconds=drain_timeout,
         launch_timeout_seconds=launch_timeout,
         health_interval_seconds=0.01,
+        replace_dead=replace_dead,
+        **({} if replace_after is None else {"replace_after_seconds": replace_after}),
     )
     sessions = SessionDirectory(config.session_ttl_seconds)
     registry = ReplicaRegistry(config, sessions)
@@ -89,6 +92,8 @@ def _fleet(*, initial=0, max_replicas=None, transport=None, state_path=None,
         # Shrunk from 30s: these tests assert what happens at both ends of the
         # grace period, and waiting it out would dominate the suite.
         stop_grace=stop_grace,
+        # Likewise the 10s a replacement waits for the dead process to let go.
+        restart_backoff=restart_backoff,
     )
     return manager, registry, fake
 
@@ -540,7 +545,7 @@ def test_get_replicas_reports_the_fleet_and_what_is_left():
     assert payload["replicas"][0]["owned"] is True
     assert payload["capacity"] == {
         "owned": 1, "ceiling": 3, "free_slots": ["node02-d0", "node02-d1"],
-        "unconfirmed": {},
+        "unconfirmed": {}, "replacing": [], "abandoned": [],
     }
 
 

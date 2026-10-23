@@ -72,6 +72,8 @@ One slot per group of `devices_per_replica` devices, taken from `devices` in ord
 | `--max-replicas N` | declared pool | Cap launched replicas below the declared devices. |
 | `--launch-timeout SECONDS` | `600` | How long a launch may take to report ready before it is stopped and its devices released. Measured loads: Qwen3-14B ~130s warm, DeepSeek V4 ~370s on eight cards. Load times move with the checkpoint and the stack, so time your own and leave headroom — too low means the router stops a replica that was loading normally. |
 | `--drain-timeout SECONDS` | `300` | How long to wait for in-flight requests before stopping a replica. |
+| `--replace-after SECONDS` | `30` | How long a replica that was serving may stay unroutable before the router retires it and launches another on the same device(s). Floored at two health intervals: a shorter dwell cannot see a recovery, so it would pay a whole model load for a replica whose next probe would have answered. |
+| `--no-replace-dead` | off | Leave a replica that died where it is, devices and all. What you want while investigating one. |
 | `--state-file PATH` | none | Records launched replicas so a restarted router can adopt them instead of paying for a fresh model load. |
 | `--admin-token TOKEN` | none | Require `Authorization: Bearer TOKEN` on `/replicas`. |
 
