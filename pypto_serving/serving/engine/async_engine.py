@@ -62,6 +62,19 @@ from pypto_serving.tools.profile import (
 
 logger = logging.getLogger(__name__)
 
+# How long to wait at each stage of reaping a worker, after the cooperative
+# shutdown command has had its turn. A worker inside a device call cannot be
+# interrupted, so each stage escalates once instead of repeating a signal that
+# has already been delivered.
+WORKER_TERM_GRACE_SECONDS = 10.0
+WORKER_KILL_GRACE_SECONDS = 5.0
+# How long to give the engine loop to notice it is stopping before the worker is
+# reaped without it. Clearing _running does not interrupt a pending read, and the
+# loop usually sits in a worker read governed by SERVING_WORKER_STEP_TIMEOUT --
+# twenty minutes by default -- so waiting it out would put the whole bounded
+# sequence behind an unbounded wait. Stopping the worker is what ends that read.
+LOOP_DRAIN_GRACE_SECONDS = 5.0
+
 
 @dataclass
 class EngineConfig:
@@ -250,6 +263,10 @@ class ReplicaEngineCore:
         self._input_queue = None
         self._output_queue = None
         self._profile_output_queue = None
+        # Sticky: set once a worker has outlived every signal. The handle is
+        # dropped at that point, so without it the next stop sees no process and
+        # reports a clean one.
+        self._worker_stranded = False
         self._profile_lock = asyncio.Lock()
         # Tracks which request_ids the worker has already received via
         # NewRequestData — prompt tokens are sent exactly once per request.
@@ -379,15 +396,18 @@ class ReplicaEngineCore:
             and self._worker_process.is_alive()
         )
 
-    async def stop(self) -> None:
-        """Stop engine loop and worker process."""
-        self._running = False
-        if self._loop_task is not None:
-            await self._loop_task
-            self._loop_task = None
+    async def stop(self) -> bool:
+        """Stop engine loop and worker process.
 
-        await asyncio.to_thread(self._shutdown_worker, timeout=30)
-        logger.info("ReplicaEngineCore stopped")
+        False means the worker outlived every signal, so its devices are still
+        held and the caller must not report a clean stop.
+        """
+        self._running = False
+        await self._drain_loop_task()
+        reaped = await asyncio.to_thread(self._shutdown_worker, timeout=30)
+        if reaped:
+            logger.info("ReplicaEngineCore stopped")
+        return reaped
 
     async def start_profile(self) -> None:
         """Start SA profiling in this replica's worker."""
@@ -1250,27 +1270,109 @@ class ReplicaEngineCore:
         )
         return delta
 
-    def _shutdown_worker(self, *, timeout: float) -> None:
+    def _shutdown_worker(self, *, timeout: float) -> bool:
+        """Stop the worker and reap it. Returns whether it is really gone.
+
+        Three stages, each escalating once rather than repeating itself: ask the
+        worker to stop, SIGTERM, SIGKILL. Re-sending a signal buys nothing --
+        one already pending is not queued twice, and a worker blocked in an
+        uninterruptible device call is no more reachable by the second than by
+        the first -- so what is repeated is the waiting, not the signal.
+
+        Returning before the worker is reaped is what strands device memory: the
+        HTTP endpoint closes with this process, so from the outside the replica
+        looks stopped while its cards are still held, and whatever is launched
+        onto them next fails for want of memory. If even SIGKILL leaves it
+        alive, that is reported rather than passed off as a clean stop.
+        """
         input_q = self._input_queue
         process = self._worker_process
-
-        if input_q is not None:
-            with contextlib.suppress(Exception):
-                # New protocol: send encoded ShutdownCommand bytes.
-                input_q.put(encode_command(ShutdownCommand()))
-
-        if process is not None:
-            with contextlib.suppress(Exception):
-                process.join(timeout=timeout)
-            with contextlib.suppress(Exception):
-                if process.is_alive():
-                    process.terminate()
-                    process.join(timeout=1)
-
         self._worker_process = None
         self._input_queue = None
         self._output_queue = None
         self._profile_output_queue = None
+
+        if process is None:
+            # Not necessarily "nothing to do": a worker that survived an earlier
+            # stop left its handle cleared behind it. start() shuts the worker
+            # down when initialization fails and the caller then calls stop(),
+            # so the second call must not call devices reclaimed that the first
+            # one could not reclaim.
+            return not self._worker_stranded
+
+        if input_q is not None:
+            with contextlib.suppress(Exception):
+                # Cooperative first: the worker closes its own device context.
+                input_q.put(encode_command(ShutdownCommand()))
+            if self._reap(process, timeout):
+                return True
+
+        with contextlib.suppress(Exception):
+            process.terminate()
+        if self._reap(process, WORKER_TERM_GRACE_SECONDS):
+            return True
+
+        with contextlib.suppress(Exception):
+            process.kill()
+        if self._reap(process, WORKER_KILL_GRACE_SECONDS):
+            return True
+
+        self._worker_stranded = True
+        logger.error(
+            "Worker process %s survived SIGKILL; device(s) %s may still be held. It is most "
+            "likely stuck in an uninterruptible device call, which no further signal can "
+            "reach -- the cards do not come back until it does",
+            getattr(process, "pid", "?"),
+            ",".join(str(device) for device in self.config.device_ids) or self.config.device_id,
+        )
+        return False
+
+    async def _drain_loop_task(self) -> None:
+        """Let the engine loop finish, but never wait on it to stop the worker.
+
+        Two ways this used to skip the stop entirely. A loop that raised -- and
+        nothing retrieves that exception, as is_ready() already notes -- made
+        `await self._loop_task` re-raise here, so the worker was never sent a
+        command, never signalled, and kept its devices while the parent exited.
+        And a loop still parked in a worker read does not come back for as long
+        as that read is allowed to take, which is not the shutdown's budget.
+
+        Neither is worth waiting for, and the stop no longer depends on it.
+
+        What this does not fix is the process exit. A read already dispatched
+        to the default executor keeps that thread parked -- mp.Queue.get() does
+        not wake because its writer died -- and asyncio.run() joins the default
+        executor on the way out, so the process can linger for the rest of
+        SERVING_WORKER_STEP_TIMEOUT after a stop whose stages are all bounded.
+        Its worker is reaped by then, so no device memory is held, but a
+        broker-managed launch keeps its allocation until the process is gone.
+        Closing that needs the worker read off the default executor, which is
+        the hot path and belongs in its own change.
+        """
+        task, self._loop_task = self._loop_task, None
+        if task is None:
+            return
+        done, _pending = await asyncio.wait({task}, timeout=LOOP_DRAIN_GRACE_SECONDS)
+        if task not in done:
+            logger.warning(
+                "Engine loop still running %.0fs into shutdown; stopping the worker anyway",
+                LOOP_DRAIN_GRACE_SECONDS,
+            )
+            # Best effort. A read already dispatched to a thread cannot be
+            # cancelled, so this only stops the loop from starting another one.
+            task.cancel()
+            return
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("Engine loop failed before shutdown: %s", task.exception())
+
+    @staticmethod
+    def _reap(process, timeout: float) -> bool:
+        """Wait out one stage, and say whether the worker is gone."""
+        with contextlib.suppress(Exception):
+            process.join(timeout=timeout)
+        with contextlib.suppress(Exception):
+            return not process.is_alive()
+        return False
 
 
 class AsyncLLMEngine:
@@ -1350,9 +1452,27 @@ class AsyncLLMEngine:
             await self.stop()
             raise
 
-    async def stop(self) -> None:
-        """Stop all DP engine cores."""
-        await asyncio.gather(*(core.stop() for core in reversed(self._cores)))
+    async def stop(self) -> bool:
+        """Stop all DP engine cores. False if a worker could not be reaped."""
+        # return_exceptions: without it one core's failure propagates before its
+        # siblings have finished, leaving their workers unsignalled on their
+        # devices -- the opposite of what stopping is for.
+        results = await asyncio.gather(
+            *(core.stop() for core in reversed(self._cores)), return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        for failure in failures:
+            logger.error("Stopping a replica core failed: %s", failure)
+        # ``is False`` rather than falsy: a core that reports nothing is not a
+        # core that reported a failure. A core that raised is counted too -- what
+        # became of its worker is exactly what it could not tell us.
+        stranded = sum(1 for result in results if result is False) + len(failures)
+        if stranded:
+            logger.error(
+                "%d of %d worker(s) could not be reaped; their device(s) are still held",
+                stranded, len(results),
+            )
+        return not stranded
 
     def is_ready(self) -> bool:
         """Report whether every replica core can still serve requests."""
