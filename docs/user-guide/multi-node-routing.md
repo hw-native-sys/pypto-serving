@@ -203,13 +203,13 @@ A slot only returns to the pool once the stop is confirmed: the stop command has
 
 A replica that was serving and then stops answering is retired and replaced on the same device group, with no operator involved. Nothing used to do this: the health poller took it out of rotation and there it stayed, unroutable, holding its cards, reported exactly like a replica still loading its model.
 
-The sequence, with the defaults: one or two failed probes take it out of rotation within a few seconds, so traffic stops reaching it almost at once; `--replace-after` (30s) then decides that unroutable means dead rather than briefly unwell; the replica is drained and stopped like any other, and only once that stop is **confirmed** is another launched on its slot. A stop that cannot be confirmed is never launched onto — the slot stays reserved under `capacity.unconfirmed`, because putting a second process on cards the first may still hold is worse than running short.
+The sequence, with the defaults: one or two failed probes take it out of rotation within a few seconds, so traffic stops reaching it almost at once; `--replace-after` (30s, floored at two health intervals -- so with `--health-interval` above 15s that floor is what applies) then decides that unroutable means dead rather than briefly unwell; the replica is drained and stopped like any other, and only once that stop is **confirmed** is another launched on its slot. A stop that cannot be confirmed is never launched onto — the slot stays reserved under `capacity.unconfirmed`, because putting a second process on cards the first may still hold is worse than running short.
 
 A slot that keeps losing replicas is given up on: three in a row, with the wait between attempts doubling from 10s, and then the slot is left free and listed under `capacity.abandoned`. The router will not use it again by itself; `POST /replicas` or a restart will, once whatever is wrong with it is fixed.
 
 `/replicas` and `/health` carry a `phase` per replica — `starting`, `ready`, `draining` or `failed` — and `/health` counts the failed ones in `replicas_failed`. Before this, a dead replica and one three minutes into a model load were the same JSON.
 
-Measured on two cards with Qwen3-14B: a replica killed outright was out of rotation in 7s, the router began replacing it 52s after the death, and the fleet was back to full strength 199s after it, with the surviving replica serving both users throughout — 288 turns, no failures.
+Measured on two cards with Qwen3-14B at the default settings: a replica killed outright was out of rotation in 7s, the router began replacing it 52s after the death, and the fleet was back to full strength 199s after it, with the surviving replica serving both users throughout — 288 turns, no failures.
 
 Concurrent `DELETE`s for the same replica share one retirement rather than running one each, and the cleanup is keyed on the instance that was launched, not on the slot name — the name is reused by whatever replica comes next.
 

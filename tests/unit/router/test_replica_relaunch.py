@@ -20,9 +20,15 @@ when the router decides a replica is dead, and what it does about it.
 from __future__ import annotations
 
 import asyncio
+import json
 
 from pypto_serving.router.fleet import MAX_RESTARTS
-from tests.unit.router.test_launcher import _fleet, _FakeTransport
+from tests.unit.router.test_launcher import (
+    _AdminRequest,
+    _fleet,
+    _FakeTransport,
+    _router_with_pool,
+)
 
 
 def _launches(transport: _FakeTransport) -> int:
@@ -237,6 +243,71 @@ def test_a_delete_during_a_replacement_is_not_resurrected():
     assert launches == 1, "the cancelled replacement launched anyway"
     assert "local-d0" in capacity["free_slots"], "a cancelled replacement left its slot reserved"
     assert capacity["replacing"] == []
+
+
+def test_a_delete_during_the_replacements_own_drain_is_not_resurrected():
+    """The window the first guard missed.
+
+    A replacement arms itself and *then* drains, and a drain can last the whole
+    drain timeout. A DELETE arriving in there finds the registry entry present
+    and draining, joins the retirement already running, and is answered
+    "stopped" -- while the replacement, still armed, puts the replica back.
+    """
+    async def scenario():
+        # The real handler, because the fix is the order it does things in.
+        router, transport = _router_with_pool(
+            replace_after_seconds=0.05, drain_timeout_seconds=3.0,
+        )
+        created = json.loads((await router._add_replica(_AdminRequest())).body)
+        name = created["name"]
+        router.registry.set_ready(name, True)
+        await asyncio.sleep(0.05)
+        router.registry.acquire(name)  # one request in flight, so the drain waits
+        router.registry.set_ready(name, False)
+        assert await _until(lambda: router.fleet.capacity()["replacing"] == [name])
+
+        response = await router._remove_replica(name, _AdminRequest())
+        await asyncio.sleep(0.5)
+        return response.status_code, _launches(transport), router.fleet.capacity()
+
+    status, launches, capacity = asyncio.run(scenario())
+    assert status == 200, "the operator was not told the replica had stopped"
+    assert launches == 1, "the retired replica came back anyway"
+    assert "local-d0" in capacity["free_slots"]
+
+
+def test_a_shutdown_during_the_launch_does_not_leave_a_replica_behind():
+    """stop_all cannot see a replacement that has not been registered yet.
+
+    Its snapshot of what is owned is taken before _adopt_instance runs, so a
+    launch still in flight is invisible to it and the router would exit with a
+    process it had just started holding a card.
+    """
+    class _SlowTransport(_FakeTransport):
+        """A launch that takes long enough for a shutdown to overtake it."""
+
+        async def run(self, host, argv, env, *, detach=False, log_path=None):
+            await super().run(host, argv, env, detach=detach, log_path=log_path)
+            if detach:
+                await asyncio.sleep(1.0)
+
+    async def scenario():
+        transport = _SlowTransport()
+        fleet, registry, _ = _fleet(probe=None, replace_after=0.05, transport=transport)
+        spec = await fleet.launch_one()
+        await _promote(registry, fleet, spec.name)
+
+        await _die(registry, spec.name)
+        # The replacement's launch command has gone out and has not returned.
+        assert await _until(lambda: _launches(transport) == 2)
+        await fleet.stop_all()
+        await asyncio.sleep(2.0)
+        return fleet.owned_names, _stops(transport), fleet.capacity()
+
+    owned, stops, capacity = asyncio.run(scenario())
+    assert owned == (), "the router exited owning a replica it had just launched"
+    assert stops == 2, "the overtaken replacement was never stopped"
+    assert capacity["owned"] == 0
 
 
 def test_the_dwell_is_never_shorter_than_two_probe_intervals():

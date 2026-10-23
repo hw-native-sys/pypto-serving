@@ -373,7 +373,19 @@ class FleetManager:
             if self._closing or not self._replacing.get(name):
                 self._pool.release(name)
                 return
-            await self._launch_on(slot)
+            spec = await self._launch_on(slot)
+            if self._closing or not self._replacing.get(name):
+                # Both can arrive while the launch is in flight, and neither
+                # can be seen from outside: stop_all() snapshots _owned before
+                # _adopt_instance has added this one, and a cancelled
+                # replacement has already been answered "called off". Retire
+                # what we just started rather than leave a replica holding a
+                # card with nothing left to stop it.
+                logger.warning(
+                    "replacement %s was overtaken while it was launching; stopping it",
+                    spec.name,
+                )
+                await self.stop(name, drain=False)
         except Exception:  # noqa: BLE001 - a failed replacement must not kill the watcher
             logger.exception("replacing replica %s failed", name)
         finally:

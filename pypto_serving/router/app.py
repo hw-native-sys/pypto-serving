@@ -261,6 +261,12 @@ class ServingRouter:
                 content={"object": "error",
                          "message": f"replica {name!r} was not launched by this router"},
             )
+        # Disarmed before the stop, not only once the entry has gone: a
+        # replacement sets its flag and *then* drains, which can take the whole
+        # drain timeout. A DELETE inside that window joins the retirement
+        # already running and is answered "stopped", while the replacement --
+        # still armed -- puts the replica back a moment later.
+        self.fleet.cancel_replacement(name)
         stopped = await self.fleet.stop(name)
         if not stopped:
             # Out of rotation, but its devices are in an unknown state, so the

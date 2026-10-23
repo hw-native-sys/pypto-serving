@@ -65,26 +65,36 @@ class _Cluster:
             }),
             encoding="utf-8",
         )
-        self.procs: dict[str, subprocess.Popen] = {
-            name: subprocess.Popen(
-                [sys.executable, str(STUB), "--port", str(port), "--name", name],
+        # Set before anything is spawned, so the cleanup below can run no
+        # matter how far the startup got: a cluster that fails to come up used
+        # to leave its stubs and its router running on their ports, which is
+        # the one moment a developer most needs a clean session.
+        self.procs: dict[str, subprocess.Popen] = {}
+        self.router: subprocess.Popen | None = None
+        try:
+            self.procs = {
+                name: subprocess.Popen(
+                    [sys.executable, str(STUB), "--port", str(port), "--name", name],
+                    cwd=str(REPO_ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                for name, port in self.ports.items()
+            }
+            self.router = subprocess.Popen(
+                [
+                    sys.executable, "-m", "pypto_serving.router.app",
+                    "--replicas", str(table),
+                    "--port", str(self.router_port),
+                    "--health-interval", str(health_interval),
+                ],
                 cwd=str(REPO_ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-            for name, port in self.ports.items()
-        }
-        self.router = subprocess.Popen(
-            [
-                sys.executable, "-m", "pypto_serving.router.app",
-                "--replicas", str(table),
-                "--port", str(self.router_port),
-                "--health-interval", str(health_interval),
-            ],
-            cwd=str(REPO_ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        for port in self.ports.values():
-            _await_ready(f"http://127.0.0.1:{port}/health")
-        _await_ready(self.url("/health"))
-        assert _await(lambda: self.health()["replicas_ready"] == 2), "the router never saw both"
+            for port in self.ports.values():
+                _await_ready(f"http://127.0.0.1:{port}/health")
+            _await_ready(self.url("/health"))
+            assert _await(lambda: self.health()["replicas_ready"] == 2), "the router never saw both"
+        except BaseException:
+            self.close()
+            raise
 
     def url(self, path: str) -> str:
         return f"http://127.0.0.1:{self.router_port}{path}"
@@ -113,9 +123,10 @@ class _Cluster:
             return exc.code, exc.read()
 
     def close(self) -> None:
-        for proc in [*self.procs.values(), self.router]:
+        running = [proc for proc in [*self.procs.values(), self.router] if proc is not None]
+        for proc in running:
             proc.terminate()
-        for proc in [*self.procs.values(), self.router]:
+        for proc in running:
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -212,12 +223,16 @@ def test_a_stream_whose_replica_dies_mid_flight_ends_instead_of_hanging(unwatche
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
+    received = b""
+    response = OPENER.open(request, timeout=30.0)
+    assert response.status == 200, "the first chunk went out before the replica died"
     try:
-        with OPENER.open(request, timeout=30.0) as response:
-            assert response.status == 200, "the first chunk went out before the replica died"
-            received = b"".join(response)
-    except Exception as exc:  # noqa: BLE001 - a reset is one of the two honest outcomes
-        received = getattr(exc, "partial", b"")
+        for chunk in response:
+            received += chunk
+    except Exception:  # noqa: BLE001 - a reset is one of the two honest outcomes
+        pass
+    finally:
+        response.close()
 
     assert b"hello" in received, "the replica died before the stream started; nothing mid-flight"
     assert b"data: [DONE]" not in received, "a truncated stream must not look complete"
