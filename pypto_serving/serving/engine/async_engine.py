@@ -17,11 +17,12 @@ import time
 from collections import deque
 from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Callable
+from typing import Callable, Literal
 
 from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
 from pypto_serving.observability import InMemoryStatLogger, IterationStats, SchedulerStats
+from pypto_serving.serving.agentinfer_admission import AgentInferAdmission, AgentInferOptions
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.reasoning import (
@@ -93,6 +94,8 @@ class EngineConfig:
     # Feature flags
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
+    agentinfer_mode: Literal["disabled", "enforce"] = "disabled"
+    agentinfer_config: AgentInferOptions = field(default_factory=AgentInferOptions)
     # Async (pipelined) scheduling. None = auto (on). Speculative/MTP decoders
     # are supported: the scheduler optimistically reserves the upper bound of
     # tokens per step and subtracts the shortfall once the worker replies.
@@ -239,6 +242,15 @@ class ReplicaEngineCore:
         # Validate before worker startup, while the manager's pools are still lazy.
         scheduler_config.validate_cache_groups(runtime.kv_cache_groups)
         self.scheduler = Scheduler(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)
+        if self.config.agentinfer_mode not in ("disabled", "enforce"):
+            raise ValueError(f"Unsupported AgentInfer mode: {self.config.agentinfer_mode}")
+        if self.config.agentinfer_mode != "disabled" and runtime.kv_cache_groups:
+            raise ValueError("AgentInfer requires a generic KV cache pool")
+        if self.config.agentinfer_mode == "enforce" and (
+            self.config.executor_cls != "PyptoQwen14BExecutor" or not self.config.enable_prefix_cache
+        ):
+            raise ValueError("AgentInfer enforce requires Qwen with prefix caching enabled")
+        self._agentinfer_admission: AgentInferAdmission | None = None
 
         self._request_contexts: dict[str, _RequestContext] = {}
         self._running = False
@@ -352,6 +364,15 @@ class ReplicaEngineCore:
                     self._runtime.page_size,
                 )
 
+            if self.config.agentinfer_mode == "enforce":
+                try:
+                    self._agentinfer_admission = AgentInferAdmission(
+                        self.config.dp_rank, self.scheduler, self.kv_cache_manager, self.config.agentinfer_config,
+                    )
+                except BaseException:
+                    await asyncio.to_thread(self._shutdown_worker, timeout=5)
+                    raise
+
         # The KV-cache block pool, scheduler tables and tokenizer are now
         # resident. Freeze the engine-process heap so the GC won't rescan them
         # during serving (see gc_utils). Per-process: the worker freezes its
@@ -381,10 +402,17 @@ class ReplicaEngineCore:
 
     async def stop(self) -> None:
         """Stop engine loop and worker process."""
+        admission = getattr(self, "_agentinfer_admission", None)
+        if admission is not None:
+            for request_id in admission.retained_request_ids:
+                await self.abort_request(request_id)
         self._running = False
         if self._loop_task is not None:
             await self._loop_task
             self._loop_task = None
+
+        if admission is not None:
+            admission.close()
 
         await asyncio.to_thread(self._shutdown_worker, timeout=30)
         logger.info("ReplicaEngineCore stopped")
@@ -441,6 +469,10 @@ class ReplicaEngineCore:
             load += prompt_remaining + generation_remaining
         return load
 
+    def observe_agent_lifecycle(self, session_id: str, request_id: str, lifecycle: str) -> bool:
+        admission = getattr(self, "_agentinfer_admission", None)
+        return admission.observe_lifecycle(session_id, request_id, lifecycle) if admission is not None else False
+
     async def add_request(
         self,
         request_id: str,
@@ -451,6 +483,7 @@ class ReplicaEngineCore:
         prompt_token_ids: Sequence[int] | None = None,
         output_parser_spec: OutputParserSpec | None = None,
         constraint_spec: ConstraintSpec | None = None,
+        agent_session_id: str | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
         with profile_span(
@@ -479,10 +512,21 @@ class ReplicaEngineCore:
                 stream=getattr(config, "stream", True),
                 output_parser=create_output_parser(output_parser_spec, self.tokenizer),
             )
-            self.scheduler.add_request(request)
-            # Registration can reject a request before the generator reaches its
-            # cleanup finally block. Do not retain an orphaned context in that case.
             self._request_contexts[request_id] = ctx
+            admission = getattr(self, "_agentinfer_admission", None)
+            try:
+                if admission is not None and agent_session_id is not None:
+                    self.scheduler.validate_request(request)
+                admitted = admission.arrive(request, agent_session_id) if (
+                    admission is not None and agent_session_id is not None
+                ) else True
+                if admitted:
+                    self.scheduler.add_request(request)
+            except BaseException:
+                self._request_contexts.pop(request_id, None)
+                if admission is not None:
+                    admission.cancel(request_id)
+                raise
             stat_logger = getattr(self, "_stat_logger", None)
             if stat_logger is not None:
                 stat_logger.record_queued(getattr(self, "_engine_index", 0), request_id)
@@ -526,7 +570,10 @@ class ReplicaEngineCore:
             # membership check and freeing the same request on the worker twice.
             if not finished_normally and request_id in self._request_contexts:
                 self._request_contexts.pop(request_id, None)
-                self.scheduler.abort_request(request_id)
+                admission = getattr(self, "_agentinfer_admission", None)
+                retained = admission.cancel(request_id) if admission is not None else False
+                if not retained:
+                    self.scheduler.abort_request(request_id)
                 stat_logger = getattr(self, "_stat_logger", None)
                 if stat_logger is not None:
                     stat_logger.finish_request(
@@ -537,7 +584,8 @@ class ReplicaEngineCore:
                 # Aborted/cancelled ids must ride the next StepCommand's
                 # finished_request_ids, otherwise they leak in _req_cache /
                 # _worker_known_req_ids and pin device resources.
-                self._schedule_worker_free(request_id)
+                if not retained:
+                    self._schedule_worker_free(request_id)
 
     async def abort_request(self, request_id: str) -> None:
         ctx = self._request_contexts.pop(request_id, None)
@@ -545,7 +593,10 @@ class ReplicaEngineCore:
             # Already finished/cleaned up: nothing pinned to release, and the
             # scheduler no longer tracks it. Avoid scheduling a duplicate free.
             return
-        self.scheduler.abort_request(request_id)
+        admission = getattr(self, "_agentinfer_admission", None)
+        retained = admission.cancel(request_id) if admission is not None else False
+        if not retained:
+            self.scheduler.abort_request(request_id)
         self._record_scheduler_stats()
         stat_logger = getattr(self, "_stat_logger", None)
         if stat_logger is not None:
@@ -558,7 +609,8 @@ class ReplicaEngineCore:
             TokenOutput(finished=True, finish_reason="FINISHED_ABORTED")
         )
         # See note in add_request's finally block: schedule worker-side cleanup.
-        self._schedule_worker_free(request_id)
+        if not retained:
+            self._schedule_worker_free(request_id)
 
     def _schedule_worker_free(self, request_id: str) -> None:
         """Queue a request id for worker-side release on the next StepCommand.
@@ -588,6 +640,19 @@ class ReplicaEngineCore:
         """
         logger.info("Engine loop started (async_scheduling=%s)", self._async_scheduling)
         while self._running:
+            admission = getattr(self, "_agentinfer_admission", None)
+            if admission is not None:
+                for request in admission.poll():
+                    ctx = self._request_contexts.get(request.request_id)
+                    if ctx is None:
+                        continue
+                    try:
+                        self.scheduler.add_request(request)
+                    except ValueError as exc:
+                        logger.warning("request %s rejected after AgentInfer admission: %s", request.request_id, exc)
+                        self._request_contexts.pop(request.request_id, None)
+                        admission.cancel(request.request_id)
+                        ctx.queue.put_nowait(exc)
             dispatched = False
             if len(self._batch_queue) < self._max_in_flight and self.scheduler.has_work():
                 dispatched = self._try_dispatch_step()
@@ -624,6 +689,13 @@ class ReplicaEngineCore:
                 ctx.queue.put_nowait(ValueError(reason))
             if request_id in self._worker_known_req_ids:
                 self._schedule_worker_free(request_id)
+            admission = getattr(self, "_agentinfer_admission", None)
+            if admission is not None:
+                admission.cancel(request_id)
+        admission = getattr(self, "_agentinfer_admission", None)
+        if admission is not None:
+            for scheduled in scheduler_output.scheduled_requests:
+                admission.native_scheduled(scheduled)
         self._record_scheduler_stats(scheduler_output)
         # Preempted requests must release their worker-side cache / device slots;
         # queue their ids so the next StepCommand frees them.
@@ -922,6 +994,9 @@ class ReplicaEngineCore:
                     )
                 self._schedule_worker_free(request_id)
                 self.scheduler.abort_request(request_id)
+                admission = getattr(self, "_agentinfer_admission", None)
+                if admission is not None:
+                    admission.cancel(request_id)
         self._record_scheduler_stats()
 
     def _process_step_output(
@@ -1002,6 +1077,9 @@ class ReplicaEngineCore:
                     req_output.request_id,
                     completion_tokens=output_count,
                 )
+            admission = getattr(self, "_agentinfer_admission", None)
+            if admission is not None:
+                admission.progress(ctx.request)
 
             if req_output.finished:
                 # Flush the authoritative full decode: if generation ends while a
@@ -1080,6 +1158,8 @@ class ReplicaEngineCore:
                     self._request_contexts.pop(req_output.request_id, None)
                     ctx.queue.put_nowait(exc)
                     self.scheduler.abort_request(req_output.request_id)
+                    if admission is not None:
+                        admission.cancel(req_output.request_id)
                     self._schedule_worker_free(req_output.request_id)
                     if stat_logger is not None:
                         stat_logger.finish_request(engine_index, req_output.request_id, "error")
@@ -1123,6 +1203,8 @@ class ReplicaEngineCore:
             if req_output.finished:
                 # Final output owns the already-scheduled worker release. Drop
                 # the context before waking a consumer that may close at once.
+                if admission is not None:
+                    admission.complete(ctx.request)
                 self._request_contexts.pop(req_output.request_id, None)
             ctx.queue.put_nowait(token_output)
 
@@ -1300,6 +1382,9 @@ class AsyncLLMEngine:
             )
             config = replace(config, parallel_config=parallel)
 
+        if config.agentinfer_mode != "disabled" and parallel.num_replicas != 1:
+            raise ValueError("AgentInfer currently supports only single-replica serving")
+
         self.config = config
         self.tokenizer = tokenizer
         assert self.tokenizer is not None
@@ -1452,6 +1537,12 @@ class AsyncLLMEngine:
     def kv_cache_manager(self) -> KvCacheManager:
         return self._single_core().kv_cache_manager
 
+    def observe_agent_lifecycle(self, session_id: str, request_id: str, lifecycle: str) -> bool:
+        """Lifecycle routing is replica-local until AgentInfer multi-replica support exists."""
+        if self.config.agentinfer_mode != "enforce":
+            return False
+        return self._single_core().observe_agent_lifecycle(session_id, request_id, lifecycle)
+
     async def add_request(
         self,
         request_id: str,
@@ -1460,6 +1551,7 @@ class AsyncLLMEngine:
         *,
         output_parser_spec: OutputParserSpec | None = None,
         constraint_spec: ConstraintSpec | None = None,
+        agent_session_id: str | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         arrival_monotonic = time.monotonic()
         replica_idx = self._select_replica()
@@ -1494,6 +1586,8 @@ class AsyncLLMEngine:
                 request_options["output_parser_spec"] = output_parser_spec
             if constraint_spec is not None:
                 request_options["constraint_spec"] = constraint_spec
+            if agent_session_id is not None:
+                request_options["agent_session_id"] = agent_session_id
             outputs = core.add_request(
                 request_id,
                 prompt,

@@ -55,6 +55,20 @@ class KVCacheBlocks:
         return [block.block_id for block in self.blocks[0] if block.block_hash is None]
 
 
+@dataclass(frozen=True)
+class KVCacheCapacityObservation:
+    total_tokens: int
+    used_tokens: int
+    free_tokens: int
+
+
+@dataclass(frozen=True)
+class PrefixCacheObservation:
+    cached_tokens: int
+    shared_tokens: int
+    reclaimable_tokens: int
+
+
 class FreeKVCacheBlockQueue:
     """Doubly-linked free block queue in eviction order."""
 
@@ -172,6 +186,8 @@ class KvCacheManager:
         self.blocks: list[KVCacheBlock] = []
         self.free_queue = FreeKVCacheBlockQueue()
         self.hash_to_block: dict[int, KVCacheBlock] = {}
+        # Keep alternate owners only for hashes published by multiple blocks.
+        self._duplicate_hash_blocks: dict[int, dict[int, KVCacheBlock]] = {}
         self.request_blocks: dict[str, list[KVCacheBlock]] = {}
         self._group_pools: dict[str, _GroupBlockPool] = {}
         self._group_request_partitions: dict[str, int] = {}
@@ -303,8 +319,7 @@ class KvCacheManager:
                     self.release(allocated)
                 return None
             if block.block_hash is not None:
-                self.hash_to_block.pop(block.block_hash, None)
-                block.block_hash = None
+                self._forget_cached_block(block)
             block.ref_cnt = 1
             blocks.append(block)
         return blocks
@@ -349,10 +364,34 @@ class KvCacheManager:
         """Publish a full block to the prefix cache."""
         if not self.enable_prefix_cache:
             return
-        if block.block_hash is not None and block.block_hash in self.hash_to_block:
-            del self.hash_to_block[block.block_hash]
+        if block.block_hash is not None:
+            self._forget_cached_block(block)
+        owner = self.hash_to_block.get(block_hash)
+        if owner is not None:
+            duplicates = self._duplicate_hash_blocks.setdefault(block_hash, {owner.block_id: owner})
+            duplicates[block.block_id] = block
         block.block_hash = block_hash
         self.hash_to_block[block_hash] = block
+
+    def _forget_cached_block(self, block: KVCacheBlock) -> None:
+        block_hash = block.block_hash
+        if block_hash is None:
+            return
+        duplicates = self._duplicate_hash_blocks.get(block_hash)
+        if duplicates is not None:
+            duplicates.pop(block.block_id)
+            if len(duplicates) == 1:
+                self.hash_to_block[block_hash] = next(iter(duplicates.values()))
+                del self._duplicate_hash_blocks[block_hash]
+            elif duplicates:
+                if self.hash_to_block.get(block_hash) is block:
+                    self.hash_to_block[block_hash] = duplicates[next(reversed(duplicates))]
+            else:
+                del self.hash_to_block[block_hash]
+                del self._duplicate_hash_blocks[block_hash]
+        elif self.hash_to_block.get(block_hash) is block:
+            del self.hash_to_block[block_hash]
+        block.block_hash = None
 
     def cache_block_ids(self, block_ids: list[int], block_hashes: list[int], start: int, end: int) -> None:
         """Publish a range of full blocks to the prefix cache."""
@@ -426,6 +465,44 @@ class KvCacheManager:
                 break
             hit_blocks.append(block)
         return hit_blocks
+
+    def observe_capacity(self) -> KVCacheCapacityObservation:
+        """Read generic-pool capacity without changing block ownership."""
+        if self.has_groups:
+            raise NotImplementedError("Grouped KV cache capacity requires per-partition observation")
+        total = self.num_blocks * self.block_size
+        free = self.num_free_blocks * self.block_size
+        return KVCacheCapacityObservation(total, total - free, free)
+
+    def observe_prefix(
+        self,
+        token_ids: list[int],
+        *,
+        max_cache_hit_tokens: int | None = None,
+    ) -> PrefixCacheObservation:
+        """Read the reusable generic prefix without acquiring block references."""
+        if self.has_groups:
+            raise NotImplementedError("Grouped KV cache prefixes require rank-partition observation")
+        if not self.enable_prefix_cache:
+            return PrefixCacheObservation(0, 0, 0)
+        if max_cache_hit_tokens is None:
+            max_cache_hit_tokens = max(0, len(token_ids) - 1)
+        max_hit_blocks = max(0, int(max_cache_hit_tokens)) // self.block_size
+        hit_blocks = 0
+        shared_blocks = 0
+        for _, block_hash in self._iter_block_hashes(token_ids):
+            if hit_blocks >= max_hit_blocks:
+                break
+            block = self.hash_to_block.get(block_hash)
+            if block is None:
+                break
+            hit_blocks += 1
+            shared_blocks += block.ref_cnt > 0
+        return PrefixCacheObservation(
+            cached_tokens=hit_blocks * self.block_size,
+            shared_tokens=shared_blocks * self.block_size,
+            reclaimable_tokens=(hit_blocks - shared_blocks) * self.block_size,
+        )
 
     def compute_block_hashes(self, token_ids: list[int]) -> list[int]:
         """Compute chained hashes for all full blocks in the token sequence."""

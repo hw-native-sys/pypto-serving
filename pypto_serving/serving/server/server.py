@@ -39,9 +39,9 @@ logger = logging.getLogger(__name__)
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 try:
-    from fastapi import FastAPI
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import JSONResponse, Response, StreamingResponse
-    from pydantic import BaseModel, Field, model_serializer, model_validator
+    from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 except ImportError as e:
     raise ImportError(
         "Serving requires fastapi and pydantic. Install with: pip install fastapi uvicorn sse-starlette pydantic"
@@ -125,6 +125,28 @@ class ChatDelta(ChatMessage):
     tool_calls: list[DeltaToolCall] | None = None
 
 
+class AgentSession(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+        strict=True,
+    )
+
+
+class AgentHint(AgentSession):
+    # Text-action agents must explicitly confirm task completion. Structured
+    # Chat agents can opt into upstream stop/tool-call response semantics.
+    lifecycle_mode: Literal["explicit", "chat"] = "explicit"
+
+
+class AgentLifecycleRequest(AgentSession):
+    request_id: str = Field(min_length=1, max_length=128, strict=True)
+    lifecycle: Literal["unknown", "continue", "terminal"]
+
+
 class ChatCompletionRequest(BaseModel):
     model: str = ""
     messages: list[ChatMessage]
@@ -144,6 +166,7 @@ class ChatCompletionRequest(BaseModel):
     tools: list[ChatTool] | None = None
     tool_choice: str | dict | None = None
     parallel_tool_calls: bool = True
+    agent_hint: AgentHint | None = None
 
     @model_validator(mode="after")
     def _validate_selected_token_limit(self) -> ChatCompletionRequest:
@@ -227,6 +250,7 @@ class ServingServer:
         self.app.add_api_route("/v1/models", self._list_models, methods=["GET"])
         self.app.add_api_route("/v1/completions", self._completions, methods=["POST"], response_model=None)
         self.app.add_api_route("/v1/chat/completions", self._chat_completions, methods=["POST"], response_model=None)
+        self.app.add_api_route("/v1/agent/lifecycle", self._agent_lifecycle, methods=["POST"])
         if getattr(self.engine, "metrics", None) is not None:
             self.app.add_api_route("/metrics", self._metrics, methods=["GET"])
             self.app.add_api_route("/metrics/json", self._metrics_json, methods=["GET"])
@@ -345,7 +369,48 @@ class ServingServer:
             ),
         )
 
-    async def _completions(self, request: CompletionRequest) -> StreamingResponse | JSONResponse:
+    async def _disconnect_aware_outputs(self, outputs, http_request: Request | None):
+        """Close the engine generator when a non-streaming client disconnects."""
+        async def watch_disconnect():
+            # FastAPI has already read the body. Observe the ASGI disconnect
+            # directly so cancellation of the watcher cannot be swallowed.
+            while True:
+                if (await http_request.receive())["type"] == "http.disconnect":
+                    return
+
+        watcher = asyncio.create_task(watch_disconnect()) if http_request is not None else None
+        try:
+            async with contextlib.aclosing(outputs):
+                while True:
+                    if watcher is None:
+                        try:
+                            output = await anext(outputs)
+                        except StopAsyncIteration:
+                            break
+                    else:
+                        pending = asyncio.create_task(anext(outputs))
+                        try:
+                            done, _ = await asyncio.wait((pending, watcher), return_when=asyncio.FIRST_COMPLETED)
+                            if watcher in done:
+                                watcher.result()
+                                raise HTTPException(status_code=499, detail="Client disconnected")
+                            try:
+                                output = pending.result()
+                            except StopAsyncIteration:
+                                break
+                        finally:
+                            if not pending.done():
+                                pending.cancel()
+                            await asyncio.gather(pending, return_exceptions=True)
+                    yield output
+        finally:
+            if watcher is not None:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+
+    async def _completions(
+        self, request: CompletionRequest, http_request: Request = None,
+    ) -> StreamingResponse | JSONResponse:
         request_id = f"cmpl-{uuid.uuid4().hex[:8]}"
         config = dataclasses.replace(self._resolve_generate_config(request), ignore_eos=True)
 
@@ -363,7 +428,10 @@ class ServingServer:
             full_text = ""
             finish_reason = ""
             usage = None
-            async for output in self.engine.add_request(request_id, request.prompt, config):
+            outputs = self._disconnect_aware_outputs(
+                self.engine.add_request(request_id, request.prompt, config), http_request,
+            )
+            async for output in outputs:
                 if output.text:
                     full_text = output.text
                 if output.finished:
@@ -383,8 +451,10 @@ class ServingServer:
             )
             return JSONResponse(response.model_dump())
 
-    async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
-        request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    async def _chat_completions(
+        self, request: ChatCompletionRequest, http_request: Request = None,
+    ) -> StreamingResponse | JSONResponse:
+        request_id = f"chatcmpl-{uuid.uuid4().hex}"
         output_parser_spec = self._output_parser_spec(request)
         constraint_spec = self._constraint_spec(request, output_parser_spec)
         if constraint_spec is not None:
@@ -396,6 +466,8 @@ class ServingServer:
             tools=request.tools,
         )
         config = self._resolve_generate_config(request)
+        agent_session_id = request.agent_hint.session_id if request.agent_hint else None
+
         with profile_span(
             "http.chat_completions",
             cat="request",
@@ -411,6 +483,8 @@ class ServingServer:
                         output_parser_spec=output_parser_spec,
                         constraint_spec=constraint_spec,
                         parallel_tool_calls=request.parallel_tool_calls,
+                        agent_session_id=agent_session_id,
+                        agent_lifecycle_mode=request.agent_hint.lifecycle_mode if request.agent_hint else "explicit",
                     ),
                     media_type="text/event-stream",
                 )
@@ -420,19 +494,30 @@ class ServingServer:
             tool_calls = ()
             finish_reason = ""
             usage = None
-            async for output in self.engine.add_request(
-                request_id,
-                prompt,
-                config,
-                output_parser_spec=output_parser_spec,
-                **({"constraint_spec": constraint_spec} if constraint_spec else {}),
-            ):
+            kwargs = {"agent_session_id": agent_session_id} if agent_session_id is not None else {}
+            outputs = self._disconnect_aware_outputs(
+                self.engine.add_request(
+                    request_id,
+                    prompt,
+                    config,
+                    output_parser_spec=output_parser_spec,
+                    **({"constraint_spec": constraint_spec} if constraint_spec else {}),
+                    **kwargs,
+                ),
+                http_request,
+            )
+            async for output in outputs:
                 if output.text:
                     full_text = output.text
                 if output.reasoning:
                     full_reasoning = output.reasoning
                 if output.finished:
                     finish_reason = self._chat_finish_reason(output)
+                    self._observe_chat_lifecycle(
+                        agent_session_id, request_id,
+                        request.agent_hint.lifecycle_mode if request.agent_hint else "explicit",
+                        output,
+                    )
                     tool_calls = output.tool_calls if request.parallel_tool_calls else output.tool_calls[:1]
                     usage = ResponseUsage(
                         prompt_tokens=output.prompt_tokens,
@@ -513,13 +598,16 @@ class ServingServer:
         output_parser_spec: OutputParserSpec | None = None,
         constraint_spec: ConstraintSpec | None = None,
         parallel_tool_calls: bool = True,
+        agent_session_id: str | None = None,
+        agent_lifecycle_mode: str = "explicit",
     ):
         # Once SSE headers have been sent, request-local parser failures must be
         # reported in the stream. Cancellation still propagates to engine cleanup.
         chunks = self._stream_chat_chunks(
             request_id, prompt, config, model, output_parser_spec=output_parser_spec,
             constraint_spec=constraint_spec,
-            parallel_tool_calls=parallel_tool_calls,
+            parallel_tool_calls=parallel_tool_calls, agent_session_id=agent_session_id,
+            agent_lifecycle_mode=agent_lifecycle_mode,
         )
         try:
             async with contextlib.aclosing(chunks):
@@ -540,16 +628,20 @@ class ServingServer:
         output_parser_spec: OutputParserSpec | None,
         constraint_spec: ConstraintSpec | None,
         parallel_tool_calls: bool,
+        agent_session_id: str | None = None,
+        agent_lifecycle_mode: str = "explicit",
     ):
         with profile_span("http.stream_chat_completion", cat="request", args={"request_id": request_id}):
             prev_text = ""
             prev_reasoning = ""
+            kwargs = {"agent_session_id": agent_session_id} if agent_session_id is not None else {}
             outputs = self.engine.add_request(
                 request_id,
                 prompt,
                 config,
                 output_parser_spec=output_parser_spec,
                 **({"constraint_spec": constraint_spec} if constraint_spec else {}),
+                **kwargs,
             )
             async with contextlib.aclosing(outputs):
                 async for output in outputs:
@@ -562,6 +654,8 @@ class ServingServer:
                         reasoning_delta = output.reasoning[len(prev_reasoning):] if output.reasoning else ""
                         prev_reasoning = output.reasoning or prev_reasoning
                     finish_reason = self._chat_finish_reason(output) if output.finished else None
+                    if output.finished:
+                        self._observe_chat_lifecycle(agent_session_id, request_id, agent_lifecycle_mode, output)
                     tool_deltas = [
                         self._tool_delta(item) for item in output.tool_call_deltas
                         if parallel_tool_calls or item.index == 0
@@ -605,6 +699,24 @@ class ServingServer:
                         )
                         yield "data: [DONE]\n\n"
                         break
+
+    async def _agent_lifecycle(self, request: AgentLifecycleRequest) -> dict:
+        return {"released": self._notify_agent_lifecycle(request.session_id, request.request_id, request.lifecycle)}
+
+    def _notify_agent_lifecycle(self, session_id: str, request_id: str, lifecycle: str) -> bool:
+        notify = getattr(self.engine, "observe_agent_lifecycle", None)
+        return notify(session_id, request_id, lifecycle) if notify is not None else False
+
+    def _observe_chat_lifecycle(
+        self, session_id: str | None, request_id: str, mode: str, output: TokenOutput,
+    ) -> None:
+        if session_id is None:
+            return
+        reason = self._chat_finish_reason(output)
+        if output.tool_calls or reason == "tool_calls":
+            self._notify_agent_lifecycle(session_id, request_id, "continue")
+        elif mode == "chat" and reason == "stop":
+            self._notify_agent_lifecycle(session_id, request_id, "terminal")
 
     @staticmethod
     def _tool_delta(delta: ToolCallDelta) -> DeltaToolCall:
