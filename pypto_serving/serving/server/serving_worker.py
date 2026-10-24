@@ -1508,7 +1508,7 @@ def _worker_entry(
     input_queue: mp.Queue,
     output_queue: mp.Queue,
     ready_event,
-    num_pages_value,
+    cache_capacity,
     profile_output_queue: mp.Queue | None = None,
     services_factory=None,
 ):
@@ -1531,7 +1531,16 @@ def _worker_entry(
     worker = WorkerProcess(config, input_queue, output_queue, profile_output_queue, services_factory)
     try:
         num_pages = worker.init_device_and_model()
-        num_pages_value.value = num_pages
+        sizes = worker.executor.cache_group_sizes(config.model_id)
+        groups = config.resolve_runtime_config().kv_cache_groups
+        if sizes and set(sizes) != {group.name for group in groups}:
+            raise ValueError("executor must report capacity for every cache group")
+        if sizes and (any(type(size) is not int or size <= 0 for size in sizes.values())
+                      or sizes[groups[0].name] != num_pages):
+            raise ValueError("invalid executor cache group capacities")
+        for index, group in enumerate(groups, 1):
+            cache_capacity[index] = sizes.get(group.name, 0)
+        cache_capacity[0] = num_pages
         # Model weights, compiled kernels and KV-cache objects are now resident.
         # Freeze them so the GC won't rescan them during decode (avoids
         # multi-ms gen2 pauses landing mid-step). Must happen in this process:
@@ -1553,10 +1562,9 @@ def _worker_entry(
 def spawn_worker(config: EngineConfig, *, services_factory=None):
     """Spawn a worker process and return its process, queues, and ready state.
 
-    ``num_pages_value`` is a shared ``multiprocessing.Value('i')`` that the
-    worker writes after ``init_device_and_model()`` completes.  The main
-    process reads it to synchronise the ``KvCacheManager`` block metadata with
-    the actual device-side KV cache size. Profile acknowledgements use a
+    ``cache_capacity`` reports primary and optional per-group physical counts
+    through one shared array after model initialization. The main process
+    initializes allocator metadata from these exact sizes. Profile replies use a
     dedicated output queue so they cannot be mistaken for inference results.
     """
     ctx = mp.get_context("spawn")
@@ -1564,7 +1572,7 @@ def spawn_worker(config: EngineConfig, *, services_factory=None):
     output_queue = ctx.Queue()
     profile_output_queue = ctx.Queue()
     ready_event = ctx.Event()
-    num_pages_value = ctx.Value("i", 0)
+    cache_capacity = ctx.Array("q", 1 + len(config.resolve_runtime_config().kv_cache_groups))
 
     process = ctx.Process(
         target=_worker_entry,
@@ -1573,7 +1581,7 @@ def spawn_worker(config: EngineConfig, *, services_factory=None):
             input_queue,
             output_queue,
             ready_event,
-            num_pages_value,
+            cache_capacity,
             profile_output_queue,
             services_factory,
         ),
@@ -1586,5 +1594,5 @@ def spawn_worker(config: EngineConfig, *, services_factory=None):
         output_queue,
         profile_output_queue,
         ready_event,
-        num_pages_value,
+        cache_capacity,
     )

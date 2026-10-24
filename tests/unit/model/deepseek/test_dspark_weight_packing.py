@@ -17,17 +17,18 @@ than coinciding with an unpacked slab.
 """
 from __future__ import annotations
 
+import pytest
 import torch
 
 from pypto_serving.model.common.weights.nz import unpack_nz
 from pypto_serving.model.deepseek.weight_loader import deepseek_v4_local_expert_ids
 from pypto_serving.model.deepseek_dspark.weight_loader import DSparkWeightStore
-from pypto_serving.model.deepseek_dspark.weight_spec import DSPARK_TP_SIZE
 
 _RANKS = 4
 
 
-def test_dspark_stacked_weights_nz_round_trip(deepseek_checkpoint):
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_dspark_stacked_weights_nz_round_trip(deepseek_checkpoint, tp_size):
     checkpoint = deepseek_checkpoint(
         compress_ratios=(0, 4, 128, 4),
         n_routed_experts=4,
@@ -37,13 +38,14 @@ def test_dspark_stacked_weights_nz_round_trip(deepseek_checkpoint):
     store = DSparkWeightStore(model_dir=checkpoint.model_dir, weight_map=checkpoint.weight_map)
     weights = store.load_stacked_layer_weights(
         ranks=_RANKS,
+        tp_size=tp_size,
         n_routed_experts=4,
         compress_ratios=(0, 4, 128, 4),
         num_hash_layers=1,
     )
     tensors = weights.tensors
     layers = range(4)
-    local_groups = 8 // DSPARK_TP_SIZE
+    local_groups = 8 // tp_size
 
     # A missing NZ pass would leave these bytes equal to their own unpacking.
     # Both output projections are covered, in both packed dtypes.
@@ -77,7 +79,7 @@ def test_dspark_stacked_weights_nz_round_trip(deepseek_checkpoint):
             .contiguous()
         )
         for rank in range(_RANKS):
-            tp = rank % DSPARK_TP_SIZE
+            tp = rank % tp_size
             groups = slice(tp * local_groups, (tp + 1) * local_groups)
             assert torch.equal(
                 unpack_nz(tensors["wo_a"])[rank, layer * local_groups : (layer + 1) * local_groups],

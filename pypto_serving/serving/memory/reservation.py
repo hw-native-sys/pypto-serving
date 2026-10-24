@@ -30,7 +30,7 @@ class GroupCacheReservation:
 
     reservation_id: str
     request_id: str
-    token_capacity: int
+    token_capacity: int  # Logical generation limit, not preallocated output pages.
     prompt_token_count: int
     partition: int
     block_ids_by_group: dict[str, tuple[int, ...]]
@@ -84,6 +84,10 @@ class GroupedCacheReservations:
         prompt_tokens = token_capacity if prompt_token_count is None else prompt_token_count
         if type(prompt_tokens) is not int or not 0 < prompt_tokens <= token_capacity:
             raise ValueError("prompt_token_count must be within the reservation capacity")
+        if any(pool.spec.sliding_window is None and
+               token_capacity > pool.spec.max_blocks_per_seq * pool.spec.spec.token_capacity
+               for pool in self.manager._group_pools.values()):
+            raise KVCacheCapacityError("logical generation limit exceeds full-history cache tables")
         prefix_hashes = prefix_block_hashes or {}
         if prefix_hashes and not shareable_group_names:
             raise ValueError("prefix hashes require explicit shareable cache groups")
@@ -127,7 +131,9 @@ class GroupedCacheReservations:
                 selected = self.manager.group_request_partition(request_id)
                 if selected is None:
                     raise RuntimeError("grouped reservation has no selected partition")
-                self.manager._reserve_group_decode_capacity(request_id, token_capacity, selected)
+                # Only the received prompt is physically backed. The logical
+                # generation limit is checked on adoption; normal Decode grows
+                # the same tables one scheduled step at a time.
                 return selected
 
             try:

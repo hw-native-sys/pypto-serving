@@ -31,15 +31,12 @@ import torch
 from pypto_serving.model.common.runner.buffer_set import Placement, Slot
 from pypto_serving.model.common.runner.task_args import TaskArgs
 from pypto_serving.model.deepseek_dspark.npu_runner import (
-    DSPARK_DECODE_BATCH,
     DSPARK_DECODE_CMP_C4_TABLE_BLOCKS,
     DSPARK_DECODE_HCA_CMP_TABLE_BLOCKS,
     DSPARK_DECODE_HCA_STATE_TABLE_BLOCKS,
     DSPARK_DECODE_IDX_TABLE_BLOCKS,
-    DSPARK_DECODE_LOCAL_BATCH,
     DSPARK_DECODE_LOCAL_TOKENS,
     DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS,
-    DSPARK_DECODE_TOKENS,
     DSPARK_BLOCK_SIZE,
     DSPARK_DRAFTER_CONTEXT_ROWS,
     DSPARK_DRAFTER_BATCHES,
@@ -257,10 +254,10 @@ def prefill_task_args(runner: DSparkModelRunner) -> TaskArgs:
 def _decode_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
     """Host-shared decode slot name -> (dtype, full shape)."""
     ranks = layout.ranks
-    local_batch = DSPARK_DECODE_LOCAL_BATCH
-    group_batch = DSPARK_DECODE_BATCH
-    local_tokens = DSPARK_DECODE_LOCAL_TOKENS
-    group_tokens = DSPARK_DECODE_TOKENS
+    local_batch = layout.decode_local_batch
+    group_batch = layout.decode_batch
+    local_tokens = layout.decode_local_tokens
+    group_tokens = layout.decode_tokens
     rope = (DSPARK_ROPE_HEAD_DIM,)
     window = (DSPARK_SLIDING_WINDOW,)
     slot_specs = {
@@ -322,7 +319,7 @@ def _decode_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
         "grammar_mask": (
             torch.int16, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS),
         ),
-        "valid_draft_counts": (torch.int32, (ranks, DSPARK_DECODE_BATCH)),
+        "valid_draft_counts": (torch.int32, (ranks, group_batch)),
         "sampled_ids": (
             torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_SAMPLED_IDS_PAD),
         ),
@@ -578,7 +575,7 @@ def _drafter_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
     batch = DSPARK_DRAFTER_MAX_BATCH
     context = DSPARK_DRAFTER_CONTEXT_ROWS
     query = batch * DSPARK_DRAFTER_QUERY_WIDTH
-    group_query = 4 * query
+    group_query = layout.tp_size * query
     rope = (DSPARK_ROPE_HEAD_DIM,)
     return {
         "target_hidden": (
@@ -599,8 +596,9 @@ def _drafter_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
     }
 
 
-def bootstrap_metadata_specs(ranks: int) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+def bootstrap_metadata_specs(layout) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     """Ordered output ABI for the descriptor-driven bootstrap metadata program."""
+    ranks, tp = layout.ranks, layout.tp_size
     query = DSPARK_DRAFTER_MAX_BATCH * DSPARK_DRAFTER_QUERY_WIDTH
     return {
         "tail_selectors": ((ranks, DSPARK_DRAFTER_BATCHES[0], 4), torch.int32),
@@ -612,12 +610,12 @@ def bootstrap_metadata_specs(ranks: int) -> dict[str, tuple[tuple[int, ...], tor
         "context_group_slot_mapping": ((ranks, 3, 4 * DSPARK_SLIDING_WINDOW), torch.int64),
         "context_group_freqs_cos": ((ranks, 4 * DSPARK_SLIDING_WINDOW, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
         "context_group_freqs_sin": ((ranks, 4 * DSPARK_SLIDING_WINDOW, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
-        "query_group_position_ids": ((ranks, 4 * query), torch.int32),
-        "query_group_slot_mapping": ((ranks, 3, 4 * query), torch.int64),
+        "query_group_position_ids": ((ranks, tp * query), torch.int32),
+        "query_group_slot_mapping": ((ranks, 3, tp * query), torch.int64),
         "query_freqs_cos": ((ranks, query, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
         "query_freqs_sin": ((ranks, query, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
-        "query_group_freqs_cos": ((ranks, 4 * query, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
-        "query_group_freqs_sin": ((ranks, 4 * query, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
+        "query_group_freqs_cos": ((ranks, tp * query, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
+        "query_group_freqs_sin": ((ranks, tp * query, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
         "logit_row_indices": ((ranks, 128), torch.int32),
     }
 

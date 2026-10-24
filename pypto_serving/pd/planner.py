@@ -34,12 +34,15 @@ class Geometry(msgspec.Struct, frozen=True):
         return self.name, self.layers, self.rows, self.row_bytes, self.dtype
 
 
-def rank_mapping(ranks, tp, source_partition, destination_partition):
-    if ranks <= 0 or tp <= 0 or ranks % tp or any(
-        type(p) is not int or not 0 <= p < ranks // tp for p in (source_partition, destination_partition)
-    ):
-        raise ValueError("invalid partition/rank topology")
-    return tuple((source_partition * tp + slot, destination_partition * tp + slot) for slot in range(tp))
+def rank_mapping(source_topology, destination_topology, source_partition, destination_partition):
+    """Select a complete source replica for every required destination owner."""
+    for topology, partition in ((source_topology, source_partition),
+                                (destination_topology, destination_partition)):
+        if type(partition) is not int or not 0 <= partition < len(topology.groups):
+            raise ValueError("invalid partition/rank topology")
+    source = source_topology.groups[source_partition]
+    return tuple((source[rank % len(source)], rank)
+                 for rank in destination_topology.groups[destination_partition])
 
 
 def valid_from(groups, components, p_hit, d_hit):

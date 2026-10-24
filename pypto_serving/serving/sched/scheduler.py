@@ -141,6 +141,9 @@ class Request:
     group_block_hashes: dict[str, list[bytes]] = field(default_factory=dict)
     num_blocks_cached: int = 0  # Track how many blocks have been published to prefix cache
     num_group_blocks_cached: dict[str, int] = field(default_factory=dict)
+    # Fixed from the complete prompt, not the latest confirmed/in-flight chunk.
+    # Externally populated requests keep their allocator-owned checkpoint policy.
+    group_checkpoint_boundary: int | None = None
     # Earliest valid KV position after a model skips the beginning of a
     # prefill chunk. Keep this across decode so partial pages stay unpublished.
     group_cache_valid_from: dict[str, int] = field(default_factory=dict)
@@ -279,6 +282,10 @@ class Scheduler:
                 raise ValueError(rejection)
         if self.config.enable_prefix_cache:
             if self.kv_cache_manager.has_groups:
+                request.group_checkpoint_boundary = self.kv_cache_manager.group_prefix_cache_boundary(
+                    request.num_prompt_tokens,
+                    replay_tokens=self.config.speculative_prefix_cache_replay_tokens,
+                )
                 request.group_block_hashes = self.kv_cache_manager.compute_group_block_hashes(
                     request.prompt_token_ids
                 )
@@ -423,7 +430,7 @@ class Scheduler:
         scheduled_req_ids: set[str] = set()
         num_scheduled_tokens: dict[str, int] = {}
         running_to_keep: list[Request] = []
-        stalled_constrained: list[Request] = []
+        stalled_non_recomputable: list[Request] = []
         for request in self.running:
             # A request later in this snapshot may have been preempted while
             # scheduling an earlier request. Do not schedule it again from the
@@ -474,8 +481,8 @@ class Scheduler:
                     request, scheduled_req_ids, num_scheduled_tokens, output
                 )
                 if preempted is None:
-                    if request.constraint_spec is not None:
-                        stalled_constrained.append(request)
+                    if request.constraint_spec is not None or request.cache_reservation_id:
+                        stalled_non_recomputable.append(request)
                     running_to_keep.append(request)
                     continue
                 token_budget += preempted.get("returned_tokens", 0)
@@ -518,7 +525,7 @@ class Scheduler:
         ]
         if (
             allow_reject_stalled
-            and stalled_constrained
+            and stalled_non_recomputable
             and not output.scheduled_requests
             and not any(
                 request.num_output_placeholders or request.terminal_prefill_in_flight
@@ -526,13 +533,14 @@ class Scheduler:
             )
         ):
             # No running request can free a block or produce an in-flight result.
-            # Recompute preemption cannot reconstruct a constrained matcher, so
-            # fail one stalled request explicitly instead of spinning forever.
-            victim = stalled_constrained[-1]
+            # Neither a constrained matcher nor an external Prefill can be
+            # reconstructed by local recompute. Reject rather than spin forever.
+            victim = stalled_non_recomputable[-1]
+            reason = ("external Prefill cannot be recomputed locally" if victim.cache_reservation_id
+                      else "constrained recompute preemption is not supported")
             self.abort_request(victim.request_id)
             output.rejected_requests[victim.request_id] = (
-                f"Request {victim.request_id} cannot allocate KV blocks; "
-                "constrained recompute preemption is not supported"
+                f"Request {victim.request_id} cannot allocate KV blocks; {reason}"
             )
 
         # Keep grouped-cache commands single-phase. Prefill may run in the next
@@ -568,11 +576,7 @@ class Scheduler:
                     ) = self.kv_cache_manager.acquire_group_prefix_blocks(
                         request.request_id,
                         request.group_block_hashes,
-                        max_cache_hit_tokens=max(
-                            0,
-                            request.num_prompt_tokens
-                            - max(1, self.config.speculative_prefix_cache_replay_tokens),
-                        ),
+                        max_cache_hit_tokens=request.group_checkpoint_boundary,
                     )
                     request.num_group_blocks_cached = (
                         self.kv_cache_manager.published_group_block_counts(
@@ -1057,6 +1061,7 @@ class Scheduler:
                         scheduled.cache_partition,
                         request_id=request.request_id,
                         valid_from=request.group_cache_valid_from,
+                        checkpoint_boundary=request.group_checkpoint_boundary,
                     )
                 )
             else:
@@ -1170,6 +1175,7 @@ class Scheduler:
             r
             for r in self.running
             if r.request_id != exclude.request_id and r.constraint_spec is None
+            and not r.cache_reservation_id
             and not r.prefill_complete and not r.scheduling_held
         ]
         if self.kv_cache_manager.has_groups:
@@ -1254,6 +1260,7 @@ class Scheduler:
                 confirmed_tokens,
                 request.num_group_blocks_cached,
                 valid_from=request.group_cache_valid_from,
+                checkpoint_boundary=request.group_checkpoint_boundary,
             )
             return
         total_blocks_computed = min(

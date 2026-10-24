@@ -21,13 +21,8 @@ class GroupPrefixCheckpoints:
         self.histories = {}
         self.history_changed = False
 
-    def publish(self, owner, pools, hashes, tokens, partition, alignment, valid_from):
-        # Leave room for the replay token used by local Prefill. At the first
-        # boundary there is no earlier checkpoint, so retain that boundary.
-        boundary = max(0, tokens - 1) // alignment * alignment
-        if not boundary:
-            boundary = tokens // alignment * alignment
-        if not boundary:
+    def publish(self, owner, pools, hashes, tokens, partition, boundary, valid_from):
+        if not 0 < boundary <= tokens:
             return
         members, identity, history = [], [], {}
         for name, values in hashes.items():

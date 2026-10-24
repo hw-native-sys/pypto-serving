@@ -17,12 +17,14 @@ and returns a ``spec``-typed stand-in for ``DistributedCompiledProgram``.
 from __future__ import annotations
 
 from unittest.mock import MagicMock
+import warnings
 
 import pytest
 from pypto import CacheConfig
 
 from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
-from pypto.runtime import RunConfig
+from pypto.backend import BackendType
+from pypto.runtime import ExecutionMode, RunConfig
 from pypto_serving.model.common.compiler.compiler import KernelCompiler
 from pypto_serving.model.common.compiler.l3_callable import L3Callable
 from pypto_serving.model.common.executor.utils import build_pypto_run_config
@@ -31,6 +33,29 @@ from pypto_serving.model.common.executor.utils import build_pypto_run_config
 def _base_run_config() -> RunConfig:
     """Build the base RunConfig an executor hands to KernelCompiler."""
     return build_pypto_run_config(platform="a2a3sim", device_ids=(0, 1))
+
+
+@pytest.mark.parametrize("platform,backend,mode", [
+    ("a2a3", BackendType.Ascend910B, ExecutionMode.ONBOARD),
+    ("a2a3sim", BackendType.Ascend910B, ExecutionMode.SIM),
+    ("a5", BackendType.Ascend950, ExecutionMode.ONBOARD),
+    ("a5sim", BackendType.Ascend950, ExecutionMode.SIM),
+])
+def test_run_config_uses_explicit_target_axes(platform, backend, mode):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        config = build_pypto_run_config(platform=platform, device_ids=(2, 3))
+    assert config.backend_type == backend
+    assert config.execution_mode == mode
+    assert config.platform == platform
+    assert config.device_id == 2
+    assert config.distributed_config.device_ids == [2, 3]
+    assert config.codegen_only is True
+
+
+def test_run_config_rejects_unknown_platform():
+    with pytest.raises(ValueError, match="Unsupported PyPTO platform"):
+        build_pypto_run_config(platform="a2a3invalid", device_ids=(0,))
 
 
 class _FakeJitFn:
@@ -208,3 +233,30 @@ def test_explicit_output_base_keeps_programs_separate(tmp_path):
         compiler.compile(name, jit_fn)
         assert jit_fn.last_config.save_kernels_dir == str(tmp_path / name)
     assert config.save_kernels_dir == str(tmp_path)
+
+
+@pytest.mark.parametrize("failure", [None, "allocation", "preflight"])
+def test_registration_closes_unpublished_runner_on_capacity_failure(failure):
+    from types import SimpleNamespace
+    from pypto_serving.model.common.executor.pypto_executor import PyptoExecutor
+
+    closed = []
+    def init(*_args):
+        if failure == "allocation":
+            raise MemoryError("allocation failed")
+        return 7
+    def preflight(_record):
+        if failure == "preflight":
+            raise RuntimeError("preflight failed")
+    runner = SimpleNamespace(init_kv_cache=init, preflight=preflight, close=lambda: closed.append(True))
+    compiled = object()
+    executor = SimpleNamespace(_compile_model=lambda _runtime: compiled,
+        _create_runner=lambda *_args: runner, _runners={}, _compiled={})
+    record = SimpleNamespace(runtime_model=object(), config=object(), runtime=object())
+    if failure:
+        with pytest.raises((MemoryError, RuntimeError), match=failure):
+            PyptoExecutor.register_model(executor, "model", record)
+        assert closed == [True] and not executor._runners and not executor._compiled
+    else:
+        assert PyptoExecutor.register_model(executor, "model", record) == 7
+        assert not closed and executor._runners == {"model": runner}

@@ -35,6 +35,10 @@ class ModelExecutor(ABC):
         """Store the KV cache manager shared with the engine (optional for serving path)."""
         self._kv_cache_manager = kv_cache_manager
 
+    def cache_group_sizes(self, model_id: str) -> dict[str, int]:
+        """Report independently planned pools, or use primary-pool scaling."""
+        return {}
+
     @property
     def supports_device_sampling(self) -> bool:
         """Return whether executor results may include already-sampled token IDs."""

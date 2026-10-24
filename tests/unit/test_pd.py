@@ -17,18 +17,20 @@ import msgspec
 import pytest
 
 from pypto_serving.pd.config import Config, Endpoint
-from pypto_serving.pd.protocol import Binding, Component, Contract, Node, decode, receive
+from pypto_serving.pd.protocol import Binding, Component, Contract, Node, Topology, decode, receive
 from pypto_serving.pd.routing import Directory
 from pypto_serving.pd.session import PeerPool
 
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])
-def test_application_lifespan(monkeypatch, role):
+@pytest.mark.parametrize("tp", [1, 4])
+def test_application_lifespan(monkeypatch, role, tp):
     from pypto_serving.pd import integration as module
     runtime = make_dataclass("Runtime", ["num_speculative_tokens", "speculative_prefix_cache_replay_tokens"])(7, 128)
     config = make_dataclass("Engine", ["runtime_config", "executor_kwargs", "async_scheduling",
                                       "executor_cls", "model_id"])(
-        runtime, {}, True, "PyptoDeepSeekV4DSparkExecutor", "model")
+        runtime, {"cache_ranks": 16, "tp_size": tp, "lm_head_tp_size": 4},
+        True, "PyptoDeepSeekV4DSparkExecutor", "model")
     engine = SimpleNamespace(config=config, tokenizer=None, metrics=None,
         start_profile=None, stop_profile=None,
         single_core=lambda: SimpleNamespace(config=config, kv_cache_manager=caches()))
@@ -46,6 +48,10 @@ def test_application_lifespan(monkeypatch, role):
     assert captured[0].runtime_config.num_speculative_tokens == (0 if role == "prefill" else 7)
     assert captured[0].runtime_config.speculative_prefix_cache_replay_tokens == 128
     assert captured[0].executor_kwargs["capture_prefill_tail"] == (role == "prefill")
+    assert captured[0].executor_kwargs["execution_role"] == role
+    assert captured[0].executor_kwargs["tp_size"] == tp
+    assert captured[0].executor_kwargs["lm_head_tp_size"] == 4
+    assert captured[0].executor_kwargs["cache_ranks"] == 16
     assert captured[0].async_scheduling == (role == "decode")
     async def check():
         async with app.app.router.lifespan_context(app.app):
@@ -101,12 +107,12 @@ def test_pd_capture_skips_only_whole_batches_outside_the_final_window(speculativ
         assert wrapped is capture  # D keeps normal K7 capture/bootstrap semantics.
 
 
-def caches(enabled=True, slots=3):
+def caches(enabled=True, slots=3, partitions=4):
     from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
     from pypto_serving.serving.memory.kv_cache import KvCacheManager
     specs = tuple(KVCacheGroupSpec(name=name, layer_indices=(0,),
         spec=KVCacheSpec(tokens, tokens // ratio * 64, ratio), max_blocks_per_seq=blocks,
-        num_partitions=4, sliding_window=window) for name, tokens, ratio, blocks, window in (
+        num_partitions=partitions, sliding_window=window) for name, tokens, ratio, blocks, window in (
         ("ori", 32, 1, 32, 128), ("cmp_c128", 128, 128, 16, None),
         ("cmp_c4", 128, 4, 16, None), ("idx", 128, 4, 16, None),
         ("hca_state", 8, 1, 128, 128), ("csa_state", 2, 1, 512, 8),
@@ -135,7 +141,9 @@ def warm(cache, tokens, length, partition=0):
 @pytest.mark.parametrize("p_hit,d_hit", [(0, 0), (0, 256), (256, 0), (128, 256),
                                        (256, 128), (256, 256), (0, 512), (384, 512)])
 @pytest.mark.parametrize("outcome", ["unknown", "complete", "seed_accept", "seed_reject", "cancel", "early_cancel"])
-def test_prefix_mapping_completion_and_quarantine(p_hit, d_hit, outcome):
+@pytest.mark.parametrize("p_ranks,p_tp,d_ranks,d_tp", [(16, 4, 16, 4), (16, 4, 16, 1),
+                                                      (8, 1, 16, 4)])
+def test_prefix_mapping_completion_and_quarantine(p_hit, d_hit, outcome, p_ranks, p_tp, d_ranks, d_tp):
     from types import SimpleNamespace
     from pypto_serving.config.types import GenerateConfig
     from pypto_serving.pd.adapter import DeepSeekDSpark
@@ -146,14 +154,14 @@ def test_prefix_mapping_completion_and_quarantine(p_hit, d_hit, outcome):
     from pypto_serving.pd.transfer import TransferError
     from pypto_serving.serving.memory.reservation import GroupReservationState
     async def run():
-        p_cache, d_cache = caches(), caches()
+        p_cache, d_cache = caches(partitions=p_ranks // p_tp), caches(partitions=d_ranks // d_tp)
         tokens = tuple(range(512))
         warm(d_cache, tokens, d_hit)
         adapter = DeepSeekDSpark()
         source, destination = geometries(p_cache), geometries(d_cache)
-        contract = adapter.contract("weights", source, (16, 4))
-        p = Node("p", "prefill", "p-boot", contract, "p-registry")
-        d = Node("d", "decode", "d-boot", contract, "d-registry")
+        contract = adapter.contract("weights", source)
+        p = Node("p", "prefill", "p-boot", contract, "p-registry", Topology.for_tp(p_ranks, p_tp))
+        d = Node("d", "decode", "d-boot", contract, "d-registry", Topology.for_tp(d_ranks, d_tp))
         config = Config((Endpoint("p", 8001, "p"),), (Endpoint("d", 8002, "d"),))
         state = set()
         async def worker(operation, payload):
@@ -196,28 +204,30 @@ def test_prefix_mapping_completion_and_quarantine(p_hit, d_hit, outcome):
         tables = {k: tuple(v) for k, v in p_cache.ensure_group_blocks("source", 512, partition=1).items()}
         chunk = Chunk(binding.request, 0, p_hit, 512, True, 17, tables, 1, {"bootstrap": 3})
         plan = plan_chunk(binding, chunk, placement, contract, p_cache.group_specs, source, destination,
-                          p_hit, adapter.mapping(contract.topology, 1, placement.partition), digest(continuation))
-        service.validate_plan(entry, plan, source, p_hit)
+                          p_hit, adapter.mapping(p.topology, d.topology, 1, placement.partition),
+                          digest(continuation))
+        service.validate_plan(entry, plan, source, p_hit, p.topology)
         tail = next(c for c in plan.copies if c.component == "bootstrap_hidden")
         assert tail.source_offset == 3 * source[-1].page_bytes
         assert tail.destination_offset == 5 * destination[-1].page_bytes
         with pytest.raises(ValueError):
             service.validate_plan(entry, msgspec.structs.replace(plan, copies=tuple(
-                c for c in plan.copies if c.component != "bootstrap_hidden")), source, p_hit)
+                c for c in plan.copies if c.component != "bootstrap_hidden")), source, p_hit, p.topology)
         with pytest.raises(ValueError, match="write aliases"):
             service.validate_plan(entry, msgspec.structs.replace(plan, copies=(
                 msgspec.structs.replace(tail, destination_offset=6 * destination[-1].page_bytes),
-                *(c for c in plan.copies if c is not tail))), source, p_hit)
+                *(c for c in plan.copies if c is not tail))), source, p_hit, p.topology)
         with pytest.raises(ValueError):
             service.validate_plan(entry, msgspec.structs.replace(plan, copies=tuple(
-                c for c in plan.copies if c.component != plan.copies[0].component)), source, p_hit)
+                c for c in plan.copies if c.component != plan.copies[0].component)), source, p_hit, p.topology)
         with pytest.raises(ValueError):
-            service.validate_plan(entry, msgspec.structs.replace(plan, continuation_digest="wrong"), source, p_hit)
+            service.validate_plan(entry, msgspec.structs.replace(plan, continuation_digest="wrong"),
+                                  source, p_hit, p.topology)
         if any(c.component == "idx_k" for c in plan.copies):
             with pytest.raises(ValueError):
                 service.validate_plan(entry, msgspec.structs.replace(plan,
-                    copies=tuple(c for c in plan.copies if c.component != "idx_scale")), source, p_hit)
-        assert plan.mapping == tuple((4 + slot, slot) for slot in range(4))
+                    copies=tuple(c for c in plan.copies if c.component != "idx_scale")), source, p_hit, p.topology)
+        assert plan.mapping == tuple((p_tp + slot % p_tp, slot) for slot in range(d_tp))
         assert {c.component for c in plan.copies} >= {"hca_state", "csa_state", "csa_inner_state"}
         if d_hit == 512:
             assert {c.component for c in plan.copies} == {
@@ -300,8 +310,129 @@ def test_mooncake_owner_bounds_and_uncertain_retirement():
 
 
 def node(name="p0", role="prefill", **kwargs):
-    return Node(name, role, f"boot-{name}", Contract("model", "weights", "layout", (4, 2),
-                (Component("kv", "kv", "kv"),)), f"registry-{name}", **kwargs)
+    topology = kwargs.pop("topology", Topology.for_tp(4, 2))
+    return Node(name, role, f"boot-{name}", Contract("model", "weights", "layout",
+                (Component("kv", "kv", "kv"),)), f"registry-{name}", topology, **kwargs)
+
+
+@pytest.mark.parametrize("p_ranks,p_tp,d_ranks,d_tp", [
+    (16, 4, 16, 4), (16, 4, 16, 1), (8, 2, 16, 4), (12, 3, 6, 2), (5, 1, 3, 1),
+])
+def test_common_contract_routes_independent_local_topologies(p_ranks, p_tp, d_ranks, d_tp):
+    p = node("p", topology=Topology.for_tp(p_ranks, p_tp))
+    d = node("d", "decode", topology=Topology.for_tp(d_ranks, d_tp))
+    assert p.contract == d.contract and p.compatible(d) and d.compatible(p)
+    directory = Directory((Endpoint("p", 8001, "p"), Endpoint("d", 8002, "d")))
+    directory.update(p)
+    directory.update(d)
+    assert directory.select() == (p, d)
+    binding = Binding.create(p, d, {"prompt": "hello"})
+    binding.check(p, "prefill")
+    binding.check(d, "decode")
+    for item in (p, d):
+        restored = decode(msgspec.msgpack.decode(msgspec.msgpack.encode(item)), Node)
+        assert restored == item and restored.topology == item.topology
+
+
+@pytest.mark.parametrize("field,value", [("adapter", "other"), ("model", "other"),
+                                         ("layout", "other"),
+                                         ("components", (Component("kv", "kv", "different-atomic-group"),))])
+def test_different_topologies_do_not_relax_data_contract(field, value):
+    p, d = node(), node("d", "decode", topology=Topology.for_tp(16, 1))
+    d = msgspec.structs.replace(d, contract=msgspec.structs.replace(d.contract, **{field: value}))
+    assert not p.compatible(d)
+    with pytest.raises(ValueError, match="incompatible"):
+        Binding.create(p, d, {})
+
+
+def test_contract_excludes_local_pool_capacity_and_topology():
+    from pypto_serving.pd.adapter import DeepSeekDSpark
+    adapter = DeepSeekDSpark()
+    a, b = geometries(caches(slots=3)), geometries(caches(slots=7))
+    assert a[0].blocks != b[0].blocks
+    assert adapter.contract("weights", a) == adapter.contract("weights", b)
+    assert "topology" not in msgspec.to_builtins(adapter.contract("weights", a))
+
+
+@pytest.mark.parametrize("components", [(), (Component("kv", "a", "a"), Component("kv", "b", "b")),
+                                        (Component("state", "state", "state", replicated=False),)])
+def test_contract_rejects_ambiguous_or_nonreplicated_pages(components):
+    with pytest.raises(ValueError, match="replicated-page"):
+        Contract("model", "weights", "layout", components)
+
+
+def test_topology_preserves_explicit_rank_groups():
+    topology = Topology(4, ((3, 1), (2, 0)))
+    assert topology.partition(0) == 1 and topology.partition(1) == 0
+    assert decode(msgspec.to_builtins(topology), Topology) == topology
+    for rank in (-1, 4, True):
+        with pytest.raises(ValueError):
+            topology.partition(rank)
+
+
+@pytest.mark.parametrize("ranks,groups", [(0, ()), (-1, ((0,),)), (True, ((0,),)),
+    (4, ()), (4, ((), (0, 1, 2, 3))), (4, ((0, 1), (1, 3))),
+    (4, ((0, 1), (2,))), (4, ((0, 1), (2, 4))), (2, ((False,), (1,))),
+    (2, ((-1,), (1,))), (2, (("0",), (1,))),
+])
+def test_topology_rejects_missing_duplicate_or_invalid_allocation_owners(ranks, groups):
+    with pytest.raises(ValueError):
+        Topology(ranks, groups)
+    with pytest.raises(msgspec.ValidationError):
+        decode(dict(ranks=ranks, groups=groups), Topology)
+
+
+@pytest.mark.parametrize("ranks,tp", [(0, 1), (4, 0), (3, 2), (4, -1), (True, 1), (4, True)])
+def test_local_topology_builder_rejects_invalid_compute_configuration(ranks, tp):
+    with pytest.raises(ValueError):
+        Topology.for_tp(ranks, tp)
+
+
+@pytest.mark.parametrize("old_contract", [False, True])
+def test_wire_requires_separate_current_node_topology(old_contract):
+    value = msgspec.to_builtins(node())
+    if old_contract:
+        value["contract"]["topology"] = (4, 2)
+    else:
+        del value["topology"]
+    with pytest.raises(msgspec.ValidationError):
+        decode(value, Node)
+    with pytest.raises(ValueError, match="incompatible"):
+        Binding.create(node(), msgspec.structs.replace(node("d", "decode"), version=1), {})
+
+
+def test_handshake_checks_descriptor_topology_against_registry_before_install(monkeypatch):
+    import struct
+    from pypto_serving.pd import service as module
+    from pypto_serving.pd.protocol import digest
+    async def run():
+        installed = []
+        async def worker(*args):
+            installed.append(args)
+            raise AssertionError("mismatched registry must not reach the worker")
+        config = Config((Endpoint("p", 8001, "p"),), (Endpoint("d", 8002, "d"),))
+        service = module.Service(config, config.prefill[0], "prefill", None,
+                                 SimpleNamespace(kv_cache_manager=caches(), call_worker=worker), None)
+        service.node, service.registry = node("p"), {"local": "registry"}
+        registry = dict(geometry=(), regions=(), topology=Topology.for_tp(8, 2))
+        peer = msgspec.structs.replace(node("d", "decode", topology=Topology.for_tp(16, 1)),
+                                      registry=digest(registry))
+        payload = msgspec.msgpack.encode(dict(node=peer, registry=registry))
+        reader = asyncio.StreamReader()
+        reader.feed_data(struct.pack("!I", len(payload)) + payload)
+        class Writer:
+            closed = False
+            def write(self, value): pass
+            async def drain(self): pass
+            def close(self): self.closed = True
+            async def wait_closed(self): pass
+        writer = Writer()
+        async def connect(*args): return reader, writer
+        monkeypatch.setattr(module.asyncio, "open_connection", connect)
+        with pytest.raises(ValueError, match="contract changed"):
+            await service.connect(peer)
+        assert not installed and writer.closed
+    asyncio.run(run())
 
 
 def test_config(tmp_path):
@@ -489,9 +620,10 @@ def test_cancel_during_state_reservation_drains_and_discards(reserve_fails):
             config=SimpleNamespace(runtime_config=SimpleNamespace(max_seq_len=1024)),
             scheduler=SimpleNamespace(requests={}))
         service = Service(config, config.decode[0], "decode", adapter, core, None)
-        contract = adapter.contract("weights", geometry, (16, 4))
-        p = Node("p", "prefill", "pb", contract, "pr")
-        service.node = Node("d", "decode", "db", contract, "dr")
+        contract = adapter.contract("weights", geometry)
+        topology = Topology.for_tp(16, 4)
+        p = Node("p", "prefill", "pb", contract, "pr", topology)
+        service.node = Node("d", "decode", "db", contract, "dr", topology)
         binding = Binding.create(p, service.node, {"prompt": "test"})
         entry = service.register_http(binding, {"prompt": "test"})
         tokens = tuple(range(256))
@@ -647,6 +779,108 @@ def test_terminal_output_waits_for_owned_retirement(cancel_cleanup):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("outcome", ["delayed", "expired", "cancelled"])
+def test_decode_receipt_uses_execution_timeout_and_preserves_cleanup(outcome):
+    from pypto_serving.config.types import GenerateConfig
+    from pypto_serving.pd.service import Request, Service
+    from pypto_serving.serving.engine.async_engine import TokenOutput
+
+    async def run():
+        activated, retired = [], []
+        async def generate(**kwargs):
+            activated.append(kwargs)
+            yield TokenOutput(token_id=7, text="answer")
+        core = SimpleNamespace(kv_cache_manager=caches(), tokenizer=SimpleNamespace(eos_token_id=2),
+                               add_prefilled_request=generate)
+        config = Config((Endpoint("p", 8001, "p"),), (Endpoint("d", 8002, "d"),),
+                        handoff_timeout=0.01, request_timeout=0.03 if outcome == "expired" else 2)
+        service = Service(config, config.decode[0], "decode", None, core, None)
+        entry = Request(SimpleNamespace(request="request"))
+        entry.continuation = SimpleNamespace(config=asdict(GenerateConfig()), tokens=(1,),
+                                            parser=None, constraint=None)
+        entry.first_token = 7
+        service.requests["request"] = entry
+        async def retire(value, terminal):
+            retired.append((value, terminal))
+        service.close_output = retire
+        outputs = service.outputs("request")
+        pending = asyncio.create_task(anext(outputs))
+        try:
+            if outcome == "delayed":
+                await asyncio.sleep(0.03)  # Healthy compute can outlive a control-operation deadline.
+                assert not pending.done() and not activated and not retired
+                entry.transferred.set()
+                assert (await pending).token_id == 7
+            elif outcome == "expired":
+                with pytest.raises(TimeoutError, match="Prefill data.*request_timeout"):
+                    await pending
+                assert not activated
+            else:
+                await asyncio.sleep(0)
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+                assert not activated
+        finally:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+            await outputs.aclose()
+        assert retired == [(entry, False)]
+        assert config.handoff_timeout == 0.01
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("stage", ["prefill", "decode"])
+def test_router_response_deadline_distinguishes_stream_headers_from_json_execution(stream, stage):
+    import httpx
+    from pypto_serving.pd.router import Router
+
+    async def run():
+        aborted = []
+        async def transport(request):
+            if request.url.path == "/internal/pd/abort":
+                aborted.append(request.url.host)
+                return httpx.Response(200, json={})
+            if request.url.host == "p":
+                if stage == "prefill":
+                    await asyncio.sleep(0.04)
+                binding = msgspec.json.decode(request.headers["x-pd-context"])["binding"]
+                return httpx.Response(200, json=dict(request=binding["request"], status="ready"))
+            if not stream or stage == "decode":
+                await asyncio.sleep(0.06)
+            if stream:
+                return httpx.Response(200, content=b"data: [DONE]\n\n")
+            return httpx.Response(200, json={"answer": "ok"})
+        config = Config((Endpoint("p", 8001, "p"),), (Endpoint("d", 8002, "d"),),
+                        capacity=1, handoff_timeout=0.01, request_timeout=2)
+        router = Router(config, httpx.MockTransport(transport))
+        router.directory.update(node("p"))
+        router.directory.update(node("d", "decode"))
+        async def refresh(): pass
+        router.refresh = refresh
+        class Request:
+            url = SimpleNamespace(path="/v1/completions")
+            async def json(self): return dict(prompt="hello", stream=stream)
+        try:
+            if stream and stage == "decode":
+                with pytest.raises(asyncio.TimeoutError):
+                    await router.generate(Request())
+                assert sorted(aborted) == ["d", "p"]
+            else:
+                response = await router.generate(Request())
+                if stream:
+                    assert "".join([part async for part in response.body_iterator]).endswith("data: [DONE]\n\n")
+                else:
+                    assert msgspec.json.decode(response.body) == {"answer": "ok"}
+                assert not aborted
+            assert not router.requests.locked() and not router.handoffs.locked()
+            assert config.handoff_timeout == 0.01
+        finally:
+            await router.client.aclose()
+    asyncio.run(run())
+
+
 def test_router_connection_budget_scales_with_all_node_pools(monkeypatch):
     from pypto_serving.pd import router as module
     captured = {}
@@ -791,8 +1025,10 @@ def test_all_rank_validation_precedes_parallel_native_submission(monkeypatch, of
     monkeypatch.setattr("pypto_serving.pd.worker.Owner", Owner)
     runtime = WorkerRuntime(WorkerSettings("p", "host", "mooncake", 2, 2),
                             SimpleNamespace(ranks=2, tp=1, regions=lambda: {"kv": None}))
-    local = dict(geometry=(), topology=(2, 1), regions=tuple(Region("p", r, "kv", 256, {"buffer": r}) for r in range(2)))
-    remote = dict(geometry=(), topology=(2, 1), regions=tuple(Region("d", r, "kv", 256, {"buffer": r}) for r in range(2)))
+    local = dict(geometry=(), topology=Topology.for_tp(2, 1),
+                 regions=tuple(Region("p", r, "kv", 256, {"buffer": r}) for r in range(2)))
+    remote = dict(geometry=(), topology=Topology.for_tp(2, 1),
+                  regions=tuple(Region("d", r, "kv", 256, {"buffer": r}) for r in range(2)))
     runtime.registry = local
     runtime.install(msgspec.to_builtins(remote))
     binding = Binding("request", ("p", "p", digest(local)), ("d", "d", digest(remote)), "input")
@@ -813,6 +1049,62 @@ def test_all_rank_validation_precedes_parallel_native_submission(monkeypatch, of
     runtime.close()
 
 
+@pytest.mark.parametrize("source,destination", [
+    (Topology.for_tp(16, 4), Topology.for_tp(16, 4)),
+    (Topology.for_tp(16, 4), Topology.for_tp(16, 1)),
+    (Topology.for_tp(8, 1), Topology.for_tp(16, 4)),
+    (Topology(4, ((3, 1), (0, 2))), Topology(3, ((2, 0, 1),))),
+])
+def test_replica_mapping_covers_every_partition_pair(source, destination):
+    from pypto_serving.pd.adapter import DeepSeekDSpark
+    adapter = DeepSeekDSpark()
+    for p, members in enumerate(source.groups):
+        for d, targets in enumerate(destination.groups):
+            mapping = adapter.mapping(source, destination, p, d)
+            assert tuple(dr for _, dr in mapping) == targets
+            assert all(sr in members for sr, _ in mapping)
+            adapter.validate_mapping(source, destination, SimpleNamespace(partition=d), mapping)
+            with pytest.raises(ValueError):
+                adapter.validate_mapping(source, destination, SimpleNamespace(partition=d), mapping + mapping[:1])
+    for p, d in ((-1, 0), (0, -1), (len(source.groups), 0), (0, len(destination.groups)), (True, 0)):
+        with pytest.raises(ValueError):
+            adapter.mapping(source, destination, p, d)
+
+
+def test_worker_fanout_batches_by_source_and_destination_owner(monkeypatch):
+    from concurrent.futures import wait
+    from pypto_serving.pd.protocol import Copy, Plan, digest
+    from pypto_serving.pd.transfer import Region
+    from pypto_serving.pd.worker import WorkerRuntime, WorkerSettings
+    writes = []
+    class Owner:
+        retained = ()
+        def __init__(self, *args): pass
+        def call(self, operation, **kwargs):
+            if operation == "write":
+                assert len({c.destination_rank for c in kwargs["copies"]}) == 1
+                writes.extend(kwargs["copies"])
+        def close(self): pass
+    monkeypatch.setattr("pypto_serving.pd.worker.Owner", Owner)
+    runtime = WorkerRuntime(WorkerSettings("p", "host", "mooncake", 2, 2),
+                            SimpleNamespace(ranks=1, tp=1, regions=lambda: {"kv": None}))
+    runtime.registry = dict(geometry=(), topology=Topology.for_tp(1, 1),
+                            regions=(Region("p", 0, "kv", 256, {}),))
+    remote = dict(geometry=(), topology=Topology.for_tp(3, 3),
+                  regions=tuple(Region("d", r, "kv", 256, {}) for r in range(3)))
+    runtime.install(msgspec.to_builtins(remote))
+    binding = Binding("request", ("p", "p", digest(runtime.registry)), ("d", "d", digest(remote)), "input")
+    plan = Plan(binding, "normalized", 0, 0, 1, True, ((0, 0), (0, 1), (0, 2)),
+                tuple(Copy("kv", 0, dr, 0, 64, 64) for dr in range(3)),
+                tuple((dr, "kv") for dr in range(3)), 7)
+    job = runtime.submit(plan)
+    assert not wait(runtime.jobs[job][1], timeout=2).not_done
+    runtime.poll((job,))[0]["completion"].check(plan)
+    assert set(writes) == set(plan.copies)
+    runtime.handle("forget", msgspec.msgpack.encode(job))
+    runtime.close()
+
+
 def test_disabled_mode_and_router_have_no_native_pd_imports():
     import subprocess
     import sys
@@ -827,7 +1119,9 @@ def test_disabled_mode_and_router_have_no_native_pd_imports():
                                         ("chat", False), ("chat", True)])
 @pytest.mark.parametrize("unknown", [False, True])
 @pytest.mark.parametrize("max_tokens", [1, 3])
-def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, stream, unknown, max_tokens):
+@pytest.mark.parametrize("p_tp,d_tp", [(4, 4), (4, 1), (1, 4)])
+def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, stream, unknown, max_tokens,
+                                                               p_tp, d_tp):
     from types import SimpleNamespace
     import httpx
     from pypto_serving.config.types import GenerateConfig, RuntimeConfig
@@ -855,7 +1149,8 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
 
         class Core:
             def __init__(self, role, enabled):
-                self.role, self.kv_cache_manager = role, caches(enabled)
+                self.role = role
+                self.kv_cache_manager = caches(enabled, partitions=16 // (p_tp if role == "prefill" else d_tp))
                 self.states = set()
                 self.config = SimpleNamespace(runtime_config=RuntimeConfig(max_seq_len=1024))
                 self.tokenizer = Tokenizer()
@@ -958,9 +1253,11 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
         for service, name in ((p, "p"), (d, "d")):
             geometry = geometries(service.cache)
             service.geometry = geometry
-            service.registry = dict(geometry=geometry, regions=(), topology=(16, 4))
+            topology = Topology.for_tp(16, p_tp if name == "p" else d_tp)
+            service.registry = dict(geometry=geometry, regions=(), topology=topology)
             service.node = Node(name, service.role, name + "-boot",
-                adapter.contract("test-model", geometry, (16, 4)), digest(service.registry), prefix=service.cache.enable_prefix_cache)
+                adapter.contract("test-model", geometry), digest(service.registry), topology,
+                prefix=service.cache.enable_prefix_cache)
             service.core.service = service
 
         class Peer:

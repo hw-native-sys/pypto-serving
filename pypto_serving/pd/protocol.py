@@ -15,7 +15,7 @@ import uuid
 
 import msgspec
 
-VERSION = 1
+VERSION = 2
 MAX_FRAME = 16 * 1024 * 1024
 
 
@@ -29,22 +29,57 @@ class Component(msgspec.Struct, frozen=True):
     group: str
     atomic: str
     final: bool = False
+    replicated: bool = True
 
 
-class Contract(msgspec.Struct, frozen=True):
+class Contract(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     adapter: str
     model: str
     layout: str
-    topology: tuple[int, int]
     components: tuple[Component, ...]
 
+    def __post_init__(self):
+        if (not self.components or len({c.name for c in self.components}) != len(self.components)
+                or any(not c.replicated for c in self.components)):
+            raise ValueError("PD requires unique replicated-page components")
 
-class Node(msgspec.Struct, frozen=True):
+
+class Topology(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """Local allocation owners, grouped by replicated cache partition."""
+
+    ranks: int
+    groups: tuple[tuple[int, ...], ...]
+
+    def __post_init__(self):
+        members = tuple(rank for group in self.groups for rank in group)
+        if (type(self.ranks) is not int or self.ranks <= 0 or not self.groups
+                or any(not group for group in self.groups)
+                or any(type(rank) is not int for rank in members)
+                or len(members) != self.ranks or set(members) != set(range(self.ranks))):
+            raise ValueError("invalid replica partition/rank topology")
+
+    @classmethod
+    def for_tp(cls, ranks, tp):
+        if (type(ranks) is not int or type(tp) is not int or ranks <= 0 or tp <= 0 or ranks % tp):
+            raise ValueError("invalid ranks/TP configuration")
+        return cls(ranks, tuple(tuple(range(start, start + tp)) for start in range(0, ranks, tp)))
+
+    def partition(self, rank):
+        if type(rank) is not int:
+            raise ValueError("rank must be an integer")
+        for partition, members in enumerate(self.groups):
+            if rank in members:
+                return partition
+        raise ValueError("rank outside local topology")
+
+
+class Node(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     node_id: str
     role: str
     boot: str
     contract: Contract
     registry: str
+    topology: Topology
     provider: str = "mooncake"
     prefix: bool = True
     healthy: bool = True

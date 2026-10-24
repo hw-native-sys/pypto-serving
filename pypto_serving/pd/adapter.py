@@ -20,9 +20,9 @@ from .worker import WorkerRuntime
 
 class ModelAdapter(Protocol):
     def prefix_spec(self, tokens, cache) -> Prefix: ...
-    def contract(self, model, geometry, topology) -> Contract: ...
+    def contract(self, model, geometry) -> Contract: ...
     def worker_factory(self, **kwargs): ...
-    def mapping(self, topology, source_partition, destination_partition): ...
+    def mapping(self, source_topology, destination_topology, source_partition, destination_partition): ...
 
 
 CACHE_COMPONENTS = (
@@ -40,17 +40,18 @@ TENSORS = dict(zip((c.name for c in CACHE_COMPONENTS), (
 
 class DeepSeekDSpark:
     @staticmethod
-    def mapping(topology, source_partition, destination_partition):
-        return rank_mapping(*topology, source_partition, destination_partition)
+    def mapping(source_topology, destination_topology, source_partition, destination_partition):
+        return rank_mapping(source_topology, destination_topology, source_partition, destination_partition)
 
     @staticmethod
-    def validate_mapping(topology, placement, mapping):
+    def validate_mapping(source_topology, destination_topology, placement, mapping):
         if not mapping:
             raise ValueError("missing rank mapping")
-        if mapping != rank_mapping(*topology, mapping[0][0] // topology[1], placement.partition):
+        if mapping != rank_mapping(source_topology, destination_topology,
+                                   source_topology.partition(mapping[0][0]), placement.partition):
             raise ValueError("invalid DSpark partition/TP slot mapping")
 
-    def contract(self, model, geometry, topology):
+    def contract(self, model, geometry):
         if {g.name for g in geometry} != {c.name for c in COMPONENTS}:
             raise ValueError("DSpark requires target cache, final state and bootstrap hidden")
         geometry = {g.name: g for g in geometry}
@@ -58,7 +59,7 @@ class DeepSeekDSpark:
         if (a.layers, a.blocks, a.rows) != (b.layers, b.blocks, b.rows):
             raise ValueError("index K/scale geometry mismatch")
         layout = digest(tuple(geometry[c.name].layout for c in COMPONENTS))
-        return Contract("deepseek-v4-dspark-k7", model, layout, tuple(topology), COMPONENTS)
+        return Contract("deepseek-v4-dspark-k7", model, layout, COMPONENTS)
 
     def prefix_spec(self, tokens, cache):
         groups = tuple(dict.fromkeys(c.group for c in COMPONENTS if not c.final))

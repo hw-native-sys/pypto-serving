@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 
 import pytest
 
@@ -153,18 +154,18 @@ def test_generate_config_defaults_to_greedy(options):
     assert config.temperature == 0.0
 
 
-def test_dspark_topology_accepts_the_8_card_and_16_card_worlds():
-    # The DSpark serving topology is TP4 with expert parallelism spanning the
-    # whole world: --ep is the rank count (16 in production, 8 on a half
-    # node) and --dp is the derived scheduler-partition count.
-    for dp, ep in ((2, 8), (4, 16)):
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_dspark_topology_accepts_the_8_card_and_16_card_worlds(tp):
+    # Attention TP determines cache partitions; expert parallelism spans the world.
+    for ep in (8, 16):
+        dp = ep // tp
         devices = ",".join(str(device) for device in range(ep))
         args = _parse_cli_args(
             [
                 "--model", "model",
                 "--dp", str(dp),
                 "--ep", str(ep),
-                "--tp", "4",
+                "--tp", str(tp),
                 "--devices", devices,
                 "--block-size", "32",
                 "--max-num-seqs", "8",
@@ -173,6 +174,34 @@ def test_dspark_topology_accepts_the_8_card_and_16_card_worlds():
         )
 
         cli._validate_dspark_topology(args)
+
+
+@pytest.mark.parametrize("tp", [1, 4])
+@pytest.mark.parametrize("prefix", [False, True])
+def test_dspark_config_keeps_local_attention_and_independent_head_axes(tmp_path, tp, prefix):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({
+        "model_type": "deepseek_v4", "num_hidden_layers": 43,
+        "compress_ratios": [0, 4, 128] + [4] * 40,
+    }))
+    args = _parse_cli_args([
+        "--model", str(model), "--devices", ",".join(map(str, range(16))),
+        "--ep", "16", "--tp", str(tp), "--dp", str(16 // tp), "--lm-head-tp", "4",
+        "--speculative-config", '{"method":"dspark","num_speculative_tokens":7}',
+        "--block-size", "32", "--max-num-seqs", "8", "--max-model-len", "655360",
+        "--long-prefill-token-threshold", "128",
+        "--enable-prefix-caching" if prefix else "--no-enable-prefix-caching",
+    ])
+    config = cli.build_serving_engine_config(args)
+    assert config.executor_kwargs["cache_ranks"] == 16
+    assert config.executor_kwargs["tp_size"] == tp
+    assert config.executor_kwargs["lm_head_tp_size"] == 4
+    assert config.worker_device_ids() == tuple(range(16))
+    assert config.parallel_config.num_replicas == 1
+    assert config.enable_prefix_cache is prefix
+    assert config.runtime_config.num_speculative_tokens == 7
+    assert all(group.num_partitions == 16 // tp for group in config.runtime_config.kv_cache_groups)
 
 
 @pytest.mark.parametrize("requested", [None, "", "diagnostic-output"])

@@ -21,7 +21,8 @@ from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.tools.profile import profile_span
 from .planner import Geometry, SourcePins, page_indices, physical, plan_chunk, valid_from
-from .protocol import (Binding, Completion, Continuation, Node, Placement, Plan, decode, digest, receive, send)
+from .protocol import (Binding, Completion, Continuation, Node, Placement, Plan, Topology,
+                       decode, digest, receive, send)
 from .session import PeerPool, Session
 from .transfer import TransferError
 
@@ -83,9 +84,10 @@ class Service:
     async def start(self, boot, model):
         self.registry = await self.worker("registry")
         self.geometry = tuple(decode(g, Geometry) for g in self.registry["geometry"])
-        contract = self.adapter.contract(model, self.geometry, tuple(self.registry["topology"]))
+        contract = self.adapter.contract(model, self.geometry)
+        topology = decode(self.registry["topology"], Topology)
         self.node = Node(self.endpoint.node_id, self.role, boot, contract, digest(self.registry),
-                         self.config.provider, self.cache.enable_prefix_cache)
+                         topology, self.config.provider, self.cache.enable_prefix_cache)
         if self.role == "decode":
             self.listener = await asyncio.start_server(self._accept, "0.0.0.0", self.endpoint.control_port)
         logger.info("ready node=%s role=%s boot=%s prefix=%s", self.node.node_id, self.role,
@@ -130,7 +132,8 @@ class Service:
             await send(writer, dict(node=self.node, registry=self.registry))
             hello = await receive(reader)
             peer = decode(hello["node"], Node)
-            if peer != node or not self.node.compatible(peer) or digest(hello["registry"]) != peer.registry:
+            if (peer != node or not self.node.compatible(peer) or digest(hello["registry"]) != peer.registry
+                    or decode(hello["registry"]["topology"], Topology) != peer.topology):
                 raise ValueError("peer identity/contract changed before handshake")
             await self.worker("install", hello["registry"])
             session = Session(reader, writer, self.config.capacity * 2)
@@ -153,7 +156,8 @@ class Service:
             if not peer.compatible(self.node):
                 raise ValueError("incompatible Prefill peer")
             geometry = tuple(decode(g, Geometry) for g in hello["registry"]["geometry"])
-            if digest(hello["registry"]) != peer.registry:
+            if (digest(hello["registry"]) != peer.registry
+                    or decode(hello["registry"]["topology"], Topology) != peer.topology):
                 raise ValueError("peer registry fingerprint mismatch")
             await send(writer, dict(node=self.node, registry=self.registry))
             async def dispatch(message):
@@ -253,7 +257,7 @@ class Service:
             if (type(p_hit) is not int or not 0 <= p_hit <= plan.end
                     or p_hit % entry.continuation.prefix.alignment or (entry.chunk and p_hit != entry.p_hit)):
                 raise ValueError("invalid source Prefix boundary")
-            self.validate_plan(entry, plan, geometry, p_hit)
+            self.validate_plan(entry, plan, geometry, p_hit, peer.topology)
             self.cache.authorize_group_cache_write(request)
             entry.pending = plan
             entry.p_hit = p_hit
@@ -295,7 +299,7 @@ class Service:
             return {}
         raise ValueError("unknown handoff operation")
 
-    def validate_plan(self, entry, plan, geometry, p_hit):
+    def validate_plan(self, entry, plan, geometry, p_hit, source_topology):
         if (entry.reservation is None or entry.pending is not None or plan.binding != entry.binding
                 or plan.continuation_digest != entry.normalized_digest
                 or plan.chunk != entry.chunk or plan.start != entry.end
@@ -303,12 +307,12 @@ class Service:
                 or plan.final != (plan.end == len(entry.continuation.tokens))
                 or (plan.final and plan.first_token is None)):
             raise ValueError("invalid chunk sequence or final boundary")
-        ranks, tp = self.node.contract.topology
-        self.adapter.validate_mapping(self.node.contract.topology, entry.reservation, plan.mapping)
+        topology = self.node.topology
+        self.adapter.validate_mapping(source_topology, topology, entry.reservation, plan.mapping)
         if entry.mapping and entry.mapping != plan.mapping:
             raise ValueError("rank mapping changed during a request")
-        expected = {(entry.reservation.partition * tp + slot, c.name)
-                    for slot in range(tp) for c in self.node.contract.components if plan.final or not c.final}
+        expected = {(rank, c.name) for rank in topology.groups[entry.reservation.partition]
+                    for c in self.node.contract.components if plan.final or not c.final}
         if set(plan.units) != expected or len(plan.units) != len(expected):
             raise ValueError("missing required rank/region completion units")
         geo = {g.name: g for g in self.geometry}
@@ -316,7 +320,8 @@ class Service:
         component_group = {c.name: c.group for c in self.node.contract.components}
         occupied = set()
         for copy in plan.copies:
-            if (copy.destination_rank, copy.component) not in expected or not 0 <= copy.source_rank < ranks:
+            if ((copy.destination_rank, copy.component) not in expected
+                    or not 0 <= copy.source_rank < source_topology.ranks):
                 raise ValueError("copy outside rank/component mapping")
             if (copy.source_rank, copy.destination_rank) not in plan.mapping:
                 raise ValueError("copy outside request rank mapping")
@@ -451,7 +456,7 @@ class Service:
                         chunk = replace(chunk, state_slots=await self.worker("source_state", request))
                     plan = plan_chunk(entry.binding, chunk, placement, self.node.contract,
                                       self.cache.group_specs, self.geometry, peer_geometry, p_hit,
-                                      self.adapter.mapping(self.node.contract.topology,
+                                      self.adapter.mapping(self.node.topology, peer.topology,
                                                            chunk.partition, placement.partition),
                                       entry.normalized_digest)
                     self.pins.retain(chunk)
@@ -514,7 +519,10 @@ class Service:
         entry = self.requests[request]
         terminal = False
         try:
-            await asyncio.wait_for(entry.transferred.wait(), self.config.handoff_timeout)
+            try:
+                await asyncio.wait_for(entry.transferred.wait(), self.config.request_timeout)
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError("Prefill data did not arrive within request_timeout") from exc
             if entry.error is not None:
                 raise entry.error
             if entry.cancelled:

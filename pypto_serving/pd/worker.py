@@ -15,7 +15,7 @@ import threading
 
 import msgspec
 
-from .protocol import Completion, MAX_FRAME, Plan, decode, digest
+from .protocol import Completion, MAX_FRAME, Plan, Topology, decode, digest
 from .transfer import Owner, Region, TransferError, owner_factories
 
 
@@ -49,11 +49,13 @@ class WorkerRuntime:
             regions = tuple(owner.register(self.model.worker(), tensor.shards[rank], name)
                             for rank, owner in enumerate(self.owners)
                             for name, tensor in self.model.regions().items())
-            self.registry = dict(geometry=geometry, regions=regions, topology=(self.model.ranks, self.model.tp))
+            self.registry = dict(geometry=geometry, regions=regions,
+                                 topology=Topology.for_tp(self.model.ranks, self.model.tp))
         return self.registry
 
     def install(self, value):
         regions = tuple(decode(r, Region) for r in value["regions"])
+        topology = decode(value["topology"], Topology)
         boots = {r.boot for r in regions}
         if len(boots) != 1:
             raise ValueError("registry must belong to one node boot")
@@ -65,8 +67,8 @@ class WorkerRuntime:
         if len(self.peers) >= self.settings.peer_capacity:
             raise ValueError("peer registry capacity exhausted")
         names = set(self.model.regions())
-        if ({(r.rank, r.name) for r in regions} != {(i, n) for i in range(self.model.ranks) for n in names}
-                or len(regions) != len(names) * self.model.ranks):
+        if ({(r.rank, r.name) for r in regions} != {(i, n) for i in range(topology.ranks) for n in names}
+                or len(regions) != len(names) * topology.ranks):
             raise ValueError("peer registry has missing or duplicate rank/region")
         for owner in self.owners:
             owner.call("install", regions=regions)
@@ -97,7 +99,7 @@ class WorkerRuntime:
                 raise ValueError("copy outside source/destination registration")
             key = copy.destination_rank, copy.component
             occupied.setdefault(key, []).append((copy.destination_offset, copy.destination_offset + copy.length))
-            batches.setdefault(copy.source_rank, []).append(copy)
+            batches.setdefault((copy.source_rank, copy.destination_rank), []).append(copy)
         for intervals in occupied.values():
             ordered = sorted(intervals)
             if any(a[1] > b[0] for a, b in zip(ordered, ordered[1:])):
@@ -109,7 +111,7 @@ class WorkerRuntime:
             # Every rank was validated before the first native task is enqueued.
             try:
                 futures = tuple(self.pool.submit(self.owners[rank].call, "write", peer=peer, copies=tuple(copies))
-                                for rank, copies in batches.items())
+                                for (rank, _), copies in batches.items())
             except BaseException as exc:
                 self.uncertain = True
                 raise TransferError("partial rank submission", uncertain=True) from exc

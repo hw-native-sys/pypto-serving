@@ -8,10 +8,9 @@
 # -----------------------------------------------------------------------------------------------------------
 """PyPTO executor for the DSpark DeepSeek-V4-Flash target kernels.
 
-Compiles ``l3_prefill_fwd`` and ``l3_decode_fwd`` from
-``pypto-lib/models/deepseek_v4_flash_dspark`` with the canonical 16-card
-import contract (``--tp 4 --ep 16 --weight-bank-size 43``) and hands the
-compiled programs to :class:`DSparkModelRunner`.  The DSpark kernels freeze
+Compiles the role's programs from ``pypto-lib/models/deepseek_v4_flash_dspark``
+with local attention TP, independent head TP and an EP-wide world, then hands
+them to :class:`DSparkModelRunner`. The DSpark kernels freeze
 their shapes from ``sys.argv`` at import, so every import runs inside
 ``_dspark_import_context``; the module names collide with the MTP variant's
 (``config``, ``moe``, ``lm_head`` ...), so the context evicts any same-named
@@ -26,6 +25,7 @@ import importlib
 import os
 import sys
 from collections.abc import Iterable, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -149,8 +149,9 @@ def _dspark_import_context(
     ep: int,
     weight_bank_size: int,
     dp: int = 1,
+    lm_head_tp: int = 4,
 ):
-    """Import DSpark kernels with the canonical 16-card shape arguments."""
+    """Import kernels with one node's independent attention and head shapes."""
     old_argv = list(sys.argv)
     old_path = list(sys.path)
     missing = object()
@@ -166,11 +167,9 @@ def _dspark_import_context(
     sys.argv = [
         "pypto-serving-dspark",
         "--tp", str(int(tp)),
+        "--lm-head-tp", str(int(lm_head_tp)),
         "--ep", str(int(ep)),
-        # lm_head.WORLD_SIZE = TP * DP scopes the markov sampler's stacked
-        # tensors; only lm_head/dspark_markov parse --dp (the target programs
-        # ignore it), so passing the DP group count makes the markov program
-        # cover the full 16-rank world in one dispatch.
+        # EP fixes the composed world; attention DP is not head DP.
         "--dp", str(int(dp)),
         "--weight-bank-size", str(int(weight_bank_size)),
     ]
@@ -206,6 +205,9 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         device_ids: Sequence[int] | None = None,
         pypto_build_dir: str | None = None,
         cache_ranks: int = DSPARK_RANKS,
+        tp_size: int = 4,
+        lm_head_tp_size: int = 4,
+        execution_role: str = "mixed",
         compile_kernels: bool = False,
         num_speculative_tokens: int = 0,
         capture_prefill_tail: bool = False,
@@ -225,7 +227,12 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         # The serving topology is flag-driven: --ep is the rank count and this
         # layout freezes every rank-derived axis (kernel import arguments,
         # scheduler cache partitions, packed-prefill capacity) from it.
-        self._topology_layout = DSparkCacheLayout.for_ranks(cache_ranks)
+        self._topology_layout = DSparkCacheLayout.for_ranks(
+            cache_ranks, tp_size=tp_size, lm_head_tp_size=lm_head_tp_size,
+        )
+        if execution_role not in ("mixed", "prefill", "decode"):
+            raise ValueError("invalid DSpark execution role")
+        self._execution_role = execution_role
         self._runner_extension_factory = runner_extension_factory
         if self._num_speculative_tokens not in (0, DSPARK_SPECULATIVE_TOKENS):
             raise ValueError(
@@ -252,6 +259,9 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             (compiled.layout.prefill_batch for compiled in self._compiled.values()),
             default=self._topology_layout.prefill_batch,
         )
+
+    def cache_group_sizes(self, model_id: str) -> dict[str, int]:
+        return dict(self._runners[model_id]._cache_group_num_blocks)
 
     @property
     def max_prefill_requests_per_partition(self) -> int:
@@ -325,7 +335,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                      if runner.runtime_extension is not None)
 
     def _compile_model(self, model: RuntimeModel) -> DSparkCompiledKernels:
-        """Validate DSpark metadata, compile the two L3 programs, and package."""
+        """Validate DSpark metadata and compile the role's L3 programs."""
         metadata = model.extra
         if metadata.get("family") != "deepseek_v4":
             raise ValueError("DeepSeekV4DSparkPyptoExecutor received a non-DeepSeekV4 model")
@@ -333,9 +343,8 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             raise ValueError(
                 "DeepSeekV4DSparkPyptoExecutor requires the W8A8 compressed-tensors checkpoint"
             )
-        layout = DSparkCacheLayout(
-            ranks=self._topology_layout.ranks,
-            partitions=self._topology_layout.partitions,
+        layout = replace(
+            self._topology_layout,
             prefill_batch=min(
                 model.runtime.max_batch_size, self._topology_layout.prefill_batch
             ),
@@ -417,10 +426,10 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         rope: DSparkRopeTables | None = None
         if self._compile_kernels:
             modules = self._load_kernel_modules(layout, speculative=speculative)
-            prefill = self._compile_l3_callable(
-                "dspark_prefill",
-                modules["prefill_fwd"].l3_prefill_fwd,
-            )
+            if self._execution_role != "decode":
+                prefill = self._compile_l3_callable(
+                    "dspark_prefill", modules["prefill_fwd"].l3_prefill_fwd,
+                )
             if prefill_device_tail:
                 prefill_capture = self._compile_l3_callable(
                     "dspark_prefill_capture", modules["prefill_state"].l3_capture_prefill_tail
@@ -438,7 +447,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                     "dspark_decode_one_l2",
                     modules["decode_fwd_dspark"].l3_decode_fwd_dspark,
                 )
-            else:
+            elif self._execution_role != "prefill":
                 decode = self._compile_l3_callable(
                     "dspark_decode", modules["decode_fwd"].l3_decode_fwd
                 )
@@ -553,6 +562,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             ep=layout.ranks,
             weight_bank_size=DSPARK_FWD_NUM_LAYERS,
             dp=layout.partitions,
+            lm_head_tp=layout.lm_head_tp_size,
         ):
             config = importlib.import_module("config")
             utils = importlib.import_module("utils")

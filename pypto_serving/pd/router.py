@@ -105,13 +105,16 @@ class Router:
                 json=payload, headers=headers(d)))
             d_task = asyncio.create_task(self.client.send(self.client.build_request(
                 "POST", endpoints[1].url + request.url.path, json=payload, headers=headers(p)), stream=True))
+            # JSON headers follow generation; SSE headers only acknowledge setup.
+            header_timeout = (self.config.handoff_timeout if payload.get("stream", False)
+                              else self.config.request_timeout)
             done, _ = await asyncio.wait((p_task, d_task), return_when=asyncio.FIRST_COMPLETED,
-                                         timeout=self.config.handoff_timeout)
+                                         timeout=header_timeout)
             if not done:
                 raise RuntimeError("handoff header deadline exceeded")
             if p_task in done:
                 await ready()
-            response = await asyncio.wait_for(asyncio.shield(d_task), self.config.handoff_timeout)
+            response = await asyncio.wait_for(asyncio.shield(d_task), header_timeout)
             if response.status_code != 200:
                 body = await response.aread()
                 raise HTTPException(response.status_code, body.decode()[:1000])

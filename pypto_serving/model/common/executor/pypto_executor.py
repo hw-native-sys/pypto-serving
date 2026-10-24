@@ -78,14 +78,14 @@ class PyptoExecutor(ModelExecutor, ABC):
 
             try:
                 num_pages = runner.init_kv_cache(model_id, record.config, record.runtime)
+                with profile_span("PyptoExecutor.preflight", cat="executor", args={"model_id": model_id}):
+                    runner.preflight(record)
             except Exception:
                 close = getattr(runner, "close", None)
                 if callable(close):
                     close()
                 raise
 
-            with profile_span("PyptoExecutor.preflight", cat="executor", args={"model_id": model_id}):
-                runner.preflight(record)
             logger.info(
                 "PyptoExecutor %s: model loaded (%.1fs total)",
                 model_id,

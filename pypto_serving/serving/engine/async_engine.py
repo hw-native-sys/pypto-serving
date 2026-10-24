@@ -337,7 +337,7 @@ class ReplicaEngineCore:
                 output_q,
                 profile_output_q,
                 ready_event,
-                num_pages_value,
+                cache_capacity,
             ) = self._worker_factory(self.config)
             self._worker_process = process
             self._input_queue = input_q
@@ -360,10 +360,13 @@ class ReplicaEngineCore:
             # Synchronise block metadata with the actual device-side KV cache
             # size. Grouped runners report the first group's rank-local block
             # count; generic runners report their single-pool page count.
-            reported_num_blocks = num_pages_value.value
+            reported_num_blocks = cache_capacity[0]
+            group_sizes = {group.name: cache_capacity[index]
+                           for index, group in enumerate(self._runtime.kv_cache_groups, 1)}
             self.kv_cache_manager.initialize(
                 self._runtime,
                 num_blocks=reported_num_blocks,
+                group_num_blocks=group_sizes if any(group_sizes.values()) else None,
             )
             if self.kv_cache_manager.has_groups:
                 logger.info(

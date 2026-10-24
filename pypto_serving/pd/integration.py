@@ -189,6 +189,7 @@ class Application:
         engine_config = replace(engine_config,
             runtime_config=replace(engine_config.runtime_config, num_speculative_tokens=tokens),
             executor_kwargs={**engine_config.executor_kwargs, "num_speculative_tokens": tokens,
+                "execution_role": role,
                 "capture_prefill_tail": role == "prefill",
                 "runner_extension_factory": partial(self.adapter.worker_factory,
                                                       settings=settings, progress_channel=channel)},
