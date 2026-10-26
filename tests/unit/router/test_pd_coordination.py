@@ -36,9 +36,9 @@ def config(p=1, d=1, **options):
         observability={"enabled": False}, health_interval_seconds=60)
 
 
-def request(payload):
+def request(payload, *, raw=None):
     async def receive():
-        return {"type": "http.request", "body": json.dumps(payload).encode()}
+        return {"type": "http.request", "body": json.dumps(payload).encode() if raw is None else raw}
     return Request({"type": "http", "method": "POST", "path": "/v1/completions",
                     "headers": [(b"x-session-id", b"conversation")]}, receive)
 
@@ -231,6 +231,12 @@ def test_pd_failures_cancel_both_ends_without_leaking_slots(failure):
         cfg = config()
         peers = Peers(cfg)
         router = peers.router(cfg)
+        releases = []
+        release = router.registry.release
+        def record_release(name):
+            releases.append(name)
+            release(name)
+        router.registry.release = record_release
         async def managed_operation():
             pytest.fail("PD must not launch, adopt or stop external model processes")
         router.fleet.adopt_previous = router.fleet.launch_initial = router.fleet.stop_all = managed_operation
@@ -258,10 +264,11 @@ def test_pd_failures_cancel_both_ends_without_leaking_slots(failure):
             assert all(s.outstanding == 0 for s in router.registry.states)
             assert router.proxy.requests == router.proxy.handoffs == 0
             assert not router.proxy.active and not router.client.is_closed
+            assert releases.count("p0") == releases.count("d0") == 1
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("fault", ["identity", "role", "provider", "layout"])
+@pytest.mark.parametrize("fault", ["identity", "role", "provider", "layout", "version"])
 def test_unusable_descriptor_cannot_receive_a_generation(fault):
     async def run():
         cfg = config()
@@ -269,6 +276,7 @@ def test_unusable_descriptor_cannot_receive_a_generation(fault):
         node = peers.nodes["d0"]
         changes = {"identity": {"node_id": "wrong"}, "role": {"role": "prefill"},
                    "provider": {"provider": "other"},
+                   "version": {"version": 99},
                    "layout": {"contract": msgspec.structs.replace(node.contract, layout="other")}}
         peers.nodes["d0"] = msgspec.structs.replace(node, **changes[fault])
         router = peers.router(cfg)
@@ -364,7 +372,7 @@ def test_node_error_keeps_body_status_and_meaningful_headers(node, encoding):
                 else ("unavailable " * 300).encode())
         headers = {"Content-Type": "application/json" if encoding == "json" else "text/plain",
                    "Retry-After": "7", "X-Request-Id": "backend-request",
-                   "Connection": "close, x-private-hop", "X-Private-Hop": "drop",
+                   "Connection": "close, x-private-hop", "X-Private-Hop": "drop", "Trailer": "Digest",
                    "X-PyPTO-Error-Source": "forged"}
         if encoding == "gzip":
             headers["Content-Encoding"] = "gzip"
@@ -379,6 +387,7 @@ def test_node_error_keeps_body_status_and_meaningful_headers(node, encoding):
             assert response.headers["x-request-id"] == "backend-request"
             assert response.headers["x-pypto-error-source"] == "upstream"
             assert "content-encoding" not in response.headers and "x-private-hop" not in response.headers
+            assert "trailer" not in response.headers
             assert int(response.headers["content-length"]) == len(body)
             assert sum(path.endswith("abort") for _, path in peers.calls) == 2
             assert all(s.outstanding == 0 for s in router.registry.states)
@@ -545,23 +554,28 @@ def test_capacity_skips_full_nodes_and_releases_once_on_cancellation():
     async def run():
         cfg = config(2, 2, handoff_timeout=1, request_timeout=2)
         peers = Peers(cfg)
-        peers.p_hold, peers.d_hold = asyncio.Event(), asyncio.Event()
         router = peers.router(cfg)
         async with router.app.router.lifespan_context(router.app):
+            assert (await router.proxy.forward(request({}), "/v1/completions")).status_code == 200
+            # The next rotation starts at p1/d1. Its occupied slots must then be
+            # skipped at p0/d1 and p1/d0 before p0/d0 can accept the second request.
+            peers.p_hold, peers.d_hold = asyncio.Event(), asyncio.Event()
+            previous_posts = sum(path == "/v1/completions" for _, path in peers.calls)
             pending = []
             for expected in (1, 2):
                 pending.append(asyncio.create_task(router.proxy.forward(request({}), "/v1/completions")))
-                while sum(path == "/v1/completions" for _, path in peers.calls) < 2 * expected:
+                while sum(path == "/v1/completions" for _, path in peers.calls) < previous_posts + 2 * expected:
                     await asyncio.sleep(0)
                 assert all(s.outstanding <= 1 for s in router.registry.states)
             assert router.proxy.requests == router.proxy.handoffs == 2
             assert {req.url.host for req in peers.requests if req.url.path == "/v1/completions"} == {
                 "p0", "p1", "d0", "d1"}
             count = len(peers.calls)
-            response = await asyncio.wait_for(router.proxy.forward(request({}), "/v1/completions"), 0.1)
-            assert response.status_code == 503 and len(peers.calls) == count
-            assert json.loads(response.body)["code"] == "capacity_exhausted"
-            assert router.registry.rejected == 1 and router.registry.total_routed() == 2
+            rejected = await asyncio.wait_for(asyncio.gather(*(
+                router.proxy.forward(request({}), "/v1/completions") for _ in range(16))), 0.5)
+            assert all(response.status_code == 503 for response in rejected) and len(peers.calls) == count
+            assert all(json.loads(response.body)["code"] == "capacity_exhausted" for response in rejected)
+            assert router.registry.rejected == 16 and router.registry.total_routed() == 3
             for task in pending:
                 task.cancel()
             results = await asyncio.gather(*pending, return_exceptions=True)
@@ -623,6 +637,87 @@ def test_round_robin_positions_survive_health_changes_and_use_current_boots():
             assert selected["prefill"] == ["p1", "restarted", "new"]
             assert selected["decode"][0] == "d1"
             assert router.registry.total_routed() == 4
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("raw", [b"{", b"null", b"[]", b'{"model":false}', b'{"model":[]}'])
+def test_invalid_requests_have_stable_errors_without_dispatch(raw):
+    async def run():
+        cfg = config()
+        peers = Peers(cfg)
+        router = peers.router(cfg)
+        async with router.app.router.lifespan_context(router.app):
+            response = await router.proxy.forward(request(None, raw=raw), "/v1/completions")
+            value = json.loads(response.body)
+            assert response.status_code == 400 and value["code"] == "invalid_request"
+            assert value["object"] == "error" and value["message"]
+            assert response.headers["x-pypto-error-source"] == "router"
+            assert response.headers["x-session-id"] == "conversation"
+            assert router.registry.rejected == 1 and router.registry.total_routed() == 0
+            assert router.proxy.requests == router.proxy.handoffs == 0 and not router.proxy.active
+            assert all(path.endswith("descriptor") for _, path in peers.calls)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("fault", [{"node_id": "other"}, {"role": "prefill"},
+                                   {"provider": "other"}, {"version": 99}])
+def test_invalid_descriptors_cannot_poison_model_discovery(fault):
+    async def run():
+        cfg = config()
+        peers = Peers(cfg)
+        original = peers.nodes["d0"]
+        peers.nodes["d0"] = msgspec.structs.replace(original,
+            contract=msgspec.structs.replace(original.contract, model="unverified-model"), **fault)
+        router = peers.router(cfg)
+        async with router.app.router.lifespan_context(router.app):
+            assert router.proxy.models == {"model"} and router.proxy.discovered == {"p0"}
+            error = await router.proxy.forward(request({"model": "unverified-model"}), "/v1/completions")
+            assert error.status_code == 503
+            peers.nodes["d0"] = original
+            await router.health.probe_once()
+            error = await router.proxy.forward(request({"model": "unverified-model"}), "/v1/completions")
+            assert error.status_code == 404 and router.proxy.models == {"model"}
+            assert all(path.endswith("descriptor") for _, path in peers.calls)
+    asyncio.run(run())
+
+
+def test_first_invalid_health_sample_is_visible_in_pd_role_metrics():
+    async def run():
+        cfg = config()
+        peers = Peers(cfg)
+        router = peers.router(cfg)
+        async with router.app.router.lifespan_context(router.app):
+            peers.nodes["d0"] = msgspec.structs.replace(peers.nodes["d0"], healthy=False)
+            await router.health.probe_once()
+            response = await router._health()
+            status = json.loads(response.body)
+            assert response.status_code == 503 and status["replicas_ready"] == 1
+            assert status["roles"]["decode"]["ready"] == 0
+            assert not router.registry.state("d0").ready
+            peers.nodes["d0"] = msgspec.structs.replace(peers.nodes["d0"], healthy=True, boot="new")
+            await router.health.probe_once()
+            assert (await router._health()).status_code == 200
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("body", ['data: {broken}\n\n', 'data: []\n\n',
+                                  'data: {"choices":[{"text":"partial"}]}\n\n'])
+def test_malformed_or_incomplete_sse_reports_a_router_protocol_error(body):
+    async def run():
+        cfg = config()
+        peers = Peers(cfg)
+        peers.stream_body = body
+        router = peers.router(cfg)
+        async with router.app.router.lifespan_context(router.app):
+            response = await router.proxy.forward(request({"stream": True}), "/v1/completions")
+            assert response.status_code == 200
+            stream = "".join([part async for part in response.body_iterator])
+            errors = [json.loads(line[6:])["error"] for line in stream.splitlines()
+                      if line.startswith("data: {") and '"error"' in line]
+            assert len(errors) == 1
+            assert errors[0]["code"] == "pd_protocol_error" and errors[0]["source"] == "router"
+            assert stream.count("data: [DONE]") == 1
+            assert router.proxy.requests == router.proxy.handoffs == 0
     asyncio.run(run())
 
 

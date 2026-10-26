@@ -44,7 +44,7 @@ def _failure(exc):
         return exc
     if isinstance(exc, httpx.PoolTimeout):
         return _Failure(503, "http_pool_exhausted", "Router HTTP connection pool is busy")
-    if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException)):
         return _Failure(503, "pd_operation_timeout", str(exc) or "PD HTTP operation timed out")
     if isinstance(exc, httpx.HTTPError):
         return _Failure(502, "upstream_connection_error", str(exc))
@@ -93,6 +93,7 @@ class PDCoordinator:
             self.discovered.add(spec.name)
             if not node.healthy:
                 self.nodes.pop(spec.name, None)
+                self.registry.set_ready(spec.name, False)
                 return False
             self.nodes[spec.name] = node
             return True
@@ -102,6 +103,7 @@ class PDCoordinator:
             return None
         except (httpx.HTTPError, ValueError):
             self.nodes.pop(spec.name, None)
+            self.registry.set_ready(spec.name, False)
             return False
 
     def _candidates(self, model):
@@ -167,7 +169,7 @@ class PDCoordinator:
                 raise ValueError("request must be a JSON object")
             payload["stream"] = _STREAM.validate_python(payload.get("stream", False))
             return await self._forward(request, path, owner, payload, session_id)
-        except (_Failure, ValueError, RuntimeError, TimeoutError, httpx.HTTPError) as exc:
+        except (_Failure, ValueError, RuntimeError, asyncio.TimeoutError, TimeoutError, httpx.HTTPError) as exc:
             error = _failure(exc)
             if error.code in {"invalid_request", "model_not_found", "no_available_backend",
                               "capacity_exhausted", "router_closing"}:
@@ -217,7 +219,8 @@ class PDCoordinator:
                         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True),
                                                self.config.handoff_timeout)
                     except asyncio.TimeoutError:
-                        pass  # Node-side leases remain gated until positive native proof.
+                        logger.warning("PD HTTP task retirement timed out request=%s; native leases stay guarded",
+                                       binding.request)
                 received = response
                 if received is None and d_task is not None and d_task.done() and not d_task.cancelled():
                     if d_task.exception() is None:
@@ -277,7 +280,7 @@ class PDCoordinator:
             try:
                 response = await asyncio.wait_for(asyncio.shield(d_task),
                     max(0, deadline - asyncio.get_running_loop().time()))
-            except TimeoutError as exc:
+            except asyncio.TimeoutError as exc:
                 raise _Failure(503, "pd_operation_timeout", "Decode response header wait timed out") from exc
             if response.status_code != 200:
                 await response.aread()
@@ -309,6 +312,8 @@ class PDCoordinator:
                             data = text[6:]
                             terminal = data == "[DONE]"
                             value = None if terminal else json.loads(data)
+                            if not terminal and not isinstance(value, dict):
+                                raise ValueError("Decode SSE data must be a JSON object")
                             if value and value.get("error") is not None:
                                 upstream_failed = True
                             if not upstream_failed and (terminal or (

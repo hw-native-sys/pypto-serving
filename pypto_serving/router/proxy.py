@@ -37,7 +37,7 @@ _SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,128}\Z")
 # Headers that describe one hop and must not be relayed to the next.
 _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade",
+    "te", "trailer", "trailers", "transfer-encoding", "upgrade",
 })
 # The router re-frames the body, so the upstream framing headers no longer
 # describe what the client receives.
