@@ -11,7 +11,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from contextlib import contextmanager
-import json
 import logging
 from pathlib import Path
 import uuid
@@ -30,6 +29,8 @@ class Endpoint:
     def __post_init__(self):
         if not self.host or any(c in self.host for c in "/?#@"):
             raise ValueError("endpoint host must be a hostname or IP address")
+        if type(self.control_port) is not int or not isinstance(self.transfer_hostname, str):
+            raise ValueError("invalid control/transfer address")
         for port in (self.port, self.control_port or self.port + 10000):
             if type(port) is not int or not 0 < port < 65536:
                 raise ValueError("endpoint port outside 1..65535")
@@ -76,17 +77,28 @@ class Config:
 
     @classmethod
     def load(cls, path):
-        document = json.loads(Path(path).read_text())
-        if set(document) - {"runtime", "observability"}:
-            raise ValueError("unknown PD document section")
-        runtime = dict(document["runtime"])
-        logs = document.get("observability", {})
+        from pypto_serving.router.config import load_router_config
+
+        return cls.from_router(load_router_config(path))
+
+    @classmethod
+    def from_router(cls, config):
+        if not config.is_pd:
+            raise ValueError("PD requires prefill/decode replicas")
+        runtime = config.pd_options if config.pd_options is not None else {}
+        logs = config.observability if config.observability is not None else {}
+        if not isinstance(runtime, dict) or set(runtime) - {
+                "provider", "policy", "capacity", "handoff_timeout", "request_timeout", "run_id"}:
+            raise ValueError("invalid PD options")
+        if not isinstance(logs, dict):
+            raise ValueError("invalid observability options")
         if set(logs) - {"enabled", "root"} or type(logs.get("enabled", True)) is not bool:
             raise ValueError("invalid observability options")
         try:
-            return cls(
-                **{**runtime, "prefill": tuple(Endpoint(**n) for n in runtime["prefill"]),
-                   "decode": tuple(Endpoint(**n) for n in runtime["decode"])},
+            endpoints = {role: tuple(Endpoint(r.host, r.port, r.name, r.control_port, r.transfer_hostname)
+                                    for r in config.replicas if r.role == role)
+                         for role in ("prefill", "decode")}
+            return cls(**runtime, **endpoints,
                 log_enabled=logs.get("enabled", True), log_root=logs.get("root", "serving_log/pd_disag"),
             )
         except (TypeError, KeyError) as exc:

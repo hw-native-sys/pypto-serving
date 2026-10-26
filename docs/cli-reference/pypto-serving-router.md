@@ -2,7 +2,7 @@
 
 `pypto-serving-router` is an OpenAI-compatible reverse proxy over a fixed set of `pypto-serving` replicas. It keeps each conversation on the replica that holds its KV cache, and takes unreachable replicas out of rotation.
 
-It requires no NPU, no model directory, and no tokenizer: request bodies are forwarded verbatim.
+It requires no NPU, no model directory, and no tokenizer. Ordinary replica request bodies are forwarded verbatim. Prefill/decode deployments use the same Router with role-tagged endpoints; their request lifecycle is coordinated by the PD module. See [Prefill/decode disaggregation](../user-guide/pd-disaggregation.md).
 
 For the deployment walkthrough, see [Multi-Node Routing](../user-guide/multi-node-routing.md).
 
@@ -32,6 +32,7 @@ A JSON file with `replicas` (endpoints that already exist) and/or `hosts` (machi
 | `host` | Required | Hostname or address of the replica. |
 | `port` | Required | Port the replica's HTTP server listens on. |
 | `name` | `host:port` | Label used in logs and on `/health`. |
+| `role` | `replica` | `replica` for a complete server, or `prefill` / `decode` for PD pools. PD requires both roles, uses HTTP, and cannot mix with complete replicas or launchable `hosts`. |
 | `scheme` | `http` | `http` or `https`. Request bodies and generated text cross this hop in the clear under `http`; set `https` when the replicas are not on a trusted network and TLS is terminated in front of them. |
 
 ### `hosts` — machines the router may launch on
@@ -66,7 +67,7 @@ One slot per group of `devices_per_replica` devices, taken from `devices` in ord
 | `--session-ttl SECONDS` | `600` | Inactivity before a conversation loses its replica pin. Expiry drops the pin only; KV blocks are reclaimed by each replica's own cache. |
 | `--affinity-slack N` | `8` | Extra outstanding requests a pinned replica may carry, relative to the least loaded one, before a session is re-routed. `0` disables affinity; a large value makes it strict. |
 | `--health-interval SECONDS` | `5` | Interval between replica health probes. |
-| `--request-timeout SECONDS` | `3600` | Overall timeout for one proxied request. There is no read timeout: decode is slow by design. |
+| `--request-timeout SECONDS` | `3600` | HTTP write/pool timeout for ordinary proxy requests, with no read or overall execution deadline. PD execution and handoff deadlines are set separately in the `pd` configuration section. |
 | `--connect-timeout SECONDS` | `5` | Connect timeout per replica. |
 | `--initial-replicas N` | `1` with hosts, else `0` | Replicas to launch at startup, filling slots in config order, local machine first. Refused at startup if it exceeds the pool. |
 | `--max-replicas N` | declared pool | Cap launched replicas below the declared devices. |

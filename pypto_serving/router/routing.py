@@ -69,6 +69,20 @@ class NoReplicaAvailable(RuntimeError):
     """Raised when every replica in the table is unroutable."""
 
 
+class RoundRobin:
+    """Rotate over an already filtered collection of routing candidates."""
+
+    def __init__(self):
+        self.cursor = 0
+
+    def select(self, candidates):
+        if not candidates:
+            raise NoReplicaAvailable("no compatible healthy routing candidate")
+        selected = candidates[self.cursor % len(candidates)]
+        self.cursor += 1
+        return selected
+
+
 def new_session_id() -> str:
     return uuid.uuid4().hex
 
@@ -200,7 +214,8 @@ class ReplicaRegistry:
     def __init__(self, config: RouterConfig, sessions: SessionDirectory) -> None:
         self._config = config
         self._sessions = sessions
-        self._states = [ReplicaState(spec=spec, index=i) for i, spec in enumerate(config.replicas)]
+        self._states = [ReplicaState(spec=spec, index=i, ready=spec.role == "replica")
+                        for i, spec in enumerate(config.replicas)]
         self._by_name = {state.name: state for state in self._states}
         # Rotating tiebreak, matching AsyncLLMEngine._select_replica: equal-load
         # replicas are taken in turn instead of always the lowest index.
@@ -221,6 +236,9 @@ class ReplicaRegistry:
     def failed_count(self) -> int:
         """Replicas that were serving and are not any more."""
         return sum(1 for state in self._states if state.phase == "failed")
+
+    def candidates(self, role: str) -> tuple[ReplicaState, ...]:
+        return tuple(state for state in self._states if state.routable and state.spec.role == role)
 
     def total_routed(self) -> int:
         return sum(state.routed for state in self._states)
@@ -361,16 +379,19 @@ class HealthMonitor:
     """
 
     def __init__(self, config: RouterConfig, registry: ReplicaRegistry,
-                 sessions: SessionDirectory, client) -> None:
+                 sessions: SessionDirectory, client, *, probe=None) -> None:
         self._config = config
         self._registry = registry
         self._sessions = sessions
         self._client = client
+        self._probe_callback = probe
         self._task: asyncio.Task | None = None
 
-    async def start(self) -> None:
+    async def start(self, *, probe_first: bool = False) -> None:
         if self._task is None:
-            self._task = asyncio.create_task(self._loop())
+            if probe_first:
+                await self.probe_once()
+            self._task = asyncio.create_task(self._loop(delay_first=probe_first))
 
     async def stop(self) -> None:
         task, self._task = self._task, None
@@ -380,7 +401,9 @@ class HealthMonitor:
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    async def _loop(self) -> None:
+    async def _loop(self, *, delay_first: bool = False) -> None:
+        if delay_first:
+            await asyncio.sleep(self._config.health_interval_seconds)
         while True:
             try:
                 await self.probe_once()
@@ -399,10 +422,13 @@ class HealthMonitor:
     async def _probe(self, state: ReplicaState) -> None:
         healthy = False
         try:
-            response = await self._client.get(
-                f"{state.spec.base_url}/health", timeout=self._config.connect_timeout_seconds
-            )
-            healthy = response.status_code == 200
+            if self._probe_callback is not None:
+                healthy = await self._probe_callback(state.spec)
+            else:
+                response = await self._client.get(
+                    f"{state.spec.base_url}/health", timeout=self._config.connect_timeout_seconds
+                )
+                healthy = response.status_code == 200
         except Exception as exc:  # noqa: BLE001 - refused and timeout both mean unroutable
             if is_router_side_failure(exc):
                 # The probe never left the router, so this cycle saw nothing.

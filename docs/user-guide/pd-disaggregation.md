@@ -18,7 +18,7 @@ Install `python -m pip install -e '.[pd]'` in each environment. The Router only 
 
 ## Configure and start
 
-Copy [the minimal configuration](https://github.com/hw-native-sys/pypto-serving/blob/main/examples/pd.json), replace the example IPs, and use the same configuration on all processes. Each service/model has its own Router and node pools. Add entries to either list for multiple nodes; the policy defaults to round-robin over compatible healthy pairs. With multiple entries in one role, select the node using `--pd-node-id host:port` (or an explicit entry `node_id`).
+Copy [the minimal configuration](https://github.com/hw-native-sys/pypto-serving/blob/main/examples/pd.json), replace the example IPs, and use the same configuration on all processes. Each service/model has its own Router and node pools. Add replica entries with either role for multiple nodes; the policy defaults to round-robin over compatible healthy pairs. With multiple entries in one role, select the node using `--pd-node-id host:port` (or an explicit entry `name`).
 
 On **each** model host, start one process with its appropriate role and port:
 
@@ -55,10 +55,12 @@ other parallel layouts or full-length context stress.
 
 Each node independently accepts `--no-enable-prefix-caching`; all four P/D combinations are supported. No prefix mode belongs in JSON. P cache hits reduce computation; D hits reduce network traffic, independently.
 
+The common Serving Router uses `role: "prefill"` and `role: "decode"` in its `replicas` table. Entries without a role remain ordinary complete replicas. PD requires both roles and uses statically launched nodes; mixing complete replicas, PD nodes or launchable `hosts` is rejected. The Router never starts or stops these external P/D processes.
+
 Start the external Router, then wait for `/health` to report `ok`:
 
 ```bash
-pypto-pd-router --pd-config examples/pd.json --host 0.0.0.0 --port 8110
+pypto-serving-router --replicas examples/pd.json --host 0.0.0.0 --port 8110
 curl http://127.0.0.1:8110/health
 curl -N http://127.0.0.1:8110/v1/chat/completions \
   -H 'Content-Type: application/json' \
@@ -67,11 +69,11 @@ curl -N http://127.0.0.1:8110/v1/chat/completions \
 
 Completion/chat, streaming, tools and optional constraints reuse Serving's ordinary API. Invalid preparation fails before SSE headers. Later execution failures emit an explicit stream error; clients must inspect events even after HTTP 200.
 
-HTTP, control (HTTP port + 10000 by default), and Mooncake's dynamic RPC/RoCE endpoints must be reachable. Optional entry fields are `control_port` and `transfer_hostname` for a distinct data-plane address. Optional runtime fields are `provider` (currently `mooncake`), `policy` (currently `round_robin`), `capacity` (8 per node), `handoff_timeout` (300 seconds), `request_timeout` (3600 seconds), and `run_id`. Timeouts do not authorize reuse of possibly active memory.
+HTTP, control (HTTP port + 10000 by default), and Mooncake's dynamic RPC/RoCE endpoints must be reachable. Optional entry fields are `control_port` and `transfer_hostname` for a distinct data-plane address. Optional fields in the top-level `pd` section are `provider` (currently `mooncake`), `policy` (currently `round_robin`), `capacity` (8 per node), `handoff_timeout` (300 seconds), `request_timeout` (3600 seconds), and `run_id`. Timeouts do not authorize reuse of possibly active memory.
 
 `handoff_timeout` bounds individual control, transfer, and stop-confirmation operations. Waiting for the full Prefill before Decode uses `request_timeout`, so a long, progressing Prefill is not mistaken for a stalled transfer. Non-streaming JSON response headers also wait under `request_timeout`, because they follow generation; streaming setup headers retain `handoff_timeout`. Expiry still follows the normal abort and lease-retirement rules.
 
-Logs default to `serving_log/pd_disag/<automatic-run-id>/{router,p,d}/`; node files have stable hashed names. Set a shared `runtime.run_id` to group processes under one tag. Boot identities are still regenerated at every startup. Optional `observability` fields are `enabled` and `root`. Detailed profiling uses Serving's existing profiler, not a second trace system.
+Logs default to `serving_log/pd_disag/<automatic-run-id>/{router,p,d}/`; node files have stable hashed names. Set a shared `pd.run_id` to group processes under one tag. Boot identities are still regenerated at every startup. Optional `observability` fields are `enabled` and `root`. Detailed profiling uses Serving's existing profiler, not a second trace system.
 
 ### Optional Decode Step Metrics
 
@@ -83,7 +85,7 @@ Prepared synchronous and asynchronous paths exclude explicit input preparation. 
 
 ## Execution, extension and shutdown
 
-The Router fixes a P/D pair per request and sends two ordinary generation POSTs concurrently. P prepares input once; D reserves shared read-only prefix and writable suffix/state. After each confirmed prefill chunk, P pins source pages and submits a rank-mapped transfer. Owner-side communication and an independent progress channel overlap subsequent computation. D validates all required regions, commits through CacheManager, accepts the grammar seed, and adopts the request into ordinary K7 decode. Final request-local state is transferred even on a complete D prefix hit; output does not wait for P's source cleanup.
+The common Router refreshes PD descriptors through its existing background health monitor. It becomes ready only when a compatible healthy P/D pair exists. Ordinary session-affine routing is unchanged; PD retains round-robin pair selection without session pinning. The PD coordinator fixes a pair per request and sends two ordinary generation POSTs concurrently. P prepares input once; D reserves shared read-only prefix and writable suffix/state. After each confirmed prefill chunk, P pins source pages and submits a rank-mapped transfer. Owner-side communication and an independent progress channel overlap subsequent computation. D validates all required regions, commits through CacheManager, accepts the grammar seed, and adopts the request into ordinary K7 decode. Final request-local state is transferred even on a complete D prefix hit; output does not wait for P's source cleanup.
 
 DSpark sizes each cache group from the tightest post-resident rank budget using
 `--npu-memory-utilization` (default `0.90`), including filler/alignment, live rings,
@@ -97,7 +99,7 @@ never falls back to local Prefill recomputation.
 
 P also captures the last 128 prompt tokens' target hidden states, without loading or running the drafter. Target-only P skips capture dispatches outside that window; a packed batch keeps the existing all-rank collective if any request needs capture. Ordinary K7 prefill is unchanged. The final asynchronous transfer includes this request-local bootstrap region, even on a complete D KV hit. D reconstructs absolute positions from the agreed prompt length and uses its own lease generation, then reuses ordinary terminal-prefill bootstrap before its first verification. This initializes D's local drafter with prompt history rather than an empty window. The fixed 128-row hidden region is 3 MiB per destination rank: 12 MiB for a TP4 cache group or 3 MiB for TP1, including short prompts. Bootstrap runs once at admission; steady-state decode keeps its existing asynchronous pipeline. The optional profiler span `pd.dspark.bootstrap` isolates this initialization cost.
 
-`pd/adapter.py` owns model-specific regions, prefix rules, mapping and decode bootstrap; register another executor in `ADAPTERS`. `pd/transfer.py` defines the owner-side provider contract; register another implementation in `config.PROVIDERS`. `pd/routing.py` owns pair selection. The Router never manages physical cache; providers never implement model semantics. New adapters/providers require their own layout, lifecycle and native validation; changing JSON alone cannot add them.
+`pd/adapter.py` owns model-specific regions, prefix rules, mapping and decode bootstrap; register another executor in `ADAPTERS`. `pd/transfer.py` defines the owner-side provider contract; register another implementation in `config.PROVIDERS`. `router/routing.py` provides node pools and routing policies; `pd/coordinator.py` filters compatible pairs and coordinates their execution inside the common Router. The Router never manages physical cache; providers never implement model semantics. New adapters/providers require their own layout, lifecycle and native validation; changing JSON alone cannot add them.
 
 Terminal output waits for request retirement, including the local state-release acknowledgement, before the Router can admit a replacement. Normal Decode completion reuses Serving's FIFO worker-release ACK without an extra control barrier. Initial-token termination and cancellation without that ACK still explicitly discard reserved state. HTTP cancellation does not cancel the owned retirement task. A confirmed abort for a request that was never admitted consumes no capacity and authorizes no writes.
 
