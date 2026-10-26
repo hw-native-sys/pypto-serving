@@ -56,6 +56,7 @@ class Peers:
         self.p_hold = self.d_hold = None
         self.missing_done = False
         self.stream_body = None
+        self.d_stream = None
 
     async def handle(self, req):
         name, path = req.url.host, req.url.path
@@ -82,6 +83,9 @@ class Peers:
             await self.d_hold.wait()
         await asyncio.sleep(self.delay)
         if payload.get("stream"):
+            if self.d_stream is not None:
+                return httpx.Response(self.d_status, stream=self.d_stream,
+                                      headers={"Content-Type": "text/event-stream"})
             content = 'data: {"choices":[{"text":"answer"}]}\n\n'
             if not self.missing_done:
                 content += 'data: [DONE]\n\n'
@@ -225,7 +229,7 @@ def test_stream_output_overlaps_prefill_cleanup_and_checks_terminal():
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("failure", ["p_error", "d_error", "missing_done", "cancel", "close"])
+@pytest.mark.parametrize("failure", ["p_error", "d_error", "both_error", "missing_done", "cancel", "close"])
 def test_pd_failures_cancel_both_ends_without_leaking_slots(failure):
     async def run():
         cfg = config()
@@ -240,8 +244,8 @@ def test_pd_failures_cancel_both_ends_without_leaking_slots(failure):
         async def managed_operation():
             pytest.fail("PD must not launch, adopt or stop external model processes")
         router.fleet.adopt_previous = router.fleet.launch_initial = router.fleet.stop_all = managed_operation
-        if failure == "p_error": peers.p_status = 422
-        if failure == "d_error": peers.d_status = 500
+        if failure in ("p_error", "both_error"): peers.p_status = 422
+        if failure in ("d_error", "both_error"): peers.d_status = 500
         if failure == "missing_done": peers.missing_done = True
         if failure in ("cancel", "close"): peers.d_hold = asyncio.Event()
         async with router.app.router.lifespan_context(router.app):
@@ -258,7 +262,7 @@ def test_pd_failures_cancel_both_ends_without_leaking_slots(failure):
                 assert "pd_execution_error" in body and "[DONE]" in body
             else:
                 response = await pending
-                assert response.status_code == (422 if failure == "p_error" else 500)
+                assert response.status_code == (422 if failure in ("p_error", "both_error") else 500)
                 assert response.headers["x-pypto-error-source"] == "upstream"
             assert sum(path.endswith("abort") for _, path in peers.calls) == 2
             assert all(s.outstanding == 0 for s in router.registry.states)
@@ -483,16 +487,19 @@ def test_local_pool_pressure_does_not_invalidate_a_healthy_descriptor():
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("node_error", [False, True])
-def test_errors_after_stream_headers_keep_the_stream_error_boundary(node_error):
+@pytest.mark.parametrize("failure", ["prefill", "node", "node_eof"])
+def test_errors_after_stream_headers_keep_the_stream_error_boundary(failure):
     async def run():
         cfg = config()
         peers = Peers(cfg)
         peers.p_hold = asyncio.Event()
         peers.p_status = 422
+        node_error = failure != "prefill"
         original = {"error": {"message": "node failed", "code": "node_specific"}}
         if node_error:
-            peers.stream_body = "data: " + json.dumps(original) + "\n\ndata: [DONE]\n\n"
+            peers.stream_body = "data: " + json.dumps(original) + "\n\n"
+            if failure != "node_eof":
+                peers.stream_body += "data: [DONE]\n\n"
         router = peers.router(cfg)
         async with router.app.router.lifespan_context(router.app):
             response = await router.proxy.forward(request({"stream": True}), "/v1/completions")
@@ -511,6 +518,32 @@ def test_errors_after_stream_headers_keep_the_stream_error_boundary(node_error):
                 assert errors[0]["error"]["type"] == "pd_execution_error"
             assert all(s.outstanding == 0 for s in router.registry.states)
             assert sum(path.endswith("abort") for _, path in peers.calls) == 2
+    asyncio.run(run())
+
+
+def test_sse_transport_failure_is_not_rewritten_as_an_http_error():
+    class BrokenStream(httpx.AsyncByteStream):
+        closes = 0
+        async def __aiter__(self):
+            yield b'data: {"choices":[{"text":"partial"}]}\n\n'
+            raise httpx.ReadError("Decode connection was interrupted")
+        async def aclose(self):
+            self.closes += 1
+    async def run():
+        cfg = config()
+        peers = Peers(cfg)
+        peers.d_stream = BrokenStream()
+        router = peers.router(cfg)
+        async with router.app.router.lifespan_context(router.app):
+            response = await router.proxy.forward(request({"stream": True}), "/v1/completions")
+            assert response.status_code == 200
+            body = "".join([part async for part in response.body_iterator])
+            error = next(json.loads(line[6:])["error"] for line in body.splitlines()
+                         if line.startswith("data: {") and '"error"' in line)
+            assert error["code"] == "upstream_connection_error" and error["source"] == "router"
+            assert body.count("data: [DONE]") == 1 and peers.d_stream.closes == 1
+            assert router.proxy.requests == router.proxy.handoffs == 0
+            assert all(s.outstanding == 0 for s in router.registry.states)
     asyncio.run(run())
 
 
