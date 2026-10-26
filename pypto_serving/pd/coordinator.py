@@ -65,8 +65,9 @@ class PDCoordinator:
         self.nodes = {}
         self.models, self.discovered = set(), set()
         self.policy = RoundRobin()
-        self.requests = asyncio.Semaphore(config.capacity * len(config.decode))
-        self.handoffs = asyncio.Semaphore(config.capacity * len(config.prefill))
+        self.pair_ids = tuple((p.node_id, config.decode[(i + offset) % len(config.decode)].node_id)
+                              for offset in range(len(config.decode)) for i, p in enumerate(config.prefill))
+        self.requests = self.handoffs = 0
         self.active = {}
         self.closing = False
 
@@ -101,13 +102,43 @@ class PDCoordinator:
             self.nodes.pop(spec.name, None)
             return False
 
+    def _candidates(self, model):
+        result = []
+        for p_id, d_id in self.pair_ids:
+            p, d = self.nodes.get(p_id), self.nodes.get(d_id)
+            valid = (p is not None and d is not None and p.compatible(d)
+                     and all(self.registry.state(n).routable for n in (p_id, d_id))
+                     and (model is None or p.contract.model == model))
+            result.append((p, d) if valid else None)
+        return result
+
     def pairs(self, model=None):
-        p = [self.nodes[s.name] for s in self.registry.candidates("prefill") if s.name in self.nodes]
-        d = [self.nodes[s.name] for s in self.registry.candidates("decode") if s.name in self.nodes]
-        return [(p[i], d[(i + offset) % len(d)])
-                for offset in range(len(d)) for i in range(len(p))
-                if p[i].compatible(d[(i + offset) % len(d)])
-                and (model is None or p[i].contract.model == model)]
+        return [pair for pair in self._candidates(model) if pair is not None]
+
+    def _admit(self, payload):
+        """Select current immutable node snapshots and reserve counts without yielding."""
+        model = payload.get("model")
+        if model is not None and not isinstance(model, str):
+            raise ValueError("model must be a string")
+        candidates = self._candidates(model or None)
+        if not any(candidates):
+            if model and model not in self.models and len(self.discovered) == len(self.registry.states):
+                raise _Failure(404, "model_not_found", f"Unknown model: {model}")
+            raise _Failure(503, "no_available_backend", "No compatible healthy P/D pair is available")
+        available = [pair if pair and all(self.registry.state(n.node_id).outstanding < self.config.capacity
+                                          for n in pair) else None for pair in candidates]
+        if (self.requests >= self.config.capacity * len(self.config.decode)
+                or self.handoffs >= self.config.capacity * len(self.config.prefill) or not any(available)):
+            raise _Failure(503, "capacity_exhausted", "All compatible P/D pairs are at capacity. Retry later.")
+        p, d = self.policy.select(available)
+        binding = Binding.create(p, d, payload)
+        endpoints = tuple(self.registry.state(n.node_id).spec for n in (p, d))
+        self.requests += 1
+        self.handoffs += 1
+        for endpoint in endpoints:
+            self.registry.acquire(endpoint.name)
+        self.registry.record_route(*(e.name for e in endpoints))
+        return p, d, binding, endpoints
 
     async def close(self):
         self.closing = True
@@ -159,17 +190,22 @@ class PDCoordinator:
                 logger.warning("HTTP abort not confirmed node=%s result=%s", endpoint.name, result)
 
     async def _forward(self, request, path, owner, payload, session_id):
-        await self.requests.acquire()
-        handoff_held = False
-        p_task = d_task = response = binding = None
-        endpoints = ()
+        p, d, binding, endpoints = self._admit(payload)
+        p_task = d_task = response = None
         finished = False
         cleanup_task = None
         p_released = False
+
+        def release_handoff(_done=None):
+            nonlocal p_released
+            if not p_released:
+                p_released = True
+                self.registry.release(endpoints[0].name)
+                self.handoffs -= 1
+
         async def cleanup():
-            nonlocal handoff_held, p_released
             try:
-                if binding is not None and not finished:
+                if not finished:
                     # Abort wakes D's pre-header rendezvous before HTTP tasks are joined.
                     await self.abort(binding, endpoints)
                 tasks = tuple(t for t in (p_task, d_task) if t is not None)
@@ -188,15 +224,9 @@ class PDCoordinator:
             except Exception:
                 logger.exception("PD HTTP cleanup failed request=%s", binding.request if binding else None)
             finally:
-                if handoff_held:
-                    handoff_held = False
-                    self.handoffs.release()
-                if endpoints:
-                    if not p_released:
-                        p_released = True
-                        self.registry.release(endpoints[0].name)
-                    self.registry.release(endpoints[1].name)
-                self.requests.release()
+                release_handoff()
+                self.registry.release(endpoints[1].name)
+                self.requests -= 1
                 self.active.pop(owner, None)
 
         def retire():
@@ -219,24 +249,7 @@ class PDCoordinator:
                 raise _Failure(503, "pd_protocol_error", "Prefill returned an invalid handoff confirmation")
 
         try:
-            await self.handoffs.acquire()
-            handoff_held = True
-            model = payload.get("model")
-            if model is not None and not isinstance(model, str):
-                raise ValueError("model must be a string")
-            model = model or None
-            pairs = self.pairs(model)
-            if not pairs:
-                if model and model not in self.models and len(self.discovered) == len(self.registry.states):
-                    raise _Failure(404, "model_not_found", f"Unknown model: {model}")
-                raise _Failure(503, "no_available_backend", "No compatible healthy P/D pair is available")
-            p, d = self.policy.select(pairs)
-            binding = Binding.create(p, d, payload)
             logger.info("route request=%s prefill=%s decode=%s", binding.request, p.node_id, d.node_id)
-            endpoints = tuple(self.registry.state(n.node_id).spec for n in (p, d))
-            for endpoint in endpoints:
-                self.registry.acquire(endpoint.name)
-            self.registry.record_route(*(e.name for e in endpoints))
             forwarded = _filter_headers(request.headers, _DROP_REQUEST | {
                 "content-encoding", "content-type", "x-pd-context", ERROR_SOURCE_HEADER})
             def headers(peer):
@@ -244,6 +257,7 @@ class PDCoordinator:
                         "x-pd-context": msgspec.json.encode(dict(binding=binding, peer=peer)).decode()}
             p_task = asyncio.create_task(self.client.post(endpoints[0].base_url + path,
                 json=payload, headers=headers(d), timeout=self._timeout(self.config.request_timeout)))
+            p_task.add_done_callback(release_handoff)
             d_task = asyncio.create_task(self.client.send(self.client.build_request(
                 "POST", endpoints[1].base_url + path, json=payload, headers=headers(p),
                 timeout=self._timeout(self.config.request_timeout)), stream=True))
@@ -265,15 +279,6 @@ class PDCoordinator:
             if response.status_code != 200:
                 await response.aread()
                 raise _Failure(response.status_code, "upstream_error", response.text, response)
-            def release_handoff(done):
-                nonlocal handoff_held, p_released
-                if not p_released:
-                    p_released = True
-                    self.registry.release(endpoints[0].name)
-                if handoff_held:
-                    handoff_held = False
-                    self.handoffs.release()
-            p_task.add_done_callback(release_handoff)
             if not payload.get("stream", False):
                 body = await response.aread()
                 await ready()

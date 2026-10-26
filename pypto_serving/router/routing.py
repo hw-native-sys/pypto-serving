@@ -70,17 +70,18 @@ class NoReplicaAvailable(RuntimeError):
 
 
 class RoundRobin:
-    """Rotate over an already filtered collection of routing candidates."""
+    """Rotate over fixed candidate positions, skipping unavailable (None) entries."""
 
     def __init__(self):
         self.cursor = 0
 
     def select(self, candidates):
-        if not candidates:
-            raise NoReplicaAvailable("no compatible healthy routing candidate")
-        selected = candidates[self.cursor % len(candidates)]
-        self.cursor += 1
-        return selected
+        for offset in range(len(candidates)):
+            index = (self.cursor + offset) % len(candidates)
+            if candidates[index] is not None:
+                self.cursor = (index + 1) % len(candidates)
+                return candidates[index]
+        raise NoReplicaAvailable("no compatible healthy routing candidate")
 
 
 def new_session_id() -> str:

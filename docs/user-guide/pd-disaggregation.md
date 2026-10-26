@@ -87,6 +87,7 @@ The Router always constructs its own PD context.
 
 | Router error code | HTTP status | Meaning |
 | --- | --- | --- |
+| `capacity_exhausted` | 503 | Compatible pairs exist but their request slots or global admission limits are full. The request was not dispatched; `Retry-After` suggests a delay before resubmission. |
 | `no_available_backend` | 503 | No healthy compatible pair; also used for an unseen model while node discovery is incomplete. |
 | `model_not_found` | 404 | Every configured node has supplied a valid descriptor and the model is unknown. |
 | `invalid_request` | 400 | Invalid JSON, object or model field. Model-specific validation stays on the nodes. |
@@ -101,6 +102,15 @@ existing `error.message` and `error.type` fields and add `error.code` and
 `error.source`; node error events keep their original structure. Clients must
 check error events: HTTP 200 and `[DONE]` alone do not prove generation succeeded.
 HTTP disconnects and Router counter release do not prove native transfers stopped.
+
+PD admission does not add a Router waiting queue. Selection follows fixed
+configured P/D-pair positions, skipping unhealthy, draining, incompatible or full
+nodes. Selection and counter reservation do not yield; P/D POSTs still run
+concurrently. P capacity returns when its handoff task finishes, independently
+of D headers or output; D capacity returns after response cleanup. The nodes
+retain their own capacity and safe-retirement checks. Only `capacity_exhausted`
+guarantees rejection before either POST; other errors may require cleanup of
+already-started work. The Router never retries or rebinds a started request.
 
 Logs default to `serving_log/pd_disag/<automatic-run-id>/{router,p,d}/`; node files have stable hashed names. Set a shared `pd.run_id` to group processes under one tag. Boot identities are still regenerated at every startup. Optional `observability` fields are `enabled` and `root`. Detailed profiling uses Serving's existing profiler, not a second trace system.
 

@@ -199,7 +199,7 @@ def test_pd_header_deadline_and_one_time_release(stream):
                 response = await router.proxy.forward(request({}), "/v1/completions")
                 assert response.status_code == 200
             assert all(s.outstanding == 0 for s in router.registry.states)
-            assert not router.proxy.requests.locked() and not router.proxy.handoffs.locked()
+            assert router.proxy.requests == router.proxy.handoffs == 0
             assert not router.proxy.active
     asyncio.run(run())
 
@@ -256,7 +256,7 @@ def test_pd_failures_cancel_both_ends_without_leaking_slots(failure):
                 assert response.headers["x-pypto-error-source"] == "upstream"
             assert sum(path.endswith("abort") for _, path in peers.calls) == 2
             assert all(s.outstanding == 0 for s in router.registry.states)
-            assert not router.proxy.requests.locked() and not router.proxy.handoffs.locked()
+            assert router.proxy.requests == router.proxy.handoffs == 0
             assert not router.proxy.active and not router.client.is_closed
     asyncio.run(run())
 
@@ -279,28 +279,27 @@ def test_unusable_descriptor_cannot_receive_a_generation(fault):
             assert error.status_code == 503
             assert error.headers["x-session-id"] == "conversation"
             assert all(path.endswith("descriptor") for _, path in peers.calls)
-            assert not router.proxy.active and not router.proxy.requests.locked()
+            assert not router.proxy.active and router.proxy.requests == router.proxy.handoffs == 0
     asyncio.run(run())
 
 
-def test_cancel_while_waiting_for_handoff_releases_only_owned_slots():
+@pytest.mark.parametrize("gate", ["requests", "handoffs"])
+def test_a_full_global_gate_rejects_without_taking_or_releasing_a_slot(gate):
     async def run():
         cfg = config()
         peers = Peers(cfg)
         router = peers.router(cfg)
         async with router.app.router.lifespan_context(router.app):
-            await router.proxy.handoffs.acquire()
-            pending = asyncio.create_task(router.proxy.forward(request({}), "/v1/completions"))
-            while not router.proxy.requests.locked():
-                await asyncio.sleep(0)
-            pending.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await pending
-            assert not router.proxy.requests.locked()
-            assert router.proxy.handoffs.locked()
+            setattr(router.proxy, gate, 1)
+            response = await asyncio.wait_for(router.proxy.forward(request({}), "/v1/completions"), 0.1)
+            assert response.status_code == 503 and json.loads(response.body)["code"] == "capacity_exhausted"
+            assert response.headers["retry-after"] == "1" and response.headers["x-pypto-error-source"] == "router"
+            assert getattr(router.proxy, gate) == 1
             assert not router.proxy.active
             assert all(s.outstanding == 0 for s in router.registry.states)
-            router.proxy.handoffs.release()
+            assert all(path.endswith("descriptor") for _, path in peers.calls)
+            assert router.registry.rejected == 1 and router.registry.total_routed() == 0
+            setattr(router.proxy, gate, 0)
     asyncio.run(run())
 
 
@@ -539,6 +538,91 @@ def test_prefill_completion_does_not_restart_the_header_wait_budget():
             await released
             assert response.status_code == 503 and json.loads(response.body)["code"] == "pd_operation_timeout"
             assert all(s.outstanding == 0 for s in router.registry.states)
+    asyncio.run(run())
+
+
+def test_capacity_skips_full_nodes_and_releases_once_on_cancellation():
+    async def run():
+        cfg = config(2, 2, handoff_timeout=1, request_timeout=2)
+        peers = Peers(cfg)
+        peers.p_hold, peers.d_hold = asyncio.Event(), asyncio.Event()
+        router = peers.router(cfg)
+        async with router.app.router.lifespan_context(router.app):
+            pending = []
+            for expected in (1, 2):
+                pending.append(asyncio.create_task(router.proxy.forward(request({}), "/v1/completions")))
+                while sum(path == "/v1/completions" for _, path in peers.calls) < 2 * expected:
+                    await asyncio.sleep(0)
+                assert all(s.outstanding <= 1 for s in router.registry.states)
+            assert router.proxy.requests == router.proxy.handoffs == 2
+            assert {req.url.host for req in peers.requests if req.url.path == "/v1/completions"} == {
+                "p0", "p1", "d0", "d1"}
+            count = len(peers.calls)
+            response = await asyncio.wait_for(router.proxy.forward(request({}), "/v1/completions"), 0.1)
+            assert response.status_code == 503 and len(peers.calls) == count
+            assert json.loads(response.body)["code"] == "capacity_exhausted"
+            assert router.registry.rejected == 1 and router.registry.total_routed() == 2
+            for task in pending:
+                task.cancel()
+            results = await asyncio.gather(*pending, return_exceptions=True)
+            assert all(isinstance(result, asyncio.CancelledError) for result in results)
+            assert all(s.outstanding == 0 for s in router.registry.states)
+            assert router.proxy.requests == router.proxy.handoffs == 0
+            assert not router.proxy.active
+            assert sum(path.endswith("abort") for _, path in peers.calls) == 4
+            assert (await router.proxy.forward(request({}), "/v1/completions")).status_code == 200
+    asyncio.run(run())
+
+
+def test_prefill_capacity_returns_before_decode_json_headers():
+    async def run():
+        cfg = config(1, 2, handoff_timeout=1, request_timeout=2)
+        peers = Peers(cfg)
+        peers.d_hold = asyncio.Event()
+        router = peers.router(cfg)
+        async with router.app.router.lifespan_context(router.app):
+            first = asyncio.create_task(router.proxy.forward(request({}), "/v1/completions"))
+            while router.registry.state("d0").outstanding == 0 or router.registry.state("p0").outstanding:
+                await asyncio.sleep(0)
+            assert not first.done()
+            assert router.proxy.requests == 1 and router.proxy.handoffs == 0
+            second = asyncio.create_task(router.proxy.forward(request({}), "/v1/completions"))
+            while router.registry.state("d1").outstanding == 0 or router.registry.state("p0").outstanding:
+                await asyncio.sleep(0)
+            assert not second.done() and router.proxy.requests == 2
+            assert router.proxy.handoffs == 0
+            assert (await router.proxy.forward(request({}), "/v1/completions")).status_code == 503
+            peers.d_hold.set()
+            assert all(response.status_code == 200 for response in await asyncio.gather(first, second))
+            assert router.proxy.requests == router.proxy.handoffs == 0
+            assert all(s.outstanding == 0 for s in router.registry.states)
+    asyncio.run(run())
+
+
+def test_round_robin_positions_survive_health_changes_and_use_current_boots():
+    async def run():
+        cfg = config(2, 2)
+        peers = Peers(cfg)
+        router = peers.router(cfg)
+        async with router.app.router.lifespan_context(router.app):
+            async def route():
+                assert (await router.proxy.forward(request({}), "/v1/completions")).status_code == 200
+                post = next(r for r in reversed(peers.requests) if r.url.path == "/v1/completions")
+                context = json.loads(post.headers["x-pd-context"])
+                return context["binding"]
+            assert (await route())["decode"][0] == "d0"
+            router.registry.set_draining("d1", True)
+            selected = await route()
+            assert (selected["prefill"][0], selected["decode"][0]) == ("p1", "d0")
+            router.registry.set_draining("d1", False)
+            selected = await route()
+            assert (selected["prefill"][0], selected["decode"][0]) == ("p0", "d0")
+            peers.nodes["p1"] = msgspec.structs.replace(peers.nodes["p1"], boot="restarted", registry="new")
+            await router.health.probe_once()
+            selected = await route()
+            assert selected["prefill"] == ["p1", "restarted", "new"]
+            assert selected["decode"][0] == "d1"
+            assert router.registry.total_routed() == 4
     asyncio.run(run())
 
 
