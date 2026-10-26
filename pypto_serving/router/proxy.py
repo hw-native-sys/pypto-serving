@@ -74,6 +74,8 @@ def resolve_session_id(headers, body: bytes) -> str:
 
 
 def _filter_headers(headers, drop: frozenset[str]) -> dict[str, str]:
+    connection = next((v for k, v in headers.items() if k.lower() == "connection"), "")
+    drop = drop | {name.strip().lower() for name in connection.split(",")}
     return {k: v for k, v in headers.items() if k.lower() not in drop}
 
 

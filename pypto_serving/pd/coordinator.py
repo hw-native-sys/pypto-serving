@@ -12,16 +12,48 @@ import asyncio
 import json
 import logging
 
-from fastapi import HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 import httpx
 import msgspec
 
-from .protocol import Binding, MAX_FRAME, Node, decode
-from pypto_serving.router.proxy import SESSION_HEADER, resolve_session_id
+from .protocol import Binding, MAX_FRAME, Node, VERSION, decode
+from pypto_serving.router.proxy import (
+    SESSION_HEADER, _DROP_REQUEST, _DROP_RESPONSE, _filter_headers, resolve_session_id,
+)
 from pypto_serving.router.routing import RoundRobin
 
 logger = logging.getLogger(__name__)
+ERROR_SOURCE_HEADER = "x-pypto-error-source"
+
+
+class _Failure(Exception):
+    def __init__(self, status, code, message, upstream=None):
+        super().__init__(message)
+        self.status, self.code, self.upstream = status, code, upstream
+
+    @property
+    def source(self):
+        return "upstream" if self.upstream is not None else "router"
+
+
+def _failure(exc):
+    if isinstance(exc, _Failure):
+        return exc
+    if isinstance(exc, httpx.PoolTimeout):
+        return _Failure(503, "http_pool_exhausted", "Router HTTP connection pool is busy")
+    if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+        return _Failure(503, "pd_operation_timeout", str(exc) or "PD HTTP operation timed out")
+    if isinstance(exc, httpx.HTTPError):
+        return _Failure(502, "upstream_connection_error", str(exc))
+    if isinstance(exc, ValueError):
+        return _Failure(400, "invalid_request", str(exc))
+    return _Failure(503, "pd_protocol_error", str(exc))
+
+
+def _response_headers(response, session_id):
+    headers = _filter_headers(response.headers, _DROP_RESPONSE | {"content-encoding", ERROR_SOURCE_HEADER})
+    return {**headers, SESSION_HEADER: session_id}
 
 
 class PDCoordinator:
@@ -31,22 +63,40 @@ class PDCoordinator:
         self.config, self.registry, self.client = config, registry, client
         self.probe_client = probe_client
         self.nodes = {}
+        self.models, self.discovered = set(), set()
         self.policy = RoundRobin()
         self.requests = asyncio.Semaphore(config.capacity * len(config.decode))
         self.handoffs = asyncio.Semaphore(config.capacity * len(config.prefill))
         self.active = {}
         self.closing = False
 
+    def _timeout(self, read, *, control=False):
+        values = self.client.timeout.as_dict()
+        if control:
+            values = {k: min(v, read) if v is not None else read for k, v in values.items()}
+        return httpx.Timeout(**{**values, "read": read})
+
     async def probe(self, spec):
         try:
-            response = await self.probe_client.get(spec.base_url + "/internal/pd/descriptor", timeout=5)
+            response = await self.probe_client.get(spec.base_url + "/internal/pd/descriptor",
+                                             timeout=self._timeout(5, control=True))
             response.raise_for_status()
             node = decode(response.json(), Node)
             if (node.node_id != spec.name or node.role != spec.role
-                    or node.provider != self.config.provider or not node.healthy):
-                raise ValueError("descriptor differs from configured healthy PD node")
+                    or node.provider != self.config.provider or node.version != VERSION
+                    or not node.contract.model):
+                raise ValueError("descriptor differs from configured PD node")
+            self.models.add(node.contract.model)
+            self.discovered.add(spec.name)
+            if not node.healthy:
+                self.nodes.pop(spec.name, None)
+                return False
             self.nodes[spec.name] = node
             return True
+        except httpx.PoolTimeout:
+            # Local pool pressure is not a liveness observation about this node.
+            logger.warning("descriptor probe deferred: HTTP pool busy node=%s", spec.name)
+            return None
         except (httpx.HTTPError, ValueError):
             self.nodes.pop(spec.name, None)
             return False
@@ -71,29 +121,44 @@ class PDCoordinator:
                                    self.config.handoff_timeout + 5)
 
     async def forward(self, request: Request, path: str):
-        if self.closing:
-            raise HTTPException(503, "router is closing")
         owner = asyncio.current_task()
         self.active[owner] = None
+        session_id = resolve_session_id(request.headers, b"")
         try:
-            return await self._forward(request, path, owner)
-        except BaseException as exc:
-            self.active.pop(owner, None)
-            if isinstance(exc, ValueError):
-                raise HTTPException(400, str(exc)) from exc
-            if isinstance(exc, httpx.HTTPError):
-                raise HTTPException(502, str(exc)) from exc
-            raise
+            if self.closing:
+                raise _Failure(503, "router_closing", "Router is closing")
+            body = await request.body()
+            session_id = resolve_session_id(request.headers, body)
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise ValueError("request must be a JSON object")
+            return await self._forward(request, path, owner, payload, session_id)
+        except (_Failure, ValueError, RuntimeError, TimeoutError, httpx.HTTPError) as exc:
+            error = _failure(exc)
+            if error.code in {"invalid_request", "model_not_found", "no_available_backend",
+                              "capacity_exhausted", "router_closing"}:
+                self.registry.rejected += 1
+            headers = {SESSION_HEADER: session_id, ERROR_SOURCE_HEADER: error.source}
+            if error.upstream is not None:
+                return Response(error.upstream.content, status_code=error.status,
+                                headers={**_response_headers(error.upstream, session_id), **headers})
+            if error.code == "capacity_exhausted":
+                headers["Retry-After"] = "1"
+            return JSONResponse({"object": "error", "code": error.code, "message": str(error)},
+                                status_code=error.status, headers=headers)
+        finally:
+            if self.active.get(owner) is None:
+                self.active.pop(owner, None)
 
     async def abort(self, binding, endpoints):
-        await asyncio.gather(*(self.client.post(e.base_url + "/internal/pd/abort",
-            json=msgspec.to_builtins(binding), timeout=5) for e in endpoints), return_exceptions=True)
+        results = await asyncio.gather(*(self.client.post(e.base_url + "/internal/pd/abort",
+            json=msgspec.to_builtins(binding), timeout=self._timeout(5, control=True))
+            for e in endpoints), return_exceptions=True)
+        for endpoint, result in zip(endpoints, results):
+            if isinstance(result, BaseException) or result.status_code != 200:
+                logger.warning("HTTP abort not confirmed node=%s result=%s", endpoint.name, result)
 
-    async def _forward(self, request, path, owner):
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise HTTPException(400, "request must be a JSON object")
-        session_id = resolve_session_id(request.headers, await request.body())
+    async def _forward(self, request, path, owner, payload, session_id):
         await self.requests.acquire()
         handoff_held = False
         p_task = d_task = response = binding = None
@@ -120,6 +185,8 @@ class PDCoordinator:
                         received = d_task.result()
                 if received is not None:
                     await received.aclose()
+            except Exception:
+                logger.exception("PD HTTP cleanup failed request=%s", binding.request if binding else None)
             finally:
                 if handoff_held:
                     handoff_held = False
@@ -143,40 +210,61 @@ class PDCoordinator:
         async def ready():
             result = await p_task
             if result.status_code != 200:
-                raise HTTPException(result.status_code, result.text[:1000])
-            if result.json() != {"request": binding.request, "status": "ready"}:
-                raise RuntimeError(f"Prefill rejected handoff: {result.text[:1000]}")
+                raise _Failure(result.status_code, "upstream_error", result.text, result)
+            try:
+                valid = result.json() == {"request": binding.request, "status": "ready"}
+            except ValueError:
+                valid = False
+            if not valid:
+                raise _Failure(503, "pd_protocol_error", "Prefill returned an invalid handoff confirmation")
 
         try:
             await self.handoffs.acquire()
             handoff_held = True
-            p, d = self.policy.select(self.pairs(payload.get("model") or None))
+            model = payload.get("model")
+            if model is not None and not isinstance(model, str):
+                raise ValueError("model must be a string")
+            model = model or None
+            pairs = self.pairs(model)
+            if not pairs:
+                if model and model not in self.models and len(self.discovered) == len(self.registry.states):
+                    raise _Failure(404, "model_not_found", f"Unknown model: {model}")
+                raise _Failure(503, "no_available_backend", "No compatible healthy P/D pair is available")
+            p, d = self.policy.select(pairs)
             binding = Binding.create(p, d, payload)
             logger.info("route request=%s prefill=%s decode=%s", binding.request, p.node_id, d.node_id)
             endpoints = tuple(self.registry.state(n.node_id).spec for n in (p, d))
             for endpoint in endpoints:
                 self.registry.acquire(endpoint.name)
-                self.registry.state(endpoint.name).routed += 1
+            self.registry.record_route(*(e.name for e in endpoints))
+            forwarded = _filter_headers(request.headers, _DROP_REQUEST | {
+                "content-encoding", "content-type", "x-pd-context", ERROR_SOURCE_HEADER})
             def headers(peer):
-                return {"x-pd-context": msgspec.json.encode(dict(binding=binding, peer=peer)).decode()}
+                return {**forwarded, SESSION_HEADER: session_id,
+                        "x-pd-context": msgspec.json.encode(dict(binding=binding, peer=peer)).decode()}
             p_task = asyncio.create_task(self.client.post(endpoints[0].base_url + path,
-                json=payload, headers=headers(d), timeout=self.config.request_timeout))
+                json=payload, headers=headers(d), timeout=self._timeout(self.config.request_timeout)))
             d_task = asyncio.create_task(self.client.send(self.client.build_request(
                 "POST", endpoints[1].base_url + path, json=payload, headers=headers(p),
-                timeout=self.config.request_timeout), stream=True))
+                timeout=self._timeout(self.config.request_timeout)), stream=True))
             # JSON headers follow generation; SSE headers only acknowledge setup.
             header_timeout = (self.config.handoff_timeout if payload.get("stream", False)
                               else self.config.request_timeout)
+            deadline = asyncio.get_running_loop().time() + header_timeout
             done, _ = await asyncio.wait((p_task, d_task), return_when=asyncio.FIRST_COMPLETED,
                                          timeout=header_timeout)
             if not done:
-                raise RuntimeError("handoff header deadline exceeded")
+                raise _Failure(503, "pd_operation_timeout", "PD response header wait timed out")
             if p_task in done:
                 await ready()
-            response = await asyncio.wait_for(asyncio.shield(d_task), header_timeout)
+            try:
+                response = await asyncio.wait_for(asyncio.shield(d_task),
+                    max(0, deadline - asyncio.get_running_loop().time()))
+            except TimeoutError as exc:
+                raise _Failure(503, "pd_operation_timeout", "Decode response header wait timed out") from exc
             if response.status_code != 200:
-                body = await response.aread()
-                raise HTTPException(response.status_code, body.decode()[:1000])
+                await response.aread()
+                raise _Failure(response.status_code, "upstream_error", response.text, response)
             def release_handoff(done):
                 nonlocal handoff_held, p_released
                 if not p_released:
@@ -190,7 +278,7 @@ class PDCoordinator:
                 body = await response.aread()
                 await ready()
                 finished = True
-                result = JSONResponse(json.loads(body), headers={SESSION_HEADER: session_id})
+                result = Response(body, headers=_response_headers(response, session_id))
                 await asyncio.shield(retire())
                 return result
 
@@ -198,6 +286,7 @@ class PDCoordinator:
                 nonlocal finished
                 frame = []
                 size = 0
+                upstream_failed = False
                 try:
                     async for line in response.aiter_lines():
                         size += len(line)
@@ -212,15 +301,26 @@ class PDCoordinator:
                             data = text[6:]
                             terminal = data == "[DONE]"
                             value = None if terminal else json.loads(data)
-                            if terminal or (value and any(c.get("finish_reason") for c in value.get("choices", []))):
+                            if value and value.get("error") is not None:
+                                upstream_failed = True
+                            if not upstream_failed and (terminal or (
+                                    value and any(c.get("finish_reason") for c in value.get("choices", [])))):
                                 await ready()
                             if terminal:
-                                finished = True
+                                finished = not upstream_failed
                             yield text + "\n\n"
+                            if terminal:
+                                return
+                    if upstream_failed:
+                        yield "data: [DONE]\n\n"
+                        return
                     if not finished:
                         raise RuntimeError("Decode stream ended without terminal event")
                 except Exception as exc:
-                    yield "data: " + json.dumps({"error": {"message": str(exc), "type": "pd_execution_error"}}) + "\n\n"
+                    error = (_Failure(503, "pd_protocol_error", str(exc))
+                             if isinstance(exc, ValueError) else _failure(exc))
+                    yield "data: " + json.dumps({"error": {"message": str(error), "type": "pd_execution_error",
+                        "code": error.code, "source": error.source}}) + "\n\n"
                     yield "data: [DONE]\n\n"
                 finally:
                     task = retire()
@@ -230,18 +330,12 @@ class PDCoordinator:
                         await asyncio.shield(task)
                         raise
             return StreamingResponse(stream(), media_type="text/event-stream",
-                                     headers={SESSION_HEADER: session_id})
-        except BaseException as exc:
+                                     headers=_response_headers(response, session_id))
+        except BaseException:
             task = retire()
             try:
                 await asyncio.shield(task)
             except asyncio.CancelledError:
                 await asyncio.shield(task)
                 raise
-            if isinstance(exc, HTTPException):
-                exc.headers = {**(exc.headers or {}), SESSION_HEADER: session_id}
-            elif isinstance(exc, (RuntimeError, ValueError, TimeoutError, httpx.HTTPError)):
-                status = 400 if isinstance(exc, ValueError) else 502 if isinstance(exc, httpx.HTTPError) else 503
-                raise HTTPException(status, str(exc) or "PD operation deadline exceeded",
-                                    headers={SESSION_HEADER: session_id}) from exc
             raise

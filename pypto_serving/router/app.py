@@ -390,6 +390,11 @@ class ServingRouter:
         }
         if self.config.is_pd:
             payload["compatible_pairs"] = len(self.proxy.pairs())
+            payload["roles"] = {role: {
+                "ready": sum(s.routable for s in self.registry.states if s.spec.role == role),
+                "outstanding": sum(s.outstanding for s in self.registry.states if s.spec.role == role),
+                "routed": sum(s.routed for s in self.registry.states if s.spec.role == role),
+            } for role in ("prefill", "decode")}
         return JSONResponse(payload, status_code=200 if available else 503)
 
     async def _list_models(self) -> JSONResponse:
@@ -460,13 +465,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Cap the number of launched replicas below the declared pool. "
                              "On a shared cluster this is what stops the router taking every "
                              "free card.")
-    parser.add_argument("--launch-timeout", type=float, default=DEFAULT_LAUNCH_TIMEOUT_SECONDS,
+    parser.add_argument("--launch-timeout", type=float, default=None,
                         help="Seconds a launched replica may take to report ready before it is "
                              f"stopped and its device freed (default: {DEFAULT_LAUNCH_TIMEOUT_SECONDS:g}).")
-    parser.add_argument("--drain-timeout", type=float, default=DEFAULT_DRAIN_TIMEOUT_SECONDS,
+    parser.add_argument("--drain-timeout", type=float, default=None,
                         help="Seconds to wait for in-flight requests before stopping a replica "
                              f"(default: {DEFAULT_DRAIN_TIMEOUT_SECONDS:g}).")
-    parser.add_argument("--replace-after", type=float, default=DEFAULT_REPLACE_AFTER_SECONDS,
+    parser.add_argument("--replace-after", type=float, default=None,
                         metavar="SECONDS",
                         help="Seconds a replica may stay unroutable before the router retires it "
                              "and launches another on the same device(s) "
@@ -485,10 +490,10 @@ def build_parser() -> argparse.ArgumentParser:
                              f"token in argv is readable by any local user through ps.")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0).")
     parser.add_argument("--port", type=int, default=8000, help="Port (default: 8000).")
-    parser.add_argument("--session-ttl", type=float, default=DEFAULT_SESSION_TTL_SECONDS,
+    parser.add_argument("--session-ttl", type=float, default=None,
                         help="Seconds a conversation keeps its replica pin after its last "
                              f"request (default: {DEFAULT_SESSION_TTL_SECONDS:g}).")
-    parser.add_argument("--affinity-slack", type=int, default=DEFAULT_AFFINITY_SLACK,
+    parser.add_argument("--affinity-slack", type=int, default=None,
                         help="Extra outstanding requests a pinned replica may carry before a "
                              f"session is re-routed (default: {DEFAULT_AFFINITY_SLACK}; "
                              "0 disables affinity).")
@@ -512,18 +517,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         # somewhere to launch it; a static-only file must not be forced to.
         config = load_router_config(
             args.replicas,
-            session_ttl_seconds=args.session_ttl,
-            affinity_slack=args.affinity_slack,
             health_interval_seconds=args.health_interval,
             request_timeout_seconds=args.request_timeout,
             connect_timeout_seconds=args.connect_timeout,
-            launch_timeout_seconds=args.launch_timeout,
-            drain_timeout_seconds=args.drain_timeout,
-            replace_dead=not args.no_replace_dead,
-            replace_after_seconds=args.replace_after,
-            initial_replicas=args.initial_replicas,
-            max_replicas=args.max_replicas,
+            **{field: value for field, value in {
+                "session_ttl_seconds": args.session_ttl, "affinity_slack": args.affinity_slack,
+                "launch_timeout_seconds": args.launch_timeout, "drain_timeout_seconds": args.drain_timeout,
+                "initial_replicas": args.initial_replicas, "max_replicas": args.max_replicas,
+                "replace_dead": False if args.no_replace_dead else None,
+                "replace_after_seconds": args.replace_after,
+            }.items() if value is not None},
         )
+        if config.is_pd and args.state_file is not None:
+            raise ValueError("PD replicas are externally managed; --state-file is not applicable")
     except ValueError as exc:
         print(f"error: {exc}")
         return 1

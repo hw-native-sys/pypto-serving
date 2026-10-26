@@ -27,8 +27,7 @@ from pathlib import Path
 DEFAULT_AFFINITY_SLACK = 8
 DEFAULT_SESSION_TTL_SECONDS = 600.0
 DEFAULT_HEALTH_INTERVAL_SECONDS = 5.0
-# Generation is slow by design, so there is no useful read timeout; this bounds
-# the whole exchange instead.
+# Generation has no default read deadline; this bounds HTTP write/pool waits.
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 3600.0
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
 
@@ -462,7 +461,16 @@ def load_router_config(path: str | Path, **settings) -> RouterConfig:
 
     replicas = tuple(_parse_replica(entry, i) for i, entry in enumerate(raw_replicas))
     hosts = tuple(_parse_host(entry, i) for i, entry in enumerate(raw_hosts))
-    if settings.get("initial_replicas", 0) is None:
+    if any(replica.role != "replica" for replica in replicas):
+        ordinary_only = {
+            "session_ttl_seconds": "--session-ttl", "affinity_slack": "--affinity-slack",
+            "launch_timeout_seconds": "--launch-timeout", "drain_timeout_seconds": "--drain-timeout",
+            "initial_replicas": "--initial-replicas", "max_replicas": "--max-replicas",
+        }
+        unsupported = [flag for key, flag in ordinary_only.items() if settings.get(key) is not None]
+        if unsupported:
+            raise ValueError("PD replicas do not support " + ", ".join(unsupported))
+    if settings.get("initial_replicas") is None:
         settings["initial_replicas"] = int(bool(hosts))
     return RouterConfig(replicas=replicas, hosts=hosts, pd_options=data.get("pd"),
                         observability=data.get("observability"), **settings)

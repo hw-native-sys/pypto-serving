@@ -73,6 +73,35 @@ HTTP, control (HTTP port + 10000 by default), and Mooncake's dynamic RPC/RoCE en
 
 `handoff_timeout` bounds individual control, transfer, and stop-confirmation operations. Waiting for the full Prefill before Decode uses `request_timeout`, so a long, progressing Prefill is not mistaken for a stalled transfer. Non-streaming JSON response headers also wait under `request_timeout`, because they follow generation; streaming setup headers retain `handoff_timeout`. Expiry still follows the normal abort and lease-retirement rules.
 
+The Router preserves its configured HTTP connect and write/pool timeouts. PD
+generation reads use `pd.request_timeout` as a read-idle timeout, with a separate
+response-header wait as described above. These are not an end-to-end generation
+deadline. Descriptor and HTTP abort probes cap each HTTP phase at five seconds.
+
+Before response headers, Router-generated errors contain `object: "error"`, a
+stable `code` and a readable `message`, with `X-PyPTO-Error-Source: router`.
+Node errors retain their HTTP status, body, content type and applicable headers,
+with `X-PyPTO-Error-Source: upstream`; they are not wrapped in another JSON error.
+Request authorization, trace and request-id headers are forwarded to both nodes.
+The Router always constructs its own PD context.
+
+| Router error code | HTTP status | Meaning |
+| --- | --- | --- |
+| `no_available_backend` | 503 | No healthy compatible pair; also used for an unseen model while node discovery is incomplete. |
+| `model_not_found` | 404 | Every configured node has supplied a valid descriptor and the model is unknown. |
+| `invalid_request` | 400 | Invalid JSON, object or model field. Model-specific validation stays on the nodes. |
+| `upstream_connection_error` | 502 | An upstream HTTP transport failed. |
+| `http_pool_exhausted` | 503 | The Router's local HTTP pool could not supply a connection; this does not mark a node unhealthy. |
+| `pd_operation_timeout` | 503 | A PD coordination wait or HTTP operation timed out; the message identifies the wait or HTTP failure. |
+| `pd_protocol_error` | 503 | Invalid handoff confirmation or response protocol. |
+| `router_closing` | 503 | The Router is shutting down. |
+
+After SSE headers, errors remain stream events. Router-generated events keep the
+existing `error.message` and `error.type` fields and add `error.code` and
+`error.source`; node error events keep their original structure. Clients must
+check error events: HTTP 200 and `[DONE]` alone do not prove generation succeeded.
+HTTP disconnects and Router counter release do not prove native transfers stopped.
+
 Logs default to `serving_log/pd_disag/<automatic-run-id>/{router,p,d}/`; node files have stable hashed names. Set a shared `pd.run_id` to group processes under one tag. Boot identities are still regenerated at every startup. Optional `observability` fields are `enabled` and `root`. Detailed profiling uses Serving's existing profiler, not a second trace system.
 
 ### Optional Decode Step Metrics

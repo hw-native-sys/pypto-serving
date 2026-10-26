@@ -220,6 +220,7 @@ class ReplicaRegistry:
         # Rotating tiebreak, matching AsyncLLMEngine._select_replica: equal-load
         # replicas are taken in turn instead of always the lowest index.
         self._route_counter = 0
+        self._routed = 0
         self.affinity_hits = 0
         self.rejected = 0
 
@@ -241,7 +242,13 @@ class ReplicaRegistry:
         return tuple(state for state in self._states if state.routable and state.spec.role == role)
 
     def total_routed(self) -> int:
-        return sum(state.routed for state in self._states)
+        return self._routed
+
+    def record_route(self, *names: str) -> None:
+        """Count a client request once, with a dispatch on each selected node."""
+        self._routed += 1
+        for name in names:
+            self._by_name[name].routed += 1
 
     def add(self, spec: ReplicaSpec, *, ready: bool = False, owned: bool = False) -> ReplicaState:
         """Register a replica at runtime.
@@ -358,7 +365,7 @@ class ReplicaRegistry:
             self._route_counter = (chosen.index + 1) % len(self._states)
 
         self._sessions.pin(session_id, chosen.name)
-        chosen.routed += 1
+        self.record_route(chosen.name)
         self.affinity_hits += affinity_hit
         return RoutingDecision(replica=chosen.spec, affinity_hit=affinity_hit)
 
@@ -424,6 +431,8 @@ class HealthMonitor:
         try:
             if self._probe_callback is not None:
                 healthy = await self._probe_callback(state.spec)
+                if healthy is None:
+                    return  # A locally deferred probe is not a failed liveness sample.
             else:
                 response = await self._client.get(
                     f"{state.spec.base_url}/health", timeout=self._config.connect_timeout_seconds

@@ -67,7 +67,7 @@ One slot per group of `devices_per_replica` devices, taken from `devices` in ord
 | `--session-ttl SECONDS` | `600` | Inactivity before a conversation loses its replica pin. Expiry drops the pin only; KV blocks are reclaimed by each replica's own cache. |
 | `--affinity-slack N` | `8` | Extra outstanding requests a pinned replica may carry, relative to the least loaded one, before a session is re-routed. `0` disables affinity; a large value makes it strict. |
 | `--health-interval SECONDS` | `5` | Interval between replica health probes. |
-| `--request-timeout SECONDS` | `3600` | HTTP write/pool timeout for ordinary proxy requests, with no read or overall execution deadline. PD execution and handoff deadlines are set separately in the `pd` configuration section. |
+| `--request-timeout SECONDS` | `3600` | HTTP write/pool timeout. Ordinary forwarding has no read deadline. PD response-read and coordination waits use the separate `pd` options; neither is a single deadline for the whole SSE response. |
 | `--connect-timeout SECONDS` | `5` | Connect timeout per replica. |
 | `--initial-replicas N` | `1` with hosts, else `0` | Replicas to launch at startup, filling slots in config order, local machine first. Refused at startup if it exceeds the pool. |
 | `--max-replicas N` | declared pool | Cap launched replicas below the declared devices. |
@@ -77,6 +77,12 @@ One slot per group of `devices_per_replica` devices, taken from `devices` in ord
 | `--no-replace-dead` | off | Leave a replica that died where it is, devices and all. What you want while investigating one. |
 | `--state-file PATH` | none | Records launched replicas so a restarted router can adopt them instead of paying for a fresh model load. |
 | `--admin-token TOKEN` | none | Require `Authorization: Bearer TOKEN` on `/replicas`. |
+
+PD nodes are externally managed and use round-robin routing without session affinity.
+Explicit `--session-ttl`, `--affinity-slack`, `--initial-replicas`, `--max-replicas`,
+`--launch-timeout`, `--drain-timeout` and `--state-file` are rejected for PD,
+including values equal to the ordinary defaults. `X-Session-Id` is still returned
+for request correlation; it does not pin a PD pair.
 
 ## Endpoints
 
