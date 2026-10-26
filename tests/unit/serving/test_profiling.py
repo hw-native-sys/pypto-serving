@@ -12,10 +12,11 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import pytest
 
 import pypto_serving.cli.main as cli
 from pypto_serving.config.types import GenerateConfig
-from pypto_serving.serving.engine.async_engine import ReplicaEngineCore
+from pypto_serving.serving.engine.async_engine import EngineConfig, ReplicaEngineCore
 from pypto_serving.serving.server import server as server_module
 from pypto_serving.serving.server import serving_worker
 from pypto_serving.serving.server.ipc import (
@@ -27,7 +28,7 @@ from pypto_serving.serving.server.ipc import (
     encode_command,
     encode_profile_result,
 )
-from pypto_serving.tools.profile.env import load_profile_config
+from pypto_serving.tools.profile.env import create_profile_config, load_profile_config
 from pypto_serving.tools.profile.merge import merge_fragments
 from pypto_serving.tools.profile.recorder import ProfileRecorder
 
@@ -57,6 +58,8 @@ def test_profile_cli_config_reaches_engine_workers(tmp_path):
             str(output),
             "--profile-level",
             "verbose",
+            "--profile-chip-level",
+            "2",
         ]
     )
 
@@ -66,6 +69,18 @@ def test_profile_cli_config_reaches_engine_workers(tmp_path):
     assert config.output == output.resolve()
     assert config.includes("e2e")
     assert config.includes("kernel")
+    assert config.chip_swimlane_level == 2
+    assert config.chip_artifacts_dir == output / "chip"
+
+
+def test_chip_profile_requires_profile_flag(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    args = cli.build_parser().parse_args(
+        ["--model", str(model_dir), "--profile-chip-level", "2"]
+    )
+    with pytest.raises(ValueError, match="require --profile"):
+        cli.build_serving_engine_config(args)
 
 
 def test_profile_recorder_can_start_and_stop_without_process_exit(tmp_path):
@@ -106,6 +121,7 @@ def test_worker_profile_commands_ack_after_state_change(monkeypatch):
     monkeypatch.setattr(serving_worker, "get_profiler", lambda **_kwargs: profiler)
 
     worker = serving_worker.WorkerProcess.__new__(serving_worker.WorkerProcess)
+    worker.config = EngineConfig(profile_config=create_profile_config(enabled=True))
     worker.input_queue = _Queue(
         [
             encode_command(ProfileCommand(active=True)),
@@ -120,6 +136,41 @@ def test_worker_profile_commands_ack_after_state_change(monkeypatch):
     assert results == [
         ProfileResult(active=True),
         ProfileResult(active=False),
+    ]
+
+
+def test_worker_chip_profile_follows_start_and_stop(monkeypatch, tmp_path):
+    class _Profiler:
+        active = False
+
+        def start(self):
+            self.active = True
+
+        def stop(self):
+            self.active = False
+
+    class _Executor:
+        def __init__(self):
+            self.calls = []
+
+        def set_chip_swimlane_level(self, level, output_dir=None):
+            self.calls.append((level, output_dir))
+
+    profiler = _Profiler()
+    monkeypatch.setattr(serving_worker, "get_profiler", lambda **_kwargs: profiler)
+    config = create_profile_config(enabled=True, output=tmp_path, chip_swimlane_level=2)
+    worker = serving_worker.WorkerProcess.__new__(serving_worker.WorkerProcess)
+    worker.config = SimpleNamespace(profile_config=config)
+    worker.executor = _Executor()
+    worker.profile_output_queue = _Queue()
+
+    worker._handle_profile_command(ProfileCommand(active=True))
+    worker._handle_profile_command(ProfileCommand(active=True))
+    worker._handle_profile_command(ProfileCommand(active=False))
+
+    assert worker.executor.calls == [(2, config.chip_artifacts_dir / "captures"), (0, None)]
+    assert [decode_profile_result(raw) for raw in worker.profile_output_queue.values] == [
+        ProfileResult(active=True), ProfileResult(active=True), ProfileResult(active=False),
     ]
 
 
