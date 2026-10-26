@@ -16,6 +16,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 import httpx
 import msgspec
+from pydantic import TypeAdapter
 
 from .protocol import Binding, MAX_FRAME, Node, VERSION, decode
 from pypto_serving.router.proxy import (
@@ -25,6 +26,7 @@ from pypto_serving.router.routing import RoundRobin
 
 logger = logging.getLogger(__name__)
 ERROR_SOURCE_HEADER = "x-pypto-error-source"
+_STREAM = TypeAdapter(bool)
 
 
 class _Failure(Exception):
@@ -163,6 +165,7 @@ class PDCoordinator:
             payload = json.loads(body)
             if not isinstance(payload, dict):
                 raise ValueError("request must be a JSON object")
+            payload["stream"] = _STREAM.validate_python(payload.get("stream", False))
             return await self._forward(request, path, owner, payload, session_id)
         except (_Failure, ValueError, RuntimeError, TimeoutError, httpx.HTTPError) as exc:
             error = _failure(exc)

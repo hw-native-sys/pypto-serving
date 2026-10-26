@@ -17,7 +17,7 @@ import msgspec
 import pytest
 from starlette.requests import Request
 
-from pypto_serving.pd.protocol import Component, Contract, Node, Topology
+from pypto_serving.pd.protocol import Binding, Component, Contract, Node, Topology, decode, digest
 from pypto_serving.router.app import ServingRouter
 from pypto_serving.router.config import ReplicaSpec, RouterConfig
 
@@ -102,4 +102,49 @@ def test_cleanup_closes_decode_response_returned_after_abort(failure):
             finally:
                 for response in responses:
                     await response.aclose()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("kind", ["completion", "chat"])
+@pytest.mark.parametrize("fields,streaming", [({}, False), ({"stream": False}, False),
+    ({"stream": "false"}, False), ({"stream": "0"}, False), ({"stream": "off"}, False),
+    ({"stream": True}, True), ({"stream": "true"}, True), ({"stream": 0}, False),
+    ({"stream": 1}, True), ({"stream": None}, None), ({"stream": "invalid"}, None)])
+def test_stream_coercion_matches_model_node_schema(kind, fields, streaming):
+    from pypto_serving.serving.server.server import ChatCompletionRequest, CompletionRequest
+    async def run():
+        posts = []
+        schema = CompletionRequest if kind == "completion" else ChatCompletionRequest
+        async def transport(req):
+            if req.url.path.endswith("descriptor"):
+                return httpx.Response(200, json=msgspec.to_builtins(descriptor(req.url.host)))
+            if req.url.path.endswith("abort"):
+                return httpx.Response(200, json={"accepted": True})
+            body = json.loads(req.content)
+            public = schema.model_validate(body)
+            binding = decode(json.loads(req.headers["x-pd-context"])["binding"], Binding)
+            assert binding.input_digest == digest(body)
+            assert type(body["stream"]) is bool and public.stream == streaming
+            posts.append(req.url.host)
+            if req.url.host == "p":
+                return httpx.Response(200, json={"request": binding.request, "status": "ready"})
+            if public.stream:
+                return httpx.Response(200, text='data: {"choices":[{"text":"answer","finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+                                      headers={"content-type": "text/event-stream"})
+            # A coerced-false request must use the longer JSON header deadline.
+            await asyncio.sleep(config().pd_options["handoff_timeout"] * 2)
+            return httpx.Response(200, json={"choices": [{"text": "answer"}]})
+        payload = {"prompt": "hello"} if kind == "completion" else {
+            "messages": [{"role": "user", "content": "hello"}]}
+        path = "/v1/completions" if kind == "completion" else "/v1/chat/completions"
+        async with application(httpx.MockTransport(transport)) as router:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=router.app), base_url="http://router") as client:
+                response = await asyncio.wait_for(client.post(path, json={**payload, **fields}), 2)
+            if streaming is None:
+                assert response.status_code == 400 and not posts
+            else:
+                assert response.status_code == 200 and "answer" in response.text
+                assert "pd_execution_error" not in response.text and sorted(posts) == ["d", "p"]
+                media = "text/event-stream" if streaming else "application/json"
+                assert response.headers["content-type"].startswith(media)
     asyncio.run(run())
