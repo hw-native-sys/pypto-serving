@@ -63,3 +63,11 @@ Worker responsibilities:
 `ModelExecutor` defines the worker-facing capabilities and prefill/decode methods. `ModelRunner` defines `init_kv_cache()`, `run_prefill()`, and `run_decode()`; model implementations may also support split prepare/dispatch/reclaim methods for asynchronous execution. Qwen, DeepSeek V4 MTP, and DSpark have separate executors and runners because their kernel ABIs, cache layouts, and parallel contracts differ. The [Model Integration](model-integration.md) guide maps these interfaces to the steps for adding a model.
 
 Changes to request scheduling or cache allocation should include focused unit tests under `tests/unit/serving/` and NPU validation when model behavior or device dispatch is affected.
+
+## PyPTO target configuration
+
+The serving CLI retains `--platform` (`a2a3`, `a2a3sim`, `a5`, or `a5sim`).
+The shared executor config builder translates this into PyPTO `backend_type`
+and `execution_mode`; the common kernel compiler preserves both when applying
+per-model options. PyPTO continues to derive its internal platform encoding
+for artifact metadata and caches, including the simulator suffix.
