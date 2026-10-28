@@ -69,7 +69,7 @@ curl -N http://127.0.0.1:8110/v1/chat/completions \
 
 Completion/chat, streaming, tools and optional constraints reuse Serving's ordinary API. Invalid preparation fails before SSE headers. Later execution failures emit an explicit stream error; clients must inspect events even after HTTP 200.
 
-HTTP, control (HTTP port + 10000 by default), and Mooncake's dynamic RPC/RoCE endpoints must be reachable. Optional entry fields are `control_port` and `transfer_hostname` for a distinct data-plane address. Optional fields in the top-level `pd` section are `provider` (currently `mooncake`), `policy` (currently `round_robin`), `capacity` (8 per node), `handoff_timeout` (300 seconds), `request_timeout` (3600 seconds), and `run_id`. Timeouts do not authorize reuse of possibly active memory.
+HTTP, control (HTTP port + 10000 by default), and Mooncake's dynamic RPC/RoCE endpoints must be reachable. Optional entry fields are `control_port` and `transfer_hostname` for a distinct data-plane address. Optional fields in the top-level `pd` section are `provider` (currently `mooncake`), `policy` (currently `round_robin`), `capacity` (256 per node), `handoff_timeout` (300 seconds), `request_timeout` (3600 seconds), and `run_id`. Timeouts do not authorize reuse of possibly active memory.
 
 `handoff_timeout` bounds individual control, transfer, and stop-confirmation operations. Waiting for the full Prefill before Decode uses `request_timeout`, so a long, progressing Prefill is not mistaken for a stalled transfer. Non-streaming JSON response headers also wait under `request_timeout`, because they follow generation; streaming setup headers retain `handoff_timeout`. Expiry still follows the normal abort and lease-retirement rules.
 
@@ -115,6 +115,11 @@ of D headers or output; D capacity returns after response cleanup. The nodes
 retain their own capacity and safe-retirement checks. Only `capacity_exhausted`
 guarantees rejection before either POST; other errors may require cleanup of
 already-started work. The Router never retries or rebinds a started request.
+
+`capacity` limits in-flight requests, not model batch size or available HBM.
+Increasing it can increase queueing latency and KV/state pressure; a node can
+still reject requests when cache pages or request-state slots are exhausted.
+Use the same deployment configuration for the Router and P/D nodes.
 
 Logs default to `serving_log/pd_disag/<automatic-run-id>/{router,p,d}/`; node files have stable hashed names. Set a shared `pd.run_id` to group processes under one tag. Boot identities are still regenerated at every startup. Optional `observability` fields are `enabled` and `root`. Detailed profiling uses Serving's existing profiler, not a second trace system.
 

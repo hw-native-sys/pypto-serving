@@ -49,7 +49,7 @@ class Config:
     decode: tuple[Endpoint, ...]
     provider: str = "mooncake"
     policy: str = "round_robin"
-    capacity: int = 8
+    capacity: int = 256
     handoff_timeout: float = 300.0
     request_timeout: float = 3600.0
     run_id: str = field(default_factory=lambda: datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8])

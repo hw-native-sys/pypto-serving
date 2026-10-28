@@ -93,7 +93,7 @@ def default_client_factory(config: RouterConfig):
     # the number suggests.
     max_connections = config.max_connections
     if config.is_pd:
-        capacity = (config.pd_options or {}).get("capacity", 8)
+        capacity = (config.pd_options or {}).get("capacity", 256)
         p = sum(r.role == "prefill" for r in config.replicas)
         d = sum(r.role == "decode" for r in config.replicas)
         max_connections = capacity * (d * (p + d + 3) + p) + p + d
