@@ -18,7 +18,7 @@ from enum import Enum, auto
 
 from pypto_serving.config.types import KVCacheGroupSpec
 from pypto_serving.serving.constraints import ConstraintSpec
-from pypto_serving.serving.memory.kv_cache import KVCacheCapacityError, KvCacheManager
+from pypto_serving.serving.memory.kv_cache import KVCacheCapacityError, KvCacheManager, PrefixCacheObservation
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +141,8 @@ class Request:
     # prefill chunk. Keep this across decode so partial pages stay unpublished.
     group_cache_valid_from: dict[str, int] = field(default_factory=dict)
     prefix_cache_metrics_recorded: bool = False
+    observe_prefix_cache: bool = False
+    prefix_cache_observation: PrefixCacheObservation | None = None
     # Async scheduling: tokens scheduled optimistically but not yet sampled.
     # Stands in for output tokens still in flight so the next schedule() advances
     # correctly; decremented as real tokens are applied in update_from_output.
@@ -230,6 +232,22 @@ class Scheduler:
         self._next_grouped_cache_phase = "decode"
 
     def add_request(self, request: Request) -> None:
+        self.validate_request(request)
+        if self.config.enable_prefix_cache:
+            if self.kv_cache_manager.has_groups:
+                request.group_block_hashes = self.kv_cache_manager.compute_group_block_hashes(
+                    request.prompt_token_ids
+                )
+            else:
+                request.block_hashes = self.kv_cache_manager.compute_block_hashes(
+                    request.prompt_token_ids
+                )
+        request.status = RequestStatus.WAITING
+        self.waiting.append(request)
+        self.requests[request.request_id] = request
+
+    def validate_request(self, request: Request) -> None:
+        """Reject invalid lengths and cap generation before request admission."""
         prompt_len = len(request.prompt_token_ids)
         max_seq_len = self.config.max_seq_len
         if prompt_len > max_seq_len:
@@ -268,18 +286,6 @@ class Scheduler:
             rejection = self._single_prefill_rejection(request)
             if rejection is not None:
                 raise ValueError(rejection)
-        if self.config.enable_prefix_cache:
-            if self.kv_cache_manager.has_groups:
-                request.group_block_hashes = self.kv_cache_manager.compute_group_block_hashes(
-                    request.prompt_token_ids
-                )
-            else:
-                request.block_hashes = self.kv_cache_manager.compute_block_hashes(
-                    request.prompt_token_ids
-                )
-        request.status = RequestStatus.WAITING
-        self.waiting.append(request)
-        self.requests[request.request_id] = request
 
     def abort_request(self, request_id: str) -> None:
         request = self.requests.get(request_id)
@@ -447,6 +453,15 @@ class Scheduler:
             # Prefix cache lookup
             if self.config.enable_prefix_cache:
                 if self.kv_cache_manager.has_groups:
+                    max_hit_tokens = max(
+                        0,
+                        request.num_prompt_tokens
+                        - max(1, self.config.speculative_prefix_cache_replay_tokens),
+                    )
+                    if request.observe_prefix_cache:
+                        request.prefix_cache_observation = self.kv_cache_manager.observe_group_prefix(
+                            request.group_block_hashes, max_cache_hit_tokens=max_hit_tokens,
+                        )
                     (
                         request.allocated_group_block_ids,
                         request.num_computed_tokens,
@@ -454,11 +469,7 @@ class Scheduler:
                     ) = self.kv_cache_manager.acquire_group_prefix_blocks(
                         request.request_id,
                         request.group_block_hashes,
-                        max_cache_hit_tokens=max(
-                            0,
-                            request.num_prompt_tokens
-                            - max(1, self.config.speculative_prefix_cache_replay_tokens),
-                        ),
+                        max_cache_hit_tokens=max_hit_tokens,
                     )
                     request.num_group_blocks_cached = (
                         self.kv_cache_manager.published_group_block_counts(
@@ -475,6 +486,12 @@ class Scheduler:
                         )
                     cached_blocks = []
                 else:
+                    if request.observe_prefix_cache:
+                        # Capture ownership before get_computed_blocks acquires
+                        # this request's references. No await occurs between lookups.
+                        request.prefix_cache_observation = self.kv_cache_manager.observe_prefix(
+                            request.prompt_token_ids,
+                        )
                     cached_blocks = self.kv_cache_manager.get_computed_blocks(
                         request.prompt_token_ids
                     )
@@ -586,6 +603,7 @@ class Scheduler:
         request.num_computed_tokens = 0
         request.num_blocks_cached = 0
         request.num_group_blocks_cached = {}
+        request.prefix_cache_observation = None
 
     def _prefill_chunk_limit(self) -> int | None:
         """Return the configured per-request prefill limit before step budget."""

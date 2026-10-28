@@ -24,6 +24,12 @@ PY_HEADER = """\
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------"""
 
+AGENTINFER_HEADER = """\
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
+# Modified by PyPTO Serving: internal imports use the bundled scheduling package."""
+AGENTINFER_SOURCE = Path(__file__).resolve().parents[2] / "pypto_serving/serving/agentinfer_core/scheduling"
+
 
 def get_git_tracked_files(root: Path) -> list[Path]:
     """Return git-tracked files under ``root``."""
@@ -42,8 +48,9 @@ def get_git_tracked_files(root: Path) -> list[Path]:
 
 
 def check_header(path: Path) -> tuple[bool, str]:
-    """Check that ``path`` starts with the project Python header."""
-    expected_lines = PY_HEADER.split("\n")
+    """Check project sources and the explicitly vendored AgentInfer sources."""
+    header = AGENTINFER_HEADER if path.is_relative_to(AGENTINFER_SOURCE) else PY_HEADER
+    expected_lines = header.split("\n")
     try:
         content = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:

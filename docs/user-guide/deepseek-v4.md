@@ -81,6 +81,8 @@ pypto-serving \
 
 Each NPU runs one prefill row at a time, so DP=8 admits up to eight prefill requests in one global step. The vLLM-style `--speculative-config` selects `method="mtp"`; `num_speculative_tokens` is the maximum number of draft tokens, and any positive value enables MTP. The 16-row MTP decode tile uses B8S2 for K=1, B4S4 for K=2-3, and B2S8 for K>=4. K values larger than seven are supported through repeated target verification chunks. Set `--max-num-seqs` no higher than 64, 32, or 16, respectively. Non-MTP decode retains B8S1T8. The deprecated `--num-speculative-tokens K` flag remains as a compatibility alias.
 
+AgentInfer admission is available for the standard K=1 configuration with prefix caching enabled. Add `--agentinfer-mode enforce` to the server command. Requests with a stable `X-Session-Id` header enter the same AgentInfer session; Chat requests can also use `"agent_hint":{"session_id":"your-session-id"}`. Requests without a recognized session identity continue through the native scheduler. DSpark and other MTP depths do not support AgentInfer admission yet.
+
 The server applies DeepSeek V4's model-specific message encoding for chat requests because the checkpoint does not ship a Jinja chat template. Chat mode is the default:
 
 ```bash

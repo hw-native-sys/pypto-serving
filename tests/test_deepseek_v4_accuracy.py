@@ -252,11 +252,12 @@ def _request_json(
     endpoint: str,
     request_kind: str,
     payload: dict[str, object],
+    request_headers: dict[str, str] | None = None,
 ) -> dict:
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}{endpoint}",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **(request_headers or {})},
         method="POST",
     )
     results: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
@@ -471,6 +472,67 @@ def test_deepseek_v4_http_completion_contract(
                 f"Expected grouped prefix-cache hits {expected_hits}, got {hits} "
                 f"for a repeated {case.prompt_tokens}-token prompt"
             )
+    except BaseException:
+        _print_server_log(log_path)
+        raise
+
+
+def test_deepseek_v4_agentinfer_chat_session(tmp_path: Path) -> None:
+    model_dir_env = os.environ.get("PYPTO_DSV4_MODEL_DIR")
+    model_dir = Path(model_dir_env) if model_dir_env else None
+    if model_dir is None or not model_dir.is_dir():
+        pytest.fail(f"PYPTO_DSV4_MODEL_DIR not set or not a directory: {model_dir}")
+    devices = _task_devices()
+    port = _unused_local_port()
+    log_path = tmp_path / "deepseek-v4-agentinfer-server.log"
+    deadline = time.monotonic() + OVERALL_TIMEOUT_SECONDS
+    command = _server_command(model_dir, devices, port, 1, True) + ["--agentinfer-mode", "enforce"]
+    session_id = "deepseek-k1-agentinfer-smoke"
+
+    try:
+        with log_path.open("w", encoding="utf-8") as server_log:
+            process = subprocess.Popen(
+                command, cwd=ROOT, stdout=server_log, stderr=subprocess.STDOUT,
+                start_new_session=True, text=True,
+            )
+            try:
+                _wait_for_health(process, port, deadline)
+                payload = {
+                    "model": MODEL_ID,
+                    "messages": [{"role": "user", "content": PREFIX_HIT_PROMPT}],
+                    "max_tokens": 10,
+                    "temperature": 0.0,
+                }
+                responses = [
+                    _request_json(
+                        process, port, deadline, endpoint="/v1/chat/completions",
+                        request_kind=f"agent chat {index}", payload=payload,
+                        request_headers={"X-Session-Id": session_id},
+                    )
+                    for index in range(2)
+                ]
+                for response in responses:
+                    assert response["model"] == MODEL_ID
+                    assert response["choices"][0]["finish_reason"] == "length"
+                    assert response["usage"]["completion_tokens"] == 10
+                    assert response["usage"]["prompt_tokens"] > 1024
+                assert responses[0]["id"] != responses[1]["id"]
+                terminal = _request_json(
+                    process, port, deadline, endpoint="/v1/agent/lifecycle",
+                    request_kind="agent terminal", payload={
+                        "session_id": f"{session_id}:lead",
+                        "request_id": responses[1]["id"], "lifecycle": "terminal",
+                    },
+                )
+                assert terminal == {"released": True}
+            finally:
+                _stop_process_group(process)
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+        assert "AgentInfer admission configured" in log_text
+        hits = [int(hit) for hit in re.findall(r"prefix_cache_hit_tokens=(\d+)", log_text)]
+        print(f"DeepSeek AgentInfer prompt_tokens={responses[0]['usage']['prompt_tokens']} "
+              f"prefix_hits={hits} terminal={terminal}", flush=True)
+        assert any(hit > 0 for hit in hits)
     except BaseException:
         _print_server_log(log_path)
         raise

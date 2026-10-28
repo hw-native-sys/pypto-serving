@@ -1066,6 +1066,7 @@ def test_grouped_prefix_hit_falls_back_to_an_idle_partition_when_suffix_does_not
         request_id="fallback",
         prompt_token_ids=prompt,
         max_new_tokens=1,
+        observe_prefix_cache=True,
     )
     scheduler.add_request(request)
 
@@ -1076,6 +1077,7 @@ def test_grouped_prefix_hit_falls_back_to_an_idle_partition_when_suffix_does_not
     assert output.scheduled_requests[0].num_new_tokens == len(prompt)
     assert request.cache_partition == 1
     assert output.prefix_cache_hits == 0
+    assert request.prefix_cache_observation is None
 
 
 def test_grouped_prefix_metrics_count_reused_tokens():

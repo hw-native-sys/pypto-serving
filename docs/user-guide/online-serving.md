@@ -56,6 +56,24 @@ Chat completions accept `model`, `messages`, `max_completion_tokens`, `max_token
 
 The server converts chat messages to a prompt with the tokenizer's `apply_chat_template` method. `chat_template_kwargs` is forwarded to the tokenizer, which allows model-specific controls such as Qwen thinking-mode settings when the tokenizer supports them.
 
+## AgentInfer Session Identity
+
+Start the server with `--agentinfer-mode enforce` to enable AgentInfer admission. For `/v1/chat/completions` and `/v1/completions`, the server uses identity already sent by the agent; no separate `agent_hint` is needed when a stable session header is present. Chat requests also accept canonical context:
+
+| Existing request metadata | Identity used by AgentInfer |
+| --- | --- |
+| `X-Claude-Code-Session-Id`, optionally `X-Claude-Code-Agent-Id` | Session plus lead or subagent ID. |
+| `X-OpenCode-Session-Id` (also `X-OpenCode-Session`) | Session plus lead ID. |
+| `X-DeepSeek-Harness-Session-Id` | Session plus lead ID; auxiliary compaction requests are excluded. |
+| `Session-Id`, optionally `Thread-Id` and `X-Codex-Parent-Thread-Id` | Session plus lead or thread ID, with parent lineage when supplied. |
+| `X-Session-Id` | Session plus lead ID. |
+| `vllm_xargs.agentic_context` | Canonical Program identity, including optional parent and task fields. |
+| `agent_hint.session_id`, optionally `parent_session_id` | Explicit session identity and optional parent lineage. |
+
+For example, `X-Session-Id: run-123` groups rounds under `run-123:lead`; a different session or subagent gets a separate Program. These mappings require the agent to already send the indicated metadata to a supported endpoint; no request changes are needed in that case. Canonical `vllm_xargs.agentic_context` takes precedence over `agent_hint`, which takes precedence over headers. Requests without a recognized identity continue through the native scheduler. Header-derived sessions use explicit lifecycle tracking; clients that know a run has ended can report it through `/v1/agent/lifecycle` using the derived Program ID and response ID, while sessions without a terminal signal expire through the admission policy's normal timeout.
+
+Identity detection applies to the OpenAI-compatible Chat and Completions endpoints. A native Claude Code client using Anthropic Messages or a Codex client using OpenAI Responses cannot connect directly to this server yet, even when it sends a recognized session header. The current AgentInfer mode also requires a single-replica Qwen model with prefix caching, and the Qwen Chat path does not expose structured tool calls. Agents that send no stable session identity cannot be grouped reliably from their prompt text; they remain on the native scheduler.
+
 ## DeepSeek V4 Function Tools
 
 Tool calling is selected by the model tokenizer; no extra launcher flag or vLLM dependency is required. Serving encodes tool definitions and parses model output. **The client executes tools**, then sends the results in a new chat request. Constrained generation for DeepSeek V4 DSpark K7 additionally requires XGrammar; see [deployment and compatibility](deepseek-v4-dspark-tool-constraints.md).
