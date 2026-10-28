@@ -95,7 +95,7 @@ async def serve(peer):
             await asyncio.wait_for(task, 5)
 
 
-@pytest.mark.parametrize("retirement", ["cancel_streams", "close_router"])
+@pytest.mark.parametrize("retirement", ["cancel_streams", "close_router", "unstarted_streams"])
 def test_real_pool_keeps_descriptors_and_aborts_moving(retirement):
     async def run():
         peers = [Peer(role) for role in ("prefill", "decode")]
@@ -120,6 +120,8 @@ def test_real_pool_keeps_descriptors_and_aborts_moving(retirement):
                 assert (await router._health()).status_code == 200
                 if retirement == "close_router":
                     await asyncio.wait_for(router.proxy.close(), 3)
+                elif retirement == "unstarted_streams":
+                    await until(lambda: not router.proxy.active)
                 else:
                     for response in responses:
                         assert "answer" in await anext(response.body_iterator)

@@ -73,6 +73,10 @@ HTTP, control (HTTP port + 10000 by default), and Mooncake's dynamic RPC/RoCE en
 
 `handoff_timeout` bounds individual control, transfer, and stop-confirmation operations. Waiting for the full Prefill before Decode uses `request_timeout`, so a long, progressing Prefill is not mistaken for a stalled transfer. Non-streaming JSON response headers also wait under `request_timeout`, because they follow generation; streaming setup headers retain `handoff_timeout`. Expiry still follows the normal abort and lease-retirement rules.
 
+An SSE response whose body iterator has not started within `handoff_timeout` is
+retired through the same abort and cleanup path. The guard is cancelled when
+iteration begins; it does not limit the duration of an active stream.
+
 The Router preserves its configured HTTP connect and write/pool timeouts. PD
 generation reads use `pd.request_timeout` as a read-idle timeout, with a separate
 response-header wait as described above. These are not an end-to-end generation

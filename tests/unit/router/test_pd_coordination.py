@@ -315,6 +315,93 @@ def test_a_full_global_gate_rejects_without_taking_or_releasing_a_slot(gate):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("close_iterator", [False, True])
+def test_unstarted_stream_retires_without_router_shutdown(close_iterator):
+    class UnreadStream(httpx.AsyncByteStream):
+        closes = 0
+        reads = 0
+        async def __aiter__(self):
+            self.reads += 1
+            yield b'data: {"choices":[{"text":"answer"}]}\n\ndata: [DONE]\n\n'
+        async def aclose(self):
+            self.closes += 1
+    async def run():
+        cfg = config()
+        peers = Peers(cfg)
+        peers.p_hold = asyncio.Event()
+        peers.d_stream = UnreadStream()
+        router = peers.router(cfg)
+        releases = []
+        release = router.registry.release
+        def record_release(name):
+            releases.append(name)
+            release(name)
+        router.registry.release = record_release
+        async with router.app.router.lifespan_context(router.app):
+            pending = asyncio.create_task(router.proxy.forward(request({"stream": True}), "/v1/completions"))
+            response = await pending
+            assert pending.done() and router.proxy.active
+            if close_iterator:
+                await response.body_iterator.aclose()
+            async def retired():
+                while router.proxy.active:
+                    await asyncio.sleep(0.005)
+            await asyncio.wait_for(retired(), 1)
+            assert not router.proxy.closing and not router.client.is_closed
+            assert peers.d_stream.closes == 1 and peers.d_stream.reads == 0
+            assert router.proxy.requests == router.proxy.handoffs == 0
+            assert all(s.outstanding == 0 for s in router.registry.states)
+            assert sum(path.endswith("abort") for _, path in peers.calls) == 2
+            assert releases.count("p0") == releases.count("d0") == 1
+            if not close_iterator:
+                body = "".join([part async for part in response.body_iterator])
+                assert "pd_operation_timeout" in body and "[DONE]" in body and "answer" not in body
+                assert peers.d_stream.reads == 0
+            await router.proxy.close()
+            await response.body_iterator.aclose()
+            assert peers.d_stream.closes == 1
+    asyncio.run(run())
+
+
+def test_stream_start_cancels_guard_before_first_upstream_byte():
+    class WaitingStream(httpx.AsyncByteStream):
+        closes = 0
+        async def __aiter__(self):
+            self.started.set()
+            await self.release.wait()
+            yield b'data: {"choices":[{"text":"answer"}]}\n\n'
+        async def aclose(self):
+            self.closes += 1
+    async def run():
+        cfg = config()
+        peers = Peers(cfg)
+        peers.p_hold = asyncio.Event()
+        stream = peers.d_stream = WaitingStream()
+        stream.started, stream.release = asyncio.Event(), asyncio.Event()
+        router = peers.router(cfg)
+        async with router.app.router.lifespan_context(router.app):
+            response = await router.proxy.forward(request({"stream": True}), "/v1/completions")
+            first = asyncio.create_task(anext(response.body_iterator))
+            try:
+                await asyncio.wait_for(stream.started.wait(), 1)
+                await asyncio.sleep(cfg.pd_options["handoff_timeout"] * 2)
+                assert not first.done() and stream.closes == 0
+                assert not any(path.endswith("abort") for _, path in peers.calls)
+                assert router.proxy.requests == router.proxy.handoffs == 1
+                stream.release.set()
+                assert "answer" in await asyncio.wait_for(first, 1)
+            finally:
+                stream.release.set()
+                first.cancel()
+                await asyncio.gather(first, return_exceptions=True)
+                await response.body_iterator.aclose()
+            assert stream.closes == 1 and not router.proxy.active
+            assert router.proxy.requests == router.proxy.handoffs == 0
+            assert all(s.outstanding == 0 for s in router.registry.states)
+            assert sum(path.endswith("abort") for _, path in peers.calls) == 2
+    asyncio.run(run())
+
+
 def test_router_close_retires_a_response_before_its_stream_starts():
     async def run():
         cfg = config()
@@ -332,6 +419,9 @@ def test_router_close_retires_a_response_before_its_stream_starts():
             assert sum(path.endswith("abort") for _, path in peers.calls) == 2
             assert not router.client.is_closed
             await response.body_iterator.aclose()
+            await asyncio.sleep(cfg.pd_options["handoff_timeout"] * 2)
+            assert router.proxy.requests == router.proxy.handoffs == 0
+            assert sum(path.endswith("abort") for _, path in peers.calls) == 2
     asyncio.run(run())
 
 

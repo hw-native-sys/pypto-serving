@@ -199,6 +199,7 @@ class PDCoordinator:
         p_task = d_task = response = None
         finished = False
         cleanup_task = None
+        start_timer = None
         p_released = False
 
         def release_handoff(_done=None):
@@ -237,6 +238,8 @@ class PDCoordinator:
 
         def retire():
             nonlocal cleanup_task
+            if start_timer is not None:
+                start_timer.cancel()
             if cleanup_task is None:
                 cleanup_task = asyncio.create_task(cleanup())
             return cleanup_task
@@ -295,10 +298,13 @@ class PDCoordinator:
 
             async def stream():
                 nonlocal finished
+                start_timer.cancel()
                 frame = []
                 size = 0
                 upstream_failed = False
                 try:
+                    if cleanup_task is not None:
+                        raise _Failure(503, "pd_operation_timeout", "PD response retired before streaming began")
                     async for line in response.aiter_lines():
                         size += len(line)
                         if size > MAX_FRAME:
@@ -342,6 +348,8 @@ class PDCoordinator:
                     except asyncio.CancelledError:
                         await asyncio.shield(task)
                         raise
+            # An async generator's finally cannot retire a body that never starts.
+            start_timer = asyncio.get_running_loop().call_later(self.config.handoff_timeout, retire)
             return StreamingResponse(stream(), media_type="text/event-stream",
                                      headers=_response_headers(response, session_id))
         except BaseException:
