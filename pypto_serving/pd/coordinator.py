@@ -18,6 +18,7 @@ import httpx
 import msgspec
 from pydantic import TypeAdapter
 
+from pypto_serving.tools.observe import record
 from .protocol import Binding, MAX_FRAME, Node, VERSION, decode
 from pypto_serving.router.proxy import (
     SESSION_HEADER, _DROP_REQUEST, _DROP_RESPONSE, _filter_headers, resolve_session_id,
@@ -111,6 +112,7 @@ class PDCoordinator:
         for p_id, d_id in self.pair_ids:
             p, d = self.nodes.get(p_id), self.nodes.get(d_id)
             valid = (p is not None and d is not None and p.compatible(d)
+                     and p.role == "prefill" and d.role == "decode"
                      and all(self.registry.state(n).routable for n in (p_id, d_id))
                      and (model is None or p.contract.model == model))
             result.append((p, d) if valid else None)
@@ -134,7 +136,10 @@ class PDCoordinator:
         if (self.requests >= self.config.capacity * len(self.config.decode)
                 or self.handoffs >= self.config.capacity * len(self.config.prefill) or not any(available)):
             raise _Failure(503, "capacity_exhausted", "All compatible P/D pairs are at capacity. Retry later.")
-        p, d = self.policy.select(available)
+        pair, reason = self.policy.select(available)
+        if not any(pair is candidate for candidate in available):
+            raise RuntimeError("policy selected an ineligible P/D pair")
+        p, d = pair
         binding = Binding.create(p, d, payload)
         endpoints = tuple(self.registry.state(n.node_id).spec for n in (p, d))
         self.requests += 1
@@ -142,6 +147,8 @@ class PDCoordinator:
         for endpoint in endpoints:
             self.registry.acquire(endpoint.name)
         self.registry.record_route(*(e.name for e in endpoints))
+        record(logger, "route", request=binding.request, prefill=p.node_id, decode=d.node_id,
+               policy=self.config.policy, reason=reason, prefill_identity=p.key, decode_identity=d.key)
         return p, d, binding, endpoints
 
     async def close(self):
@@ -171,6 +178,9 @@ class PDCoordinator:
             return await self._forward(request, path, owner, payload, session_id)
         except (_Failure, ValueError, RuntimeError, asyncio.TimeoutError, TimeoutError, httpx.HTTPError) as exc:
             error = _failure(exc)
+            record(logger, "route.reject", session=session_id, reason=error.code, status=error.status,
+                   node_snapshots=tuple((s.name, self.nodes[s.name].key if s.name in self.nodes else None,
+                                         s.ready, s.draining, s.outstanding) for s in self.registry.states))
             if error.code in {"invalid_request", "model_not_found", "no_available_backend",
                               "capacity_exhausted", "router_closing"}:
                 self.registry.rejected += 1
@@ -235,6 +245,8 @@ class PDCoordinator:
                 self.registry.release(endpoints[1].name)
                 self.requests -= 1
                 self.active.pop(owner, None)
+                record(logger, "http.retire", request=binding.request, finished=finished,
+                       status=response.status_code if response is not None else "unknown")
 
         def retire():
             nonlocal cleanup_task
@@ -258,7 +270,6 @@ class PDCoordinator:
                 raise _Failure(503, "pd_protocol_error", "Prefill returned an invalid handoff confirmation")
 
         try:
-            logger.info("route request=%s prefill=%s decode=%s", binding.request, p.node_id, d.node_id)
             forwarded = _filter_headers(request.headers, _DROP_REQUEST | {
                 "content-encoding", "content-type", "x-pd-context", ERROR_SOURCE_HEADER})
             def headers(peer):

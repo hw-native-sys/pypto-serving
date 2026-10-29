@@ -105,8 +105,9 @@ class ReplicaProxy:
             )
 
         replica = decision.replica
-        logger.info("routing session %s to %s (affinity=%s) %s",
-                    session_id, replica.name, decision.affinity_hit, path)
+        from pypto_serving.tools.observe import record
+        record(logger, "route", session=session_id, node=replica.name, policy="least_loaded_affinity",
+               reason=decision.reason, affinity=decision.affinity_hit, path=path)
 
         self._registry.acquire(replica.name)
         released = False

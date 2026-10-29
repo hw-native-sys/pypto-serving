@@ -11,12 +11,16 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import logging
 import threading
 
 import msgspec
 
+from pypto_serving.tools.observe import record
 from .protocol import Completion, MAX_FRAME, Plan, Topology, decode, digest
 from .transfer import Owner, Region, TransferError, owner_factories
+
+logger = logging.getLogger(__name__)
 
 
 class WorkerRuntime:
@@ -105,17 +109,23 @@ class WorkerRuntime:
             if any(a[1] > b[0] for a, b in zip(ordered, ordered[1:])):
                 raise ValueError("overlapping destination writes")
         job = digest(plan)
+        observation = dict(request=plan.binding.request, plan_digest=job,
+                           prefill=plan.binding.prefill, decode=plan.binding.decode)
         with self.lock:
             if len(self.jobs) >= self.settings.capacity or job in self.jobs:
                 raise ValueError("transfer capacity exceeded or duplicate submission")
             # Every rank was validated before the first native task is enqueued.
             try:
-                futures = tuple(self.pool.submit(self.owners[rank].call, "write", peer=peer, copies=tuple(copies))
-                                for (rank, _), copies in batches.items())
+                futures = tuple(self.pool.submit(self.owners[rank].call, "write", peer=peer,
+                    copies=tuple(copies), observation={**observation, "source_rank": rank,
+                                                     "destination_rank": destination})
+                    for (rank, destination), copies in batches.items())
             except BaseException as exc:
                 self.uncertain = True
                 raise TransferError("partial rank submission", uncertain=True) from exc
             self.jobs[job] = (plan, futures)
+        record(logger, "transfer.submit", **observation, bytes=sum(c.length for c in plan.copies),
+               rank_batches=len(batches))
         return job
 
     def poll(self, jobs):

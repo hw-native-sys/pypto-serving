@@ -123,6 +123,39 @@ Use the same deployment configuration for the Router and P/D nodes.
 
 Logs default to `serving_log/pd_disag/<automatic-run-id>/{router,p,d}/`; node files have stable hashed names. Set a shared `pd.run_id` to group processes under one tag. Boot identities are still regenerated at every startup. Optional `observability` fields are `enabled` and `root`. Detailed profiling uses Serving's existing profiler, not a second trace system.
 
+Routing records identify the policy, reason and immutable P/D node identities.
+Handoff records use the same `request` and `plan_digest` as the worker job, including
+owner-side `pd.native.write` durations and bytes. Byte counts include physical TP
+copies; they are not unique KV-content sizes. Logging/profiling failures do not
+authorize writes, change completion checks or release resources.
+
+### Internal request status
+
+On a model node, query the request ID from its Router/handoff logs:
+
+```bash
+curl http://127.0.0.1:8000/internal/pd/requests/REQUEST_ID
+```
+
+The read-only response reports node identity/boot, Service execution and handoff
+facts, the **current** CacheManager receive reservation, P source-pin presence and
+observed worker state-release acknowledgements. D reservation states remain
+`CONSTRUCTING`, `READY`, `IN_USE`, `RELEASED` and `QUARANTINED`; P has no receive
+reservation. Pending plans expose their digest/range, not addresses or block tables.
+The endpoint does not poll native jobs or allocate, commit, release or recover anything.
+
+Missing or retired records return HTTP 200 with absence indicators and null fields
+for unknown facts; they do not report successful release. A tombstone only rejects
+stale request reuse. Worker release confirmation is separate from the cache lease,
+and `RELEASED` does not imply prefix eviction. Cross-process observations are not
+an atomic global snapshot. The Router does not cache or aggregate these records.
+
+Node health and descriptors share the Engine-loop/worker readiness and existing
+gate/closing checks. New HTTP, begin and plan operations recheck readiness;
+unavailable HTTP admission returns 503 with `pd_node_unavailable`. Existing
+completion, abort and stop-confirmation handling does not require a functioning
+compute engine, but still validates identity, plans and native stop proofs.
+
 ### Optional Decode Step Metrics
 
 Set `PYPTO_SERVING_DECODE_METRICS_DIR` before starting each model server to collect lightweight worker JSONL records. Use a fresh directory per server run. This is disabled by default and does not require profiling.

@@ -218,6 +218,21 @@ def test_new_sessions_spread_across_replicas():
     assert sorted(registry.select(f"s{i}").replica.name for i in range(3)) == ["r0", "r1", "r2"]
 
 
+def test_policy_cannot_bypass_eligibility_or_commit_a_rejected_choice():
+    registry, sessions = _registry(_config())
+    excluded, eligible = registry.states
+    registry.set_draining(excluded.name, True)
+    def choose(candidates, **kwargs):
+        assert candidates == (eligible,)
+        return excluded, "invalid_choice"
+    registry.policy = SimpleNamespace(select=choose)
+    with pytest.raises(NoReplicaAvailable, match="ineligible"):
+        registry.select("session")
+    assert sessions.lookup("session") is None
+    assert registry.total_routed() == 0 and registry.affinity_hits == 0
+    assert all(state.outstanding == state.routed == 0 for state in registry.states)
+
+
 def test_expired_pin_re_routes_by_load():
     clock = _Clock()
     registry, sessions = _registry(_config(session_ttl_seconds=60.0), clock=clock)

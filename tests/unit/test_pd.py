@@ -115,7 +115,7 @@ def test_pool_policy_and_binding():
     for n in nodes:
         coordinator.nodes[n.node_id] = n
         registry.set_ready(n.node_id, True)
-    pairs = [coordinator.policy.select(coordinator.pairs()) for _ in range(4)]
+    pairs = [coordinator.policy.select(coordinator.pairs())[0] for _ in range(4)]
     assert {(p.node_id, d.node_id) for p, d in pairs} == {
         (p, d) for p in ("p0", "p1") for d in ("d0", "d1")}
     binding = Binding.create(*pairs[0], {"prompt": "hello"})
@@ -168,6 +168,8 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
             def apply_chat_template(self, *args, **kwargs): return "templated prompt"
 
         class Core:
+            def is_ready(self): return True
+
             def __init__(self, role, enabled):
                 self.role = role
                 self.kv_cache_manager = caches(enabled, partitions=16 // (p_tp if role == "prefill" else d_tp))

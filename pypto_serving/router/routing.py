@@ -80,8 +80,18 @@ class RoundRobin:
             index = (self.cursor + offset) % len(candidates)
             if candidates[index] is not None:
                 self.cursor = (index + 1) % len(candidates)
-                return candidates[index]
+                return candidates[index], "round_robin"
         raise NoReplicaAvailable("no compatible healthy routing candidate")
+
+
+class LeastLoaded:
+    """Choose from eligible replicas without changing pins or request counters."""
+
+    def select(self, candidates, *, pinned, slack, cursor, count):
+        least = min(candidates, key=lambda s: (s.outstanding, (s.index - cursor) % count, s.index))
+        if pinned is not None and pinned.outstanding <= least.outstanding + slack:
+            return pinned, "session_affinity"
+        return least, "affinity_slack" if pinned is not None else "least_outstanding"
 
 
 def new_session_id() -> str:
@@ -207,6 +217,7 @@ class ReplicaState:
 class RoutingDecision:
     replica: ReplicaSpec
     affinity_hit: bool
+    reason: str
 
 
 class ReplicaRegistry:
@@ -224,6 +235,7 @@ class ReplicaRegistry:
         self._routed = 0
         self.affinity_hits = 0
         self.rejected = 0
+        self.policy = LeastLoaded()
 
     @property
     def states(self) -> tuple[ReplicaState, ...]:
@@ -341,24 +353,19 @@ class ReplicaRegistry:
         so a hit is never guaranteed, and the one prefill it saves is worth less
         than an unbounded wait behind a saturated replica.
         """
-        candidates = [state for state in self._states if state.routable]
+        candidates = tuple(state for state in self._states if state.routable and state.spec.role == "replica")
         if not candidates:
             self.rejected += 1
             raise NoReplicaAvailable("no routable replica")
 
-        least = self._least_loaded(candidates)
         pinned = self._by_name.get(self._sessions.lookup(session_id) or "")
-        chosen, affinity_hit = least, False
-
-        if pinned is not None and pinned.routable:
-            if pinned.outstanding > least.outstanding + self._config.affinity_slack:
-                logger.info(
-                    "session %s leaves %s (outstanding=%d) for %s (outstanding=%d): slack %d exceeded",
-                    session_id, pinned.name, pinned.outstanding,
-                    least.name, least.outstanding, self._config.affinity_slack,
-                )
-            else:
-                chosen, affinity_hit = pinned, True
+        if not any(pinned is state for state in candidates):
+            pinned = None
+        chosen, reason = self.policy.select(candidates, pinned=pinned, slack=self._config.affinity_slack,
+                                            cursor=self._route_counter, count=len(self._states))
+        if not any(chosen is state for state in candidates):
+            raise NoReplicaAvailable("policy selected an ineligible replica")
+        affinity_hit = chosen is pinned
 
         if not affinity_hit:
             # Only advance the rotation when load decided the route, so a stream
@@ -368,14 +375,7 @@ class ReplicaRegistry:
         self._sessions.pin(session_id, chosen.name)
         self.record_route(chosen.name)
         self.affinity_hits += affinity_hit
-        return RoutingDecision(replica=chosen.spec, affinity_hit=affinity_hit)
-
-    def _least_loaded(self, candidates: list[ReplicaState]) -> ReplicaState:
-        count = len(self._states)
-        return min(
-            candidates,
-            key=lambda s: (s.outstanding, (s.index - self._route_counter) % count, s.index),
-        )
+        return RoutingDecision(replica=chosen.spec, affinity_hit=affinity_hit, reason=reason)
 
 
 class HealthMonitor:
