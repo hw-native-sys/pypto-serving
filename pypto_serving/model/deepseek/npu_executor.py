@@ -13,6 +13,7 @@ import contextlib
 import importlib
 import os
 import sys
+from dataclasses import replace
 from collections.abc import Iterable, Sequence
 from functools import lru_cache
 from pathlib import Path
@@ -222,6 +223,10 @@ def _deepseek_v4_import_context(
 
 class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
     """PyPTO executor boundary for DeepSeekV4 Flash W8A8 serving."""
+
+    @classmethod
+    def resolve_runtime_config(cls, runtime, device_ids):
+        return replace(runtime, requires_homogeneous_prefill_decode=True)
 
     def __init__(
         self,

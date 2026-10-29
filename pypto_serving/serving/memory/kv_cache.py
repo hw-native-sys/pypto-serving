@@ -1131,7 +1131,8 @@ class KvCacheManager:
             if pool.spec.sliding_window is not None:
                 if completed and not block_ids:
                     raise RuntimeError(f"Cache group {name!r} has an empty scheduled table")
-                start = max(start, completed - len(block_ids))
+                allocated = self._logical_group_blocks(pool, int(num_computed_tokens))
+                start = max(start, allocated - len(block_ids))
 
             for index in range(start, completed):
                 slot = index if pool.spec.sliding_window is None else index % len(block_ids)

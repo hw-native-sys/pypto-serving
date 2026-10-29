@@ -337,8 +337,8 @@ def test_worker_close_releases_executor_once():
     assert worker.executor is None
 
 
-@pytest.mark.parametrize("constrained", [False, True])
-def test_worker_prepares_next_decode_while_prior_device_step_runs(constrained):
+@pytest.mark.parametrize("constrained,device_embedding", [(False, True), (True, True), (False, False)])
+def test_worker_prepares_next_decode_while_prior_device_step_runs(constrained, device_embedding):
     """MRV2 cadence: prepare and reclaim overlap the FIFO device lane."""
     model = _model(max_batch_size=1, eos_token_id=0)
     first_running = threading.Event()
@@ -355,14 +355,15 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs(constrained):
     class Executor:
         supports_async_decode_prepare = True
         supports_async_decode_reclaim = True
-        supports_device_decode_embedding = True
+        supports_device_decode_embedding = device_embedding
+        supports_async_decode_prepare_without_embeddings = not device_embedding
         supports_device_sampling = True
         device_topk_sampling_k = 0
         device_token = 10
 
         @staticmethod
         def prepared_decode_requires_token(_prepared):
-            return False
+            return not device_embedding
 
         @staticmethod
         def prepare_decode(_model, batch, *, buffer_slot):
@@ -379,6 +380,8 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs(constrained):
         @classmethod
         def dispatch_prepared_decode(cls, _model, _batch, prepared):
             calls.append(("execute", prepared.slot))
+            if not device_embedding:
+                assert _batch.token_ids.tolist() == [[cls.device_token]]
             if constrained:
                 # Planning the next mask can only see actually committed output.
                 assert committed == list(range(11, cls.device_token + 1))
@@ -462,10 +465,10 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs(constrained):
     assert released == []
     allow_first_finish.set()
 
-    # N+1 is fully bound by prepare, so its device dispatch is not held behind
-    # N's host-side output processing.
+    # Persistent-token dispatch can overlap reclaim. Host-token dispatch waits
+    # until reclaim publishes the token that late binding needs.
     assert first_reclaim_running.wait(timeout=5)
-    if constrained:
+    if constrained or not device_embedding:
         assert not second_dispatched.wait(timeout=0.1)
     else:
         assert second_dispatched.wait(timeout=5)
@@ -542,7 +545,7 @@ def test_worker_does_not_prepare_host_embedding_decode_asynchronously():
     worker = WorkerProcess.__new__(WorkerProcess)
     worker._services = None
     worker._batch_builder = worker._make_decode_batch
-    worker.executor = SimpleNamespace(supports_device_decode_embedding=False)
+    worker.executor = _ImmediateEosExecutor(KvCacheManager())
     command = StepCommand(
         new_requests=[],
         prefill_requests=[],
@@ -551,7 +554,91 @@ def test_worker_does_not_prepare_host_embedding_decode_asynchronously():
         step_id=1,
     )
 
+    assert not worker.executor.supports_async_decode_prepare_without_embeddings
     assert worker._prepare_step_command(command) is None
+
+
+def test_worker_prepares_host_embedding_metadata_then_resolves_real_token():
+    class MetadataExecutor(_ImmediateEosExecutor):
+        supports_async_decode_prepare_without_embeddings = True
+
+        def prepare_decode(self, model, batch, *, buffer_slot):
+            assert batch.hidden_states is None
+            assert not self.embedding_lookup_shapes
+            return SimpleNamespace(buffer_slot=buffer_slot)
+
+    model = _model(max_batch_size=1)
+    model.embed_tokens.copy_(torch.arange(model.embed_tokens.numel()).reshape_as(model.embed_tokens))
+    executor = MetadataExecutor(KvCacheManager())
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
+    worker.executor = executor
+    worker.model_record = SimpleNamespace(runtime_model=model)
+    worker._req_cache = {"req": NewRequestData("req", [1], 0.0, 1.0, None)}
+    worker._last_tokens = {}
+    command = StepCommand(
+        new_requests=[], prefill_requests=[],
+        decode_requests=[DecodeRequest("req", -1, 2, [0])],
+        finished_request_ids=[], step_id=1,
+    )
+
+    assert not executor.supports_device_decode_embedding
+    prepared = worker._prepare_step_command(command, buffer_slot=1)
+    assert prepared.prepared.buffer_slot == 1
+    assert prepared.batch.token_ids.tolist() == [[0]]
+    assert prepared.batch.hidden_states is None and not executor.embedding_lookup_shapes
+
+    worker._last_tokens["req"] = [11]
+    bound = worker._late_bind_prepared_decode_batch(prepared, tuple(command.decode_requests))
+    assert bound.token_ids.tolist() == [[11]]
+    assert prepared.batch.token_ids.tolist() == [[0]]
+    assert bound.hidden_states is None and not executor.embedding_lookup_shapes
+
+    resolved = worker._make_decode_batch(
+        command.decode_requests, model, resolve_tokens=True,
+        allow_device_greedy_sampling=False, allow_device_topk_sampling=False,
+    )
+    assert resolved.token_ids.tolist() == [[11]]
+    assert torch.equal(resolved.hidden_states, model.embed_tokens[11:12])
+    assert executor.embedding_lookup_shapes == [(1,)]
+
+
+def test_decode_prepare_defers_stop_policy_until_fifo_registration():
+    class MetadataExecutor(_ImmediateEosExecutor):
+        supports_async_decode_prepare_without_embeddings = True
+
+        def prepare_decode(self, model, batch, *, buffer_slot):
+            return SimpleNamespace(buffer_slot=buffer_slot)
+
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
+    worker.executor = MetadataExecutor(KvCacheManager())
+    worker.model_record = SimpleNamespace(runtime_model=_model(max_batch_size=1))
+    registration = NewRequestData("req", [1], 0.0, 1.0, None, eos_token_id=0, min_tokens=2)
+    # The receive lane publishes metadata before the device lane applies lifecycle.
+    worker._req_cache = {"req": registration}
+    worker._accepted_output_lengths = {}
+    command = StepCommand(
+        new_requests=[], prefill_requests=[],
+        decode_requests=[DecodeRequest("req", -1, 2, [0])],
+        finished_request_ids=[], step_id=2,
+    )
+    assert worker._prepare_step_command(command) is None
+    with pytest.raises(RuntimeError, match="accepted output length is not registered"):
+        worker._sampling_params("req")
+
+    worker._apply_command_lifecycle(StepCommand(
+        new_requests=[registration], prefill_requests=[], decode_requests=[],
+        finished_request_ids=[], step_id=1,
+    ))
+    assert worker._sampling_params("req").forbidden_token_ids == (0,)
+    assert worker._prepare_step_command(command) is None
+    worker._accept_output_tokens("req", 2)
+    prepared = worker._prepare_step_command(command)
+    assert prepared is not None and prepared.prepared.buffer_slot == 0
+    assert worker._sampling_params("req").forbidden_token_ids == ()
 
 
 def test_worker_routes_decode_failures_through_device_fifo():

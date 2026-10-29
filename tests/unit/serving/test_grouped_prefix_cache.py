@@ -268,3 +268,20 @@ def test_paged_receive_failure_keeps_healthy_shared_prefix(uncertain):
     cache.release_group_cache("failed", confirmed_stopped=uncertain)
     assert query(cache, tokens, TARGET) == 8192
     assert all(block.ref_cnt == 0 for pool in cache._group_pools.values() for block in pool.blocks)
+
+
+def test_partial_ring_tail_does_not_publish_an_overwritten_checkpoint():
+    group = KVCacheGroupSpec("state", (0,), KVCacheSpec(128, 16, 128), 2, num_blocks=8,
+                             sliding_window=128)
+    cache = KvCacheManager(enable_prefix_cache=True)
+    cache.init_groups((group,), max_batch_size=1)
+    tokens = list(range(257))
+    tables = cache.ensure_group_blocks("producer", 257)
+    hashes = cache.compute_group_block_hashes(tokens)
+    cache.retain_group_block_snapshot(tables, 0)
+    cache.cache_group_blocks_from_snapshot(hashes, 257, {}, tables, 0, request_id="producer")
+    cache.release_group_block_snapshot(tables, 0)
+    # The ring contains the 256 endpoint and a mutable 257 tail. The 128 page
+    # has already been displaced and must not be registered under its old hash.
+    assert query(cache, tokens[:129]) == 0
+    assert query(cache, tokens) == 256

@@ -7,12 +7,15 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+from collections import deque
+
 import pytest
 
 from pypto_serving.config.types import (
     KVCacheGroupSpec,
     KVCacheSpec,
     PREFILL_CHUNK_SIZE_CHOICES,
+    RuntimeConfig,
 )
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.constraints import ConstraintSpec
@@ -29,6 +32,93 @@ from pypto_serving.serving.sched.scheduler import (
 def test_scheduler_rejects_speculative_depth_larger_than_token_budget():
     with pytest.raises(ValueError, match="one decode token"):
         SchedulerConfig(max_num_scheduled_tokens=4, num_speculative_tokens=4)
+
+
+@pytest.mark.parametrize("options", [
+    {"prefill_chunk_alignment": 0}, {"prefill_chunk_alignment": True},
+    {"prefill_chunk_alignment": 1.5},
+    {"prefill_chunk_alignment": 16, "max_num_scheduled_tokens": 15},
+    {"prefill_chunk_alignment": 16, "max_prefill_tokens_per_request": 15},
+    {"prefill_chunk_alignment": 16, "long_prefill_token_threshold": 15},
+])
+def test_scheduler_rejects_prefill_alignment_limits_that_cannot_make_progress(options):
+    with pytest.raises(ValueError, match="prefill.*alignment"):
+        SchedulerConfig(max_seq_len=512, **options)
+
+
+@pytest.mark.parametrize("context", [8, 15, 16])
+def test_aligned_prefill_accepts_a_smaller_complete_context(context):
+    runtime = RuntimeConfig(max_seq_len=context, max_num_batched_tokens=context,
+                            max_prefill_tokens_per_request=context, prefill_chunk_alignment=16)
+    scheduler = _prefill_scheduler(max_seq_len=runtime.max_seq_len, max_num_scheduled_tokens=context,
+                                   long_prefill_token_threshold=context, prefill_chunk_alignment=16)
+    scheduler.add_request(Request("small", list(range(context - 1)), max_new_tokens=1))
+    output = scheduler.schedule()
+    assert [(item.num_computed_tokens, item.num_new_tokens) for item in output.scheduled_requests] == [(0, context - 1)]
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_aligned_prefill_defers_ongoing_work_but_uses_arbitrary_terminal_tails(async_mode):
+    scheduler = _prefill_scheduler(
+        num_blocks=64, max_num_scheduled_tokens=128, long_prefill_token_threshold=32,
+        prefill_chunk_alignment=16, max_seq_len=512, async_scheduling=async_mode,
+    )
+    lengths = {"short": 17, "a": 401, "b": 402, "c": 415, "deferred": 339, "tail": 7}
+    for name, length in lengths.items():
+        scheduler.add_request(Request(name, list(range(length)), max_new_tokens=1))
+    chunks = {name: [] for name in lengths}
+    for step in range(100):
+        if not scheduler.has_work():
+            break
+        # Stable per-request recurrence boundaries must survive batch reordering.
+        scheduler.running.reverse()
+        output = scheduler.schedule()
+        assert output.scheduled_requests
+        assert output.num_prefill_tokens <= 128
+        if step == 0:
+            assert [(item.request.request_id, item.num_new_tokens) for item in output.scheduled_requests] == [
+                ("short", 17), ("a", 32), ("b", 32), ("c", 32), ("tail", 7),
+            ]
+            assert [request.request_id for request in scheduler.waiting] == ["deferred"]
+        sampled = {}
+        for item in output.scheduled_requests:
+            start, length = item.num_computed_tokens, item.num_new_tokens
+            chunks[item.request.request_id].append((start, length))
+            assert start % 16 == 0
+            if start + length < item.request.num_prompt_tokens:
+                assert length % 16 == 0
+            else:
+                sampled[item.request.request_id] = [9]
+        if async_mode:
+            scheduler.advance_after_schedule(output)
+        scheduler.update_from_output(output, sampled)
+    else:
+        pytest.fail("aligned prefill stalled")
+    assert not scheduler.has_work()
+    assert chunks["a"][-1][1] % 16 == 1
+    assert chunks["b"][-1][1] % 16 == 2
+    assert chunks["c"][-1][1] % 16 == 15
+    assert all(sum(length for _, length in rows) == lengths[name] for name, rows in chunks.items())
+
+
+@pytest.mark.parametrize("alignment,expected", [(1, [(0, 31), (31, 18)]),
+                                               (16, [(0, 16), (16, 16), (32, 17)])])
+def test_prefill_alignment_preserves_final_tail_and_single_token_decode(alignment, expected):
+    scheduler = _prefill_scheduler(max_num_scheduled_tokens=128, long_prefill_token_threshold=31,
+                                   prefill_chunk_alignment=alignment)
+    request = Request("request", list(range(49)), max_new_tokens=2)
+    scheduler.add_request(request)
+    chunks = []
+    while request.is_prefill:
+        output = scheduler.schedule()
+        item, = output.scheduled_requests
+        chunks.append((item.num_computed_tokens, item.num_new_tokens))
+        terminal = item.num_computed_tokens + item.num_new_tokens == request.num_prompt_tokens
+        scheduler.update_from_output(output, {"request": [9]} if terminal else {})
+    assert chunks == expected
+    decode = scheduler.schedule()
+    item, = decode.scheduled_requests
+    assert not item.is_prefill and item.num_new_tokens == 1
 
 
 @pytest.mark.parametrize("chunk_size", PREFILL_CHUNK_SIZE_CHOICES)
@@ -1096,3 +1186,206 @@ def test_grouped_prefix_metrics_count_reused_tokens():
     assert output.prefix_cache_queries == 4
     assert output.prefix_cache_hits == 4
     assert output.prefix_cache_query_tokens == 5
+
+
+@pytest.mark.parametrize("ignore_eos", [False, True])
+def test_scheduler_stops_on_secondary_model_eos(ignore_eos):
+    manager = KvCacheManager(num_blocks=4, block_size=2, enable_prefix_cache=False)
+    scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=False), manager)
+    request = Request(request_id="multi-eos", prompt_token_ids=[1], max_new_tokens=4,
+                      eos_token_id=7, eos_token_ids=(7, 9), num_computed_tokens=1,
+                      status=RequestStatus.RUNNING, ignore_eos=ignore_eos)
+    scheduler.running.append(request)
+    scheduler.requests[request.request_id] = request
+    scheduled = SchedulerOutput(
+        scheduled_requests=[ScheduledRequest(request=request, num_new_tokens=1, is_prefill=False)]
+    )
+    outputs = scheduler.update_from_output(scheduled, {request.request_id: 9})
+    assert request.status is (RequestStatus.RUNNING if ignore_eos else RequestStatus.FINISHED_EOS)
+    assert outputs[0].finished is (not ignore_eos)
+
+
+def _output_budget_scheduler(**options):
+    config = {"max_num_scheduled_tokens": 128, "long_prefill_token_threshold": 32,
+              "max_seq_len": 512, "prefill_chunk_alignment": 16, "async_scheduling": True}
+    config.update(options)
+    return _prefill_scheduler(num_blocks=128, **config)
+
+
+def _output_budget_request(scheduler, *, outputs=6, maximum=8):
+    request = _running_decode_request()
+    request.max_new_tokens = maximum
+    request.output_token_ids = list(range(100, 100 + outputs))
+    request.num_computed_tokens = request.num_prompt_tokens + outputs - 1
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+    return request
+
+
+def test_async_output_budget_keeps_final_reservation_pending():
+    scheduler = _output_budget_scheduler()
+    request = _output_budget_request(scheduler, outputs=7)
+    final = scheduler.schedule()
+    scheduler.advance_after_schedule(final)
+    blocks = list(request.allocated_block_ids)
+    assert request.num_output_placeholders == 1
+    assert request.num_remaining_output_tokens == 0
+    assert scheduler.schedule().is_empty
+    assert request.status is RequestStatus.RUNNING
+    assert request.allocated_block_ids == blocks
+    scheduler.update_from_output(final, {request.request_id: 107})
+    assert request.output_token_ids == list(range(100, 108))
+    assert request.num_output_placeholders == 0
+    assert request.status is RequestStatus.FINISHED_LENGTH
+
+
+def test_async_output_budget_preserves_two_valid_decode_dispatches():
+    scheduler = _output_budget_scheduler()
+    request = _output_budget_request(scheduler)
+    first = scheduler.schedule()
+    scheduler.advance_after_schedule(first)
+    second = scheduler.schedule()
+    assert not second.is_empty
+    scheduler.advance_after_schedule(second)
+    assert request.num_output_placeholders == 2
+    assert scheduler.schedule().is_empty
+    scheduler.update_from_output(first, {request.request_id: 106})
+    assert scheduler.schedule().is_empty
+    scheduler.update_from_output(second, {request.request_id: 107})
+    assert request.output_token_ids[-2:] == [106, 107]
+    assert request.status is RequestStatus.FINISHED_LENGTH
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("concurrency", [1, 2, 4])
+@pytest.mark.parametrize("maximum", [1, 2, 8])
+def test_output_budget_counts_terminal_prefill_token(async_mode, concurrency, maximum):
+    scheduler = _output_budget_scheduler(async_scheduling=async_mode)
+    requests = [Request(str(index), list(range(128)), max_new_tokens=maximum, ignore_eos=True)
+                for index in range(concurrency)]
+    for request in requests:
+        scheduler.add_request(request)
+    pending = deque()
+    submitted = 0
+    sampled = {request.request_id: 0 for request in requests}
+    depth = 2 if async_mode else 1
+    for _ in range(100):
+        dispatched = False
+        if len(pending) < depth and scheduler.has_work():
+            output = scheduler.schedule(allow_reject_stalled=not pending)
+            if not output.is_empty:
+                tokens = {}
+                for item in output.scheduled_requests:
+                    if item.is_prefill:
+                        assert item.num_computed_tokens % 16 == 0
+                        assert item.num_new_tokens == 32
+                        if item.num_computed_tokens + item.num_new_tokens < item.request.num_prompt_tokens:
+                            continue
+                    sampled[item.request.request_id] += 1
+                    tokens[item.request.request_id] = 1000 + sampled[item.request.request_id]
+                scheduler.advance_after_schedule(output)
+                pending.append((output, tokens))
+                submitted += 1
+                dispatched = True
+        if pending and (len(pending) >= depth or not dispatched):
+            output, tokens = pending.popleft()
+            scheduler.update_from_output(output, tokens)
+        elif not pending and not scheduler.has_work():
+            break
+        elif not pending and not dispatched:
+            pytest.fail("generation budget stalled without in-flight work")
+    else:
+        pytest.fail("generation budget did not finish")
+    assert submitted == 4 + maximum - 1
+    for request in requests:
+        assert request.output_token_ids == list(range(1001, 1001 + maximum))
+        assert request.num_output_placeholders == 0
+        assert request.status is RequestStatus.FINISHED_LENGTH
+
+
+def test_grouped_output_budget_keeps_other_prefill_runnable():
+    scheduler = _grouped_scheduler(
+        num_blocks=128, block_size=128, max_blocks_per_seq=4,
+        max_num_scheduled_tokens=128, long_prefill_token_threshold=32,
+        max_prefill_tokens_per_request=32, max_seq_len=512,
+        prefill_chunk_alignment=16, async_scheduling=True,
+    )
+    request = _output_budget_request(scheduler, outputs=7)
+    final = scheduler.schedule()
+    scheduler.advance_after_schedule(final)
+    assert request.num_remaining_output_tokens == 0
+    other = Request("other", list(range(32)), max_new_tokens=2)
+    scheduler.add_request(other)
+    output = scheduler.schedule()
+    assert [item.request.request_id for item in output.scheduled_requests] == ["other"]
+    assert output.scheduled_requests[0].is_prefill
+    assert output.scheduled_requests[0].num_new_tokens == 32
+
+
+def test_async_output_budget_reopens_after_speculative_shortfall():
+    scheduler = _output_budget_scheduler(num_speculative_tokens=2)
+    request = _output_budget_request(scheduler, outputs=1, maximum=4)
+    first = scheduler.schedule()
+    scheduler.advance_after_schedule(first)
+    assert request.num_output_placeholders == 3
+    assert request.num_remaining_output_tokens == 0
+    assert scheduler.schedule().is_empty
+    scheduler.update_from_output(first, {request.request_id: [101]})
+    assert request.num_output_placeholders == 0
+    assert request.num_remaining_output_tokens == 2
+    assert not scheduler.schedule().is_empty
+
+
+def test_aligned_nonterminal_prefill_keeps_output_budget_available():
+    scheduler = _output_budget_scheduler()
+    request = Request("r", list(range(81)), max_new_tokens=1)
+    scheduler.add_request(request)
+    first = scheduler.schedule()
+    scheduler.advance_after_schedule(first)
+    second = scheduler.schedule()
+    scheduler.advance_after_schedule(second)
+    assert request.num_computed_tokens == 64
+    assert request.num_output_placeholders == 0
+    assert request.num_remaining_output_tokens == 1
+    assert [first.scheduled_requests[0].num_new_tokens, second.scheduled_requests[0].num_new_tokens] == [32, 32]
+
+
+@pytest.mark.parametrize("discard_failed_step", [False, True])
+def test_output_budget_cancel_and_failure_do_not_charge_new_request(discard_failed_step):
+    scheduler = _output_budget_scheduler()
+    request = _output_budget_request(scheduler, outputs=7)
+    old = scheduler.schedule()
+    scheduler.advance_after_schedule(old)
+    if discard_failed_step:
+        scheduler.discard_scheduled_request(old.scheduled_requests[0])
+    scheduler.abort_request(request.request_id)
+    replacement = Request(request.request_id, [3], max_new_tokens=1)
+    scheduler.add_request(replacement)
+    assert replacement.num_remaining_output_tokens == 1
+    fresh = scheduler.schedule()
+    scheduler.advance_after_schedule(fresh)
+    free_blocks = scheduler.kv_cache_manager.num_free_blocks
+    scheduler.update_from_output(old, {request.request_id: 12345})
+    assert replacement.output_token_ids == []
+    assert replacement.num_output_placeholders == 1
+    assert scheduler.kv_cache_manager.num_free_blocks == free_blocks
+    scheduler.update_from_output(fresh, {replacement.request_id: 7})
+    assert replacement.output_token_ids == [7]
+    assert request.status is RequestStatus.FINISHED_ABORTED
+
+
+def test_async_preemption_releases_output_budget_reservation():
+    scheduler = _output_budget_scheduler()
+    request = _output_budget_request(scheduler)
+    old = scheduler.schedule()
+    scheduler.advance_after_schedule(old)
+    exclude = Request("exclude", [1], max_new_tokens=1)
+    preempted = scheduler._preempt_lowest_priority(exclude, set(), {}, SchedulerOutput())
+    assert preempted["request"] is request
+    assert request.status is RequestStatus.PREEMPTED
+    assert request.num_output_placeholders == 0
+    assert request.num_remaining_output_tokens == 2
+    scheduler.update_from_output(old, {request.request_id: 12345})
+    assert len(request.output_token_ids) == 6
+    readmitted = scheduler.schedule()
+    assert [item.request.request_id for item in readmitted.scheduled_requests] == [request.request_id]

@@ -116,7 +116,7 @@ The HTTP completion path always ignores EOS. Chat requests can set `max_completi
 
 | Argument | Default | Description |
 | --- | --- | --- |
-| `--enable-prefix-caching` / `--no-enable-prefix-caching` | enabled | Enable or disable prefix caching for supported paths. |
+| `--enable-prefix-caching` / `--no-enable-prefix-caching` | enabled | Enable or disable prefix caching for supported paths, including partial-prefix state reuse for GLM. |
 | `--enable-chunked-prefill` / `--no-enable-chunked-prefill` | enabled | Enable or disable chunked prefill. |
 | `--speculative-config JSON` | unset | Model-specific speculative decoding configuration; currently supported by DeepSeek V4. |
 | `--num-speculative-tokens K` | unset | Deprecated alias for the DeepSeek V4 MTP draft-token count. |
@@ -125,7 +125,7 @@ The HTTP completion path always ignores EOS. Chat requests can set `max_completi
 
 Chunked prefill breaks long prompts into scheduler-visible chunks when a prompt exceeds `--long-prefill-token-threshold`. `--no-enable-chunked-prefill` disables that scheduler path.
 
-Prefix caching reuses KV cache state for repeated prompt prefixes when the model executor supports it. The flag is enabled by default, but model-specific decoding modes may disable caching or require an explicit choice; consult the model guide.
+Prefix caching reuses state for repeated prompt prefixes when the model executor supports it. It is off by default for GLM and on for other models. For GLM, `--enable-prefix-caching` reuses saved aligned state endpoints strictly shorter than the prompt; the remaining tokens run through prefill to compute logits. Model-specific decoding modes may disable caching; consult the model guide.
 
 `--speculative-config` selects a model-supported decoding method and its parameters. Currently only DeepSeek V4 accepts this option; see its [MTP](../models/deepseek-v4/mtp.md#8-device-dpep-serving) and [DSpark](../models/deepseek-v4/dspark.md) guides for supported values and constraints. The deprecated `--num-speculative-tokens` flag remains a DeepSeek V4 MTP compatibility alias.
 

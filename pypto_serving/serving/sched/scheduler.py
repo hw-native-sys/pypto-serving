@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from pypto_serving.config.types import KVCacheGroupSpec
+from pypto_serving.serving.utils.prefill import validate_prefill_chunk_alignment
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.memory.kv_cache import KVCacheCapacityError, KvCacheManager
 
@@ -50,6 +51,7 @@ class SchedulerConfig:
     max_num_scheduled_tokens: int = 4096
     long_prefill_token_threshold: int = 2048
     max_prefill_tokens_per_request: int | None = None
+    prefill_chunk_alignment: int = 1
     prefill_chunk_size_choices: tuple[int, ...] = ()
     max_seq_len: int = 4096
     # Feature flags
@@ -96,6 +98,13 @@ class SchedulerConfig:
                 f"long_prefill_token_threshold must be one of ({choices}), "
                 f"got {self.long_prefill_token_threshold}"
             )
+        limits = [self.max_prefill_tokens_per_request] if self.max_prefill_tokens_per_request is not None else []
+        if self.enable_chunk_prefill and self.long_prefill_token_threshold > 0:
+            limits.append(self.long_prefill_token_threshold)
+        validate_prefill_chunk_alignment(
+            self.prefill_chunk_alignment, self.max_seq_len,
+            self.max_num_scheduled_tokens, min(limits) if limits else None,
+        )
 
     def validate_cache_groups(self, groups: Sequence[KVCacheGroupSpec]) -> None:
         """Require enough replay to rebuild non-EAGLE rolling history."""
@@ -127,6 +136,7 @@ class Request:
     output_token_ids: list[int] = field(default_factory=list)
     stop_strings: tuple[str, ...] = ()
     eos_token_id: int | None = None
+    eos_token_ids: tuple[int, ...] = ()
     ignore_eos: bool = False
     temperature: float = 0.0
     top_p: float = 1.0
@@ -172,6 +182,11 @@ class Request:
         # num_new_tokens_needed and is_prefill stay consistent when the next step
         # is scheduled before the in-flight token has been appended.
         return self.num_prompt_tokens + len(self.output_token_ids) + self.num_output_placeholders
+
+    @property
+    def num_remaining_output_tokens(self) -> int:
+        """Generation capacity after committed tokens and in-flight reservations."""
+        return max(0, self.max_new_tokens - len(self.output_token_ids) - self.num_output_placeholders)
 
     @property
     def num_new_tokens_needed(self) -> int:
@@ -228,7 +243,9 @@ class RequestOutput:
 class Scheduler:
     """Continuous batching scheduler with chunked prefill and preemption."""
 
-    def __init__(self, config: SchedulerConfig, kv_cache_manager: KvCacheManager) -> None:
+    def __init__(
+        self, config: SchedulerConfig, kv_cache_manager: KvCacheManager,
+    ) -> None:
         self.config = config
         self.kv_cache_manager = kv_cache_manager
         self.config.validate_cache_groups(self.kv_cache_manager.group_specs)
@@ -437,7 +454,9 @@ class Scheduler:
             # stale iteration snapshot.
             if request.status is RequestStatus.PREEMPTED:
                 continue
-            if request.terminal_prefill_in_flight:
+            if request.terminal_prefill_in_flight or (
+                not request.is_prefill and request.num_remaining_output_tokens == 0
+            ):
                 running_to_keep.append(request)
                 continue
             if request.prefill_complete:
@@ -593,9 +612,7 @@ class Scheduler:
                         )
                     cached_blocks = []
                 else:
-                    cached_blocks = self.kv_cache_manager.get_computed_blocks(
-                        request.prompt_token_ids
-                    )
+                    cached_blocks = self.kv_cache_manager.get_computed_blocks(request.prompt_token_ids)
                     if cached_blocks:
                         request.cached_block_ids = [b.block_id for b in cached_blocks]
                         request.num_computed_tokens = (
@@ -766,7 +783,13 @@ class Scheduler:
                 limit = min(limit, chunk_limit)
             if self._requires_single_prefill_dispatch() and needed > limit:
                 return 0
-        return max(0, min(needed, limit, self.config.max_seq_len - request.num_computed_tokens))
+        scheduled = max(0, min(needed, limit, self.config.max_seq_len - request.num_computed_tokens))
+        if request.is_prefill and request.num_computed_tokens + scheduled < request.num_prompt_tokens:
+            # KDA's BF16 recurrence boundaries must stay fixed across dispatches.
+            # Leave arbitrary final tails intact; defer unfinished work when the
+            # remaining shared budget cannot fit one recurrence block.
+            scheduled -= scheduled % self.config.prefill_chunk_alignment
+        return scheduled
 
     def _grouped_cache_phase(self) -> str | None:
         """Choose one homogeneous kernel phase and rotate fairly."""
@@ -791,6 +814,7 @@ class Scheduler:
             and not request.prefill_complete
             and not request.scheduling_held
             and not request.is_prefill
+            and request.num_remaining_output_tokens > 0
             and request.num_new_tokens_needed > 0
             for request in self.running
         )
@@ -1111,7 +1135,10 @@ class Scheduler:
         if not request.output_token_ids:
             return None
         last_token = request.output_token_ids[-1]
-        if not request.ignore_eos and request.eos_token_id is not None and last_token == request.eos_token_id:
+        if not request.ignore_eos and (
+            last_token in request.eos_token_ids
+            or (request.eos_token_id is not None and last_token == request.eos_token_id)
+        ):
             return RequestStatus.FINISHED_EOS
         if len(request.output_token_ids) >= request.max_new_tokens:
             return RequestStatus.FINISHED_LENGTH

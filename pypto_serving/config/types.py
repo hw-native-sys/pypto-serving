@@ -183,6 +183,9 @@ class RuntimeConfig:
     # single dispatch. ``None`` means the model has no stricter per-request
     # limit than ``max_num_batched_tokens``.
     max_prefill_tokens_per_request: int | None = None
+    # Unfinished prompt chunks preserve this kernel recurrence boundary. The
+    # final prompt tail can have any length. Other models use token granularity.
+    prefill_chunk_alignment: int = 1
     # User-selectable scheduler chunk sizes supported by this model. Empty
     # means that the shared scheduler imposes no model-specific allowlist.
     prefill_chunk_size_choices: tuple[int, ...] = ()
@@ -211,6 +214,14 @@ class RuntimeConfig:
     ring_dep_pool: int | list[int] | None = None
     ring_task_window: int | list[int] | None = None
     ring_heap: int | list[int] | None = None
+
+    def __post_init__(self) -> None:
+        from pypto_serving.serving.utils.prefill import validate_prefill_chunk_alignment
+
+        validate_prefill_chunk_alignment(
+            self.prefill_chunk_alignment, self.max_seq_len,
+            self.max_num_batched_tokens, self.max_prefill_tokens_per_request,
+        )
 
 
 @dataclass(frozen=True)
