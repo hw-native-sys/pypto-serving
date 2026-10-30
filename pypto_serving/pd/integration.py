@@ -130,8 +130,7 @@ class Server(ServingServer):
                 self.service.adapter.validate(config)
                 tokens = tuple(self.real_engine._tokenize_prompt(prompt))
                 continuation = Continuation(tokens, asdict(config), asdict(parser) if parser else None,
-                                            constraint.to_wire() if constraint else None,
-                                            self.service.adapter.prefix_spec(tokens, self.service.cache))
+                                            constraint.to_wire() if constraint else None)
                 entry.task = asyncio.create_task(self.service.prefill(entry, continuation, peer))
                 try:
                     await asyncio.shield(entry.task)

@@ -182,15 +182,13 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
                 else:
                     self.scheduler = SimpleNamespace(resume_request=lambda _: self.resumed.set())
             async def call_worker(self, operation, payload):
+                assert operation != "forget"
                 value = msgspec.msgpack.decode(payload) if payload else None
                 if operation == "submit":
                     plan = decode(value, Plan)
                     jobs[digest(plan)] = plan
                     events.append(("submit", plan.chunk))
                     result = dict(job=digest(plan))
-                elif operation == "forget":
-                    del jobs[value]
-                    result = None
                 elif operation == "reserve_state":
                     self.states.add(value["request"])
                     result = {"bootstrap": 5}
@@ -265,6 +263,7 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
                 if unknown:
                     from pypto_serving.pd.transfer import TransferError
                     raise TransferError("unknown native completion", uncertain=True)
+                del jobs[job]
                 return Completion(job, plan.units)
 
         p_core, d_core = Core("prefill", prefix[0]), Core("decode", prefix[1])
@@ -272,6 +271,13 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
         warm(d_core.kv_cache_manager, tokens, 256)
         p = Service(config, config.prefill[0], "prefill", adapter, p_core, Progress())
         d = Service(config, config.decode[0], "decode", adapter, d_core, None)
+        prefix_spec = adapter.prefix_spec
+        prefix_queries = []
+        def local_prefix(tokens, cache):
+            assert cache is d_core.kv_cache_manager
+            prefix_queries.append(cache)
+            return prefix_spec(tokens, cache)
+        adapter.prefix_spec = local_prefix
         for service, name in ((p, "p"), (d, "d")):
             geometry = geometries(service.cache)
             service.geometry = geometry
@@ -300,6 +306,8 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
                             await d.control(p.node, p.geometry, operation,
                                             {**wire, "plan": msgspec.to_builtins(invalid)})
                 value = await d.control(p.node, p.geometry, operation, wire)
+                if operation == "plan" and not plan.copies and not plan.final:
+                    assert not d.cache.group_cache_reservation(plan.binding.request).write_authorized
                 return msgspec.msgpack.decode(msgspec.msgpack.encode(value))
             async def close(self): self.closed = True
         async def connect(peer): return Peer()
@@ -328,6 +336,7 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
                 assert rejected.status_code in (400, 422) and "text/event-stream" not in rejected.headers["content-type"]
                 assert not events and not jobs and not p.requests and not d.requests
                 response = await asyncio.wait_for(client.post(path, json=body), 4)
+                assert len(prefix_queries) == 1
                 if unknown:
                     assert response.status_code >= 400 or '"error"' in response.text
                     assert p.gated and d.gated and p.pins.active and jobs
@@ -348,8 +357,10 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
             assert not d_core.states
             assert not p.gated and not d.gated
             assert events.index(("decode-first", 0)) < events.index(("source-clean", 0))
-            if not prefix[0]:
+            if not prefix[0] and not prefix[1]:
                 assert ("overlap-proven", 0) in events
+            if prefix[1] and not prefix[0]:
+                assert not any(name == "submit" and chunk == 0 for name, chunk in events)
             await p.peers.close()
 
     asyncio.run(run())

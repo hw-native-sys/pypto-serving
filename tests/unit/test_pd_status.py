@@ -207,7 +207,7 @@ def test_cancelled_begin_cannot_allocate_after_http_rendezvous_cleanup():
                 entry.response_closed = True
                 await s.cancel_binding(binding)
         entry.source_done.wait = cancellation_at_rendezvous_exit
-        continuation = Continuation(tuple(range(128)), {"max_new_tokens": 16}, None, None, prefix)
+        continuation = Continuation(tuple(range(128)), {"max_new_tokens": 16}, None, None)
         with pytest.raises(ValueError, match="cancelled"):
             await s.control(p, (), "begin", dict(binding=msgspec.to_builtins(binding),
                 continuation=msgspec.to_builtins(continuation)))

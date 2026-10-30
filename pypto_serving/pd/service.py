@@ -20,7 +20,7 @@ from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.tools.observe import record, span
-from .planner import Geometry, SourcePins, page_indices, physical, plan_chunk, valid_from
+from .planner import Geometry, SourcePins, page_indices, physical, plan_chunk, rolling_bounds
 from .protocol import (Binding, Completion, Continuation, Node, Placement, Plan, Topology,
                        decode, digest, receive, send)
 from .session import PeerPool, Session
@@ -42,6 +42,7 @@ class Request:
     source_done: asyncio.Event = field(default_factory=asyncio.Event)
     cancelled: bool = False
     continuation: object = None
+    prefix: object = None
     reservation: object = None
     pending: object = None
     error: Exception | None = None
@@ -56,6 +57,7 @@ class Request:
     state_slots: dict = field(default_factory=dict)
     admitted: bool = False
     worker_release_ack: asyncio.Event = field(default_factory=asyncio.Event)
+    completion_source: str | None = None
 
 
 class Service:
@@ -134,7 +136,7 @@ class Service:
                 source_stop_confirmed=entry.source_done.is_set() if self.role == "decode" else None)
             pending = entry.pending
             result["handoff"] = dict(confirmed_chunks=entry.chunk, confirmed_end=entry.end,
-                confirmation_source="owner_completion" if self.role == "prefill" else "sender_completion",
+                confirmation_source=entry.completion_source,
                 uncertain=uncertain, pending_plan=(dict(plan_digest=digest(pending), chunk=pending.chunk,
                     start=pending.start, end=pending.end, final=pending.final) if pending is not None else None))
             result["worker"] = dict(state_reservation_confirmed=bool(entry.state_slots)
@@ -302,11 +304,12 @@ class Service:
             config = GenerateConfig(**continuation.config)
             self.adapter.validate(config)
             prefix = self.adapter.prefix_spec(continuation.tokens, self.cache)
-            if prefix != continuation.prefix or not continuation.tokens or config.max_new_tokens <= 0:
-                raise ValueError("continuation Prefix specification mismatch")
+            if not continuation.tokens or config.max_new_tokens <= 0:
+                raise ValueError("invalid continuation tokens or generation limit")
             if len(continuation.tokens) + config.max_new_tokens > self.core.config.runtime_config.max_seq_len:
                 raise ValueError("request exceeds model context capacity")
             entry.continuation = continuation
+            entry.prefix = prefix
             entry.normalized_digest = digest(continuation)
             try:
                 if not self.is_ready():
@@ -339,10 +342,11 @@ class Service:
             plan = decode(payload["plan"], Plan)
             p_hit = payload["p_hit"]
             if (type(p_hit) is not int or not 0 <= p_hit <= plan.end
-                    or p_hit % entry.continuation.prefix.alignment or (entry.chunk and p_hit != entry.p_hit)):
+                    or p_hit % entry.prefix.alignment or (entry.chunk and p_hit != entry.p_hit)):
                 raise ValueError("invalid source Prefix boundary")
             self.validate_plan(entry, plan, geometry, p_hit, peer.topology)
-            self.cache.authorize_group_cache_write(request)
+            if plan.copies or plan.final:
+                self.cache.authorize_group_cache_write(request)
             entry.pending = plan
             entry.p_hit = p_hit
             entry.mapping = plan.mapping
@@ -359,11 +363,10 @@ class Service:
             entry.pending = None
             entry.chunk += 1
             entry.end = plan.end
+            entry.completion_source = "sender_completion" if plan.copies else "empty_plan"
             self.observe("completion", entry, plan_digest=completion.plan_digest, end=entry.end)
             if plan.final:
-                self.cache.commit_group_cache(request, valid_from=valid_from(
-                    self.cache.group_specs, self.node.contract.components,
-                    entry.p_hit, entry.reservation.prefix_hit_tokens))
+                self.cache.commit_group_cache(request, valid_from=plan.valid_from)
                 self.observe("commit", entry, plan_digest=completion.plan_digest, end=entry.end,
                              state=self.cache.group_cache_reservation(request).state.value)
                 try:
@@ -406,6 +409,20 @@ class Service:
                     for c in self.node.contract.components if plan.final or not c.final}
         if set(plan.units) != expected or len(plan.units) != len(expected):
             raise ValueError("missing required rank/region completion units")
+        final_groups = {c.group for c in self.node.contract.components if c.final}
+        rolling = {g.name: g for g in self.cache.group_specs
+                   if g.sliding_window is not None and g.name not in final_groups} if plan.final else {}
+        if set(plan.valid_from) != set(rolling):
+            raise ValueError("invalid rolling publication groups")
+        for name, group in rolling.items():
+            floor = plan.valid_from[name]
+            lower, upper = rolling_bounds(group, p_hit, entry.reservation.prefix_hit_tokens,
+                                          plan.end, self.cache.group_prefix_cache_alignment)
+            page = group.spec.token_capacity
+            table = entry.reservation.block_ids_by_group[name]
+            lower = max(lower, max(0, (plan.end + page - 1) // page - len(table)) * page)
+            if type(floor) is not int or floor % page or not lower <= floor <= upper:
+                raise ValueError("invalid rolling publication floor")
         geo = {g.name: g for g in self.geometry}
         sources = {g.name: g for g in geometry}
         component_group = {c.name: c.group for c in self.node.contract.components}
@@ -445,7 +462,7 @@ class Service:
                     table = entry.reservation.block_ids_by_group[component.group]
                     blocks = (physical(group, table, logical) for logical, _ in page_indices(
                         group, component, plan.start, plan.end, plan.final,
-                        table, p_hit, entry.reservation.prefix_hit_tokens))
+                        table, p_hit, entry.reservation.prefix_hit_tokens, plan.valid_from))
                 else:
                     blocks = (entry.state_slots[component.group],)
                 for block in blocks:
@@ -553,26 +570,31 @@ class Service:
                                       self.adapter.mapping(self.node.topology, peer.topology,
                                                            chunk.partition, placement.partition),
                                       entry.normalized_digest)
-                    self.pins.retain(chunk)
+                    if plan.copies:
+                        self.pins.retain(chunk)
                     entry.pending = plan
                     submitted = False
                     if await call("plan", plan=plan, p_hit=p_hit) != digest(plan):
                         raise ValueError("destination acknowledged a different plan")
-                    submitted = True  # Lost ordered-submit replies are uncertain.
-                    job = await self.worker("submit", plan)
+                    job = None
+                    if plan.copies:
+                        submitted = True  # Lost ordered-submit replies are uncertain.
+                        job = await self.worker("submit", plan)
                     async def settle(plan=plan, job=job):
                         try:
-                            completion = await self.progress.wait(job)
+                            completion = (await self.progress.wait(job) if job is not None
+                                          else Completion(digest(plan), plan.units))
                         except TransferError as exc:
                             if not exc.uncertain:
                                 self.pins.release(request)
-                                await self.worker("forget", job)
                             raise
                         completion.check(plan)
                         entry.chunk, entry.end = plan.chunk + 1, plan.end
-                        self.pins.release(request)
-                        await self.worker("forget", job)
-                        self.observe("completion", entry, plan_digest=job, end=plan.end)
+                        entry.completion_source = "owner_completion" if job is not None else "empty_plan"
+                        if job is not None:
+                            self.pins.release(request)
+                        self.observe("completion", entry, plan_digest=completion.plan_digest, end=plan.end,
+                                     native_write=job is not None)
                         response = await call("complete", completion=completion)
                         if response.get("error"):
                             raise ValueError(response["error"])

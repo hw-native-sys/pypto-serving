@@ -129,6 +129,11 @@ class WorkerRuntime:
         return job
 
     def poll(self, jobs):
+        """Take terminal results once; source pins outlive this bookkeeping.
+
+        A lost reply remains UNKNOWN at the caller. Neither taking a result
+        nor losing it releases cache snapshots or registered owner allocations.
+        """
         with self.lock:
             result = []
             for job in jobs:
@@ -143,6 +148,7 @@ class WorkerRuntime:
                     result.append(dict(error="rank transfer failed", uncertain=uncertain))
                 else:
                     result.append(dict(completion=Completion(job, plan.units)))
+                del self.jobs[job]
             return result
 
     def handle(self, operation, payload):
@@ -156,13 +162,6 @@ class WorkerRuntime:
                 result = dict(job=self.submit(decode(value, Plan)))
             except (TransferError, ValueError) as exc:
                 result = dict(error=str(exc), uncertain=isinstance(exc, TransferError) and exc.uncertain)
-        elif operation == "forget":
-            with self.lock:
-                _, futures = self.jobs[value]
-                if not all(f.done() for f in futures):
-                    raise RuntimeError("cannot forget an in-flight native job")
-                del self.jobs[value]
-            result = None
         elif operation == "release":
             if self.uncertain or self.jobs:
                 raise TransferError("cannot unregister an unsafe or active owner", uncertain=True)
