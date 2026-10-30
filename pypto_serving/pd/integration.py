@@ -140,10 +140,12 @@ class Server(ServingServer):
                     await asyncio.shield(entry.task)
                     raise
                 return JSONResponse(dict(request=binding.request, status="ready"))
-            except Exception as exc:
+            except BaseException as exc:
+                if isinstance(exc, asyncio.CancelledError):
+                    entry.cancelled = True
                 if entry.error is None:
                     self.service.fail(entry, exc)
-                if binding.request not in self.service.pins.active:
+                if (entry.task is None or entry.task.done()) and binding.request not in self.service.pins.active:
                     self.service.finish(entry)
                 raise
         try:

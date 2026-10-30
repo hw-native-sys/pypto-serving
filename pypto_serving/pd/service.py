@@ -196,6 +196,7 @@ class Service:
     def finish(self, entry):
         if self.requests.pop(entry.binding.request, None) is None:
             return
+        self.chunks.pop(entry.binding.request, None)
         self.remember_terminal(entry.binding)
         self.observe("finished", entry, cancelled=entry.cancelled, error=entry.error,
                      p_hit=entry.p_hit, d_hit=entry.reservation.prefix_hit_tokens
@@ -295,6 +296,8 @@ class Service:
                 for task in (http, stopped):
                     task.cancel()
                 await asyncio.gather(http, stopped, return_exceptions=True)
+            if entry.cancelled:
+                raise ValueError("request cancelled before resource reservation")
             continuation = decode(payload["continuation"], Continuation)
             config = GenerateConfig(**continuation.config)
             self.adapter.validate(config)
@@ -607,7 +610,6 @@ class Service:
                 raise
             finally:
                 if request not in self.pins.active:
-                    self.chunks.pop(request, None)
                     self.finish(entry)
 
     async def outputs(self, request, *args, **kwargs):

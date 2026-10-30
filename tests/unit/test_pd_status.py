@@ -184,6 +184,101 @@ def cache_service(role="decode"):
     return s, p, binding, entry
 
 
+def test_cancelled_begin_cannot_allocate_after_http_rendezvous_cleanup():
+    from pypto_serving.pd.protocol import Continuation, Prefix
+
+    async def run():
+        s, p, binding, entry = cache_service()
+        prefix = Prefix(128, 32, {})
+        s.adapter = SimpleNamespace(validate=lambda _: None, prefix_spec=lambda *_: prefix)
+        s.core.config = SimpleNamespace(runtime_config=SimpleNamespace(max_seq_len=1024))
+        states = set()
+        async def worker(operation, value):
+            assert operation == "reserve_state"
+            states.add(value["request"])
+            return {"bootstrap": 0}
+        s.worker = worker
+        wait = entry.source_done.wait
+        async def cancellation_at_rendezvous_exit():
+            try:
+                return await wait()
+            finally:
+                # An HTTP cancellation can run while begin joins its waiters.
+                entry.response_closed = True
+                await s.cancel_binding(binding)
+        entry.source_done.wait = cancellation_at_rendezvous_exit
+        continuation = Continuation(tuple(range(128)), {"max_new_tokens": 16}, None, None, prefix)
+        with pytest.raises(ValueError, match="cancelled"):
+            await s.control(p, (), "begin", dict(binding=msgspec.to_builtins(binding),
+                continuation=msgspec.to_builtins(continuation)))
+        assert not s.requests and binding.request in s.terminal
+        assert s.cache.group_cache_reservation(binding.request) is None
+        assert not states
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["cancel_prepare", "connect", "cancel_prefill"])
+def test_prefill_setup_failure_retires_request_and_chunk_queue(failure):
+    from pypto_serving.config.types import GenerateConfig
+    from pypto_serving.pd.integration import Server
+    from pypto_serving.pd.protocol import Prefix
+
+    async def run():
+        s, p, d = service("prefill")
+        payload = dict(model="model", messages=[dict(role="user", content="hello")])
+        binding = Binding.create(p, d, payload)
+        preparing = asyncio.Event()
+        prefilling, release = asyncio.Event(), asyncio.Event()
+        async def prepare_chat(_):
+            preparing.set()
+            if failure == "cancel_prepare":
+                await asyncio.Event().wait()
+            return "hello", GenerateConfig(max_new_tokens=1), None, None
+        async def connect(_):
+            raise ConnectionError("peer unavailable")
+        async def body():
+            return payload
+        async def prefill(entry, *_):
+            s.chunks[binding.request] = asyncio.Queue()
+            prefilling.set()
+            try:
+                await release.wait()
+            finally:
+                s.finish(entry)
+        s.connect = connect
+        if failure == "cancel_prefill":
+            s.prefill = prefill
+        s.adapter = SimpleNamespace(validate=lambda _: None, prefix_spec=lambda *_: Prefix(1, 32, {}))
+        server = SimpleNamespace(service=s, prepare_chat=prepare_chat,
+                                 real_engine=SimpleNamespace(_tokenize_prompt=lambda _: [1]))
+        request = SimpleNamespace(json=body, headers={"x-pd-context":
+            msgspec.json.encode(dict(binding=binding, peer=d)).decode()})
+        task = asyncio.create_task(Server.handle(server, request, "chat"))
+        await preparing.wait()
+        if failure != "connect":
+            entry = s.requests[binding.request]
+        if failure == "cancel_prepare":
+            task.cancel()
+        if failure == "cancel_prefill":
+            await prefilling.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+        with pytest.raises(ConnectionError if failure == "connect" else asyncio.CancelledError):
+            await task
+        if failure != "connect":
+            assert entry.cancelled
+        if failure == "cancel_prefill":
+            entry = s.requests[binding.request]
+            assert not entry.task.done() and binding.request in s.chunks
+            release.set()
+            await entry.task
+        assert not s.requests and not s.chunks and not s.pins.active
+        assert binding.request in s.terminal
+        assert not s.gated
+    asyncio.run(run())
+
+
 def test_query_reads_current_lease_and_preserves_prefix_after_release():
     s, _, binding, entry = cache_service()
     rid = binding.request
