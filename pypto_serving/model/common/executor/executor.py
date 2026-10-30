@@ -163,6 +163,16 @@ class ModelExecutor(ABC):
     ) -> PrefillResult:
         raise NotImplementedError(f"{type(self).__name__} does not support owned prefill slots")
 
+    def run_dspark_prefill_batch(self, batch: PrefillBatch) -> object:
+        """Run a pre-lowered DSpark bootstrap batch.
+
+        Model-specific serving integrations may expose this hook when a batch
+        carries the complete lib composite ABI in ``dspark_stages``.  The
+        default keeps ordinary executors from accidentally accepting a DSpark
+        payload without implementing its state ownership.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support DSpark prefill")
+
     def lookup_embeddings(self, model: RuntimeModel, token_ids: torch.Tensor) -> torch.Tensor:
         """Return embedding rows for ``token_ids`` on the model runtime device."""
         token_ids = token_ids.to(device=model.runtime.device, dtype=torch.long)
@@ -223,3 +233,7 @@ class ModelExecutor(ABC):
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
         """Run one decode step for active requests and return next-token logits."""
         raise NotImplementedError
+
+    def run_dspark_decode_batch(self, batch: DecodeBatch) -> DecodeResult:
+        """Run a pre-lowered DSpark target/accept/draft/Markov round."""
+        raise NotImplementedError(f"{type(self).__name__} does not support DSpark decode")

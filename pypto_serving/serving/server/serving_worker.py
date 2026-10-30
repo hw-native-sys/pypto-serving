@@ -1058,6 +1058,19 @@ class WorkerProcess:
         }
         return batch
 
+    @staticmethod
+    def _require_v41_dspark_stages(runtime_model, batch, *, phase: str) -> None:
+        """Reject V4.1 speculative work before it falls back to target-only dispatch."""
+        extra = getattr(runtime_model, "extra", {})
+        runtime = getattr(runtime_model, "runtime", None)
+        if (isinstance(extra, dict) and extra.get("family") == "deepseek_v41"
+                and getattr(runtime, "num_speculative_tokens", 0) == 5
+                and batch.dspark_stages is None):
+            raise RuntimeError(
+                f"V4.1 DSpark {phase} requires lowered dspark_stages; "
+                "ordinary target-only dispatch is not a valid fallback"
+            )
+
     def _batch_prefill(
         self,
         scheduled: list[PrefillRequest],
@@ -1071,6 +1084,7 @@ class WorkerProcess:
             args={"batch_size": len(scheduled), "request_ids": [pr.request_id for pr in scheduled]},
         ):
             batch = self._make_prefill_batch(scheduled, runtime_model)
+            self._require_v41_dspark_stages(runtime_model, batch, phase="prefill")
             allow_device_greedy_sampling = batch.allow_device_greedy_sampling
             allow_device_topk_sampling = batch.allow_device_topk_sampling
             if prefill_slot is not None and getattr(self.executor, "supports_async_prefill_reclaim", False):
@@ -1123,6 +1137,8 @@ class WorkerProcess:
                     completed_token_ids,
                     completed_sampling_params,
                 )
+                if batch.dspark_stages is not None:
+                    self.executor.run_dspark_prefill_batch(batch)
 
     def _resolve_decode_token(self, dr: DecodeRequest) -> int:
         """Return the decode input token, substituting from cache on placeholder.
@@ -1292,9 +1308,13 @@ class WorkerProcess:
                 allow_device_greedy_sampling=allow_device_greedy_sampling,
                 allow_device_topk_sampling=allow_device_topk_sampling,
             )
+            self._require_v41_dspark_stages(runtime_model, batch, phase="decode")
             if prepared_decode is None:
                 started_ns = self._decode_metrics.start() if self._decode_metrics else 0
-                decode_result = self.executor.run_decode(runtime_model, batch)
+                if batch.dspark_stages is None:
+                    decode_result = self.executor.run_decode(runtime_model, batch)
+                else:
+                    decode_result = self.executor.run_dspark_decode_batch(batch)
             else:
                 if prepared_decode.error is not None:
                     raise RuntimeError(prepared_decode.error)
@@ -1309,11 +1329,17 @@ class WorkerProcess:
                         buffer_slot=prepared_decode.buffer_slot,
                     )
                 started_ns = self._decode_metrics.start() if self._decode_metrics else 0
-                decode_result = self.executor.run_prepared_decode(
-                    runtime_model,
-                    batch,
-                    prepared,
-                )
+                if batch.dspark_stages is None:
+                    decode_result = self.executor.run_prepared_decode(
+                        runtime_model,
+                        batch,
+                        prepared,
+                    )
+                else:
+                    raise RuntimeError(
+                        "DSpark decode batches cannot use the generic prepared-decode lane; "
+                        "provide a DSpark-specific prepared/reclaim contract"
+                    )
             num_draft_tokens = self._consume_decode_result(scheduled, decode_result, new_tokens, batch=batch)
             if self._decode_metrics:
                 self._decode_metrics.record(

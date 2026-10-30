@@ -11,12 +11,21 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
 import torch
 
-from pypto_serving.config.types import LoadedModel, ModelConfig, RuntimeConfig, RuntimeModel
+from pypto_serving.config.types import (
+    DecodeBatch,
+    DecodeResult,
+    LoadedModel,
+    ModelConfig,
+    PrefillBatch,
+    RuntimeConfig,
+    RuntimeModel,
+)
 from pypto_serving.model.common.executor.executor import ModelExecutor
 from pypto_serving.model.model_family import is_deepseek_v41_config, read_model_config
 from pypto_serving.model.model_loader import SafetensorsDirectoryLoader, _build_layer_specs
@@ -80,10 +89,27 @@ class DeepSeekV41DirectoryLoader(SafetensorsDirectoryLoader):
             raise ValueError("V4.1 cache pages require 128 physical rows")
         layers = plan_layers(raw)
         if runtime.kv_cache_groups:
-            validate_cache_groups(layers, runtime.kv_cache_groups, runtime.max_seq_len,
-                                  dp_size=runtime.kv_cache_groups[0].num_partitions)
+            dp_size = runtime.kv_cache_groups[0].num_partitions
+            validate_cache_groups(
+                layers, runtime.kv_cache_groups, runtime.max_seq_len, dp_size=dp_size,
+            )
         elif len(layers) == 40:
-            runtime = replace(runtime, kv_cache_groups=build_cache_groups(layers, runtime.max_seq_len))
+            # Direct executor users may omit grouped cache specs. Keep that
+            # path consistent with the CLI-selected DP topology instead of
+            # silently constructing an eight-partition runtime for DP4.
+            configured_dp = os.environ.get("PYPTO_DSV41_DP_SIZE", "8")
+            try:
+                dp_size = int(configured_dp)
+            except ValueError as exc:
+                raise ValueError("PYPTO_DSV41_DP_SIZE must be 4 or 8") from exc
+            if dp_size not in (4, 8):
+                raise ValueError("PYPTO_DSV41_DP_SIZE must be 4 or 8")
+            runtime = replace(
+                runtime,
+                kv_cache_groups=build_cache_groups(
+                    layers, runtime.max_seq_len, dp_size=dp_size,
+                ),
+            )
         if len(layers) == 40:
             capacity = SegmentTopology.for_decode().capacity
             runtime = replace(
@@ -118,7 +144,7 @@ class DeepSeekV41DirectoryLoader(SafetensorsDirectoryLoader):
 class DeepSeekV41PyptoExecutor(ModelExecutor):
     """Shared worker interface with a synchronous, collective V4.1 runner."""
     def __init__(self, kv_cache_manager=None, *, platform="a5", device_ids=tuple(range(8)),
-                 pypto_build_dir=None, bindings=None):
+                 pypto_build_dir=None, use_compile_cache=False, bindings=None):
         super().__init__(kv_cache_manager)
         if platform != "a5":
             raise ValueError("V4.1 M0 currently requires the A5 platform")
@@ -128,24 +154,35 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         self._failed_runners = []
         self.platform = platform
         self.pypto_build_dir = pypto_build_dir
+        self.use_compile_cache = use_compile_cache
 
     def register_model(self, model_id, record):
         if model_id in self.runners:
             raise ValueError("model already registered")
+        dp_size = (record.runtime.kv_cache_groups[0].num_partitions
+                   if record.runtime.kv_cache_groups else None)
         bindings = self.bindings or load_composite_bindings(
             record.runtime_model.extra["model_dir"], record.runtime.max_seq_len,
-            dp_size=len(self.device_ids))
+            tokenizer=record.tokenizer, dp_size=dp_size)
         if not bindings.cache_groups:
             raise MissingCompositeInterface("V4.1 requires explicit grouped cache layouts and capacities")
         if record.runtime.kv_cache_groups != bindings.cache_groups:
             raise ValueError("scheduler and composite cache group contracts differ")
+        rank_count = len(self.device_ids)
+        if rank_count not in (4, 8):
+            raise ValueError("V4.1 DSpark serving requires 4 or 8 devices")
+        if bindings.segment_topology.dp != rank_count:
+            raise ValueError(
+                "V4.1 DSpark topology mismatch: set PYPTO_DSV41_DP_SIZE "
+                f"to {rank_count} before creating bindings"
+            )
         plan = V41ExecutionPlan(
             record.runtime_model.extra["model_dir"],
-            RankPlacement(0, tp_size=1, dp_size=len(self.device_ids), ep_size=len(self.device_ids)),
+            RankPlacement(0, tp_size=1, dp_size=rank_count, ep_size=rank_count),
         )
         runner = V41ModelRunner(
             plan, bindings, device_ids=self.device_ids, runtime=record.runtime,
-            build_options=BuildOptions(self.platform, self.pypto_build_dir),
+            build_options=BuildOptions(self.platform, self.pypto_build_dir, self.use_compile_cache),
         )
         try:
             pages = runner.preflight()
@@ -164,6 +201,25 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
 
     def run_decode(self, model, batch):
         return self.runners[model.config.model_id].run_decode(model, batch)
+
+    def run_dspark_prefill_batch(self, batch: PrefillBatch):
+        """Dispatch serving-owned, already-lowered DSpark bootstrap stages."""
+        if not self.runners:
+            raise RuntimeError("V4.1 DSpark runner is not registered")
+        if len(self.runners) != 1:
+            raise RuntimeError("V4.1 DSpark batch dispatch requires one registered model")
+        return next(iter(self.runners.values())).run_dspark_prefill_batch(batch)
+
+    def run_dspark_decode_batch(self, batch: DecodeBatch) -> DecodeResult:
+        """Dispatch one serving-owned DSpark verification round."""
+        if not self.runners:
+            raise RuntimeError("V4.1 DSpark runner is not registered")
+        if len(self.runners) != 1:
+            raise RuntimeError("V4.1 DSpark batch dispatch requires one registered model")
+        result = next(iter(self.runners.values())).run_dspark_decode_batch(batch)
+        if not isinstance(result, DecodeResult):
+            raise TypeError("V4.1 DSpark runner must return DecodeResult")
+        return result
 
     def release_finished_requests(self, request_ids):
         for runner in self.runners.values():

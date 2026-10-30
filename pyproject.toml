@@ -31,3 +31,6 @@ pypto-serving-router = "pypto_serving.router.app:main"
 where = ["."]
 include = ["pypto_serving*"]
 namespaces = false
+
+[tool.setuptools.package-data]
+"pypto_serving.model.deepseek_v41" = ["encoding.LICENSE"]
