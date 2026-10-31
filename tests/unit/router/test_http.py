@@ -18,7 +18,7 @@ import pytest
 from pypto_serving.router.app import ServingRouter
 from pypto_serving.router.config import ReplicaSpec, RouterConfig
 from pypto_serving.router.http import request_headers, response_headers
-from tests.unit.router.test_pd_coordination import Peers, config, request
+from tests.unit.pd.test_coordination import Peers, config, request
 
 
 def router(pd, *, body=None, error=None):

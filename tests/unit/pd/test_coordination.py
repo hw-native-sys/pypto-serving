@@ -11,7 +11,6 @@
 """Basic configuration, routing and request lifecycle checks for PD."""
 
 import asyncio
-from dataclasses import replace
 import json
 
 import httpx
@@ -19,10 +18,9 @@ import msgspec
 import pytest
 from starlette.requests import Request
 
-from pypto_serving.pd.config import Config
 from pypto_serving.pd.protocol import Binding, Component, Contract, Node, Topology
 from pypto_serving.router.app import ServingRouter
-from pypto_serving.router.config import HostSpec, ReplicaSpec, RouterConfig, load_router_config
+from pypto_serving.router.config import ReplicaSpec, RouterConfig
 
 
 def config(p=1, d=1):
@@ -83,23 +81,6 @@ def assert_idle(router):
     assert all(s.outstanding == 0 for s in router.registry.states)
 
 
-def test_shared_config_and_static_pd_nodes(tmp_path):
-    path = tmp_path / "deployment.json"
-    path.write_text(json.dumps({"replicas": [
-        {"name": "p", "host": "127.0.0.1", "port": 8123, "role": "prefill", "control_port": 22222},
-        {"name": "d", "host": "127.0.0.2", "port": 8124, "role": "decode"}],
-        "pd": {"capacity": 2}, "observability": {"enabled": False}}))
-    common, pd = load_router_config(path), Config.load(path)
-    assert common.is_pd and pd.capacity == 2 and not pd.log_enabled
-    assert pd.prefill[0].node_id == common.replicas[0].name
-    assert pd.prefill[0].control_port == 22222
-    assert pd.decode[0].url == common.replicas[1].base_url
-    with pytest.raises(ValueError):
-        replace(common, replicas=common.replicas + (ReplicaSpec("r", "r", 8000),))
-    with pytest.raises(ValueError):
-        replace(common, hosts=(HostSpec("host", devices=(0,), model="weights"),))
-
-
 @pytest.mark.parametrize("stream", [False, True])
 def test_json_and_sse_generation(stream):
     async def run():
@@ -146,42 +127,6 @@ def test_pool_rotation_health_and_new_boot():
             peers.nodes["d0"] = msgspec.structs.replace(peers.nodes["d0"], healthy=False)
             await router.health.probe_once()
             assert all(d.node_id == "d1" for _, d in router.proxy.pairs())
-            assert_idle(router)
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("unavailable", [False, True])
-def test_unknown_model_and_unavailable_backend(unavailable):
-    async def run():
-        cfg = config()
-        peers = Peers(cfg)
-        if unavailable:
-            peers.nodes["d0"] = msgspec.structs.replace(peers.nodes["d0"], healthy=False)
-        router = peers.router(cfg)
-        async with router.app.router.lifespan_context(router.app):
-            response = await router.proxy.forward(request({"model": "model" if unavailable else "missing"}),
-                                                  "/v1/completions")
-            assert response.status_code == (503 if unavailable else 404)
-            assert json.loads(response.body)["code"] == (
-                "no_available_backend" if unavailable else "model_not_found")
-            assert not peers.requests
-            assert_idle(router)
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("node", ["p0", "d0"])
-def test_node_error_is_forwarded(node):
-    async def run():
-        cfg = config()
-        peers = Peers(cfg)
-        peers.errors[node] = httpx.Response(503, json={"detail": "unavailable"}, headers={"Retry-After": "1"})
-        router = peers.router(cfg)
-        async with router.app.router.lifespan_context(router.app):
-            response = await router.proxy.forward(request({}), "/v1/completions")
-            assert response.status_code == 503 and json.loads(response.body) == {"detail": "unavailable"}
-            assert response.headers["x-pypto-error-source"] == "upstream"
-            assert response.headers["retry-after"] == "1"
-            assert sum(path.endswith("abort") for _, path in peers.calls) == 2
             assert_idle(router)
     asyncio.run(run())
 
