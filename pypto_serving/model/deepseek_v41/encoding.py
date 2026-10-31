@@ -193,10 +193,6 @@ def encode_messages(
 class DeepSeekV41TokenizerAdapter(TransformersTokenizerAdapter):
     """Pure-text generation adapter; the checkpoint has no Jinja chat_template."""
 
-    @property
-    def output_parser_id(self) -> str:
-        return "deepseek_v41"
-
     def apply_chat_template(self, messages: Sequence[Mapping[str, object]], **kwargs):
         allowed = {
             "thinking",

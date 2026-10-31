@@ -45,6 +45,17 @@ from pypto_serving.serving.server.serving_worker import WorkerProcess
 from ..device_sampling_fakes import _FixedSampler, _ImmediateEosExecutor, _model
 
 
+def test_v41_dspark_rejects_missing_lowered_stage_payload():
+    model = SimpleNamespace(
+        extra={"family": "deepseek_v41"},
+        runtime=SimpleNamespace(num_speculative_tokens=5),
+    )
+    batch = SimpleNamespace(dspark_stages=None)
+
+    with pytest.raises(RuntimeError, match="requires lowered dspark_stages"):
+        WorkerProcess._require_v41_dspark_stages(model, batch, phase="decode")
+
+
 def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
     core._request_contexts = {}

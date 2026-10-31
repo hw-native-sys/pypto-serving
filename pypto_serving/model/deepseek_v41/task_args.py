@@ -86,8 +86,8 @@ def validate_cache_groups(
         _, block_size, ratio = expected[family]
         if (group.spec.block_size != block_size or group.spec.compress_ratio != ratio
                 or group.spec.storage_block_size != 128 or group.num_partitions != dp_size
-                or group.sliding_window is not None or group.is_eagle_group
-                or group.max_requests_per_partition != 1):
+                or group.max_requests_per_partition != 1
+                or group.sliding_window is not None or group.is_eagle_group):
             raise ValueError(f"V4.1 {family} cache page layout disagrees with the lib ABI")
         required = (max_seq_len + block_size - 1) // block_size
         if (group.max_blocks_per_seq < required

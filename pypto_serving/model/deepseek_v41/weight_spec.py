@@ -35,11 +35,15 @@ def pack_fp4_tiles(payload, tile=256):
     k = half_k * 2
     if k % tile or n % tile:
         raise ValueError("routed FP4 weights require complete 256x256 tiles")
-    pairs = source.reshape(n // tile, tile // 2, 2, k // tile, tile // 2)
-    even, odd = pairs[:, :, 0], pairs[:, :, 1]
     output = torch.empty((n // tile, k // tile, tile, tile // 2), dtype=torch.uint8)
-    output[:, :, 0::2] = ((even & 15) | ((odd & 15) << 4)).permute(0, 2, 3, 1)
-    output[:, :, 1::2] = ((even >> 4) | (odd & 0xF0)).permute(0, 2, 3, 1)
+    for nb in range(n // tile):
+        for kb in range(k // tile):
+            block = source[nb*tile:(nb+1)*tile, kb*(tile//2):(kb+1)*(tile//2)]
+            codes = torch.empty((tile, tile), dtype=torch.uint8)
+            codes[:, 0::2] = block & 15
+            codes[:, 1::2] = block >> 4
+            transposed = codes.T
+            output[nb, kb] = transposed[:, 0::2] | (transposed[:, 1::2] << 4)
     return output.reshape(k * n // tile, tile // 2)
 
 
@@ -220,4 +224,17 @@ def backbone_weight_specs(config: Mapping[str, Any]) -> dict[str, TensorSpec]:
             if layer in kv_sources:
                 add(prefix + ".wk.weight", (index_dim, head_dim), "BF16")
                 add(prefix + ".k_norm.weight", (index_dim,), "BF16")
+    # Engram projection weights are shared across EP ranks. Large lookup
+    # tables are deliberately excluded; they remain row-addressed host data.
+    engram_layers = tuple(text.get("engram_layer_ids", ()))
+    if engram_layers:
+        engram_heads = positive("engram_n_heads")
+        engram_head_dim = positive("engram_head_dim")
+        engram_k = (positive("engram_max_ngram_size") - 1) * engram_heads * engram_head_dim
+        engram_out = (hc + 1) * dim
+        for layer in engram_layers:
+            prefix = f"layers.{layer}.engram"
+            dense(prefix + ".wkv", engram_out, engram_k)
+            add(prefix + ".q_weight", (hc, dim), "BF16")
+            add(prefix + ".k_weight", (hc, dim), "BF16")
     return specs

@@ -41,12 +41,25 @@ from .task_args import (
     build_cache_groups,
     validate_cache_groups,
 )
+from .dspark_resources import DSPARK_MAX_BATCH_PER_DP
+from .dspark_runtime import (
+    DECODE_STAGE_ORDER,
+    PREFILL_STAGE_ORDER,
+    DSPARK_ROWS_PER_REQUEST,
+    DSPARK_SPECULATIVE_TOKENS,
+    DSparkDecodeDispatch,
+    DSparkLoweredInputs,
+    DSparkLoweringProvider,
+    DSparkPrefillDispatch,
+    V41DSparkRuntime,
+)
 from .weight_loader import (
     DecodeWeightBank,
     DecodeWeightLayout,
     LayerPlan,
     RankPlacement,
     ResidentFullDecodeWeights,
+    RowAddressedCheckpoint,
     V41ExecutionPlan,
     V41WeightLoader,
     iter_decode_weight_slices,
@@ -76,8 +89,80 @@ class DecodeCachePlan:
     physical_request_slots: int
 
 
+def cache_bytes_per_rank(plan: DecodeCachePlan) -> int:
+    """Count the physical pool, including pages hidden from the scheduler."""
+    return sum(torch.Size(spec.shape[1:]).numel() * torch.empty((), dtype=spec.dtype).element_size()
+               for spec in plan.buffers)
+
+
+def make_post_resident_cache_planner(layers, groups, *, max_seq_len, abi,
+                                     utilization, max_request_slots,
+                                     reserved_bytes_per_rank, requested_pages=None):
+    """Build a V4-style post-resident cache planner for one persistent worker.
+
+    The caller must charge every layer scratch allocation that follows cache
+    allocation in ``reserved_bytes_per_rank``. Group capacities remain unset
+    until the worker reports HBM; the scheduler sees only non-padding pages.
+    """
+    if (not isinstance(utilization, (float, int)) or not 0 < utilization <= 1
+            or type(max_request_slots) is not int or max_request_slots <= 0
+            or type(reserved_bytes_per_rank) is not int or reserved_bytes_per_rank <= 0
+            or requested_pages is not None and (type(requested_pages) is not int or requested_pages <= 0)):
+        raise ValueError("invalid post-resident cache budget")
+    if any(group.num_blocks is not None for group in groups):
+        raise ValueError("dynamic cache groups must not fix scheduler block counts")
+    window_pages = groups[0].max_blocks_per_seq
+
+    def plan_for_slots(slots):
+        return plan_decode_cache_pools(
+            layers, groups, max_seq_len=max_seq_len,
+            primary_num_blocks=slots * window_pages,
+            request_slots=slots, abi=abi)
+
+    one, two = plan_for_slots(1), plan_for_slots(2)
+    one_bytes, two_bytes = cache_bytes_per_rank(one), cache_bytes_per_rank(two)
+    slot_bytes = two_bytes - one_bytes
+    fixed_bytes = one_bytes - slot_bytes
+    if slot_bytes <= 0 or fixed_bytes <= 0:
+        raise ValueError("cache shape does not scale linearly with request slots")
+
+    def choose(worker):
+        budgets = []
+        for rank in range(one.buffers[0].shape[0]):
+            free_bytes, total_bytes = worker.device_memory_info(rank)
+            if not 0 <= free_bytes <= total_bytes:
+                raise ValueError("device memory report is inconsistent")
+            used_bytes = total_bytes - free_bytes
+            budgets.append(int(total_bytes * utilization) - used_bytes - reserved_bytes_per_rank)
+        available = min(budgets)
+        if available < fixed_bytes + slot_bytes:
+            raise MemoryError("post-resident HBM cannot hold one V4.1 cache request slot")
+        slots = min(max_request_slots, (available - fixed_bytes) // slot_bytes)
+        if requested_pages is not None:
+            slots = min(slots, requested_pages // window_pages)
+        if slots < 1:
+            raise MemoryError("configured cache pages cannot hold one V4.1 request slot")
+        return slots, plan_for_slots
+
+    return choose
+
+
+def allocate_cache_with_retry(worker, requested_slots, plan_for_slots, state_reset, page_resets):
+    """Release every cache family before retrying a smaller shared slot count."""
+    if type(requested_slots) is not int or requested_slots <= 0:
+        raise ValueError("requested cache slots must be positive")
+    slots = requested_slots
+    while True:
+        try:
+            return DecodeCachePools(worker, plan_for_slots(slots), state_reset, page_resets)
+        except (MemoryError, RuntimeError) as exc:
+            if slots == 1:
+                raise RuntimeError("V4.1 cache allocation failed at the one-slot minimum") from exc
+            slots = max(slots // 2, 1)
+
+
 def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
-                            request_slots, abi, dp_size) -> DecodeCachePlan:
+                            request_slots, abi) -> DecodeCachePlan:
     """Match scheduler page capacities to decode_fwd's source-sliced pools.
 
     ``abi`` is the imported decode_fwd module from the selected lib revision.
@@ -85,8 +170,15 @@ def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
     scales each group by its own max_blocks_per_seq. All shapes include the EP
     rank axis; each rank has a private copy of its DP partition's page IDs.
     """
+    # V4.1 decode_fwd intentionally imports only EP_SIZE: DSpark is currently
+    # compiled for TP1 and the lib module does not expose a TP_SIZE constant.
+    # Use the selected serving topology as the source of truth instead of
+    # reaching through an optional lib implementation detail.
+    abi_tp_size = int(getattr(abi, "TP_SIZE", 1))
+    if abi_tp_size <= 0:
+        raise ValueError(f"invalid V4.1 decode TP size: {abi_tp_size}")
     resolved = validate_cache_groups(tuple(layers), tuple(groups), max_seq_len,
-                                     dp_size=dp_size)
+                                     dp_size=abi.EP_SIZE // abi_tp_size)
     by_name = {group.name: group for group in groups}
     window = by_name[resolved.window]
     if groups[0].name != resolved.window:
@@ -130,7 +222,7 @@ def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
                        (head, index, abi.STATE_CAPACITY, abi.STATE_WIDTH))
             or head % abi.WINDOW_CACHE_GROUP or head % abi.COMPRESSED_CACHE_GROUP
             or index % abi.INDEX_CACHE_GROUP):
-        raise ValueError("decode cache dimensions disagree with the V4.1 EP topology")
+        raise ValueError("decode cache dimensions disagree with the V4.1 EP4/EP8 topology")
     block = abi.BLOCK_SIZE
     window_pages = physical_group_blocks[resolved.window]
     # One lib source axis covers both compression families, so its stride must
@@ -441,6 +533,7 @@ class BuildOptions:
     """Worker-selected compilation settings passed unchanged to the adapter."""
     platform: str = "a5"
     pypto_build_dir: str | None = None
+    use_compile_cache: bool = False
 
 
 @dataclass(frozen=True)
@@ -453,41 +546,76 @@ class LayerState:
 
 @dataclass(frozen=True)
 class CompositeBindings:
-    """Bind complete lib forwards and their request-owned resources."""
+    """Explicit adapter seam for a verified lib revision.
+
+    Entries consume (LayerPlan, LayerState, step, resources, weights) and return
+    LayerState. initialize consumes (embeddings, step, resources); output consumes
+    (state, step, resources) and returns host logits in original request order.
+    The adapter owns device uploads and lib ABI binding. Serving never expands
+    packed FP4 or calls the sub-operators of a complete layer.
+    allocate consumes (plan, device_ids, runtime, BuildOptions), including the
+    worker's build directory and compile-cache choice, and returns (resources,
+    num_pages). It also prepares global weights needed by initialize/output.
+
+    No default implementation fabricates results. A supplied adapter must handle
+    all DP partitions collectively, including empty partitions, and retain input
+    objects until wait() completes. reset_request must clear every persistent
+    cache and compressor slot for that request before returning.
+    """
     revision: str
+    entries: Mapping[tuple[str, str], Callable]
     initialize: Callable
     output: Callable
     allocate: Callable
+    prepare_weights: Callable
     reset_request: Callable
     wait: Callable
     close: Callable
-    prefill_backbone: Callable
-    decode_backbone: Callable
     cache_groups: tuple = ()
     segment_topology: SegmentTopology | None = None
     input_layout: str = "tp_replicated"
     output_layout: str = "tp_replicated"
+    decode_backbone: Callable | None = None
+    prefill_backbone: Callable | None = None
 
     def require(self, layers: tuple[LayerPlan, ...], placement: RankPlacement) -> None:
         if not self.revision:
             raise ValueError("composite bindings must identify the validated lib revision")
-        if not layers or any(not isinstance(layer, LayerPlan) for layer in layers):
-            raise ValueError("V4.1 serving requires planned backbone layers")
-        for name in ("initialize", "output", "allocate", "prefill_backbone",
-                     "decode_backbone", "reset_request", "wait", "close"):
+        phases = tuple(phase for phase, backbone in (
+            ("prefill", self.prefill_backbone), ("decode", self.decode_backbone),
+        ) if not callable(backbone))
+        missing = sorted({f"{phase}/{layer.mode}" for phase in phases
+                          for layer in layers if not callable(self.entries.get((phase, layer.mode)))})
+        if missing:
+            raise MissingCompositeInterface("missing complete layer composites: " + ", ".join(missing))
+        for name in ("initialize", "output", "allocate", "prepare_weights", "reset_request", "wait", "close"):
             if not callable(getattr(self, name)):
                 raise MissingCompositeInterface(f"missing composite resource/output operation: {name}")
         if self.input_layout not in ("tp_replicated", "tp_local_token") or self.output_layout != self.input_layout:
-            raise MissingCompositeInterface("full forwards must preserve their declared residual/pre_mix layout")
-        if (placement.tp_size, placement.dp_size, placement.ep_size) not in ((1, 4, 4), (1, 8, 8)):
-            raise ValueError("V4.1 serving requires TP1/DP4/EP4 or TP1/DP8/EP8")
+            raise MissingCompositeInterface("layer entries must preserve their declared residual/pre_mix layout")
+        if (placement.tp_size != 1 or placement.dp_size not in (4, 8)
+                or placement.ep_size != placement.dp_size):
+            raise ValueError("V4.1 serving requires TP1 with matching DP/EP size 4 or 8")
 
 
-def load_composite_bindings(model_dir=None, max_seq_len=None, *, dp_size=8) -> CompositeBindings:
+def load_composite_bindings(
+    model_dir=None,
+    max_seq_len=None,
+    tokenizer=None,
+    *,
+    dp_size=None,
+    dspark_lowering_provider=None,
+) -> CompositeBindings:
     """Resolve the model-specific contract without opening a device."""
     if model_dir is None or max_seq_len is None:
         raise ValueError("V4.1 composite bindings require a model directory and context length")
-    return make_production_bindings(model_dir, max_seq_len, dp_size=dp_size)
+    return make_production_bindings(
+        model_dir,
+        max_seq_len,
+        tokenizer=tokenizer,
+        dp_size=dp_size,
+        dspark_lowering_provider=dspark_lowering_provider,
+    )
 
 
 # decode_padding
@@ -767,6 +895,18 @@ def decode_requests(batch, config, runtime, groups):
 
 
 # swa_segment
+ATTENTION_ARGS = (
+    "x_hc incoming_pre_mix hc_attn_fn hc_attn_scale hc_attn_base attn_norm_weight "
+    "wq_a wq_a_scale q_norm_weight wq_b wq_b_scale wkv wkv_scale kv_norm_weight "
+    "attn_sink wo_a wo_b wo_b_scale rope_cos rope_sin window_slots window_indices "
+    "window_cache window_cache_scale output next_pre_mix hidden attn_out num_tokens attention_epoch"
+).split()
+MOE_ARGS = (
+    "x_hc pre_mix hc_ffn_fn hc_ffn_scale hc_ffn_base norm_weight gate_weight correction_bias "
+    "routed_w1 routed_w1_scale routed_w2 routed_w2_scale routed_w3 routed_w3_scale mxfp4_pair_lut "
+    "shared_w1 shared_w1_scale shared_w2 shared_w2_scale shared_w3 shared_w3_scale "
+    "next_pre_mix x_mixed x_next num_tokens moe_epoch"
+).split()
 
 
 @dataclass(frozen=True)
@@ -850,9 +990,26 @@ def load_segment_modules(lib_root, topology):
         sys.argv = old_argv
 
 
+def compile_segment(compiler, lib_root, topology):
+    """Compile the two existing lib composites with the shared V4 compiler."""
+    import pypto.language as pl
+
+    attention, moe = load_segment_modules(lib_root, topology)
+    swa = compiler.compile(
+        "v41_swa_segment", attention.make_hc_program(topology.capacity, topology.world, epochs=1),
+        attention_epoch=pl.RUNTIME,
+    )
+    ffn = compiler.compile("v41_moe_segment", moe.l3_moe, moe_epoch=pl.RUNTIME)
+    return swa, ffn
+
 
 def make_segment_worker(programs, run_config, inherited_host_tensors=()):
-    """Keep compiled programs and their communication windows on one worker."""
+    """Retain both programs' communication windows as in the V4 runner.
+
+    Attention waits for (epoch - 1) * 2 before publishing the next phase.
+    The runtime's default reset-on-reuse policy would erase that completion
+    signal and stall the second layer. Each compiled program owns its windows.
+    """
     from pypto.runtime import DistributedWorker
 
     return DistributedWorker(
@@ -860,6 +1017,141 @@ def make_segment_worker(programs, run_config, inherited_host_tensors=()):
         persistent=True, reset_persistent_windows=False,
         inherited_host_tensors=inherited_host_tensors,
     )
+
+
+class SwaSegment:
+    """Synchronous half-layer dispatcher on one persistent DistributedWorker.
+
+    Construct the worker with make_segment_worker(). Metadata must be shared
+    CPU tensors created before worker startup:
+    attention_counts [world, 1] and moe_counts [world], both int32.
+    Per-layer argument maps contain all ABI tensors except input state, counts
+    and epoch. They own separate output/scratch/cache buffers. No host copies
+    occur between half-layers or between consecutive calls to run_layer().
+    """
+
+    def __init__(self, worker, programs, topology, attention_counts, moe_counts, run_config):
+        import torch
+
+        for value, shape in ((attention_counts, (topology.world, 1)),
+                             (moe_counts, (topology.world,))):
+            if (not isinstance(value, torch.Tensor) or value.device.type != "cpu"
+                    or tuple(value.shape) != shape or value.dtype != torch.int32 or not value.is_shared()):
+                raise ValueError("counts must be shared CPU int32 metadata allocated before worker startup")
+        self.worker, self.programs, self.topology = worker, programs, topology
+        self.attention_counts, self.moe_counts = attention_counts, moe_counts
+        self.run_config = run_config
+        self._epoch = 0
+        self._attention_epochs = {}
+        self._failed = False
+
+    def _check_state(self, state):
+        import torch
+        from pypto.runtime import StackedDeviceTensor
+
+        if state.layout != "tp_local_token":
+            raise ValueError("SWA segment requires contiguous TP-local token state")
+        prefix = (self.topology.world, self.topology.local_capacity)
+        for value, shape in ((state.residual, (*prefix, 4, 5120)), (state.pre_mix, (*prefix, 4))):
+            if (not isinstance(value, StackedDeviceTensor) or tuple(value.shape) != shape
+                    or value.dtype != torch.float32
+                    or tuple(value.worker_ids) != tuple(range(self.topology.world))):
+                raise ValueError("state must be FP32 device shards with canonical rank placement and capacity")
+
+    def run_layer(self, state, attention, moe, *, group_counts):
+        """Return MoE outputs directly for the following layer's Attention input.
+
+        Request packing, RoPE, page mapping and cache initialization are owned
+        by the caller and must use the same contiguous group/slab ordering.
+        """
+        return self._run_layer(state, attention, moe, group_counts=group_counts,
+                               attention_program=self.programs[0], argument_names=ATTENTION_ARGS,
+                               input_mix="incoming_pre_mix", output_residual="output")
+
+    def _run_layer(self, state, attention, moe, *, group_counts, attention_program,
+                   argument_names, input_mix, output_residual):
+        """Dispatch an audited TP-local Attention ABI and the shared MoE entry."""
+        if self._failed:
+            raise RuntimeError("segment dispatch failed; close this worker before attempting recovery")
+        self._check_state(state)
+        group, local = self.topology.counts(group_counts)
+        a = dict(attention, x_hc=state.residual, num_tokens=self.attention_counts)
+        a[input_mix] = state.pre_mix
+        attention_state = LayerState(a[output_residual], a["next_pre_mix"], "tp_local_token")
+        m = dict(moe, x_hc=attention_state.residual, pre_mix=attention_state.pre_mix,
+                 num_tokens=self.moe_counts)
+        result = LayerState(m["x_next"], m["next_pre_mix"], "tp_local_token")
+        self._check_state(attention_state)
+        self._check_state(result)
+        # Reject aliases before launching either kernel, including distinct
+        # handles pointing at the same allocation. Reuse across layers is fine.
+        buffers = (state.residual, state.pre_mix, attention_state.residual,
+                   attention_state.pre_mix, result.residual, result.pre_mix)
+        seen = set()
+        for buffer in buffers:
+            for rank, shard in zip(buffer.worker_ids, buffer.shards):
+                key = (rank, shard.data_ptr)
+                if key in seen:
+                    raise ValueError("input and half-layer outputs must not alias")
+                seen.add(key)
+        moe_reset = self._epoch == 512
+        epoch = 1 if moe_reset else self._epoch + 1
+        program_key = id(attention_program.compiled)
+        prior_attention_epoch = self._attention_epochs.get(program_key, 0)
+        attention_reset = prior_attention_epoch == 512
+        attention_epoch = 1 if attention_reset else prior_attention_epoch + 1
+        if max(epoch, attention_epoch) > (2**31 - 1) // 2:
+            raise OverflowError("communication epoch exhausted; recreate worker")
+        # Each compiled Attention owns separate retained signal windows. A
+        # mode's first call must use epoch 1 even after another mode ran.
+        a["attention_epoch"] = ctypes.c_int32(attention_epoch)
+        m["moe_epoch"] = ctypes.c_int32(epoch)
+        # Resolve all arguments before the first collective: a missing MoE
+        # weight must not leave an already-mutated Attention cache behind.
+        a_args = [a[name] for name in argument_names]
+        m_args = [m[name] for name in MOE_ARGS]
+        self._check_weights(m)
+        for rank, (global_n, local_n) in enumerate(zip(group, local)):
+            self.attention_counts[rank, 0] = global_n
+            self.moe_counts[rank] = local_n
+        self._epoch = epoch
+        self._attention_epochs[program_key] = attention_epoch
+        if attention_reset or moe_reset:
+            if not getattr(self.worker, "_persistent", False) or not hasattr(
+                self.worker, "_reset_persistent_windows"
+            ):
+                raise RuntimeError("prefill epoch reset requires a persistent PyPTO worker")
+            previous_reset = self.worker._reset_persistent_windows
+        try:
+            if attention_reset:
+                self.worker._reset_persistent_windows = True
+            try:
+                self.worker.run(attention_program.compiled, *a_args, config=self.run_config)
+            finally:
+                if attention_reset:
+                    self.worker._reset_persistent_windows = previous_reset
+            if moe_reset:
+                self.worker._reset_persistent_windows = True
+            try:
+                self.worker.run(self.programs[1].compiled, *m_args, config=self.run_config)
+            finally:
+                if moe_reset:
+                    self.worker._reset_persistent_windows = previous_reset
+        except BaseException:
+            self._failed = True
+            raise
+        return result
+
+    @staticmethod
+    def _check_weights(moe):
+        import torch
+        from pypto.runtime import StackedDeviceTensor
+
+        for name in ("routed_w1", "routed_w2", "routed_w3", "mxfp4_pair_lut"):
+            value = moe[name]
+            expected = torch.int16 if name == "mxfp4_pair_lut" else torch.uint8
+            if not isinstance(value, StackedDeviceTensor) or value.dtype != expected:
+                raise ValueError(f"{name} must be a resident packed-FP4 ABI tensor ({expected})")
 
 
 # compressed_metadata
@@ -1004,6 +1296,65 @@ def compile_decode_fwd(compiler, lib_root, topology):
     return program, tuple(entry.param_names), counts_are_tensor
 
 
+def compile_decode_fwd_dspark(compiler, lib_root, topology, *, target_program=None,
+                              target_param_names=None):
+    """Compile the V4.1 DSpark stage programs into the shared worker.
+
+    The DSpark entry is intentionally kept as a set of host composites.  The
+    serving layer owns dispatch state and buffers; the lib owns the ordering
+    and device-side implementation of each stage.
+    """
+    import pypto.language as pl
+
+    if topology.tp != 1:
+        raise MissingCompositeInterface("V4.1 DSpark currently requires TP1")
+    load_segment_modules(lib_root, topology)
+    module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd_dspark")
+    entries = {
+        "prepare_target": module.l3_prepare_target,
+        "prepare_target_decode": module.l3_prepare_target_decode,
+        "copy_target_hidden": module.l3_copy_target_hidden,
+    }
+    if target_program is None or target_param_names is None:
+        raise MissingCompositeInterface(
+            "V4.1 DSpark requires the complete l3_decode_fwd target composite"
+        )
+    # decode_fwd_dspark's host orchestrator invokes l3_decode_fwd between
+    # target-input preparation and target sampling. Reuse the already compiled
+    # full decode program so the worker owns one target ABI and one set of
+    # resident weights instead of compiling a second copy.
+    state = importlib.import_module("models.deepseek_v4_1_flash.dspark_state")
+    entries.update({name.removeprefix("l3_"): getattr(state, name) for name in (
+        "l3_bootstrap_inputs", "l3_publish_bootstrap", "l3_accept_target",
+        "l3_commit_drafts", "l3_prepare_drafter_geometry",
+        "l3_prepare_prefill_drafter_geometry")})
+    target_sample = importlib.import_module("models.deepseek_v4_1_flash.dspark_target_sample")
+    for chunk in range(5):
+        entries[f"sample_target_chunk_{chunk}"] = target_sample.l3_sample_target_chunk
+    entries["merge_target_chunks"] = target_sample.l3_merge_target_chunks
+    entries["dspark_drafter"] = importlib.import_module(
+        "models.deepseek_v4_1_flash.dspark_drafter").l3_dspark_drafter
+    entries["markov_sample"] = importlib.import_module(
+        "models.deepseek_v4_1_flash.dspark_markov").l3_markov_sample_from_hidden
+    programs = {}
+    programs["target_decode"] = target_program
+    param_names = {"target_decode": tuple(target_param_names)}
+    for name, entry in entries.items():
+        kwargs = {}
+        params = set(entry.param_names)
+        if "attention_epoch" in params:
+            kwargs["attention_epoch"] = pl.RUNTIME
+        if "moe_epoch" in params:
+            kwargs["moe_epoch"] = pl.RUNTIME
+        if "logits_epoch" in params:
+            kwargs["logits_epoch"] = pl.RUNTIME
+        if name.startswith("sample_target_chunk_"):
+            kwargs["chunk"] = int(name.rsplit("_", 1)[1])
+        programs[name] = compiler.compile("v41_dspark_" + name, entry, **kwargs)
+        param_names[name] = tuple(entry.param_names)
+    return programs, param_names
+
+
 class DecodeForwardSegment:
     """Bind one full-backbone dispatch to resident weights, caches and metadata."""
 
@@ -1015,6 +1366,8 @@ class DecodeForwardSegment:
         "c1a_index_block_table": "c1a_index_block_table",
         "query_start_loc": "c2a_query_start_loc",
         "state_block_table": "c2a_state_block_table",
+        "engram_lookup": "engram_lookup",
+        "dspark_target_hidden": "dspark_target_hidden",
     }
 
     def __init__(self, worker, program, param_names, run_config, topology,
@@ -1208,9 +1561,19 @@ class V41ModelRunner:
         self._check_state(state)
         backbone = (self.bindings.prefill_backbone if step.phase == "prefill"
                     else self.bindings.decode_backbone)
-        state = backbone(state, step, self.resources, plans)
-        self.bindings.wait(self.resources)
-        return self._check_state(state)
+        if backbone is not None:
+            state = backbone(state, step, self.resources, plans)
+            self.bindings.wait(self.resources)
+            return self._check_state(state)
+        for layer in self.plan.layers:
+            # The adapter chooses bounded staging or residency; payloads stay packed.
+            weights = self.bindings.prepare_weights(plans, layer, self.resources)
+            self.bindings.wait(self.resources)
+            state = self.bindings.entries[(step.phase, layer.mode)](
+                layer, state, step, self.resources, weights)
+            self.bindings.wait(self.resources)
+            self._check_state(state)
+        return state
 
     def _execute_step(self, step, embeddings):
         state = self._run_layers(step, embeddings)
@@ -1246,6 +1609,208 @@ class V41ModelRunner:
                 self.bindings.wait(self.resources)
                 self.ledger.release(request_ids, self._reset_request)
 
+    def run_dspark_prefill(self, request_id, *, slot, generation, prompt_length,
+                           anchor, stages, lowered=None):
+        """Publish the first five drafts after a completed V4.1 prefill.
+
+        The scheduler/device adapter supplies already-bound stage arguments;
+        this method only owns request state and invokes the lib composites in
+        their documented order.
+        """
+        if self.runtime.num_speculative_tokens != 5:
+            raise ValueError("V4.1 DSpark requires num_speculative_tokens=5")
+        if not hasattr(self.resources, "run_dspark_prefill"):
+            raise MissingCompositeInterface("V4.1 resources do not expose DSpark stage dispatch")
+        return self.resources.run_dspark_prefill(
+            request_id, slot=slot, generation=generation,
+            prompt_length=prompt_length, anchor=anchor, stages=stages,
+            lowered=lowered,
+        )
+
+    def lower_dspark_prefill_batch(self, model, batch, *, request_ids, sampled_token_ids):
+        """Lower a terminal prefill batch through the resident provider."""
+        if self.resources is None:
+            raise MissingCompositeInterface("V4.1 DSpark resources are not initialized")
+        return self.resources.lower_dspark_prefill(
+            model=model, batch=batch, request_ids=request_ids,
+            sampled_token_ids=sampled_token_ids,
+        )
+
+    def run_dspark_decode(self, request_ids, *, stages, accepted_counts=None,
+                          last_sampled=None, draft_ids=None, lowered=None,
+                          request_ranks=None):
+        """Run one target-accept-drafter-Markov-commit verification round."""
+        if self.runtime.num_speculative_tokens != 5:
+            raise ValueError("V4.1 DSpark requires num_speculative_tokens=5")
+        if not hasattr(self.resources, "run_dspark_decode"):
+            raise MissingCompositeInterface("V4.1 resources do not expose DSpark stage dispatch")
+        return self.resources.run_dspark_decode(
+            request_ids, stages=stages, accepted_counts=accepted_counts,
+            last_sampled=last_sampled, draft_ids=draft_ids,
+            lowered=lowered, request_ranks=request_ranks,
+        )
+
+    def lower_dspark_decode_batch(self, model, batch):
+        """Lower one decode batch through the resident provider."""
+        if self.resources is None:
+            raise MissingCompositeInterface("V4.1 DSpark resources are not initialized")
+        return self.resources.lower_dspark_decode(model=model, batch=batch)
+
+    def run_dspark_prefill_batch(self, batch):
+        """Consume the typed DSpark prefill payload from a serving batch."""
+        dispatch = DSparkPrefillDispatch.from_batch(batch)
+        return self.run_dspark_prefill(
+            dispatch.request_id,
+            slot=dispatch.slot,
+            generation=dispatch.generation,
+            prompt_length=dispatch.prompt_length,
+            anchor=dispatch.anchor,
+            stages=dispatch.stages,
+            lowered=dispatch.lowered,
+        )
+
+    def run_dspark_decode_batch(self, batch):
+        """Consume the typed DSpark decode payload from a serving batch."""
+        dispatch = DSparkDecodeDispatch.from_batch(batch)
+        return self.run_dspark_decode(
+            dispatch.request_ids,
+            stages=dispatch.stages,
+            accepted_counts=dispatch.accepted_counts,
+            last_sampled=dispatch.last_sampled,
+            draft_ids=dispatch.draft_ids,
+            lowered=dispatch.lowered,
+            request_ranks=dispatch.request_ranks,
+        )
+
+# prefill_segment
+_WEIGHTS = (
+    "x_hc pre_mix hc_attn_fn hc_attn_scale hc_attn_base attn_norm_weight "
+    "wq_a wq_a_scale q_norm_weight wq_b wq_b_scale wkv wkv_scale kv_norm_weight "
+    "attn_sink wo_a wo_b wo_b_scale "
+)
+_WINDOW = "window_slots window_indices window_cache window_cache_scale "
+_OUTPUTS = "attn_input attn_output next_pre_mix x_hc_out num_tokens attention_epoch"
+C2A_FULL_ARGS = (_WEIGHTS + "freqs_cos freqs_sin " + _WINDOW +
+    "compressed_cache compressed_cache_scale token_to_req_indices compressed_lens "
+    "index_cache index_cache_scale index_block_table position_ids compressed_freqs_cos compressed_freqs_sin "
+    "compressed_rope_positions compressor_wkv compressor_wgate query_start_loc state_block_table state_cache "
+    "compressor_norm_weight compressed_slots index_wk index_norm_weight index_wq_b index_wq_b_scale "
+    "index_weights_proj topk_indices " + _OUTPUTS).split()
+C2A_REUSE_ARGS = (_WEIGHTS + "rope_cos rope_sin " + _WINDOW +
+    "compressed_cache compressed_cache_scale compressed_indices " + _OUTPUTS).split()
+C1A_ARGS = (_WEIGHTS + "rope_cos rope_sin " + _WINDOW +
+    "compressed_cache compressed_cache_scale request_ids compressed_lens index_cache index_cache_scale "
+    "index_block_table compressed_rope_cos compressed_rope_sin compressor_wkv compressor_norm_weight "
+    "compressed_slots index_wk index_norm_weight index_wq_b index_wq_b_scale index_weights_proj "
+    "topk_indices candidate_mask compressed_indices " + _OUTPUTS).split()
+PREFILL_ARGUMENTS = {
+    "swa": ATTENTION_ARGS, "c2a_full": C2A_FULL_ARGS, "c2a_reuse": C2A_REUSE_ARGS,
+    "c1a_full": C1A_ARGS, "c1a_reindex": C1A_ARGS, "c1a_reuse": C1A_ARGS,
+}
+
+
+def bind_prefill_producers(plans, arguments):
+    """Bind one ordered forward chain to its actual producer allocations.
+
+    Like V4's worker-owned cache arguments, handles stay resident for the whole
+    dispatch. V4.1 additionally shares compressed KV/index pools and physical
+    Top-K rows according to LayerPlan. This performs no tensor computation.
+    Every producer must execute earlier in this chain, so a previous request's
+    transient Top-K/candidate rows cannot satisfy a missing dependency.
+
+    C1A's common ABI retains unused Full weights in Reindex/Reuse. Bind those
+    slots to their real producer weights; never allocate placeholder weights.
+    Keep unused index slots in separate allocations. The common C1A ABI marks
+    them writable even when a selected mode does not use them; aliasing those
+    arguments makes the runtime reject overlapping write ranges (lib fbe92bfc).
+    """
+    plans = tuple(plans)
+    if not plans or any(not isinstance(p, LayerPlan) for p in plans):
+        raise ValueError("prefill chain requires LayerPlan entries")
+    if any(b.layer_id != a.layer_id + 1 for a, b in zip(plans, plans[1:])):
+        raise ValueError("prefill chain must execute consecutive layers in order")
+    result, seen = {}, {}
+    for plan in plans:
+        if plan.mode not in PREFILL_ARGUMENTS:
+            raise ValueError("unsupported prefill mode")
+        current = dict(arguments[plan.layer_id])
+        if plan.mode != "swa":
+            family, mode = plan.mode.split("_")
+
+            def producer(source, kind):
+                if source == plan.layer_id:
+                    if mode != "full" and not (kind == "index" and mode == "reindex"):
+                        raise ValueError(f"{plan.mode} cannot produce its own {kind}")
+                    return current
+                if source not in seen or not seen[source].mode.startswith(family + "_"):
+                    raise ValueError(f"missing preceding {kind} producer for layer {plan.layer_id}")
+                source_mode = seen[source].mode.split("_")[1]
+                if source_mode != "full" and not (kind == "index" and source_mode == "reindex"):
+                    raise ValueError(f"invalid {kind} producer mode")
+                return result[source]
+
+            if mode == "full" and (plan.kv_source != plan.layer_id or plan.index_source != plan.layer_id):
+                raise ValueError("Full must own its KV and index outputs")
+            if mode == "reindex" and (family != "c1a" or plan.index_source != plan.layer_id):
+                raise ValueError("Reindex must own its C1A index output")
+            kv = producer(plan.kv_source, "KV")
+            index = producer(plan.index_source, "index")
+            if plan.index_source != plan.layer_id and seen[plan.index_source].kv_source != plan.kv_source:
+                raise ValueError("index selection must address the same KV producer")
+            for name in ("compressed_cache", "compressed_cache_scale"):
+                current[name] = kv[name]
+            if family == "c1a":
+                candidate = producer(plan.candidate_source, "candidate")
+                if plan.candidate_source != plan.kv_source:
+                    raise ValueError("C1A candidates must use the same KV producer")
+                for name in ("index_cache", "index_cache_scale", "compressor_wkv", "compressor_norm_weight",
+                             "index_wk", "index_norm_weight"):
+                    current[name] = kv[name]
+                current["candidate_mask"] = candidate["candidate_mask"]
+                if mode == "reuse":
+                    for name in ("index_wq_b", "index_wq_b_scale", "index_weights_proj"):
+                        current[name] = index[name]
+                    current["compressed_indices"] = index["topk_indices"]
+                if current["compressed_indices"] is current["topk_indices"]:
+                    raise ValueError("C1A index ABI arguments require separate allocations")
+            elif mode == "reuse":
+                current["compressed_indices"] = index["topk_indices"]
+        elif any(source is not None for source in (plan.kv_source, plan.index_source, plan.candidate_source)):
+            raise ValueError("SWA must not declare compressed producers")
+        result[plan.layer_id], seen[plan.layer_id] = current, plan
+    return result
+
+
+def compile_prefill_segments(compiler, lib_root, topology, modes):
+    """Compile existing composite entries, sharing one packed-FP4 MoE program.
+
+    C1A uses the SP program exposed by the current prefill_c1a_full module.
+    No model operators are composed by this serving module.
+    """
+    import pypto.language as pl
+
+    modes = tuple(dict.fromkeys(modes))
+    if not modes or any(mode not in PREFILL_ARGUMENTS for mode in modes):
+        raise ValueError("unsupported or empty prefill mode selection")
+    swa, moe = load_segment_modules(lib_root, topology)
+    attention = {}
+    for mode in modes:
+        if mode == "swa":
+            entry = swa.make_hc_program(topology.capacity, topology.world, epochs=1)
+        elif mode.startswith("c2a_"):
+            module = importlib.import_module("models.deepseek_v4_1_flash.prefill_" + mode)
+            entry = module.make_hc_program(topology.capacity, topology.world, epochs=1)
+        else:
+            module = importlib.import_module("models.deepseek_v4_1_flash.prefill_c1a_full")
+            entry = module.make_c1a_sp_program(mode.removeprefix("c1a_"), topology.world, epochs=1)
+        if tuple(entry.param_names) != tuple(PREFILL_ARGUMENTS[mode]):
+            raise ValueError(f"{mode} prefill parameter order disagrees with the selected lib")
+        attention[mode] = compiler.compile("v41_prefill_" + mode, entry, attention_epoch=pl.RUNTIME)
+    if tuple(moe.l3_moe.param_names) != tuple(MOE_ARGS):
+        raise ValueError("prefill MoE parameter order disagrees with the selected lib")
+    ffn = compiler.compile("v41_moe_segment", moe.l3_moe, moe_epoch=pl.RUNTIME)
+    return attention, ffn
+
 
 def compile_prefill_fwd(compiler, lib_root, topology):
     """Compile the lib's complete CED prefill at the serving row capacity."""
@@ -1261,6 +1826,62 @@ def compile_prefill_fwd(compiler, lib_root, topology):
         raise ValueError("lib prefill_fwd was imported for another capacity or EP topology")
     entry = module.l3_prefill_fwd
     return compiler.compile("v41_prefill_fwd", entry), tuple(entry.param_names)
+
+
+class PrefillSegment(SwaSegment):
+    """Carry device residual/pre_mix through a selected prefill mode and MoE.
+
+    The worker must own all supplied programs via make_segment_worker(). Each
+    Attention program advances its own epoch; the shared MoE advances on every
+    layer. Cache ownership, cross-layer producer bindings and padded metadata
+    remain caller responsibilities. Any runtime failure poisons the whole worker.
+    """
+
+    def __init__(self, worker, attention_programs, moe_program, topology,
+                 attention_counts, moe_counts, run_config):
+        if not attention_programs or any(mode not in PREFILL_ARGUMENTS for mode in attention_programs):
+            raise ValueError("unsupported or empty prefill program set")
+        self.attention_programs = dict(attention_programs)
+        super().__init__(worker, (next(iter(attention_programs.values())), moe_program),
+                         topology, attention_counts, moe_counts, run_config)
+
+    def run_layer(self, state, attention, moe, *, group_counts, mode):
+        if mode not in self.attention_programs:
+            raise ValueError(f"prefill mode was not compiled: {mode}")
+        return self._run_layer(
+            state, attention, moe, group_counts=group_counts,
+            attention_program=self.attention_programs[mode], argument_names=PREFILL_ARGUMENTS[mode],
+            input_mix="incoming_pre_mix" if mode == "swa" else "pre_mix",
+            output_residual="output" if mode == "swa" else "x_hc_out",
+        )
+
+    def run_chain(self, state, plans, attention, moe, *, group_counts):
+        """Execute one request step through its producers and consumers in order.
+
+        The resource owner must prepare every layer for the SAME packed step
+        and retain all allocations until this synchronous call returns. This
+        is still a bounded prefill segment, not a complete serving backend.
+        """
+        plans = tuple(plans)
+        bound = bind_prefill_producers(plans, attention)
+        self.topology.counts(group_counts)
+        # Resolve the whole chain before any cache mutation. Runtime state,
+        # active counts and per-program epochs are provided by run_layer.
+        dynamic = {"x_hc", "pre_mix", "incoming_pre_mix", "num_tokens", "attention_epoch", "moe_epoch"}
+        for plan in plans:
+            if plan.mode not in self.attention_programs:
+                raise ValueError(f"prefill mode was not compiled: {plan.mode}")
+            for name in PREFILL_ARGUMENTS[plan.mode]:
+                if name not in dynamic:
+                    bound[plan.layer_id][name]
+            for name in MOE_ARGS:
+                if name not in dynamic:
+                    moe[plan.layer_id][name]
+            self._check_weights(moe[plan.layer_id])
+        for plan in plans:
+            state = self.run_layer(state, bound[plan.layer_id], moe[plan.layer_id],
+                                   group_counts=group_counts, mode=plan.mode)
+        return state
 
 
 # segment_inputs
@@ -1517,6 +2138,95 @@ def collect_final_logits(logits: torch.Tensor, rows: FinalOutputRows) -> torch.T
     return result
 
 
+def make_final_output_program(lib_root, topology):
+    load_segment_modules(lib_root, topology)
+    previous_argv = sys.argv[:]
+    try:
+        sys.argv = [previous_argv[0], "--tp", str(topology.tp), "--dp", str(topology.dp)]
+        lm_head = importlib.import_module("models.deepseek_v4_1_flash.lm_head")
+    finally:
+        sys.argv = previous_argv
+    if hasattr(lm_head, "l3_final_output"):
+        if (lm_head.TP_SIZE, lm_head.DP_SIZE, lm_head.WORLD_SIZE) != (
+                topology.tp, topology.dp, topology.world):
+            raise ValueError("V4.1 final output was imported for a different topology")
+        return lm_head.l3_final_output
+    from . import final_output as module
+    return module.make_final_output_program(topology.tp, topology.dp)
+
+
+def compile_final_output(compiler, lib_root, topology):
+    import pypto.language as pl
+
+    entry = make_final_output_program(lib_root, topology)
+    param_names = tuple(entry.param_names)
+    if "done_epoch" in param_names:
+        program = compiler.compile("v41_final_output", entry, done_epoch=pl.RUNTIME)
+    else:
+        program = compiler.compile("v41_final_output", entry)
+    return program, param_names
+
+
+class FinalOutput:
+    """Dispatch final logits under the selected lib communication contract."""
+
+    def __init__(self, worker, program, param_names, run_config):
+        self.worker = worker
+        self.program = program
+        self.param_names = tuple(param_names)
+        self.run_config = run_config
+        self.epoch = 0
+        self.failed = False
+        legacy = {"x_hc", "pre_mix", "norm_weight", "head_weight", "logit_row_indices",
+                  "normed", "logits", "sampled_ids", "done_epoch"}
+        current = {"x_hc", "pre_mix", "final_norm_weight", "lm_head_weight",
+                   "logit_row_indices", "logits", "sampled_ids"}
+        names = set(self.param_names)
+        if names not in (legacy, current) or len(self.param_names) != len(names):
+            raise ValueError("final output ABI differs from the lib composite")
+        self.fresh_windows = names == current
+
+    def run(self, state: LayerState, arguments):
+        if self.failed:
+            raise RuntimeError("output dispatch failed; close the worker before retrying")
+        if state.layout != "tp_local_token":
+            raise ValueError("final output requires TP-local residual and pre_mix")
+        reserved = {"x_hc", "pre_mix"}
+        if not self.fresh_windows:
+            reserved.add("done_epoch")
+        if reserved & arguments.keys():
+            raise ValueError("final state and epoch must come from this dispatch")
+        missing = set(self.param_names) - reserved - arguments.keys()
+        if missing:
+            raise ValueError("missing output ABI arguments: " + ", ".join(sorted(missing)))
+        if not self.fresh_windows and self.epoch >= (2**31 - 1) // 16:
+            raise OverflowError("output completion epoch exhausted; recreate worker")
+        reset_windows = not self.fresh_windows and self.epoch == 128
+        next_epoch = 1 if reset_windows else self.epoch + 1
+        bound = dict(arguments, x_hc=state.residual, pre_mix=state.pre_mix)
+        if not self.fresh_windows:
+            bound["done_epoch"] = ctypes.c_int32(next_epoch)
+        if reset_windows:
+            if not getattr(self.worker, "_persistent", False) or not hasattr(
+                self.worker, "_reset_persistent_windows"
+            ):
+                raise RuntimeError("final output window reset requires a persistent PyPTO worker")
+            previous_reset = self.worker._reset_persistent_windows
+            self.worker._reset_persistent_windows = True
+        try:
+            self.worker.run(self.program.compiled, *(bound[name] for name in self.param_names),
+                            config=self.run_config)
+        except BaseException:
+            self.failed = True
+            raise
+        finally:
+            if reset_windows:
+                self.worker._reset_persistent_windows = previous_reset
+        if not self.fresh_windows:
+            self.epoch = next_epoch
+        return arguments["logits"], arguments["sampled_ids"]
+
+
 # input_resources
 @dataclass(frozen=True)
 class InputHostResources:
@@ -1593,13 +2303,93 @@ class InputStateRuntime:
         self._resident.clear()
 
 
+# prefill_layer_resources
+class PrefillLayerResources:
+    """Own only transient device buffers; weight and cache handles are borrowed."""
+
+    def __init__(self, worker, topology, plans, weights, cache, metadata, *,
+                 kv_sources, index_sources, c2a_sources, max_seq_len, index_topk=512):
+        self.worker = worker
+        self.topology = topology
+        self.plans = tuple(plans)
+        self.metadata = metadata
+        if (not self.plans or any(plan.mode not in PREFILL_ARGUMENTS for plan in self.plans)
+                or any(type(n) is not int or n <= 0 for n in (max_seq_len, index_topk))):
+            raise ValueError("prefill binding requires ordered modes and positive model capacities")
+        self._owned = []
+        world, local, tokens = topology.world, topology.local_capacity, topology.capacity
+
+        def allocate(shape, dtype):
+            value = alloc_device_buffer(worker, shape, dtype, stacked=True)
+            self._owned.append(value)
+            return value
+
+        try:
+            states = [(allocate((world, local, 4, 5120), torch.float32),
+                       allocate((world, local, 4), torch.float32)) for _ in range(3)]
+            attention_hidden = allocate((world, tokens, 5120), torch.bfloat16)
+            attention_out = allocate((world, local, 5120), torch.bfloat16)
+            moe_mixed = allocate((world, local, 5120), torch.bfloat16)
+            topk = {plan.layer_id: allocate((world, tokens, index_topk), torch.int32)
+                    for plan in self.plans if plan.index_source == plan.layer_id}
+            unused_topk = allocate((world, tokens, index_topk), torch.int32)
+            unused_indices = allocate((world, tokens, index_topk), torch.int32)
+            candidate = {plan.layer_id: allocate((world, tokens, max_seq_len), torch.uint8)
+                         for plan in self.plans if plan.mode == "c1a_full"}
+            attention, moe = {}, {}
+            for plan in self.plans:
+                layer = plan.layer_id
+                a, m = weights.prefill_weights(
+                    plan, kv_sources=kv_sources, index_sources=index_sources,
+                    c2a_sources=c2a_sources)
+                a = dict(a, **cache.prefill_views(
+                    plan, kv_sources=kv_sources, index_sources=index_sources,
+                    c2a_sources=c2a_sources))
+                a.update(metadata.arguments(plan.mode))
+                attn_residual, attn_mix = states[(2 * layer) % 3]
+                moe_residual, moe_mix = states[(2 * layer + 1) % 3]
+                a.update(attn_input=attention_hidden, attn_output=attention_out,
+                         hidden=attention_hidden, attn_out=attention_out,
+                         output=attn_residual, x_hc_out=attn_residual,
+                         next_pre_mix=attn_mix)
+                if plan.mode.startswith("c1a_"):
+                    a.update(topk_indices=topk.get(layer, unused_topk),
+                             compressed_indices=unused_indices,
+                             candidate_mask=candidate[plan.candidate_source])
+                elif plan.mode == "c2a_full":
+                    a["topk_indices"] = topk[layer]
+                elif plan.mode == "c2a_reuse":
+                    a["compressed_indices"] = unused_indices
+                m = dict(m, next_pre_mix=moe_mix, x_next=moe_residual, x_mixed=moe_mixed)
+                attention[layer], moe[layer] = a, m
+            bound = bind_prefill_producers(self.plans, attention)
+            dynamic = {"x_hc", "pre_mix", "incoming_pre_mix", "num_tokens",
+                       "attention_epoch", "moe_epoch"}
+            for plan in self.plans:
+                missing_a = set(PREFILL_ARGUMENTS[plan.mode]) - dynamic - bound[plan.layer_id].keys()
+                missing_m = set(MOE_ARGS) - dynamic - moe[plan.layer_id].keys()
+                if missing_a or missing_m:
+                    raise ValueError(f"layer {plan.layer_id} has unbound prefill ABI fields: "
+                                     f"{sorted(missing_a | missing_m)}")
+            self.attention, self.moe = bound, moe
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        for value in reversed(self._owned):
+            self.worker.free_stacked_tensor(value)
+        self._owned.clear()
+
+
 # prefill_metadata_resources
 class PrefillMetadataResources:
-    """Keep C2A and C1A page/length contracts separate for full forwards."""
+    """Keep C2A and C1A page/length contracts separate across one layer chain."""
 
     def __init__(self, topology, *, max_seq_len, max_requests, window_pages,
                  c2a_pages, c1a_pages, rope_tables, compressed_rope_tables,
-                 full_hidden_size=None):
+                 full_hidden_size=None, engram_width=None, dspark_hidden_size=None,
+                 engram_lookup_fn=None):
         if any(type(value) is not int or value <= 0 for value in
                (max_seq_len, max_requests, window_pages, c2a_pages, c1a_pages)):
             raise ValueError("prefill metadata capacities must be positive integers")
@@ -1617,6 +2407,15 @@ class PrefillMetadataResources:
         self.full_hidden_size = full_hidden_size
         if full_hidden_size is not None and (type(full_hidden_size) is not int or full_hidden_size <= 0):
             raise ValueError("full prefill hidden size must be positive")
+        for value, name in ((engram_width, "engram width"),
+                            (dspark_hidden_size, "DSpark hidden size")):
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ValueError(f"{name} must be positive")
+        self.engram_width = engram_width
+        self.dspark_hidden_size = dspark_hidden_size
+        if engram_lookup_fn is not None and not callable(engram_lookup_fn):
+            raise TypeError("Engram lookup provider must be callable")
+        self.engram_lookup_fn = engram_lookup_fn
 
         def shared(name, shape, dtype, fill=0):
             value = torch.empty(shape, dtype=dtype).share_memory_()
@@ -1671,6 +2470,14 @@ class PrefillMetadataResources:
             shared("full_token_requests", (world, 2, tokens), torch.int32, -1)
             shared("full_query_starts", (world, 2, max_requests + 1), torch.int32)
             shared("full_logit_rows", (world, 16), torch.int32, -1)
+        if engram_width is not None:
+            # Host rows are populated from the request's Engram history before
+            # dispatch. The table itself remains checkpoint-backed and lazy.
+            shared("engram_lookup", (world, 2, tokens, engram_width), torch.bfloat16)
+        if dspark_hidden_size is not None:
+            # The target hidden is an output of the complete backbone and is
+            # retained for the following DSpark drafter dispatch.
+            shared("dspark_target_hidden", (world, tokens, dspark_hidden_size), torch.bfloat16)
 
     @property
     def inherited_host_tensors(self):
@@ -1723,6 +2530,25 @@ class PrefillMetadataResources:
             else:
                 self.fields["compressed_rope_cos"].copy_(rows[0])
                 self.fields["compressed_rope_sin"].copy_(rows[1])
+        if self.engram_width is not None:
+            lookup = self.fields["engram_lookup"]
+            lookup.zero_()
+            if self.engram_lookup_fn is None:
+                raise MissingCompositeInterface(
+                    "V4.1 Engram-enabled lib requires a request lookup provider")
+            offsets = [0] * self.topology.world
+            for request in step.requests:
+                count = len(request.token_ids)
+                offset = offsets[request.partition]
+                rows = self.engram_lookup_fn(
+                    torch.tensor(request.token_ids, dtype=torch.int64), count,
+                    request.start, request.request_id)
+                if (not isinstance(rows, torch.Tensor) or rows.device.type != "cpu"
+                        or rows.dtype != torch.bfloat16
+                        or tuple(rows.shape) != (2, count, self.engram_width)):
+                    raise ValueError("Engram lookup provider returned an invalid host shape")
+                lookup[request.partition, :, offset:offset + count].copy_(rows)
+                offsets[request.partition] += count
         return swa.group_counts
 
     def stage_full(self, step, embeddings):
@@ -1787,7 +2613,40 @@ class PrefillMetadataResources:
             "c1a_compressed_slots": "c1a_compressed_slots",
             "state_block_table": "c2a_state_block_table",
         }
+        for name in ("engram_lookup", "dspark_target_hidden"):
+            if name in f:
+                names[name] = name
         return {name: f[source] for name, source in names.items()}
+
+    def arguments(self, mode):
+        common = {name: self.fields[name] for name in
+                  ("window_slots", "window_indices", "rope_cos", "rope_sin")}
+        if mode == "swa":
+            return common
+        if mode not in ("c2a_full", "c2a_reuse", "c1a_full", "c1a_reindex", "c1a_reuse"):
+            raise ValueError("unknown V4.1 prefill metadata mode")
+        prefix = mode[:3]
+        names = ("request_ids", "compressed_lens", "compressed_slots", "index_block_table")
+        result = dict(common, **{name: self.fields[prefix + "_" + name] for name in names})
+        if mode == "c2a_full":
+            result.update({
+                "freqs_cos": self.fields["freqs_cos"],
+                "freqs_sin": self.fields["freqs_sin"],
+                "compressed_freqs_cos": self.fields["compressed_freqs_cos"],
+                "compressed_freqs_sin": self.fields["compressed_freqs_sin"],
+                "token_to_req_indices": result["request_ids"],
+                "position_ids": self.fields["c2a_position_ids"],
+                "compressed_rope_positions": self.fields["c2a_compressed_rope_positions"],
+                "compressed_rope_cos": self.fields["c2a_compressed_rope_cos"],
+                "compressed_rope_sin": self.fields["c2a_compressed_rope_sin"],
+                "query_start_loc": self.fields["c2a_query_start_loc"],
+                "state_block_table": self.fields["c2a_state_block_table"],
+            })
+        elif mode.startswith("c1a_"):
+            result["compressed_rope_cos"] = self.fields["compressed_rope_cos"]
+            result["compressed_rope_sin"] = self.fields["compressed_rope_sin"]
+        return result
+
 
 # final_output_resources
 @dataclass(frozen=True)
@@ -1812,7 +2671,8 @@ def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
                                      max_logit_rows: int = 16, chunk_rows: int = 64,
                                      max_host_bytes: int = 16 << 30) -> FinalOutputHostResources:
     """Load one TP vocabulary shard at a time before the worker forks."""
-    if not isinstance(topology, SegmentTopology) or (topology.tp, topology.dp) not in ((1, 4), (1, 8)):
+    if (not isinstance(topology, SegmentTopology) or topology.tp != 1
+            or topology.dp not in (4, 8)):
         raise ValueError("V4.1 final output requires TP1/DP4 or TP1/DP8 placement")
     if any(type(value) is not int or value <= 0 for value in
            (max_logit_rows, chunk_rows, max_host_bytes)):
@@ -1858,17 +2718,18 @@ def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
     return FinalOutputHostResources(norm, head, indices, logits, sampled)
 
 
-class FinalOutputWeights:
-    """Keep output weights resident for the full lib forwards.
+class FinalOutputRuntime:
+    """Keep output weights resident and stage only request rows per dispatch.
 
     The host resources must exist before the shared DistributedWorker forks.
     The caller owns and closes the worker after this runtime releases its tensors.
     """
 
-    def __init__(self, worker, topology: SegmentTopology, host: FinalOutputHostResources):
+    def __init__(self, worker, program, param_names, run_config, topology: SegmentTopology,
+                 host: FinalOutputHostResources, *, prefill_local_capacity: int | None = None):
         if not isinstance(host, FinalOutputHostResources) or not isinstance(topology, SegmentTopology):
             raise ValueError("final output requires host resources and a segment topology")
-        world = topology.world
+        world, local = topology.world, topology.local_capacity
         if any(not tensor.is_shared() for tensor in host.all_host_tensors):
             raise ValueError("final output host buffers must be shared before worker creation")
         if (host.norm_weight.dtype != torch.bfloat16 or host.norm_weight.shape != (world, host.head_weight.shape[-1])
@@ -1877,22 +2738,97 @@ class FinalOutputWeights:
                 or host.logits.dtype != torch.float32
                 or host.logits.shape != (world, 16, host.head_weight.shape[1] * topology.tp)
                 or host.sampled_ids.dtype != torch.int32 or host.sampled_ids.shape != (world, 16, 8)):
-            raise ValueError("final output host buffers disagree with the lib TP1/DP ABI")
+            raise ValueError("final output host buffers disagree with the lib TP1/DP4 or TP1/DP8 ABI")
         self.worker, self.host, self.topology = worker, host, topology
+        if (prefill_local_capacity is not None and
+                (type(prefill_local_capacity) is not int or not 0 < prefill_local_capacity <= 1024)):
+            raise ValueError("prefill output capacity must fit the M0 boundary")
+        self.dispatcher = FinalOutput(worker, program, param_names, run_config)
         self._resident = []
         try:
             self.norm_weight = worker.alloc_stacked_tensor(host.norm_weight)
             self._resident.append(self.norm_weight)
             self.head_weight = worker.alloc_stacked_tensor(host.head_weight)
             self._resident.append(self.head_weight)
+            self._normed_by_capacity = {}
+            if not self.dispatcher.fresh_windows:
+                normed = alloc_device_buffer(
+                    worker, (world, local, host.head_weight.shape[-1]), torch.bfloat16, stacked=True,
+                )
+                self._resident.append(normed)
+                self._normed_by_capacity[local] = normed
+                if prefill_local_capacity is not None and prefill_local_capacity != local:
+                    prefill_normed = alloc_device_buffer(
+                        worker, (world, prefill_local_capacity, host.head_weight.shape[-1]),
+                        torch.bfloat16, stacked=True)
+                    self._resident.append(prefill_normed)
+                    self._normed_by_capacity[prefill_local_capacity] = prefill_normed
         except BaseException:
             self.close()
             raise
+
+    def run(self, state, inputs):
+        local = inputs.row_indices.shape[1]
+        normed = self._normed_by_capacity.get(local)
+        if not self.dispatcher.fresh_windows and normed is None:
+            raise ValueError("final output capacity was not preallocated before worker dispatch")
+        rows = prepare_final_output_rows(
+            inputs, self.host.logit_row_indices, local_capacity=local,
+        )
+        self.host.logits.zero_()
+        self.host.sampled_ids.fill_(-1)
+        arguments = {
+            "logit_row_indices": self.host.logit_row_indices,
+            "logits": self.host.logits,
+            "sampled_ids": self.host.sampled_ids,
+        }
+        if self.dispatcher.fresh_windows:
+            arguments.update(final_norm_weight=self.norm_weight, lm_head_weight=self.head_weight)
+        else:
+            arguments.update(norm_weight=self.norm_weight, head_weight=self.head_weight, normed=normed)
+        self.dispatcher.run(state, arguments)
+        return collect_final_logits(self.host.logits, rows)
 
     def close(self):
         for tensor in reversed(self._resident):
             self.worker.free_stacked_tensor(tensor)
         self._resident.clear()
+
+
+class ResidentPrefillBank:
+    """Stream checkpoint weights into the lib's five packed device banks."""
+
+    def __init__(self, worker, manifest):
+        from pypto.runtime import StackedDeviceTensor
+
+        self.worker = worker
+        self.tensors = {}
+        self._owned = []
+        layouts = manifest.tensor_layouts
+        try:
+            for rank in range(manifest.ranks):
+                handles = {}
+                for name, (shape, dtype) in layouts.items():
+                    handle = worker.alloc_tensor(shape, dtype, worker_id=rank)
+                    self._owned.append((rank, handle))
+                    handles[name] = handle
+                    self.tensors.setdefault(name, []).append(handle)
+                manifest.upload(worker, rank, handles)
+            self.tensors = {
+                name: StackedDeviceTensor(tuple(shards),
+                                          (manifest.ranks, *layouts[name][0]),
+                                          range(manifest.ranks))
+                for name, shards in self.tensors.items()
+            }
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        for rank, handle in reversed(self._owned):
+            self.worker.free_tensor(handle, worker_id=rank)
+        self._owned.clear()
+        self.tensors.clear()
 
 
 class PrefillForwardSegment:
@@ -1954,15 +2890,304 @@ class PrefillForwardSegment:
         self._owned.clear()
 
 
+class ResidentDSparkWeights:
+    """Upload deferred DSpark weights one EP rank and layer at a time.
+
+    The checkpoint contract deliberately exposes bounded ``load_layer_packed``
+    reads.  Keep that property here: the worker owns the final ``[EP, 3, ...]``
+    tensors while only one rank/layer temporary exists on the host.
+    """
+
+    def __init__(self, worker, model_dir, world):
+        from pypto.runtime import StackedDeviceTensor
+
+        from .dspark_weights import V41DSparkWeightContract
+        from .weight_loader import V41WeightLoader
+
+        self.worker = worker
+        self.tensors = {}
+        self._owned = []
+        contracts = [
+            V41DSparkWeightContract(V41WeightLoader(
+                model_dir, tp_size=1, tp_rank=0, ep_size=world, ep_rank=rank,
+                max_load_bytes=512 << 20,
+            )) for rank in range(world)
+        ]
+        try:
+            # Heads are replicated over EP.  Read them once and upload one copy
+            # to every rank; the three draft layers remain rank-local.
+            heads = contracts[0].load_heads().tensors
+            for name, value in heads.items():
+                shards = []
+                for rank in range(world):
+                    shard = worker.alloc_tensor(tuple(value.shape), value.dtype, worker_id=rank)
+                    self._owned.append((rank, shard))
+                    self._copy(worker, shard, value, rank)
+                    shards.append(shard)
+                self.tensors[name] = StackedDeviceTensor(
+                    tuple(shards), (world, *value.shape), tuple(range(world)))
+
+            layer_shapes = {}
+            layer_handles = {}
+            # Stream one rank/layer at a time.  In particular, do not retain
+            # the 3-layer expert payloads for all EP ranks on the host.
+            for rank, contract in enumerate(contracts):
+                for layer in range(3):
+                    packed = contract.load_layer_packed(layer).tensors
+                    for name, value in packed.items():
+                        shape = tuple(value.shape)
+                        previous = layer_shapes.get(name)
+                        if previous is not None and previous != (shape, value.dtype):
+                            raise ValueError(f"DSpark rank/layer shape mismatch for {name}")
+                        layer_shapes[name] = (shape, value.dtype)
+                        handles = layer_handles.setdefault(name, [None] * world)
+                        if handles[rank] is None:
+                            handles[rank] = worker.alloc_tensor(
+                                (3, *shape), value.dtype, worker_id=rank)
+                            self._owned.append((rank, handles[rank]))
+                        self._copy(
+                            worker, handles[rank], value, rank,
+                            offset=layer * value.numel() * value.element_size(),
+                        )
+                    del packed
+            for name, (shape, dtype) in layer_shapes.items():
+                handles = layer_handles[name]
+                if any(handle is None for handle in handles):
+                    raise ValueError(f"DSpark layer field {name} was not loaded for every EP rank")
+                self.tensors[name] = StackedDeviceTensor(
+                    tuple(handles), (world, 3, *shape), tuple(range(world)))
+        except BaseException:
+            self.close()
+            raise
+
+        from .dspark_weights import mxfp4_pair_lut
+        lut = mxfp4_pair_lut()
+        shards = []
+        for rank in range(world):
+            shard = worker.alloc_tensor(tuple(lut.shape), lut.dtype, worker_id=rank)
+            self._owned.append((rank, shard))
+            self._copy(worker, shard, lut, rank)
+            shards.append(shard)
+        self.tensors["mxfp4_pair_lut"] = StackedDeviceTensor(
+            tuple(shards), (world, *lut.shape), tuple(range(world)))
+
+    @staticmethod
+    def _copy(worker, destination, source, rank, *, offset=0):
+        destination_ptr = destination.data_ptr
+        if callable(destination_ptr):
+            destination_ptr = destination_ptr()
+        worker.copy_to(
+            destination_ptr, source.data_ptr(), source.numel() * source.element_size(),
+            dst_offset=offset, worker_id=rank,
+        )
+
+    def full(self, name):
+        return self.tensors[name]
+
+    def close(self):
+        for rank, tensor in reversed(self._owned):
+            self.worker.free_tensor(tensor, worker_id=rank)
+        self._owned.clear()
+        self.tensors.clear()
+
+
+class ResidentDSparkEmbedding:
+    """Stream the full target embedding into one device shard per EP rank."""
+
+    def __init__(self, worker, model_dir, world, *, chunk_rows=256):
+        from pypto.runtime import StackedDeviceTensor
+        from .weight_loader import V41WeightLoader
+
+        self.worker = worker
+        self._owned = []
+        first = V41WeightLoader(model_dir, tp_size=1, tp_rank=0, ep_size=world, ep_rank=0)
+        vocab, hidden = first.config.vocab_size, first.config.hidden_size
+        shards = []
+        try:
+            for rank in range(world):
+                loader = first if rank == 0 else V41WeightLoader(
+                    model_dir, tp_size=1, tp_rank=0, ep_size=world, ep_rank=rank)
+                shard = worker.alloc_tensor((vocab, hidden), torch.bfloat16, worker_id=rank)
+                self._owned.append((rank, shard))
+                row_bytes = hidden * 2
+                for start in range(0, vocab, chunk_rows):
+                    stop = min(start + chunk_rows, vocab)
+                    value = loader.load_rows("embed.weight", start, stop).weight
+                    if value.dtype != torch.bfloat16:
+                        raise ValueError("DSpark target embedding must be BF16")
+                    destination_ptr = shard.data_ptr
+                    if callable(destination_ptr):
+                        destination_ptr = destination_ptr()
+                    worker.copy_to(
+                        destination_ptr, value.data_ptr(), value.numel() * value.element_size(),
+                        dst_offset=start * row_bytes, worker_id=rank,
+                    )
+                    del value
+                shards.append(shard)
+        except BaseException:
+            self.close()
+            raise
+        self.tensor = StackedDeviceTensor(tuple(shards), (world, vocab, hidden), tuple(range(world)))
+
+    def close(self):
+        for rank, tensor in reversed(self._owned):
+            self.worker.free_tensor(tensor, worker_id=rank)
+        self._owned.clear()
+        self.tensor = None
+
+
+class ResidentDSparkCache:
+    """Private sliding-window KV pools for the three draft layers."""
+
+    def __init__(self, worker, world, max_seq_len):
+        from .dspark_resources import DSPARK_DRAFT_LAYERS, DSPARK_WINDOW
+
+        self.worker = worker
+        blocks = (max_seq_len + DSPARK_WINDOW - 1) // DSPARK_WINDOW
+        self.window_cache = alloc_device_buffer(
+            worker, (world, DSPARK_DRAFT_LAYERS, blocks, DSPARK_WINDOW, 1, 512),
+            torch.float8_e4m3fn, stacked=True)
+        self.window_cache_scale = alloc_device_buffer(
+            worker, (world, DSPARK_DRAFT_LAYERS, blocks, DSPARK_WINDOW, 1, 16),
+            torch.bfloat16, stacked=True)
+
+    def close(self):
+        for name in ("window_cache", "window_cache_scale"):
+            tensor = getattr(self, name, None)
+            if tensor is not None:
+                self.worker.free_stacked_tensor(tensor)
+                setattr(self, name, None)
+
+
+@dataclass(frozen=True)
+class _DSparkDeviceState:
+    slot_ids: object
+    generations: object
+    tokens: object
+    meta: object
+
+    def __getitem__(self, name):
+        return getattr(self, {"state_tokens": "tokens", "state_meta": "meta"}.get(name, name))
+
+
+class ResidentDSparkBuffers:
+    """Persistent device state and scratch buffers for the DSpark composites."""
+
+    def __init__(self, worker, host_resources):
+        from .dspark_resources import DSparkHostState
+
+        self.worker = worker
+        self.host = host_resources
+        self._owned = []
+        try:
+            self.state = DSparkHostState(*(
+                self._alloc(value) for value in host_resources.state.values()
+            ))
+            self.decode_workspace = {
+                name: self._alloc(value) for name, value in host_resources.decode_workspace.items()
+            }
+            self.prefill_workspace = {}
+            for name, value in host_resources.prefill_workspace.items():
+                # Common buffers are intentionally shared between the two
+                # phases; dynamic prompt-axis buffers have distinct shapes.
+                common = host_resources.decode_workspace.get(name)
+                if common is value:
+                    self.prefill_workspace[name] = self.decode_workspace[name]
+                else:
+                    self.prefill_workspace[name] = self._alloc(value)
+            self.cache_tables = {name: self._alloc(value)
+                                 for name, value in host_resources.cache_tables.items()}
+            self.rope_tables = {name: self._alloc(value)
+                                for name, value in host_resources.rope_tables.items()}
+        except BaseException:
+            self.close()
+            raise
+
+    def _alloc(self, host):
+        value = alloc_device_buffer(self.worker, tuple(host.shape), host.dtype, stacked=True)
+        self._owned.append(value)
+        self._copy(host, value)
+        return value
+
+    def _copy(self, host, device):
+        for rank, shard in enumerate(device.shards):
+            destination = shard.data_ptr
+            if callable(destination):
+                destination = destination()
+            self.worker.copy_to(
+                destination, host[rank].data_ptr(),
+                host[rank].numel() * host.element_size(), dst_offset=0, worker_id=rank,
+            )
+
+    def sync(self, name, *, phase="decode"):
+        host = self.host.for_phase(phase).get(name)
+        device = (self.prefill_workspace if phase == "prefill" else self.decode_workspace).get(name)
+        if host is None or device is None:
+            raise ValueError(f"unknown DSpark {phase} workspace field: {name}")
+        self._copy(host, device)
+
+    def sync_state(self):
+        for host, device in zip(self.host.state.values(), self.state.values(), strict=True):
+            self._copy(host, device)
+
+    def sync_cache_tables(self):
+        for name, device in self.cache_tables.items():
+            self._copy(self.host.cache_tables[name], device)
+
+    def reset_slot(self, rank, slot, generation):
+        host = self.host.state
+        host.tokens[rank, slot].zero_()
+        host.meta[rank, slot].zero_()
+        host.meta[rank, slot, 1] = generation
+        self._copy(host.tokens, self.state.tokens)
+        self._copy(host.meta, self.state.meta)
+
+    def close(self):
+        for tensor in reversed(self._owned):
+            self.worker.free_stacked_tensor(tensor)
+        self._owned.clear()
+
+
 # resident_resources
+class _DSparkOrchestratorRunner:
+    """Adapt the lib's callable stage runner to resident serving resources."""
+
+    def __init__(self, resources, phase):
+        self.resources = resources
+        self.expected = PREFILL_STAGE_ORDER if phase == "prefill" else DECODE_STAGE_ORDER
+        self.index = 0
+
+    def __call__(self, _entry, arguments):
+        if self.index >= len(self.expected):
+            raise RuntimeError("V4.1 DSpark lib emitted more stages than its ABI")
+        stage = self.expected[self.index]
+        self.index += 1
+        self.resources.dispatch_dspark(stage, arguments)
+
+    def finish(self):
+        if self.index != len(self.expected):
+            raise RuntimeError(
+                "V4.1 DSpark lib emitted an incomplete stage sequence: "
+                f"{self.index}/{len(self.expected)}"
+            )
+
+
 class V41ResidentResources:
-    """Own full-forward programs, buffers and shared host mappings until close."""
+    """Own resident buffers and their shared host mappings until worker close.
+
+    This is the resource lifetime for a production binding, not an executable
+    binding by itself: the caller still has to lower every prefill/decode ABI
+    argument and dispatch the compiled layer programs.
+    """
 
     def __init__(self, programs, run_config, *, weight_bank, weight_param_names,
                  cache_plan, state_reset, page_resets, input_host, final_host,
-                 prefill_host, topology,
+                 prefill_host, final_program, final_param_names, topology,
                  decode_input_host=None, decode_host=None, worker_factory=make_segment_worker,
-                 prefill_program=None, prefill_param_names=None):
+                 prefill_program=None, prefill_param_names=None,
+                 dspark_programs=None, dspark_param_names=None, max_seq_len=None,
+                 dspark_weight_contract=None, dspark_lowering_provider=None,
+                 dspark_host_resources=None):
         weight_bank.finish(weight_param_names)
         if decode_host is not None and (decode_input_host is None or
                 decode_host.topology != decode_input_host.topology):
@@ -1972,34 +3197,64 @@ class V41ResidentResources:
                      + prefill_host.inherited_host_tensors
                      + (() if decode_host is None else decode_host.inherited_host_tensors)
                      + final_host.all_host_tensors
+                     + (() if dspark_host_resources is None
+                        else tuple(dspark_host_resources.state.values())
+                        + tuple(dspark_host_resources.decode_workspace.values())
+                        + tuple(dspark_host_resources.prefill_workspace.values())
+                        + tuple(dspark_host_resources.cache_tables.values())
+                        + tuple(dspark_host_resources.rope_tables.values()))
                      + (state_reset, *page_resets.values()))
         if any(not tensor.is_shared() for tensor in inherited):
             raise ValueError("all inherited V4.1 host buffers must be shared before worker creation")
         if not getattr(weight_bank, "prepacked", False) and any(
                 not tensor.is_shared() for tensor in weight_bank.tensors.values()):
             raise ValueError("all inherited V4.1 host buffers must be shared before worker creation")
-        if weight_bank.prepacked:
-            weight_bank.prepare_rank_major_uploads()
+        if final_program not in programs:
+            raise ValueError("final composite must be registered on the shared worker")
 
         self.worker = worker_factory(programs, run_config,
-                                     tuple(weight_bank.tensors.values())
-                                     + tuple(weight_bank.rank_major_uploads.values()) + inherited)
+                                     tuple(weight_bank.tensors.values()) + inherited)
+        self.run_config = run_config
         self.host_resources = (weight_bank, input_host, decode_input_host, prefill_host, decode_host,
-                               final_host, state_reset, page_resets)
+                               final_host, dspark_host_resources, state_reset, page_resets)
         self.prefill_host = prefill_host
         self.decode_host = decode_host
+        self.dspark_host_resources = dspark_host_resources
+        self.dspark_weights = None
+        self.dspark_embedding = None
+        self.dspark_cache = None
+        self.dspark_buffers = None
+        self._dspark_generations = {}
         self._owned = []
         self._step = None
         self._inputs = None
         self._output_rows = None
         self._group_counts = None
+        self._prefill = None
         self._prefill_fwd = None
         self._decode_fwd = None
         self._decode_binding = None
         self._weight_bank = weight_bank
         self._weight_param_names = tuple(weight_param_names)
         self._prefill_binding = (prefill_program, prefill_param_names, run_config, topology)
+        self.dspark_programs = dict(dspark_programs or {})
+        self.dspark_param_names = dict(dspark_param_names or {})
+        if self.dspark_programs:
+            if type(max_seq_len) is not int or max_seq_len <= 0:
+                raise ValueError("DSpark resources require a positive max_seq_len")
+            self.dspark = V41DSparkRuntime(self, max_seq_len=max_seq_len)
+        else:
+            self.dspark = None
         self.weights = None
+        self.dspark_weight_contract = dspark_weight_contract
+        if dspark_lowering_provider is not None and not (
+                hasattr(dspark_lowering_provider, "lower_prefill")
+                and hasattr(dspark_lowering_provider, "lower_decode")):
+            raise TypeError(
+                "V4.1 DSpark lowering provider must expose lower_prefill and lower_decode"
+            )
+        self.dspark_lowering_provider: DSparkLoweringProvider | None = dspark_lowering_provider
+        self.failed = False
         self.closed = False
         try:
             self.weights = ResidentFullDecodeWeights(
@@ -2007,15 +3262,41 @@ class V41ResidentResources:
             self.input = self._own(InputStateRuntime(self.worker, input_host))
             self.decode_input = (None if decode_input_host is None else
                                  self._own(InputStateRuntime(self.worker, decode_input_host)))
-            self.final = self._own(FinalOutputWeights(self.worker, topology, final_host))
-            self.cache = self._own(DecodeFullCachePools(
-                self.worker, cache_plan, state_reset, page_resets))
+            self.final = self._own(FinalOutputRuntime(
+                self.worker, final_program, final_param_names, run_config, topology,
+                final_host, prefill_local_capacity=prefill_host.topology.local_capacity))
+            if callable(cache_plan):
+                slots, plan_for_slots = cache_plan(self.worker)
+                cache = allocate_cache_with_retry(
+                    self.worker, slots, plan_for_slots, state_reset, page_resets)
+            else:
+                cache = DecodeFullCachePools(self.worker, cache_plan, state_reset, page_resets)
+            self.cache = self._own(cache)
+            if self.dspark_host_resources is not None:
+                if dspark_weight_contract is None:
+                    raise MissingCompositeInterface(
+                        "V4.1 DSpark resources require the deferred checkpoint contract"
+                    )
+                self.dspark_weights = self._own(
+                    ResidentDSparkWeights(self.worker, dspark_weight_contract.loader.model_dir,
+                                          topology.world)
+                )
+                self.dspark_embedding = self._own(
+                    ResidentDSparkEmbedding(self.worker, dspark_weight_contract.loader.model_dir,
+                                            topology.world)
+                )
+                self.dspark_cache = self._own(
+                    ResidentDSparkCache(self.worker, topology.world, max_seq_len)
+                )
+                self.dspark_buffers = self._own(
+                    ResidentDSparkBuffers(self.worker, self.dspark_host_resources)
+                )
             if prefill_program is not None:
                 if prefill_param_names is None or prefill_host.full_hidden_size is None:
                     raise ValueError("full prefill binding requires its ABI and metadata")
                 self._activate_prefill()
             if decode_host is not None:
-                plan = self.cache.plan
+                plan = cache.plan
                 if decode_host.max_requests < plan.physical_request_slots:
                     raise ValueError("decode metadata must reserve the filler state slot")
                 if decode_host.window_pages < plan.physical_group_blocks[plan.family_groups.window]:
@@ -2031,6 +3312,335 @@ class V41ResidentResources:
     def _own(self, resource):
         self._owned.append(resource)
         return resource
+
+    def dspark_state_generation(self, rank: int, slot: int) -> int:
+        """Return the generation currently reserved for one local state slot."""
+        return self._dspark_generations.get((rank, slot), 1)
+
+    @staticmethod
+    def _dspark_group_pages(batch, row, group):
+        tables = getattr(batch, "block_ids_by_group", ())
+        if row < len(tables) and isinstance(tables[row], Mapping):
+            pages = tables[row].get(group)
+            if pages is not None:
+                return tuple(int(page) for page in pages)
+        blocks = getattr(batch, "block_ids", ())
+        if group == "window" and row < len(blocks):
+            return tuple(int(page) for page in blocks[row])
+        return ()
+
+    def _stage_dspark_tables(self, batch):
+        host = self.dspark_host_resources
+        if host is None or self.dspark_buffers is None:
+            raise MissingCompositeInterface("V4.1 DSpark host/device resources are not initialized")
+        tables = host.cache_tables
+        for value in tables.values():
+            value.fill_(-1)
+        request_ids = tuple(getattr(batch, "request_ids", ()))
+        partitions = tuple(getattr(batch, "cache_partitions", ()))
+        next_rows = {}
+        for row, partition_value in enumerate(partitions):
+            rank = 0 if partition_value is None else int(partition_value)
+            local_row = next_rows.get(rank, 0)
+            next_rows[rank] = local_row + 1
+            if not 0 <= rank < host.layout.dp_size or local_row >= DSPARK_MAX_BATCH_PER_DP:
+                raise ValueError("DSpark batch row exceeds the selected DP topology")
+            for group, name in (("window", "target_window"), ("c2a", "target_c2a"),
+                                ("c1a", "target_c1a")):
+                pages = self._dspark_group_pages(batch, row, group)
+                target = tables[name]
+                if len(pages) > target.shape[-1]:
+                    raise ValueError(f"DSpark {group} page table exceeds its capacity")
+                if pages:
+                    target[rank, local_row, :len(pages)] = torch.tensor(
+                        pages, dtype=target.dtype)
+                if group == "window":
+                    tables["draft"][rank, :, local_row, :len(pages)] = target[rank, local_row, :len(pages)]
+        self.dspark_buffers.sync_cache_tables()
+        return request_ids
+
+    def _build_dspark_target_model(self):
+        if self._decode_fwd is None:
+            self._activate_decode()
+        dynamic = {
+            "x_hc", "pre_mix", "dspark_target_hidden", "position_ids", "token_to_req_indices",
+            "window_slots", "window_indices", "c2a_compressed_slots", "c1a_compressed_slots",
+            "query_start_loc", "logit_row_indices", "attention_num_tokens", "moe_num_tokens",
+        }
+        target = {name: value for name, value in self._decode_fwd.arguments.items()
+                  if name not in dynamic}
+        target["embedding_weight"] = self.dspark_embedding.tensor
+        target["logit_row_indices"] = self.dspark_buffers.decode_workspace["logit_row_indices"]
+        return target
+
+    def build_dspark_payload(self, *, model, batch, phase, resources, **extra):
+        """Build real device mappings for the lib-owned DSpark orchestrator."""
+        if resources is not self.dspark_host_resources:
+            raise ValueError("DSpark payload resources do not belong to this resident worker")
+        if self.dspark_buffers is None or self.dspark_weights is None or self.dspark_embedding is None:
+            raise MissingCompositeInterface("V4.1 DSpark deferred weights and buffers are unavailable")
+        request_ids = tuple(extra.get("request_ids", getattr(batch, "request_ids", ())))
+        self._stage_dspark_tables(batch)
+        self.dspark_buffers.sync_state()
+        draft = {name: self.dspark_weights.full(name) for name in self.dspark_weights.tensors}
+        draft.update({
+            "embedding_weight": self.dspark_embedding.tensor,
+            "window_cache": self.dspark_cache.window_cache,
+            "window_cache_scale": self.dspark_cache.window_cache_scale,
+        })
+        markov = {
+            "final_norm_weight": self.final.norm_weight,
+            "lm_head_weight": self.final.head_weight,
+            **{name: self.dspark_weights.full(name) for name in (
+                "markov_w1", "markov_w2", "confidence_weight")},
+        }
+        workspace = (self.dspark_buffers.prefill_workspace if phase == "prefill"
+                     else self.dspark_buffers.decode_workspace)
+        target = {} if phase == "prefill" else self._build_dspark_target_model()
+        outputs = {
+            "accepted_counts": workspace.get("accepted_counts"),
+            "accepted_ids": workspace.get("accepted_ids"),
+            "last_sampled": workspace.get("last_sampled"),
+            "draft_ids": workspace.get("draft_ids"),
+        }
+        from .dspark_runtime import DSparkLoweredInputs
+        return DSparkLoweredInputs(
+            state=self.dspark_buffers.state,
+            workspace=workspace,
+            target_model=target,
+            draft_model=draft,
+            markov_model=markov,
+            cache_tables=self.dspark_buffers.cache_tables,
+            rope_tables=self.dspark_buffers.rope_tables,
+            attention_epoch=getattr(self, "_dspark_attention_epoch", 1),
+            moe_epoch=getattr(self, "_dspark_moe_epoch", 1),
+            logits_epoch=getattr(self, "_dspark_logits_epoch", 1),
+            outputs=outputs,
+            request_ranks=tuple(
+                0 if value is None else int(value)
+                for value in getattr(batch, "cache_partitions", ())
+            ) or None,
+        )
+
+    def _resolve_dspark_state(self, request_id):
+        """Resolve the stable scheduler slot before/after bootstrap."""
+        if self.dspark is not None and request_id in self.dspark.states.requests:
+            state = self.dspark.states.get(request_id)
+            return state.slot, state.generation
+        if self.ledger is None or request_id not in self.ledger.owners:
+            raise MissingCompositeInterface(
+                f"V4.1 DSpark request {request_id!r} has no scheduler state"
+            )
+        owner = self.ledger.owners[request_id]
+        generation = self._dspark_generations.setdefault(request_id, 1)
+        return owner.slot, generation
+
+    @staticmethod
+    def _host_tensor(value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu()
+        return torch.as_tensor(value)
+
+    def _stage_dspark_tables(self, resources, batch, request_ranks, request_rows):
+        tables = resources.cache_tables
+        for value in tables.values():
+            value.fill_(-1)
+        if not getattr(batch, "block_ids_by_group", None):
+            raise MissingCompositeInterface(
+                "V4.1 DSpark requires scheduler block_ids_by_group for all cache families"
+            )
+        window_name = self.cache_groups.window
+        c2a_name = self.cache_groups.c2a
+        c1a_name = self.cache_groups.c1a
+        for index, (rank, row) in enumerate(zip(request_ranks, request_rows, strict=True)):
+            groups = batch.block_ids_by_group[index]
+            for name, target in ((window_name, tables["target_window"]),
+                                 (c1a_name, tables["target_c1a"])):
+                pages = tuple(groups.get(name, ()))
+                if not pages:
+                    raise MissingCompositeInterface(f"DSpark request is missing {name} pages")
+                if len(pages) > target.shape[-1]:
+                    raise ValueError(f"DSpark {name} page table exceeds its ABI capacity")
+                target[rank, row, :len(pages)] = torch.tensor(pages, dtype=torch.int32)
+            pages = tuple(groups.get(c2a_name, ()))
+            if not pages:
+                raise MissingCompositeInterface(f"DSpark request is missing {c2a_name} pages")
+            if len(pages) > tables["target_c2a"].shape[-1]:
+                raise ValueError("DSpark C2A page table exceeds its ABI capacity")
+            tables["target_c2a"][rank, row, :len(pages)] = torch.tensor(pages, dtype=torch.int32)
+            draft = tables["draft"]
+            draft[rank, :, row, :len(groups[window_name])] = torch.tensor(
+                groups[window_name], dtype=torch.int32)
+
+    def _stage_dspark_decode(self, resources, batch):
+        request_ids = tuple(batch.request_ids)
+        partitions = tuple(int(value) for value in batch.cache_partitions)
+        if len(partitions) != len(request_ids):
+            raise ValueError("DSpark decode partitions must match request order")
+        rows_by_rank = {}
+        request_rows = []
+        for rank in partitions:
+            row = rows_by_rank.get(rank, 0)
+            rows_by_rank[rank] = row + 1
+            request_rows.append(row)
+        workspace = resources.decode_workspace
+        for value in workspace.values():
+            if isinstance(value, torch.Tensor):
+                value.zero_()
+        workspace["input_ids"].zero_()
+        workspace["target_positions"].fill_(-1)
+        workspace["active_widths"].zero_()
+        tokens = self._host_tensor(batch.token_ids).reshape(-1).tolist()
+        positions = self._host_tensor(batch.seq_lens).reshape(-1).tolist()
+        if len(tokens) != len(request_ids) or len(positions) != len(request_ids):
+            raise ValueError("DSpark decode token and position rows must match requests")
+        state = resources.state
+        for index, (request_id, rank, row) in enumerate(
+                zip(request_ids, partitions, request_rows, strict=True)):
+            request_state = self.dspark.states.get(request_id)
+            if len(request_state.draft_ids) != 5:
+                raise MissingCompositeInterface(
+                    f"DSpark request {request_id!r} has no five-token draft state")
+            slot, generation = self._resolve_dspark_state(request_id)
+            state.slot_ids[rank, row] = slot
+            state.generations[rank, row] = generation
+            workspace["input_ids"][rank, row, 0] = int(tokens[index])
+            workspace["input_ids"][rank, row, 1:] = torch.tensor(
+                request_state.draft_ids, dtype=torch.int64)
+            workspace["target_positions"][rank, row] = torch.arange(
+                int(positions[index]), int(positions[index]) + DSPARK_ROWS_PER_REQUEST,
+                dtype=torch.int32)
+            workspace["active_widths"][rank, row] = DSPARK_ROWS_PER_REQUEST
+            workspace["zero_prefill_tokens"][rank, row] = 0
+        self._stage_dspark_tables(resources, batch, partitions, request_rows)
+        return tuple(partitions), tuple(request_rows)
+
+    def _stage_dspark_prefill(self, resources, batch, request_ids, sampled_token_ids):
+        if len(request_ids) != 1:
+            raise ValueError("V4.1 DSpark bootstrap currently accepts one terminal request")
+        request_id = str(request_ids[0])
+        partitions = tuple(int(value) for value in getattr(batch, "cache_partitions", (0,)))
+        rank = partitions[0] if partitions else 0
+        slot, generation = self._resolve_dspark_state(request_id)
+        workspace = resources.prefill_workspace
+        for value in workspace.values():
+            if isinstance(value, torch.Tensor):
+                value.zero_()
+        prompt_length = int(batch.prompt_lens[0])
+        if not 0 < prompt_length <= resources.layout.max_prefill_tokens:
+            raise ValueError("DSpark prefill prompt exceeds the configured ABI capacity")
+        workspace["prompt_lengths"][rank, 0] = prompt_length
+        workspace["position_limits"][rank, 0] = resources.layout.max_seq_len
+        workspace["sampled_rows"][rank, 0] = prompt_length - 1
+        workspace["next_prefill_tokens"][rank, 0] = int(sampled_token_ids[0])
+        workspace["prefill_counts"][rank, 0] = prompt_length
+        workspace["first_query_positions"][rank, 0] = prompt_length
+        workspace["prefill_positions"][rank, :prompt_length] = torch.arange(
+            prompt_length, dtype=torch.int32)
+        workspace["prefill_request_ids"][rank, :prompt_length] = 0
+        workspace["prefill_sampled_ids"][rank, 0, 0] = int(sampled_token_ids[0])
+        # The full target prefill writes its three tap rows to the metadata
+        # field.  Copy only the active prefix into the DSpark-owned workspace.
+        source = self.prefill_host.fields.get("dspark_target_hidden")
+        if source is None:
+            raise MissingCompositeInterface("target prefill did not expose dspark_target_hidden")
+        workspace["prefill_target_hidden"][rank, :prompt_length].copy_(
+            source[rank, :prompt_length])
+        groups = getattr(batch, "block_ids_by_group", ())
+        if len(groups) != 1:
+            raise ValueError("DSpark bootstrap requires one cache allocation")
+        self._stage_dspark_tables(resources, batch, (rank,), (0,))
+        return request_id, slot, generation
+
+    def _dspark_payload(self, *, model, batch, phase, resources, **extra):
+        from .dspark_resources import _DRAFT_MODEL_KEYS, _MARKOV_MODEL_KEYS, _TARGET_DYNAMIC_KEYS
+
+        if self.dspark_weights is None or self.dspark_embedding is None or self.dspark_cache is None:
+            raise MissingCompositeInterface("resident DSpark weights/cache are not initialized")
+        draft = {name: self.dspark_weights.full(name) for name in _DRAFT_MODEL_KEYS
+                  if name in self.dspark_weights.tensors}
+        draft["embedding_weight"] = self.dspark_embedding.tensor
+        draft["window_cache"] = self.dspark_cache.window_cache
+        draft["window_cache_scale"] = self.dspark_cache.window_cache_scale
+        heads = self.dspark_weights
+        markov = {name: heads.full(name) for name in _MARKOV_MODEL_KEYS
+                  if name in heads.tensors}
+        markov["final_norm_weight"] = self.final.norm_weight
+        markov["lm_head_weight"] = self.final.head_weight
+        target = {}
+        if self._decode_fwd is not None:
+            target.update({name: value for name, value in self._decode_fwd.arguments.items()
+                           if name not in _TARGET_DYNAMIC_KEYS})
+        target["embedding_weight"] = self.dspark_embedding.tensor
+        if phase == "decode":
+            ranks, rows = self._stage_dspark_decode(resources, batch)
+            workspace = resources.decode_workspace
+            outputs = {name: workspace[name] for name in (
+                "accepted_counts", "accepted_ids", "last_sampled", "draft_ids", "confidences")}
+            outputs["request_rows"] = rows
+            return DSparkLoweredInputs(
+                state=resources.state, workspace=workspace, target_model=target,
+                draft_model=draft, markov_model=markov,
+                cache_tables=resources.cache_tables, rope_tables=resources.rope_tables,
+                outputs=outputs, request_ranks=ranks,
+            )
+        request_id, slot, generation = self._stage_dspark_prefill(
+            resources, batch, extra["request_ids"], extra["sampled_token_ids"])
+        workspace = resources.prefill_workspace
+        outputs = {"draft_ids": workspace["draft_ids"], "request_rows": (0,)}
+        return DSparkLoweredInputs(
+            state=resources.state, workspace=workspace, draft_model=draft,
+            markov_model=markov, cache_tables=resources.cache_tables,
+            rope_tables=resources.rope_tables, outputs=outputs,
+            request_ranks=(int(getattr(batch, "cache_partitions", [0])[0] or 0),),
+        )
+
+    def lower_dspark_prefill(self, *, model, batch, request_ids, sampled_token_ids):
+        """Lower a terminal prefill batch through the serving-owned provider."""
+        provider = self.dspark_lowering_provider
+        if provider is None:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark prefill lowering provider is not configured; "
+                "serving must bind target hidden, state, cache, workspace and outputs"
+            )
+        dispatch = provider.lower_prefill(
+            model=model, batch=batch, request_ids=tuple(request_ids),
+            sampled_token_ids=tuple(int(token) for token in sampled_token_ids),
+        )
+        if not isinstance(dispatch, DSparkPrefillDispatch):
+            if isinstance(dispatch, Mapping):
+                dispatch = DSparkPrefillDispatch.from_batch(
+                    type("DSparkBatch", (), {"dspark_stages": dispatch})()
+                )
+            else:
+                raise TypeError("DSpark prefill lowering provider must return DSparkPrefillDispatch")
+        if dispatch.lowered is None:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark prefill lowering provider returned no complete lowered inputs"
+            )
+        return dispatch
+
+    def lower_dspark_decode(self, *, model, batch):
+        """Lower one decode batch through the serving-owned provider."""
+        provider = self.dspark_lowering_provider
+        if provider is None:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark decode lowering provider is not configured; "
+                "serving must bind target/draft/Markov state and outputs"
+            )
+        dispatch = provider.lower_decode(model=model, batch=batch)
+        if not isinstance(dispatch, DSparkDecodeDispatch):
+            if isinstance(dispatch, Mapping):
+                dispatch = DSparkDecodeDispatch.from_batch(
+                    type("DSparkBatch", (), {"dspark_stages": dispatch})()
+                )
+            else:
+                raise TypeError("DSpark decode lowering provider must return DSparkDecodeDispatch")
+        if dispatch.lowered is None:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark decode lowering provider returned no complete lowered inputs"
+            )
+        return dispatch
 
     def _activate_prefill(self):
         if self._prefill_fwd is not None:
@@ -2085,6 +3695,30 @@ class V41ResidentResources:
         self._group_counts = counts
         return state
 
+    def prefill_arguments(self, mode, step):
+        if self.closed or step is not self._step or step.phase != "prefill":
+            raise ValueError("prefill arguments require the active prefill step")
+        return self.prefill_host.arguments(mode), self._group_counts
+
+    def bind_prefill(self, plans, *, kv_sources, index_sources, c2a_sources,
+                     max_seq_len, index_topk=512):
+        """Complete per-layer arguments using this worker's resident resources."""
+        if self.closed or self._prefill is not None or self._step is not None:
+            raise RuntimeError("prefill must be bound once before a request step")
+        self._prefill = self._own(PrefillLayerResources(
+            self.worker, self.prefill_host.topology, plans, self.weights, self.cache,
+            self.prefill_host, kv_sources=kv_sources, index_sources=index_sources,
+            c2a_sources=c2a_sources, max_seq_len=max_seq_len, index_topk=index_topk))
+        return self._prefill
+
+    def run_prefill(self, segment, state, step):
+        if (self.closed or self._prefill is None or step is not self._step
+                or step.phase != "prefill" or segment.worker is not self.worker):
+            raise ValueError("prefill dispatch requires the active step and shared worker")
+        return segment.run_chain(
+            state, self._prefill.plans, self._prefill.attention, self._prefill.moe,
+            group_counts=self._group_counts)
+
     def run_prefill_fwd(self, state, step):
         if (self.closed or step is not self._step or step.phase != "prefill"
                 or self._prefill_fwd is None):
@@ -2106,6 +3740,260 @@ class V41ResidentResources:
             raise ValueError("full decode requires the active decode step")
         return self._decode_fwd.run(state, group_counts=self._group_counts)
 
+    def dispatch_dspark(self, stage, arguments):
+        """Dispatch one compiled DSpark composite with an exact ABI check.
+
+        The request scheduler supplies the resident tensors and state for a
+        stage.  Keeping this narrow boundary lets the lib's
+        ``decode_fwd_dspark`` orchestrator remain the owner of stage ordering;
+        serving does not rebuild the drafter or Markov graph from small ops.
+        """
+        if self.closed or self.failed:
+            raise RuntimeError("cannot dispatch DSpark on a closed or failed worker")
+        try:
+            program = self.dspark_programs[stage]
+            param_names = self.dspark_param_names[stage]
+        except KeyError as exc:
+            raise MissingCompositeInterface(f"DSpark stage is not compiled: {stage}") from exc
+        supplied = set(arguments)
+        required = set(param_names)
+        if supplied != required:
+            raise ValueError(
+                f"DSpark stage {stage} ABI mismatch: "
+                f"missing={sorted(required - supplied)} extra={sorted(supplied - required)}"
+            )
+        self.worker.run(program.compiled,
+                        *(arguments[name] for name in param_names), config=self.run_config)
+
+    def _run_dspark_orchestrator(self, lowered: DSparkLoweredInputs, *, phase: str) -> None:
+        """Run the lib-owned orchestration against resident compiled stages."""
+        if not isinstance(lowered, DSparkLoweredInputs):
+            raise TypeError("DSpark orchestration requires lowered serving inputs")
+        try:
+            lowered.validate(phase=phase)
+        except (TypeError, ValueError) as exc:
+            raise MissingCompositeInterface(str(exc)) from exc
+        required_mappings = (
+            ("draft_model", lowered.draft_model),
+            ("markov_model", lowered.markov_model),
+            ("cache_tables", lowered.cache_tables),
+            ("rope_tables", lowered.rope_tables),
+        )
+        missing = [name for name, mapping in required_mappings if not mapping]
+        if missing:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark lowering is missing mappings: " + ", ".join(missing)
+            )
+        try:
+            module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd_dspark")
+            function = (module.prefill_bootstrap_dspark if phase == "prefill"
+                        else module.decode_fwd_dspark)
+        except (ImportError, AttributeError) as exc:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark lib orchestration entry is unavailable"
+            ) from exc
+        runner = _DSparkOrchestratorRunner(self, phase)
+        try:
+            kwargs = dict(
+                attention_epoch=lowered.attention_epoch,
+                moe_epoch=lowered.moe_epoch,
+                logits_epoch=lowered.logits_epoch,
+            )
+            if phase == "prefill":
+                function(
+                    runner, lowered.state, lowered.workspace, lowered.draft_model,
+                    lowered.markov_model, lowered.cache_tables, lowered.rope_tables,
+                    **kwargs,
+                )
+            else:
+                function(
+                    runner, lowered.state, lowered.workspace, lowered.target_model,
+                    lowered.draft_model, lowered.markov_model, lowered.cache_tables,
+                    lowered.rope_tables, **kwargs,
+                )
+            runner.finish()
+        except MissingCompositeInterface:
+            raise
+        except BaseException as exc:
+            self.failed = True
+            raise RuntimeError(f"V4.1 DSpark {phase} orchestration failed") from exc
+
+    def _read_dspark_output(self, lowered, name):
+        """Return an owned CPU copy of one device-produced DSpark output."""
+        value = lowered.outputs.get(name, lowered.workspace.get(name))
+        if value is None:
+            raise MissingCompositeInterface(
+                f"V4.1 DSpark output lowering is missing {name!r}"
+            )
+        if callable(value):
+            value = value()
+        if isinstance(value, torch.Tensor):
+            if value.device.type != "cpu":
+                raise MissingCompositeInterface(
+                    f"V4.1 DSpark output {name!r} needs a serving readback buffer"
+                )
+            return value.detach().clone()
+        from pypto.runtime import StackedDeviceTensor
+
+        shards = getattr(value, "shards", None)
+        if shards is None or not isinstance(value, StackedDeviceTensor):
+            raise TypeError(f"V4.1 DSpark output {name!r} is not a tensor")
+        result = torch.empty(tuple(value.shape), dtype=value.dtype).share_memory_()
+        for rank, shard in enumerate(shards):
+            destination = result[rank]
+            self.worker.copy_from(
+                destination.data_ptr(), shard.data_ptr,
+                destination.numel() * destination.element_size(),
+                src_offset=0, worker_id=value.worker_ids[rank],
+            )
+        return result
+
+    @staticmethod
+    def _dspark_output_row(value, *, rank, row, kind):
+        vector_output = kind in ("accepted_ids", "draft_ids")
+        if value.ndim == 1:
+            # Single-request lowering may expose a token vector directly.
+            if vector_output:
+                if row != 0:
+                    raise ValueError(f"DSpark {kind} row is outside the output")
+                return value
+            if row >= value.shape[0]:
+                raise ValueError(f"DSpark {kind} row is outside the output")
+            return value[row]
+        if vector_output and value.ndim == 2:
+            if row >= value.shape[0]:
+                raise ValueError(f"DSpark {kind} row is outside the output")
+            return value[row]
+        if value.ndim >= 2:
+            if rank >= value.shape[0] or row >= value.shape[1]:
+                raise ValueError(f"DSpark {kind} rank/row is outside the output")
+            return value[rank, row]
+        raise ValueError("DSpark output tensor must have at least one dimension")
+
+    @staticmethod
+    def _validate_dspark_token_row(value, *, kind, minimum):
+        if getattr(value, "ndim", None) != 1 or value.shape[0] < minimum:
+            raise ValueError(
+                f"DSpark {kind} output must be a token vector with at least "
+                f"{minimum} entries"
+            )
+
+    def _dspark_request_rows(self, lowered, count):
+        ranks = lowered.request_ranks
+        if ranks is None:
+            ranks = tuple(range(count))
+        if len(ranks) != count or any(type(rank) is not int or rank < 0 for rank in ranks):
+            raise ValueError("DSpark request_ranks must match request order")
+        explicit = lowered.outputs.get("request_rows")
+        if explicit is None:
+            explicit = lowered.workspace.get("request_rows")
+        if explicit is not None:
+            if len(explicit) != count:
+                raise ValueError("DSpark request_rows must match request order")
+            if any(type(row) is not int or row < 0 for row in explicit):
+                raise ValueError("DSpark request_rows must be nonnegative integers")
+            rows = tuple(explicit)
+        else:
+            next_row = {}
+            rows = []
+            for rank in ranks:
+                rows.append(next_row.get(rank, 0))
+                next_row[rank] = rows[-1] + 1
+            rows = tuple(rows)
+        return tuple(ranks), rows
+
+    def run_dspark_prefill(self, request_id, *, slot, generation, prompt_length,
+                           anchor, stages, lowered=None):
+        if self.dspark is None:
+            raise MissingCompositeInterface("V4.1 DSpark programs were not registered")
+        if lowered is None:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark prefill output lowering is not implemented: "
+                "serving must bind target hidden/sample outputs and publish draft state"
+            )
+        try:
+            self._run_dspark_orchestrator(lowered, phase="prefill")
+            draft_ids = self._read_dspark_output(lowered, "draft_ids")
+            rank, row = self._dspark_request_rows(lowered, 1)
+            draft_ids = self._dspark_output_row(
+                draft_ids, rank=rank[0], row=row[0], kind="draft_ids")
+            self._validate_dspark_token_row(
+                draft_ids, kind="draft_ids", minimum=DSPARK_SPECULATIVE_TOKENS)
+            state = self.dspark.record_bootstrap(
+                request_id, slot=slot, generation=generation,
+                prompt_length=prompt_length, anchor=anchor,
+                draft_ids=[int(token) for token in draft_ids.tolist()],
+            )
+            return state
+        except BaseException:
+            self.failed = True
+            raise
+
+    def run_dspark_decode(self, request_ids, *, stages, accepted_counts=None,
+                          last_sampled=None, draft_ids=None, lowered=None,
+                          request_ranks=None):
+        if self.dspark is None:
+            raise MissingCompositeInterface("V4.1 DSpark programs were not registered")
+        if lowered is None:
+            raise MissingCompositeInterface(
+                "V4.1 DSpark decode output lowering is not implemented: "
+                "serving must bind target decode, acceptance, draft/Markov outputs "
+                "and return DecodeResult"
+            )
+        if request_ranks is not None and lowered.request_ranks is None:
+            lowered = replace(lowered, request_ranks=tuple(request_ranks))
+        try:
+            for request_id in request_ids:
+                self.dspark.states.get(request_id)
+            self._run_dspark_orchestrator(lowered, phase="decode")
+            counts_tensor = self._read_dspark_output(lowered, "accepted_counts")
+            accepted_tensor = self._read_dspark_output(lowered, "accepted_ids")
+            sampled_tensor = self._read_dspark_output(lowered, "last_sampled")
+            drafts_tensor = self._read_dspark_output(lowered, "draft_ids")
+            ranks, rows = self._dspark_request_rows(lowered, len(request_ids))
+            accepted, counts, sampled, drafts = [], [], [], []
+            for request_id, rank, row in zip(request_ids, ranks, rows, strict=True):
+                count = int(self._dspark_output_row(
+                    counts_tensor, rank=rank, row=row, kind="accepted_counts"))
+                if not 1 <= count <= 6:
+                    raise ValueError(f"DSpark accepted count for {request_id!r} is outside [1, 6]")
+                ids = self._dspark_output_row(
+                    accepted_tensor, rank=rank, row=row, kind="accepted_ids")
+                self._validate_dspark_token_row(
+                    ids, kind="accepted_ids", minimum=DSPARK_ROWS_PER_REQUEST)
+                token_ids = [int(token) for token in ids[:count].tolist()]
+                sampled_token = int(self._dspark_output_row(
+                    sampled_tensor, rank=rank, row=row, kind="last_sampled"))
+                draft_row = self._dspark_output_row(
+                    drafts_tensor, rank=rank, row=row, kind="draft_ids")
+                self._validate_dspark_token_row(
+                    draft_row, kind="draft_ids", minimum=DSPARK_SPECULATIVE_TOKENS)
+                draft = [int(token) for token in draft_row[:5].tolist()]
+                self.dspark.states.get(request_id).validate_accept(count, sampled_token)
+                accepted.append(token_ids)
+                counts.append(count)
+                sampled.append(sampled_token)
+                drafts.append(draft)
+            self.dspark.apply_decode_outputs(
+                request_ids, accepted_counts=counts, last_sampled=sampled, draft_ids=drafts,
+            )
+            draft_counts = lowered.outputs.get("draft_counts", lowered.workspace.get("draft_counts"))
+            if draft_counts is None:
+                draft_count_values = [5] * len(request_ids)
+            else:
+                draft_counts_tensor = self._read_dspark_output(lowered, "draft_counts")
+                draft_count_values = [int(self._dspark_output_row(
+                    draft_counts_tensor, rank=rank, row=row, kind="draft_counts"))
+                    for rank, row in zip(ranks, rows, strict=True)]
+            return DecodeResult(
+                hidden_states=None, logits=None,
+                accepted_token_ids=accepted,
+                num_draft_tokens=draft_count_values,
+            )
+        except BaseException:
+            self.failed = True
+            raise
+
     def finish_step(self, state, step):
         if self.closed or step is not self._step:
             raise ValueError("final output must use the active request step")
@@ -2114,14 +4002,20 @@ class V41ResidentResources:
         finally:
             self._step = self._inputs = self._group_counts = self._output_rows = None
 
-    def reset_request(self, owner):
+    def reset_request(self, key, owner):
         self._step = self._inputs = self._group_counts = self._output_rows = None
         self.cache.reset_request(owner)
+        if self.dspark is not None:
+            self.dspark.release((key,))
+        if getattr(self, "engram", None) is not None:
+            self.engram.history.pop(key, None)
 
     def close(self):
         if self.closed:
             return
         self._step = self._inputs = self._group_counts = self._output_rows = None
+        if getattr(self, "engram", None) is not None:
+            self.engram.history.clear()
         try:
             if self._prefill_fwd is not None:
                 self._prefill_fwd.close()
@@ -2138,6 +4032,7 @@ class V41ResidentResources:
 
 
 # production_binding
+_MODES = ("swa", "c2a_full", "c2a_reuse", "c1a_full", "c1a_reindex", "c1a_reuse")
 _LOG = logging.getLogger(__name__)
 
 
@@ -2152,7 +4047,7 @@ def _lib_root():
     return root
 
 
-def selected_decode_topology(lib_root=None, *, dp_size=8):
+def selected_decode_topology(lib_root=None, *, dp_size=None):
     """Reject a lib whose import-time decode extent differs from this adapter."""
     root = _lib_root() if lib_root is None else Path(lib_root).resolve()
     config = root / "models/deepseek_v4_1_flash/config.py"
@@ -2180,15 +4075,25 @@ def selected_decode_topology(lib_root=None, *, dp_size=8):
             or not isinstance(rows.left, ast.Name) or rows.left.id != "DSPARK_SPEC_TOKENS"
             or not isinstance(rows.right, ast.Constant) or rows.right.value != 1):
         raise MissingCompositeInterface("V4.1 serving requires the lib's 12-request, six-row decode ABI")
+    if dp_size is None:
+        dp_size = int(os.environ.get("PYPTO_DSV41_DP_SIZE", "8"))
     if dp_size not in (4, 8):
-        raise ValueError("V4.1 decode requires DP4 or DP8")
+        raise ValueError("V4.1 DSpark serving supports DP4/EP4 or DP8/EP8")
     return SegmentTopology.for_decode(tp=1, dp=dp_size)
 
 
 def _revision(root):
-    return subprocess.check_output(
-        ["git", "-C", str(root), "rev-parse", "HEAD"], text=True,
-    ).strip()
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        # CI and packaged deployments may provide a source archive without a
+        # .git directory.  The selected source path is still validated by the
+        # ABI checks above; callers may provide a provenance value explicitly.
+        return os.environ.get("PYPTO_LIB_REVISION", "archive")
 
 
 def _sources(layers):
@@ -2207,10 +4112,22 @@ def _check_runtime_binaries(platform):
         builder.get_binaries(runtime)
 
 
-def make_production_bindings(model_dir, max_seq_len, *, dp_size=8):
+def make_production_bindings(
+    model_dir,
+    max_seq_len,
+    *,
+    tokenizer=None,
+    engram_lookup_fn=None,
+    dp_size=None,
+    dspark_lowering_provider=None,
+):
     model_dir = Path(model_dir).resolve()
     raw = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     layers = plan_layers(raw)
+    dp_size = (int(os.environ.get("PYPTO_DSV41_DP_SIZE", "8"))
+               if dp_size is None else dp_size)
+    if dp_size not in (4, 8):
+        raise ValueError("PYPTO_DSV41_DP_SIZE must be 4 or 8")
     groups = build_cache_groups(layers, max_seq_len, dp_size=dp_size)
     root = _lib_root()
     revision = _revision(root)
@@ -2224,28 +4141,64 @@ def make_production_bindings(model_dir, max_seq_len, *, dp_size=8):
             raise ValueError("V4.1 binding and execution plan refer to different checkpoints")
         if runtime.max_seq_len != max_seq_len or runtime.kv_cache_groups != groups:
             raise ValueError("V4.1 scheduler and resident cache contracts differ")
-        if len(device_ids) != topology.world or options.platform != "a5":
-            raise ValueError("V4.1 production binding requires one A5 device per EP rank")
+        if len(device_ids) != topology.dp or options.platform != "a5":
+            raise ValueError(f"V4.1 production binding requires {topology.dp} A5 devices")
         _check_runtime_binaries(options.platform)
+        dspark_weight_contract = None
+        if runtime.num_speculative_tokens:
+            from .dspark_weights import V41DSparkWeightContract
+
+            dspark_loader = V41WeightLoader(
+                model_dir, tp_size=topology.tp, tp_rank=0,
+                ep_size=topology.world, ep_rank=0, max_load_bytes=512 << 20,
+            )
+            dspark_weight_contract = V41DSparkWeightContract(dspark_loader)
+            # Validate the index before compiling or allocating the worker. The
+            # large three-layer draft bank is intentionally packed lazily by
+            # the stage-argument provider and is never materialized here.
+            dspark_weight_contract.validate_index()
         run_config = replace(
             build_pypto_run_config(
                 platform=options.platform,
                 device_ids=device_ids,
                 pypto_build_dir=options.pypto_build_dir,
             ),
-            ring_heap=(tuple(size * (1 << 30) for size in (2, 2, 2, 4))
-                       if topology.dp == 4 else 2 * (1 << 30)),
-            # DP4's 8K prefill can exhaust ring 2's default dependency pool.
-            ring_dep_pool=((16384, 16384, 32764, 16384)
-                           if topology.dp == 4 else None),
+            ring_heap=2 * 1024 * 1024 * 1024,
         )
         compiler = KernelCompiler(run_config=run_config)
         prefill, prefill_names = compile_prefill_fwd(compiler, root, topology)
         decode, decode_names, decode_counts_are_tensor = compile_decode_fwd(
             compiler, root, topology)
+        if runtime.num_speculative_tokens:
+            dspark_programs, dspark_param_names = compile_decode_fwd_dspark(
+                compiler, root, topology,
+                target_program=decode, target_param_names=decode_names)
+        else:
+            dspark_programs, dspark_param_names = {}, {}
+        final, final_names = compile_final_output(compiler, root, topology)
         abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
+        engram = None
+        lookup_fn = engram_lookup_fn
+        if getattr(abi, "ENGRAM_K", None) is not None:
+            if tokenizer is None:
+                raise MissingCompositeInterface(
+                    "V4.1 Engram-enabled lib requires the serving tokenizer")
+            engram_module = importlib.import_module("models.deepseek_v4_1_flash.engram")
+            engram_loader = V41WeightLoader(
+                model_dir, tp_size=topology.tp, tp_rank=0,
+                ep_size=topology.world, ep_rank=0, max_load_bytes=512 << 20,
+            )
+            # Transformers 5.x wraps the Rust tokenizer in a
+            # ``TokenizersBackend`` object.  Engram consumes the underlying
+            # tokenizers.Tokenizer ABI (get_vocab_size/id_to_token/normalizer)
+            # rather than the Transformers compatibility wrapper.
+            tokenizer_impl = getattr(tokenizer, "tokenizer", tokenizer)
+            tokenizer_impl = getattr(tokenizer_impl, "_tokenizer", tokenizer_impl)
+            engram = engram_module.HostEngram(
+                RowAddressedCheckpoint(engram_loader.store), tokenizer_impl)
+            lookup_fn = engram.lookup
         kv_sources, index_sources, c2a_sources = _sources(layers)
-        layout = DecodeWeightLayout.from_lib(abi, tp_size=topology.tp)
+        layout = DecodeWeightLayout.from_lib(abi)
         if (layout.layers, layout.kv_sources, layout.index_sources,
                 layout.c2a_sources, layout.world) != (
                     len(layers), len(kv_sources), len(index_sources), len(c2a_sources), topology.world):
@@ -2276,6 +4229,18 @@ def make_production_bindings(model_dir, max_seq_len, *, dp_size=8):
             finally:
                 if parallel_experts and previous_threads < 8:
                     torch.set_num_threads(previous_threads)
+            for item in iter_decode_weight_slices(
+                model_dir, topology, parallel_experts=parallel_experts, bank=bank,
+                include_engram=layout.slots("engram_wkv") > 0,
+            ):
+                append_started = time.perf_counter()
+                bank.append(item)
+                append_seconds += time.perf_counter() - append_started
+                if item.name == "hc_attn_fn":
+                    now = time.perf_counter()
+                    _LOG.info("V4.1 checkpoint layer %d/%d loaded into shared weight bank (%.2fs)",
+                              item.slot + 1, layout.layers, now - layer_started)
+                    layer_started = now
             bank.finish(decode_names)
             _LOG.info("V4.1 checkpoint staging %.2fs (bank copies %.2fs)",
                       time.perf_counter() - bank_started, append_seconds)
@@ -2292,7 +4257,7 @@ def make_production_bindings(model_dir, max_seq_len, *, dp_size=8):
         cache_plan = plan_decode_cache_pools(
             layers, groups, max_seq_len=max_seq_len,
             primary_num_blocks=groups[0].max_blocks_per_seq,
-            request_slots=1, abi=abi, dp_size=topology.dp,
+            request_slots=1, abi=abi,
         )
         if (runtime.total_kv_pages is not None and
                 runtime.total_kv_pages < cache_plan.primary_num_blocks):
@@ -2308,6 +4273,9 @@ def make_production_bindings(model_dir, max_seq_len, *, dp_size=8):
             c1a_pages=cache_plan.physical_group_blocks[family.c1a],
             rope_tables=swa_tables,
             compressed_rope_tables=compressed_tables,
+            engram_width=getattr(abi, "ENGRAM_K", None),
+            dspark_hidden_size=getattr(abi, "DSPARK_MAIN_IN", None),
+            engram_lookup_fn=lookup_fn,
         )
         decode_host = PrefillMetadataResources(topology, **host_kwargs)
         input_host = make_input_host_resources(topology, plan.weights.config.hidden_size)
@@ -2315,21 +4283,52 @@ def make_production_bindings(model_dir, max_seq_len, *, dp_size=8):
         final_host = load_final_output_host_resources(model_dir, topology)
         prefill_host = PrefillMetadataResources(
             topology, **host_kwargs, full_hidden_size=plan.weights.config.hidden_size)
-        programs = (prefill, decode)
+        dspark_host = None
+        if runtime.num_speculative_tokens:
+            from .dspark_resources import DSparkResourceLayout, allocate_dspark_host_resources
+
+            dspark_host = allocate_dspark_host_resources(DSparkResourceLayout(
+                dp_size=topology.dp, max_seq_len=max_seq_len,
+                vocab_size=plan.weights.config.vocab_size,
+                max_prefill_tokens=min(max_seq_len, 8192),
+            ))
+            # Reuse the already validated target RoPE table.  The draft ABI
+            # uses the same 32-wide adjacent-pair table as the target.
+            dspark_host.rope_tables["draft_cos"].copy_(decode_host.fields["freqs_cos"])
+            dspark_host.rope_tables["draft_sin"].copy_(decode_host.fields["freqs_sin"])
+        # ``target_decode`` deliberately aliases the full decode program above;
+        # register each compiled object once with the shared worker.
+        programs = tuple(dict.fromkeys((prefill, decode, final, *dspark_programs.values())))
         resident_started = time.perf_counter()
         resident = V41ResidentResources(
             programs, run_config, weight_bank=bank, weight_param_names=decode_names,
             cache_plan=cache_plan, state_reset=state_reset, page_resets=resets,
             input_host=input_host, decode_input_host=decode_input_host,
             prefill_host=prefill_host, decode_host=decode_host,
-            final_host=final_host,
+            final_host=final_host, final_program=final, final_param_names=final_names,
             topology=topology, prefill_program=prefill, prefill_param_names=prefill_names,
+            dspark_programs=dspark_programs, dspark_param_names=dspark_param_names,
+            max_seq_len=max_seq_len,
+            dspark_weight_contract=dspark_weight_contract,
+            dspark_lowering_provider=dspark_lowering_provider,
+            dspark_host_resources=dspark_host,
         )
+        resident.engram = engram
         _LOG.info("V4.1 resident upload and allocation %.2fs",
                   time.perf_counter() - resident_started)
         try:
             resident.bind_decode_fwd(
                 decode, decode_names, run_config, decode_counts_are_tensor)
+            if dspark_host is not None and dspark_lowering_provider is None:
+                from .dspark_resources import V41DSparkLoweringProvider
+
+                resident.dspark_lowering_provider = V41DSparkLoweringProvider(
+                    dspark_host, payload_builder=resident._dspark_payload,
+                    state_resolver=resident._resolve_dspark_state,
+                    target_param_names=decode_names,
+                    draft_param_names=dspark_param_names["dspark_drafter"],
+                    markov_param_names=dspark_param_names["markov_sample"],
+                )
         except BaseException:
             resident.close()
             raise
@@ -2337,10 +4336,12 @@ def make_production_bindings(model_dir, max_seq_len, *, dp_size=8):
 
     return CompositeBindings(
         revision=revision,
+        entries={},
         initialize=lambda embeddings, step, resources: resources.begin_step(embeddings, step),
         output=lambda state, step, resources: resources.finish_step(state, step),
         allocate=allocate,
-        reset_request=lambda resources, key, owner: resources.reset_request(owner),
+        prepare_weights=lambda plans, layer, resources: None,
+        reset_request=lambda resources, key, owner: resources.reset_request(key, owner),
         wait=lambda resources: None,
         close=lambda resources: resources.close(),
         cache_groups=groups,

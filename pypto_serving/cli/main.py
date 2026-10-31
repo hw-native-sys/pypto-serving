@@ -99,8 +99,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["least_pending_tokens"],
         help="Data-parallel request routing policy.",
     )
-    parser.add_argument("--lm-head-tp", type=int, default=4,
-                        help="DSpark vocabulary head TP, independent of attention TP (default: 4).")
+    parser.add_argument(
+        "--lm-head-tp", type=int, default=4,
+        help="DSpark vocabulary head TP, independent of attention TP (default: 4).",
+    )
     # Dtype
     parser.add_argument("--dtype", default="bfloat16", help="Weight data type (default: bfloat16).")
     parser.add_argument("--kv-cache-dtype", default="bfloat16", help="KV cache data type. 'auto' follows --dtype (default: bfloat16).")
@@ -108,6 +110,11 @@ def build_parser() -> argparse.ArgumentParser:
     # Runtime
     parser.add_argument("--max-model-len", type=int, default=1024, help="Maximum sequence length (prompt + generated; default: 1024).")
     parser.add_argument("--block-size", type=int, default=128, help="KV cache block size (default: 128).")
+    parser.add_argument(
+        "--use-compile-cache",
+        action="store_true",
+        help="Reuse compiled V4.1 lib programs when the build cache matches.",
+    )
     parser.add_argument(
         "--npu-memory-utilization",
         type=float,
@@ -197,14 +204,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Speculative decoding configuration as JSON. DeepSeek V4 supports "
             "method='mtp' with a positive num_speculative_tokens, and "
-            "method='dspark' with num_speculative_tokens 0 (target-only serving)."
+            "method='dspark' with its model-specific fixed draft width."
         ),
     )
 
-    # Serving
+    # Prefill/decode disaggregated serving
     parser.add_argument("--pd-role", choices=("prefill", "decode"), default=None)
     parser.add_argument("--pd-config", default=None, help="Shared PD deployment JSON.")
     parser.add_argument("--pd-node-id", default=None, help="Select a node when its role has multiple endpoints.")
+
+    # Serving
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind the serving server (default: 0.0.0.0).")
     parser.add_argument("--port", type=int, default=8000, help="Port for the serving server (default: 8000).")
     parser.add_argument("--max-num-seqs", type=int, default=16, help="Max concurrent requests in serving mode (default: 16).")
@@ -289,16 +298,16 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         raise ValueError(
             "--speculative-config/--num-speculative-tokens is only supported for DeepSeek V4"
         )
-    # DSpark's attention DP/TP are model-local; the executor owns one EP-wide
-    # worker group, with a replicated cache partition per attention group.
+    # The DSpark TP4/DP4 axes are internal to the kernels (TP groups hold
+    # replicated caches; DP groups are the four scheduler cache partitions).
+    # The serving contract is one overlapped worker group of 16 ranks with
+    # expert parallelism spanning it, so the config collapses dp/tp to one.
     dspark_variant = model_family == "deepseek_v4" and model_variant == "dspark"
     if dspark_variant:
         # The dspark world size is flag-driven: --ep is the rank count and the
         # executor freezes the kernel layout (import arguments, cache
         # partitions, packed-prefill capacity) from it.
         executor_kwargs["cache_ranks"] = args.expert_parallel_size
-        executor_kwargs["tp_size"] = args.tensor_parallel_size
-        executor_kwargs["lm_head_tp_size"] = args.lm_head_tp
     parallel_config = ParallelConfig(
         data_parallel_size=1 if dspark_variant else args.data_parallel_size,
         tensor_parallel_size=1 if dspark_variant else args.tensor_parallel_size,
@@ -351,7 +360,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     """Resolve the V4.1 worker boundary before starting any device resources.
 
     Like DSpark placement, TP/DP are internal to one overlapped EP worker.
-    The scheduler uses one cache partition per logical DP rank instead of creating DP replicas.
+    The scheduler uses one cache partition per configured DP/EP rank instead of creating DP replicas.
     """
     from pypto_serving.config.types import KVCacheGroupSpec
     from pypto_serving.model.deepseek_v41.npu_runner import (
@@ -362,13 +371,26 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     from pypto_serving.serving.engine.async_engine import EngineConfig
 
     text = V41TextConfig.from_dict(raw)
-    if getattr(args, "speculative_config", None) is not None or getattr(args, "num_speculative_tokens", 0):
-        raise ValueError("V4.1 text serving does not support DSpark or MTP")
+    speculative = getattr(args, "speculative_config", None)
+    legacy_speculative = getattr(args, "num_speculative_tokens", None)
+    if legacy_speculative not in (None, 0):
+        raise ValueError("V4.1 requires --speculative-config with method='dspark'")
+    if speculative is None:
+        dspark_tokens = 0
+    else:
+        if speculative.get("method") != "dspark":
+            raise ValueError("V4.1 --speculative-config requires method='dspark'")
+        dspark_tokens = speculative.get("num_speculative_tokens")
+        if type(dspark_tokens) is not int or dspark_tokens != 5:
+            raise ValueError("V4.1 DSpark requires num_speculative_tokens=5")
     if args.platform != "a5":
         raise ValueError("V4.1 M0 serving requires --platform a5")
     topology = (args.tensor_parallel_size, args.data_parallel_size, args.expert_parallel_size)
-    if topology not in ((1, 4, 4), (1, 8, 8)) or len(devices) != topology[2]:
-        raise ValueError("V4.1 serving requires TP1/DP4/EP4 or TP1/DP8/EP8 with matching device IDs")
+    if (args.tensor_parallel_size != 1 or args.data_parallel_size != args.expert_parallel_size
+            or args.data_parallel_size not in (4, 8)
+            or len(devices) != args.data_parallel_size):
+        raise ValueError("V4.1 serving requires TP1 with matching DP/EP size 4 or 8")
+    dp_size = args.data_parallel_size
     if args.block_size != 128:
         raise ValueError("V4.1 serving requires --block-size 128")
     if not 0 < args.max_model_len <= text.max_position_embeddings:
@@ -377,22 +399,22 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         raise ValueError("V4.1 batch and token capacities must be positive")
 
     parallel = ParallelConfig(
-        data_parallel_size=1, tensor_parallel_size=1, expert_parallel_size=topology[2],
+        data_parallel_size=1, tensor_parallel_size=1, expert_parallel_size=dp_size,
         enable_expert_parallel=True, placement_mode="overlapped", devices=devices,
         data_parallel_routing=args.data_parallel_routing,
     )
     # This resolver intentionally raises while the lib adapter is missing.
     # No default generic KV layout may be substituted for the V4.1 pools.
-    bindings = load_composite_bindings(model_dir, args.max_model_len, dp_size=topology[1])
-    bindings.require(plan_layers(raw), RankPlacement(0, tp_size=1, dp_size=topology[1], ep_size=topology[2]))
+    bindings = load_composite_bindings(model_dir, args.max_model_len, dp_size=dp_size)
+    bindings.require(plan_layers(raw), RankPlacement(0, tp_size=1, dp_size=dp_size, ep_size=dp_size))
     if bindings.segment_topology is None:
         raise MissingCompositeInterface("V4.1 bindings must declare the selected lib decode capacity")
     step_tokens = min(args.max_num_batched_tokens, bindings.segment_topology.capacity)
     groups = tuple(bindings.cache_groups)
     if not groups or any(not isinstance(group, KVCacheGroupSpec) for group in groups):
         raise MissingCompositeInterface("V4.1 bindings must provide concrete grouped cache specifications")
-    if any(group.num_partitions != topology[1] for group in groups):
-        raise ValueError("V4.1 cache groups must match the logical DP size")
+    if any(group.num_partitions != dp_size for group in groups):
+        raise ValueError(f"V4.1 cache groups must use {dp_size} logical DP partitions")
     if len({group.name for group in groups}) != len(groups):
         raise ValueError("V4.1 cache group names must be unique")
     runtime = dataclasses.replace(
@@ -401,6 +423,8 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         max_num_batched_tokens=step_tokens,
         max_prefill_tokens_per_request=step_tokens,
         requires_homogeneous_prefill_decode=True,
+        supports_chunked_prefill_with_speculation=not bool(dspark_tokens),
+        num_speculative_tokens=dspark_tokens,
     )
     return EngineConfig(
         model_id=args.served_model_name or Path(model_dir).name,
@@ -410,6 +434,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         device_ids=devices,
         parallel_config=parallel,
         executor_cls=_executor_cls_for_model_family("deepseek_v41"),
+        executor_kwargs={"use_compile_cache": args.use_compile_cache},
         runtime_config=runtime,
         profile_config=_build_profile_config(args),
         max_num_running_reqs=args.max_num_seqs,
@@ -444,6 +469,7 @@ def _build_runtime_config(
         from pypto_serving.model.deepseek_dspark.npu_runner import (
             DSPARK_PREFILL_MAX_TOKENS,
             DSPARK_SLIDING_WINDOW,
+            DSPARK_TP_SIZE,
             build_dspark_cache_group_specs,
         )
 
@@ -462,7 +488,7 @@ def _build_runtime_config(
             compress_ratios,
             max_seq_len=args.max_model_len,
             max_prefill_tokens=max_prefill_tokens_per_request,
-            partitions=args.expert_parallel_size // args.tensor_parallel_size,
+            partitions=args.expert_parallel_size // DSPARK_TP_SIZE,
         )
         if num_speculative_tokens:
             speculative_prefix_cache_replay_tokens = DSPARK_SLIDING_WINDOW
@@ -792,28 +818,33 @@ def _validate_model_topology(
 
 
 def _validate_dspark_topology(args: argparse.Namespace) -> None:
-    """Validate one local topology shared by the node's execution stages."""
+    """Validate the configured TP4 DSpark serving topology from the flags."""
     from pypto_serving.model.deepseek_dspark.npu_runner import (
-        DSparkCacheLayout,
+        DSPARK_DECODE_BATCH,
         DSPARK_MAX_SEQ_LEN,
+        DSPARK_TP_SIZE,
     )
 
+    # The deployment is TP4 with expert parallelism spanning the whole world:
+    # --ep is the rank count (16 in production, 8 on a half node) and --dp is
+    # the scheduler cache-partition count derived from it.
     ranks = args.expert_parallel_size
-    layout = DSparkCacheLayout.for_ranks(
-        ranks, tp_size=args.tensor_parallel_size, lm_head_tp_size=args.lm_head_tp,
-    )
-    partitions = layout.partitions
+    partitions = ranks // DSPARK_TP_SIZE
+    if args.tensor_parallel_size != DSPARK_TP_SIZE:
+        raise ValueError(f"DSpark serving requires --tp {DSPARK_TP_SIZE}")
+    if ranks not in (2 * DSPARK_TP_SIZE, 4 * DSPARK_TP_SIZE):
+        raise ValueError("DSpark serving requires --ep 8 or --ep 16 (TP4, EP=ranks)")
     if args.data_parallel_size != partitions:
         raise ValueError(f"DSpark serving requires --dp {partitions} with --ep {ranks}")
     if len(parse_device_ids(args.devices, default_device=args.device)) != ranks:
         raise ValueError(f"DSpark serving requires exactly {ranks} NPU device ids")
     if args.block_size != 32:
         raise ValueError("DSpark kernels require --block-size 32")
-    max_global_batch = partitions * layout.decode_capacity
+    max_global_batch = partitions * DSPARK_DECODE_BATCH
     if args.max_num_seqs > max_global_batch:
         raise ValueError(
             "DSpark decode kernels support at most "
-            f"--max-num-seqs {max_global_batch} ({layout.decode_capacity} per attention group)"
+            f"--max-num-seqs {max_global_batch} ({DSPARK_DECODE_BATCH} per TP group)"
         )
     if args.max_model_len > DSPARK_MAX_SEQ_LEN:
         raise ValueError(
@@ -902,13 +933,12 @@ def run_serve(
     print(f"  Endpoints: {endpoints}")
 
     log_config = create_uvicorn_log_config(["/metrics", "/metrics/json"])
-    # Bounded on purpose. uvicorn waits for in-flight requests before it runs
-    # the shutdown hook, so without a timeout one stuck request keeps the worker
-    # from ever being asked to stop -- and its devices with it.
     uvicorn.run(
-        app, host=host, port=port, log_level="info", log_config=log_config,
-        # uvicorn takes whole seconds; max() keeps a sub-second setting from
-        # rounding down to zero, which would cancel in-flight work immediately.
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        log_config=log_config,
         timeout_graceful_shutdown=max(1, round(graceful_shutdown_timeout_seconds())),
     )
 
@@ -1069,6 +1099,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.pd_role:
         from pypto_serving.pd.integration import run
+
         run(args, config, generate_config)
     elif args.pd_config or args.pd_node_id:
         raise ValueError("PD options require --pd-role")

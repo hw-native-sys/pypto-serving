@@ -120,3 +120,4 @@ nav:
       - Model Integration: developer-guide/model-integration.md
       - Weight Staging: developer-guide/weight-staging.md
       - JIT Cache: developer-guide/jit-cache.md
+      - DeepSeek V4.1 Entry: developer-guide/deepseek-v41-entry.md
