@@ -45,6 +45,7 @@ class Request:
     prefix: object = None
     reservation: object = None
     pending: object = None
+    pending_digest: str | None = None
     error: Exception | None = None
     chunk: int = 0
     end: int = 0
@@ -78,8 +79,10 @@ class Service:
         self.preflight = None
 
     async def worker(self, operation, value=None):
-        payload = msgspec.msgpack.encode(value) if value is not None else b""
-        with span(logger, "pd.worker." + operation):
+        with span(logger, "pd.worker.encode", log=False, thread_cpu=True, operation=operation) as timing:
+            payload = msgspec.msgpack.encode(value) if value is not None else b""
+        with span(logger, "pd.worker." + operation, encode_ms=timing["duration_ms"],
+                  encode_thread_cpu_ms=timing["thread_cpu_ms"]):
             result = msgspec.msgpack.decode(await self.core.call_worker(operation, payload))
         if operation == "submit":
             if "error" in result:
@@ -137,7 +140,7 @@ class Service:
             pending = entry.pending
             result["handoff"] = dict(confirmed_chunks=entry.chunk, confirmed_end=entry.end,
                 confirmation_source=entry.completion_source,
-                uncertain=uncertain, pending_plan=(dict(plan_digest=digest(pending), chunk=pending.chunk,
+                uncertain=uncertain, pending_plan=(dict(plan_digest=entry.pending_digest, chunk=pending.chunk,
                     start=pending.start, end=pending.end, final=pending.final) if pending is not None else None))
             result["worker"] = dict(state_reservation_confirmed=bool(entry.state_slots)
                 if self.role == "decode" else None, state_release_confirmed=entry.worker_release_ack.is_set()
@@ -344,23 +347,28 @@ class Service:
             if (type(p_hit) is not int or not 0 <= p_hit <= plan.end
                     or p_hit % entry.prefix.alignment or (entry.chunk and p_hit != entry.p_hit)):
                 raise ValueError("invalid source Prefix boundary")
-            self.validate_plan(entry, plan, geometry, p_hit, peer.topology)
+            with span(logger, "pd.plan.validate", log=False, thread_cpu=True,
+                      request=request, chunk=plan.chunk) as timing:
+                self.validate_plan(entry, plan, geometry, p_hit, peer.topology)
+                plan_digest = digest(plan)
             if plan.copies or plan.final:
                 self.cache.authorize_group_cache_write(request)
             entry.pending = plan
+            entry.pending_digest = plan_digest
             entry.p_hit = p_hit
             entry.mapping = plan.mapping
-            plan_digest = digest(plan)
             self.observe("plan.authorized", entry, plan_digest=plan_digest, chunk=plan.chunk,
-                         start=plan.start, end=plan.end, final=plan.final)
+                         start=plan.start, end=plan.end, final=plan.final,
+                         validation_ms=timing["duration_ms"], validation_thread_cpu_ms=timing["thread_cpu_ms"])
             return plan_digest
         if operation == "complete":
             plan = entry.pending
             if plan is None:
                 raise ValueError("no authorized chunk")
             completion = decode(payload["completion"], Completion)
-            completion.check(plan)
+            completion.check(entry.pending_digest, plan.units)
             entry.pending = None
+            entry.pending_digest = None
             entry.chunk += 1
             entry.end = plan.end
             entry.completion_source = "sender_completion" if plan.copies else "empty_plan"
@@ -565,40 +573,46 @@ class Service:
                         raise ValueError("request cancelled")
                     if chunk.final:
                         chunk = replace(chunk, state_slots=await self.worker("source_state", request))
-                    plan = plan_chunk(entry.binding, chunk, placement, self.node.contract,
-                                      self.cache.group_specs, self.geometry, peer_geometry, p_hit,
-                                      self.adapter.mapping(self.node.topology, peer.topology,
-                                                           chunk.partition, placement.partition),
-                                      entry.normalized_digest)
+                    with span(logger, "pd.plan.build", log=False, thread_cpu=True,
+                              request=request, chunk=chunk.chunk) as plan_timing:
+                        plan = plan_chunk(entry.binding, chunk, placement, self.node.contract,
+                                          self.cache.group_specs, self.geometry, peer_geometry, p_hit,
+                                          self.adapter.mapping(self.node.topology, peer.topology,
+                                                               chunk.partition, placement.partition),
+                                          entry.normalized_digest)
+                        plan_digest = digest(plan)
                     if plan.copies:
                         self.pins.retain(chunk)
                     entry.pending = plan
+                    entry.pending_digest = plan_digest
                     submitted = False
-                    if await call("plan", plan=plan, p_hit=p_hit) != digest(plan):
+                    if await call("plan", plan=plan, p_hit=p_hit) != plan_digest:
                         raise ValueError("destination acknowledged a different plan")
                     job = None
                     if plan.copies:
                         submitted = True  # Lost ordered-submit replies are uncertain.
                         job = await self.worker("submit", plan)
-                    async def settle(plan=plan, job=job):
+                    async def settle(plan=plan, job=job, plan_digest=plan_digest, plan_timing=plan_timing):
                         try:
                             completion = (await self.progress.wait(job) if job is not None
-                                          else Completion(digest(plan), plan.units))
+                                          else Completion(plan_digest, plan.units))
                         except TransferError as exc:
                             if not exc.uncertain:
                                 self.pins.release(request)
                             raise
-                        completion.check(plan)
+                        completion.check(plan_digest, plan.units)
                         entry.chunk, entry.end = plan.chunk + 1, plan.end
                         entry.completion_source = "owner_completion" if job is not None else "empty_plan"
                         if job is not None:
                             self.pins.release(request)
                         self.observe("completion", entry, plan_digest=completion.plan_digest, end=plan.end,
-                                     native_write=job is not None)
+                                     native_write=job is not None, plan_ms=plan_timing["duration_ms"],
+                                     plan_thread_cpu_ms=plan_timing["thread_cpu_ms"])
                         response = await call("complete", completion=completion)
                         if response.get("error"):
                             raise ValueError(response["error"])
                         entry.pending = None
+                        entry.pending_digest = None
                     inflight = asyncio.create_task(settle())
                     if chunk.final:
                         await inflight

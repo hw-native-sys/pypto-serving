@@ -22,19 +22,30 @@ def record(logger, name, **fields):
 
 
 @contextmanager
-def span(logger, name, *, cat="pd", **fields):
+def span(logger, name, *, cat="pd", thread_cpu=False, log=True, **fields):
+    """Return per-call timing; thread CPU is only meaningful for synchronous phases.
+
+    With log=False, detail goes only to the existing on-demand profiler.
+    No samples or counters are retained by this context manager.
+    """
     started = time.perf_counter_ns()
+    cpu_started = time.thread_time_ns() if thread_cpu else None
+    timing = {}
     outcome = "completed"
     try:
-        yield
+        yield timing
     except BaseException:
         outcome = "error"
         raise
     finally:
         duration = (time.perf_counter_ns() - started) / 1000
-        record(logger, name, **fields, outcome=outcome, duration_ms=duration / 1000)
+        timing["duration_ms"] = duration / 1000
+        cpu = {} if cpu_started is None else {"thread_cpu_ms": (time.thread_time_ns() - cpu_started) / 1e6}
+        timing.update(cpu)
+        if log:
+            record(logger, name, **fields, **timing, outcome=outcome)
         try:
             profile_duration(name, cat=cat, dur_us=duration, ts_us=started / 1000,
-                             args={**fields, "outcome": outcome})
+                             args={**fields, **cpu, "outcome": outcome})
         except Exception:
             pass

@@ -160,9 +160,9 @@ class Completion(msgspec.Struct, frozen=True):
     plan_digest: str
     completed: tuple[tuple[int, str], ...]
 
-    def check(self, plan):
-        if (self.plan_digest != digest(plan) or len(set(self.completed)) != len(self.completed)
-                or set(self.completed) != set(plan.units)):
+    def check(self, plan_digest, units):
+        if (self.plan_digest != plan_digest or len(set(self.completed)) != len(self.completed)
+                or set(self.completed) != set(units)):
             raise ValueError("incomplete or mismatched transfer completion")
 
 

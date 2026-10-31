@@ -87,7 +87,7 @@ def test_native_observation_preserves_result_and_explicit_owner_context(monkeypa
         if sink == "broken":
             raise OSError("profiler unavailable")
         if sink == "enabled":
-            traces.append(kwargs)
+            traces.append((args[0], kwargs))
     def info(*args, **kwargs):
         if sink == "broken":
             raise OSError("log unavailable")
@@ -106,8 +106,9 @@ def test_native_observation_preserves_result_and_explicit_owner_context(monkeypa
     assert len(calls) == 1 and calls[0][0] == "d-boot"
     assert all("error" not in reply for reply in replies) and owner.stopped
     if sink == "enabled":
-        assert traces[0]["args"] == {**observation, "bytes": 64, "segments": 1, "outcome": "completed"}
-        assert traces[0]["dur_us"] >= 0
+        trace = next(value for name, value in traces if name == "pd.native.write")
+        assert trace["args"] == {**observation, "bytes": 64, "segments": 1, "outcome": "completed"}
+        assert trace["dur_us"] >= 0
     else:
         assert not traces
 
@@ -120,6 +121,7 @@ def test_unavailable_node_accepts_existing_completion_and_stop_but_no_new_work(f
         entry = s.register_http(binding, {})
         plan = Plan(binding, "continuation", 0, 0, 128, False, ((0, 0),), (), ((0, "kv"),))
         entry.pending = plan
+        entry.pending_digest = digest(plan)
         s.core.is_ready = lambda: failure != "engine"
         s.gated, s.closing = failure == "gated", failure == "closing"
         payload = {"binding": msgspec.to_builtins(binding)}
@@ -318,6 +320,7 @@ def test_query_during_unknown_and_http_cancel_is_read_only_and_does_not_claim_re
         entry.reservation = s.cache.reserve_group_cache(rid, rid, 256, prompt_token_count=128)
         s.cache.authorize_group_cache_write(rid)
         entry.pending = Plan(binding, "continuation", 0, 0, 128, True, ((0, 0),), (), ((0, "kv"),))
+        entry.pending_digest = digest(entry.pending)
         s.fail(entry, TransferError("native result unknown", uncertain=True))
         assert entry.transferred.is_set() and entry.prepared.is_set()
         current = s.cache.group_cache_reservation(rid)
