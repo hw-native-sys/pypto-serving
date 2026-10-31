@@ -15,7 +15,7 @@ import uuid
 
 import msgspec
 
-VERSION = 2
+VERSION = 3
 MAX_FRAME = 16 * 1024 * 1024
 
 
@@ -118,12 +118,11 @@ class Prefix(msgspec.Struct, frozen=True):
     hashes: dict[str, tuple[str, ...]]
 
 
-class Continuation(msgspec.Struct, frozen=True):
+class Continuation(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     tokens: tuple[int, ...]
     config: dict
     parser: dict | None
     constraint: dict | None
-    prefix: Prefix
 
 
 class Placement(msgspec.Struct, frozen=True):
@@ -154,6 +153,7 @@ class Plan(msgspec.Struct, frozen=True):
     copies: tuple[Copy, ...]
     units: tuple[tuple[int, str], ...]
     first_token: int | None = None
+    valid_from: dict[str, int] = msgspec.field(default_factory=dict)
 
 
 class Completion(msgspec.Struct, frozen=True):
