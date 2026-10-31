@@ -768,6 +768,11 @@ class ServingServer:
         has_tool_history = any(m.tool_calls or m.role == "tool" for m in request.messages)
         if (request.tools or has_tool_history) and not supports_tool_calls(parser_id):
             raise ValueError("the model has no tool-call parser")
+        if (
+            getattr(self.engine.tokenizer, "output_parser_requires_tool_context", False)
+            and not (request.tools or has_tool_history)
+        ):
+            return None
         if not parser_id:
             return None
         kwargs = self._chat_kwargs(request.chat_template_kwargs, request.reasoning_effort)
