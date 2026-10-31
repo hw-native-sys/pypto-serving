@@ -50,6 +50,11 @@ class TokenizerAdapter:
         """Return the Serving output parser registered for this tokenizer."""
         return None
 
+    @property
+    def output_parser_requires_tool_context(self) -> bool:
+        """Whether parsing is needed only for requests with tool context."""
+        return False
+
     def apply_chat_template(self, messages: list[dict[str, object]], **kwargs) -> str:
         """Encode chat messages into the model's generation prompt."""
         raise NotImplementedError
@@ -200,13 +205,18 @@ class DeepSeekV4TokenizerAdapter(TransformersTokenizerAdapter):
 def load_tokenizer(model_dir: str | Path, *, trust_remote_code: bool = False) -> TokenizerAdapter:
     """Load a local tokenizer and select any model-specific chat encoding."""
     model_path = Path(model_dir)
-    family = detect_model_family(read_model_config(model_path))
+    model_config = read_model_config(model_path)
+    family = detect_model_family(model_config)
     if family == "deepseek_v41":
         from .deepseek_v41.encoding import DeepSeekV41TokenizerAdapter
 
         adapter_cls = DeepSeekV41TokenizerAdapter
     elif family == "deepseek_v4":
         adapter_cls = DeepSeekV4TokenizerAdapter
+    elif model_config.get("model_type") == "qwen3":
+        from .qwen.encoding import Qwen3TokenizerAdapter
+
+        adapter_cls = Qwen3TokenizerAdapter
     else:
         adapter_cls = TransformersTokenizerAdapter
     if (model_path / "tokenizer.json").exists():
