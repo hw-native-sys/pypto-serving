@@ -27,7 +27,7 @@ pypto-serving \
   --model /path/to/dsv4-flash-dspark-w8a8 --served-model-name dsv4 \
   --backend npu --platform a2a3 \
   --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
-  --dp 4 --ep 16 --tp 4 --block-size 32 --max-num-seqs 8 \
+  --dp 4 --ep 16 --tp 4 --block-size 32 \
   --max-model-len 655360 --max-num-batched-tokens 8192 \
   --long-prefill-token-threshold 128 \
   --speculative-config '{"method":"dspark","num_speculative_tokens":7}' \
@@ -37,6 +37,14 @@ pypto-serving \
 ```
 
 Use `--pd-role decode` on D; both launchers specify K7, while P internally runs target-only prefill. The context limit covers **prompt plus output**: 655360 allows a 524288-token prompt plus 131072 generated tokens, subject to actual device memory. Configuring this limit is not a full-length validation.
+
+When omitted, `--max-num-seqs` defaults to **16 on P** and **72 on D**.
+The value configures both the local request limit and cache-pool planning;
+an explicit `--max-num-seqs N` overrides the role default. It does not reserve
+every request's maximum output length or guarantee that all in-flight requests
+fit in HBM. Ordinary Serving keeps its default of 16.
+Use separate compilation output directories for different deployments and
+topologies when setting `PYPTO_PROG_BUILD_DIR`.
 
 Each node chooses its own attention `--tp`, with `--dp = --ep / --tp`.
 The vocabulary head uses independent `--lm-head-tp` (default 4, retaining NZ).

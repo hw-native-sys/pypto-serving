@@ -18,6 +18,10 @@ import uuid
 PROVIDERS = {"mooncake": ("pypto_serving.pd.transfer", "Mooncake")}
 
 
+def default_max_num_seqs(role):
+    return {"prefill": 16, "decode": 72}[role]
+
+
 @dataclass(frozen=True)
 class Endpoint:
     host: str
