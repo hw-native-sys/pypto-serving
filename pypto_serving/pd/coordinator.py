@@ -99,9 +99,7 @@ class PDCoordinator:
             self.nodes[spec.name] = node
             return True
         except httpx.PoolTimeout:
-            # Local pool pressure is not a liveness observation about this node.
-            logger.warning("descriptor probe deferred: HTTP pool busy node=%s", spec.name)
-            return None
+            raise  # The shared HealthMonitor classifies local pool pressure.
         except (httpx.HTTPError, ValueError):
             self.nodes.pop(spec.name, None)
             self.registry.set_ready(spec.name, False)

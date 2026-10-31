@@ -432,8 +432,6 @@ class HealthMonitor:
         try:
             if self._probe_callback is not None:
                 healthy = await self._probe_callback(state.spec)
-                if healthy is None:
-                    return  # A locally deferred probe is not a failed liveness sample.
             else:
                 response = await self._client.get(
                     f"{state.spec.base_url}/health", timeout=self._config.connect_timeout_seconds

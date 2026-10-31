@@ -466,6 +466,7 @@ def load_router_config(path: str | Path, **settings) -> RouterConfig:
             "session_ttl_seconds": "--session-ttl", "affinity_slack": "--affinity-slack",
             "launch_timeout_seconds": "--launch-timeout", "drain_timeout_seconds": "--drain-timeout",
             "initial_replicas": "--initial-replicas", "max_replicas": "--max-replicas",
+            "replace_dead": "--no-replace-dead", "replace_after_seconds": "--replace-after",
         }
         unsupported = [flag for key, flag in ordinary_only.items() if settings.get(key) is not None]
         if unsupported:

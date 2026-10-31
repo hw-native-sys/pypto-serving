@@ -67,8 +67,8 @@ One slot per group of `devices_per_replica` devices, taken from `devices` in ord
 | `--session-ttl SECONDS` | `600` | Inactivity before a conversation loses its replica pin. Expiry drops the pin only; KV blocks are reclaimed by each replica's own cache. |
 | `--affinity-slack N` | `8` | Extra outstanding requests a pinned replica may carry, relative to the least loaded one, before a session is re-routed. `0` disables affinity; a large value makes it strict. |
 | `--health-interval SECONDS` | `5` | Interval between replica health probes. |
-| `--request-timeout SECONDS` | `3600` | HTTP write/pool timeout. Ordinary forwarding has no read deadline. PD response-read and coordination waits use the separate `pd` options; neither is a single deadline for the whole SSE response. |
-| `--connect-timeout SECONDS` | `5` | Connect timeout per replica. |
+| `--request-timeout SECONDS` | `3600` | HTTP write timeout. Ordinary forwarding has no read deadline. Pool waits use `--connect-timeout`; PD response-read and coordination waits use the separate `pd` options. Neither is a single deadline for the whole SSE response. |
+| `--connect-timeout SECONDS` | `5` | Connect and connection-pool timeout per replica. |
 | `--initial-replicas N` | `1` with hosts, else `0` | Replicas to launch at startup, filling slots in config order, local machine first. Refused at startup if it exceeds the pool. |
 | `--max-replicas N` | declared pool | Cap launched replicas below the declared devices. |
 | `--launch-timeout SECONDS` | `600` | How long a launch may take to report ready before it is stopped and its devices released. Measured loads: Qwen3-14B ~130s warm, DeepSeek V4 ~370s on eight cards. Load times move with the checkpoint and the stack, so time your own and leave headroom — too low means the router stops a replica that was loading normally. |
@@ -80,9 +80,14 @@ One slot per group of `devices_per_replica` devices, taken from `devices` in ord
 
 PD nodes are externally managed and use round-robin routing without session affinity.
 Explicit `--session-ttl`, `--affinity-slack`, `--initial-replicas`, `--max-replicas`,
-`--launch-timeout`, `--drain-timeout` and `--state-file` are rejected for PD,
+`--launch-timeout`, `--drain-timeout`, `--replace-after`, `--no-replace-dead`
+and `--state-file` are rejected for PD,
 including values equal to the ordinary defaults. `X-Session-Id` is still returned
 for request correlation; it does not pin a PD pair.
+
+Both modes use a separate HTTP pool for health probes. Local pool exhaustion
+does not demote a backend. Automatic replacement applies only to ordinary
+replicas launched by the Router.
 
 ## Endpoints
 

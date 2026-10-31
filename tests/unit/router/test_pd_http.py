@@ -148,3 +148,68 @@ def test_stream_coercion_matches_model_node_schema(kind, fields, streaming):
                 media = "text/event-stream" if streaming else "application/json"
                 assert response.headers["content-type"].startswith(media)
     asyncio.run(run())
+
+
+def test_pd_probes_share_health_monitor_but_not_generation_pool(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    async def run():
+        clients = []
+        mode = "ready"
+        async def transport(req):
+            assert req.url.path.endswith("descriptor")
+            if mode == "busy":
+                raise httpx.PoolTimeout("local pool busy")
+            node = msgspec.structs.replace(descriptor(req.url.host), healthy=mode == "ready")
+            return httpx.Response(200, json=msgspec.to_builtins(node))
+        def factory(_):
+            probe = len(clients) == 1
+            async def handler(req):
+                assert probe, "descriptor used the generation pool"
+                return await transport(req)
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=1)
+            clients.append(client)
+            return client
+        router = ServingRouter(config(), client_factory=factory)
+        for operation in ("adopt_previous", "launch_initial", "stop_all"):
+            monkeypatch.setattr(router.fleet, operation, AsyncMock(side_effect=AssertionError(
+                "PD nodes are externally managed")))
+        assert router.proxy.probe_client is router.probe_client is clients[1]
+        assert router.health._client is clients[1] and router.client is clients[0]
+        async with router.app.router.lifespan_context(router.app):
+            before = dict(router.proxy.nodes)
+            assert len(before) == 2 and (await router._health()).status_code == 200
+            mode = "busy"
+            await router.health.probe_once()
+            assert router.proxy.nodes == before
+            assert all(state.ready and state.failures == 0 for state in router.registry.states)
+            mode = "unready"
+            await router.health.probe_once()
+            assert not router.proxy.nodes and (await router._health()).status_code == 503
+            assert router.fleet.owned_names == () and not router.fleet._watchers
+        assert all(client.is_closed for client in clients)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("pd", [False, True])
+@pytest.mark.parametrize("flags,enabled,delay", [([], True, 30),
+    (["--no-replace-dead"], False, 30), (["--replace-after", "9"], True, 9)])
+def test_replacement_cli_preserves_replica_defaults_and_rejects_pd(tmp_path, monkeypatch, pd,
+                                                                  flags, enabled, delay):
+    from pypto_serving.router import app
+    import uvicorn
+
+    replicas = ([dict(name="p", host="p", port=8111, role="prefill"),
+                 dict(name="d", host="d", port=8112, role="decode")] if pd
+                else [dict(name="r", host="r", port=8111)])
+    path = tmp_path / "router.json"
+    path.write_text(json.dumps(dict(replicas=replicas)))
+    created = []
+    monkeypatch.delenv(app.ADMIN_TOKEN_ENV, raising=False)
+    monkeypatch.setattr(app, "create_router_app", lambda cfg, **_: created.append(cfg) or object())
+    monkeypatch.setattr(uvicorn, "run", lambda *_, **__: None)
+    assert app.main(["--replicas", str(path), *flags]) == int(pd and bool(flags))
+    if pd and flags:
+        assert not created
+    else:
+        assert created[0].replace_dead is enabled and created[0].replace_after_seconds == delay
