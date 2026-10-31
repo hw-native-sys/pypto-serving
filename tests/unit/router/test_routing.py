@@ -290,14 +290,21 @@ def test_counters_track_where_requests_went():
     assert sum(state.routed for state in registry.states) == 4
 
 
-def test_release_floors_at_zero_and_unknown_names_are_ignored():
+def test_count_release_is_once_and_bound_to_the_original_node():
     registry, _ = _registry(_config())
-    registry.release("r0")
-    assert registry.state("r0").outstanding == 0
-    registry.acquire("ghost")
-    registry.release("ghost")
-    registry.set_ready("ghost", False)
-    assert registry.ready_count() == 2
+    old = registry.state("r0")
+    release = registry.acquire("r0", "r1")
+    registry.remove("r0")
+    registry.add(ReplicaSpec("r0", "replacement", 9000), ready=True)
+    new_release = registry.acquire("r0")
+    release("r0")
+    release("r0")
+    assert old.outstanding == 0 and registry.state("r0").outstanding == 1
+    assert registry.state("r1").outstanding == 1
+    release()
+    release()
+    new_release()
+    assert all(state.outstanding == 0 for state in registry.states)
 
 
 # --- health polling ---

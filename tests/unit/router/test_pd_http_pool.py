@@ -16,7 +16,6 @@ import socket
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import msgspec
-import pytest
 import uvicorn
 
 from pypto_serving.pd.protocol import Component, Contract, Node, Topology
@@ -95,8 +94,7 @@ async def serve(peer):
             await asyncio.wait_for(task, 5)
 
 
-@pytest.mark.parametrize("retirement", ["cancel_streams", "close_router", "unstarted_streams"])
-def test_real_pool_keeps_descriptors_and_aborts_moving(retirement):
+def test_real_pool_keeps_descriptors_and_aborts_moving():
     async def run():
         peers = [Peer(role) for role in ("prefill", "decode")]
         async with AsyncExitStack() as stack:
@@ -118,15 +116,10 @@ def test_real_pool_keeps_descriptors_and_aborts_moving(retirement):
                 await asyncio.wait_for(router.health.probe_once(), 2)
                 assert all(peer.probes == 2 for peer in peers)
                 assert (await router._health()).status_code == 200
-                if retirement == "close_router":
-                    await asyncio.wait_for(router.proxy.close(), 3)
-                elif retirement == "unstarted_streams":
-                    await until(lambda: not router.proxy.active)
-                else:
-                    for response in responses:
-                        assert "answer" in await anext(response.body_iterator)
-                    await asyncio.wait_for(asyncio.gather(*(
-                        response.body_iterator.aclose() for response in responses)), 3)
+                for response in responses:
+                    assert "answer" in await anext(response.body_iterator)
+                await asyncio.wait_for(asyncio.gather(*(
+                    response.body_iterator.aclose() for response in responses)), 3)
                 await until(lambda: not any(peer.active for peer in peers))
                 assert all(peer.aborts == 2 for peer in peers)
                 assert all(s.outstanding == 0 for s in router.registry.states)

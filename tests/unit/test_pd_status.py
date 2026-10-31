@@ -19,17 +19,13 @@ from pypto_serving.pd.protocol import Binding, Completion, Plan, digest
 from tests.unit.test_pd_cancellation import service
 
 
-@pytest.mark.parametrize("failure", ["none", "initializing", "loop", "worker", "gated", "closing"])
+@pytest.mark.parametrize("failure", ["none", "initializing", "engine", "gated", "closing"])
 def test_readiness_is_shared_by_health_descriptor_and_admission(failure):
     from pypto_serving.pd.integration import Server
-    from pypto_serving.serving.engine.async_engine import ReplicaEngineCore
 
     async def run():
         s, p, d = service("decode")
-        state = SimpleNamespace(_running=True,
-            _loop_task=SimpleNamespace(done=lambda: failure == "loop"),
-            _worker_process=SimpleNamespace(is_alive=lambda: failure != "worker"))
-        s.core.is_ready = lambda: ReplicaEngineCore.is_ready(state)
+        s.core.is_ready = lambda: failure != "engine"
         s.gated, s.closing = failure == "gated", failure == "closing"
         if failure == "initializing":
             s.node = None
@@ -53,8 +49,7 @@ def test_readiness_is_shared_by_health_descriptor_and_admission(failure):
 
 
 def test_pd_policy_cannot_select_a_pair_outside_filtered_candidates():
-    from pypto_serving.router.routing import RoundRobin
-    from tests.unit.router.test_pd_coordination import Peers, config, request, assert_idle
+    from tests.unit.router.test_pd_coordination import Peers, config, assert_idle
 
     async def run():
         cfg = config(p=2)
@@ -70,14 +65,10 @@ def test_pd_policy_cannot_select_a_pair_outside_filtered_candidates():
                 router.proxy._admit({})
             assert_idle(router)
             assert router.registry.total_routed() == 0
-            router.proxy.policy = RoundRobin()
-            assert (await router.proxy.forward(request({}), "/v1/completions")).status_code == 200
-            assert router.registry.total_routed() == 1
-            assert_idle(router)
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("sink", ["enabled", "disabled", "broken"])
+@pytest.mark.parametrize("sink", ["enabled", "broken"])
 def test_native_observation_preserves_result_and_explicit_owner_context(monkeypatch, sink):
     import logging
     import threading

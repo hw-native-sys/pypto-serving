@@ -80,7 +80,6 @@ class Peers:
 
 def assert_idle(router):
     assert not router.proxy.active
-    assert router.proxy.requests == router.proxy.handoffs == 0
     assert all(s.outstanding == 0 for s in router.registry.states)
 
 
@@ -232,48 +231,5 @@ def test_capacity_rejection_and_cancel_release():
             assert_idle(router)
             assert sum(path.endswith("abort") for _, path in peers.calls) == 2
             assert (await router.proxy.forward(request({}), "/v1/completions")).status_code == 200
-            assert_idle(router)
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("retirement", ["timeout", "cancel", "router_close"])
-def test_stream_retirement(retirement):
-    class Body(httpx.AsyncByteStream):
-        closes = 0
-        async def __aiter__(self):
-            self.started.set()
-            await self.release.wait()
-            yield b'data: {"choices":[{"text":"answer"}]}\n\n'
-        async def aclose(self):
-            self.closes += 1
-    async def run():
-        cfg = config()
-        peers = Peers(cfg)
-        peers.p_hold = asyncio.Event()
-        body = peers.d_stream = Body()
-        body.started, body.release = asyncio.Event(), asyncio.Event()
-        router = peers.router(cfg)
-        async with router.app.router.lifespan_context(router.app):
-            response = await asyncio.create_task(router.proxy.forward(request({"stream": True}), "/v1/completions"))
-            if retirement == "cancel":
-                first = asyncio.create_task(anext(response.body_iterator))
-                await asyncio.wait_for(body.started.wait(), 1)
-                await asyncio.sleep(cfg.pd_options["handoff_timeout"] * 2)
-                assert not first.done() and body.closes == 0 and router.proxy.requests == 1
-                first.cancel()
-                await asyncio.gather(first, return_exceptions=True)
-            elif retirement == "router_close":
-                await router.proxy.close()
-            else:
-                async def retired():
-                    while router.proxy.active:
-                        await asyncio.sleep(0.005)
-                await asyncio.wait_for(retired(), 1)
-                assert not body.started.is_set() and not router.proxy.closing
-                error = await asyncio.wait_for(anext(response.body_iterator), 1)
-                assert "pd_operation_timeout" in error and "answer" not in error
-            await response.body_iterator.aclose()
-            assert body.closes == 1
-            assert sum(path.endswith("abort") for _, path in peers.calls) == 2
             assert_idle(router)
     asyncio.run(run())

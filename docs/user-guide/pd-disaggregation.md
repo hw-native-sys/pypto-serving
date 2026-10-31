@@ -99,7 +99,7 @@ The Router always constructs its own PD context.
 
 | Router error code | HTTP status | Meaning |
 | --- | --- | --- |
-| `capacity_exhausted` | 503 | Compatible pairs exist but their request slots or global admission limits are full. The request was not dispatched; `Retry-After` suggests a delay before resubmission. |
+| `capacity_exhausted` | 503 | Compatible pairs exist but their per-node request slots are full. The request was not dispatched; `Retry-After` suggests a delay before resubmission. |
 | `no_available_backend` | 503 | No healthy compatible pair; also used for an unseen model while node discovery is incomplete. |
 | `model_not_found` | 404 | Every configured node has supplied a valid descriptor and the model is unknown. |
 | `invalid_request` | 400 | Invalid JSON, object or model field. Model-specific validation stays on the nodes. |
@@ -108,6 +108,7 @@ The Router always constructs its own PD context.
 | `pd_operation_timeout` | 503 | A PD coordination wait or HTTP operation timed out; the message identifies the wait or HTTP failure. |
 | `pd_protocol_error` | 503 | Invalid handoff confirmation or response protocol. |
 | `router_closing` | 503 | The Router is shutting down. |
+| `response_retired` | 503 | The unstarted-body guard retired the response before iteration began. After SSE headers this is a stream error. |
 
 After SSE headers, errors remain stream events. Router-generated events keep the
 existing `error.message` and `error.type` fields and add `error.code` and
@@ -118,7 +119,8 @@ HTTP disconnects and Router counter release do not prove native transfers stoppe
 PD admission does not add a Router waiting queue. Selection follows fixed
 configured P/D-pair positions, skipping unhealthy, draining, incompatible or full
 nodes. Selection and counter reservation do not yield; P/D POSTs still run
-concurrently. P capacity returns when its handoff task finishes, independently
+concurrently. Both modes use the common Registry's per-node outstanding counts,
+with one idempotent release for each admitted request. P capacity returns when its handoff task finishes, independently
 of D headers or output; D capacity returns after response cleanup. The nodes
 retain their own capacity and safe-retirement checks. Only `capacity_exhausted`
 guarantees rejection before either POST; other errors may require cleanup of

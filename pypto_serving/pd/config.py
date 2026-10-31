@@ -16,6 +16,7 @@ from pathlib import Path
 import uuid
 
 PROVIDERS = {"mooncake": ("pypto_serving.pd.transfer", "Mooncake")}
+DEFAULT_CAPACITY = 256
 
 
 def default_max_num_seqs(role):
@@ -53,12 +54,18 @@ class Config:
     decode: tuple[Endpoint, ...]
     provider: str = "mooncake"
     policy: str = "round_robin"
-    capacity: int = 256
+    capacity: int = DEFAULT_CAPACITY
     handoff_timeout: float = 300.0
     request_timeout: float = 3600.0
     run_id: str = field(default_factory=lambda: datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8])
     log_enabled: bool = True
     log_root: str = "serving_log/pd_disag"
+
+    @property
+    def http_connections(self):
+        """Conservative generation/control budget; probes use their own pool."""
+        p, d = len(self.prefill), len(self.decode)
+        return self.capacity * (d * (p + d + 3) + p) + p + d
 
     def __post_init__(self):
         if self.provider not in PROVIDERS:

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from dataclasses import replace
 import logging
 import os
 import secrets
@@ -39,12 +40,12 @@ from pypto_serving.router.config import (
 )
 from pypto_serving.router.fleet import FleetManager, PoolExhausted
 from pypto_serving.router.launcher import LaunchError
-from pypto_serving.router.proxy import SESSION_HEADER, ReplicaProxy
+from pypto_serving.router.http import SESSION_HEADER, is_router_side_failure
+from pypto_serving.router.proxy import ReplicaProxy
 from pypto_serving.router.routing import (
     HealthMonitor,
     ReplicaRegistry,
     SessionDirectory,
-    is_router_side_failure,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,13 +92,7 @@ def default_client_factory(config: RouterConfig):
     # concurrent upstream requests, and a deployment whose clients hold long
     # streams -- a coding agent does -- reaches it with far fewer users than
     # the number suggests.
-    max_connections = config.max_connections
-    if config.is_pd:
-        capacity = (config.pd_options or {}).get("capacity", 256)
-        p = sum(r.role == "prefill" for r in config.replicas)
-        d = sum(r.role == "decode" for r in config.replicas)
-        max_connections = capacity * (d * (p + d + 3) + p) + p + d
-    limits = httpx.Limits(max_connections=max_connections,
+    limits = httpx.Limits(max_connections=config.max_connections,
                           max_keepalive_connections=config.max_keepalive_connections)
     return httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=False)
 
@@ -121,7 +116,11 @@ class ServingRouter:
             pd_config = Config.from_router(config)
             if state_path is not None:
                 raise ValueError("PD replicas are externally managed; --state-file requires ordinary hosts")
-        self.client = client_factory(config)
+        client_config = (replace(config, max_connections=pd_config.http_connections,
+                                 max_keepalive_connections=min(config.max_keepalive_connections,
+                                                               pd_config.http_connections))
+                         if config.is_pd else config)
+        self.client = client_factory(client_config)
         # A second client, so probes have a connection pool of their own. They
         # share the proxy's otherwise, and a coding agent's long streams can
         # hold every slot in it: the probes then fail for want of a connection
@@ -130,7 +129,7 @@ class ServingRouter:
         # at once, because the pool is what they have in common.
         self.probe_client = client_factory(config)
         self.proxy = (PDCoordinator(pd_config, self.registry, self.client, self.probe_client) if config.is_pd
-                      else ReplicaProxy(self.registry, self.client))
+                      else ReplicaProxy(self.registry, self.client, config.connect_timeout_seconds))
         self.health = HealthMonitor(config, self.registry, self.sessions, self.probe_client,
                                     probe=self.proxy.probe if config.is_pd else None)
         self._admin_token = admin_token
@@ -191,10 +190,9 @@ class ServingRouter:
                 yield
             finally:
                 try:
-                    if self.config.is_pd:
-                        await self.proxy.close()
-                    else:
+                    if not self.config.is_pd:
                         await self.fleet.stop_all()
+                    await self.proxy.close()
                 finally:
                     await self.health.stop()
                     for client in (self.client, self.probe_client):

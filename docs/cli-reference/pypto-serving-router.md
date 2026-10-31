@@ -89,6 +89,20 @@ Both modes use a separate HTTP pool for health probes. Local pool exhaustion
 does not demote a backend. Automatic replacement applies only to ordinary
 replicas launched by the Router.
 
+Both modes share header filtering, HTTP error classification and response cleanup.
+Router errors return `object: "error"`, `code` and `message`, with
+`X-PyPTO-Error-Source: router`. Local pool exhaustion returns 503 with
+`http_pool_exhausted`; connection failures return 502 with
+`upstream_connection_error`. Backend HTTP errors retain their status and body
+and carry `X-PyPTO-Error-Source: upstream`.
+
+Response cleanup closes the upstream HTTP response and releases its Registry
+count once, including cancellation and an unstarted body. The unstarted-body
+guard uses `connect_timeout_seconds` for ordinary forwarding and
+`pd.handoff_timeout` for PD; it is cancelled as iteration begins and does not
+limit generation. HTTP cleanup does not authorize native transfer or cache
+release. PD abort and handoff coordination remain in the PD module.
+
 ## Endpoints
 
 | Endpoint | Behaviour |

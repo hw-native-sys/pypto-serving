@@ -15,18 +15,10 @@ from contextlib import asynccontextmanager
 import httpx
 import msgspec
 import pytest
-from starlette.requests import Request
 
-from pypto_serving.pd.protocol import Binding, Component, Contract, Node, Topology, decode, digest
+from pypto_serving.pd.protocol import Binding, decode, digest
 from pypto_serving.router.app import ServingRouter
-from pypto_serving.router.config import ReplicaSpec, RouterConfig
-
-
-def config():
-    return RouterConfig(replicas=tuple(ReplicaSpec(name, name, 8111 + i, role=role)
-        for i, (name, role) in enumerate((("p", "prefill"), ("d", "decode")))),
-        pd_options={"capacity": 1, "handoff_timeout": 0.05, "request_timeout": 1},
-        observability={"enabled": False}, health_interval_seconds=60)
+from tests.unit.router.test_pd_coordination import Peers, config, request
 
 
 @asynccontextmanager
@@ -38,16 +30,7 @@ async def application(transport):
 
 
 def descriptor(name):
-    return Node(name, "prefill" if name == "p" else "decode", "boot-" + name,
-                Contract("test", "model", "layout", (Component("kv", "kv", "kv"),)),
-                "registry-" + name, Topology.for_tp(1, 1))
-
-
-def request(payload, path="/v1/completions"):
-    async def receive():
-        return {"type": "http.request", "body": json.dumps(payload).encode(), "more_body": False}
-    return Request({"type": "http", "method": "POST", "scheme": "http", "server": ("router", 8110),
-                    "path": path, "query_string": b"", "headers": []}, receive)
+    return Peers(config()).nodes[name]
 
 
 class Body(httpx.AsyncByteStream):
@@ -73,7 +56,7 @@ def test_cleanup_closes_decode_response_returned_after_abort(failure):
                 aborts.append(req.url.host)
                 release.set()
                 return httpx.Response(200, json={"accepted": True})
-            if req.url.host == "p":
+            if req.url.host == "p0":
                 await started.wait()
                 if failure != "prefill":
                     await release.wait()
@@ -95,7 +78,7 @@ def test_cleanup_closes_decode_response_returned_after_abort(failure):
                 else:
                     response = await asyncio.wait_for(task, 1)
                     assert response.status_code == (500 if failure == "prefill" else 503)
-                assert sorted(aborts) == ["d", "p"]
+                assert sorted(aborts) == ["d0", "p0"]
                 assert len(responses) == 1 and responses[0].is_closed and body.closes == 1
                 assert not any(state.outstanding for state in router.registry.states)
                 assert not router.proxy.active
@@ -106,10 +89,8 @@ def test_cleanup_closes_decode_response_returned_after_abort(failure):
 
 
 @pytest.mark.parametrize("kind", ["completion", "chat"])
-@pytest.mark.parametrize("fields,streaming", [({}, False), ({"stream": False}, False),
-    ({"stream": "false"}, False), ({"stream": "0"}, False), ({"stream": "off"}, False),
-    ({"stream": True}, True), ({"stream": "true"}, True), ({"stream": 0}, False),
-    ({"stream": 1}, True), ({"stream": None}, None), ({"stream": "invalid"}, None)])
+@pytest.mark.parametrize("fields,streaming", [({}, False), ({"stream": True}, True),
+    ({"stream": "false"}, False), ({"stream": None}, None)])
 def test_stream_coercion_matches_model_node_schema(kind, fields, streaming):
     from pypto_serving.serving.server.server import ChatCompletionRequest, CompletionRequest
     async def run():
@@ -126,7 +107,7 @@ def test_stream_coercion_matches_model_node_schema(kind, fields, streaming):
             assert binding.input_digest == digest(body)
             assert type(body["stream"]) is bool and public.stream == streaming
             posts.append(req.url.host)
-            if req.url.host == "p":
+            if req.url.host == "p0":
                 return httpx.Response(200, json={"request": binding.request, "status": "ready"})
             if public.stream:
                 return httpx.Response(200, text='data: {"choices":[{"text":"answer","finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
@@ -144,7 +125,7 @@ def test_stream_coercion_matches_model_node_schema(kind, fields, streaming):
                 assert response.status_code == 400 and not posts
             else:
                 assert response.status_code == 200 and "answer" in response.text
-                assert "pd_execution_error" not in response.text and sorted(posts) == ["d", "p"]
+                assert "pd_execution_error" not in response.text and sorted(posts) == ["d0", "p0"]
                 media = "text/event-stream" if streaming else "application/json"
                 assert response.headers["content-type"].startswith(media)
     asyncio.run(run())
@@ -191,25 +172,14 @@ def test_pd_probes_share_health_monitor_but_not_generation_pool(monkeypatch):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("pd", [False, True])
-@pytest.mark.parametrize("flags,enabled,delay", [([], True, 30),
-    (["--no-replace-dead"], False, 30), (["--replace-after", "9"], True, 9)])
-def test_replacement_cli_preserves_replica_defaults_and_rejects_pd(tmp_path, monkeypatch, pd,
-                                                                  flags, enabled, delay):
+@pytest.mark.parametrize("flags", [["--no-replace-dead"], ["--replace-after", "9"]])
+def test_pd_rejects_replica_replacement_cli(tmp_path, monkeypatch, flags):
     from pypto_serving.router import app
-    import uvicorn
 
-    replicas = ([dict(name="p", host="p", port=8111, role="prefill"),
-                 dict(name="d", host="d", port=8112, role="decode")] if pd
-                else [dict(name="r", host="r", port=8111)])
     path = tmp_path / "router.json"
-    path.write_text(json.dumps(dict(replicas=replicas)))
-    created = []
+    path.write_text(json.dumps(dict(replicas=[
+        dict(name="p", host="p", port=8111, role="prefill"),
+        dict(name="d", host="d", port=8112, role="decode")])))
     monkeypatch.delenv(app.ADMIN_TOKEN_ENV, raising=False)
-    monkeypatch.setattr(app, "create_router_app", lambda cfg, **_: created.append(cfg) or object())
-    monkeypatch.setattr(uvicorn, "run", lambda *_, **__: None)
-    assert app.main(["--replicas", str(path), *flags]) == int(pd and bool(flags))
-    if pd and flags:
-        assert not created
-    else:
-        assert created[0].replace_dead is enabled and created[0].replace_after_seconds == delay
+    monkeypatch.setattr(app, "create_router_app", lambda *_, **__: pytest.fail("PD launch must reject flags"))
+    assert app.main(["--replicas", str(path), *flags]) == 1

@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from pypto_serving.router.config import ReplicaSpec, RouterConfig
+from .http import is_router_side_failure
 
 logger = logging.getLogger(__name__)
 
@@ -44,25 +45,6 @@ UNHEALTHY_THRESHOLD = 2
 # untrusted input until its entries expire. Cap it and evict least-recently-used
 # pins: losing a pin costs one prefill, unbounded growth costs the process.
 DEFAULT_MAX_SESSIONS = 100_000
-
-
-def is_router_side_failure(exc: BaseException) -> bool:
-    """Did the request fail inside the router rather than at the replica?
-
-    httpx raises PoolTimeout when *our* connection pool has no free slot, which
-    happens when the router is busy and says nothing about the replica at the
-    other end. Every other transport error -- refused, reset, read timeout --
-    is evidence about the replica and is meant to count.
-
-    The distinction matters because a demotion is no longer only a pause in
-    rotation: a replica that stays unroutable long enough is now stopped and
-    replaced, at the price of a model load. Router congestion must not buy that.
-    """
-    try:
-        import httpx
-    except ImportError:  # pragma: no cover - the router cannot run without it
-        return False
-    return isinstance(exc, httpx.PoolTimeout)
 
 
 class NoReplicaAvailable(RuntimeError):
@@ -336,15 +318,17 @@ class ReplicaRegistry:
         state.ready = ready
         logger.info("replica %s is now %s", name, "routable" if ready else "unroutable")
 
-    def acquire(self, name: str) -> None:
-        state = self._by_name.get(name)
-        if state is not None:
+    def acquire(self, *names: str):
+        """Count dispatches once; return an idempotent release bound to these node instances."""
+        pending = {name: self._by_name[name] for name in names}
+        for state in pending.values():
             state.outstanding += 1
-
-    def release(self, name: str) -> None:
-        state = self._by_name.get(name)
-        if state is not None:
-            state.outstanding = max(0, state.outstanding - 1)
+        def release(name=None):
+            for key in tuple(pending) if name is None else (name,):
+                state = pending.pop(key, None)
+                if state is not None:
+                    state.outstanding -= 1
+        return release
 
     def select(self, session_id: str) -> RoutingDecision:
         """Pick a replica for this session and record the pin.
