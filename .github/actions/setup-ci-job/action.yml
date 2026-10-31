@@ -420,10 +420,14 @@ runs:
           done
         }
         rm -rf "$PTO_ISA_ROOT"
-        retry timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git "$PTO_ISA_ROOT" \
-          || { rm -rf "$PTO_ISA_ROOT"; retry timeout 300 git clone https://gitcode.com/luohuan40/pto-isa.git "$PTO_ISA_ROOT"; }
-        cd "$PTO_ISA_ROOT"
-        git checkout "$PTO_ISA_COMMIT"
+        git init --quiet "$PTO_ISA_ROOT"
+        git -C "$PTO_ISA_ROOT" remote add origin https://github.com/hw-native-sys/pto-isa.git
+        # Fetch only the pinned commit instead of timing out on the full history.
+        # A mirror is usable only if it contains that same commit; never use its HEAD.
+        retry timeout 180 git -C "$PTO_ISA_ROOT" fetch --depth=1 origin "$PTO_ISA_COMMIT" \
+          || retry timeout 180 git -C "$PTO_ISA_ROOT" fetch --depth=1 \
+            https://gitcode.com/luohuan40/pto-isa.git "$PTO_ISA_COMMIT"
+        git -C "$PTO_ISA_ROOT" checkout --detach "$PTO_ISA_COMMIT"
 
     - name: Bootstrap conda + per-job venv + write activate.sh
       if: ${{ inputs.toolchain == 'conda' }}

@@ -47,6 +47,18 @@ jobs:
 
     steps:
       - name: Fetch composite action definitions
+        id: checkout_actions
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      # Sparse checkout can download blobs after the fetch retry loop.
+      # Retry the full authenticated checkout; a second failure is fatal.
+      - name: Retry fetching composite action definitions
+        if: steps.checkout_actions.outcome == 'failure'
         uses: actions/checkout@v4
         with:
           sparse-checkout: .github/actions
@@ -170,6 +182,18 @@ jobs:
 
     steps:
       - name: Fetch composite action definitions
+        id: checkout_actions
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      # Sparse checkout can download blobs after the fetch retry loop.
+      # Retry the full authenticated checkout; a second failure is fatal.
+      - name: Retry fetching composite action definitions
+        if: steps.checkout_actions.outcome == 'failure'
         uses: actions/checkout@v4
         with:
           sparse-checkout: .github/actions
