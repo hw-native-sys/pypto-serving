@@ -31,7 +31,7 @@ from pypto_serving.serving.server.serving_worker import spawn_worker
 from .adapter import select_adapter
 from .config import Config, log_context
 from .protocol import Binding, Continuation, Node, decode
-from .service import Service
+from .service import NodeUnavailable, Service
 from .worker import Progress, Services, WorkerSettings
 
 
@@ -69,13 +69,25 @@ class Server(ServingServer):
         super().__init__(facade, engine.config.model_id, generate)
         service.preflight = self._preflight_constraint
 
+    def _register_exception_handlers(self):
+        super()._register_exception_handlers()
+        self.app.add_exception_handler(NodeUnavailable, self.unavailable)
+
+    @staticmethod
+    async def unavailable(request, exc):
+        return JSONResponse(dict(object="error", code="pd_node_unavailable", message=str(exc)), status_code=503)
+
     def _register_routes(self):
         super()._register_routes()
         self.app.add_api_route("/internal/pd/descriptor", self.descriptor, methods=["GET"])
         self.app.add_api_route("/internal/pd/abort", self.abort, methods=["POST"])
+        self.app.add_api_route("/internal/pd/requests/{request_id}", self.status, methods=["GET"])
+
+    async def status(self, request_id: str):
+        return JSONResponse(self.service.status(request_id))
 
     async def _health(self):
-        healthy = self.service.node is not None and not self.service.gated and not self.service.closing
+        healthy = self.service.is_ready()
         return JSONResponse(dict(status="ok" if healthy else "unavailable"), status_code=200 if healthy else 503)
 
     async def descriptor(self):
@@ -83,7 +95,7 @@ class Server(ServingServer):
         if node is None:
             return JSONResponse(dict(error="node initializing"), status_code=503)
         return JSONResponse(msgspec.to_builtins(msgspec.structs.replace(
-            node, healthy=not self.service.gated and not self.service.closing)))
+            node, healthy=self.service.is_ready())))
 
     async def abort(self, request: HTTPRequest):
         binding = decode(await request.json(), Binding)
@@ -97,6 +109,8 @@ class Server(ServingServer):
         return await self.handle(request, "chat")
 
     async def handle(self, request, kind):
+        if not self.service.is_ready():
+            raise NodeUnavailable("PD node is unavailable")
         raw = await request.json()
         context = json.loads(request.headers.get("x-pd-context", "{}"))
         if set(context) != {"binding", "peer"}:
@@ -116,8 +130,7 @@ class Server(ServingServer):
                 self.service.adapter.validate(config)
                 tokens = tuple(self.real_engine._tokenize_prompt(prompt))
                 continuation = Continuation(tokens, asdict(config), asdict(parser) if parser else None,
-                                            constraint.to_wire() if constraint else None,
-                                            self.service.adapter.prefix_spec(tokens, self.service.cache))
+                                            constraint.to_wire() if constraint else None)
                 entry.task = asyncio.create_task(self.service.prefill(entry, continuation, peer))
                 try:
                     await asyncio.shield(entry.task)
@@ -126,10 +139,12 @@ class Server(ServingServer):
                     await asyncio.shield(entry.task)
                     raise
                 return JSONResponse(dict(request=binding.request, status="ready"))
-            except Exception as exc:
+            except BaseException as exc:
+                if isinstance(exc, asyncio.CancelledError):
+                    entry.cancelled = True
                 if entry.error is None:
                     self.service.fail(entry, exc)
-                if binding.request not in self.service.pins.active:
+                if (entry.task is None or entry.task.done()) and binding.request not in self.service.pins.active:
                     self.service.finish(entry)
                 raise
         try:

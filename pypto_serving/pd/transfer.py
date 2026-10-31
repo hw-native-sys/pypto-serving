@@ -11,6 +11,7 @@
 import ctypes
 from functools import partial
 import importlib
+import logging
 import os
 import select
 import socket
@@ -22,9 +23,12 @@ from typing import Protocol
 
 import msgspec
 
-from pypto_serving.tools.profile import profile_span, configure_profiler, get_profiler
+from pypto_serving.tools.observe import span
+from pypto_serving.tools.profile import configure_profiler, get_profiler
 from .config import PROVIDERS
 from .protocol import Copy, MAX_FRAME, decode
+
+logger = logging.getLogger(__name__)
 
 
 class TransferError(RuntimeError):
@@ -107,6 +111,21 @@ class Mooncake:
 
     def write(self, peer, copies):
         self._check()
+        with span(logger, "pd.provider.lower", log=False, thread_cpu=True,
+                  peer=peer, segments=len(copies)):
+            source, destination, lengths, endpoints = self._lower(peer, copies)
+        if not copies:
+            return
+        try:
+            with span(logger, "MooncakeTransferEngine.batch_transfer_sync_write", cat="native-transfer",
+                      log=False, segments=len(copies), bytes=sum(lengths)):
+                self._code(self.engine.batch_transfer_sync_write(
+                    endpoints.pop(), source, destination, lengths), uncertain=True)
+        except BaseException as exc:
+            self.poisoned = True
+            raise TransferError(f"native completion uncertain: {exc}", uncertain=True) from exc
+
+    def _lower(self, peer, copies):
         source, destination, lengths, endpoints = [], [], [], set()
         for copy in copies:
             src = self.local[copy.component]
@@ -119,18 +138,9 @@ class Mooncake:
             destination.append(dst.handle["address"] + copy.destination_offset)
             lengths.append(copy.length)
             endpoints.add(dst.handle["endpoint"])
-        if not copies:
-            return
-        if len(endpoints) != 1:
+        if copies and len(endpoints) != 1:
             raise ValueError("one native batch must target one rank owner")
-        try:
-            with profile_span("pd.native.write", cat="native-transfer",
-                              args={"bytes": sum(lengths), "segments": len(lengths)}):
-                self._code(self.engine.batch_transfer_sync_write(
-                    endpoints.pop(), source, destination, lengths), uncertain=True)
-        except BaseException as exc:
-            self.poisoned = True
-            raise TransferError(f"native completion uncertain: {exc}", uncertain=True) from exc
+        return source, destination, lengths, endpoints
 
     def release(self):
         self._check()
@@ -152,7 +162,9 @@ def provider_factory(name, hostname):
 
 
 def _send(channel, value):
-    payload = msgspec.msgpack.encode(value)
+    with span(logger, "pd.owner.encode", log=False, thread_cpu=True,
+              operation=value.get("operation", "reply"), sequence=value.get("sequence")):
+        payload = msgspec.msgpack.encode(value)
     if len(payload) > MAX_FRAME:
         raise ValueError("owner message too large")
     channel.sendall(struct.pack("!I", len(payload)) + payload)
@@ -212,13 +224,15 @@ class Owner:
         return OwnerService(context, self.child, self)
 
     def call(self, operation, **payload):
-        with self.lock:
+        fields = dict(operation=operation, owner_rank=self.rank, **payload.get("observation", {}))
+        with span(logger, "pd.owner.call", log=False, **fields), self.lock:
             if self.uncertain:
                 raise TransferError("owner gated", uncertain=True)
             self.sequence += 1
             try:
-                _send(self.parent, dict(sequence=self.sequence, boot=self.boot, operation=operation, **payload))
-                reply = _receive(self.parent)
+                with span(logger, "pd.owner.rpc", log=False, **fields):
+                    _send(self.parent, dict(sequence=self.sequence, boot=self.boot, operation=operation, **payload))
+                    reply = _receive(self.parent)
                 if reply["sequence"] != self.sequence or reply["boot"] != self.boot:
                     raise ValueError("stale owner reply")
                 if "error" in reply:
@@ -334,7 +348,13 @@ class OwnerService:
                     elif op == "install":
                         provider.install(tuple(decode(r, Region) for r in request["regions"]))
                     elif op == "write":
-                        provider.write(request["peer"], tuple(decode(c, Copy) for c in request["copies"]))
+                        with span(logger, "pd.owner.decode", log=False, thread_cpu=True,
+                                  **request["observation"]):
+                            copies = tuple(decode(c, Copy) for c in request["copies"])
+                        with span(logger, "pd.native.write", cat="native-transfer",
+                                  **request["observation"], bytes=sum(c.length for c in copies),
+                                  segments=len(copies)):
+                            provider.write(request["peer"], copies)
                     elif op == "release":
                         provider.release()
                         for token in self.tokens:

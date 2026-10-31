@@ -19,14 +19,18 @@ import msgspec
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.reasoning import OutputParserSpec
-from pypto_serving.tools.profile import profile_span
-from .planner import Geometry, SourcePins, page_indices, physical, plan_chunk, valid_from
+from pypto_serving.tools.observe import record, span
+from .planner import Geometry, SourcePins, page_indices, physical, plan_chunk, rolling_bounds
 from .protocol import (Binding, Completion, Continuation, Node, Placement, Plan, Topology,
                        decode, digest, receive, send)
 from .session import PeerPool, Session
 from .transfer import TransferError
 
 logger = logging.getLogger(__name__)
+
+
+class NodeUnavailable(RuntimeError):
+    """This node cannot admit new work; existing retirement remains allowed."""
 
 
 @dataclass
@@ -38,8 +42,10 @@ class Request:
     source_done: asyncio.Event = field(default_factory=asyncio.Event)
     cancelled: bool = False
     continuation: object = None
+    prefix: object = None
     reservation: object = None
     pending: object = None
+    pending_digest: str | None = None
     error: Exception | None = None
     chunk: int = 0
     end: int = 0
@@ -52,6 +58,7 @@ class Request:
     state_slots: dict = field(default_factory=dict)
     admitted: bool = False
     worker_release_ack: asyncio.Event = field(default_factory=asyncio.Event)
+    completion_source: str | None = None
 
 
 class Service:
@@ -72,14 +79,20 @@ class Service:
         self.preflight = None
 
     async def worker(self, operation, value=None):
-        payload = msgspec.msgpack.encode(value) if value is not None else b""
-        with profile_span("pd.worker." + operation, cat="pd"):
+        with span(logger, "pd.worker.encode", log=False, thread_cpu=True, operation=operation) as timing:
+            payload = msgspec.msgpack.encode(value) if value is not None else b""
+        with span(logger, "pd.worker." + operation, encode_ms=timing["duration_ms"],
+                  encode_thread_cpu_ms=timing["thread_cpu_ms"]):
             result = msgspec.msgpack.decode(await self.core.call_worker(operation, payload))
         if operation == "submit":
             if "error" in result:
                 raise TransferError(result["error"], uncertain=result["uncertain"])
             return result["job"]
         return result
+
+    def observe(self, name, entry, **fields):
+        record(logger, name, request=entry.binding.request, node_id=self.node.node_id,
+               boot=self.node.boot, registry=self.node.registry, **fields)
 
     async def start(self, boot, model):
         self.registry = await self.worker("registry")
@@ -93,12 +106,59 @@ class Service:
         logger.info("ready node=%s role=%s boot=%s prefix=%s", self.node.node_id, self.role,
                     boot, self.node.prefix)
 
-    def entry(self, binding):
+    def is_ready(self):
+        return (self.node is not None and not self.gated and not self.closing
+                and self.core.is_ready())
+
+    def status(self, request):
+        """Copy current facts without advancing execution or querying a native owner."""
+        entry = self.requests.get(request)
+        reservation = self.cache.group_cache_reservation(request) if self.role == "decode" else None
+        node = self.node
+        result = dict(node=dict(node_id=self.endpoint.node_id, role=self.role,
+                                boot=node.boot if node is not None else None,
+                                registry=node.registry if node is not None else None,
+                                ready=self.is_ready()), request=request, entry_present=entry is not None,
+                      terminal_binding_present=request in self.terminal, execution=None, handoff=None,
+                      reservation=None, source_pin=request in self.pins.active if self.role == "prefill" else None,
+                      worker=None)
+        if self.role == "decode":
+            result["reservation"] = dict(present=reservation is not None, state=None)
+        if reservation is not None:
+            result["reservation"].update(state=reservation.state.value,
+                reservation_id=reservation.reservation_id, request_id=reservation.request_id,
+                write_authorized=reservation.write_authorized, prompt_tokens=reservation.prompt_token_count,
+                token_capacity=reservation.token_capacity, prefix_hit_tokens=reservation.prefix_hit_tokens,
+                published_block_counts=dict(reservation.published_block_counts),
+                publication_valid_from=dict(reservation.publication_valid_from))
+        if entry is not None:
+            error = entry.error
+            uncertain = isinstance(error, TransferError) and error.uncertain
+            result["execution"] = dict(cancelled=entry.cancelled, response_closed=entry.response_closed,
+                error=dict(type=type(error).__name__, uncertain=uncertain) if error is not None else None,
+                source_stop_confirmed=entry.source_done.is_set() if self.role == "decode" else None)
+            pending = entry.pending
+            result["handoff"] = dict(confirmed_chunks=entry.chunk, confirmed_end=entry.end,
+                confirmation_source=entry.completion_source,
+                uncertain=uncertain, pending_plan=(dict(plan_digest=entry.pending_digest, chunk=pending.chunk,
+                    start=pending.start, end=pending.end, final=pending.final) if pending is not None else None))
+            result["worker"] = dict(state_reservation_confirmed=bool(entry.state_slots)
+                if self.role == "decode" else None, state_release_confirmed=entry.worker_release_ack.is_set()
+                if self.role == "decode" else None)
+        return result
+
+    def entry(self, binding, *, create=False):
+        if self.node is None:
+            raise NodeUnavailable("PD node is unavailable")
         binding.check(self.node, self.role)
-        if self.closing or self.gated or binding.request in self.terminal:
-            raise ValueError("node unavailable or request already terminal")
+        if binding.request in self.terminal:
+            raise ValueError("request already terminal")
+        if create and not self.is_ready():
+            raise NodeUnavailable("PD node is unavailable")
         entry = self.requests.get(binding.request)
         if entry is None:
+            if not create:
+                raise ValueError("unknown PD request")
             if len(self.requests) >= self.config.capacity:
                 raise ValueError("PD request capacity exhausted")
             entry = self.requests[binding.request] = Request(binding)
@@ -109,7 +169,7 @@ class Service:
     def register_http(self, binding, payload):
         if digest(payload) != binding.input_digest:
             raise ValueError("HTTP input differs from routed request")
-        entry = self.entry(binding)
+        entry = self.entry(binding, create=True)
         if entry.cancelled:
             raise ValueError("request cancelled")
         if entry.http.is_set():
@@ -141,10 +201,11 @@ class Service:
     def finish(self, entry):
         if self.requests.pop(entry.binding.request, None) is None:
             return
+        self.chunks.pop(entry.binding.request, None)
         self.remember_terminal(entry.binding)
-        logger.info("finished request=%s cancelled=%s error=%s p_hit=%d d_hit=%d", entry.binding.request,
-                    entry.cancelled, entry.error, entry.p_hit,
-                    entry.reservation.prefix_hit_tokens if entry.reservation is not None else 0)
+        self.observe("finished", entry, cancelled=entry.cancelled, error=entry.error,
+                     p_hit=entry.p_hit, d_hit=entry.reservation.prefix_hit_tokens
+                     if entry.reservation is not None else 0)
 
     async def connect(self, node):
         endpoint = self.config.endpoint("decode", node.node_id)
@@ -190,7 +251,7 @@ class Service:
                     reply = dict(id=message["id"], error=str(exc))
                 async with write_lock:
                     await send(writer, reply)
-            while not self.closing:
+            while True:
                 message = await receive(reader)
                 if len(tasks) >= self.config.capacity * 2:
                     await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -222,7 +283,7 @@ class Service:
                 # could be authorized, and abort must not allocate a new slot.
                 self.remember_terminal(binding)
                 return {}
-        entry = self.entry(binding)
+        entry = self.entry(binding, create=operation == "begin")
         request = binding.request
         if operation == "begin":
             if entry.continuation is not None or entry.cancelled:
@@ -240,17 +301,22 @@ class Service:
                 for task in (http, stopped):
                     task.cancel()
                 await asyncio.gather(http, stopped, return_exceptions=True)
+            if entry.cancelled:
+                raise ValueError("request cancelled before resource reservation")
             continuation = decode(payload["continuation"], Continuation)
             config = GenerateConfig(**continuation.config)
             self.adapter.validate(config)
             prefix = self.adapter.prefix_spec(continuation.tokens, self.cache)
-            if prefix != continuation.prefix or not continuation.tokens or config.max_new_tokens <= 0:
-                raise ValueError("continuation Prefix specification mismatch")
+            if not continuation.tokens or config.max_new_tokens <= 0:
+                raise ValueError("invalid continuation tokens or generation limit")
             if len(continuation.tokens) + config.max_new_tokens > self.core.config.runtime_config.max_seq_len:
                 raise ValueError("request exceeds model context capacity")
             entry.continuation = continuation
+            entry.prefix = prefix
             entry.normalized_digest = digest(continuation)
             try:
+                if not self.is_ready():
+                    raise NodeUnavailable("PD node is unavailable")
                 reservation = self.cache.reserve_group_cache(
                     request, request, len(continuation.tokens) + config.max_new_tokens,
                     prompt_token_count=len(continuation.tokens),
@@ -264,38 +330,53 @@ class Service:
                 if entry.cancelled:
                     raise ValueError("request cancelled during state reservation")
                 entry.prepared.set()
+                self.observe("reservation", entry, state=reservation.state.value,
+                             partition=reservation.partition, d_hit=reservation.prefix_hit_tokens)
                 return Placement(request, reservation.prefix_hit_tokens, reservation.partition,
                                  reservation.block_ids_by_group, entry.state_slots)
             except Exception as exc:
                 self.fail(entry, exc)
                 raise
         if operation == "plan":
+            if not self.is_ready():
+                raise NodeUnavailable("PD node is unavailable")
             if entry.cancelled:
                 raise ValueError("cancelled request cannot authorize new writes")
             plan = decode(payload["plan"], Plan)
             p_hit = payload["p_hit"]
             if (type(p_hit) is not int or not 0 <= p_hit <= plan.end
-                    or p_hit % entry.continuation.prefix.alignment or (entry.chunk and p_hit != entry.p_hit)):
+                    or p_hit % entry.prefix.alignment or (entry.chunk and p_hit != entry.p_hit)):
                 raise ValueError("invalid source Prefix boundary")
-            self.validate_plan(entry, plan, geometry, p_hit, peer.topology)
-            self.cache.authorize_group_cache_write(request)
+            with span(logger, "pd.plan.validate", log=False, thread_cpu=True,
+                      request=request, chunk=plan.chunk) as timing:
+                self.validate_plan(entry, plan, geometry, p_hit, peer.topology)
+                plan_digest = digest(plan)
+            if plan.copies or plan.final:
+                self.cache.authorize_group_cache_write(request)
             entry.pending = plan
+            entry.pending_digest = plan_digest
             entry.p_hit = p_hit
             entry.mapping = plan.mapping
-            return digest(plan)
+            self.observe("plan.authorized", entry, plan_digest=plan_digest, chunk=plan.chunk,
+                         start=plan.start, end=plan.end, final=plan.final,
+                         validation_ms=timing["duration_ms"], validation_thread_cpu_ms=timing["thread_cpu_ms"])
+            return plan_digest
         if operation == "complete":
             plan = entry.pending
             if plan is None:
                 raise ValueError("no authorized chunk")
             completion = decode(payload["completion"], Completion)
-            completion.check(plan)
+            completion.check(entry.pending_digest, plan.units)
             entry.pending = None
+            entry.pending_digest = None
             entry.chunk += 1
             entry.end = plan.end
+            entry.completion_source = "sender_completion" if plan.copies else "empty_plan"
+            self.observe("completion", entry, plan_digest=completion.plan_digest, end=entry.end)
             if plan.final:
-                self.cache.commit_group_cache(request, valid_from=valid_from(
-                    self.cache.group_specs, self.node.contract.components,
-                    entry.p_hit, entry.reservation.prefix_hit_tokens))
+                self.cache.commit_group_cache(request, valid_from=plan.valid_from)
+                self.observe("commit", entry, plan_digest=completion.plan_digest, end=entry.end,
+                             state=self.cache.group_cache_reservation(request).state.value)
                 try:
                     if entry.continuation.constraint is not None:
                         await self.preflight(ConstraintSpec.from_wire(entry.continuation.constraint),
@@ -308,6 +389,7 @@ class Service:
             return {}
         if operation == "source_done":
             entry.source_done.set()
+            self.observe("source_done", entry)
             if entry.cancelled or entry.error is not None:
                 await self.abort(entry, stopped=True)
             return {}
@@ -335,6 +417,20 @@ class Service:
                     for c in self.node.contract.components if plan.final or not c.final}
         if set(plan.units) != expected or len(plan.units) != len(expected):
             raise ValueError("missing required rank/region completion units")
+        final_groups = {c.group for c in self.node.contract.components if c.final}
+        rolling = {g.name: g for g in self.cache.group_specs
+                   if g.sliding_window is not None and g.name not in final_groups} if plan.final else {}
+        if set(plan.valid_from) != set(rolling):
+            raise ValueError("invalid rolling publication groups")
+        for name, group in rolling.items():
+            floor = plan.valid_from[name]
+            lower, upper = rolling_bounds(group, p_hit, entry.reservation.prefix_hit_tokens,
+                                          plan.end, self.cache.group_prefix_cache_alignment)
+            page = group.spec.token_capacity
+            table = entry.reservation.block_ids_by_group[name]
+            lower = max(lower, max(0, (plan.end + page - 1) // page - len(table)) * page)
+            if type(floor) is not int or floor % page or not lower <= floor <= upper:
+                raise ValueError("invalid rolling publication floor")
         geo = {g.name: g for g in self.geometry}
         sources = {g.name: g for g in geometry}
         component_group = {c.name: c.group for c in self.node.contract.components}
@@ -374,7 +470,7 @@ class Service:
                     table = entry.reservation.block_ids_by_group[component.group]
                     blocks = (physical(group, table, logical) for logical, _ in page_indices(
                         group, component, plan.start, plan.end, plan.final,
-                        table, p_hit, entry.reservation.prefix_hit_tokens))
+                        table, p_hit, entry.reservation.prefix_hit_tokens, plan.valid_from))
                 else:
                     blocks = (entry.state_slots[component.group],)
                 for block in blocks:
@@ -391,6 +487,8 @@ class Service:
             self.gated = True
             if entry.reservation is not None:
                 self.cache.quarantine_group_cache(entry.binding.request)
+        self.observe("request.error", entry, error=type(error).__name__,
+                     uncertain=isinstance(error, TransferError) and error.uncertain)
 
     async def abort(self, entry, stopped=False):
         entry.cancelled = True
@@ -428,6 +526,7 @@ class Service:
             # Early first-token termination/cancellation still needs a barrier.
             if not entry.worker_release_ack.is_set():
                 await self.worker("discard_state", entry.binding.request)
+                entry.worker_release_ack.set()
             entry.state_task = None
 
     async def prefill(self, entry, continuation, peer):
@@ -474,31 +573,46 @@ class Service:
                         raise ValueError("request cancelled")
                     if chunk.final:
                         chunk = replace(chunk, state_slots=await self.worker("source_state", request))
-                    plan = plan_chunk(entry.binding, chunk, placement, self.node.contract,
-                                      self.cache.group_specs, self.geometry, peer_geometry, p_hit,
-                                      self.adapter.mapping(self.node.topology, peer.topology,
-                                                           chunk.partition, placement.partition),
-                                      entry.normalized_digest)
-                    self.pins.retain(chunk)
+                    with span(logger, "pd.plan.build", log=False, thread_cpu=True,
+                              request=request, chunk=chunk.chunk) as plan_timing:
+                        plan = plan_chunk(entry.binding, chunk, placement, self.node.contract,
+                                          self.cache.group_specs, self.geometry, peer_geometry, p_hit,
+                                          self.adapter.mapping(self.node.topology, peer.topology,
+                                                               chunk.partition, placement.partition),
+                                          entry.normalized_digest)
+                        plan_digest = digest(plan)
+                    if plan.copies:
+                        self.pins.retain(chunk)
+                    entry.pending = plan
+                    entry.pending_digest = plan_digest
                     submitted = False
-                    if await call("plan", plan=plan, p_hit=p_hit) != digest(plan):
+                    if await call("plan", plan=plan, p_hit=p_hit) != plan_digest:
                         raise ValueError("destination acknowledged a different plan")
-                    submitted = True  # Lost ordered-submit replies are uncertain.
-                    job = await self.worker("submit", plan)
-                    async def settle(plan=plan, job=job):
+                    job = None
+                    if plan.copies:
+                        submitted = True  # Lost ordered-submit replies are uncertain.
+                        job = await self.worker("submit", plan)
+                    async def settle(plan=plan, job=job, plan_digest=plan_digest, plan_timing=plan_timing):
                         try:
-                            completion = await self.progress.wait(job)
+                            completion = (await self.progress.wait(job) if job is not None
+                                          else Completion(plan_digest, plan.units))
                         except TransferError as exc:
                             if not exc.uncertain:
                                 self.pins.release(request)
-                                await self.worker("forget", job)
                             raise
-                        completion.check(plan)
-                        self.pins.release(request)
-                        await self.worker("forget", job)
+                        completion.check(plan_digest, plan.units)
+                        entry.chunk, entry.end = plan.chunk + 1, plan.end
+                        entry.completion_source = "owner_completion" if job is not None else "empty_plan"
+                        if job is not None:
+                            self.pins.release(request)
+                        self.observe("completion", entry, plan_digest=completion.plan_digest, end=plan.end,
+                                     native_write=job is not None, plan_ms=plan_timing["duration_ms"],
+                                     plan_thread_cpu_ms=plan_timing["thread_cpu_ms"])
                         response = await call("complete", completion=completion)
                         if response.get("error"):
                             raise ValueError(response["error"])
+                        entry.pending = None
+                        entry.pending_digest = None
                     inflight = asyncio.create_task(settle())
                     if chunk.final:
                         await inflight
@@ -532,7 +646,6 @@ class Service:
                 raise
             finally:
                 if request not in self.pins.active:
-                    self.chunks.pop(request, None)
                     self.finish(entry)
 
     async def outputs(self, request, *args, **kwargs):

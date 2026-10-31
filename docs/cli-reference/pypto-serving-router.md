@@ -2,7 +2,7 @@
 
 `pypto-serving-router` is an OpenAI-compatible reverse proxy over a fixed set of `pypto-serving` replicas. It keeps each conversation on the replica that holds its KV cache, and takes unreachable replicas out of rotation.
 
-It requires no NPU, no model directory, and no tokenizer: request bodies are forwarded verbatim.
+It requires no NPU, no model directory, and no tokenizer. Ordinary replica request bodies are forwarded verbatim. Prefill/decode deployments use the same Router with role-tagged endpoints; their request lifecycle is coordinated by the PD module. See [Prefill/decode disaggregation](../user-guide/pd-disaggregation.md).
 
 For the deployment walkthrough, see [Multi-Node Routing](../user-guide/multi-node-routing.md).
 
@@ -32,6 +32,7 @@ A JSON file with `replicas` (endpoints that already exist) and/or `hosts` (machi
 | `host` | Required | Hostname or address of the replica. |
 | `port` | Required | Port the replica's HTTP server listens on. |
 | `name` | `host:port` | Label used in logs and on `/health`. |
+| `role` | `replica` | `replica` for a complete server, or `prefill` / `decode` for PD pools. PD requires both roles, uses HTTP, and cannot mix with complete replicas or launchable `hosts`. |
 | `scheme` | `http` | `http` or `https`. Request bodies and generated text cross this hop in the clear under `http`; set `https` when the replicas are not on a trusted network and TLS is terminated in front of them. |
 
 ### `hosts` — machines the router may launch on
@@ -66,8 +67,8 @@ One slot per group of `devices_per_replica` devices, taken from `devices` in ord
 | `--session-ttl SECONDS` | `600` | Inactivity before a conversation loses its replica pin. Expiry drops the pin only; KV blocks are reclaimed by each replica's own cache. |
 | `--affinity-slack N` | `8` | Extra outstanding requests a pinned replica may carry, relative to the least loaded one, before a session is re-routed. `0` disables affinity; a large value makes it strict. |
 | `--health-interval SECONDS` | `5` | Interval between replica health probes. |
-| `--request-timeout SECONDS` | `3600` | Overall timeout for one proxied request. There is no read timeout: decode is slow by design. |
-| `--connect-timeout SECONDS` | `5` | Connect timeout per replica. |
+| `--request-timeout SECONDS` | `3600` | HTTP write timeout. Ordinary forwarding has no read deadline. Pool waits use `--connect-timeout`; PD response-read and coordination waits use the separate `pd` options. Neither is a single deadline for the whole SSE response. |
+| `--connect-timeout SECONDS` | `5` | Connect and connection-pool timeout per replica. |
 | `--initial-replicas N` | `1` with hosts, else `0` | Replicas to launch at startup, filling slots in config order, local machine first. Refused at startup if it exceeds the pool. |
 | `--max-replicas N` | declared pool | Cap launched replicas below the declared devices. |
 | `--launch-timeout SECONDS` | `600` | How long a launch may take to report ready before it is stopped and its devices released. Measured loads: Qwen3-14B ~130s warm, DeepSeek V4 ~370s on eight cards. Load times move with the checkpoint and the stack, so time your own and leave headroom — too low means the router stops a replica that was loading normally. |
@@ -76,6 +77,31 @@ One slot per group of `devices_per_replica` devices, taken from `devices` in ord
 | `--no-replace-dead` | off | Leave a replica that died where it is, devices and all. What you want while investigating one. |
 | `--state-file PATH` | none | Records launched replicas so a restarted router can adopt them instead of paying for a fresh model load. |
 | `--admin-token TOKEN` | none | Require `Authorization: Bearer TOKEN` on `/replicas`. |
+
+PD nodes are externally managed and use round-robin routing without session affinity.
+Explicit `--session-ttl`, `--affinity-slack`, `--initial-replicas`, `--max-replicas`,
+`--launch-timeout`, `--drain-timeout`, `--replace-after`, `--no-replace-dead`
+and `--state-file` are rejected for PD,
+including values equal to the ordinary defaults. `X-Session-Id` is still returned
+for request correlation; it does not pin a PD pair.
+
+Both modes use a separate HTTP pool for health probes. Local pool exhaustion
+does not demote a backend. Automatic replacement applies only to ordinary
+replicas launched by the Router.
+
+Both modes share header filtering, HTTP error classification and response cleanup.
+Router errors return `object: "error"`, `code` and `message`, with
+`X-PyPTO-Error-Source: router`. Local pool exhaustion returns 503 with
+`http_pool_exhausted`; connection failures return 502 with
+`upstream_connection_error`. Backend HTTP errors retain their status and body
+and carry `X-PyPTO-Error-Source: upstream`.
+
+Response cleanup closes the upstream HTTP response and releases its Registry
+count once, including cancellation and an unstarted body. The unstarted-body
+guard uses `connect_timeout_seconds` for ordinary forwarding and
+`pd.handoff_timeout` for PD; it is cancelled as iteration begins and does not
+limit generation. HTTP cleanup does not authorize native transfer or cache
+release. PD abort and handoff coordination remain in the PD module.
 
 ## Endpoints
 

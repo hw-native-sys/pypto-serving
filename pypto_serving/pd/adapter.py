@@ -63,7 +63,8 @@ class DeepSeekDSpark:
 
     def prefix_spec(self, tokens, cache):
         groups = tuple(dict.fromkeys(c.group for c in COMPONENTS if not c.final))
-        hashes = cache.compute_group_block_hashes(list(tokens), group_names=groups)
+        hashes = (cache.compute_group_block_hashes(list(tokens), group_names=groups)
+                  if cache.enable_prefix_cache else {})
         return Prefix(len(tokens), cache.group_prefix_cache_alignment,
                       {k: tuple(h.hex() for h in values) for k, values in hashes.items()})
 
@@ -200,7 +201,8 @@ class DSparkExtension:
         runner = self.runner
         if self.compiled.bootstrap_metadata is None:
             raise RuntimeError("PD continuation requires device prefill bootstrap")
-        runner._wait_for_pending_decode_dispatches()
+        with profile_span("pd.dspark.bootstrap.wait", cat="pd", args={"requests": len(fresh)}):
+            runner._wait_for_pending_decode_dispatches()
         requests = [batch.request_ids[i] for i in fresh]
         # Scrub reused draft KV, never the received target cache or hidden tail.
         for request in requests:
@@ -237,7 +239,8 @@ class DSparkExtension:
                     size = source.numel() * source.element_size()
                     self.worker().copy_to(target.shards[rank].data_ptr, source.data_ptr(), size,
                                           dst_offset=slot * size, worker_id=target.worker_ids[rank])
-        runner._bootstrap_prefill_requests(requests, [0] * len(requests))
+        with profile_span("pd.dspark.bootstrap.execute", cat="pd", args={"requests": len(fresh)}):
+            runner._bootstrap_prefill_requests(requests, [0] * len(requests))
 
     def set_profile_active(self, active):
         for owner in self.transfer.owners:

@@ -15,7 +15,18 @@ import pytest
 
 from pypto_serving.pd.config import Config, Endpoint
 from pypto_serving.pd.protocol import Binding, Component, Contract, Node, Topology, decode
-from pypto_serving.pd.routing import Directory
+from pypto_serving.pd.coordinator import PDCoordinator
+from pypto_serving.router.app import create_router_app
+from pypto_serving.router.config import ReplicaSpec, RouterConfig
+from pypto_serving.router.routing import ReplicaRegistry, SessionDirectory
+
+
+def router_config(config):
+    return RouterConfig(replicas=tuple(
+        ReplicaSpec(e.node_id, e.host, e.port, role=role)
+        for role in ("prefill", "decode") for e in getattr(config, role)),
+        pd_options={"capacity": config.capacity, "handoff_timeout": config.handoff_timeout,
+                    "request_timeout": config.request_timeout}, observability={"enabled": False})
 
 
 def caches(enabled=True, slots=3, partitions=4):
@@ -98,10 +109,13 @@ def node(name="p0", role="prefill", **kwargs):
 
 def test_pool_policy_and_binding():
     nodes = [node("p0"), node("p1"), node("d0", "decode"), node("d1", "decode", prefix=False)]
-    directory = Directory([Endpoint(n.node_id, 8000, node_id=n.node_id) for n in nodes])
+    config = RouterConfig(replicas=tuple(ReplicaSpec(n.node_id, n.node_id, 8000, role=n.role) for n in nodes))
+    registry = ReplicaRegistry(config, SessionDirectory(600))
+    coordinator = PDCoordinator(Config.from_router(config), registry, None, None)
     for n in nodes:
-        directory.update(n)
-    pairs = [directory.select() for _ in range(4)]
+        coordinator.nodes[n.node_id] = n
+        registry.set_ready(n.node_id, True)
+    pairs = [coordinator.policy.select(coordinator.pairs())[0] for _ in range(4)]
     assert {(p.node_id, d.node_id) for p, d in pairs} == {
         (p, d) for p in ("p0", "p1") for d in ("d0", "d1")}
     binding = Binding.create(*pairs[0], {"prompt": "hello"})
@@ -115,7 +129,8 @@ def test_disabled_mode_and_router_have_no_native_pd_imports():
     import subprocess
     import sys
     for module, absent in (("pypto_serving.serving.server.server", ("pypto_serving.pd", "mooncake", "xgrammar")),
-                           ("pypto_serving.pd.router", ("torch", "mooncake", "pypto_serving.pd.adapter"))):
+                           ("pypto_serving.router.app", ("pypto_serving.pd", "msgspec", "torch", "mooncake")),
+                           ("pypto_serving.pd.coordinator", ("torch", "mooncake", "pypto_serving.pd.adapter"))):
         script = f"import {module}; import sys; assert not any(n in sys.modules for n in {absent!r})"
         subprocess.run([sys.executable, "-c", script], check=True, timeout=20)
 
@@ -134,7 +149,6 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
     from pypto_serving.pd.adapter import DeepSeekDSpark
     from pypto_serving.pd.integration import Chunk, Server
     from pypto_serving.pd.protocol import Completion, Plan, digest
-    from pypto_serving.pd.router import create_app
     from pypto_serving.pd.service import Service
     from pypto_serving.serving.engine.async_engine import TokenOutput
     from pypto_serving.serving.sched.scheduler import RequestStatus, Scheduler, SchedulerConfig
@@ -154,6 +168,8 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
             def apply_chat_template(self, *args, **kwargs): return "templated prompt"
 
         class Core:
+            def is_ready(self): return True
+
             def __init__(self, role, enabled):
                 self.role = role
                 self.kv_cache_manager = caches(enabled, partitions=16 // (p_tp if role == "prefill" else d_tp))
@@ -166,15 +182,13 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
                 else:
                     self.scheduler = SimpleNamespace(resume_request=lambda _: self.resumed.set())
             async def call_worker(self, operation, payload):
+                assert operation != "forget"
                 value = msgspec.msgpack.decode(payload) if payload else None
                 if operation == "submit":
                     plan = decode(value, Plan)
                     jobs[digest(plan)] = plan
                     events.append(("submit", plan.chunk))
                     result = dict(job=digest(plan))
-                elif operation == "forget":
-                    del jobs[value]
-                    result = None
                 elif operation == "reserve_state":
                     self.states.add(value["request"])
                     result = {"bootstrap": 5}
@@ -249,6 +263,7 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
                 if unknown:
                     from pypto_serving.pd.transfer import TransferError
                     raise TransferError("unknown native completion", uncertain=True)
+                del jobs[job]
                 return Completion(job, plan.units)
 
         p_core, d_core = Core("prefill", prefix[0]), Core("decode", prefix[1])
@@ -256,6 +271,13 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
         warm(d_core.kv_cache_manager, tokens, 256)
         p = Service(config, config.prefill[0], "prefill", adapter, p_core, Progress())
         d = Service(config, config.decode[0], "decode", adapter, d_core, None)
+        prefix_spec = adapter.prefix_spec
+        prefix_queries = []
+        def local_prefix(tokens, cache):
+            assert cache is d_core.kv_cache_manager
+            prefix_queries.append(cache)
+            return prefix_spec(tokens, cache)
+        adapter.prefix_spec = local_prefix
         for service, name in ((p, "p"), (d, "d")):
             geometry = geometries(service.cache)
             service.geometry = geometry
@@ -284,6 +306,8 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
                             await d.control(p.node, p.geometry, operation,
                                             {**wire, "plan": msgspec.to_builtins(invalid)})
                 value = await d.control(p.node, p.geometry, operation, wire)
+                if operation == "plan" and not plan.copies and not plan.final:
+                    assert not d.cache.group_cache_reservation(plan.binding.request).write_authorized
                 return msgspec.msgpack.decode(msgspec.msgpack.encode(value))
             async def close(self): self.closed = True
         async def connect(peer): return Peer()
@@ -298,41 +322,45 @@ def test_generation_handoff_overlaps_compute_and_source_cleanup(prefix, kind, st
                       for name, server in servers.items()}
         async def transport(request):
             return await transports[request.url.host].handle_async_request(request)
-        app = create_app(config, httpx.MockTransport(transport))
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router") as client:
-            body = {"model": "test-model", "stream": stream, "max_tokens": max_tokens}
-            body.update({"prompt": "hello"} if kind == "completion" else {
-                "messages": [{"role": "user", "content": "hello"}],
-                "max_tokens": max_tokens + 1, "max_completion_tokens": max_tokens,
-                "min_tokens": minimum, "ignore_eos": ignore_eos})
-            path = "/v1/completions" if kind == "completion" else "/v1/chat/completions"
-            rejected = await asyncio.wait_for(client.post(path, json={**body, "temperature": 0.5}), 4)
-            assert rejected.status_code in (400, 422) and "text/event-stream" not in rejected.headers["content-type"]
-            assert not events and not jobs and not p.requests and not d.requests
-            response = await asyncio.wait_for(client.post(path, json=body), 4)
-            if unknown:
-                assert response.status_code >= 400 or '"error"' in response.text
-                assert p.gated and d.gated and p.pins.active and jobs
-                assert not any(name == "decode-first" for name, _ in events)
-                assert p.requests and d.requests and p.chunks
-                assert d_core.states == set(d.requests)
-                with pytest.raises(RuntimeError):
-                    await p.close()
-                await p.peers.close()
-                await app.state.router.client.aclose()
-                return
-            assert response.status_code == 200, response.text
-            if stream:
-                assert response.text.endswith("data: [DONE]\n\n") and '"error"' not in response.text
-                assert "answer" in response.text
-            else:
-                assert response.json()["usage"]["completion_tokens"] == max_tokens
-        assert not p.requests and not d.requests and not p.pins.active and not jobs
-        assert not d_core.states
-        assert not p.gated and not d.gated
-        assert events.index(("decode-first", 0)) < events.index(("source-clean", 0))
-        if not prefix[0]:
-            assert ("overlap-proven", 0) in events
-        await p.peers.close()
-        await app.state.router.client.aclose()
+        app = create_router_app(router_config(config), client_factory=lambda _: httpx.AsyncClient(
+            transport=httpx.MockTransport(transport)))
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router") as client:
+                body = {"model": "test-model", "stream": stream, "max_tokens": max_tokens}
+                body.update({"prompt": "hello"} if kind == "completion" else {
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": max_tokens + 1, "max_completion_tokens": max_tokens,
+                    "min_tokens": minimum, "ignore_eos": ignore_eos})
+                path = "/v1/completions" if kind == "completion" else "/v1/chat/completions"
+                rejected = await asyncio.wait_for(client.post(path, json={**body, "temperature": 0.5}), 4)
+                assert rejected.status_code in (400, 422) and "text/event-stream" not in rejected.headers["content-type"]
+                assert not events and not jobs and not p.requests and not d.requests
+                response = await asyncio.wait_for(client.post(path, json=body), 4)
+                assert len(prefix_queries) == 1
+                if unknown:
+                    assert response.status_code >= 400 or '"error"' in response.text
+                    assert p.gated and d.gated and p.pins.active and jobs
+                    assert not any(name == "decode-first" for name, _ in events)
+                    assert p.requests and d.requests and p.chunks
+                    assert d_core.states == set(d.requests)
+                    with pytest.raises(RuntimeError):
+                        await p.close()
+                    await p.peers.close()
+                    return
+                assert response.status_code == 200, response.text
+                if stream:
+                    assert response.text.endswith("data: [DONE]\n\n") and '"error"' not in response.text
+                    assert "answer" in response.text
+                else:
+                    assert response.json()["usage"]["completion_tokens"] == max_tokens
+            assert not p.requests and not d.requests and not p.pins.active and not jobs
+            assert not d_core.states
+            assert not p.gated and not d.gated
+            assert events.index(("decode-first", 0)) < events.index(("source-clean", 0))
+            if not prefix[0] and not prefix[1]:
+                assert ("overlap-proven", 0) in events
+            if prefix[1] and not prefix[0]:
+                assert not any(name == "submit" and chunk == 0 for name, chunk in events)
+            await p.peers.close()
+
     asyncio.run(run())

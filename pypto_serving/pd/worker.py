@@ -11,12 +11,16 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import logging
 import threading
 
 import msgspec
 
+from pypto_serving.tools.observe import record, span
 from .protocol import Completion, MAX_FRAME, Plan, Topology, decode, digest
 from .transfer import Owner, Region, TransferError, owner_factories
+
+logger = logging.getLogger(__name__)
 
 
 class WorkerRuntime:
@@ -26,6 +30,8 @@ class WorkerRuntime:
                             for i in range(model.ranks))
         self.peers, self.peer_fingerprints, self.jobs = {}, {}, {}
         self.registry = None
+        self.registry_digest = None
+        self.local_regions, self.peer_regions = {}, {}
         self.uncertain = False
         self.pool = ThreadPoolExecutor(max_workers=model.ranks, thread_name_prefix="pd-write")
         self.lock = threading.Lock()
@@ -51,6 +57,9 @@ class WorkerRuntime:
                             for name, tensor in self.model.regions().items())
             self.registry = dict(geometry=geometry, regions=regions,
                                  topology=Topology.for_tp(self.model.ranks, self.model.tp))
+            self.registry_digest = digest(self.registry)
+            # Region geometry is fixed for this boot; request page IDs are not cached here.
+            self.local_regions = {(r.rank, r.name): r for r in regions}
         return self.registry
 
     def install(self, value):
@@ -60,8 +69,9 @@ class WorkerRuntime:
         if len(boots) != 1:
             raise ValueError("registry must belong to one node boot")
         peer = next(iter(boots))
+        fingerprint = digest(value)
         if peer in self.peers:
-            if self.peers[peer] != regions:
+            if self.peer_fingerprints[peer] != fingerprint:
                 raise ValueError("peer registry changed within boot")
             return
         if len(self.peers) >= self.settings.peer_capacity:
@@ -73,19 +83,19 @@ class WorkerRuntime:
         for owner in self.owners:
             owner.call("install", regions=regions)
         self.peers[peer] = regions
-        self.peer_fingerprints[peer] = digest(value)
+        self.peer_fingerprints[peer] = fingerprint
+        self.peer_regions[peer] = {(r.rank, r.name): r for r in regions}
 
-    def submit(self, plan):
+    def _lower(self, plan):
         if (self.uncertain or plan.binding.prefill[1] != self.settings.boot
-                or plan.binding.prefill[2] != digest(self.registry)):
+                or plan.binding.prefill[2] != self.registry_digest):
             raise TransferError("worker gated or source boot mismatch", uncertain=self.uncertain)
         peer = plan.binding.decode[1]
         if peer not in self.peers:
             raise ValueError("destination registry not installed")
         if self.peer_fingerprints[peer] != plan.binding.decode[2]:
             raise ValueError("destination registry fingerprint mismatch")
-        local = {(r.rank, r.name): r for r in self.registry["regions"]}
-        remote = {(r.rank, r.name): r for r in self.peers[peer]}
+        local, remote = self.local_regions, self.peer_regions[peer]
         batches = {}
         occupied = {}
         for copy in plan.copies:
@@ -105,20 +115,38 @@ class WorkerRuntime:
             if any(a[1] > b[0] for a, b in zip(ordered, ordered[1:])):
                 raise ValueError("overlapping destination writes")
         job = digest(plan)
+        observation = dict(request=plan.binding.request, plan_digest=job,
+                           prefill=plan.binding.prefill, decode=plan.binding.decode)
+        return peer, batches, job, observation
+
+    def submit(self, plan):
+        with span(logger, "pd.transfer.lower", log=False, thread_cpu=True,
+                  request=plan.binding.request, chunk=plan.chunk) as timing:
+            peer, batches, job, observation = self._lower(plan)
         with self.lock:
             if len(self.jobs) >= self.settings.capacity or job in self.jobs:
                 raise ValueError("transfer capacity exceeded or duplicate submission")
             # Every rank was validated before the first native task is enqueued.
             try:
-                futures = tuple(self.pool.submit(self.owners[rank].call, "write", peer=peer, copies=tuple(copies))
-                                for (rank, _), copies in batches.items())
+                futures = tuple(self.pool.submit(self.owners[rank].call, "write", peer=peer,
+                    copies=tuple(copies), observation={**observation, "source_rank": rank,
+                                                     "destination_rank": destination})
+                    for (rank, destination), copies in batches.items())
             except BaseException as exc:
                 self.uncertain = True
                 raise TransferError("partial rank submission", uncertain=True) from exc
             self.jobs[job] = (plan, futures)
+        record(logger, "transfer.submit", **observation, bytes=sum(c.length for c in plan.copies),
+               rank_batches=len(batches), lower_ms=timing["duration_ms"],
+               lower_thread_cpu_ms=timing["thread_cpu_ms"])
         return job
 
     def poll(self, jobs):
+        """Take terminal results once; source pins outlive this bookkeeping.
+
+        A lost reply remains UNKNOWN at the caller. Neither taking a result
+        nor losing it releases cache snapshots or registered owner allocations.
+        """
         with self.lock:
             result = []
             for job in jobs:
@@ -133,26 +161,23 @@ class WorkerRuntime:
                     result.append(dict(error="rank transfer failed", uncertain=uncertain))
                 else:
                     result.append(dict(completion=Completion(job, plan.units)))
+                del self.jobs[job]
             return result
 
     def handle(self, operation, payload):
-        value = msgspec.msgpack.decode(payload) if payload else None
+        with span(logger, "pd.worker.decode_message", log=False, thread_cpu=True, operation=operation):
+            value = msgspec.msgpack.decode(payload) if payload else None
         if operation == "registry":
             result = self.prepare()
         elif operation == "install":
             result = self.install(value)
         elif operation == "submit":
             try:
-                result = dict(job=self.submit(decode(value, Plan)))
+                with span(logger, "pd.worker.decode_plan", log=False, thread_cpu=True):
+                    plan = decode(value, Plan)
+                result = dict(job=self.submit(plan))
             except (TransferError, ValueError) as exc:
                 result = dict(error=str(exc), uncertain=isinstance(exc, TransferError) and exc.uncertain)
-        elif operation == "forget":
-            with self.lock:
-                _, futures = self.jobs[value]
-                if not all(f.done() for f in futures):
-                    raise RuntimeError("cannot forget an in-flight native job")
-                del self.jobs[value]
-            result = None
         elif operation == "release":
             if self.uncertain or self.jobs:
                 raise TransferError("cannot unregister an unsafe or active owner", uncertain=True)

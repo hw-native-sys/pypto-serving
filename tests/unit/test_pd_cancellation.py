@@ -26,7 +26,8 @@ def service(role):
     p, d = (Node(name, kind, "boot-" + name, contract, "registry-" + name, Topology.for_tp(1, 1))
             for name, kind in (("p", "prefill"), ("d", "decode")))
     cache = SimpleNamespace(group_cache_reservation=lambda _: None)
-    core = SimpleNamespace(kv_cache_manager=cache, scheduler=SimpleNamespace(requests={}))
+    core = SimpleNamespace(kv_cache_manager=cache, scheduler=SimpleNamespace(requests={}),
+                           is_ready=lambda: True)
     result = Service(config, config.endpoint(role), role, None, core, None)
     result.node = p if role == "prefill" else d
     return result, p, d
