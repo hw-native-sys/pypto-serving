@@ -26,8 +26,9 @@ from ..model_family import is_deepseek_v41_config
 class V41TextConfig:
     """Backbone dimensions, not a claim that a checkpoint can execute yet.
 
-    Vision, Engram and draft metadata may exist in the checkpoint. They are
-    outside this stage; compression modes here cover only the target backbone.
+    Vision and draft metadata may exist in the checkpoint. Engram tables are
+    host offloaded by the V4.1 forward adapter; compression modes here cover
+    only the target text backbone.
     """
 
     vocab_size: int

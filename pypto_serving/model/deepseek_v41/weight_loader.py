@@ -254,6 +254,43 @@ class V41WeightLoader:
         return WeightBundle(self._read(name, ranges), None, "vocabulary_rows_bf16", (name,),
                             self.tp_rank, self.ep_rank, estimate)
 
+    def tensor_rows(self, name, rows):
+        """Read arbitrary rows from an auxiliary host-offloaded tensor.
+
+        V4.1 Engram tables are intentionally outside the resident backbone
+        spec.  This bounded reader keeps that data on the host and only
+        materializes the hash-selected rows needed by the current request.
+        """
+        rows = torch.as_tensor(rows, dtype=torch.int64, device="cpu")
+        if rows.ndim == 0 or bool((rows < 0).any()):
+            raise ValueError("tensor row indices must be non-negative")
+        if name not in self.store:
+            raise KeyError(f"Missing weight tensor in index: {name}")
+        path = self.store.path_for(name)
+        with self.store._safe_open_fn(path, self.store.device) as reader:
+            source = reader.get_slice(name)
+            shape = tuple(source.get_shape())
+            dtype = source.get_dtype()
+            max_row = int(rows.max()) if rows.numel() else -1
+            if len(shape) != 2 or max_row >= shape[0]:
+                raise ValueError(f"row indices exceed tensor {name} shape {shape}")
+            if not rows.numel():
+                values = source[0:0].clone()
+            else:
+                flat = rows.reshape(-1)
+                unique, inverse = torch.unique(flat, sorted=True, return_inverse=True)
+                ids = unique.tolist()
+                pieces = []
+                start = 0
+                while start < len(ids):
+                    stop = start + 1
+                    while stop < len(ids) and ids[stop] == ids[stop - 1] + 1:
+                        stop += 1
+                    pieces.append(source[ids[start]:ids[stop - 1] + 1].clone())
+                    start = stop
+                values = torch.cat(pieces, dim=0).index_select(0, inverse)
+        return values.reshape(*rows.shape, shape[1])
+
     def load(self, name, *, session=None):
         """Load one dense weight or one projection with its required scales.
 
