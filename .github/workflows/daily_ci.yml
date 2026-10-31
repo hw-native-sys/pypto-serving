@@ -1,0 +1,90 @@
+name: Daily Serving Performance
+
+on:
+  schedule:
+    - cron: '17 18 * * *'  # 02:17 Asia/Shanghai (next day UTC), away from pypto-lib's morning run.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-serving-performance
+  cancel-in-progress: false
+
+jobs:
+  dspark-performance:
+    runs-on: [self-hosted, linux, arm64, npu]
+    timeout-minutes: 720
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/perf-checkout/ptoas-bin
+      PTO_ISA_ROOT: ${{ github.workspace }}/perf-checkout/pto-isa
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      CCACHE_UMASK: '000'
+
+    steps:
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Check DSpark checkpoint
+        shell: bash
+        run: |
+          if [ -z "${PYPTO_DSV4_DSPARK_MODEL_DIR:-}" ] || [ ! -d "$PYPTO_DSV4_DSPARK_MODEL_DIR" ]; then
+            echo "::error::PYPTO_DSV4_DSPARK_MODEL_DIR must point to the DSpark W8A8 checkpoint on this runner"
+            exit 1
+          fi
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: perf-checkout
+          needs-device: 'true'
+          toolchain: bundle
+          build-namespace: pypto-serving-daily
+          pip-cache-name: pip-pypto-serving-daily
+
+      - name: Run six DSpark performance rounds
+        id: benchmark
+        shell: bash
+        run: |
+          source "$GITHUB_WORKSPACE/perf-checkout/activate.sh"
+          checkout="$GITHUB_WORKSPACE/perf-checkout"
+          output="$checkout/daily-perf-results-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          printf -v checkout_q '%q' "$checkout"
+          printf -v model_q '%q' "$PYPTO_DSV4_DSPARK_MODEL_DIR"
+          printf -v output_q '%q' "$output"
+          printf -v source_q '%q' "$PYPTO_SRC"
+          run_cmd="cd $checkout_q && source activate.sh && PYPTO_SRC=$source_q PYTHONPATH=$checkout_q PYPTO_LOG_LEVEL=error PYPTO_RUNTIME_LOG=error python scripts/daily_serving_perf.py --model $model_q --output-dir $output_q"
+          task-submit --device auto --device-num 16 --ignore-whitelist \
+            --timeout 4800 --max-time 28800 --run "$run_cmd"
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: perf-checkout
+
+      - name: Publish performance summary
+        if: always()
+        shell: bash
+        run: |
+          report="$GITHUB_WORKSPACE/perf-checkout/daily-perf-results-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/report.md"
+          if [ -f "$report" ]; then
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Daily Serving performance produced no report; inspect setup and task-submit logs.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload performance results
+        if: ${{ always() && steps.benchmark.outcome != 'skipped' }}
+        uses: ./.github/actions/upload-results
+        with:
+          name: serving-perf-${{ github.run_attempt }}
+          path: perf-checkout/daily-perf-results-${{ github.run_id }}-${{ github.run_attempt }}
