@@ -23,6 +23,7 @@ import msgspec
 
 from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
+from pypto_serving.model.common.executor import resolve_executor_cls
 from pypto_serving.observability import InMemoryStatLogger, IterationStats, SchedulerStats
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
@@ -128,22 +129,13 @@ class EngineConfig:
 
     def sampling_capabilities(self) -> SamplingCapabilities:
         return sampling_capabilities(
-            self.executor_cls, self.resolve_runtime_config().num_speculative_tokens
+            self.executor_cls, (self.runtime_config or RuntimeConfig()).num_speculative_tokens
         )
 
     def resolve_runtime_config(self) -> RuntimeConfig:
         """Return runtime settings with executor requirements resolved."""
-        runtime = self.runtime_config or RuntimeConfig()
-        is_deepseek_v4 = self.executor_cls == "PyptoDeepSeekV4Executor"
-        homogeneous_prefill_decode = (
-            runtime.requires_homogeneous_prefill_decode or is_deepseek_v4
-        )
-        if runtime.requires_homogeneous_prefill_decode == homogeneous_prefill_decode:
-            return runtime
-        return replace(
-            runtime,
-            requires_homogeneous_prefill_decode=homogeneous_prefill_decode,
-        )
+        executor_cls = resolve_executor_cls(self.executor_cls)
+        return executor_cls.resolve_runtime_config(self.runtime_config or RuntimeConfig(), self.worker_device_ids())
 
     def worker_device_ids(self) -> tuple[int, ...]:
         """Return the device ids this engine worker should own."""
@@ -222,9 +214,9 @@ class ReplicaEngineCore:
     """Engine core for one serving replica.
 
     A core owns all mutable serving state for one replica: one scheduler, one
-    KV cache manager, one worker process, one executor/model runtime, and one
-    tensor-parallel device group. Requests assigned to this core are scheduled
-    only against this core's local KV cache and worker state.
+    grouped KV/state cache manager, one worker process,
+    one executor/model runtime, and one tensor-parallel device group. Requests
+    assigned to this core use its local cache and worker state.
     """
 
     def __init__(
@@ -255,6 +247,7 @@ class ReplicaEngineCore:
             max_num_scheduled_tokens=self.config.max_num_scheduled_tokens,
             long_prefill_token_threshold=self.config.long_prefill_token_threshold,
             max_prefill_tokens_per_request=runtime.max_prefill_tokens_per_request,
+            prefill_chunk_alignment=runtime.prefill_chunk_alignment,
             prefill_chunk_size_choices=runtime.prefill_chunk_size_choices,
             max_seq_len=runtime.max_seq_len,
             enable_prefix_cache=self.config.enable_prefix_cache,
@@ -271,7 +264,9 @@ class ReplicaEngineCore:
         )
         # Validate before worker startup, while the manager's pools are still lazy.
         scheduler_config.validate_cache_groups(runtime.kv_cache_groups)
-        self.scheduler = scheduler_factory(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)
+        self.scheduler = scheduler_factory(
+            config=scheduler_config, kv_cache_manager=self.kv_cache_manager,
+        )
 
         self._request_contexts: dict[str, _RequestContext] = {}
         self._running = False
@@ -574,6 +569,7 @@ class ReplicaEngineCore:
                 arrival_time=time.time(),
                 stop_strings=tuple(config.stop) if config.stop else (),
                 eos_token_id=self.tokenizer.eos_token_id,
+                eos_token_ids=getattr(self.tokenizer, "eos_token_ids", ()),
                 ignore_eos=config.ignore_eos,
                 temperature=config.temperature,
                 top_p=config.top_p,
@@ -1014,6 +1010,7 @@ class ReplicaEngineCore:
                     seed=req.seed,
                     min_tokens=req.min_tokens,
                     eos_token_id=req.eos_token_id,
+                    eos_token_ids=req.eos_token_ids,
                     initial_output_tokens=len(req.output_token_ids),
                     constraint_spec=req.constraint_spec.to_wire() if req.constraint_spec else None,
                     initialize_from_cache=req.requires_initial_step,
@@ -1651,13 +1648,11 @@ class AsyncLLMEngine:
         core_factory: Callable[..., ReplicaEngineCore] = ReplicaEngineCore,
     ) -> None:
         config = replace(config, runtime_config=config.resolve_runtime_config())
+        config = resolve_executor_cls(config.executor_cls).configure_engine(config)
         parallel = config.parallel_config
         if parallel is None:
-            worker_devices = config.worker_device_ids()
-            parallel = ParallelConfig(
-                tensor_parallel_size=len(worker_devices),
-                devices=worker_devices,
-            )
+            parallel = ParallelConfig(tensor_parallel_size=len(config.worker_device_ids()),
+                                      devices=config.worker_device_ids())
             config = replace(config, parallel_config=parallel)
 
         self.config = config

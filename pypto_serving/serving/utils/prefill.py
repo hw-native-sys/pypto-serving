@@ -16,6 +16,27 @@ import torch
 from pypto_serving.config.types import KvAllocation, PrefillBatch
 
 
+def validate_prefill_chunk_alignment(
+    alignment: int, max_seq_len: int, max_num_batched_tokens: int, prefill_limit: int | None = None,
+) -> None:
+    """Require enough work per dispatch to advance an unfinished prompt."""
+    if not isinstance(alignment, int) or isinstance(alignment, bool) or alignment <= 0:
+        raise ValueError("prefill_chunk_alignment must be a positive non-boolean integer")
+    if alignment == 1:
+        return
+    minimum = min(alignment, max_seq_len)
+    if max_num_batched_tokens < minimum:
+        raise ValueError(
+            f"prefill chunk alignment {alignment} requires token budget >= {minimum}; "
+            "increase max_num_batched_tokens/max_num_scheduled_tokens"
+        )
+    if prefill_limit is not None and prefill_limit < minimum:
+        raise ValueError(
+            f"prefill chunk alignment {alignment} requires effective prefill limit >= {minimum}; "
+            "increase max_prefill_tokens_per_request/long_prefill_token_threshold"
+        )
+
+
 def pack_prefill_batch(
     *,
     request_ids: Sequence[str],

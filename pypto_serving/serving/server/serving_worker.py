@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 
+from pypto_serving.model.common.executor import resolve_executor_cls
 from pypto_serving.config.types import (
     DecodeBatch,
     DecodeResult,
@@ -246,27 +247,7 @@ class WorkerProcess:
             return num_pages
 
     def _resolve_executor_cls(self):
-        if self.config.executor_cls == "PyptoDeepSeekV41Executor":
-            from pypto_serving.model.deepseek_v41.npu_executor import DeepSeekV41PyptoExecutor
-
-            return DeepSeekV41PyptoExecutor
-        if self.config.executor_cls == "PyptoQwen14BExecutor":
-            from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor
-
-            return Qwen314BPyptoExecutor
-        if self.config.executor_cls == "PyptoDeepSeekV4Executor":
-            from pypto_serving.model.deepseek.npu_executor import DeepSeekV4PyptoExecutor
-
-            return DeepSeekV4PyptoExecutor
-        if self.config.executor_cls == "PyptoDeepSeekV4DSparkExecutor":
-            from pypto_serving.model.deepseek_dspark.npu_executor import (
-                DeepSeekV4DSparkPyptoExecutor,
-            )
-
-            return DeepSeekV4DSparkPyptoExecutor
-        from pypto_serving.model.common.executor.executor import ModelExecutor
-
-        return ModelExecutor
+        return resolve_executor_cls(self.config.executor_cls)
 
     def _configure_pypto_build_dir(self, device_ids: tuple[int, ...]) -> Path | None:
         """Namespace explicitly requested output without disabling JIT reuse by default."""
@@ -387,7 +368,10 @@ class WorkerProcess:
                     isinstance(cmd, StepCommand)
                     and (cmd.decode_requests or (cmd.prefill_requests and
                          getattr(self.executor, "supports_async_prefill_reclaim", False)))
-                    and self.executor.supports_device_decode_embedding
+                    and (
+                        self.executor.supports_device_decode_embedding
+                        or getattr(self.executor, "supports_async_decode_prepare_without_embeddings", False)
+                    )
                 ):
                     # Every writer must own its slot, including the decode
                     # half of a mixed command that stages later on the device
@@ -509,6 +493,10 @@ class WorkerProcess:
             if self._can_split_decode_output(cmd, prepared):
                 assert prepared is not None and prepared.batch is not None
                 try:
+                    if self.executor.prepared_decode_requires_token(prepared.prepared):
+                        self._wait_for_pending_decode_reclaims(
+                            [request.request_id for request in cmd.decode_requests]
+                        )
                     with profile_span(
                         "WorkerProcess.dispatch_decode",
                         cat="worker",
@@ -1176,9 +1164,21 @@ class WorkerProcess:
             return None
         if not cmd.decode_requests:
             return None
-        if not self.executor.supports_device_decode_embedding:
-            # Placeholder tokens cannot be embedded correctly until the prior
-            # device result is available. Keep this executor on the serial path.
+        if not (
+            self.executor.supports_device_decode_embedding
+            or getattr(self.executor, "supports_async_decode_prepare_without_embeddings", False)
+        ):
+            # Host embedding executors must explicitly support preparation
+            # without the preceding output token and its embeddings.
+            return None
+        # Preparation may run ahead of FIFO request registration. Stop-token
+        # policy needs the accepted count initialized on the device lane.
+        accepted_lengths = getattr(self, "_accepted_output_lengths", {})
+        if any(
+            item.request_id not in accepted_lengths
+            and self._min_tokens_mask_active(self._req_cache[item.request_id], 0)
+            for item in cmd.decode_requests
+        ):
             return None
         if self._needs_host_stop_token_mask(cmd.decode_requests, "decode"):
             return None
@@ -1231,7 +1231,10 @@ class WorkerProcess:
             else [0] * len(scheduled)
         )
         decode_token_tensor = torch.tensor(decode_tokens, dtype=torch.long, device=device)
-        if self.executor.supports_device_decode_embedding:
+        if self.executor.supports_device_decode_embedding or (
+            not resolve_tokens
+            and getattr(self.executor, "supports_async_decode_prepare_without_embeddings", False)
+        ):
             decode_embeddings = None
         else:
             decode_embeddings = self.executor.lookup_embeddings(runtime_model, decode_token_tensor)
@@ -1432,11 +1435,12 @@ class WorkerProcess:
 
     @staticmethod
     def _min_tokens_mask_active(cached: NewRequestData, accepted_count: int) -> bool:
-        return cached.eos_token_id is not None and accepted_count < cached.min_tokens
+        has_eos = cached.eos_token_id is not None or bool(cached.eos_token_ids)
+        return has_eos and accepted_count < cached.min_tokens
 
     def _stop_token_mask(self, request_id: str) -> StopTokenMask | None:
         cached = self._req_cache[request_id]
-        if cached.min_tokens <= 0 or cached.eos_token_id is None:
+        if cached.min_tokens <= 0 or (cached.eos_token_id is None and not cached.eos_token_ids):
             return None
         lengths = getattr(self, "_accepted_output_lengths", {})
         if request_id not in lengths:
@@ -1444,7 +1448,9 @@ class WorkerProcess:
         if not self._min_tokens_mask_active(cached, lengths[request_id]):
             return None
         remaining = cached.min_tokens - lengths[request_id]
-        stop_ids = blocked_token_ids((cached.eos_token_id,), remaining)
+        primary = () if cached.eos_token_id is None else (cached.eos_token_id,)
+        all_eos = tuple(dict.fromkeys(primary + cached.eos_token_ids))
+        stop_ids = blocked_token_ids(all_eos, remaining)
         return StopTokenMask(stop_ids, remaining) if stop_ids else None
 
     def _sampling_params(self, request_id: str) -> SamplingParams:

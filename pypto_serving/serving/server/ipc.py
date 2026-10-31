@@ -55,6 +55,7 @@ class NewRequestData(msgspec.Struct):
     seed: int | None = None
     min_tokens: int = 0
     eos_token_id: int | None = None
+    eos_token_ids: tuple[int, ...] = ()
     initial_output_tokens: int = 0
     constraint_spec: dict[str, Any] | None = None
     # The target cache was adopted from a preinitialized cache lease.  This is

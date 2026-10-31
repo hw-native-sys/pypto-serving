@@ -24,7 +24,7 @@ from pypto_serving.config.types import (
     RuntimeModel,
 )
 
-from .model_family import is_deepseek_v4_config, is_deepseek_v41_config, read_model_config
+from .model_family import is_deepseek_v4_config, is_deepseek_v41_config, is_glm53_config, read_model_config
 from .tokenizer import TokenizerAdapter, load_tokenizer
 
 
@@ -437,6 +437,20 @@ def _validate_deepseek_v4_weight_index(weight_map: dict[str, str], config_data: 
         )
 
 
+class Glm53W8A8DirectoryLoader(SafetensorsDirectoryLoader):
+    """Load GLM metadata before executor-owned kernel and weight preparation."""
+
+    format_names = ("glm53_w8a8", "glm53-w8a8")
+
+    def _recognises(self, model_path: Path) -> bool:
+        return is_glm53_config(read_model_config(model_path))
+
+    def load(self, request: ModelLoadRequest) -> LoadedModel:
+        from pypto_serving.model.glm53.weight_loader import load_checkpoint
+
+        return load_checkpoint(request.model_id, request.model_dir, request.runtime_config)
+
+
 class ModelLoader:
     """Registry that selects a model-format loader and loads models."""
 
@@ -445,7 +459,8 @@ class ModelLoader:
         from .deepseek_v41.npu_executor import DeepSeekV41DirectoryLoader
 
         self._format_loaders = format_loaders or [
-            DeepSeekV41DirectoryLoader(), DeepSeekV4W8A8DirectoryLoader(), HuggingFaceDirectoryLoader(),
+            Glm53W8A8DirectoryLoader(), DeepSeekV41DirectoryLoader(),
+            DeepSeekV4W8A8DirectoryLoader(), HuggingFaceDirectoryLoader(),
         ]
 
     def register(self, format_loader: ModelFormatLoader) -> None:
