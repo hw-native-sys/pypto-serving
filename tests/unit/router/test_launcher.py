@@ -266,7 +266,7 @@ def test_stopping_drains_first_then_stops():
     async def check():
         spec = await manager.launch_one()
         registry.set_ready(spec.name, True)
-        registry.acquire(spec.name)          # one request in flight
+        release = registry.acquire(spec.name)  # one request in flight
 
         stopping = asyncio.create_task(manager.stop(spec.name))
         await asyncio.sleep(0.1)
@@ -276,7 +276,7 @@ def test_stopping_drains_first_then_stops():
         assert registry.ready_count() == 0
         assert not stopping.done()
 
-        registry.release(spec.name)
+        release()
         await stopping
         return spec
 

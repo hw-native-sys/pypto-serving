@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Pure chunk planning from Serving snapshots, never from a private Prefix index."""
 
+import math
+
 import msgspec
 
 from .protocol import Copy, Plan
@@ -45,13 +47,34 @@ def rank_mapping(source_topology, destination_topology, source_partition, destin
                  for rank in destination_topology.groups[destination_partition])
 
 
-def valid_from(groups, components, p_hit, d_hit):
+def rolling_bounds(group, p_hit, d_hit, end, alignment):
+    """Keep the Decode tail and the latest queryable checkpoint, when resident."""
+    page = group.spec.token_capacity
+    boundary = max(0, end - 1) // alignment * alignment
+    lower = max(d_hit, p_hit - group.sliding_window, max(0, boundary - group.sliding_window))
+    upper = max(d_hit, max(0, end - group.sliding_window) // page * page)
+    return lower, upper
+
+
+def valid_from(groups, components, p_hit, d_hit, end, source, destination):
     final = {c.group for c in components if c.final}
-    return {g.name: max(d_hit, p_hit - g.sliding_window) for g in groups
-            if g.sliding_window is not None and g.name not in final}
+    alignment = math.lcm(*(g.spec.token_capacity for g in groups))
+    floors = {}
+    for group in groups:
+        if group.sliding_window is None or group.name in final:
+            continue
+        page = group.spec.token_capacity
+        lower, upper = rolling_bounds(group, p_hit, d_hit, end, alignment)
+        logical_end = math.ceil(end / page)
+        floor = max(lower, max(0, logical_end - min(len(source[group.name]),
+                    len(destination[group.name]))) * page)
+        if floor > upper:
+            raise ValueError("rolling snapshot cannot cover the Decode tail")
+        floors[group.name] = floor
+    return floors
 
 
-def page_indices(group, component, start, end, final, source_table, p_hit, d_hit):
+def page_indices(group, component, start, end, final, source_table, p_hit, d_hit, publication_floor):
     capacity = group.spec.token_capacity
     logical_end = (end + capacity - 1) // capacity
     if component.final:
@@ -59,7 +82,12 @@ def page_indices(group, component, start, end, final, source_table, p_hit, d_hit
             return ()
         indices = range(max(0, logical_end - len(source_table)), logical_end)
     else:
-        floor = max(start, d_hit, p_hit - group.sliding_window if group.sliding_window else 0)
+        if group.sliding_window is not None:
+            if not final:
+                return ()  # D consumes rolling KV only after final commit.
+            floor = publication_floor[group.name]
+        else:
+            floor = max(start, d_hit)
         indices = range(floor // capacity, end // capacity)
     rows = {i: group.spec.storage_block_size for i in indices}
     remainder = end % capacity
@@ -92,6 +120,8 @@ def plan_chunk(binding, chunk, placement, contract, groups, source, destination,
         if any(len(table) != len(set(table)) or any(type(b) is not int or b < 0 for b in table)
                for table in tables.values()):
             raise ValueError("invalid physical block table")
+    floors = (valid_from(groups, contract.components, p_hit, placement.hit, chunk.end,
+                         chunk.blocks, placement.blocks) if chunk.final else {})
     copies, units = [], []
     for sr, dr in mapping:
         for component in contract.components:
@@ -106,13 +136,13 @@ def plan_chunk(binding, chunk, placement, contract, groups, source, destination,
                 pages = tuple((physical(group, chunk.blocks[group.name], logical),
                                physical(group, placement.blocks[group.name], logical))
                               for logical, _ in page_indices(group, component, start, chunk.end, chunk.final,
-                                  chunk.blocks[group.name], p_hit, placement.hit))
+                                  chunk.blocks[group.name], p_hit, placement.hit, floors))
             else:
                 pages = ((chunk.state_slots[component.group], placement.state_slots[component.group]),)
-            for sb, db in pages:
-                if min(sb, db) < 0 or sb >= a.blocks or db >= b.blocks:
-                    raise ValueError("physical block outside registered region")
-                for layer in range(len(a.layers)):
+            if any(min(sb, db) < 0 or sb >= a.blocks or db >= b.blocks for sb, db in pages):
+                raise ValueError("physical block outside registered region")
+            for layer in range(len(a.layers)):
+                for sb, db in sorted(pages):
                     # Final partial pages are exclusively reserved and copied whole.
                     copy = Copy(component.name, sr, dr, (layer * a.blocks + sb) * a.page_bytes,
                                 (layer * b.blocks + db) * b.page_bytes, a.page_bytes)
@@ -125,7 +155,7 @@ def plan_chunk(binding, chunk, placement, contract, groups, source, destination,
                             continue
                     copies.append(copy)
     return Plan(binding, continuation_digest, chunk.chunk, start, chunk.end, chunk.final, mapping,
-                tuple(copies), tuple(units), chunk.first_token)
+                tuple(copies), tuple(units), chunk.first_token, floors)
 
 
 class SourcePins:

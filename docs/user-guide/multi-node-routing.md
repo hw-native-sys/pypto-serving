@@ -24,7 +24,7 @@ The id may be supplied either as an `X-Session-Id` request header or as a top-le
 
 Affinity is a preference, not a guarantee. Cached blocks are evicted under memory pressure, and a pinned replica that falls too far behind loses the session to a less loaded one — see `--affinity-slack`. Pins expire after `--session-ttl` of inactivity; expiry releases the pin only, since KV blocks are keyed by content and reclaimed by each replica's own cache.
 
-Session affinity buys nothing when prefix caching is off, which is the case for DeepSeek V4 with more than one speculative token.
+Session affinity helps when the replica has prefix caching enabled. Prefix caching is enabled by default; each replica can disable it with `--no-enable-prefix-caching`.
 
 ## Two Ways to Get Replicas
 

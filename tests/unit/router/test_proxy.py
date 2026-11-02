@@ -25,7 +25,7 @@ from starlette.datastructures import Headers
 
 from pypto_serving.router.app import ServingRouter
 from pypto_serving.router.config import ReplicaSpec, RouterConfig
-from pypto_serving.router.proxy import SESSION_HEADER
+from pypto_serving.router.http import SESSION_HEADER
 
 
 # --- fakes ---

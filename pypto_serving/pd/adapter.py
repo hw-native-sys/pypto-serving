@@ -63,7 +63,8 @@ class DeepSeekDSpark:
 
     def prefix_spec(self, tokens, cache):
         groups = tuple(dict.fromkeys(c.group for c in COMPONENTS if not c.final))
-        hashes = cache.compute_group_block_hashes(list(tokens), group_names=groups)
+        hashes = (cache.compute_group_block_hashes(list(tokens), group_names=groups)
+                  if cache.enable_prefix_cache else {})
         return Prefix(len(tokens), cache.group_prefix_cache_alignment,
                       {k: tuple(h.hex() for h in values) for k, values in hashes.items()})
 

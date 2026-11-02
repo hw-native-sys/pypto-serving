@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from dataclasses import replace
 import logging
 import os
 import secrets
@@ -35,16 +36,16 @@ from pypto_serving.router.config import (
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_SESSION_TTL_SECONDS,
     RouterConfig,
-    load_fleet_file,
+    load_router_config,
 )
 from pypto_serving.router.fleet import FleetManager, PoolExhausted
 from pypto_serving.router.launcher import LaunchError
-from pypto_serving.router.proxy import SESSION_HEADER, ReplicaProxy
+from pypto_serving.router.http import SESSION_HEADER, is_router_side_failure
+from pypto_serving.router.proxy import ReplicaProxy
 from pypto_serving.router.routing import (
     HealthMonitor,
     ReplicaRegistry,
     SessionDirectory,
-    is_router_side_failure,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,15 +92,13 @@ def default_client_factory(config: RouterConfig):
     # concurrent upstream requests, and a deployment whose clients hold long
     # streams -- a coding agent does -- reaches it with far fewer users than
     # the number suggests.
-    limits = httpx.Limits(
-        max_connections=config.max_connections,
-        max_keepalive_connections=config.max_keepalive_connections,
-    )
+    limits = httpx.Limits(max_connections=config.max_connections,
+                          max_keepalive_connections=config.max_keepalive_connections)
     return httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=False)
 
 
 class ServingRouter:
-    """Session-affine router over a flat table of serving replicas."""
+    """Common HTTP entry point for complete replicas or coordinated P/D pools."""
 
     def __init__(self, config: RouterConfig, *,
                  client_factory: Callable[[RouterConfig], object] = default_client_factory,
@@ -109,7 +108,19 @@ class ServingRouter:
         self.config = config
         self.sessions = SessionDirectory(config.session_ttl_seconds)
         self.registry = ReplicaRegistry(config, self.sessions)
-        self.client = client_factory(config)
+        pd_config = None
+        if config.is_pd:
+            from pypto_serving.pd.config import Config
+            from pypto_serving.pd.coordinator import PDCoordinator
+
+            pd_config = Config.from_router(config)
+            if state_path is not None:
+                raise ValueError("PD replicas are externally managed; --state-file requires ordinary hosts")
+        client_config = (replace(config, max_connections=pd_config.http_connections,
+                                 max_keepalive_connections=min(config.max_keepalive_connections,
+                                                               pd_config.http_connections))
+                         if config.is_pd else config)
+        self.client = client_factory(client_config)
         # A second client, so probes have a connection pool of their own. They
         # share the proxy's otherwise, and a coding agent's long streams can
         # hold every slot in it: the probes then fail for want of a connection
@@ -117,8 +128,10 @@ class ServingRouter:
         # congestion indistinguishable from a dead backend, for every replica
         # at once, because the pool is what they have in common.
         self.probe_client = client_factory(config)
-        self.proxy = ReplicaProxy(self.registry, self.client)
-        self.health = HealthMonitor(config, self.registry, self.sessions, self.probe_client)
+        self.proxy = (PDCoordinator(pd_config, self.registry, self.client, self.probe_client) if config.is_pd
+                      else ReplicaProxy(self.registry, self.client, config.connect_timeout_seconds))
+        self.health = HealthMonitor(config, self.registry, self.sessions, self.probe_client,
+                                    probe=self.proxy.probe if config.is_pd else None)
         self._admin_token = admin_token
         fleet_kwargs = {
             "state_path": state_path,
@@ -131,6 +144,7 @@ class ServingRouter:
             fleet_kwargs["transport_factory"] = transport_factory
         self.fleet = FleetManager(config, self.registry, **fleet_kwargs)
         self.app = FastAPI(title="PyPTO Serving Router", lifespan=self._lifespan)
+        self.app.state.router = self
 
         self.app.add_api_route("/health", self._health, methods=["GET"])
         self.app.add_api_route("/v1/models", self._list_models, methods=["GET"])
@@ -163,18 +177,28 @@ class ServingRouter:
         replica that survives a router crash is minutes of model load saved,
         and the next run adopts it.
         """
-        await self.health.start()
-        try:
-            await self.fleet.adopt_previous()
-            await self.fleet.launch_initial()
-            yield
-        finally:
-            await self.fleet.stop_all()
-            await self.health.stop()
-            for client in (self.client, self.probe_client):
-                close = getattr(client, "aclose", None)
-                if close is not None:
-                    await close()
+        with contextlib.ExitStack() as stack:
+            if self.config.is_pd:
+                from pypto_serving.pd.config import log_context
+
+                stack.enter_context(log_context(self.proxy.config, "router"))
+            try:
+                await self.health.start(probe_first=self.config.is_pd)
+                if not self.config.is_pd:
+                    await self.fleet.adopt_previous()
+                    await self.fleet.launch_initial()
+                yield
+            finally:
+                try:
+                    if not self.config.is_pd:
+                        await self.fleet.stop_all()
+                    await self.proxy.close()
+                finally:
+                    await self.health.stop()
+                    for client in (self.client, self.probe_client):
+                        close = getattr(client, "aclose", None)
+                        if close is not None:
+                            await close()
 
     async def _health_status(self, spec) -> int | None:
         """The replica's /health status, or None if nothing answered.
@@ -253,6 +277,7 @@ class ServingRouter:
             # starting / ready / draining / failed. "ready" alone could not say
             # whether an unroutable replica was still loading or had died.
             "phase": state.phase,
+            "role": state.spec.role,
             "outstanding": state.outstanding,
             "routed": state.routed,
         }
@@ -343,8 +368,9 @@ class ServingRouter:
     async def _health(self) -> JSONResponse:
         """The router's own view of the replica table."""
         ready = self.registry.ready_count()
+        available = bool(self.proxy.pairs()) if self.config.is_pd else bool(ready)
         payload = {
-            "status": "ok" if ready else "no_replicas",
+            "status": "ok" if available else "no_replicas",
             "replicas_ready": ready,
             # Reported here and not only on /replicas, which needs the admin
             # token: how many replicas died is operational, not administrative.
@@ -360,10 +386,20 @@ class ServingRouter:
                 for s in self.registry.states
             ],
         }
-        return JSONResponse(payload, status_code=200 if ready else 503)
+        if self.config.is_pd:
+            payload["compatible_pairs"] = len(self.proxy.pairs())
+            payload["roles"] = {role: {
+                "ready": sum(s.routable for s in self.registry.states if s.spec.role == role),
+                "outstanding": sum(s.outstanding for s in self.registry.states if s.spec.role == role),
+                "routed": sum(s.routed for s in self.registry.states if s.spec.role == role),
+            } for role in ("prefill", "decode")}
+        return JSONResponse(payload, status_code=200 if available else 503)
 
     async def _list_models(self) -> JSONResponse:
         """Answer from any routable replica; every replica serves one model."""
+        if self.config.is_pd:
+            names = sorted({p.contract.model for p, _ in self.proxy.pairs()})
+            return JSONResponse({"object": "list", "data": [{"id": n, "object": "model"} for n in names]})
         for state in self.registry.states:
             if not state.ready:
                 continue
@@ -427,13 +463,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Cap the number of launched replicas below the declared pool. "
                              "On a shared cluster this is what stops the router taking every "
                              "free card.")
-    parser.add_argument("--launch-timeout", type=float, default=DEFAULT_LAUNCH_TIMEOUT_SECONDS,
+    parser.add_argument("--launch-timeout", type=float, default=None,
                         help="Seconds a launched replica may take to report ready before it is "
                              f"stopped and its device freed (default: {DEFAULT_LAUNCH_TIMEOUT_SECONDS:g}).")
-    parser.add_argument("--drain-timeout", type=float, default=DEFAULT_DRAIN_TIMEOUT_SECONDS,
+    parser.add_argument("--drain-timeout", type=float, default=None,
                         help="Seconds to wait for in-flight requests before stopping a replica "
                              f"(default: {DEFAULT_DRAIN_TIMEOUT_SECONDS:g}).")
-    parser.add_argument("--replace-after", type=float, default=DEFAULT_REPLACE_AFTER_SECONDS,
+    parser.add_argument("--replace-after", type=float, default=None,
                         metavar="SECONDS",
                         help="Seconds a replica may stay unroutable before the router retires it "
                              "and launches another on the same device(s) "
@@ -452,10 +488,10 @@ def build_parser() -> argparse.ArgumentParser:
                              f"token in argv is readable by any local user through ps.")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0).")
     parser.add_argument("--port", type=int, default=8000, help="Port (default: 8000).")
-    parser.add_argument("--session-ttl", type=float, default=DEFAULT_SESSION_TTL_SECONDS,
+    parser.add_argument("--session-ttl", type=float, default=None,
                         help="Seconds a conversation keeps its replica pin after its last "
                              f"request (default: {DEFAULT_SESSION_TTL_SECONDS:g}).")
-    parser.add_argument("--affinity-slack", type=int, default=DEFAULT_AFFINITY_SLACK,
+    parser.add_argument("--affinity-slack", type=int, default=None,
                         help="Extra outstanding requests a pinned replica may carry before a "
                              f"session is re-routed (default: {DEFAULT_AFFINITY_SLACK}; "
                              "0 disables affinity).")
@@ -475,27 +511,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     try:
-        replicas, hosts = load_fleet_file(args.replicas)
         # Launching one replica is the useful default, but only where there is
         # somewhere to launch it; a static-only file must not be forced to.
-        initial = args.initial_replicas
-        if initial is None:
-            initial = 1 if hosts else 0
-        config = RouterConfig(
-            replicas=replicas,
-            hosts=hosts,
-            session_ttl_seconds=args.session_ttl,
-            affinity_slack=args.affinity_slack,
+        config = load_router_config(
+            args.replicas,
             health_interval_seconds=args.health_interval,
             request_timeout_seconds=args.request_timeout,
             connect_timeout_seconds=args.connect_timeout,
-            launch_timeout_seconds=args.launch_timeout,
-            drain_timeout_seconds=args.drain_timeout,
-            replace_dead=not args.no_replace_dead,
-            replace_after_seconds=args.replace_after,
-            initial_replicas=initial,
-            max_replicas=args.max_replicas,
+            **{field: value for field, value in {
+                "session_ttl_seconds": args.session_ttl, "affinity_slack": args.affinity_slack,
+                "launch_timeout_seconds": args.launch_timeout, "drain_timeout_seconds": args.drain_timeout,
+                "initial_replicas": args.initial_replicas, "max_replicas": args.max_replicas,
+                "replace_dead": False if args.no_replace_dead else None,
+                "replace_after_seconds": args.replace_after,
+            }.items() if value is not None},
         )
+        if config.is_pd and args.state_file is not None:
+            raise ValueError("PD replicas are externally managed; --state-file is not applicable")
     except ValueError as exc:
         print(f"error: {exc}")
         return 1
@@ -522,7 +554,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(f"Starting PyPTO serving router on {args.host}:{args.port}")
     for replica in config.replicas:
-        print(f"  Replica (external): {replica.name} -> {replica.base_url}")
+        print(f"  Replica ({replica.role}, external): {replica.name} -> {replica.base_url}")
     for host in config.hosts:
         where = "local" if host.is_local else host.ssh
         print(
@@ -530,18 +562,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"({host.devices_per_replica}/replica -> {host.replica_capacity} slot(s))"
         )
     print(f"  Pool: launching {config.initial_replicas} of {config.pool_ceiling} slot(s) at startup")
-    print(f"  Session TTL: {config.session_ttl_seconds:g}s, affinity slack: {config.affinity_slack}")
+    if config.is_pd:
+        print("  Routing: round-robin compatible P/D pairs; nodes are managed externally")
+    else:
+        print(f"  Session TTL: {config.session_ttl_seconds:g}s, affinity slack: {config.affinity_slack}")
     print("  Endpoints: /v1/completions, /v1/chat/completions, /v1/models, /health, /replicas")
     if config.hosts and admin_token is None:
         print("  WARNING: /replicas is unauthenticated; it can start processes on other hosts")
     elif args.admin_token is not None and not os.environ.get(ADMIN_TOKEN_ENV):
         print(f"  NOTE: --admin-token is visible in ps; prefer {ADMIN_TOKEN_ENV}")
 
-    app = create_router_app(
-        config,
-        state_path=Path(args.state_file) if args.state_file else None,
-        admin_token=admin_token,
-    )
+    try:
+        app = create_router_app(
+            config,
+            state_path=Path(args.state_file) if args.state_file else None,
+            admin_token=admin_token,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return 1
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
 

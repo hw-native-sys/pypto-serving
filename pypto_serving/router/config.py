@@ -27,8 +27,7 @@ from pathlib import Path
 DEFAULT_AFFINITY_SLACK = 8
 DEFAULT_SESSION_TTL_SECONDS = 600.0
 DEFAULT_HEALTH_INTERVAL_SECONDS = 5.0
-# Generation is slow by design, so there is no useful read timeout; this bounds
-# the whole exchange instead.
+# Generation has no default read deadline; this bounds HTTP write/pool waits.
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 3600.0
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
 
@@ -65,10 +64,22 @@ class ReplicaSpec:
     host: str
     port: int
     scheme: str = "http"
+    role: str = "replica"
+    control_port: int = 0
+    transfer_hostname: str = ""
+
+    def __post_init__(self) -> None:
+        if self.role not in ("replica", "prefill", "decode"):
+            raise ValueError(f"invalid replica role: {self.role!r}")
+        if self.role == "replica" and (self.control_port or self.transfer_hostname):
+            raise ValueError("control/transfer addresses require a PD role")
+        if self.role != "replica" and self.scheme != "http":
+            raise ValueError("PD replicas currently require http")
 
     @property
     def base_url(self) -> str:
-        return f"{self.scheme}://{self.host}:{self.port}"
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"{self.scheme}://{host}:{self.port}"
 
 
 @dataclass(frozen=True)
@@ -197,10 +208,24 @@ class RouterConfig:
     # Refill a slot whose replica died, without waiting for an operator.
     replace_dead: bool = True
     replace_after_seconds: float = DEFAULT_REPLACE_AFTER_SECONDS
+    pd_options: dict | None = None
+    observability: dict | None = None
+
+    @property
+    def is_pd(self) -> bool:
+        return any(replica.role != "replica" for replica in self.replicas)
 
     def __post_init__(self) -> None:
         if not self.replicas and not self.hosts:
             raise ValueError("router requires at least one replica or one host")
+        if self.is_pd:
+            if {r.role for r in self.replicas} != {"prefill", "decode"} or self.hosts:
+                raise ValueError("PD requires static prefill/decode pools without ordinary replicas or hosts")
+            addresses = [(r.host, r.port) for r in self.replicas]
+            if len(set(addresses)) != len(addresses):
+                raise ValueError("PD replica HTTP endpoints must be unique")
+        elif self.pd_options is not None or self.observability is not None:
+            raise ValueError("PD options require prefill/decode replicas")
         names = [replica.name for replica in self.replicas]
         if len(set(names)) != len(names):
             raise ValueError(f"replica names must be unique: {sorted(names)}")
@@ -323,7 +348,10 @@ def _parse_name(entry: dict, label: str, default: str) -> str:
 def _parse_replica(entry: object, index: int) -> ReplicaSpec:
     if not isinstance(entry, dict) or not {"host", "port"} <= set(entry):
         raise ValueError(f"replica {index} needs 'host' and 'port'")
-    unknown = sorted(set(entry) - {"name", "host", "port", "scheme"})
+    allowed = {"name", "host", "port", "scheme", "role"}
+    if entry.get("role", "replica") != "replica":
+        allowed |= {"control_port", "transfer_hostname"}
+    unknown = sorted(set(entry) - allowed)
     if unknown:
         raise ValueError(f"replica {index} has unknown fields: {', '.join(unknown)}")
     host, port = entry["host"], entry["port"]
@@ -335,6 +363,8 @@ def _parse_replica(entry: object, index: int) -> ReplicaSpec:
     return ReplicaSpec(
         name=_parse_name(entry, f"replica {index}", f"{host}:{port}"),
         host=host, port=port, scheme=scheme,
+        role=entry.get("role", "replica"), control_port=entry.get("control_port", 0),
+        transfer_hostname=entry.get("transfer_hostname", ""),
     )
 
 
@@ -400,7 +430,7 @@ def _parse_host(entry: object, index: int) -> HostSpec:
     )
 
 
-def load_fleet_file(path: str | Path) -> tuple[tuple[ReplicaSpec, ...], tuple[HostSpec, ...]]:
+def load_router_config(path: str | Path, **settings) -> RouterConfig:
     """Read ``replicas`` and ``hosts`` from a JSON file.
 
     Either key may be omitted, but the file must describe at least one of them:
@@ -416,7 +446,7 @@ def load_fleet_file(path: str | Path) -> tuple[tuple[ReplicaSpec, ...], tuple[Ho
     if not isinstance(data, dict):
         raise ValueError(f"replica file {file_path} must be a JSON object")
 
-    unknown = sorted(set(data) - {"replicas", "hosts"})
+    unknown = sorted(set(data) - {"replicas", "hosts", "pd", "observability"})
     if unknown:
         raise ValueError(f"replica file has unknown top-level keys: {', '.join(unknown)}")
 
@@ -431,7 +461,26 @@ def load_fleet_file(path: str | Path) -> tuple[tuple[ReplicaSpec, ...], tuple[Ho
 
     replicas = tuple(_parse_replica(entry, i) for i, entry in enumerate(raw_replicas))
     hosts = tuple(_parse_host(entry, i) for i, entry in enumerate(raw_hosts))
-    return replicas, hosts
+    if any(replica.role != "replica" for replica in replicas):
+        ordinary_only = {
+            "session_ttl_seconds": "--session-ttl", "affinity_slack": "--affinity-slack",
+            "launch_timeout_seconds": "--launch-timeout", "drain_timeout_seconds": "--drain-timeout",
+            "initial_replicas": "--initial-replicas", "max_replicas": "--max-replicas",
+            "replace_dead": "--no-replace-dead", "replace_after_seconds": "--replace-after",
+        }
+        unsupported = [flag for key, flag in ordinary_only.items() if settings.get(key) is not None]
+        if unsupported:
+            raise ValueError("PD replicas do not support " + ", ".join(unsupported))
+    if settings.get("initial_replicas") is None:
+        settings["initial_replicas"] = int(bool(hosts))
+    return RouterConfig(replicas=replicas, hosts=hosts, pd_options=data.get("pd"),
+                        observability=data.get("observability"), **settings)
+
+
+def load_fleet_file(path: str | Path) -> tuple[tuple[ReplicaSpec, ...], tuple[HostSpec, ...]]:
+    """Read the existing static table and optional launch pool."""
+    config = load_router_config(path)
+    return config.replicas, config.hosts
 
 
 def load_replica_table(path: str | Path) -> tuple[ReplicaSpec, ...]:

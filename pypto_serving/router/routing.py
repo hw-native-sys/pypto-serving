@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from pypto_serving.router.config import ReplicaSpec, RouterConfig
+from .http import is_router_side_failure
 
 logger = logging.getLogger(__name__)
 
@@ -46,27 +47,33 @@ UNHEALTHY_THRESHOLD = 2
 DEFAULT_MAX_SESSIONS = 100_000
 
 
-def is_router_side_failure(exc: BaseException) -> bool:
-    """Did the request fail inside the router rather than at the replica?
-
-    httpx raises PoolTimeout when *our* connection pool has no free slot, which
-    happens when the router is busy and says nothing about the replica at the
-    other end. Every other transport error -- refused, reset, read timeout --
-    is evidence about the replica and is meant to count.
-
-    The distinction matters because a demotion is no longer only a pause in
-    rotation: a replica that stays unroutable long enough is now stopped and
-    replaced, at the price of a model load. Router congestion must not buy that.
-    """
-    try:
-        import httpx
-    except ImportError:  # pragma: no cover - the router cannot run without it
-        return False
-    return isinstance(exc, httpx.PoolTimeout)
-
-
 class NoReplicaAvailable(RuntimeError):
     """Raised when every replica in the table is unroutable."""
+
+
+class RoundRobin:
+    """Rotate over fixed candidate positions, skipping unavailable (None) entries."""
+
+    def __init__(self):
+        self.cursor = 0
+
+    def select(self, candidates):
+        for offset in range(len(candidates)):
+            index = (self.cursor + offset) % len(candidates)
+            if candidates[index] is not None:
+                self.cursor = (index + 1) % len(candidates)
+                return candidates[index], "round_robin"
+        raise NoReplicaAvailable("no compatible healthy routing candidate")
+
+
+class LeastLoaded:
+    """Choose from eligible replicas without changing pins or request counters."""
+
+    def select(self, candidates, *, pinned, slack, cursor, count):
+        least = min(candidates, key=lambda s: (s.outstanding, (s.index - cursor) % count, s.index))
+        if pinned is not None and pinned.outstanding <= least.outstanding + slack:
+            return pinned, "session_affinity"
+        return least, "affinity_slack" if pinned is not None else "least_outstanding"
 
 
 def new_session_id() -> str:
@@ -192,6 +199,7 @@ class ReplicaState:
 class RoutingDecision:
     replica: ReplicaSpec
     affinity_hit: bool
+    reason: str
 
 
 class ReplicaRegistry:
@@ -200,13 +208,16 @@ class ReplicaRegistry:
     def __init__(self, config: RouterConfig, sessions: SessionDirectory) -> None:
         self._config = config
         self._sessions = sessions
-        self._states = [ReplicaState(spec=spec, index=i) for i, spec in enumerate(config.replicas)]
+        self._states = [ReplicaState(spec=spec, index=i, ready=spec.role == "replica")
+                        for i, spec in enumerate(config.replicas)]
         self._by_name = {state.name: state for state in self._states}
         # Rotating tiebreak, matching AsyncLLMEngine._select_replica: equal-load
         # replicas are taken in turn instead of always the lowest index.
         self._route_counter = 0
+        self._routed = 0
         self.affinity_hits = 0
         self.rejected = 0
+        self.policy = LeastLoaded()
 
     @property
     def states(self) -> tuple[ReplicaState, ...]:
@@ -222,8 +233,17 @@ class ReplicaRegistry:
         """Replicas that were serving and are not any more."""
         return sum(1 for state in self._states if state.phase == "failed")
 
+    def candidates(self, role: str) -> tuple[ReplicaState, ...]:
+        return tuple(state for state in self._states if state.routable and state.spec.role == role)
+
     def total_routed(self) -> int:
-        return sum(state.routed for state in self._states)
+        return self._routed
+
+    def record_route(self, *names: str) -> None:
+        """Count a client request once, with a dispatch on each selected node."""
+        self._routed += 1
+        for name in names:
+            self._by_name[name].routed += 1
 
     def add(self, spec: ReplicaSpec, *, ready: bool = False, owned: bool = False) -> ReplicaState:
         """Register a replica at runtime.
@@ -298,15 +318,17 @@ class ReplicaRegistry:
         state.ready = ready
         logger.info("replica %s is now %s", name, "routable" if ready else "unroutable")
 
-    def acquire(self, name: str) -> None:
-        state = self._by_name.get(name)
-        if state is not None:
+    def acquire(self, *names: str):
+        """Count dispatches once; return an idempotent release bound to these node instances."""
+        pending = {name: self._by_name[name] for name in names}
+        for state in pending.values():
             state.outstanding += 1
-
-    def release(self, name: str) -> None:
-        state = self._by_name.get(name)
-        if state is not None:
-            state.outstanding = max(0, state.outstanding - 1)
+        def release(name=None):
+            for key in tuple(pending) if name is None else (name,):
+                state = pending.pop(key, None)
+                if state is not None:
+                    state.outstanding -= 1
+        return release
 
     def select(self, session_id: str) -> RoutingDecision:
         """Pick a replica for this session and record the pin.
@@ -315,24 +337,19 @@ class ReplicaRegistry:
         so a hit is never guaranteed, and the one prefill it saves is worth less
         than an unbounded wait behind a saturated replica.
         """
-        candidates = [state for state in self._states if state.routable]
+        candidates = tuple(state for state in self._states if state.routable and state.spec.role == "replica")
         if not candidates:
             self.rejected += 1
             raise NoReplicaAvailable("no routable replica")
 
-        least = self._least_loaded(candidates)
         pinned = self._by_name.get(self._sessions.lookup(session_id) or "")
-        chosen, affinity_hit = least, False
-
-        if pinned is not None and pinned.routable:
-            if pinned.outstanding > least.outstanding + self._config.affinity_slack:
-                logger.info(
-                    "session %s leaves %s (outstanding=%d) for %s (outstanding=%d): slack %d exceeded",
-                    session_id, pinned.name, pinned.outstanding,
-                    least.name, least.outstanding, self._config.affinity_slack,
-                )
-            else:
-                chosen, affinity_hit = pinned, True
+        if not any(pinned is state for state in candidates):
+            pinned = None
+        chosen, reason = self.policy.select(candidates, pinned=pinned, slack=self._config.affinity_slack,
+                                            cursor=self._route_counter, count=len(self._states))
+        if not any(chosen is state for state in candidates):
+            raise NoReplicaAvailable("policy selected an ineligible replica")
+        affinity_hit = chosen is pinned
 
         if not affinity_hit:
             # Only advance the rotation when load decided the route, so a stream
@@ -340,16 +357,9 @@ class ReplicaRegistry:
             self._route_counter = (chosen.index + 1) % len(self._states)
 
         self._sessions.pin(session_id, chosen.name)
-        chosen.routed += 1
+        self.record_route(chosen.name)
         self.affinity_hits += affinity_hit
-        return RoutingDecision(replica=chosen.spec, affinity_hit=affinity_hit)
-
-    def _least_loaded(self, candidates: list[ReplicaState]) -> ReplicaState:
-        count = len(self._states)
-        return min(
-            candidates,
-            key=lambda s: (s.outstanding, (s.index - self._route_counter) % count, s.index),
-        )
+        return RoutingDecision(replica=chosen.spec, affinity_hit=affinity_hit, reason=reason)
 
 
 class HealthMonitor:
@@ -361,16 +371,19 @@ class HealthMonitor:
     """
 
     def __init__(self, config: RouterConfig, registry: ReplicaRegistry,
-                 sessions: SessionDirectory, client) -> None:
+                 sessions: SessionDirectory, client, *, probe=None) -> None:
         self._config = config
         self._registry = registry
         self._sessions = sessions
         self._client = client
+        self._probe_callback = probe
         self._task: asyncio.Task | None = None
 
-    async def start(self) -> None:
+    async def start(self, *, probe_first: bool = False) -> None:
         if self._task is None:
-            self._task = asyncio.create_task(self._loop())
+            if probe_first:
+                await self.probe_once()
+            self._task = asyncio.create_task(self._loop(delay_first=probe_first))
 
     async def stop(self) -> None:
         task, self._task = self._task, None
@@ -380,7 +393,9 @@ class HealthMonitor:
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    async def _loop(self) -> None:
+    async def _loop(self, *, delay_first: bool = False) -> None:
+        if delay_first:
+            await asyncio.sleep(self._config.health_interval_seconds)
         while True:
             try:
                 await self.probe_once()
@@ -399,10 +414,13 @@ class HealthMonitor:
     async def _probe(self, state: ReplicaState) -> None:
         healthy = False
         try:
-            response = await self._client.get(
-                f"{state.spec.base_url}/health", timeout=self._config.connect_timeout_seconds
-            )
-            healthy = response.status_code == 200
+            if self._probe_callback is not None:
+                healthy = await self._probe_callback(state.spec)
+            else:
+                response = await self._client.get(
+                    f"{state.spec.base_url}/health", timeout=self._config.connect_timeout_seconds
+                )
+                healthy = response.status_code == 200
         except Exception as exc:  # noqa: BLE001 - refused and timeout both mean unroutable
             if is_router_side_failure(exc):
                 # The probe never left the router, so this cycle saw nothing.

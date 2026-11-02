@@ -71,7 +71,7 @@ Device count and the meaning of each parallel axis depend on the model's placeme
 | `--max-model-len` | `1024` | Maximum prompt plus generated token length. |
 | `--block-size` | `128` | KV cache block size. |
 | `--npu-memory-utilization` | `0.90` | Fraction of NPU memory available to the server. |
-| `--max-num-seqs` | `16` | Maximum concurrent requests in serving mode. |
+| `--max-num-seqs` | `16`; PD decode: `72` | Maximum concurrent requests and cache-planning capacity. PD prefill defaults to `16`; explicit values override the default. |
 | `--max-num-batched-tokens` | `4096` | Maximum scheduled tokens per iteration. |
 | `--long-prefill-token-threshold` | `2048` | Chunked-prefill threshold in serving mode. |
 | `--ring-dep-pool` | runtime default | Simpler ring dependency-edge pool capacity. A single integer broadcasts to all scope-depth rings; a comma-separated four-integer list sizes rings 0..3, with `0` leaving that ring at its default. |

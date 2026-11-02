@@ -207,7 +207,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pd-node-id", default=None, help="Select a node when its role has multiple endpoints.")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind the serving server (default: 0.0.0.0).")
     parser.add_argument("--port", type=int, default=8000, help="Port for the serving server (default: 8000).")
-    parser.add_argument("--max-num-seqs", type=int, default=16, help="Max concurrent requests in serving mode (default: 16).")
+    parser.add_argument(
+        "--max-num-seqs", type=int, default=None,
+        help="Max concurrent requests (default: 16; PD decode: 72).",
+    )
     parser.add_argument("--max-num-batched-tokens", type=int, default=4096, help="Max tokens scheduled per iteration (default: 4096).")
     parser.add_argument(
         "--long-prefill-token-threshold",
@@ -265,6 +268,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     _validate_backend(args.backend)
+    if args.max_num_seqs is None:
+        if args.pd_role:
+            from pypto_serving.pd.config import default_max_num_seqs
+
+            args.max_num_seqs = default_max_num_seqs(args.pd_role)
+        else:
+            args.max_num_seqs = 16
 
     from pypto_serving.serving.engine.async_engine import EngineConfig
 

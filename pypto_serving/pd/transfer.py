@@ -11,6 +11,7 @@
 import ctypes
 from functools import partial
 import importlib
+import logging
 import os
 import select
 import socket
@@ -22,9 +23,12 @@ from typing import Protocol
 
 import msgspec
 
-from pypto_serving.tools.profile import profile_span, configure_profiler, get_profiler
+from pypto_serving.tools.observe import span
+from pypto_serving.tools.profile import configure_profiler, get_profiler
 from .config import PROVIDERS
 from .protocol import Copy, MAX_FRAME, decode
+
+logger = logging.getLogger(__name__)
 
 
 class TransferError(RuntimeError):
@@ -124,10 +128,8 @@ class Mooncake:
         if len(endpoints) != 1:
             raise ValueError("one native batch must target one rank owner")
         try:
-            with profile_span("pd.native.write", cat="native-transfer",
-                              args={"bytes": sum(lengths), "segments": len(lengths)}):
-                self._code(self.engine.batch_transfer_sync_write(
-                    endpoints.pop(), source, destination, lengths), uncertain=True)
+            self._code(self.engine.batch_transfer_sync_write(
+                endpoints.pop(), source, destination, lengths), uncertain=True)
         except BaseException as exc:
             self.poisoned = True
             raise TransferError(f"native completion uncertain: {exc}", uncertain=True) from exc
@@ -334,7 +336,11 @@ class OwnerService:
                     elif op == "install":
                         provider.install(tuple(decode(r, Region) for r in request["regions"]))
                     elif op == "write":
-                        provider.write(request["peer"], tuple(decode(c, Copy) for c in request["copies"]))
+                        copies = tuple(decode(c, Copy) for c in request["copies"])
+                        with span(logger, "pd.native.write", cat="native-transfer",
+                                  **request["observation"], bytes=sum(c.length for c in copies),
+                                  segments=len(copies)):
+                            provider.write(request["peer"], copies)
                     elif op == "release":
                         provider.release()
                         for token in self.tokens:

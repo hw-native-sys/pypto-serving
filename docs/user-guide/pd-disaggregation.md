@@ -8,7 +8,7 @@ The initial adapter supports DeepSeek V4 Flash DSpark K7, greedy sampling, ident
 
 Use matching PyPTO/Simpler source builds with owner-local service and allocation-retain hooks; these hooks are not upstream APIs yet. PyPTO must expose `chip_service_factories`, `retain_service_tensor`, and `release_service_tensor`, backed by Simpler's owner-local allocation pinning. Its `RunConfig` must support explicit `backend_type` and `execution_mode` fields. These are required interfaces, not a fallback to an older runtime.
 
-Control protocol version 2 separates the common replicated-page data contract from each node's local rank groups. All participants must use the same protocol version; older schemas are rejected. Every destination cache replica selects a complete source replica from the request's Prefill partition. Page/ring formats must remain compatible: this is replica mapping, not a general sharded-layout conversion.
+Control protocol version 3 separates the common replicated-page data contract from each node's local rank groups. All participants must use the same protocol version; older schemas are rejected. Every destination cache replica selects a complete source replica from the request's Prefill partition. Page/ring formats must remain compatible: this is replica mapping, not a general sharded-layout conversion.
 
 Follow the SDK's normal source-build instructions with its matching runtime pin and required PTOAS version. The tested integration uses PTOAS 0.67. Keep runtime revision checks enabled; a binary copied from another checkout is not a matching source installation.
 
@@ -18,7 +18,7 @@ Install `python -m pip install -e '.[pd]'` in each environment. The Router only 
 
 ## Configure and start
 
-Copy [the minimal configuration](https://github.com/hw-native-sys/pypto-serving/blob/main/examples/pd.json), replace the example IPs, and use the same configuration on all processes. Each service/model has its own Router and node pools. Add entries to either list for multiple nodes; the policy defaults to round-robin over compatible healthy pairs. With multiple entries in one role, select the node using `--pd-node-id host:port` (or an explicit entry `node_id`).
+Copy [the minimal configuration](https://github.com/hw-native-sys/pypto-serving/blob/main/examples/pd.json), replace the example IPs, and use the same configuration on all processes. Each service/model has its own Router and node pools. Add replica entries with either role for multiple nodes; the policy defaults to round-robin over compatible healthy pairs. With multiple entries in one role, select the node using `--pd-node-id host:port` (or an explicit entry `name`).
 
 On **each** model host, start one process with its appropriate role and port:
 
@@ -27,7 +27,7 @@ pypto-serving \
   --model /path/to/dsv4-flash-dspark-w8a8 --served-model-name dsv4 \
   --backend npu --platform a2a3 \
   --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
-  --dp 4 --ep 16 --tp 4 --block-size 32 --max-num-seqs 8 \
+  --dp 4 --ep 16 --tp 4 --block-size 32 \
   --max-model-len 655360 --max-num-batched-tokens 8192 \
   --long-prefill-token-threshold 128 \
   --speculative-config '{"method":"dspark","num_speculative_tokens":7}' \
@@ -37,6 +37,14 @@ pypto-serving \
 ```
 
 Use `--pd-role decode` on D; both launchers specify K7, while P internally runs target-only prefill. The context limit covers **prompt plus output**: 655360 allows a 524288-token prompt plus 131072 generated tokens, subject to actual device memory. Configuring this limit is not a full-length validation.
+
+When omitted, `--max-num-seqs` defaults to **16 on P** and **72 on D**.
+The value configures both the local request limit and cache-pool planning;
+an explicit `--max-num-seqs N` overrides the role default. It does not reserve
+every request's maximum output length or guarantee that all in-flight requests
+fit in HBM. Ordinary Serving keeps its default of 16.
+Use separate compilation output directories for different deployments and
+topologies when setting `PYPTO_PROG_BUILD_DIR`.
 
 Each node chooses its own attention `--tp`, with `--dp = --ep / --tp`.
 The vocabulary head uses independent `--lm-head-tp` (default 4, retaining NZ).
@@ -55,10 +63,12 @@ other parallel layouts or full-length context stress.
 
 Each node independently accepts `--no-enable-prefix-caching`; all four P/D combinations are supported. No prefix mode belongs in JSON. P cache hits reduce computation; D hits reduce network traffic, independently.
 
+The common Serving Router uses `role: "prefill"` and `role: "decode"` in its `replicas` table. Entries without a role remain ordinary complete replicas. PD requires both roles and uses statically launched nodes; mixing complete replicas, PD nodes or launchable `hosts` is rejected. The Router never starts or stops these external P/D processes.
+
 Start the external Router, then wait for `/health` to report `ok`:
 
 ```bash
-pypto-pd-router --pd-config examples/pd.json --host 0.0.0.0 --port 8110
+pypto-serving-router --replicas examples/pd.json --host 0.0.0.0 --port 8110
 curl http://127.0.0.1:8110/health
 curl -N http://127.0.0.1:8110/v1/chat/completions \
   -H 'Content-Type: application/json' \
@@ -67,11 +77,94 @@ curl -N http://127.0.0.1:8110/v1/chat/completions \
 
 Completion/chat, streaming, tools and optional constraints reuse Serving's ordinary API. Invalid preparation fails before SSE headers. Later execution failures emit an explicit stream error; clients must inspect events even after HTTP 200.
 
-HTTP, control (HTTP port + 10000 by default), and Mooncake's dynamic RPC/RoCE endpoints must be reachable. Optional entry fields are `control_port` and `transfer_hostname` for a distinct data-plane address. Optional runtime fields are `provider` (currently `mooncake`), `policy` (currently `round_robin`), `capacity` (8 per node), `handoff_timeout` (300 seconds), `request_timeout` (3600 seconds), and `run_id`. Timeouts do not authorize reuse of possibly active memory.
+HTTP, control (HTTP port + 10000 by default), and Mooncake's dynamic RPC/RoCE endpoints must be reachable. Optional entry fields are `control_port` and `transfer_hostname` for a distinct data-plane address. Optional fields in the top-level `pd` section are `provider` (currently `mooncake`), `policy` (currently `round_robin`), `capacity` (256 per node), `handoff_timeout` (300 seconds), `request_timeout` (3600 seconds), and `run_id`. Timeouts do not authorize reuse of possibly active memory.
 
 `handoff_timeout` bounds individual control, transfer, and stop-confirmation operations. Waiting for the full Prefill before Decode uses `request_timeout`, so a long, progressing Prefill is not mistaken for a stalled transfer. Non-streaming JSON response headers also wait under `request_timeout`, because they follow generation; streaming setup headers retain `handoff_timeout`. Expiry still follows the normal abort and lease-retirement rules.
 
-Logs default to `serving_log/pd_disag/<automatic-run-id>/{router,p,d}/`; node files have stable hashed names. Set a shared `runtime.run_id` to group processes under one tag. Boot identities are still regenerated at every startup. Optional `observability` fields are `enabled` and `root`. Detailed profiling uses Serving's existing profiler, not a second trace system.
+An SSE response whose body iterator has not started within `handoff_timeout` is
+retired through the same abort and cleanup path. The guard is cancelled when
+iteration begins; it does not limit the duration of an active stream.
+
+The Router preserves its configured HTTP connect and write/pool timeouts. PD
+generation reads use `pd.request_timeout` as a read-idle timeout, with a separate
+response-header wait as described above. These are not an end-to-end generation
+deadline. Descriptor and HTTP abort probes cap each HTTP phase at five seconds.
+
+Before response headers, Router-generated errors contain `object: "error"`, a
+stable `code` and a readable `message`, with `X-PyPTO-Error-Source: router`.
+Node errors retain their HTTP status, body, content type and applicable headers,
+with `X-PyPTO-Error-Source: upstream`; they are not wrapped in another JSON error.
+Request authorization, trace and request-id headers are forwarded to both nodes.
+The Router always constructs its own PD context.
+
+| Router error code | HTTP status | Meaning |
+| --- | --- | --- |
+| `capacity_exhausted` | 503 | Compatible pairs exist but their per-node request slots are full. The request was not dispatched; `Retry-After` suggests a delay before resubmission. |
+| `no_available_backend` | 503 | No healthy compatible pair; also used for an unseen model while node discovery is incomplete. |
+| `model_not_found` | 404 | Every configured node has supplied a valid descriptor and the model is unknown. |
+| `invalid_request` | 400 | Invalid JSON, object or model field. Model-specific validation stays on the nodes. |
+| `upstream_connection_error` | 502 | An upstream HTTP transport failed. |
+| `http_pool_exhausted` | 503 | The Router's local HTTP pool could not supply a connection; this does not mark a node unhealthy. |
+| `pd_operation_timeout` | 503 | A PD coordination wait or HTTP operation timed out; the message identifies the wait or HTTP failure. |
+| `pd_protocol_error` | 503 | Invalid handoff confirmation or response protocol. |
+| `router_closing` | 503 | The Router is shutting down. |
+| `response_retired` | 503 | The unstarted-body guard retired the response before iteration began. After SSE headers this is a stream error. |
+
+After SSE headers, errors remain stream events. Router-generated events keep the
+existing `error.message` and `error.type` fields and add `error.code` and
+`error.source`; node error events keep their original structure. Clients must
+check error events: HTTP 200 and `[DONE]` alone do not prove generation succeeded.
+HTTP disconnects and Router counter release do not prove native transfers stopped.
+
+PD admission does not add a Router waiting queue. Selection follows fixed
+configured P/D-pair positions, skipping unhealthy, draining, incompatible or full
+nodes. Selection and counter reservation do not yield; P/D POSTs still run
+concurrently. Both modes use the common Registry's per-node outstanding counts,
+with one idempotent release for each admitted request. P capacity returns when its handoff task finishes, independently
+of D headers or output; D capacity returns after response cleanup. The nodes
+retain their own capacity and safe-retirement checks. Only `capacity_exhausted`
+guarantees rejection before either POST; other errors may require cleanup of
+already-started work. The Router never retries or rebinds a started request.
+
+`capacity` limits in-flight requests, not model batch size or available HBM.
+Increasing it can increase queueing latency and KV/state pressure; a node can
+still reject requests when cache pages or request-state slots are exhausted.
+Use the same deployment configuration for the Router and P/D nodes.
+
+Logs default to `serving_log/pd_disag/<automatic-run-id>/{router,p,d}/`; node files have stable hashed names. Set a shared `pd.run_id` to group processes under one tag. Boot identities are still regenerated at every startup. Optional `observability` fields are `enabled` and `root`. Detailed profiling uses Serving's existing profiler, not a second trace system.
+
+Routing records identify the policy, reason and immutable P/D node identities.
+Handoff records use the same `request` and `plan_digest` as the worker job, including
+owner-side `pd.native.write` durations and bytes. Byte counts include physical TP
+copies; they are not unique KV-content sizes. Logging/profiling failures do not
+authorize writes, change completion checks or release resources.
+
+### Internal request status
+
+On a model node, query the request ID from its Router/handoff logs:
+
+```bash
+curl http://127.0.0.1:8000/internal/pd/requests/REQUEST_ID
+```
+
+The read-only response reports node identity/boot, Service execution and handoff
+facts, the **current** CacheManager receive reservation, P source-pin presence and
+observed worker state-release acknowledgements. D reservation states remain
+`CONSTRUCTING`, `READY`, `IN_USE`, `RELEASED` and `QUARANTINED`; P has no receive
+reservation. Pending plans expose their digest/range, not addresses or block tables.
+The endpoint does not poll native jobs or allocate, commit, release or recover anything.
+
+Missing or retired records return HTTP 200 with absence indicators and null fields
+for unknown facts; they do not report successful release. A tombstone only rejects
+stale request reuse. Worker release confirmation is separate from the cache lease,
+and `RELEASED` does not imply prefix eviction. Cross-process observations are not
+an atomic global snapshot. The Router does not cache or aggregate these records.
+
+Node health and descriptors share the Engine-loop/worker readiness and existing
+gate/closing checks. New HTTP, begin and plan operations recheck readiness;
+unavailable HTTP admission returns 503 with `pd_node_unavailable`. Existing
+completion, abort and stop-confirmation handling does not require a functioning
+compute engine, but still validates identity, plans and native stop proofs.
 
 ### Optional Decode Step Metrics
 
@@ -83,7 +176,7 @@ Prepared synchronous and asynchronous paths exclude explicit input preparation. 
 
 ## Execution, extension and shutdown
 
-The Router fixes a P/D pair per request and sends two ordinary generation POSTs concurrently. P prepares input once; D reserves shared read-only prefix and writable suffix/state. After each confirmed prefill chunk, P pins source pages and submits a rank-mapped transfer. Owner-side communication and an independent progress channel overlap subsequent computation. D validates all required regions, commits through CacheManager, accepts the grammar seed, and adopts the request into ordinary K7 decode. Final request-local state is transferred even on a complete D prefix hit; output does not wait for P's source cleanup.
+The common Router refreshes PD descriptors through its existing background health monitor. It becomes ready only when a compatible healthy P/D pair exists. Ordinary session-affine routing is unchanged; PD retains round-robin pair selection without session pinning. The PD coordinator fixes a pair per request and sends two ordinary generation POSTs concurrently. P prepares input once; D reserves shared read-only prefix and writable suffix/state. P sends token IDs and generation/parser settings once; D derives its Prefix hashes locally from the agreed model layout. After each confirmed prefill chunk, P submits a rank-mapped transfer only when pages need copying. Empty chunks still confirm sequence progress without creating a native job or pinning source pages. Owner-side communication and an independent progress channel overlap subsequent computation; taking a terminal result also retires its job record, without an extra command through the compute worker. D validates all required regions, commits through CacheManager, accepts the grammar seed, and adopts the request into ordinary K7 decode. Final request-local state is transferred even on a complete D prefix hit; output does not wait for P's source cleanup. Full-history compressed KV and index pages stream incrementally. Rolling target KV is sent at final handoff: its receive range covers the Decode tail and, where resident, the latest reusable Prefix checkpoint. The receiver validates that range and uses its actual publication floor, so uncopied older pages are never published. Physical ring periods and kernel shapes are unchanged. Final state and bootstrap hidden remain mandatory, including on a full D Prefix hit.
 
 DSpark sizes each cache group from the tightest post-resident rank budget using
 `--npu-memory-utilization` (default `0.90`), including filler/alignment, live rings,
@@ -97,7 +190,7 @@ never falls back to local Prefill recomputation.
 
 P also captures the last 128 prompt tokens' target hidden states, without loading or running the drafter. Target-only P skips capture dispatches outside that window; a packed batch keeps the existing all-rank collective if any request needs capture. Ordinary K7 prefill is unchanged. The final asynchronous transfer includes this request-local bootstrap region, even on a complete D KV hit. D reconstructs absolute positions from the agreed prompt length and uses its own lease generation, then reuses ordinary terminal-prefill bootstrap before its first verification. This initializes D's local drafter with prompt history rather than an empty window. The fixed 128-row hidden region is 3 MiB per destination rank: 12 MiB for a TP4 cache group or 3 MiB for TP1, including short prompts. Bootstrap runs once at admission; steady-state decode keeps its existing asynchronous pipeline. The optional profiler span `pd.dspark.bootstrap` isolates this initialization cost.
 
-`pd/adapter.py` owns model-specific regions, prefix rules, mapping and decode bootstrap; register another executor in `ADAPTERS`. `pd/transfer.py` defines the owner-side provider contract; register another implementation in `config.PROVIDERS`. `pd/routing.py` owns pair selection. The Router never manages physical cache; providers never implement model semantics. New adapters/providers require their own layout, lifecycle and native validation; changing JSON alone cannot add them.
+`pd/adapter.py` owns model-specific regions, prefix rules, mapping and decode bootstrap; register another executor in `ADAPTERS`. `pd/transfer.py` defines the owner-side provider contract; register another implementation in `config.PROVIDERS`. `router/routing.py` provides node pools and routing policies; `pd/coordinator.py` filters compatible pairs and coordinates their execution inside the common Router. The Router never manages physical cache; providers never implement model semantics. New adapters/providers require their own layout, lifecycle and native validation; changing JSON alone cannot add them.
 
 Terminal output waits for request retirement, including the local state-release acknowledgement, before the Router can admit a replacement. Normal Decode completion reuses Serving's FIFO worker-release ACK without an extra control barrier. Initial-token termination and cancellation without that ACK still explicitly discard reserved state. HTTP cancellation does not cancel the owned retirement task. A confirmed abort for a request that was never admitted consumes no capacity and authorizes no writes.
 

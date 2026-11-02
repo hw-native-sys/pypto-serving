@@ -19,6 +19,23 @@ def _parse_cli_args(argv: list[str]):
     return cli.build_parser().parse_args(argv)
 
 
+@pytest.mark.parametrize(("role", "specified", "expected"), [
+    (None, None, 16), ("prefill", None, 16), ("decode", None, 72),
+    (None, 32, 32), ("prefill", 8, 8), ("decode", 16, 16),
+])
+def test_request_capacity_defaults_reach_scheduler_and_cache(tmp_path, role, specified, expected):
+    model = tmp_path / "model"
+    model.mkdir()
+    argv = ["--model", str(model)]
+    if role is not None:
+        argv += ["--pd-role", role]
+    if specified is not None:
+        argv += ["--max-num-seqs", str(specified)]
+    config = cli.build_serving_engine_config(_parse_cli_args(argv))
+    assert config.max_num_running_reqs == expected
+    assert config.runtime_config.max_batch_size == expected
+
+
 def test_cli_keeps_generic_model_chunk_sizes_unrestricted():
     args = _parse_cli_args(
         ["--model", "model", "--long-prefill-token-threshold", "128"]
