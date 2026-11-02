@@ -14,8 +14,8 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 import json
 import logging
-import multiprocessing
 import os
+import socket
 from types import SimpleNamespace
 import uuid
 
@@ -190,11 +190,12 @@ class Application:
         self.config = config
         progress = channel = None
         if role == "prefill":
-            parent, channel = multiprocessing.get_context("spawn").Pipe(duplex=True)
-            progress = Progress(parent, config.handoff_timeout)
+            parent, channel = socket.socketpair()
+            progress = Progress(parent, config.handoff_timeout, config.capacity)
         self.channel, self.progress = channel, progress
         settings = WorkerSettings(self.boot, endpoint.transfer_hostname or endpoint.host,
-                                  config.provider, config.capacity, len(config.prefill) + len(config.decode))
+                                  config.provider, config.capacity, len(config.prefill) + len(config.decode),
+                                  config.handoff_timeout)
         tokens = 0 if role == "prefill" else 7
         engine_config = replace(engine_config,
             runtime_config=replace(engine_config.runtime_config, num_speculative_tokens=tokens),

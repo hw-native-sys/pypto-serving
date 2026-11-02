@@ -139,6 +139,41 @@ owner-side `pd.native.write` durations and bytes. Byte counts include physical T
 copies; they are not unique KV-content sizes. Logging/profiling failures do not
 authorize writes, change completion checks or release resources.
 
+Existing handoff records include `plan_ms` / `plan_thread_cpu_ms` on P completion,
+`lower_ms` / `lower_thread_cpu_ms` on worker submission, and
+`validation_ms` / `validation_thread_cpu_ms` on D plan authorization. Worker RPC
+records also include request encoding time. Thread CPU is measured only around
+synchronous preparation, not across asynchronous waits.
+
+P submission, final-state lookup and completion polling share one independent,
+bounded worker channel, so ready transfers need not wait behind unrelated compute.
+Final metadata is published after confirmed capture and retired with the request's
+lease. A submit acknowledgement is not native completion. Registry installation,
+D state reservation, bootstrap and retirement retain their existing ordering.
+The local channel bounds lock waiting, frame writes and complete frame reads by
+one handoff deadline; uncertain I/O closes the channel without releasing source
+pins. A rejected final metadata result fails its own handoff, while unrelated
+requests in the same successfully computed batch can continue.
+Profile spans `pd.progress.wait_channel`, `pd.progress.roundtrip` and
+`pd.progress.handle` separate channel waiting from handling;
+`pd.source.ready` / `pd.source.read` identify final metadata publication and lookup.
+
+On-demand profiling separates plan build/validation, worker and owner encoding/
+decoding, transfer lowering, owner call/RPC, provider address construction and
+`MooncakeTransferEngine.batch_transfer_sync_write`. The latter surrounds the native
+call; `pd.native.write` still covers the whole owner-side provider write. The
+bootstrap span also separates waiting for prior dispatches from bootstrap execution.
+Nested spans overlap and must not be added as independent latency components.
+Detailed spans add no default log records or per-request timing history.
+
+Region indexes and registry fingerprints are reused only within their node boot;
+accepted plan digests live only with the active request. Peer registrations are
+bounded, but old peer boots currently remain installed until the local node
+retires. Repeated peer restarts can exhaust that capacity even after their control
+sessions close; coordinate node retirement rather than evicting a registry that
+may still be referenced by native work. Log and trace files are not automatically
+rotated. Use bounded profiling windows and manage file retention externally.
+
 ### Internal request status
 
 On a model node, query the request ID from its Router/handoff logs:

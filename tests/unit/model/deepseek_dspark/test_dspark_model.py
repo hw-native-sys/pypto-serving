@@ -341,10 +341,7 @@ def test_pd_bootstrap_reuses_normal_seed_with_local_generations(monkeypatch, len
     extension.handle("reserve_state", dict(request="reused", partition=1, prompt_len=length))
     reused = runner._drafter_state("reused")
     assert reused.lease == first.lease and reused.generation == old + 1
-    with pytest.raises(RuntimeError, match="complete prompt tail"):
-        extension.handle("source_state", "reused")
-    reused.prefill_tail_positions = torch.arange(max(0, length - 128), length, dtype=torch.int64)
-    assert extension.handle("source_state", "reused") == {"bootstrap": reused.lease}
+    assert reused.prefill_tail_positions is None and not reused.device_state_initialized
 
 
 def test_prefill_to_decode_staging_contract() -> None:

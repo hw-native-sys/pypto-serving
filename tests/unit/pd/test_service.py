@@ -106,7 +106,7 @@ def test_suffix_handoff_preserves_shared_prefix_and_final_state(p_tp, d_tp, p_hi
     groups = {g.name: g for g in case.d.group_specs}
     components = {c.name: c for c in COMPONENTS}
     for plan in case.plans:
-        Completion(digest(plan), plan.units).check(plan)
+        Completion(digest(plan), plan.units).check(digest(plan), plan.units)
         for copy in plan.copies:
             group = components[copy.component].group
             if group not in ("cmp_c128", "cmp_c4", "idx"):
@@ -116,7 +116,7 @@ def test_suffix_handoff_preserves_shared_prefix_and_final_state(p_tp, d_tp, p_hi
             assert all((copy.destination_offset + offset) // geo.page_bytes % geo.blocks in writable
                        for offset in range(0, copy.length, geo.page_bytes))
     with pytest.raises(ValueError):
-        Completion(digest(final), final.units[:-1]).check(final)
+        Completion(digest(final), final.units[:-1]).check(digest(final), final.units)
 
 
 def test_owner_rejects_out_of_bounds_and_retains_unknown_registration():
@@ -184,6 +184,7 @@ def test_cancel_and_unknown_cannot_release_unconfirmed_native_writes():
         entry.reservation = s.cache.reserve_group_cache(binding.request, binding.request, 256, prompt_token_count=128)
         s.cache.authorize_group_cache_write(binding.request)
         entry.pending = Plan(binding, "continuation", 0, 0, 128, True, ((0, 0),), (), ((0, "kv"),))
+        entry.pending_digest = digest(entry.pending)
         s.fail(entry, TransferError("native result unknown", uncertain=True))
         await s.abort(entry)
         status = s.status(binding.request)
