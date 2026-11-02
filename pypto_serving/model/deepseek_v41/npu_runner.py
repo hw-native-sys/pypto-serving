@@ -41,6 +41,7 @@ from .task_args import (
     build_cache_groups,
     validate_cache_groups,
 )
+from .engram import HostEngram
 from .weight_loader import (
     DecodeWeightBank,
     DecodeWeightLayout,
@@ -54,6 +55,7 @@ from .weight_loader import (
     peak_rss_bytes,
     plan_layers,
 )
+from .weight_spec import pack_mx_scale
 
 
 # cache_resources
@@ -1019,7 +1021,7 @@ class DecodeForwardSegment:
 
     def __init__(self, worker, program, param_names, run_config, topology,
                  counts_are_tensor,
-                 weights, cache, metadata, final):
+                 weights, cache, metadata, final, engram=None):
         self.worker, self.program = worker, program
         self.param_names = tuple(param_names)
         self.run_config, self.topology = run_config, topology
@@ -1039,6 +1041,11 @@ class DecodeForwardSegment:
             logits=final.host.logits,
             sampled_ids=final.host.sampled_ids,
         )
+        if engram is not None and "engram_lookup" in param_names:
+            arguments.update(engram_lookup=metadata.fields["engram_lookup"],
+                            engram_wkv=engram.wkv,
+                            engram_wkv_scale=engram.wkv_scale,
+                            engram_weight=engram.weight)
         arguments["moe_num_tokens"] = metadata.fields["moe_counts"]
         if counts_are_tensor:
             if topology.tp != 1:
@@ -1152,6 +1159,7 @@ class V41ModelRunner:
     def _reset_request(self, key, owner):
         self.bindings.reset_request(self.resources, key, owner)
         self.bindings.wait(self.resources)
+        self.resources.release_request(key)
 
     def run_prefill(self, model, batch):
         with self._lock:
@@ -1350,6 +1358,93 @@ class SwaWindowMetadata:
     window_slots: torch.Tensor
     window_indices: torch.Tensor
     group_counts: tuple[int, ...]
+
+
+class HostEngramResources:
+    """Host hash lookup plus resident Engram projection weights."""
+
+    def __init__(self, model_dir, topology, tokenizer, *, capacity):
+        loader = V41WeightLoader(model_dir, tp_size=1, tp_rank=0,
+                                 ep_size=topology.world, ep_rank=0,
+                                 max_load_bytes=8 << 30)
+        config = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))["text_config"]
+        # The adapter follows the official model's raw tokenizer ABI. It owns
+        # host hashing/history; pypto-lib contributes only device kernels.
+        self.host = HostEngram(loader, tokenizer, config)
+        layers = self.host.layout.layer_ids
+        if len(layers) != 2:
+            raise ValueError("V4.1 serving currently requires two Engram layers")
+        wkv_values, scale_values, gate_values = [], [], []
+        for layer in layers:
+            wkv = loader.store.load_tensor(f"layers.{layer}.engram.wkv.weight")
+            scale = loader.store.load_tensor(f"layers.{layer}.engram.wkv.scale")
+            q = loader.store.load_tensor(f"layers.{layer}.engram.q_weight").float()
+            k = loader.store.load_tensor(f"layers.{layer}.engram.k_weight").float()
+            if tuple(wkv.shape) != (self.host.kv_out, self.host.layout.lookup_width) or tuple(scale.shape) != (
+                    self.host.kv_out // 32, self.host.layout.lookup_width // 32):
+                raise ValueError(f"unsupported Engram projection shape at layer {layer}")
+            wkv_values.append(wkv.t().contiguous())
+            scale_values.append(pack_mx_scale(scale.view(torch.uint8).t().repeat_interleave(32, dim=1))
+                                 .view(torch.float8_e8m0fnu))
+            gate_values.append((q * k).to(torch.float32))
+        def shared(value):
+            return value.unsqueeze(0).expand(topology.world, *value.shape).contiguous().share_memory_()
+        self.lookup = torch.zeros((topology.world, 2, capacity, self.host.layout.lookup_width),
+                                  dtype=torch.bfloat16).share_memory_()
+        self.wkv = shared(torch.stack(wkv_values))
+        # The Engram ABI flattens the two layer scale matrices along the
+        # group axis: [2 * (ENGRAM_K // 32), KV_OUT].  The weight and gate
+        # tensors keep an explicit layer dimension, so their layouts cannot
+        # be handled by the same stack operation.
+        self.wkv_scale = shared(torch.cat(scale_values, dim=0))
+        self.weight = shared(torch.stack(gate_values))
+
+    @property
+    def inherited_host_tensors(self):
+        return self.lookup, self.wkv, self.wkv_scale, self.weight
+
+    def release_request(self, request_id):
+        self.host.release_request(request_id)
+
+    def stage_lookup(self, target, step, topology):
+        if tuple(target.shape[1:]) != tuple(self.lookup.shape[1:]):
+            raise ValueError("Engram lookup capacity disagrees with the forward ABI")
+        target.zero_()
+        offsets = [0] * topology.dp
+        for request in step.requests:
+            start = offsets[request.partition]
+            values = self.host.lookup(request.token_ids, topology.capacity,
+                                      request.start, request_id=request.request_id)
+            count = len(request.token_ids)
+            for tp_rank in range(topology.tp):
+                rank = request.partition * topology.tp + tp_rank
+                target[rank, :, start:start + count].copy_(values[:, :count])
+            offsets[request.partition] += count
+
+
+class ResidentEngramWeights:
+    def __init__(self, worker, host):
+        self.worker = worker
+        self.host = host
+        self._owned = [worker.alloc_stacked_tensor(value) for value in (
+            host.wkv, host.wkv_scale, host.weight)]
+
+    @property
+    def wkv(self):
+        return self._owned[0]
+
+    @property
+    def wkv_scale(self):
+        return self._owned[1]
+
+    @property
+    def weight(self):
+        return self._owned[2]
+
+    def close(self):
+        for value in reversed(self._owned):
+            self.worker.free_stacked_tensor(value)
+        self._owned.clear()
 
 
 def gather_swa_rope_rows(
@@ -1599,7 +1694,7 @@ class PrefillMetadataResources:
 
     def __init__(self, topology, *, max_seq_len, max_requests, window_pages,
                  c2a_pages, c1a_pages, rope_tables, compressed_rope_tables,
-                 full_hidden_size=None):
+                 full_hidden_size=None, engram_k=6144):
         if any(type(value) is not int or value <= 0 for value in
                (max_seq_len, max_requests, window_pages, c2a_pages, c1a_pages)):
             raise ValueError("prefill metadata capacities must be positive integers")
@@ -1625,6 +1720,9 @@ class PrefillMetadataResources:
             return value
 
         world, tokens, width = topology.world, topology.capacity, rope_tables[0].shape[1]
+        if type(engram_k) is not int or engram_k <= 0:
+            raise ValueError("Engram width must be positive")
+        shared("engram_lookup", (world, 2, tokens, engram_k), torch.bfloat16)
         shared("attention_counts", (world, 1), torch.int32)
         shared("moe_counts", (world,), torch.int32)
         shared("window_slots", (world, tokens), torch.int64, -1)
@@ -1687,7 +1785,7 @@ class PrefillMetadataResources:
         result_sin[active] = sin[positions[active].long()]
         return result_cos, result_sin
 
-    def stage(self, step):
+    def stage(self, step, engram=None):
         swa = prepare_swa_window_metadata(
             step, self.topology, cache_pages=self.window_pages)
         self.fields["window_slots"].copy_(swa.window_slots)
@@ -1699,6 +1797,8 @@ class PrefillMetadataResources:
         attention, moe = self.topology.counts(swa.group_counts)
         self.fields["attention_counts"][:, 0].copy_(torch.tensor(attention, dtype=torch.int32))
         self.fields["moe_counts"].copy_(torch.tensor(moe, dtype=torch.int32))
+        if engram is not None:
+            engram.stage_lookup(self.fields["engram_lookup"], step, self.topology)
         for prefix, ratio in (("c2a", 2), ("c1a", 1)):
             metadata = prepare_compressed_metadata(
                 step, self.topology, ratio=ratio, compressed_group=prefix,
@@ -1725,13 +1825,13 @@ class PrefillMetadataResources:
                 self.fields["compressed_rope_sin"].copy_(rows[1])
         return swa.group_counts
 
-    def stage_full(self, step, embeddings):
+    def stage_full(self, step, embeddings, engram=None):
         """Lower one chunk into the two-stage lib prefill ABI using scheduler pages."""
         if self.full_hidden_size is None:
             raise ValueError("full prefill staging was not allocated before worker startup")
         if embeddings.shape[-1] != self.full_hidden_size:
             raise ValueError("full prefill embedding width disagrees with the checkpoint")
-        counts = self.stage(step)
+        counts = self.stage(step, engram)
         packed = prepare_segment_inputs(embeddings, step, self.topology)
         f = self.fields
         f["full_embedding"].zero_()
@@ -1773,6 +1873,7 @@ class PrefillMetadataResources:
         f = self.fields
         names = {
             "embedding": "full_embedding", "embedding_ids": "full_embedding_ids",
+            "engram_lookup": "engram_lookup",
             "initial_pre": "full_initial_pre", "identity_rows": "full_identity_rows",
             "counts": "full_counts", "replay_rows": "full_replay_rows",
             "logit_rows": "full_logit_rows",
@@ -1899,7 +2000,7 @@ class PrefillForwardSegment:
     """Run the lib's complete 40-layer prefill using resident decode weights."""
 
     def __init__(self, worker, program, param_names, run_config, topology,
-                 weights, metadata, cache, final):
+                 weights, metadata, cache, final, engram=None):
         self.worker, self.program = worker, program
         self.param_names = tuple(param_names)
         self.run_config, self.metadata = run_config, metadata
@@ -1922,6 +2023,13 @@ class PrefillForwardSegment:
                 x_hc_out=self.residual, pre_mix_out=self.pre_mix,
                 logits=final.host.logits, sampled_ids=final.host.sampled_ids,
             )
+            if engram is not None and "engram_lookup" in param_names:
+                self.arguments.update(engram_lookup=metadata.fields["engram_lookup"],
+                                      engram_wkv=engram.wkv,
+                                      engram_wkv_scale=engram.wkv_scale,
+                                      engram_weight=engram.weight)
+            elif "engram_lookup" not in param_names:
+                self.arguments.pop("engram_lookup", None)
             if len(self.param_names) != len(set(self.param_names)) or set(self.param_names) != set(self.arguments):
                 raise ValueError("lib full prefill ABI differs from the serving binding")
         except BaseException:
@@ -1961,6 +2069,7 @@ class V41ResidentResources:
     def __init__(self, programs, run_config, *, weight_bank, weight_param_names,
                  cache_plan, state_reset, page_resets, input_host, final_host,
                  prefill_host, topology,
+                 engram_host=None,
                  decode_input_host=None, decode_host=None, worker_factory=make_segment_worker,
                  prefill_program=None, prefill_param_names=None):
         weight_bank.finish(weight_param_names)
@@ -1971,6 +2080,7 @@ class V41ResidentResources:
                      + (() if decode_input_host is None else decode_input_host.inherited_host_tensors)
                      + prefill_host.inherited_host_tensors
                      + (() if decode_host is None else decode_host.inherited_host_tensors)
+                     + (() if engram_host is None else engram_host.inherited_host_tensors)
                      + final_host.all_host_tensors
                      + (state_reset, *page_resets.values()))
         if any(not tensor.is_shared() for tensor in inherited):
@@ -1987,6 +2097,7 @@ class V41ResidentResources:
         self.host_resources = (weight_bank, input_host, decode_input_host, prefill_host, decode_host,
                                final_host, state_reset, page_resets)
         self.prefill_host = prefill_host
+        self.engram_host = engram_host
         self.decode_host = decode_host
         self._owned = []
         self._step = None
@@ -2008,6 +2119,8 @@ class V41ResidentResources:
             self.decode_input = (None if decode_input_host is None else
                                  self._own(InputStateRuntime(self.worker, decode_input_host)))
             self.final = self._own(FinalOutputWeights(self.worker, topology, final_host))
+            self.engram = (None if engram_host is None else self._own(
+                ResidentEngramWeights(self.worker, engram_host)))
             self.cache = self._own(DecodeFullCachePools(
                 self.worker, cache_plan, state_reset, page_resets))
             if prefill_program is not None:
@@ -2040,7 +2153,7 @@ class V41ResidentResources:
             raise RuntimeError("full prefill was not registered")
         self._prefill_fwd = PrefillForwardSegment(
             self.worker, program, names, run_config, topology,
-            self.weights, self.prefill_host, self.cache, self.final)
+            self.weights, self.prefill_host, self.cache, self.final, self.engram)
 
     def _activate_decode(self):
         if self._decode_fwd is not None:
@@ -2050,7 +2163,7 @@ class V41ResidentResources:
         program, names, run_config, counts_are_tensor = self._decode_binding
         self._decode_fwd = DecodeForwardSegment(
             self.worker, program, names, run_config, self.decode_host.topology,
-            counts_are_tensor, self.weights, self.cache, self.decode_host, self.final)
+            counts_are_tensor, self.weights, self.cache, self.decode_host, self.final, self.engram)
 
     def begin_step(self, embeddings, step):
         if self.closed or self._step is not None:
@@ -2066,9 +2179,9 @@ class V41ResidentResources:
             for partition in padding_partitions:
                 self.cache.reset_padding(partition)
         host = self.prefill_host if step.phase == "prefill" else self.decode_host
-        counts = (host.stage_full(dispatch_step, embeddings)
+        counts = (host.stage_full(dispatch_step, embeddings, self.engram_host)
                   if step.phase == "prefill" and self._prefill_fwd is not None else
-                  host.stage(dispatch_step) if host is not None else None)
+                  host.stage(dispatch_step, self.engram_host) if host is not None else None)
         input_runtime = self.decode_input if step.phase == "decode" else self.input
         if input_runtime is None:
             raise ValueError("decode requires its own TP-local input capacity")
@@ -2117,6 +2230,10 @@ class V41ResidentResources:
     def reset_request(self, owner):
         self._step = self._inputs = self._group_counts = self._output_rows = None
         self.cache.reset_request(owner)
+
+    def release_request(self, request_id):
+        if self.engram_host is not None:
+            self.engram_host.release_request(request_id)
 
     def close(self):
         if self.closed:
@@ -2315,6 +2432,15 @@ def make_production_bindings(model_dir, max_seq_len, *, dp_size=8):
         final_host = load_final_output_host_resources(model_dir, topology)
         prefill_host = PrefillMetadataResources(
             topology, **host_kwargs, full_hidden_size=plan.weights.config.hidden_size)
+        engram_host = None
+        if "engram_lookup" in set(decode_names) | set(prefill_names):
+            from pypto_serving.model.tokenizer import load_tokenizer
+
+            tokenizer_adapter = load_tokenizer(model_dir)
+            tokenizer = getattr(tokenizer_adapter, "tokenizer", tokenizer_adapter)
+            tokenizer = getattr(tokenizer, "_tokenizer", tokenizer)
+            engram_host = HostEngramResources(
+                model_dir, topology, tokenizer, capacity=topology.capacity)
         programs = (prefill, decode)
         resident_started = time.perf_counter()
         resident = V41ResidentResources(
@@ -2322,7 +2448,7 @@ def make_production_bindings(model_dir, max_seq_len, *, dp_size=8):
             cache_plan=cache_plan, state_reset=state_reset, page_resets=resets,
             input_host=input_host, decode_input_host=decode_input_host,
             prefill_host=prefill_host, decode_host=decode_host,
-            final_host=final_host,
+            final_host=final_host, engram_host=engram_host,
             topology=topology, prefill_program=prefill, prefill_param_names=prefill_names,
         )
         _LOG.info("V4.1 resident upload and allocation %.2fs",
