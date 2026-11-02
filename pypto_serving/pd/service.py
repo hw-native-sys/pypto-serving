@@ -33,6 +33,14 @@ class NodeUnavailable(RuntimeError):
     """This node cannot admit new work; existing retirement remains allowed."""
 
 
+class ExecutionError(RuntimeError):
+    """Decode failed after handoff; this does not imply an uncertain transfer."""
+
+    def __init__(self, request_id):
+        self.request_id = request_id
+        super().__init__(f"Decode execution failed for request {request_id}")
+
+
 @dataclass
 class Request:
     binding: Binding
@@ -680,6 +688,10 @@ class Service:
             async with aclosing(outputs):
                 async for output in outputs:
                     if output.finished:
+                        if output.finish_reason == "error":
+                            error = ExecutionError(request)
+                            self.fail(entry, error)
+                            raise error
                         await asyncio.wait_for(entry.source_done.wait(), self.config.handoff_timeout)
                         terminal = True
                         # The client may disconnect as soon as it sees the

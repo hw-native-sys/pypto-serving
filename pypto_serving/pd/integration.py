@@ -31,7 +31,7 @@ from pypto_serving.serving.server.serving_worker import spawn_worker
 from .adapter import select_adapter
 from .config import Config, log_context
 from .protocol import Binding, Continuation, Node, decode
-from .service import NodeUnavailable, Service
+from .service import ExecutionError, NodeUnavailable, Service
 from .worker import Progress, Services, WorkerSettings
 
 
@@ -72,10 +72,16 @@ class Server(ServingServer):
     def _register_exception_handlers(self):
         super()._register_exception_handlers()
         self.app.add_exception_handler(NodeUnavailable, self.unavailable)
+        self.app.add_exception_handler(ExecutionError, self.execution_error)
 
     @staticmethod
     async def unavailable(request, exc):
         return JSONResponse(dict(object="error", code="pd_node_unavailable", message=str(exc)), status_code=503)
+
+    @staticmethod
+    async def execution_error(request, exc):
+        return JSONResponse(dict(object="error", code="pd_execution_error", message=str(exc),
+                                 request_id=exc.request_id), status_code=500)
 
     def _register_routes(self):
         super()._register_routes()
