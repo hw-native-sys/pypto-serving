@@ -36,6 +36,54 @@ def test_request_capacity_defaults_reach_scheduler_and_cache(tmp_path, role, spe
     assert config.runtime_config.max_batch_size == expected
 
 
+@pytest.mark.parametrize("role,budget,tp", [(None, 8192, 4), ("prefill", 8192, 4),
+    ("decode", 8192, 4), ("decode", 8192, 1), ("decode", 2048, 4), ("decode", 2048, 1)])
+def test_dspark_local_ring_budget_reaches_host_device_and_pool_without_changing_decode_width(role, budget, tp):
+    from types import SimpleNamespace
+
+    from pypto_serving.model.deepseek_dspark.cache_capacity import cache_pool_bytes
+    from pypto_serving.model.deepseek_dspark.npu_runner import DSparkCacheLayout, DSparkModelRunner
+
+    argv = ["--model", "model", "--max-model-len", "655360", "--max-num-seqs", "72",
+        "--ep", "16", "--tp", str(tp), "--dp", str(16 // tp),
+        "--max-num-batched-tokens", str(budget), "--long-prefill-token-threshold", str(budget),
+        "--speculative-config", '{"method":"dspark","num_speculative_tokens":7}']
+    if role:
+        argv += ["--pd-role", role]
+    runtime = cli._build_runtime_config(_parse_cli_args(argv), model_family="deepseek_v4",
+        config_data={"num_hidden_layers": 43, "compress_ratios": [0, 0] + [4] * 21 + [128] * 20})
+    assert runtime.max_num_batched_tokens == runtime.max_prefill_tokens_per_request == budget
+    assert runtime.num_speculative_tokens == 7 and runtime.speculative_prefix_cache_replay_tokens == 128
+    groups = {g.name: g for g in runtime.kv_cache_groups}
+    assert {name: groups[name].max_blocks_per_seq for name in
+        ("ori", "hca_state", "csa_state", "csa_inner_state")} == dict(zip(
+        ("ori", "hca_state", "csa_state", "csa_inner_state"),
+        (261, 1041, 4101, 4101) if budget == 8192 else (69, 273, 1029, 1029)))
+    runner = DSparkModelRunner.__new__(DSparkModelRunner)
+    layout = DSparkCacheLayout.for_ranks(16, tp_size=tp)
+    runner._compiled = SimpleNamespace(layout=layout, prefill=None if role == "decode" else object())
+    runner._cache_group_specs = runtime.kv_cache_groups
+    inspected = []
+    def memory(rank):
+        inspected.append(rank)
+        return 64 << 30, 80 << 30
+    runner._shared_l3_worker = lambda: SimpleNamespace(device_memory_info=memory)
+    counts = runner._compute_kv_cache_pages(runtime)
+    assert inspected == list(range(16)) and layout.decode_seq == 8
+    step = 8 if role == "decode" else budget
+    requests = min(counts[g.name] // (g.max_blocks_per_seq
+        + (step + g.spec.token_capacity - 1) // g.spec.token_capacity
+        + g.sliding_window // g.spec.token_capacity) for g in groups.values() if g.sliding_window)
+    assert requests > 0
+    for g in groups.values():
+        if g.sliding_window:
+            assert counts[g.name] == requests * (g.max_blocks_per_seq
+                + (step + g.spec.token_capacity - 1) // g.spec.token_capacity
+                + g.sliding_window // g.spec.token_capacity)
+        assert runner._decode_state_table_depth(g.name) == g.max_blocks_per_seq
+    assert cache_pool_bytes(runtime.kv_cache_groups, counts, filler_pages=64) <= int((80 << 30) * .9) - (16 << 30)
+
+
 def test_cli_keeps_generic_model_chunk_sizes_unrestricted():
     args = _parse_cli_args(
         ["--model", "model", "--long-prefill-token-threshold", "128"]

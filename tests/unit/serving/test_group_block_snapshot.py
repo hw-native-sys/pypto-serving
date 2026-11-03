@@ -177,7 +177,7 @@ def test_release_resolution_count_does_not_grow_with_batch(monkeypatch, batch):
     assert_free(manager)
 
 
-@pytest.mark.parametrize("threshold", [128, 8192])
+@pytest.mark.parametrize("threshold", [128, 2048, 8192])
 @pytest.mark.parametrize("partitions", [4, 16])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_eight_groups_keep_both_snapshots_with_real_window_geometry(threshold, partitions, enabled):

@@ -74,13 +74,15 @@ def valid_from(groups, components, p_hit, d_hit, end, source, destination):
     return floors
 
 
-def page_indices(group, component, start, end, final, source_table, p_hit, d_hit, publication_floor):
+def page_indices(group, component, start, end, final, table, p_hit, d_hit, publication_floor, state_ranges):
     capacity = group.spec.token_capacity
     logical_end = (end + capacity - 1) // capacity
     if component.final:
         if not final:
             return ()
-        indices = range(max(0, logical_end - len(source_table)), logical_end)
+        indices = range(*state_ranges[group.name])
+        if not 0 <= indices.start <= indices.stop == logical_end:
+            raise ValueError("invalid final state range")
     else:
         if group.sliding_window is not None:
             if not final:
@@ -89,6 +91,9 @@ def page_indices(group, component, start, end, final, source_table, p_hit, d_hit
         else:
             floor = max(start, d_hit)
         indices = range(floor // capacity, end // capacity)
+    if group.sliding_window is not None and indices:
+        if indices.start < max(0, logical_end - len(table)):
+            raise ValueError("rolling snapshot cannot cover required logical pages")
     rows = {i: group.spec.storage_block_size for i in indices}
     remainder = end % capacity
     if final and remainder and (component.final or end > d_hit):
@@ -141,7 +146,8 @@ def _mapped_runs(pages):
     return tuple(runs)
 
 
-def plan_chunk(binding, chunk, placement, contract, groups, source, destination, p_hit, mapping, continuation_digest):
+def plan_chunk(binding, chunk, placement, contract, groups, source, destination, p_hit, mapping,
+               continuation_digest, state_ranges):
     specs = {g.name: g for g in groups}
     src = {g.name: g for g in source}
     dst = {g.name: g for g in destination}
@@ -171,10 +177,13 @@ def plan_chunk(binding, chunk, placement, contract, groups, source, destination,
             if key not in mapped:
                 if component.group in specs:
                     group = specs[component.group]
+                    indices = page_indices(group, component, start, chunk.end, chunk.final,
+                        chunk.blocks[group.name], p_hit, placement.hit, floors, state_ranges)
+                    if group.sliding_window is not None and len(indices) > len(placement.blocks[group.name]):
+                        raise ValueError("destination ring cannot cover required logical pages")
                     pages = ((physical(group, chunk.blocks[group.name], logical),
                               physical(group, placement.blocks[group.name], logical))
-                             for logical, _ in page_indices(group, component, start, chunk.end, chunk.final,
-                                 chunk.blocks[group.name], p_hit, placement.hit, floors))
+                             for logical, _ in indices)
                 else:
                     pages = ((chunk.state_slots[component.group], placement.state_slots[component.group]),)
                 mapped[key] = _mapped_runs(pages)

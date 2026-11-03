@@ -65,7 +65,8 @@ def case(threshold, *, hit=0, final=True):
     placement = Placement(binding.request, hit, reservation.partition,
                           reservation.block_ids_by_group, entry.state_slots)
     plan = plan_chunk(binding, chunk, placement, contract, groups, geometry, geometry, 0,
-        rank_mapping(pn.topology, dn.topology, 0, reservation.partition), entry.normalized_digest)
+        rank_mapping(pn.topology, dn.topology, 0, reservation.partition), entry.normalized_digest,
+        adapter.state_ranges(groups, end) if final else {})
     return destination, entry, plan, geometry, 0, pn.topology
 
 

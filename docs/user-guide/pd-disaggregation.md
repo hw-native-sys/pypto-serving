@@ -29,14 +29,18 @@ pypto-serving \
   --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
   --dp 4 --ep 16 --tp 4 --block-size 32 \
   --max-model-len 655360 --max-num-batched-tokens 8192 \
-  --long-prefill-token-threshold 128 \
+  --long-prefill-token-threshold 8192 \
   --speculative-config '{"method":"dspark","num_speculative_tokens":7}' \
   --ring-heap 1073741824,1073741824,1073741824,1073741824 \
   --generate-config '{"max_new_tokens":131072,"temperature":0}' \
   --pd-config examples/pd.json --pd-role prefill --host 0.0.0.0 --port 8000
 ```
 
-Use `--pd-role decode` on D; both launchers specify K7, while P internally runs target-only prefill. The context limit covers **prompt plus output**: 655360 allows a 524288-token prompt plus 131072 generated tokens, subject to actual device memory. Configuring this limit is not a full-length validation.
+Use `--pd-role decode` on D; both launchers specify K7, while P internally runs target-only prefill. D can use `--max-num-batched-tokens 2048 --long-prefill-token-threshold 2048` while P keeps 8192. These local budgets plan conservative ring capacities; D still validates eight positions per request and does not run a local Prefill. The global scheduling budget does not force a batch to fill it.
+
+P and D rings may differ in length. Handoff selects the model's required logical tail and checkpoint state, then maps each page through the two local tables; D receives directly into its reservation without copying or shrinking a ring at takeover. Full-history compressed KV and index suffixes retain their normal coverage, and final request-local state/bootstrap still transfers on a full KV hit. A model-contract fingerprint distinguishes this state policy from older whole-ring senders. Unequal ring capacities have Host coverage; real-weight validation remains required.
+
+The context limit covers **prompt plus output**: 655360 allows a 524288-token prompt plus 131072 generated tokens, subject to actual device memory. Configuring this limit is not a full-length validation.
 
 When omitted, `--max-num-seqs` defaults to **16 on P** and **72 on D**.
 The value configures both the local request limit and cache-pool planning;

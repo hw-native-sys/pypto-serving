@@ -32,7 +32,7 @@ ROW_BYTES = dict(ori=1024, hca_cmp=1024, csa_cmp=1024, idx_k=128, idx_scale=4,
 
 def plan_case(threshold=8192, *, length=8205, end=None, start=0, number=0,
               p_hit=0, d_hit=0, d_tp=1, layout="contiguous", seed=0, layers=2, partition=0,
-              pool_requests=1, request_index=0):
+              pool_requests=1, request_index=0, destination_threshold=None):
     """Actual page/window widths, without tensors or allocator-sized metadata pools."""
     end = length if end is None else end
     rng = random.Random(seed)
@@ -42,14 +42,17 @@ def plan_case(threshold=8192, *, length=8205, end=None, start=0, number=0,
             layer_ids[name] = tuple(range(3, 42, 2))
         for name in ("cmp_c4", "idx", "csa_state", "csa_inner_state"):
             layer_ids[name] = tuple(range(2, 43, 2))
-    source, destination, groups, a_blocks, b_blocks, writable = {}, {}, [], {}, {}, {}
+    destination_threshold = threshold if destination_threshold is None else destination_threshold
+    source, destination, groups, d_groups, a_blocks, b_blocks, writable = {}, {}, [], [], {}, {}, {}
     for name, page, ratio, _, window in GEOMETRY:
         ring = math.ceil((window - 1 + threshold) / page) + 1 if window else math.ceil((length + 512) / page)
         groups.append(KVCacheGroupSpec(name, layer_ids[name], KVCacheSpec(page, page // ratio, ratio),
             ring, sliding_window=window))
+        d_ring = (math.ceil((window - 1 + destination_threshold) / page) + 1 if window else ring)
+        d_groups.append(replace(groups[-1], max_blocks_per_seq=d_ring))
         na, nb = math.ceil(end / page), math.ceil(length / page)
         if window is not None:
-            na, nb = min(ring, na), min(ring, nb)
+            na, nb = min(ring, na), min(d_ring, nb)
         a, b = list(range(na)), list(range(nb))
         if layout == "fragmented":
             a, b = [2 * i for i in a], [3 * i + 7 for i in b]
@@ -85,7 +88,7 @@ def plan_case(threshold=8192, *, length=8205, end=None, start=0, number=0,
     placement = Placement(binding.request, d_hit, partition, destination, {"bootstrap": 1})
     reserved = SimpleNamespace(partition=partition, prefix_hit_tokens=d_hit, block_ids_by_group=destination,
                                writable_block_ids_by_group=writable)
-    cache = SimpleNamespace(group_specs=tuple(groups), group_prefix_cache_alignment=128)
+    cache = SimpleNamespace(group_specs=tuple(d_groups), group_prefix_cache_alignment=128)
     core = SimpleNamespace(kv_cache_manager=cache, is_ready=lambda: True)
     service = Service(SimpleNamespace(prefill=(0,), decode=(0,), capacity=16),
                       SimpleNamespace(node_id="d"), "decode", adapter, core, None)
@@ -95,7 +98,8 @@ def plan_case(threshold=8192, *, length=8205, end=None, start=0, number=0,
         continuation=Continuation(tuple(range(length)), {"max_new_tokens": 512}, None, None),
         state_slots={"bootstrap": 1})
     args = (binding, chunk, placement, pn.contract, tuple(groups), pg, dg, p_hit,
-            rank_mapping(pn.topology, dn.topology, 1, partition), entry.normalized_digest)
+            rank_mapping(pn.topology, dn.topology, 1, partition), entry.normalized_digest,
+            adapter.state_ranges(groups, end) if chunk.final else {})
     return SimpleNamespace(args=args, service=service, entry=entry, source=pn, p_hit=p_hit,
                            geometry=pg, chunk=chunk, placement=placement, groups=tuple(groups))
 

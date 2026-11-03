@@ -15,7 +15,8 @@ from pypto_serving.pd.planner import page_indices, physical, rolling_bounds, val
 from pypto_serving.pd.protocol import Copy, Plan
 
 
-def page_plan(binding, chunk, placement, contract, groups, source, destination, p_hit, mapping, continuation_digest):
+def page_plan(binding, chunk, placement, contract, groups, source, destination, p_hit, mapping,
+              continuation_digest, state_ranges):
     specs = {g.name: g for g in groups}
     src = {g.name: g for g in source}
     dst = {g.name: g for g in destination}
@@ -46,7 +47,7 @@ def page_plan(binding, chunk, placement, contract, groups, source, destination, 
                 pages = tuple((physical(group, chunk.blocks[group.name], logical),
                                physical(group, placement.blocks[group.name], logical))
                               for logical, _ in page_indices(group, component, start, chunk.end, chunk.final,
-                                  chunk.blocks[group.name], p_hit, placement.hit, floors))
+                                  chunk.blocks[group.name], p_hit, placement.hit, floors, state_ranges))
             else:
                 pages = ((chunk.state_slots[component.group], placement.state_slots[component.group]),)
             if any(min(sb, db) < 0 or sb >= a.blocks or db >= b.blocks for sb, db in pages):
@@ -130,6 +131,7 @@ def page_validate(self, entry, plan, geometry, p_hit, source_topology):
             occupied.add(key)
     required = set()
     groups = {group.name: group for group in self.cache.group_specs}
+    state_ranges = self.adapter.state_ranges(self.cache.group_specs, plan.end) if plan.final else {}
     for _, rank in plan.mapping:
         for component in self.node.contract.components:
             if component.final and not plan.final:
@@ -140,7 +142,7 @@ def page_validate(self, entry, plan, geometry, p_hit, source_topology):
                 table = entry.reservation.block_ids_by_group[component.group]
                 blocks = (physical(group, table, logical) for logical, _ in page_indices(
                     group, component, plan.start, plan.end, plan.final,
-                    table, p_hit, entry.reservation.prefix_hit_tokens, plan.valid_from))
+                    table, p_hit, entry.reservation.prefix_hit_tokens, plan.valid_from, state_ranges))
             else:
                 blocks = (entry.state_slots[component.group],)
             for block in blocks:

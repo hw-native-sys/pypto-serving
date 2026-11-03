@@ -10,7 +10,7 @@
 
 from dataclasses import dataclass, replace
 import logging
-from math import prod
+from math import lcm, prod
 import threading
 from typing import Protocol
 
@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 class ModelAdapter(Protocol):
     def prefix_spec(self, tokens, cache) -> Prefix: ...
+    def state_ranges(self, groups, end): ...
     def contract(self, model, geometry) -> Contract: ...
     def worker_factory(self, **kwargs): ...
     def mapping(self, source_topology, destination_topology, source_partition, destination_partition): ...
@@ -45,6 +46,20 @@ TENSORS = dict(zip((c.name for c in CACHE_COMPONENTS), (
 
 class DeepSeekDSpark:
     @staticmethod
+    def state_ranges(groups, end):
+        """Logical state pages covering the terminal tail and its checkpoint.
+
+        These pages are request-local even when all target KV is shared. Ring
+        storage beyond this range is working capacity, not transferable state.
+        """
+        alignment = lcm(*(g.spec.token_capacity for g in groups))
+        boundary = max(0, end - 1) // alignment * alignment
+        names = {c.group for c in CACHE_COMPONENTS if c.final}
+        return {g.name: (max(0, boundary - g.sliding_window) // g.spec.token_capacity,
+                         (end + g.spec.token_capacity - 1) // g.spec.token_capacity)
+                for g in groups if g.name in names}
+
+    @staticmethod
     def mapping(source_topology, destination_topology, source_partition, destination_partition):
         return rank_mapping(source_topology, destination_topology, source_partition, destination_partition)
 
@@ -63,7 +78,8 @@ class DeepSeekDSpark:
         a, b = geometry["idx_k"], geometry["idx_scale"]
         if (a.layers, a.blocks, a.rows) != (b.layers, b.blocks, b.rows):
             raise ValueError("index K/scale geometry mismatch")
-        layout = digest(tuple(geometry[c.name].layout for c in COMPONENTS))
+        # Pair only peers that agree on terminal-state coverage as well as bytes.
+        layout = digest(("checkpoint-state-tail", tuple(geometry[c.name].layout for c in COMPONENTS)))
         return Contract("deepseek-v4-dspark-k7", model, layout, COMPONENTS)
 
     def prefix_spec(self, tokens, cache):

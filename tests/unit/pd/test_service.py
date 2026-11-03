@@ -88,7 +88,8 @@ def handoff(length, p_hit=0, d_hit=0, p_tp=4, d_tp=1, ori_blocks=9, enabled=True
         chunk = Chunk(request, number, start, end, end == length, 7 if end == length else None,
                       {k: tuple(v) for k, v in tables.items()}, 0, {"bootstrap": 0})
         plan = plan_chunk(binding, chunk, placement, nodes[0].contract, p.group_specs, pg, dg, p_hit,
-            rank_mapping(nodes[0].topology, nodes[1].topology, 0, reservation.partition), entry.normalized_digest)
+            rank_mapping(nodes[0].topology, nodes[1].topology, 0, reservation.partition), entry.normalized_digest,
+            adapter.state_ranges(p.group_specs, end) if chunk.final else {})
         destination.validate_plan(entry, plan, pg, p_hit, nodes[0].topology)
         entry.chunk, entry.end = number + 1, end
         plans.append(plan)

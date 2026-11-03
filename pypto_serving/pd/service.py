@@ -477,6 +477,7 @@ class Service:
             occupied.setdefault((copy.destination_rank, copy.component), []).append((begin, end))
         required, local_ranges = {}, {}
         groups = {group.name: group for group in self.cache.group_specs}
+        state_ranges = self.adapter.state_ranges(self.cache.group_specs, plan.end) if plan.final else {}
         for _, rank in plan.mapping:
             for component in self.node.contract.components:
                 if component.final and not plan.final:
@@ -490,7 +491,7 @@ class Service:
                             table = entry.reservation.block_ids_by_group[component.group]
                             blocks = (physical(group, table, logical) for logical, _ in page_indices(
                                 group, component, plan.start, plan.end, plan.final,
-                                table, p_hit, entry.reservation.prefix_hit_tokens, plan.valid_from))
+                                table, p_hit, entry.reservation.prefix_hit_tokens, plan.valid_from, state_ranges))
                         else:
                             blocks = (entry.state_slots[component.group],)
                         blocks = frozenset(blocks)
@@ -607,7 +608,9 @@ class Service:
                                               self.cache.group_specs, self.geometry, peer_geometry, p_hit,
                                               self.adapter.mapping(self.node.topology, peer.topology,
                                                                    chunk.partition, placement.partition),
-                                              entry.normalized_digest)
+                                              entry.normalized_digest,
+                                              self.adapter.state_ranges(self.cache.group_specs, chunk.end)
+                                              if chunk.final else {})
                         with span(logger, "pd.plan.digest", log=False, thread_cpu=True, role="prefill") as digest_timing:
                             plan_digest = digest(plan)
                     plan_timing.update(construct_ms=construct_timing["duration_ms"],
