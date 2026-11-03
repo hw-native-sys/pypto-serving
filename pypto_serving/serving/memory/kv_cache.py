@@ -12,11 +12,13 @@ from __future__ import annotations
 import hashlib
 import math
 import struct
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 
 import torch
 
 from pypto_serving.config.types import KVCacheGroupSpec, KvAllocation, ModelConfig, RuntimeConfig
+from pypto_serving.tools.profile import profile_span
 from .checkpoint import GroupPrefixCheckpoints
 from .reservation import GroupCacheReservation, GroupedCacheReservations
 
@@ -161,6 +163,14 @@ class _GroupBlockPool:
                 f"Invalid local block ID {block_id} for cache group {self.spec.name!r}"
             )
         return self.blocks[partition * self.blocks_per_partition + block_id]
+
+
+@dataclass(slots=True, eq=False)
+class GroupBlockSnapshot:
+    """Host-only pin returned by the cache manager; release through that manager."""
+
+    _owner: KvCacheManager | None = field(repr=False)
+    _groups: tuple[tuple[FreeKVCacheBlockQueue, tuple[KVCacheBlock, ...]], ...] = field(repr=False)
 
 
 class KvCacheManager:
@@ -1038,9 +1048,9 @@ class KvCacheManager:
 
     def retain_group_block_snapshot(
         self,
-        block_ids_by_group: dict[str, list[int]],
+        block_ids_by_group: dict[str, Sequence[int]],
         partition: int,
-    ) -> None:
+    ) -> GroupBlockSnapshot:
         """Pin one scheduled grouped block-table snapshot until its step settles.
 
         Async scheduling may advance a rolling request table before an older
@@ -1048,45 +1058,54 @@ class KvCacheManager:
         until that step is confirmed or discarded, matching vLLM's in-flight
         block lifetime fence.
         """
-        if not block_ids_by_group:
-            return
-        if set(block_ids_by_group) != set(self._group_pools):
-            raise ValueError("Grouped block snapshot does not match configured cache groups")
+        with profile_span("cache.snapshot.retain", cat="cache"):
+            if block_ids_by_group and set(block_ids_by_group) != set(self._group_pools):
+                raise ValueError("Grouped block snapshot does not match configured cache groups")
 
-        blocks = []
-        for name, block_ids in block_ids_by_group.items():
-            pool = self._group_pools[name]
-            if len(block_ids) != len(set(block_ids)):
-                raise ValueError(f"Cache group {name!r} snapshot contains duplicate block IDs")
-            for block_id in block_ids:
-                block = pool.block_from_local_id(partition, block_id)
-                if block.ref_cnt <= 0:
-                    raise RuntimeError(
-                        f"Cannot retain unowned grouped KV block {name}:{block_id}"
-                    )
-                blocks.append(block)
+            groups = []
+            for name, block_ids in block_ids_by_group.items():
+                pool = self._group_pools[name]
+                if not 0 <= partition < len(pool.free_queues):
+                    raise ValueError(f"Invalid cache partition {partition}")
+                if len(block_ids) != len(set(block_ids)):
+                    raise ValueError(f"Cache group {name!r} snapshot contains duplicate block IDs")
+                blocks = []
+                for block_id in block_ids:
+                    block = pool.block_from_local_id(partition, block_id)
+                    if block.ref_cnt <= 0:
+                        raise RuntimeError(
+                            f"Cannot retain unowned grouped KV block {name}:{block_id}"
+                        )
+                    blocks.append(block)
+                groups.append((pool.free_queues[partition], tuple(blocks)))
 
-        for block in blocks:
-            block.ref_cnt += 1
+            # Resolve and validate everything before acquiring any references.
+            snapshot = GroupBlockSnapshot(self, tuple(groups))
+            for _, blocks in snapshot._groups:
+                for block in blocks:
+                    block.ref_cnt += 1
+            return snapshot
 
     def release_group_block_snapshot(
         self,
-        block_ids_by_group: dict[str, list[int]],
-        partition: int,
+        snapshot: GroupBlockSnapshot,
     ) -> None:
         """Release pins acquired by :meth:`retain_group_block_snapshot`."""
-        for name, block_ids in block_ids_by_group.items():
-            pool = self._group_pools[name]
-            for block_id in block_ids:
-                block = pool.block_from_local_id(partition, block_id)
-                if block.ref_cnt <= 0:
-                    raise RuntimeError(
-                        f"Grouped KV snapshot block {name}:{block_id} has "
-                        f"invalid ref_cnt={block.ref_cnt}"
-                    )
-                block.ref_cnt -= 1
-                if block.ref_cnt == 0:
-                    pool.free_queues[partition].append(block)
+        with profile_span("cache.snapshot.release", cat="cache"):
+            if snapshot._owner is not self:
+                raise RuntimeError("Grouped KV snapshot belongs to another manager or was already released")
+            for queue, blocks in snapshot._groups:
+                for block in blocks:
+                    if block.ref_cnt <= 0:
+                        raise RuntimeError(
+                            f"Grouped KV snapshot block {block.block_id} has invalid ref_cnt={block.ref_cnt}"
+                        )
+                    block.ref_cnt -= 1
+                    if block.ref_cnt == 0:
+                        queue.append(block)
+            # A retired handle must not keep the manager or its pages alive.
+            snapshot._groups = ()
+            snapshot._owner = None
 
     def cache_group_blocks_from_snapshot(
         self,

@@ -18,7 +18,7 @@ from enum import Enum, auto
 
 from pypto_serving.config.types import KVCacheGroupSpec
 from pypto_serving.serving.constraints import ConstraintSpec
-from pypto_serving.serving.memory.kv_cache import KVCacheCapacityError, KvCacheManager
+from pypto_serving.serving.memory.kv_cache import GroupBlockSnapshot, KVCacheCapacityError, KvCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -196,7 +196,7 @@ class ScheduledRequest:
     block_ids_by_group: dict[str, list[int]] = field(default_factory=dict)
     cache_partition: int | None = None
     resumed_from_preemption: bool = False
-    group_blocks_retained: bool = False
+    group_block_snapshot: GroupBlockSnapshot | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -835,11 +835,10 @@ class Scheduler:
             if scheduled.block_ids_by_group:
                 if scheduled.cache_partition is None:
                     raise RuntimeError("Grouped async step has no cache partition")
-                self.kv_cache_manager.retain_group_block_snapshot(
+                scheduled.group_block_snapshot = self.kv_cache_manager.retain_group_block_snapshot(
                     scheduled.block_ids_by_group,
                     scheduled.cache_partition,
                 )
-                scheduled.group_blocks_retained = True
             completes_prompt = (
                 request.num_computed_tokens + scheduled.num_new_tokens
                 >= request.num_prompt_tokens
@@ -1093,15 +1092,12 @@ class Scheduler:
             request.num_computed_tokens += accepted_speculative - (reserved - 1)
 
     def _release_scheduled_group_blocks(self, scheduled: ScheduledRequest) -> None:
-        if not scheduled.group_blocks_retained:
+        if scheduled.group_block_snapshot is None:
             return
-        if scheduled.cache_partition is None:
-            raise RuntimeError("Retained grouped async step has no cache partition")
         self.kv_cache_manager.release_group_block_snapshot(
-            scheduled.block_ids_by_group,
-            scheduled.cache_partition,
+            scheduled.group_block_snapshot,
         )
-        scheduled.group_blocks_retained = False
+        scheduled.group_block_snapshot = None
 
     def discard_scheduled_request(self, scheduled: ScheduledRequest) -> None:
         """Drop one failed/stale async step without publishing its KV hashes."""

@@ -166,10 +166,7 @@ class SourcePins:
     def retain(self, chunk):
         if chunk.request in self.active:
             raise RuntimeError("one transfer per request may be in flight")
-        tables = {k: list(v) for k, v in chunk.blocks.items()}
-        self.cache.retain_group_block_snapshot(tables, chunk.partition)
-        self.active[chunk.request] = (tables, chunk.partition)
+        self.active[chunk.request] = self.cache.retain_group_block_snapshot(chunk.blocks, chunk.partition)
 
     def release(self, request):
-        tables, partition = self.active.pop(request)
-        self.cache.release_group_block_snapshot(tables, partition)
+        self.cache.release_group_block_snapshot(self.active.pop(request))

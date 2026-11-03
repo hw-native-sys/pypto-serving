@@ -223,11 +223,11 @@ def test_external_decode_capacity_waits_for_snapshot_then_fails_without_local_pr
     # A detached in-flight table occupies the last pages. No rejection until
     # its FIFO completion has had the opportunity to return those references.
     held = cache.ensure_group_blocks("inflight", 30)
-    cache.retain_group_block_snapshot(held, 0)
+    snapshot = cache.retain_group_block_snapshot(held, 0)
     cache.release_all_group_requests("inflight")
     waiting = scheduler.schedule(allow_reject_stalled=False)
     assert not waiting.rejected_requests and request in scheduler.running and not scheduler.waiting
-    cache.release_group_block_snapshot(held, 0)
+    cache.release_group_block_snapshot(snapshot)
     resumed = scheduler.schedule()
     assert [s.request.request_id for s in resumed.scheduled_requests] == ["external"]
     scheduler.advance_after_schedule(resumed)
