@@ -26,8 +26,8 @@ from threading import Condition
 import torch
 
 from pypto_serving.model.common.weights.store import LazySafetensorsStore
+from pypto_serving.model.common.weights.nz import pack_nz
 from pypto_serving.model.deepseek.weight_loader import (
-    _PREPACKED_MIN_CACHE_RESIDENCY,
     _map_shared_prepacked_tensors,
     _sample_file_page_cache_residency,
 )
@@ -44,6 +44,13 @@ from .weight_spec import (
 # weight_loader
 _BYTES = {"BF16": 2, "F32": 4, "F8_E4M3": 1, "F8_E8M0": 1, "I8": 1}
 _EXPERT = re.compile(r"^layers\.\d+\.ffn\.experts\.(\d+)\.")
+_NZ_PROJECTION_SUFFIXES = (
+    ".attn.wq_a.weight", ".attn.wq_b.weight", ".attn.wkv.weight",
+    ".attn.wo_a.weight", ".attn.wo_b.weight", ".indexer.wq_b.weight",
+    ".compressor.wkv.weight", ".compressor.wgate.weight",
+    ".indexer.wk.weight", ".indexer.weights_proj.weight",
+)
+
 _TORCH_DTYPES = {
     "BF16": torch.bfloat16,
     "F32": torch.float32,
@@ -342,6 +349,9 @@ class V41WeightLoader:
                 layout = "input_major_dense"
             else:
                 layout = "checkpoint_dense"
+        if name.endswith(_NZ_PROJECTION_SUFFIXES):
+            weight = pack_nz(weight)
+            layout += ";nz"
         return WeightBundle(weight, scale, layout, tuple(item[0] for item in requests),
                             self.tp_rank, self.ep_rank, estimate)
 
@@ -507,14 +517,16 @@ def merge_expert_scales(scales):
     return pack_mx_scale(torch.cat(logical)).view(scales[0].dtype)
 
 
-def mxfp4_pair_lut():
-    """Decode two E2M1 nibbles into two E4M3FN bytes in the lib LUT ABI."""
+
+def _legacy_mxfp4_pair_lut():
+    """Identify the retired LUT stored by earlier v2 decode sidecars."""
     codes = torch.tensor([0x00, 0x30, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C,
                           0x80, 0xB0, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC], dtype=torch.int64)
     packed = torch.arange(256)
     pair = codes[packed & 15] | (codes[packed >> 4] << 8)
     pair = torch.where(pair < 32768, pair, pair - 65536)
     return pair.to(torch.int16).reshape(1, 256).repeat(2, 1)
+
 
 
 def load_prefill_layer_weights(model_dir, layer_id, topology, *, max_bundle_bytes=32 << 30,
@@ -735,7 +747,6 @@ def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_
                 held_bytes += expert_bytes
                 if 3 * held_bytes > max_bundle_bytes:
                     raise ValueError("stacked layer weight budget exceeded")
-            m["mxfp4_pair_lut"] = mxfp4_pair_lut()
             moe.append(m)
     return ({name: stack_bytes([r[name] for r in attention]) for name in attention[0]},
             {name: stack_bytes([r[name] for r in moe]) for name in moe[0]} if moe else {})
@@ -775,14 +786,12 @@ class DecodeWeightSlice:
 
 def bind_decode_layer_weights(layer, attention, moe, *, kv_sources, index_sources, c2a_sources):
     """Map one loaded layer to the lib's layer/source axes without copying data."""
-    if not attention or not moe or "mxfp4_pair_lut" not in moe:
+    if not attention or not moe:
         raise ValueError("decode requires complete Attention and packed-FP4 MoE weights")
     result = [DecodeWeightSlice(target, layer.layer_id, attention[source])
               for target, source in _ATTENTION.items()]
     result += [DecodeWeightSlice(target, layer.layer_id, moe[source])
                for target, source in _MOE.items()]
-    if layer.layer_id == 0:
-        result.append(DecodeWeightSlice("mxfp4_pair_lut", 0, moe["mxfp4_pair_lut"]))
     if layer.layer_id in kv_sources:
         kv_slot = kv_sources.index(layer.layer_id)
         result.append(DecodeWeightSlice("compressor_norm_weight", kv_slot,
@@ -868,10 +877,10 @@ _AXIS_LAYER = frozenset({
     "wq_a", "wq_b", "wkv", "wo_b", "shared_w1", "shared_w2", "shared_w3",
 })
 _FLAT_KV = frozenset({"compressor_norm_weight"})
-_FLAT_INDEX = frozenset({"index_wk", "index_norm_weight", "index_wq_b_scale"})
-_AXIS_INDEX = frozenset({"index_wq_b", "index_weights_proj"})
+_FLAT_INDEX = frozenset({"index_norm_weight", "index_wq_b_scale"})
+_AXIS_INDEX = frozenset({"index_wk", "index_wq_b", "index_weights_proj"})
 _AXIS_C2A = frozenset({"c2a_compressor_wkv", "c2a_compressor_wgate"})
-_SINGLE = frozenset({"c1a_compressor_wkv", "mxfp4_pair_lut"})
+_SINGLE = frozenset({"c1a_compressor_wkv"})
 _ALL = (_FLAT_LAYER | _AXIS_LAYER | _FLAT_KV | _FLAT_INDEX |
         _AXIS_INDEX | _AXIS_C2A | _SINGLE)
 _LAYER_ABI_ALIASES = {
@@ -1093,7 +1102,6 @@ class ResidentDecodeWeights:
                      for target, source in _ATTENTION.items()}
         moe = {source: self.view(target, layer.layer_id)
                for target, source in _MOE.items()}
-        moe["mxfp4_pair_lut"] = self.view("mxfp4_pair_lut", 0)
         if layer.layer_id in kv_sources:
             source = kv_sources.index(layer.layer_id)
             attention["compressor_norm_weight"] = self.view("compressor_norm_weight", source)
@@ -1204,13 +1212,14 @@ class ResidentFullDecodeWeights(ResidentDecodeWeights):
 
 # weight_sidecar
 _LOG = logging.getLogger(__name__)
-_FORMAT = "pypto-deepseek-v41-decode-slot-major-v1"
+_FORMAT = "pypto-deepseek-v41-decode-slot-major-v2"
 _FLOAT8 = {"float8_e4m3fn": torch.float8_e4m3fn,
            "float8_e8m0fnu": torch.float8_e8m0fnu}
 
 
-def sidecar_path(model_dir, world=8):
-    return Path(model_dir) / f"pypto-deepseek-v41-decode-r{world}.safetensors"
+def sidecar_path(model_dir):
+    override = os.environ.get("PYPTO_V41_PREPACKED_WEIGHTS")
+    return Path(override) if override else Path(model_dir) / "pypto-deepseek-v41-decode-r8.safetensors"
 
 
 def source_fingerprint(model_dir, layout):
@@ -1233,7 +1242,7 @@ def source_fingerprint(model_dir, layout):
 
 
 def load_prepacked_bank(model_dir, layout, parameter_names, *, path=None):
-    path = sidecar_path(model_dir, layout.world) if path is None else Path(path)
+    path = sidecar_path(model_dir) if path is None else Path(path)
     if not path.is_file():
         return None
     from safetensors import safe_open
@@ -1243,10 +1252,6 @@ def load_prepacked_bank(model_dir, layout, parameter_names, *, path=None):
         residency = _sample_file_page_cache_residency(fd, path)
         _LOG.info("V4.1 weight sidecar page-cache residency: %s",
                   "unknown" if residency is None else f"{100 * residency:.1f}%")
-        if residency is None or residency < _PREPACKED_MIN_CACHE_RESIDENCY:
-            _LOG.info("Skipping cold V4.1 weight sidecar %s (requires %.1f%% page-cache residency)",
-                      path, 100 * _PREPACKED_MIN_CACHE_RESIDENCY)
-            return None
         with safe_open(f"/proc/self/fd/{fd}", framework="pt", device="cpu") as reader:
             metadata = reader.metadata() or {}
             if metadata.get("format") != _FORMAT or metadata.get("source_fingerprint") != source_fingerprint(
@@ -1254,13 +1259,25 @@ def load_prepacked_bank(model_dir, layout, parameter_names, *, path=None):
                 _LOG.warning("Ignoring stale V4.1 weight sidecar %s", path)
                 return None
             names = frozenset(reader.keys())
-            if names != _ALL:
+            legacy_lut = "mxfp4_pair_lut"
+            if names not in (_ALL, _ALL | {legacy_lut}):
                 _LOG.warning("Ignoring V4.1 weight sidecar with wrong fields: %s", path)
                 return None
+            if reader.get_slice("gate_weight").get_dtype() != "BF16":
+                _LOG.warning("Ignoring stale V4.1 weight sidecar without BF16 router weights: %s", path)
+                return None
+            if legacy_lut in names:
+                source = reader.get_slice(legacy_lut)
+                if tuple(source.get_shape()) != (layout.world, 2, 256) or source.get_dtype() != "I16":
+                    raise ValueError("V4.1 sidecar has invalid legacy MXFP4 LUT shape/dtype")
+                expected_lut = _legacy_mxfp4_pair_lut().unsqueeze(0).expand(layout.world, -1, -1)
+                if not torch.equal(reader.get_tensor(legacy_lut), expected_lut):
+                    raise ValueError("V4.1 sidecar has invalid legacy MXFP4 LUT values")
+                _LOG.info("Skipping verified legacy MXFP4 LUT in V4.1 v2 sidecar %s", path)
             float8_fields = json.loads(metadata.get("float8_fields", "{}"))
             if any(name not in _ALL or dtype not in _FLOAT8 for name, dtype in float8_fields.items()):
                 raise ValueError("V4.1 weight sidecar has invalid float8 metadata")
-            for name in names:
+            for name in _ALL:
                 source = reader.get_slice(name)
                 shape = tuple(source.get_shape())
                 if (shape[0] != (layout.world if name in _SINGLE else layout.slots(name))
@@ -1268,7 +1285,7 @@ def load_prepacked_bank(model_dir, layout, parameter_names, *, path=None):
                     raise ValueError(f"V4.1 sidecar weight has invalid rank/slot shape: {name}")
                 if name in float8_fields and source.get_dtype() != "U8":
                     raise ValueError(f"V4.1 sidecar float8 weight is not byte-backed: {name}")
-        tensors = _map_shared_prepacked_tensors(fd, names)
+        tensors = _map_shared_prepacked_tensors(fd, _ALL)
         for name, dtype in float8_fields.items():
             tensors[name] = tensors[name].view(_FLOAT8[dtype])
         bank = DecodeWeightBank(layout)

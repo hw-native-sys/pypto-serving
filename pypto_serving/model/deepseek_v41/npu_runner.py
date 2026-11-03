@@ -1040,6 +1040,7 @@ class DecodeForwardSegment:
             logit_row_indices=final.host.logit_row_indices,
             logits=final.host.logits,
             sampled_ids=final.host.sampled_ids,
+            dspark_target_hidden=final.dspark_target_hidden,
         )
         if engram is not None and "engram_lookup" in param_names:
             arguments.update(engram_lookup=metadata.fields["engram_lookup"],
@@ -1960,7 +1961,7 @@ def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
 
 
 class FinalOutputWeights:
-    """Keep output weights resident for the full lib forwards.
+    """Keep output weights and target-hidden scratch resident for full forwards.
 
     The host resources must exist before the shared DistributedWorker forks.
     The caller owns and closes the worker after this runtime releases its tensors.
@@ -1986,6 +1987,11 @@ class FinalOutputWeights:
             self._resident.append(self.norm_weight)
             self.head_weight = worker.alloc_stacked_tensor(host.head_weight)
             self._resident.append(self.head_weight)
+            # Both full forwards export the three final target layers into this scratch buffer.
+            self.dspark_target_hidden = alloc_device_buffer(
+                worker, (world, topology.local_capacity, 3 * host.head_weight.shape[-1]),
+                torch.bfloat16, stacked=True)
+            self._resident.append(self.dspark_target_hidden)
         except BaseException:
             self.close()
             raise
@@ -2022,6 +2028,7 @@ class PrefillForwardSegment:
                 final_norm_weight=final.norm_weight, lm_head_weight=final.head_weight,
                 x_hc_out=self.residual, pre_mix_out=self.pre_mix,
                 logits=final.host.logits, sampled_ids=final.host.sampled_ids,
+                dspark_target_hidden=final.dspark_target_hidden,
             )
             if engram is not None and "engram_lookup" in param_names:
                 self.arguments.update(engram_lookup=metadata.fields["engram_lookup"],
