@@ -378,6 +378,8 @@ def test_sender_preserves_authorization_pins_and_completion_boundary(failure):
             finish_prefilled_request=lambda _: finished.set(), is_ready=lambda: True)
         source = Service(cfg, cfg.prefill[0], "prefill", DeepSeekDSpark(), core, None)
         source.node, source.geometry = case.nodes[0], case.source_geometry
+        observed = []
+        source.observe = lambda name, entry, **fields: observed.append((name, fields))
         entry = source.register_http(binding, {})
         reservation = case.entry.reservation
         async def control(operation, payload):
@@ -428,6 +430,9 @@ def test_sender_preserves_authorization_pins_and_completion_boundary(failure):
             if failure == "none":
                 await source.prefill(entry, case.entry.continuation, case.nodes[1])
                 assert proof.is_set() and entry.chunk == 1 and entry.end == 128
+                timing = next(fields for name, fields in observed if name == "completion")
+                assert timing["plan_ms"] >= timing["plan_construct_ms"] + timing["plan_digest_ms"] >= 0
+                assert timing["plan_thread_cpu_ms"] >= timing["plan_construct_thread_cpu_ms"] + timing["plan_digest_thread_cpu_ms"] >= 0
             else:
                 with pytest.raises(asyncio.CancelledError if failure == "cancel_submit" else Exception):
                     await source.prefill(entry, case.entry.continuation, case.nodes[1])

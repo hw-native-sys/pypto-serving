@@ -20,7 +20,8 @@ from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.tools.observe import record, span
-from .planner import Geometry, SourcePins, page_indices, physical, plan_chunk, rolling_bounds
+from .planner import (Geometry, SourcePins, merge_ranges, page_indices, page_ranges, physical,
+                      plan_chunk, rolling_bounds)
 from .protocol import (Binding, Completion, Continuation, Node, Placement, Plan, Topology,
                        decode, digest, receive, send)
 from .session import PeerPool, Session
@@ -360,8 +361,10 @@ class Service:
                 raise ValueError("invalid source Prefix boundary")
             with span(logger, "pd.plan.validate", log=False, thread_cpu=True,
                       request=request, chunk=plan.chunk) as timing:
-                self.validate_plan(entry, plan, geometry, p_hit, peer.topology)
-                plan_digest = digest(plan)
+                with span(logger, "pd.plan.check", log=False, thread_cpu=True) as check_timing:
+                    self.validate_plan(entry, plan, geometry, p_hit, peer.topology)
+                with span(logger, "pd.plan.digest", log=False, thread_cpu=True, role="decode") as digest_timing:
+                    plan_digest = digest(plan)
             if plan.copies or plan.final:
                 self.cache.authorize_group_cache_write(request)
             entry.pending = plan
@@ -370,7 +373,11 @@ class Service:
             entry.mapping = plan.mapping
             self.observe("plan.authorized", entry, plan_digest=plan_digest, chunk=plan.chunk,
                          start=plan.start, end=plan.end, final=plan.final,
-                         validation_ms=timing["duration_ms"], validation_thread_cpu_ms=timing["thread_cpu_ms"])
+                         validation_ms=timing["duration_ms"], validation_thread_cpu_ms=timing["thread_cpu_ms"],
+                         plan_check_ms=check_timing["duration_ms"],
+                         plan_check_thread_cpu_ms=check_timing["thread_cpu_ms"],
+                         plan_digest_ms=digest_timing["duration_ms"],
+                         plan_digest_thread_cpu_ms=digest_timing["thread_cpu_ms"])
             return plan_digest
         if operation == "complete":
             plan = entry.pending
@@ -445,8 +452,7 @@ class Service:
         geo = {g.name: g for g in self.geometry}
         sources = {g.name: g for g in geometry}
         component_group = {c.name: c.group for c in self.node.contract.components}
-        occupied = set()
-        writable_sets = {}
+        occupied, writable_sets = {}, {}
         for copy in plan.copies:
             if ((copy.destination_rank, copy.component) not in expected
                     or not 0 <= copy.source_rank < source_topology.ranks):
@@ -466,32 +472,39 @@ class Service:
                             if group_name in entry.reservation.writable_block_ids_by_group
                             else (entry.state_slots[group_name],))
                 writable_sets[group_name] = frozenset(writable)
-            for page in range(copy.destination_offset // g.page_bytes,
-                              (copy.destination_offset + copy.length) // g.page_bytes):
-                key = copy.destination_rank, copy.component, page
-                if page % g.blocks not in writable_sets[group_name] or key in occupied:
-                    raise ValueError("write aliases shared Prefix or another write")
-                occupied.add(key)
-        required = set()
+            begin = copy.destination_offset // g.page_bytes
+            end = (copy.destination_offset + copy.length) // g.page_bytes
+            occupied.setdefault((copy.destination_rank, copy.component), []).append((begin, end))
+        required, local_ranges = {}, {}
         groups = {group.name: group for group in self.cache.group_specs}
         for _, rank in plan.mapping:
             for component in self.node.contract.components:
                 if component.final and not plan.final:
                     continue
-                g = geo[component.name]
-                if component.group in groups:
-                    group = groups[component.group]
-                    table = entry.reservation.block_ids_by_group[component.group]
-                    blocks = (physical(group, table, logical) for logical, _ in page_indices(
-                        group, component, plan.start, plan.end, plan.final,
-                        table, p_hit, entry.reservation.prefix_hit_tokens, plan.valid_from))
-                else:
-                    blocks = (entry.state_slots[component.group],)
-                for block in blocks:
-                    required.update((rank, component.name, layer * g.blocks + block)
-                                    for layer in range(len(g.layers)))
-        if occupied != required:
-            raise ValueError("copy plan does not cover the required destination pages")
+                if component.name not in required:
+                    g = geo[component.name]
+                    key = component.group, component.final
+                    if key not in local_ranges:
+                        if component.group in groups:
+                            group = groups[component.group]
+                            table = entry.reservation.block_ids_by_group[component.group]
+                            blocks = (physical(group, table, logical) for logical, _ in page_indices(
+                                group, component, plan.start, plan.end, plan.final,
+                                table, p_hit, entry.reservation.prefix_hit_tokens, plan.valid_from))
+                        else:
+                            blocks = (entry.state_slots[component.group],)
+                        blocks = frozenset(blocks)
+                        # Exact coverage below makes authorization of required
+                        # local pages sufficient for every layer and rank.
+                        if not blocks.issubset(writable_sets.get(component.group, ())):
+                            raise ValueError("write aliases shared Prefix or another write")
+                        local_ranges[key] = page_ranges(blocks)
+                    required[component.name] = merge_ranges(
+                        (layer * g.blocks + start, layer * g.blocks + end)
+                        for layer in range(len(g.layers)) for start, end in local_ranges[key])
+                actual = merge_ranges(occupied.get((rank, component.name), ()), reject_overlap=True)
+                if actual != required[component.name]:
+                    raise ValueError("copy plan does not cover the required destination pages")
 
     def fail(self, entry, error):
         entry.error = error
@@ -589,12 +602,17 @@ class Service:
                         chunk = replace(chunk, state_slots=await self.worker("source_state", request))
                     with span(logger, "pd.plan.build", log=False, thread_cpu=True,
                               request=request, chunk=chunk.chunk) as plan_timing:
-                        plan = plan_chunk(entry.binding, chunk, placement, self.node.contract,
-                                          self.cache.group_specs, self.geometry, peer_geometry, p_hit,
-                                          self.adapter.mapping(self.node.topology, peer.topology,
-                                                               chunk.partition, placement.partition),
-                                          entry.normalized_digest)
-                        plan_digest = digest(plan)
+                        with span(logger, "pd.plan.construct", log=False, thread_cpu=True) as construct_timing:
+                            plan = plan_chunk(entry.binding, chunk, placement, self.node.contract,
+                                              self.cache.group_specs, self.geometry, peer_geometry, p_hit,
+                                              self.adapter.mapping(self.node.topology, peer.topology,
+                                                                   chunk.partition, placement.partition),
+                                              entry.normalized_digest)
+                        with span(logger, "pd.plan.digest", log=False, thread_cpu=True, role="prefill") as digest_timing:
+                            plan_digest = digest(plan)
+                    plan_timing.update(construct_ms=construct_timing["duration_ms"],
+                        construct_thread_cpu_ms=construct_timing["thread_cpu_ms"],
+                        digest_ms=digest_timing["duration_ms"], digest_thread_cpu_ms=digest_timing["thread_cpu_ms"])
                     if plan.copies:
                         self.pins.retain(chunk)
                     entry.pending = plan
@@ -621,7 +639,11 @@ class Service:
                             self.pins.release(request)
                         self.observe("completion", entry, plan_digest=completion.plan_digest, end=plan.end,
                                      native_write=job is not None, plan_ms=plan_timing["duration_ms"],
-                                     plan_thread_cpu_ms=plan_timing["thread_cpu_ms"])
+                                     plan_thread_cpu_ms=plan_timing["thread_cpu_ms"],
+                                     plan_construct_ms=plan_timing["construct_ms"],
+                                     plan_construct_thread_cpu_ms=plan_timing["construct_thread_cpu_ms"],
+                                     plan_digest_ms=plan_timing["digest_ms"],
+                                     plan_digest_thread_cpu_ms=plan_timing["digest_thread_cpu_ms"])
                         response = await call("complete", completion=completion)
                         if response.get("error"):
                             raise ValueError(response["error"])
