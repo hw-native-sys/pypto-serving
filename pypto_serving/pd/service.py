@@ -446,6 +446,7 @@ class Service:
         sources = {g.name: g for g in geometry}
         component_group = {c.name: c.group for c in self.node.contract.components}
         occupied = set()
+        writable_sets = {}
         for copy in plan.copies:
             if ((copy.destination_rank, copy.component) not in expected
                     or not 0 <= copy.source_rank < source_topology.ranks):
@@ -460,13 +461,15 @@ class Service:
                     or copy.source_offset + copy.length > src.extent):
                 raise ValueError("copy outside compatible physical layout")
             group_name = component_group[copy.component]
-            writable = (entry.reservation.writable_block_ids_by_group[group_name]
-                        if group_name in entry.reservation.writable_block_ids_by_group
-                        else (entry.state_slots[group_name],))
+            if group_name not in writable_sets:
+                writable = (entry.reservation.writable_block_ids_by_group[group_name]
+                            if group_name in entry.reservation.writable_block_ids_by_group
+                            else (entry.state_slots[group_name],))
+                writable_sets[group_name] = frozenset(writable)
             for page in range(copy.destination_offset // g.page_bytes,
                               (copy.destination_offset + copy.length) // g.page_bytes):
                 key = copy.destination_rank, copy.component, page
-                if page % g.blocks not in writable or key in occupied:
+                if page % g.blocks not in writable_sets[group_name] or key in occupied:
                     raise ValueError("write aliases shared Prefix or another write")
                 occupied.add(key)
         required = set()
