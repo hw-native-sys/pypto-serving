@@ -14,9 +14,11 @@ import json
 import pytest
 
 from pypto_serving.model.deepseek.encoding import encode_messages
+from pypto_serving.model.qwen.encoding import Qwen3TokenizerAdapter
 from pypto_serving.model.tokenizer import (
     DeepSeekV4TokenizerAdapter,
     _load_fast_tokenizer_from_file,
+    load_tokenizer,
 )
 
 
@@ -59,6 +61,36 @@ def test_fast_tokenizer_load_registers_backend_special_tokens(tmp_path):
 
     assert tokenizer.kwargs["bos_token"] == "<bos>"
     assert tokenizer.kwargs["additional_special_tokens"] == ["<internal>"]
+
+
+def test_qwen3_checkpoint_selects_tool_parser(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text('{"model_type":"qwen3"}')
+    (tmp_path / "tokenizer.json").write_text("{}")
+    adapter = Qwen3TokenizerAdapter(tokenizer=object())
+    monkeypatch.setattr(Qwen3TokenizerAdapter, "from_tokenizer_file", lambda path: adapter)
+
+    assert load_tokenizer(tmp_path).output_parser_id == "qwen3"
+
+
+def test_qwen3_tool_history_passes_reasoning_to_checkpoint_template():
+    class TemplateTokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            assert messages[0]["reasoning_content"] == "Need data"
+            assert "reasoning" not in messages[0]
+            assert messages[0]["tool_calls"][0]["function"]["arguments"] == "{}"
+            assert kwargs["tools"][0]["function"]["name"] == "lookup"
+            return "rendered"
+
+    messages = [{
+        "role": "assistant", "content": None, "reasoning": "Need data",
+        "tool_calls": [{"function": {"name": "lookup", "arguments": "{}"}}],
+    }]
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+    adapter = Qwen3TokenizerAdapter(tokenizer=TemplateTokenizer())
+
+    assert adapter.apply_chat_template(messages, tools=tools) == "rendered"
+    assert messages[0]["reasoning"] == "Need data"
+    assert "reasoning_content" not in messages[0]
 
 
 def test_deepseek_v4_defaults_to_chat_mode():

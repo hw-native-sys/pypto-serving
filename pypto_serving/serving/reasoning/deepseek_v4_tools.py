@@ -16,19 +16,9 @@ import uuid
 from dataclasses import dataclass, field, replace
 from typing import Iterable, Sequence
 
-from .parser import (
-    DeepSeekV4ReasoningParser,
-    OutputParserSpec,
-    ParsedDelta,
-    ParsedToolCall,
-    ToolCallDelta,
-    _DROP_TERMINAL,
-    _END_TERMINAL,
-    _Segment,
-    _START_TERMINAL,
-    _TerminalSegment,
-    _TextSegment,
-)
+from .base import DROP_TERMINAL, END_TERMINAL, START_TERMINAL, Segment, TerminalSegment, TextSegment
+from .parser import DeepSeekV4ReasoningParser
+from .types import OutputParserSpec, ParsedDelta, ParsedToolCall, ToolCallDelta
 
 _DSML = "\uff5cDSML\uff5c"
 TOOL_START = f"<{_DSML}tool_calls>"
@@ -87,22 +77,22 @@ class DeepSeekV4ToolParser(DeepSeekV4ReasoningParser):
         self._calls: list[_Call] = []
         self._root_tail = ""
 
-    def _consume(self, segments: Sequence[_Segment]) -> ParsedDelta:
+    def _consume(self, segments: Sequence[Segment]) -> ParsedDelta:
         return self._consume_segments(self._split_text_roots(segments))
 
-    def _split_text_roots(self, segments: Iterable[_Segment]) -> Iterable[_Segment]:
+    def _split_text_roots(self, segments: Iterable[Segment]) -> Iterable[Segment]:
         for segment in segments:
             if self._root_pattern is None:
                 yield segment
                 continue
-            if isinstance(segment, _TextSegment) or segment.kind == "dsml_text":
+            if isinstance(segment, TextSegment) or segment.kind == "dsml_text":
                 text = self._root_tail + segment.text
                 self._root_tail = ""
                 offset = 0
                 for match in self._root_pattern.finditer(text):
                     if match.start() > offset:
-                        yield _TextSegment(text[offset:match.start()])
-                    yield _TerminalSegment(self._text_roots[match.group()], match.group())
+                        yield TextSegment(text[offset:match.start()])
+                    yield TerminalSegment(self._text_roots[match.group()], match.group())
                     offset = match.end()
                 keep = 0
                 for root in self._text_roots:
@@ -111,21 +101,21 @@ class DeepSeekV4ToolParser(DeepSeekV4ReasoningParser):
                             keep = size
                             break
                 if len(text) - keep > offset:
-                    yield _TextSegment(text[offset:len(text) - keep])
+                    yield TextSegment(text[offset:len(text) - keep])
                 self._root_tail = text[-keep:] if keep else ""
             else:
                 # Never join a textual tag across a token-ID control boundary.
                 if self._root_tail:
-                    yield _TextSegment(self._root_tail)
+                    yield TextSegment(self._root_tail)
                     self._root_tail = ""
                 yield segment
 
-    def _consume_segments(self, segments: Iterable[_Segment]) -> ParsedDelta:
+    def _consume_segments(self, segments: Iterable[Segment]) -> ParsedDelta:
         reasoning: list[str] = []
         content: list[str] = []
         deltas: list[ToolCallDelta] = []
         for segment in segments:
-            if isinstance(segment, _TextSegment):
+            if isinstance(segment, TextSegment):
                 if self._inside_tools:
                     self._consume_tool_text(segment.text, deltas)
                 elif self._state == "reasoning":
@@ -134,7 +124,7 @@ class DeepSeekV4ToolParser(DeepSeekV4ReasoningParser):
                 else:
                     content.append(segment.text)
                 continue
-            if segment.kind == _DROP_TERMINAL:
+            if segment.kind == DROP_TERMINAL:
                 continue
             if self._inside_tools and self._tool_state == "value":
                 # A think/root token inside a value is data, not a phase switch.
@@ -154,9 +144,9 @@ class DeepSeekV4ToolParser(DeepSeekV4ReasoningParser):
                 self._inside_tools = False
             elif self._inside_tools:
                 self._consume_tool_text(segment.text, deltas)
-            elif segment.kind == _START_TERMINAL:
+            elif segment.kind == START_TERMINAL:
                 self._state = "reasoning"
-            elif segment.kind == _END_TERMINAL:
+            elif segment.kind == END_TERMINAL:
                 self._state = "content"
         return ParsedDelta(
             reasoning="".join(reasoning), content="".join(content),
@@ -300,7 +290,7 @@ class DeepSeekV4ToolParser(DeepSeekV4ReasoningParser):
         if self._root_tail:
             pending = self._root_tail
             self._root_tail = ""
-            rest = self._consume_segments((_TextSegment(pending),))
+            rest = self._consume_segments((TextSegment(pending),))
             tail = ParsedDelta(
                 reasoning=tail.reasoning + rest.reasoning,
                 content=tail.content + rest.content,

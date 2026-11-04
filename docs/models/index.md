@@ -4,7 +4,7 @@ Choose the checkpoint and device topology before following a deployment command.
 
 | Path | Checkpoint | Devices and placement | Decode | HTTP tools |
 | --- | --- | --- | --- | --- |
-| [Qwen3-14B](qwen3-14b.md) | Hugging Face style checkpoint | Single device; TP for offline runs; DP replicas for HTTP serving | Standard generation | No registered tool parser |
+| [Qwen3-14B](qwen3-14b.md) | Hugging Face style checkpoint | Single device; TP for offline runs; DP replicas for HTTP serving | Standard generation | Function tools without structural constraints |
 | [DeepSeek V4 MTP](deepseek-v4/mtp.md) | Converted Flash W8A8 | 8 devices, overlapped DP8/EP8/TP1 | Autoregressive or MTP speculative | Function tools without structural constraints |
 | [DeepSeek V4 DSpark](deepseek-v4/dspark.md) | Converted Flash W8A8 | 8 devices, DP2/EP8/TP4; or 16 devices, DP4/EP16/TP4 | Greedy target-only K=0 or speculative K=7 | Function tools; [structural constraints](deepseek-v4/tool-constraints.md) on K=7 |
 
