@@ -157,6 +157,87 @@ def service():
     return result, p, d
 
 
+def test_decode_capacity_is_reserved_before_source_compute_and_counts_initialization():
+    from pypto_serving.pd.protocol import CapacityExhausted, Prefix
+
+    async def run():
+        s, p, d = service()
+        s.core.config = SimpleNamespace(max_num_running_reqs=1,
+                                       runtime_config=SimpleNamespace(max_seq_len=4096))
+        s.adapter = SimpleNamespace(validate=lambda _: None,
+            prefix_spec=lambda tokens, cache: Prefix(len(tokens), 32, {}))
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        async def worker(operation, value=None):
+            calls.append(operation)
+            entered.set()
+            await release.wait()
+            return {"bootstrap": 0}
+
+        s.worker = worker
+        continuation = Continuation(tuple(range(128)), {"max_new_tokens": 16}, None, None)
+        bindings = [Binding.create(p, d, {}) for _ in range(3)]
+        entries = [s.register_http(binding, {}) for binding in bindings]
+
+        async def begin(index):
+            return await s.control(p, (), "begin", dict(binding=msgspec.to_builtins(bindings[index]),
+                continuation=msgspec.to_builtins(continuation)))
+
+        first = asyncio.create_task(begin(0))
+        await entered.wait()
+        assert entries[0].reservation is not None and not entries[0].prepared.is_set()
+        with pytest.raises(CapacityExhausted):
+            await begin(1)
+        assert entries[1].prepared.is_set() and entries[1].transferred.is_set()
+        assert entries[1].reservation is None and calls == ["reserve_state"]
+        assert not s.gated and s.is_ready()
+        release.set()
+        await first
+        # Retired reservations release admission capacity; pending HTTP entries
+        # alone consume only the independent transaction limit.
+        s.cache.release_group_cache(bindings[0].request, confirmed_stopped=True)
+        s.cache.retire_group_cache_reservation(bindings[0].request)
+        s.finish(entries[0])
+        assert (await begin(2)).request == bindings[2].request
+        assert calls == ["reserve_state", "reserve_state"]
+
+    asyncio.run(run())
+
+
+def test_capacity_control_error_preserves_503_without_closing_session():
+    from pypto_serving.pd.integration import Server
+    from pypto_serving.pd.protocol import CapacityExhausted, receive, send
+    from pypto_serving.pd.session import Session
+
+    async def run():
+        async def peer(reader, writer):
+            try:
+                message = await receive(reader)
+                await send(writer, dict(id=message["id"], error="full", code="capacity_exhausted"))
+                message = await receive(reader)
+                await send(writer, dict(id=message["id"], result={"ok": True}))
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        server = await asyncio.start_server(peer, "127.0.0.1", 0)
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.sockets[0].getsockname()[1])
+        session = Session(reader, writer)
+        try:
+            with pytest.raises(CapacityExhausted) as error:
+                await session.call("begin", {})
+            response = await Server.capacity_exhausted(None, error.value)
+            assert response.status_code == 503 and b"capacity_exhausted" in response.body
+            assert await session.call("begin", {}) == {"ok": True}
+        finally:
+            await session.close()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+
+
 def test_status_reads_current_lease_without_changing_cache():
     s, p, d = service()
     binding = Binding.create(p, d, {})

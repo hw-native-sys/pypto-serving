@@ -30,7 +30,7 @@ from pypto_serving.serving.server.server import ChatCompletionRequest, Completio
 from pypto_serving.serving.server.serving_worker import spawn_worker
 from .adapter import select_adapter
 from .config import Config, log_context
-from .protocol import Binding, Continuation, Node, decode
+from .protocol import Binding, CapacityExhausted, Continuation, Node, decode
 from .service import ExecutionError, NodeUnavailable, Service
 from .worker import Progress, Services, WorkerSettings
 
@@ -73,6 +73,11 @@ class Server(ServingServer):
         super()._register_exception_handlers()
         self.app.add_exception_handler(NodeUnavailable, self.unavailable)
         self.app.add_exception_handler(ExecutionError, self.execution_error)
+        self.app.add_exception_handler(CapacityExhausted, self.capacity_exhausted)
+
+    @staticmethod
+    async def capacity_exhausted(request, exc):
+        return JSONResponse(dict(object="error", code="capacity_exhausted", message=str(exc)), status_code=503)
 
     @staticmethod
     async def unavailable(request, exc):

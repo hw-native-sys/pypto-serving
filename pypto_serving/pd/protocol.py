@@ -19,6 +19,10 @@ VERSION = 3
 MAX_FRAME = 16 * 1024 * 1024
 
 
+class CapacityExhausted(RuntimeError):
+    """The receiver cannot reserve another active handoff or Decode request."""
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(msgspec.to_builtins(value), sort_keys=True,
                                      separators=(",", ":"), allow_nan=False).encode()).hexdigest()

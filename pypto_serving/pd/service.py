@@ -22,7 +22,7 @@ from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.tools.observe import record, span
 from .planner import (Geometry, SourcePins, merge_ranges, page_indices, page_ranges, physical,
                       plan_chunk, rolling_bounds)
-from .protocol import (Binding, Completion, Continuation, Node, Placement, Plan, Topology,
+from .protocol import (Binding, CapacityExhausted, Completion, Continuation, Node, Placement, Plan, Topology,
                        decode, digest, receive, send)
 from .session import PeerPool, Session
 from .transfer import TransferError
@@ -261,6 +261,8 @@ class Service:
                     reply = dict(id=message["id"], result=value)
                 except Exception as exc:
                     reply = dict(id=message["id"], error=str(exc))
+                    if isinstance(exc, CapacityExhausted):
+                        reply["code"] = "capacity_exhausted"
                 async with write_lock:
                     await send(writer, reply)
             while True:
@@ -329,6 +331,9 @@ class Service:
             try:
                 if not self.is_ready():
                     raise NodeUnavailable("PD node is unavailable")
+                if (sum(r.reservation is not None for r in self.requests.values())
+                        >= self.core.config.max_num_running_reqs):
+                    raise CapacityExhausted("Decode active reservation capacity exhausted. Retry later.")
                 reservation = self.cache.reserve_group_cache(
                     request, request, len(continuation.tokens) + config.max_new_tokens,
                     prompt_token_count=len(continuation.tokens),
