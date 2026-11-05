@@ -332,7 +332,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         enable_expert_parallel=args.expert_parallel_size > 1,
         devices=devices,
         data_parallel_routing=args.data_parallel_routing,
-        placement_mode="overlapped" if model_family == "deepseek_v4" else "replica",
+        placement_mode="overlapped" if model_family in ("deepseek_v4", "glm53") else "replica",
     )
     _validate_model_topology(
         model_family,
@@ -548,7 +548,7 @@ def _build_runtime_config(
             kernel_contract.requires_homogeneous_prefill_decode
         )
 
-    return RuntimeConfig(
+    runtime = RuntimeConfig(
         page_size=args.block_size,
         max_batch_size=args.max_num_seqs,
         max_seq_len=args.max_model_len,
@@ -569,6 +569,17 @@ def _build_runtime_config(
         ring_task_window=args.ring_task_window,
         ring_heap=args.ring_heap,
     )
+    if model_family == "glm53":
+        from pypto_serving.model.glm53.kernel_api import build_glm53_runtime_config
+
+        return build_glm53_runtime_config(
+            runtime, tp_size=args.tensor_parallel_size,
+            max_num_running_reqs=args.max_num_seqs,
+            max_num_scheduled_tokens=args.max_num_batched_tokens,
+            enable_chunk_prefill=args.enable_chunked_prefill,
+            long_prefill_token_threshold=args.long_prefill_token_threshold,
+        )
+    return runtime
 
 
 def _resolve_model_variant(args: argparse.Namespace) -> str:
@@ -764,6 +775,8 @@ def _executor_cls_for_model_family(model_family: str, *, variant: str = "") -> s
     """Map model family metadata to the worker executor class id."""
     if model_family == "deepseek_v41":
         return "PyptoDeepSeekV41Executor"
+    if model_family == "glm53":
+        return "PyptoGlm53Executor"
     if model_family == "deepseek_v4":
         if variant == "dspark":
             return "PyptoDeepSeekV4DSparkExecutor"
@@ -801,6 +814,14 @@ def _validate_model_topology(
     variant: str = "",
 ) -> None:
     """Validate model-specific serving topology constraints."""
+    if model_family == "glm53":
+        from pypto_serving.model.glm53.kernel_api import validate_topology
+
+        validate_topology(
+            parallel_config.tensor_parallel_size, parallel_config.expert_parallel_size,
+            parallel_config.data_parallel_size, parallel_config.devices,
+        )
+        return
     if model_family != "deepseek_v4":
         return
     if variant == "dspark":

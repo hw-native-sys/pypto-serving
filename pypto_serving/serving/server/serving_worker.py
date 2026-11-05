@@ -264,6 +264,10 @@ class WorkerProcess:
             )
 
             return DeepSeekV4DSparkPyptoExecutor
+        if self.config.executor_cls == "PyptoGlm53Executor":
+            from pypto_serving.model.glm53.npu_executor import Glm53PyptoExecutor
+
+            return Glm53PyptoExecutor
         from pypto_serving.model.common.executor.executor import ModelExecutor
 
         return ModelExecutor
@@ -509,6 +513,10 @@ class WorkerProcess:
             if self._can_split_decode_output(cmd, prepared):
                 assert prepared is not None and prepared.batch is not None
                 try:
+                    if self.executor.prepared_decode_requires_token(prepared.prepared):
+                        self._wait_for_pending_decode_reclaims(
+                            [request.request_id for request in cmd.decode_requests]
+                        )
                     with profile_span(
                         "WorkerProcess.dispatch_decode",
                         cat="worker",
@@ -1484,11 +1492,12 @@ class WorkerProcess:
 
     @staticmethod
     def _min_tokens_mask_active(cached: NewRequestData, accepted_count: int) -> bool:
-        return cached.eos_token_id is not None and accepted_count < cached.min_tokens
+        has_eos = cached.eos_token_id is not None or bool(cached.eos_token_ids)
+        return has_eos and accepted_count < cached.min_tokens
 
     def _stop_token_mask(self, request_id: str) -> StopTokenMask | None:
         cached = self._req_cache[request_id]
-        if cached.min_tokens <= 0 or cached.eos_token_id is None:
+        if cached.min_tokens <= 0 or (cached.eos_token_id is None and not cached.eos_token_ids):
             return None
         lengths = getattr(self, "_accepted_output_lengths", {})
         if request_id not in lengths:
@@ -1496,7 +1505,9 @@ class WorkerProcess:
         if not self._min_tokens_mask_active(cached, lengths[request_id]):
             return None
         remaining = cached.min_tokens - lengths[request_id]
-        stop_ids = blocked_token_ids((cached.eos_token_id,), remaining)
+        primary = () if cached.eos_token_id is None else (cached.eos_token_id,)
+        all_eos = tuple(dict.fromkeys(primary + (cached.eos_token_ids or ())))
+        stop_ids = blocked_token_ids(all_eos, remaining)
         return StopTokenMask(stop_ids, remaining) if stop_ids else None
 
     def _sampling_params(self, request_id: str) -> SamplingParams:
@@ -1515,8 +1526,12 @@ class WorkerProcess:
         capabilities = getattr(self, "_sampling_capabilities", _DEFAULT_SAMPLING_CAPABILITIES)
         if capabilities.stop_mask_on_device(phase):
             return False
+        # Early preparation can precede FIFO registration; assume zero output until then.
+        lengths = getattr(self, "_accepted_output_lengths", {})
         return any(
-            self._stop_token_mask(item.request_id) is not None
+            self._min_tokens_mask_active(
+                self._req_cache[item.request_id], lengths.get(item.request_id, 0)
+            )
             for item in scheduled
         )
 
