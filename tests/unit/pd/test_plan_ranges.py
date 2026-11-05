@@ -32,7 +32,8 @@ ROW_BYTES = dict(ori=1024, hca_cmp=1024, csa_cmp=1024, idx_k=128, idx_scale=4,
 
 def plan_case(threshold=8192, *, length=8205, end=None, start=0, number=0,
               p_hit=0, d_hit=0, d_tp=1, layout="contiguous", seed=0, layers=2, partition=0,
-              pool_requests=1, request_index=0, destination_threshold=None, destination_state_tokens=None):
+              pool_requests=1, request_index=0, destination_threshold=None, destination_state_tokens=None,
+              source_state_tokens=None):
     """Actual page/window widths, without tensors or allocator-sized metadata pools."""
     end = length if end is None else end
     rng = random.Random(seed)
@@ -45,7 +46,8 @@ def plan_case(threshold=8192, *, length=8205, end=None, start=0, number=0,
     destination_threshold = threshold if destination_threshold is None else destination_threshold
     source, destination, groups, d_groups, a_blocks, b_blocks, writable = {}, {}, [], [], {}, {}, {}
     for name, page, ratio, _, window in GEOMETRY:
-        ring = math.ceil((window - 1 + threshold) / page) + 1 if window else math.ceil((length + 512) / page)
+        source_tokens = source_state_tokens if name.endswith("state") and source_state_tokens is not None else threshold
+        ring = math.ceil((window - 1 + source_tokens) / page) + 1 if window else math.ceil((length + 512) / page)
         groups.append(KVCacheGroupSpec(name, layer_ids[name], KVCacheSpec(page, page // ratio, ratio),
             ring, sliding_window=window))
         state_tokens = (destination_state_tokens if name.endswith("state") and destination_state_tokens is not None

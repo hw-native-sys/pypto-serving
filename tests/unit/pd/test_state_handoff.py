@@ -106,9 +106,11 @@ def test_terminal_state_copies_preserve_absolute_logical_content(destination_thr
 @pytest.mark.parametrize("layout", ["contiguous", "wrapped", "fragmented"])
 @pytest.mark.parametrize("length", [31, 32, 33, 127, 128, 129, 511, 512, 513,
                                    8192, 8205, 8319, 8320, 1048445])
-def test_compact_decode_state_rings_keep_logical_handoff(d_tp, layout, length):
+@pytest.mark.parametrize("source_state_tokens", [1024, 8192])
+def test_compact_decode_state_rings_keep_logical_handoff(d_tp, layout, length, source_state_tokens):
     case = plan_case(8192, destination_threshold=2048, destination_state_tokens=144,
-                     length=length, d_tp=d_tp, layout=layout, partition=16 // d_tp - 1)
+                     length=length, d_tp=d_tp, layout=layout, partition=16 // d_tp - 1,
+                     source_state_tokens=source_state_tokens)
     plan = plan_chunk(*case.args)
     case.service.validate_plan(case.entry, plan, case.geometry, case.p_hit, case.source.topology)
     assert_logical_contents(case, plan)
@@ -120,9 +122,11 @@ def test_compact_decode_state_rings_keep_logical_handoff(d_tp, layout, length):
 @pytest.mark.parametrize("d_tp", [1, 4])
 @pytest.mark.parametrize("p_hit,d_hit", [(0, 0), (4096, 0), (0, 4096), (4096, 4096),
                                        (8192, 4096), (4096, 8192), (8320, 8320)])
-def test_compact_decode_state_is_not_omitted_on_prefix_hits(d_tp, p_hit, d_hit):
+@pytest.mark.parametrize("source_state_tokens", [1024, 8192])
+def test_compact_decode_state_is_not_omitted_on_prefix_hits(d_tp, p_hit, d_hit, source_state_tokens):
     case = plan_case(8192, destination_threshold=2048, destination_state_tokens=144,
-                     length=8320, p_hit=p_hit, d_hit=d_hit, d_tp=d_tp, layout="wrapped")
+                     length=8320, p_hit=p_hit, d_hit=d_hit, d_tp=d_tp, layout="wrapped",
+                     source_state_tokens=source_state_tokens)
     plan = plan_chunk(*case.args)
     case.service.validate_plan(case.entry, plan, case.geometry, p_hit, case.source.topology)
     markers = assert_logical_contents(case, plan)

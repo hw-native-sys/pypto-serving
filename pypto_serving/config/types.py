@@ -137,6 +137,9 @@ class KVCacheGroupSpec:
     # Recurrent state is immutable only at an explicitly materialized Prefill
     # checkpoint, not at every position covered by the scheduled token count.
     is_checkpoint_state: bool = False
+    # Prefill reads entry history through a retained view while a compact ring
+    # is rebound for the current chunk's writes.
+    preserve_prefill_history: bool = False
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -151,6 +154,8 @@ class KVCacheGroupSpec:
             raise ValueError("KV cache max_requests_per_partition must be positive")
         if self.is_checkpoint_state and self.sliding_window is None:
             raise ValueError("Checkpoint state requires a rolling history window")
+        if self.preserve_prefill_history and not self.is_checkpoint_state:
+            raise ValueError("Preserved Prefill history requires checkpoint state")
         if self.prefill_tail_tokens is not None:
             if self.prefill_tail_tokens <= 0 or not self.is_eagle_group:
                 raise ValueError("KV cache prefill_tail_tokens requires a positive EAGLE tail extent")
@@ -342,6 +347,7 @@ class PrefillBatch:
     kv_allocations: list[KvAllocation] = field(default_factory=list)
     block_ids: list[list[int]] = field(default_factory=list)
     block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
+    read_block_ids_by_group: list[dict[str, dict[int, int]]] = field(default_factory=list)
     cache_partitions: list[int | None] = field(default_factory=list)
     # Opaque request-local generation constraints, interpreted only by capable runners.
     constraint_states: dict[str, object] = field(default_factory=dict)

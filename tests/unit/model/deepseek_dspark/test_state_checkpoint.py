@@ -176,12 +176,13 @@ def test_checkpoint_spanning_ragged_chunks_and_packed_offsets(name, length):
 @pytest.mark.parametrize("d_tp", [1, 4])
 @pytest.mark.parametrize("layout", ["wrapped", "fragmented"])
 @pytest.mark.parametrize("length", [1, 33, 129, 8192, 8205, 8319, 8320, 1048445])
-def test_actual_published_state_reaches_compact_decode_history(d_tp, layout, length):
+@pytest.mark.parametrize("source_state_tokens", [1024, 8192])
+def test_actual_published_state_reaches_compact_decode_history(d_tp, layout, length, source_state_tokens):
     from pypto_serving.pd.planner import plan_chunk
     from tests.unit.pd.test_plan_ranges import plan_case
 
     case = plan_case(8192, destination_threshold=2048, destination_state_tokens=144,
-                     length=length, d_tp=d_tp, layout=layout)
+                     length=length, d_tp=d_tp, layout=layout, source_state_tokens=source_state_tokens)
     plan = plan_chunk(*case.args)
     case.service.validate_plan(case.entry, plan, case.geometry, 0, case.source.topology)
     geometry = {g.name: g for g in case.geometry}

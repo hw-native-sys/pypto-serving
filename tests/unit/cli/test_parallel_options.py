@@ -81,13 +81,16 @@ def test_dspark_local_ring_budget_reaches_host_device_and_pool_without_changing_
     ordinary = {1024: (37, 145, 517, 517), 2048: (69, 273, 1029, 1029),
                 8192: (261, 1041, 4101, 4101)}[extent]
     expected = (ordinary[0], 35, 77, 77) if role == "decode" else ordinary
+    if role == "prefill":
+        expected = (ordinary[0], 145, 517, 517)
     assert {name: groups[name].max_blocks_per_seq for name in
         ("ori", "hca_state", "csa_state", "csa_inner_state")} == dict(zip(
         ("ori", "hca_state", "csa_state", "csa_inner_state"),
         expected))
     runner = DSparkModelRunner.__new__(DSparkModelRunner)
     layout = DSparkCacheLayout.for_ranks(16, tp_size=tp)
-    runner._compiled = SimpleNamespace(layout=layout, prefill=None if role == "decode" else object())
+    runner._compiled = SimpleNamespace(layout=layout, prefill=None if role == "decode" else object(),
+                                       decode=None if role == "prefill" else object())
     runner._cache_group_specs = runtime.kv_cache_groups
     inspected = []
     def memory(rank):
@@ -97,17 +100,18 @@ def test_dspark_local_ring_budget_reaches_host_device_and_pool_without_changing_
     counts = runner._compute_kv_cache_pages(runtime)
     assert inspected == list(range(16)) and layout.decode_seq == 8
     step = 8 if role == "decode" else extent
-    requests = min(counts[g.name] // (g.max_blocks_per_seq
-        + (step + g.spec.token_capacity - 1
-           + (g.spec.token_capacity - 1 if g.is_checkpoint_state else 0)) // g.spec.token_capacity
-        + g.sliding_window // g.spec.token_capacity) for g in groups.values() if g.sliding_window)
+    def resident_pages(g):
+        page = g.spec.token_capacity
+        if g.preserve_prefill_history:
+            return 2 * g.max_blocks_per_seq + 2 * ((g.sliding_window + 2 * page - 2) // page) + g.sliding_window // page
+        return (g.max_blocks_per_seq
+                + (step + page - 1 + (page - 1 if g.is_checkpoint_state else 0)) // page
+                + g.sliding_window // page)
+    requests = min(counts[g.name] // resident_pages(g) for g in groups.values() if g.sliding_window)
     assert requests > 0
     for g in groups.values():
         if g.sliding_window:
-            assert counts[g.name] == requests * (g.max_blocks_per_seq
-                + (step + g.spec.token_capacity - 1
-                   + (g.spec.token_capacity - 1 if g.is_checkpoint_state else 0)) // g.spec.token_capacity
-                + g.sliding_window // g.spec.token_capacity)
+            assert counts[g.name] == requests * resident_pages(g)
         assert runner._decode_state_table_depth(g.name) == g.max_blocks_per_seq
     assert cache_pool_bytes(runtime.kv_cache_groups, counts, filler_pages=64) <= int((80 << 30) * .9) - (16 << 30)
 

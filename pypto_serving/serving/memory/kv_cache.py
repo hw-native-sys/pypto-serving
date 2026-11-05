@@ -1058,6 +1058,34 @@ class KvCacheManager:
                                            valid_from, checkpoint_boundary)
         return cached_counts
 
+    def retain_group_prefill_history(
+        self, request_id: str, token_count: int,
+    ) -> tuple[dict[str, dict[int, int]], GroupBlockSnapshot | None]:
+        """Retain entry state before an entire Prefill chunk rebinds its ring."""
+        if token_count <= 0:
+            return {}, None
+        read_blocks = {}
+        pin_blocks = {name: [] for name in self._group_pools}
+        for name, pool in self._group_pools.items():
+            if not pool.spec.preserve_prefill_history:
+                continue
+            page = pool.spec.spec.token_capacity
+            owned = pool.request_blocks.get(request_id, ())
+            pages = {}
+            for logical in range(max(0, token_count - pool.spec.sliding_window) // page,
+                                 (token_count + page - 1) // page):
+                slot = logical % pool.spec.max_blocks_per_seq
+                block = owned[slot] if slot < len(owned) else None
+                if block is None:
+                    raise RuntimeError(f"Missing Prefill history for {name}:{logical}")
+                pages[logical] = pool.local_block_id(block)
+            read_blocks[name] = pages
+            pin_blocks[name] = list(dict.fromkeys(pages.values()))
+        if not read_blocks:
+            return {}, None
+        partition = self._group_request_partitions[request_id]
+        return read_blocks, self.retain_group_block_snapshot(pin_blocks, partition)
+
     def retain_group_block_snapshot(
         self,
         block_ids_by_group: dict[str, Sequence[int]],

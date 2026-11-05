@@ -1240,3 +1240,63 @@ def test_run_decode_accepts_and_redrafts(monkeypatch) -> None:
     runner._compiled.num_speculative_tokens = 0
     plain = runner.run_decode(SimpleNamespace(), decode)
     assert plain.num_draft_tokens is None
+
+
+@pytest.mark.parametrize("tp_size", [1, 4])
+def test_prefill_entry_read_views_survive_packing_and_use_independent_write_slots(tp_size):
+    runner = _runner(tp_size=tp_size)
+    runner._cache_group_num_blocks = {name: 1024 for name in DSPARK_CACHE_GROUP_NAMES}
+    starts = [129, 255, 383]
+    lengths = [31, 33, 35]
+    partitions = [1, 1, 3]
+    read_views = []
+    for index, start in enumerate(starts):
+        read_views.append({name: {q: 100 + index * 32 + k for k, q in enumerate(
+            range(max(0, start - history) // page, (start + page - 1) // page))}
+            for name, history, page in (("hca_state", 128, 8), ("csa_state", 8, 2),
+                                        ("csa_inner_state", 8, 2))})
+    blocks = _block_rows(3)
+    batch = PrefillBatch(request_ids=["first", "second", "third"],
+        token_ids=torch.arange(sum(lengths)), input_embeddings=torch.zeros(sum(lengths), 4),
+        seq_lens=[s + n for s, n in zip(starts, lengths)], prompt_lens=[s + n for s, n in zip(starts, lengths)],
+        chunk_lens=lengths, chunk_offsets=[0, 31, 64], chunk_starts=starts,
+        block_ids_by_group=blocks, read_block_ids_by_group=read_views, cache_partitions=partitions)
+    inputs = runner.prepare_prefill_inputs(SimpleNamespace(runtime=RuntimeConfig(max_seq_len=512)), batch)
+    for index, (start, length, group) in enumerate(zip(starts, lengths, partitions)):
+        row = index if index < 2 else 0
+        packed = 0 if index != 1 else lengths[0]
+        for name, table_name, mapping_name, page in (
+            ("hca_state", "hca_compress_state_block_table", "hca_state_slot_mapping_full", 8),
+            ("csa_state", "csa_compress_state_block_table", "csa_state_slot_mapping_full", 2),
+            ("csa_inner_state", "csa_inner_compress_state_block_table", "csa_inner_state_slot_mapping_full", 2)):
+            for rank in range(group * tp_size, (group + 1) * tp_size):
+                table = inputs.block_tables[table_name][rank, row]
+                for q, physical in read_views[index][name].items():
+                    assert int(table[q]) == physical
+                assert set(torch.nonzero(table >= 0).flatten().tolist()) == set(read_views[index][name])
+                for offset, position in enumerate(range(start, start + length)):
+                    expected = blocks[index][name][position // page % len(blocks[index][name])] * page + position % page
+                    assert int(inputs.slot_mappings[mapping_name][rank, packed + offset]) == expected
+
+
+@pytest.mark.parametrize("damage", ["missing-page", "missing-group", "negative", "out-of-range", "alias", "row-count"])
+def test_prefill_rejects_incomplete_or_invalid_entry_read_views(damage):
+    runner = _runner()
+    runner._cache_group_num_blocks = {name: 1024 for name in DSPARK_CACHE_GROUP_NAMES}
+    views = {name: {q: 100 + k for k, q in enumerate(range((129 - history) // page, (129 + page - 1) // page))}
+             for name, history, page in (("hca_state", 128, 8), ("csa_state", 8, 2), ("csa_inner_state", 8, 2))}
+    if damage == "missing-page":
+        views["hca_state"].pop(0)
+    elif damage == "missing-group":
+        views.pop("csa_state")
+    elif damage in ("negative", "out-of-range"):
+        views["hca_state"][0] = -1 if damage == "negative" else 1024
+    elif damage == "alias":
+        views["hca_state"][0] = views["hca_state"][1]
+    batch = PrefillBatch(request_ids=["request"], token_ids=torch.arange(31), input_embeddings=torch.zeros(31, 4),
+        seq_lens=[160], prompt_lens=[160], chunk_lens=[31], chunk_offsets=[0], chunk_starts=[129],
+        block_ids_by_group=_block_rows(1), read_block_ids_by_group=[views], cache_partitions=[0])
+    if damage == "row-count":
+        batch.read_block_ids_by_group.append(views)
+    with pytest.raises(ValueError, match="entry (history|read view)"):
+        runner.prepare_prefill_inputs(SimpleNamespace(runtime=RuntimeConfig(max_seq_len=512)), batch)

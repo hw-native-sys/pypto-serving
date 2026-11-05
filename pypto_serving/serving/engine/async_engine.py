@@ -856,10 +856,17 @@ class ReplicaEngineCore:
             cat="scheduler",
             args={"scheduled": len(scheduler_output.scheduled_requests)},
         ):
-            step_cmd = self._build_step_command(
-                scheduler_output, finished_ids, step_id=self._step_counter
-            )
-            self._input_queue.put(encode_command(step_cmd))
+            try:
+                step_cmd = self._build_step_command(
+                    scheduler_output, finished_ids, step_id=self._step_counter
+                )
+                encoded = encode_command(step_cmd)
+            except Exception:
+                # Nothing reached the worker: release pre-dispatch read pins.
+                for scheduled in scheduler_output.scheduled_requests:
+                    self.scheduler.discard_scheduled_request(scheduled)
+                raise
+            self._input_queue.put(encoded)
         reregistered_ids = {
             request.request_id for request in step_cmd.new_requests
         }
@@ -1037,6 +1044,7 @@ class ReplicaEngineCore:
                         for name, block_ids in sr.block_ids_by_group.items()
                     },
                     cache_partition=sr.cache_partition,
+                    read_block_ids_by_group=sr.read_block_ids_by_group,
                 ))
             else:
                 output_ids = req.output_token_ids
