@@ -117,6 +117,21 @@ def test_ignore_eos_and_min_tokens_combinations(ignore_eos, min_tokens):
     )
 
 
+def test_all_eos_ids_are_masked_before_min_tokens():
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker._req_cache = {"r": NewRequestData(
+        request_id="r", prompt_token_ids=[3], temperature=0.0,
+        top_p=1.0, top_k=None, min_tokens=2, eos_token_id=1,
+        eos_token_ids=(1, 2),
+    )}
+    worker._accepted_output_lengths = {"r": 0}
+    params = worker._sampling_params("r")
+    assert params.forbidden_token_ids == (1, 2)
+    assert Sampler().sample(torch.tensor([1.0, 10.0, 9.0]), params) == 0
+    worker._accept_output_tokens("r", 2)
+    assert worker._sampling_params("r").forbidden_token_ids == ()
+
+
 def test_dspark_stages_eos_mask_for_prefill_and_k7_decode():
     runner = DSparkModelRunner.__new__(DSparkModelRunner)
     masks = torch.full(
