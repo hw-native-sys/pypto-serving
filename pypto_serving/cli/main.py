@@ -219,7 +219,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Maximum tokens per request in one chunked-prefill scheduling step. "
             "DeepSeek V4 accepts 1024, 2048, 4096, or 8192; the final prompt "
-            "chunk may be smaller (default: 2048)."
+            "chunk may be smaller (default: 2048). Ignored by PD decode nodes."
         ),
     )
     parser.add_argument(
@@ -463,7 +463,8 @@ def _build_runtime_config(
             compress_ratios = None
         num_hidden_layers = int(config_data.get("num_hidden_layers", 43))
         max_prefill_tokens_per_request = min(DSPARK_PREFILL_MAX_TOKENS, args.max_num_batched_tokens)
-        if args.enable_chunked_prefill and args.long_prefill_token_threshold > 0:
+        if (args.pd_role != "decode" and args.enable_chunked_prefill
+                and args.long_prefill_token_threshold > 0):
             max_prefill_tokens_per_request = min(
                 max_prefill_tokens_per_request, args.long_prefill_token_threshold,
             )

@@ -36,9 +36,28 @@ def test_request_capacity_defaults_reach_scheduler_and_cache(tmp_path, role, spe
     assert config.runtime_config.max_batch_size == expected
 
 
-@pytest.mark.parametrize("role,budget,tp", [(None, 8192, 4), ("prefill", 8192, 4),
-    ("decode", 8192, 4), ("decode", 8192, 1), ("decode", 2048, 4), ("decode", 2048, 1)])
-def test_dspark_local_ring_budget_reaches_host_device_and_pool_without_changing_decode_width(role, budget, tp):
+@pytest.mark.parametrize("role,budget,tp,threshold,chunked,extent", [
+    (None, 8192, 4, 8192, True, 8192),
+    ("prefill", 8192, 4, 8192, True, 8192),
+    (None, 8192, 4, 2048, True, 2048),
+    ("prefill", 8192, 4, 2048, True, 2048),
+    (None, 8192, 4, 2048, False, 8192),
+    ("prefill", 8192, 4, 2048, False, 8192),
+    ("decode", 8192, 4, 8192, True, 8192),
+    ("decode", 8192, 1, 8192, True, 8192),
+    ("decode", 8192, 4, 128, True, 8192),
+    ("decode", 8192, 1, 128, True, 8192),
+    ("decode", 2048, 4, 8192, True, 2048),
+    ("decode", 2048, 1, 8192, True, 2048),
+    ("decode", 2048, 4, 1024, True, 2048),
+    ("decode", 2048, 1, 1024, True, 2048),
+    ("decode", 2048, 1, 128, False, 2048),
+    ("decode", 1024, 1, 128, True, 1024),
+    ("decode", 16384, 1, 2048, True, 8192),
+])
+def test_dspark_local_ring_budget_reaches_host_device_and_pool_without_changing_decode_width(
+    role, budget, tp, threshold, chunked, extent,
+):
     from types import SimpleNamespace
 
     from pypto_serving.model.deepseek_dspark.cache_capacity import cache_pool_bytes
@@ -46,19 +65,23 @@ def test_dspark_local_ring_budget_reaches_host_device_and_pool_without_changing_
 
     argv = ["--model", "model", "--max-model-len", "655360", "--max-num-seqs", "72",
         "--ep", "16", "--tp", str(tp), "--dp", str(16 // tp),
-        "--max-num-batched-tokens", str(budget), "--long-prefill-token-threshold", str(budget),
+        "--max-num-batched-tokens", str(budget), "--long-prefill-token-threshold", str(threshold),
         "--speculative-config", '{"method":"dspark","num_speculative_tokens":7}']
     if role:
         argv += ["--pd-role", role]
+    if not chunked:
+        argv += ["--no-enable-chunked-prefill"]
     runtime = cli._build_runtime_config(_parse_cli_args(argv), model_family="deepseek_v4",
         config_data={"num_hidden_layers": 43, "compress_ratios": [0, 0] + [4] * 21 + [128] * 20})
-    assert runtime.max_num_batched_tokens == runtime.max_prefill_tokens_per_request == budget
+    assert runtime.max_num_batched_tokens == budget
+    assert runtime.max_prefill_tokens_per_request == extent
     assert runtime.num_speculative_tokens == 7 and runtime.speculative_prefix_cache_replay_tokens == 128
     groups = {g.name: g for g in runtime.kv_cache_groups}
     assert {name: groups[name].max_blocks_per_seq for name in
         ("ori", "hca_state", "csa_state", "csa_inner_state")} == dict(zip(
         ("ori", "hca_state", "csa_state", "csa_inner_state"),
-        (261, 1041, 4101, 4101) if budget == 8192 else (69, 273, 1029, 1029)))
+        {1024: (37, 145, 517, 517), 2048: (69, 273, 1029, 1029),
+         8192: (261, 1041, 4101, 4101)}[extent]))
     runner = DSparkModelRunner.__new__(DSparkModelRunner)
     layout = DSparkCacheLayout.for_ranks(16, tp_size=tp)
     runner._compiled = SimpleNamespace(layout=layout, prefill=None if role == "decode" else object())
@@ -70,7 +93,7 @@ def test_dspark_local_ring_budget_reaches_host_device_and_pool_without_changing_
     runner._shared_l3_worker = lambda: SimpleNamespace(device_memory_info=memory)
     counts = runner._compute_kv_cache_pages(runtime)
     assert inspected == list(range(16)) and layout.decode_seq == 8
-    step = 8 if role == "decode" else budget
+    step = 8 if role == "decode" else extent
     requests = min(counts[g.name] // (g.max_blocks_per_seq
         + (step + g.spec.token_capacity - 1) // g.spec.token_capacity
         + g.sliding_window // g.spec.token_capacity) for g in groups.values() if g.sliding_window)
