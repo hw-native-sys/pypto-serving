@@ -474,6 +474,7 @@ def _build_runtime_config(
             max_seq_len=args.max_model_len,
             max_prefill_tokens=max_prefill_tokens_per_request,
             partitions=args.expert_parallel_size // args.tensor_parallel_size,
+            decode_only=args.pd_role == "decode",
         )
         if num_speculative_tokens:
             speculative_prefix_cache_replay_tokens = DSPARK_SLIDING_WINDOW

@@ -102,6 +102,34 @@ def test_terminal_state_copies_preserve_absolute_logical_content(destination_thr
     assert_logical_contents(case, plan)
 
 
+@pytest.mark.parametrize("d_tp", [1, 4])
+@pytest.mark.parametrize("layout", ["contiguous", "wrapped", "fragmented"])
+@pytest.mark.parametrize("length", [31, 32, 33, 127, 128, 129, 511, 512, 513,
+                                   8192, 8205, 8319, 8320, 1048445])
+def test_compact_decode_state_rings_keep_logical_handoff(d_tp, layout, length):
+    case = plan_case(8192, destination_threshold=2048, destination_state_tokens=144,
+                     length=length, d_tp=d_tp, layout=layout, partition=16 // d_tp - 1)
+    plan = plan_chunk(*case.args)
+    case.service.validate_plan(case.entry, plan, case.geometry, case.p_hit, case.source.topology)
+    assert_logical_contents(case, plan)
+    groups = {g.name: g for g in case.service.core.kv_cache_manager.group_specs}
+    assert groups["hca_state"].max_blocks_per_seq == 35
+    assert groups["csa_state"].max_blocks_per_seq == groups["csa_inner_state"].max_blocks_per_seq == 77
+
+
+@pytest.mark.parametrize("d_tp", [1, 4])
+@pytest.mark.parametrize("p_hit,d_hit", [(0, 0), (4096, 0), (0, 4096), (4096, 4096),
+                                       (8192, 4096), (4096, 8192), (8320, 8320)])
+def test_compact_decode_state_is_not_omitted_on_prefix_hits(d_tp, p_hit, d_hit):
+    case = plan_case(8192, destination_threshold=2048, destination_state_tokens=144,
+                     length=8320, p_hit=p_hit, d_hit=d_hit, d_tp=d_tp, layout="wrapped")
+    plan = plan_chunk(*case.args)
+    case.service.validate_plan(case.entry, plan, case.geometry, p_hit, case.source.topology)
+    markers = assert_logical_contents(case, plan)
+    assert {"hca_state", "csa_state", "csa_inner_state", "bootstrap_hidden"} <= {
+        name for _, name, _, _ in markers}
+
+
 @pytest.mark.parametrize("destination_threshold", [8192, 2048])
 @pytest.mark.parametrize("d_tp", [1, 4])
 @pytest.mark.parametrize("p_hit,d_hit", [(0, 0), (4096, 0), (0, 4096), (4096, 4096),

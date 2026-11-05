@@ -26,6 +26,11 @@ from .reservation import GroupCacheReservation, GroupedCacheReservations
 NONE_HASH = hashlib.sha256(b"pypto-serving-prefix-root/v1").digest()
 
 
+def aligned_prefix_cache_boundary(token_count: int, alignment: int, *, replay_tokens: int = 0) -> int:
+    """Return the common page boundary before the required local replay."""
+    return max(0, token_count - max(1, replay_tokens)) // alignment * alignment
+
+
 class KVCacheCapacityError(RuntimeError):
     """Raised when a cache allocation cannot fit in the physical pools."""
 
@@ -761,7 +766,7 @@ class KvCacheManager:
     def group_prefix_cache_boundary(self, token_count: int, *, replay_tokens: int = 0) -> int:
         """Align a complete prompt's reuse limit after its required local replay."""
         alignment = self.group_prefix_cache_alignment
-        return max(0, token_count - max(1, replay_tokens)) // alignment * alignment
+        return aligned_prefix_cache_boundary(token_count, alignment, replay_tokens=replay_tokens)
 
     @property
     def has_eagle_groups(self) -> bool:
@@ -1023,7 +1028,14 @@ class KvCacheManager:
                 safe_computed_tokens // pool.spec.spec.token_capacity,
                 len(hashes),
             )
+            if pool.spec.is_checkpoint_state:
+                if checkpoint_boundary is None:
+                    continue
+                completed = min(completed, checkpoint_boundary // pool.spec.spec.token_capacity)
             start = min(cached_counts.get(name, 0), completed)
+            if pool.spec.is_checkpoint_state:
+                start = max(start, max(0, checkpoint_boundary - pool.spec.sliding_window)
+                            // pool.spec.spec.token_capacity)
             if valid_from is not None:
                 token_capacity = pool.spec.spec.token_capacity
                 start = max(start, (valid_from.get(name, 0) + token_capacity - 1) // token_capacity)
@@ -1143,7 +1155,17 @@ class KvCacheManager:
                 safe_computed_tokens // pool.spec.spec.token_capacity,
                 len(hashes),
             )
+            if pool.spec.is_checkpoint_state:
+                if checkpoint_boundary is None:
+                    continue
+                completed = min(completed, checkpoint_boundary // pool.spec.spec.token_capacity)
             start = min(cached_counts.get(name, 0), completed)
+            if pool.spec.is_checkpoint_state:
+                start = max(start, max(0, checkpoint_boundary - pool.spec.sliding_window)
+                            // pool.spec.spec.token_capacity)
+                # A snapshot may already have wrapped beyond the checkpoint.
+                capacity = pool.spec.spec.token_capacity
+                start = max(start, (num_computed_tokens + capacity - 1) // capacity - len(block_ids))
             if valid_from is not None:
                 token_capacity = pool.spec.spec.token_capacity
                 start = max(start, (valid_from.get(name, 0) + token_capacity - 1) // token_capacity)
