@@ -22,7 +22,10 @@ import pytest
 from pypto_serving.pd import worker
 from pypto_serving.pd.transfer import TransferError
 from pypto_serving.pd.worker import Progress, ProgressServer, _receive_frame, _send_frame, _shutdown
-from tests.unit.test_pd_metadata import peer, plan, runtime as runtime
+from tests.unit import test_pd_metadata
+from tests.unit.test_pd_metadata import peer, plan
+
+runtime = test_pd_metadata.runtime
 
 
 @pytest.mark.parametrize("cancel", [False, True])

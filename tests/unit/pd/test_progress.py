@@ -26,8 +26,11 @@ from pypto_serving.pd.adapter import DeepSeekDSpark
 from pypto_serving.pd.config import Config, Endpoint
 from pypto_serving.pd.integration import Chunk
 from pypto_serving.pd.protocol import Completion, MAX_FRAME, Placement, digest
+from tests.unit import test_pd_metadata
 from tests.unit.pd.test_service import handoff
-from tests.unit.test_pd_metadata import finish, peer, plan, runtime as runtime
+from tests.unit.test_pd_metadata import finish, peer, plan
+
+runtime = test_pd_metadata.runtime
 
 
 @asynccontextmanager
