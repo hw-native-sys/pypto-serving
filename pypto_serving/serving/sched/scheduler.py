@@ -50,6 +50,7 @@ class SchedulerConfig:
     max_num_scheduled_tokens: int = 4096
     long_prefill_token_threshold: int = 2048
     max_prefill_tokens_per_request: int | None = None
+    prefill_chunk_alignment: int = 1
     prefill_chunk_size_choices: tuple[int, ...] = ()
     max_seq_len: int = 4096
     # Feature flags
@@ -96,6 +97,9 @@ class SchedulerConfig:
                 f"long_prefill_token_threshold must be one of ({choices}), "
                 f"got {self.long_prefill_token_threshold}"
             )
+        alignment = self.prefill_chunk_alignment
+        if not isinstance(alignment, int) or isinstance(alignment, bool) or alignment <= 0:
+            raise ValueError("prefill_chunk_alignment must be a positive non-boolean integer")
 
     def validate_cache_groups(self, groups: Sequence[KVCacheGroupSpec]) -> None:
         """Require enough replay to rebuild non-EAGLE rolling history."""
@@ -127,6 +131,7 @@ class Request:
     output_token_ids: list[int] = field(default_factory=list)
     stop_strings: tuple[str, ...] = ()
     eos_token_id: int | None = None
+    eos_token_ids: tuple[int, ...] = ()
     ignore_eos: bool = False
     temperature: float = 0.0
     top_p: float = 1.0
@@ -766,7 +771,13 @@ class Scheduler:
                 limit = min(limit, chunk_limit)
             if self._requires_single_prefill_dispatch() and needed > limit:
                 return 0
-        return max(0, min(needed, limit, self.config.max_seq_len - request.num_computed_tokens))
+        scheduled = max(0, min(needed, limit, self.config.max_seq_len - request.num_computed_tokens))
+        if request.is_prefill and request.num_computed_tokens + scheduled < request.num_prompt_tokens:
+            # KDA's BF16 recurrence boundaries must stay fixed across dispatches.
+            # Leave arbitrary final tails intact; defer unfinished work when the
+            # remaining shared budget cannot fit one recurrence block.
+            scheduled -= scheduled % self.config.prefill_chunk_alignment
+        return scheduled
 
     def _grouped_cache_phase(self) -> str | None:
         """Choose one homogeneous kernel phase and rotate fairly."""
@@ -1111,7 +1122,10 @@ class Scheduler:
         if not request.output_token_ids:
             return None
         last_token = request.output_token_ids[-1]
-        if not request.ignore_eos and request.eos_token_id is not None and last_token == request.eos_token_id:
+        if not request.ignore_eos and (
+            last_token in request.eos_token_ids
+            or (request.eos_token_id is not None and last_token == request.eos_token_id)
+        ):
             return RequestStatus.FINISHED_EOS
         if len(request.output_token_ids) >= request.max_new_tokens:
             return RequestStatus.FINISHED_LENGTH
