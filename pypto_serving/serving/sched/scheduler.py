@@ -174,6 +174,11 @@ class Request:
         return self.num_prompt_tokens + len(self.output_token_ids) + self.num_output_placeholders
 
     @property
+    def num_remaining_output_tokens(self) -> int:
+        """Generation capacity after committed tokens and in-flight reservations."""
+        return max(0, self.max_new_tokens - len(self.output_token_ids) - self.num_output_placeholders)
+
+    @property
     def num_new_tokens_needed(self) -> int:
         return self.num_tokens - self.num_computed_tokens
 
@@ -437,7 +442,9 @@ class Scheduler:
             # stale iteration snapshot.
             if request.status is RequestStatus.PREEMPTED:
                 continue
-            if request.terminal_prefill_in_flight:
+            if request.terminal_prefill_in_flight or (
+                not request.is_prefill and request.num_remaining_output_tokens == 0
+            ):
                 running_to_keep.append(request)
                 continue
             if request.prefill_complete:
@@ -791,6 +798,7 @@ class Scheduler:
             and not request.prefill_complete
             and not request.scheduling_held
             and not request.is_prefill
+            and request.num_remaining_output_tokens > 0
             and request.num_new_tokens_needed > 0
             for request in self.running
         )
