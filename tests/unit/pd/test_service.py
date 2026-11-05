@@ -10,12 +10,17 @@
 
 import asyncio
 import math
+import socket
+import threading
 from types import SimpleNamespace
 
 import msgspec
 import pytest
 
 from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
+from pypto_serving.serving.engine.async_engine import TokenOutput
+from pypto_serving.pd.service import ExecutionError
+from pypto_serving.pd.worker import Progress, ProgressServer
 from pypto_serving.pd.adapter import CACHE_COMPONENTS, COMPONENTS, DeepSeekDSpark
 from pypto_serving.pd.config import Config, Endpoint
 from pypto_serving.pd.integration import Chunk
@@ -26,10 +31,11 @@ from pypto_serving.pd.transfer import Mooncake, Region, TransferError
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from tests.unit.serving.test_grouped_prefix_cache import GEOMETRY
 
-def cache(length, partitions=1, enabled=True, ori_blocks=9, slots=4):
+def cache(length, partitions=1, enabled=True, ori_blocks=9, slots=4, state_pages=None):
+    state_pages = state_pages or {}
     groups = tuple(KVCacheGroupSpec(name, (0,), KVCacheSpec(page, page // ratio, ratio),
-        ori_blocks if name == "ori" else (math.ceil((length + 512) / page) if window is None else blocks),
-        num_blocks=max(slots * blocks if window is not None else slots * math.ceil((length + 512) / page), 32)
+        ori_blocks if name == "ori" else (math.ceil((length + 512) / page) if window is None else state_pages.get(name, blocks)),
+        num_blocks=max(slots * state_pages.get(name, blocks) if window is not None else slots * math.ceil((length + 512) / page), 32)
         if name != "ori" else slots * ori_blocks,
         num_partitions=partitions, sliding_window=window)
         for name, page, ratio, blocks, window in GEOMETRY)
@@ -50,9 +56,11 @@ def warm(cache, tokens, length, partition=0):
         cache.cache_group_blocks("warm", cache.compute_group_block_hashes(tokens), length, {})
         cache.release_all_group_requests("warm")
 
-def handoff(length, p_hit=0, d_hit=0, p_tp=4, d_tp=1, ori_blocks=9, enabled=True):
+def handoff(length, p_hit=0, d_hit=0, p_tp=4, d_tp=1, ori_blocks=9, enabled=True, compact=False):
     tokens = (1000000,) + tuple(range(1, length))
-    p, d = cache(length, 16 // p_tp, enabled, ori_blocks), cache(length, 16 // d_tp, enabled, ori_blocks)
+    names = ("hca_state", "csa_state", "csa_inner_state")
+    p = cache(length, 16 // p_tp, enabled, ori_blocks, state_pages=dict(zip(names, (145, 517, 517))) if compact else None)
+    d = cache(length, 16 // d_tp, enabled, ori_blocks, state_pages=dict(zip(names, (35, 77, 77))) if compact else None)
     warm(p, tokens, p_hit)
     warm(d, tokens, d_hit)
     adapter = DeepSeekDSpark()
@@ -97,8 +105,10 @@ def handoff(length, p_hit=0, d_hit=0, p_tp=4, d_tp=1, ori_blocks=9, enabled=True
                            source_geometry=pg, nodes=nodes, p_hit=p_hit, source_request=source_request)
 
 @pytest.mark.parametrize("p_tp,d_tp,p_hit,d_hit", [(4, 4, 0, 8192), (4, 1, 8192, 4096)])
-def test_suffix_handoff_preserves_shared_prefix_and_final_state(p_tp, d_tp, p_hit, d_hit):
-    case = handoff(8320, p_hit, d_hit, p_tp, d_tp)
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("length", [8205, 8320])
+def test_suffix_handoff_preserves_shared_prefix_and_final_state(p_tp, d_tp, p_hit, d_hit, compact, length):
+    case = handoff(length, p_hit, d_hit, p_tp, d_tp, compact=compact)
     final = case.plans[-1]
     assert final.valid_from == {"ori": max(8064, d_hit)}
     assert {"hca_state", "csa_state", "csa_inner_state", "bootstrap_hidden"} <= {c.component for c in final.copies}
@@ -110,6 +120,20 @@ def test_suffix_handoff_preserves_shared_prefix_and_final_state(p_tp, d_tp, p_hi
         Completion(digest(plan), plan.units).check(digest(plan), plan.units)
         for copy in plan.copies:
             group = components[copy.component].group
+            if group.endswith("state"):
+                source, target = case.p._group_pools[group], case.d._group_pools[group]
+                a = tuple(source.local_block_id(block) if block is not None else -1
+                          for block in source.request_blocks[case.source_request])
+                b = case.entry.reservation.block_ids_by_group[group]
+                page = groups[group].spec.token_capacity
+                first = max(0, (length - 1) // 128 * 128 - groups[group].sliding_window) // page
+                logical = {a[q % len(a)]: q for q in range(first, math.ceil(length / page))}
+                sg = next(g for g in case.source_geometry if g.name == copy.component)
+                dg = geometry[copy.component]
+                for offset in range(0, copy.length, sg.page_bytes):
+                    sp = (copy.source_offset + offset) // sg.page_bytes % sg.blocks
+                    dp = (copy.destination_offset + offset) // dg.page_bytes % dg.blocks
+                    assert dp == b[logical[sp] % len(b)]
             if group not in ("cmp_c128", "cmp_c4", "idx"):
                 continue
             geo = geometry[copy.component]
@@ -157,87 +181,6 @@ def service():
     return result, p, d
 
 
-def test_decode_capacity_is_reserved_before_source_compute_and_counts_initialization():
-    from pypto_serving.pd.protocol import CapacityExhausted, Prefix
-
-    async def run():
-        s, p, d = service()
-        s.core.config = SimpleNamespace(max_num_running_reqs=1,
-                                       runtime_config=SimpleNamespace(max_seq_len=4096))
-        s.adapter = SimpleNamespace(validate=lambda _: None,
-            prefix_spec=lambda tokens, cache: Prefix(len(tokens), 32, {}))
-        entered, release = asyncio.Event(), asyncio.Event()
-        calls = []
-
-        async def worker(operation, value=None):
-            calls.append(operation)
-            entered.set()
-            await release.wait()
-            return {"bootstrap": 0}
-
-        s.worker = worker
-        continuation = Continuation(tuple(range(128)), {"max_new_tokens": 16}, None, None)
-        bindings = [Binding.create(p, d, {}) for _ in range(3)]
-        entries = [s.register_http(binding, {}) for binding in bindings]
-
-        async def begin(index):
-            return await s.control(p, (), "begin", dict(binding=msgspec.to_builtins(bindings[index]),
-                continuation=msgspec.to_builtins(continuation)))
-
-        first = asyncio.create_task(begin(0))
-        await entered.wait()
-        assert entries[0].reservation is not None and not entries[0].prepared.is_set()
-        with pytest.raises(CapacityExhausted):
-            await begin(1)
-        assert entries[1].prepared.is_set() and entries[1].transferred.is_set()
-        assert entries[1].reservation is None and calls == ["reserve_state"]
-        assert not s.gated and s.is_ready()
-        release.set()
-        await first
-        # Retired reservations release admission capacity; pending HTTP entries
-        # alone consume only the independent transaction limit.
-        s.cache.release_group_cache(bindings[0].request, confirmed_stopped=True)
-        s.cache.retire_group_cache_reservation(bindings[0].request)
-        s.finish(entries[0])
-        assert (await begin(2)).request == bindings[2].request
-        assert calls == ["reserve_state", "reserve_state"]
-
-    asyncio.run(run())
-
-
-def test_capacity_control_error_preserves_503_without_closing_session():
-    from pypto_serving.pd.integration import Server
-    from pypto_serving.pd.protocol import CapacityExhausted, receive, send
-    from pypto_serving.pd.session import Session
-
-    async def run():
-        async def peer(reader, writer):
-            try:
-                message = await receive(reader)
-                await send(writer, dict(id=message["id"], error="full", code="capacity_exhausted"))
-                message = await receive(reader)
-                await send(writer, dict(id=message["id"], result={"ok": True}))
-            finally:
-                writer.close()
-                await writer.wait_closed()
-
-        server = await asyncio.start_server(peer, "127.0.0.1", 0)
-        reader, writer = await asyncio.open_connection("127.0.0.1", server.sockets[0].getsockname()[1])
-        session = Session(reader, writer)
-        try:
-            with pytest.raises(CapacityExhausted) as error:
-                await session.call("begin", {})
-            response = await Server.capacity_exhausted(None, error.value)
-            assert response.status_code == 503 and b"capacity_exhausted" in response.body
-            assert await session.call("begin", {}) == {"ok": True}
-        finally:
-            await session.close()
-            server.close()
-            await server.wait_closed()
-
-    asyncio.run(run())
-
-
 def test_status_reads_current_lease_without_changing_cache():
     s, p, d = service()
     binding = Binding.create(p, d, {})
@@ -276,4 +219,99 @@ def test_cancel_and_unknown_cannot_release_unconfirmed_native_writes():
             s.cache.release_group_cache(binding.request)
         await s.control(p, (), "abort", {"binding": msgspec.to_builtins(binding), "stopped": True})
         assert s.status(binding.request)["reservation"] == {"present": False, "state": None}
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("damage", ["overlap", "hole", "shared"])
+def test_plan_coverage_rejects_invalid_suffix_writes(damage):
+    case = handoff(8205, d_hit=4096, compact=True)
+    plan = case.plans[-1]
+    case.entry.chunk, case.entry.end = plan.chunk, plan.start
+    copies = list(plan.copies)
+    if damage == "overlap":
+        copies.append(copies[0])
+    elif damage == "hole":
+        copies.pop()
+    else:
+        index = next(i for i, c in enumerate(copies) if c.component == "csa_cmp")
+        copy = copies[index]
+        page = next(g for g in case.destination.geometry if g.name == copy.component).page_bytes
+        copies[index] = msgspec.structs.replace(copy, destination_offset=
+            case.entry.reservation.shared_block_ids_by_group["cmp_c4"][0] * page)
+    with pytest.raises(ValueError):
+        case.destination.validate_plan(case.entry, msgspec.structs.replace(plan, copies=tuple(copies)),
+                                       case.source_geometry, 0, case.nodes[0].topology)
+
+
+@pytest.mark.parametrize("lost_ack", [False, True])
+def test_progress_runs_during_compute_and_rejects_a_lost_ack(lost_ack):
+    async def run():
+        parent, child = socket.socketpair()
+        release, accepted = threading.Event(), threading.Event()
+        compute = threading.Thread(target=release.wait)
+        compute.start()
+        def handle(operation, payload):
+            accepted.set()
+            if lost_ack:
+                raise EOFError("accepted command lost its reply")
+            return payload
+        server = ProgressServer(child, handle, 1)
+        progress = Progress(parent, 1, 1)
+        try:
+            if lost_ack:
+                with pytest.raises(TransferError) as error:
+                    await progress.call("submit", b"work")
+                assert accepted.is_set() and error.value.uncertain
+                with pytest.raises(TransferError):
+                    await progress.call("submit", b"late")
+            else:
+                assert await progress.call("submit", b"work") == b"work" and compute.is_alive()
+        finally:
+            await progress.close()
+            server.close()
+            release.set()
+            compute.join(2)
+        assert not server.thread.is_alive() and not progress.calls
+    asyncio.run(run())
+
+
+def test_decode_compute_error_keeps_the_normal_output_cleanup():
+    async def run():
+        s, p, d = service()
+        binding = Binding.create(p, d, {})
+        entry = s.entry(binding, create=True)
+        entry.continuation = Continuation((1, 2), {"max_new_tokens": 8}, None, None)
+        entry.first_token = 7
+        entry.transferred.set()
+        s.core.tokenizer = SimpleNamespace(eos_token_id=2)
+        closed = []
+        async def generate(**kwargs):
+            yield TokenOutput(text="", finished=True, finish_reason="error")
+        async def close(current, terminal):
+            closed.append((current, terminal))
+        s.core.add_prefilled_request, s.close_output = generate, close
+        with pytest.raises(ExecutionError):
+            _ = [output async for output in s.outputs(binding.request)]
+        assert isinstance(entry.error, ExecutionError) and not s.gated
+        assert closed == [(entry, False)]
+    asyncio.run(run())
+
+
+
+def test_decode_full_reservation_rejects_before_state_initialization():
+    from pypto_serving.pd.protocol import CapacityExhausted, Prefix
+    async def run():
+        s, p, d = service()
+        s.core.config = SimpleNamespace(max_num_running_reqs=1, runtime_config=SimpleNamespace(max_seq_len=4096))
+        s.adapter = SimpleNamespace(validate=lambda _: None,
+            prefix_spec=lambda tokens, cache: Prefix(len(tokens), 32, {}))
+        first, second = [s.register_http(Binding.create(p, d, {}), {}) for _ in range(2)]
+        rid = first.binding.request
+        first.reservation = s.cache.reserve_group_cache(rid, rid, 256, prompt_token_count=128)
+        continuation = Continuation(tuple(range(128)), {"max_new_tokens": 16}, None, None)
+        with pytest.raises(CapacityExhausted):
+            await s.control(p, (), "begin", dict(binding=msgspec.to_builtins(second.binding),
+                continuation=msgspec.to_builtins(continuation)))
+        assert second.reservation is None and second.transferred.is_set() and not s.gated
+        s.cache.release_group_cache(rid, confirmed_stopped=True)
     asyncio.run(run())

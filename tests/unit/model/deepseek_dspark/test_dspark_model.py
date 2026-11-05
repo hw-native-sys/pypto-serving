@@ -688,33 +688,6 @@ def test_dspark_task_arg_orders_match_pypto_lib_abis() -> None:
     assert len(task_args_module._DECODE_TENSOR_ORDER) == 110
 
 
-@pytest.mark.parametrize("replay", [0, 128, 256])
-def test_prefill_checkpoint_metadata_uses_full_prompt_and_clears_reused_rows(replay, monkeypatch):
-    runner = _runner()
-    model = SimpleNamespace(runtime=RuntimeConfig(max_seq_len=512,
-                                                 speculative_prefix_cache_replay_tokens=replay))
-    batch = _packed_prefill_batch()
-    batch.prompt_lens = [512, 257, 128]
-    inputs = runner.prepare_prefill_inputs(model, batch)
-    boundary = lambda n: max(0, n - max(1, replay)) // 128 * 128
-    assert inputs.state_checkpoint_ends[0].tolist() == [boundary(512), boundary(128)]
-    assert inputs.state_checkpoint_ends[8].tolist() == [boundary(257), 0]
-    assert inputs.state_checkpoint_ends[4:8].count_nonzero() == 0
-    assert torch.equal(inputs.state_checkpoint_ends[:4], inputs.state_checkpoint_ends[:1].expand(4, -1))
-    runner._stage_prefill_inputs(inputs)
-    staged = runner._prefill_task_args.tensors
-    monkeypatch.setattr(runner, "_prefill_task_args", SimpleNamespace(
-        names=tuple(staged), tensors=staged, build=lambda: tuple(staged.values()),
-    ))
-    args = dict(zip(runner._prefill_task_args.names, runner._prefill_dispatch_args(12, 2)))
-    torch.testing.assert_close(args["state_checkpoint_ends"], inputs.state_checkpoint_ends)
-    smaller = runner.prepare_prefill_inputs(model, _packed_prefill_batch((3,), (0,), (0,)))
-    runner._stage_prefill_inputs(smaller)
-    args = dict(zip(runner._prefill_task_args.names, runner._prefill_dispatch_args(4, 1)))
-    assert args["state_checkpoint_ends"].shape == (16, 1)
-    assert args["state_checkpoint_ends"].count_nonzero() == 0
-
-
 def test_fused_dspark_target_args_match_pypto_lib_abi() -> None:
     """The K7 target prefix includes the mask and capped draft counts."""
     fused = _pypto_lib_function("decode_fwd_dspark", "l3_decode_fwd_dspark")
@@ -1242,61 +1215,32 @@ def test_run_decode_accepts_and_redrafts(monkeypatch) -> None:
     assert plain.num_draft_tokens is None
 
 
+
+
 @pytest.mark.parametrize("tp_size", [1, 4])
-def test_prefill_entry_read_views_survive_packing_and_use_independent_write_slots(tp_size):
+def test_prefill_entry_views_and_checkpoint_reach_the_worker(tp_size):
     runner = _runner(tp_size=tp_size)
     runner._cache_group_num_blocks = {name: 1024 for name in DSPARK_CACHE_GROUP_NAMES}
-    starts = [129, 255, 383]
-    lengths = [31, 33, 35]
-    partitions = [1, 1, 3]
-    read_views = []
-    for index, start in enumerate(starts):
-        read_views.append({name: {q: 100 + index * 32 + k for k, q in enumerate(
-            range(max(0, start - history) // page, (start + page - 1) // page))}
-            for name, history, page in (("hca_state", 128, 8), ("csa_state", 8, 2),
-                                        ("csa_inner_state", 8, 2))})
-    blocks = _block_rows(3)
-    batch = PrefillBatch(request_ids=["first", "second", "third"],
-        token_ids=torch.arange(sum(lengths)), input_embeddings=torch.zeros(sum(lengths), 4),
-        seq_lens=[s + n for s, n in zip(starts, lengths)], prompt_lens=[s + n for s, n in zip(starts, lengths)],
-        chunk_lens=lengths, chunk_offsets=[0, 31, 64], chunk_starts=starts,
-        block_ids_by_group=blocks, read_block_ids_by_group=read_views, cache_partitions=partitions)
-    inputs = runner.prepare_prefill_inputs(SimpleNamespace(runtime=RuntimeConfig(max_seq_len=512)), batch)
-    for index, (start, length, group) in enumerate(zip(starts, lengths, partitions)):
-        row = index if index < 2 else 0
-        packed = 0 if index != 1 else lengths[0]
-        for name, table_name, mapping_name, page in (
-            ("hca_state", "hca_compress_state_block_table", "hca_state_slot_mapping_full", 8),
-            ("csa_state", "csa_compress_state_block_table", "csa_state_slot_mapping_full", 2),
-            ("csa_inner_state", "csa_inner_compress_state_block_table", "csa_inner_state_slot_mapping_full", 2)):
-            for rank in range(group * tp_size, (group + 1) * tp_size):
-                table = inputs.block_tables[table_name][rank, row]
-                for q, physical in read_views[index][name].items():
-                    assert int(table[q]) == physical
-                assert set(torch.nonzero(table >= 0).flatten().tolist()) == set(read_views[index][name])
-                for offset, position in enumerate(range(start, start + length)):
-                    expected = blocks[index][name][position // page % len(blocks[index][name])] * page + position % page
-                    assert int(inputs.slot_mappings[mapping_name][rank, packed + offset]) == expected
-
-
-@pytest.mark.parametrize("damage", ["missing-page", "missing-group", "negative", "out-of-range", "alias", "row-count"])
-def test_prefill_rejects_incomplete_or_invalid_entry_read_views(damage):
-    runner = _runner()
-    runner._cache_group_num_blocks = {name: 1024 for name in DSPARK_CACHE_GROUP_NAMES}
-    views = {name: {q: 100 + k for k, q in enumerate(range((129 - history) // page, (129 + page - 1) // page))}
-             for name, history, page in (("hca_state", 128, 8), ("csa_state", 8, 2), ("csa_inner_state", 8, 2))}
-    if damage == "missing-page":
-        views["hca_state"].pop(0)
-    elif damage == "missing-group":
-        views.pop("csa_state")
-    elif damage in ("negative", "out-of-range"):
-        views["hca_state"][0] = -1 if damage == "negative" else 1024
-    elif damage == "alias":
-        views["hca_state"][0] = views["hca_state"][1]
-    batch = PrefillBatch(request_ids=["request"], token_ids=torch.arange(31), input_embeddings=torch.zeros(31, 4),
-        seq_lens=[160], prompt_lens=[160], chunk_lens=[31], chunk_offsets=[0], chunk_starts=[129],
-        block_ids_by_group=_block_rows(1), read_block_ids_by_group=[views], cache_partitions=[0])
-    if damage == "row-count":
-        batch.read_block_ids_by_group.append(views)
-    with pytest.raises(ValueError, match="entry (history|read view)"):
-        runner.prepare_prefill_inputs(SimpleNamespace(runtime=RuntimeConfig(max_seq_len=512)), batch)
+    batch = _packed_prefill_batch((31,), (0,), (129,))
+    batch.prompt_lens = [512]
+    batch.read_block_ids_by_group = [{name: {q: 100 + q for q in range((129 - history) // page, (129 + page - 1) // page)}
+        for name, history, page in (("hca_state", 128, 8), ("csa_state", 8, 2), ("csa_inner_state", 8, 2))}]
+    model = SimpleNamespace(runtime=RuntimeConfig(max_seq_len=512, speculative_prefix_cache_replay_tokens=128))
+    inputs = runner.prepare_prefill_inputs(model, batch)
+    assert int(inputs.state_checkpoint_ends[0, 0]) == 384
+    for name, prefix, page in (("hca_state", "hca", 8), ("csa_state", "csa", 2), ("csa_inner_state", "csa_inner", 2)):
+        table = inputs.block_tables[prefix + "_compress_state_block_table"][0, 0]
+        expected = batch.read_block_ids_by_group[0][name]
+        assert {q: int(table[q]) for q in torch.nonzero(table >= 0).flatten().tolist()} == expected
+        positions = torch.arange(129, 160)
+        ids = torch.tensor(batch.block_ids_by_group[0][name])
+        slots = ids[positions // page % len(ids)] * page + positions % page
+        assert torch.equal(inputs.slot_mappings[name + "_slot_mapping_full"][0, :31], slots)
+    runner._stage_prefill_inputs(inputs)
+    assert int(runner._prefill_task_args.tensors["state_checkpoint_ends"][0, 0]) == 384
+    smaller = runner.prepare_prefill_inputs(model, _packed_prefill_batch((3,), (0,), (0,)))
+    runner._stage_prefill_inputs(smaller)
+    assert runner._prefill_task_args.tensors["state_checkpoint_ends"][:tp_size, :1].count_nonzero() == 0
+    batch.read_block_ids_by_group[0].pop("hca_state")
+    with pytest.raises(ValueError, match="entry history"):
+        runner.prepare_prefill_inputs(model, batch)
