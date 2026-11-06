@@ -132,25 +132,25 @@ def test_prepacked_bank_rejects_fp32_compressor_format(tmp_path, monkeypatch):
 
 
 def _write_tiny_v2_sidecar(tmp_path, monkeypatch, *, include_legacy_lut, corrupt_lut=None,
-                           gate_dtype=torch.bfloat16):
+                           gate_dtype=torch.bfloat16, world=1):
     from safetensors.torch import save_file
 
     # Tiny source-axis slices exercise file compatibility without model-sized allocations.
-    layout = weight_loader.DecodeWeightLayout(1, 1, 1, 1, world=1)
+    layout = weight_loader.DecodeWeightLayout(1, 1, 1, 1, world=world)
     (tmp_path / "config.json").write_text("{}", encoding="utf-8")
     (tmp_path / "source.bin").write_bytes(b"checkpoint")
     (tmp_path / "model.safetensors.index.json").write_text(
         '{"weight_map": {"weight": "source.bin"}}', encoding="utf-8",
     )
     fields = {
-        name: torch.arange(4, dtype=torch.float32).reshape(
-            (1, 2, 2) if name in weight_loader._SINGLE else (1, 1, 2, 2),
+        name: torch.arange(4 * world, dtype=torch.float32).reshape(
+            (world, 2, 2) if name in weight_loader._SINGLE else (1, world, 2, 2),
         ).clone()
         for name in weight_loader._ALL
     }
     fields["gate_weight"] = fields["gate_weight"].to(gate_dtype)
     if include_legacy_lut:
-        lut = weight_loader._legacy_mxfp4_pair_lut().unsqueeze(0)
+        lut = weight_loader._legacy_mxfp4_pair_lut().unsqueeze(0).repeat(world, 1, 1)
         if corrupt_lut == "shape":
             lut = lut[:, :, :-1].contiguous()
         elif corrupt_lut == "dtype":
@@ -166,6 +166,38 @@ def _write_tiny_v2_sidecar(tmp_path, monkeypatch, *, include_legacy_lut, corrupt
     monkeypatch.setenv("PYPTO_V41_PREPACKED_WEIGHTS", str(sidecar))
     monkeypatch.setattr(weight_loader, "_sample_file_page_cache_residency", lambda *args: 0.0)
     return layout, fields
+
+
+@pytest.mark.parametrize("world", [4, 8])
+def test_prepacked_bank_selects_default_sidecar_for_world(tmp_path, monkeypatch, world):
+    layout, fields = _write_tiny_v2_sidecar(
+        tmp_path, monkeypatch, include_legacy_lut=False, world=world,
+    )
+    sidecar = tmp_path / f"pypto-deepseek-v41-decode-r{world}.safetensors"
+    (tmp_path / "weights.safetensors").rename(sidecar)
+    other_world = 8 if world == 4 else 4
+    (tmp_path / f"pypto-deepseek-v41-decode-r{other_world}.safetensors").write_bytes(b"wrong rank count")
+    monkeypatch.delenv("PYPTO_V41_PREPACKED_WEIGHTS")
+    bank = weight_loader.load_prepacked_bank(tmp_path, layout, tuple(weight_loader._ALL))
+    assert bank.prepacked
+    for name, tensor in bank.tensors.items():
+        assert torch.equal(tensor, fields[name])
+
+
+@pytest.mark.parametrize("override", ["environment", "explicit"])
+def test_prepacked_bank_path_override_takes_priority(tmp_path, monkeypatch, override):
+    layout, fields = _write_tiny_v2_sidecar(
+        tmp_path, monkeypatch, include_legacy_lut=False, world=4,
+    )
+    (tmp_path / "pypto-deepseek-v41-decode-r4.safetensors").write_bytes(b"not the requested file")
+    path = None
+    if override == "explicit":
+        path = tmp_path / "weights.safetensors"
+        monkeypatch.setenv("PYPTO_V41_PREPACKED_WEIGHTS", str(tmp_path / "missing.safetensors"))
+    bank = weight_loader.load_prepacked_bank(tmp_path, layout, tuple(weight_loader._ALL), path=path)
+    assert bank.prepacked
+    for name, tensor in bank.tensors.items():
+        assert torch.equal(tensor, fields[name])
 
 
 @pytest.mark.parametrize("include_legacy_lut", [False, True])
