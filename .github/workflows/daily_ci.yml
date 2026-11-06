@@ -46,6 +46,7 @@ jobs:
         with:
           checkout-path: perf-checkout
           needs-device: 'true'
+          runtime-platform: a2a3
           toolchain: bundle
           build-namespace: pypto-serving-daily
           pip-cache-name: pip-pypto-serving-daily
