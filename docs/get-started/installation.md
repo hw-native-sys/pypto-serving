@@ -11,9 +11,11 @@ Checkpoint format and device requirements depend on the model. See the [Qwen3-14
 ## Select the Runtime Build Target
 
 When installing PyPTO's `runtime/` submodule (simpler), select the NPU platform
-that serving will use. For A2/A3, after activating the matching CANN environment:
+that serving will use. For A2/A3, after activating the matching CANN environment,
+install the build prerequisites before using `--no-build-isolation`:
 
 ```bash
+python -m pip install 'scikit-build-core>=0.10' 'nanobind>=2,<3' 'cmake>=3.20' ninja
 python -m pip install --no-build-isolation /path/to/pypto/runtime \
   --config-settings=build.targets=build_package_a2a3
 ```
