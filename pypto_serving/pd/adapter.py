@@ -169,6 +169,11 @@ class DSparkExtension:
 
     def worker_ready(self):
         self.transfer.worker_ready()
+        # The base is otherwise lazy and can race with HIXL's first peer link.
+        # DistributedWorker exposes it only through its native Worker today;
+        # keep this SDK ABI dependency inside the model's PD adapter.
+        with span(logger, "pd.compute_communication.initialize"):
+            self.worker()._w._ensure_comm_base()
 
     def wrap_capture(self, capture):
         if self.runner.speculative:

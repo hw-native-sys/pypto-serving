@@ -263,6 +263,50 @@ def test_packed_prefill_executor_limits_follow_runtime(monkeypatch, max_batch_si
     assert executor.max_prefill_tokens_per_partition == 8192
 
 
+@pytest.mark.parametrize("pd,failure", [(False, None), (True, None), (True, "owner"), (True, "compute")])
+def test_pd_communication_initializes_after_owners_before_worker_is_returned(monkeypatch, pd, failure):
+    from pypto_serving.pd.adapter import DSparkExtension
+
+    events = []
+    def owner_ready():
+        events.append("owners-ready")
+        if failure == "owner":
+            raise RuntimeError("owner failed")
+    def compute_ready():
+        events.append("compute-init")
+        if failure == "compute":
+            raise RuntimeError("compute failed")
+        events.append("compute-ready")
+    class FakeWorker:
+        def __init__(self, compiled, **kwargs):
+            events.append("worker-created")
+            if pd:
+                self._w = SimpleNamespace(_ensure_comm_base=compute_ready)
+    monkeypatch.setattr("pypto.runtime.DistributedWorker", FakeWorker)
+    runner = DSparkModelRunner.__new__(DSparkModelRunner)
+    runner._l3_worker = None
+    runner._l3_run_config = None
+    runner._compiled = SimpleNamespace(l3_callables=lambda: [SimpleNamespace(compiled=object())])
+    runner._inherited_host_weights = lambda: ()
+    runner.runtime_extension = None
+    if pd:
+        extension = DSparkExtension.__new__(DSparkExtension)
+        extension.worker = runner._shared_l3_worker
+        extension.transfer = SimpleNamespace(worker_ready=owner_ready, worker_options=lambda: {})
+        runner.runtime_extension = extension
+    if failure:
+        with pytest.raises(RuntimeError, match=failure + " failed"):
+            runner._shared_l3_worker()
+        assert events == (["worker-created", "owners-ready"] if failure == "owner" else
+                          ["worker-created", "owners-ready", "compute-init"])
+    else:
+        worker = runner._shared_l3_worker()
+        events.append("worker-returned")
+        assert runner._shared_l3_worker() is worker  # No per-request initialization.
+        assert events == (["worker-created", "owners-ready", "compute-init", "compute-ready",
+                           "worker-returned"] if pd else ["worker-created", "worker-returned"])
+
+
 @pytest.mark.parametrize("length", [1, 127, 128, 129, 512, 8064, 8192, 8193, 655359])
 @pytest.mark.parametrize("tp_size", [1, 4])
 def test_pd_bootstrap_reuses_normal_seed_with_local_generations(monkeypatch, length, tp_size):
