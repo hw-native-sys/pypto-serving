@@ -367,6 +367,7 @@ def _build_runtime_config(
     supports_chunked_prefill_with_speculation = True
     speculative_prefix_cache_replay_tokens = 0
     requires_homogeneous_prefill_decode = False
+    preserve_prefill_chunks = False
     if model_family == "deepseek_v4" and _resolve_model_variant(args) == "dspark":
         from pypto_serving.model.deepseek_dspark.npu_runner import (
             DSPARK_PREFILL_MAX_TOKENS,
@@ -394,6 +395,20 @@ def _build_runtime_config(
         )
         if num_speculative_tokens:
             speculative_prefix_cache_replay_tokens = DSPARK_SLIDING_WINDOW
+    elif model_family == "qwen3_8_27b":
+        from pypto_serving.model.qwen3_8_27b.cache import build_qwen38_cache_group_specs
+        from pypto_serving.model.qwen3_8_27b.npu_executor import load_qwen38_serving_contract
+
+        kernel_contract = load_qwen38_serving_contract()
+        kv_cache_groups = build_qwen38_cache_group_specs(args.max_model_len)
+        max_prefill_tokens_per_request = min(
+            args.max_num_batched_tokens,
+            args.long_prefill_token_threshold or args.max_num_batched_tokens,
+            args.max_model_len,
+        )
+        kernel_contract.validate_prefill_tokens(max_prefill_tokens_per_request)
+        requires_homogeneous_prefill_decode = kernel_contract.requires_homogeneous_prefill_decode
+        preserve_prefill_chunks = kernel_contract.preserve_prefill_chunks
     elif model_family == "deepseek_v4":
         from pypto_serving.model.deepseek.npu_executor import (
             load_deepseek_v4_serving_contract,
@@ -436,6 +451,7 @@ def _build_runtime_config(
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_prefill_tokens_per_request=max_prefill_tokens_per_request,
         prefill_chunk_size_choices=prefill_chunk_size_choices,
+        preserve_prefill_chunks=preserve_prefill_chunks,
         supports_chunked_prefill_with_speculation=supports_chunked_prefill_with_speculation,
         speculative_prefix_cache_replay_tokens=speculative_prefix_cache_replay_tokens,
         requires_homogeneous_prefill_decode=requires_homogeneous_prefill_decode,
@@ -641,6 +657,8 @@ def _executor_cls_for_model_family(model_family: str, *, variant: str = "") -> s
         if variant == "dspark":
             return "PyptoDeepSeekV4DSparkExecutor"
         return "PyptoDeepSeekV4Executor"
+    if model_family == "qwen3_8_27b":
+        return "PyptoQwen38Executor"
     return "PyptoQwen14BExecutor"
 
 
@@ -674,6 +692,25 @@ def _validate_model_topology(
     variant: str = "",
 ) -> None:
     """Validate model-specific serving topology constraints."""
+    if model_family == "qwen3_8_27b":
+        from pypto_serving.model.qwen3_8_27b.npu_executor import load_qwen38_serving_contract
+
+        kernel_contract = load_qwen38_serving_contract()
+        if args.block_size != kernel_contract.kv_page_tokens:
+            raise ValueError(f"Qwen3.8 kernels require --block-size {kernel_contract.kv_page_tokens}")
+        prefill_tokens = min(
+            args.max_num_batched_tokens,
+            args.long_prefill_token_threshold or args.max_num_batched_tokens,
+            args.max_model_len,
+        )
+        kernel_contract.validate_prefill_tokens(prefill_tokens)
+        if args.max_num_seqs > kernel_contract.max_decode_batch_size:
+            raise ValueError(
+                f"Qwen3.8 decode supports at most --max-num-seqs {kernel_contract.max_decode_batch_size}"
+            )
+        if parallel_config.tensor_parallel_size != 1 or parallel_config.expert_parallel_size != 1:
+            raise ValueError("Qwen3.8 kernels currently require --tp 1 and --ep 1")
+        return
     if model_family != "deepseek_v4":
         return
     if variant == "dspark":

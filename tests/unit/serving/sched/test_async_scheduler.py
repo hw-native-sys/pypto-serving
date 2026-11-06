@@ -165,9 +165,213 @@ def _scheduled_phase(output):
     return "prefill" if phases.pop() else "decode"
 
 
+@pytest.mark.parametrize("preserve", [False, True])
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_short_tail_keeps_next_owners_full_prefill_chunk_intact(preserve, async_mode):
+    scheduler = _grouped_scheduler(
+        async_scheduling=async_mode, preserve_prefill_chunks=preserve,
+        max_num_scheduled_tokens=2048, max_prefill_tokens_per_request=2048,
+        long_prefill_token_threshold=2048, max_seq_len=4096,
+        block_size=128, max_blocks_per_seq=32, num_blocks=128,
+    )
+    for name, length in (("first", 2049), ("second", 2051)):
+        scheduler.add_request(Request(name, list(range(length)), max_new_tokens=1))
+    waves = []
+    for _ in range(8):
+        output = scheduler.schedule()
+        if output.is_empty:
+            break
+        waves.append([(s.request.request_id, s.num_computed_tokens, s.num_new_tokens)
+                      for s in output.scheduled_requests])
+        scheduler.advance_after_schedule(output)
+        tokens = {s.request.request_id: [100] for s in output.scheduled_requests
+                  if s.num_computed_tokens + s.num_new_tokens >= s.request.num_prompt_tokens}
+        scheduler.update_from_output(output, tokens)
+    assert not scheduler.has_work()
+    if preserve:
+        assert waves == [[("first", 0, 2048)], [("first", 2048, 1)],
+                         [("second", 0, 2048)], [("second", 2048, 3)]]
+    else:
+        assert waves == [[("first", 0, 2048)], [("first", 2048, 1), ("second", 0, 2047)],
+                         [("second", 2047, 4)]]
+
+
+def test_prefill_chunk_preservation_allows_short_spans_and_running_owner_progress():
+    scheduler = _prefill_scheduler(preserve_prefill_chunks=True,
+                                   max_num_scheduled_tokens=8, max_prefill_tokens_per_request=8)
+    long = Request("long", list(range(24)), max_new_tokens=1,
+                   num_computed_tokens=8, status=RequestStatus.RUNNING)
+    short = Request("short", [1, 2, 3], max_new_tokens=1, status=RequestStatus.RUNNING)
+    assert scheduler._limit_scheduled_tokens(long, 7) == 0
+    assert scheduler._limit_scheduled_tokens(long, 8) == 8
+    assert scheduler._limit_scheduled_tokens(short, 7) == 3
+    # A configured chunk ceiling larger than the step budget must not starve.
+    scheduler.config.max_prefill_tokens_per_request = 16
+    assert scheduler._limit_scheduled_tokens(long, 8) == 8
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("max_new_tokens", [1, 4])
+def test_older_prefill_reply_preserves_terminal_chunks_output_reservation(grouped, max_new_tokens):
+    factory = _grouped_scheduler if grouped else _prefill_scheduler
+    scheduler = factory(async_scheduling=True, max_num_scheduled_tokens=2,
+                        max_prefill_tokens_per_request=2)
+    request = Request("chunked", [1, 2, 3, 4, 5, 6], max_new_tokens=max_new_tokens)
+    scheduler.add_request(request)
+    pending = []
+    for _ in range(3):
+        output = scheduler.schedule()
+        assert len(output.scheduled_requests) == 1
+        scheduler.advance_after_schedule(output)
+        pending.append(output)
+    assert request.num_computed_tokens == 6
+    assert request.num_output_placeholders == 1
+
+    for output in pending[:-1]:
+        assert scheduler.update_from_output(output, {}) == []
+        assert request.num_output_placeholders == 1
+        assert request.num_computed_tokens == 6
+        assert request.output_token_ids == []
+    if max_new_tokens == 1:
+        assert scheduler.schedule().is_empty
+    scheduler.update_from_output(pending[-1], {request.request_id: [100]})
+    assert request.num_output_placeholders == 0
+    assert request.output_token_ids == [100]
+    assert request.num_computed_tokens == 6
+    assert request.status is (RequestStatus.FINISHED_LENGTH if max_new_tokens == 1
+                              else RequestStatus.RUNNING)
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("prompt_len,max_new_tokens", [(1, 1), (5, 1), (5, 2), (5, 8)])
+def test_pipeline_schedules_only_the_requested_outputs(async_mode, prompt_len, max_new_tokens):
+    scheduler = _prefill_scheduler(
+        async_scheduling=async_mode, max_num_scheduled_tokens=2,
+        long_prefill_token_threshold=2,
+    )
+    request = Request("bounded", list(range(prompt_len)), max_new_tokens=max_new_tokens)
+    scheduler.add_request(request)
+    pending = []
+    depth = 2 if async_mode else 1
+    sampled_tokens = []
+    scheduled_steps = 0
+    for _ in range(64):
+        dispatched = False
+        if len(pending) < depth and scheduler.has_work():
+            output = scheduler.schedule()
+            if not output.is_empty:
+                scheduled_steps += 1
+                scheduler.advance_after_schedule(output)
+                pending.append(output)
+                dispatched = True
+        if pending and (len(pending) >= depth or not dispatched):
+            output = pending.pop(0)
+            item = output.scheduled_requests[0]
+            tokens = {}
+            if not item.is_prefill or item.num_computed_tokens + item.num_new_tokens >= prompt_len:
+                token = 100 + len(sampled_tokens)
+                sampled_tokens.append(token)
+                tokens[request.request_id] = token
+            scheduler.update_from_output(output, tokens)
+        if not pending and not scheduler.has_work():
+            break
+    else:
+        pytest.fail("Pipeline did not drain after reaching the output limit")
+
+    assert sampled_tokens == request.output_token_ids == list(range(100, 100 + max_new_tokens))
+    assert scheduled_steps == (prompt_len + 1) // 2 + max_new_tokens - 1
+    assert request.status is RequestStatus.FINISHED_LENGTH
+    assert request.num_output_placeholders == 0
+
+
+def test_pending_length_limit_keeps_other_decode_requests_pipelined():
+    scheduler = _prefill_scheduler(async_scheduling=True)
+    short = _running_decode_request("short")
+    short.max_new_tokens = 2
+    long = _running_decode_request("long")
+    scheduler.running = [short, long]
+    scheduler.requests = {r.request_id: r for r in scheduler.running}
+
+    first = scheduler.schedule()
+    scheduler.advance_after_schedule(first)
+    second = scheduler.schedule()
+    assert [s.request.request_id for s in second.scheduled_requests] == ["long"]
+    scheduler.advance_after_schedule(second)
+    scheduler.update_from_output(first, {"short": 100, "long": 100})
+    scheduler.update_from_output(second, {"long": 101})
+
+    assert short.status is RequestStatus.FINISHED_LENGTH
+    assert short.output_token_ids == [99, 100]
+    assert long.output_token_ids == [99, 100, 101]
+    assert long.num_output_placeholders == 0
+
+
+def test_pending_length_limit_does_not_select_an_empty_decode_phase():
+    scheduler = _grouped_scheduler(async_scheduling=True)
+    short = Request("short", [1, 2], max_new_tokens=1)
+    scheduler.add_request(short)
+    terminal = scheduler.schedule()
+    scheduler.advance_after_schedule(terminal)
+    scheduler.add_request(Request("waiting", [3, 4], max_new_tokens=1))
+
+    next_output = scheduler.schedule()
+    assert _scheduled_phase(next_output) == "prefill"
+    assert [s.request.request_id for s in next_output.scheduled_requests] == ["waiting"]
+    scheduler.update_from_output(terminal, {"short": 100})
+    assert short.status is RequestStatus.FINISHED_LENGTH
+
+
+def test_speculative_shortfall_reopens_a_pending_length_limit():
+    scheduler = _mtp_scheduler(async_mode=True)
+    request = _mtp_request()
+    request.max_new_tokens = 3
+    scheduler.running = [request]
+    scheduler.requests = {request.request_id: request}
+
+    first = scheduler.schedule()
+    scheduler.advance_after_schedule(first)
+    assert scheduler.schedule().is_empty
+    scheduler.update_from_output(first, {request.request_id: [100]})
+
+    second = scheduler.schedule()
+    assert not second.is_empty
+    scheduler.advance_after_schedule(second)
+    assert scheduler.schedule().is_empty
+    scheduler.update_from_output(second, {request.request_id: [101, 102]})
+    assert request.output_token_ids == [99, 100, 101]
+    assert request.num_output_placeholders == 0
+    assert request.status is RequestStatus.FINISHED_LENGTH
+
+
+@pytest.mark.parametrize("termination", ["eos", "abort"])
+def test_pending_length_limit_allows_termination_and_cache_release(termination):
+    scheduler = _prefill_scheduler(async_scheduling=True)
+    request = Request("bounded", [1, 2], max_new_tokens=2, eos_token_id=100)
+    scheduler.add_request(request)
+    free_before = scheduler.kv_cache_manager.num_free_blocks
+    prefill = scheduler.schedule()
+    scheduler.advance_after_schedule(prefill)
+    decode = scheduler.schedule()
+    scheduler.advance_after_schedule(decode)
+    assert scheduler.schedule().is_empty
+
+    if termination == "abort":
+        scheduler.abort_request(request.request_id)
+    scheduler.update_from_output(prefill, {request.request_id: 100})
+    assert scheduler.update_from_output(decode, {request.request_id: 101}) == []
+    assert request.status is (
+        RequestStatus.FINISHED_ABORTED if termination == "abort" else RequestStatus.FINISHED_EOS
+    )
+    assert request.output_token_ids == ([] if termination == "abort" else [100])
+    assert scheduler.kv_cache_manager.num_free_blocks == free_before
+    assert not scheduler.has_work()
+
+
 @pytest.mark.parametrize("async_scheduling", [False, True])
-def test_grouped_cache_round_robins_prefill_and_decode_steps(async_scheduling):
-    scheduler = _grouped_scheduler(async_scheduling=async_scheduling)
+@pytest.mark.parametrize("preserve_prefill_chunks", [False, True])
+def test_grouped_cache_round_robins_prefill_and_decode_steps(async_scheduling, preserve_prefill_chunks):
+    scheduler = _grouped_scheduler(async_scheduling=async_scheduling,
+                                   preserve_prefill_chunks=preserve_prefill_chunks)
     prefill = Request(
         request_id="prefill",
         prompt_token_ids=list(range(6)),
@@ -220,6 +424,41 @@ def test_grouped_cache_can_mix_phases_without_a_homogeneous_kernel_contract():
     output = scheduler.schedule()
 
     assert {item.is_prefill for item in output.scheduled_requests} == {False, True}
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_qwen38_preserves_full_prefill_budget_beside_decode(async_mode):
+    from pypto_serving.serving.engine.async_engine import EngineConfig
+
+    runtime = EngineConfig(executor_cls="PyptoQwen38Executor").resolve_runtime_config()
+    scheduler = _grouped_scheduler(
+        block_size=128, max_blocks_per_seq=32, max_num_running_reqs=2,
+        max_num_scheduled_tokens=2048, long_prefill_token_threshold=2048,
+        max_prefill_tokens_per_request=2048, max_seq_len=4096,
+        requires_homogeneous_prefill_decode=runtime.requires_homogeneous_prefill_decode,
+        async_scheduling=async_mode,
+    )
+    prefill = Request(
+        request_id="prefill", prompt_token_ids=[1] * 2048, max_new_tokens=8,
+        status=RequestStatus.RUNNING,
+    )
+    decode = _running_decode_request(req_id="decode")
+    scheduler.running = [decode, prefill]
+    scheduler.requests = {request.request_id: request for request in scheduler.running}
+
+    first = scheduler.schedule()
+    assert [(item.is_prefill, item.num_new_tokens) for item in first.scheduled_requests] == [(False, 1)]
+    if async_mode:
+        scheduler.advance_after_schedule(first)
+    scheduler.update_from_output(first, {"decode": [200]})
+    second = scheduler.schedule()
+    assert [(item.is_prefill, item.num_new_tokens) for item in second.scheduled_requests] == [(True, 2048)]
+    if async_mode:
+        scheduler.advance_after_schedule(second)
+    scheduler.update_from_output(second, {"prefill": [201]})
+    third = scheduler.schedule()
+    assert all(not item.is_prefill for item in third.scheduled_requests)
+    assert {item.request.request_id for item in third.scheduled_requests} == {"decode", "prefill"}
 
 
 def test_grouped_cache_terminal_barrier_allows_waiting_prefill():

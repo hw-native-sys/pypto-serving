@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -24,7 +25,12 @@ from pypto_serving.config.types import (
     RuntimeModel,
 )
 
-from .model_family import is_deepseek_v4_config, read_model_config
+from .model_family import (
+    is_deepseek_v4_config,
+    is_qwen38_config,
+    qwen38_text_config,
+    read_model_config,
+)
 from .tokenizer import TokenizerAdapter, load_tokenizer
 
 
@@ -383,6 +389,141 @@ class DeepSeekV4W8A8DirectoryLoader(SafetensorsDirectoryLoader):
         )
 
 
+class Qwen38W8A8DirectoryLoader(SafetensorsDirectoryLoader):
+    """Lazy metadata loader for the Eco-Tech Qwen3.8-27B W8A8 checkpoint."""
+
+    format_names = ("qwen3_8_w8a8", "qwen3.8-w8a8")
+    index_filename = "quant_model_weights.safetensors.index.json"
+
+    def _recognises(self, model_path: Path) -> bool:
+        return (model_path / self.index_filename).is_file() and is_qwen38_config(
+            read_model_config(model_path)
+        )
+
+    def load(self, request: ModelLoadRequest) -> LoadedModel:
+        model_path = Path(request.model_dir)
+        config_data = read_model_config(model_path)
+        if not is_qwen38_config(config_data):
+            raise ValueError(f"{model_path} is not a Qwen3.8-27B checkpoint")
+        index_path = model_path / self.index_filename
+        if not index_path.is_file():
+            raise FileNotFoundError(f"Missing {self.index_filename} in {model_path}")
+
+        from pypto_serving.model.qwen3_8_27b.weight_spec import (
+            QWEN38_GLOBAL_RULES,
+            qwen38_layer_weight_names,
+        )
+
+        text = qwen38_text_config(config_data)
+        expected = {
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "num_hidden_layers": 64,
+            "vocab_size": 248320,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "linear_num_value_heads": 48,
+            "linear_num_key_heads": 16,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "full_attention_interval": 4,
+        }
+        mismatch = [
+            f"{name}={text.get(name)!r} (expected {value})"
+            for name, value in expected.items() if text.get(name) != value
+        ]
+        if mismatch:
+            raise ValueError("Unsupported Qwen3.8 text configuration: " + ", ".join(mismatch))
+
+        fixed_options = {
+            "rms_norm_eps": 1e-6,
+            "partial_rotary_factor": 0.25,
+            "attention_bias": False,
+            "hidden_act": "silu",
+            "tie_word_embeddings": False,
+        }
+        for name, value in fixed_options.items():
+            if text.get(name, value) != value:
+                raise ValueError(f"Unsupported Qwen3.8 {name}: {text[name]!r}; expected {value!r}")
+        layer_types = ["full_attention" if (layer + 1) % 4 == 0 else "linear_attention" for layer in range(64)]
+        if text.get("layer_types", layer_types) != layer_types:
+            raise ValueError("Qwen3.8 layer_types must repeat three linear-attention layers and one full-attention layer")
+        rope = text.get("rope_parameters") or text.get("rope_scaling") or {}
+        if not isinstance(rope, dict) or rope.get("rope_type", rope.get("type", "default")) != "default":
+            raise ValueError("Qwen3.8 supports only default text RoPE")
+        if rope.get("partial_rotary_factor", 0.25) != 0.25:
+            raise ValueError("Qwen3.8 RoPE partial_rotary_factor must be 0.25")
+        rope_theta = float(rope.get("rope_theta", text.get("rope_theta", 10_000_000.0)))
+        if not math.isfinite(rope_theta) or rope_theta <= 0:
+            raise ValueError("Qwen3.8 rope_theta must be finite and positive")
+
+        index_data = json.loads(index_path.read_text())
+        weight_map = index_data.get("weight_map")
+        if not isinstance(weight_map, dict):
+            raise ValueError(f"{index_path} has no weight_map object")
+        required = {rule.source for rule in QWEN38_GLOBAL_RULES}
+        for layer_id in range(64):
+            required.update(qwen38_layer_weight_names(layer_id))
+        missing = sorted(required - weight_map.keys())
+        if missing:
+            preview = ", ".join(missing[:8])
+            raise KeyError(f"Qwen3.8 checkpoint is missing {len(missing)} required tensors: {preview}")
+
+        tokenizer = load_tokenizer(
+            model_path,
+            trust_remote_code=bool(request.loader_options.get("trust_remote_code", False)),
+        )
+        architectures = config_data.get("architectures")
+        architecture = (
+            str(architectures[0]) if isinstance(architectures, list) and architectures
+            else "Qwen3.8ForConditionalGeneration"
+        )
+        config = ModelConfig(
+            model_id=request.model_id,
+            architecture=architecture,
+            vocab_size=int(text["vocab_size"]),
+            hidden_size=int(text["hidden_size"]),
+            intermediate_size=int(text["intermediate_size"]),
+            num_hidden_layers=int(text["num_hidden_layers"]),
+            num_attention_heads=int(text["num_attention_heads"]),
+            num_key_value_heads=int(text["num_key_value_heads"]),
+            head_dim=int(text["head_dim"]),
+            max_position_embeddings=int(text.get("max_position_embeddings", 262144)),
+            rms_norm_eps=float(text.get("rms_norm_eps", 1e-6)),
+            rope_theta=rope_theta,
+            bos_token_id=config_data.get("bos_token_id", tokenizer.bos_token_id),
+            eos_token_id=config_data.get("eos_token_id", tokenizer.eos_token_id),
+            pad_token_id=config_data.get("pad_token_id", tokenizer.pad_token_id),
+            torch_dtype=str(text.get("torch_dtype", "bfloat16")),
+        )
+        runtime = request.runtime_config or RuntimeConfig(max_seq_len=min(config.max_position_embeddings, 8192))
+        placeholder = torch.empty(0, config.hidden_size, dtype=torch.bfloat16)
+        runtime_model = RuntimeModel(
+            config=config,
+            runtime=runtime,
+            embed_tokens=placeholder,
+            final_norm_weight=torch.empty(0, dtype=torch.bfloat16),
+            lm_head=placeholder,
+            extra={
+                "family": "qwen3_8_27b",
+                "checkpoint_format": "w8a8-modelslim",
+                "config_data": config_data,
+                "weight_map": weight_map,
+                "model_dir": str(model_path),
+            },
+        )
+        return LoadedModel(
+            model_id=request.model_id,
+            model_dir=str(model_path),
+            config=config,
+            tokenizer=tokenizer,
+            layer_specs=_build_layer_specs(config),
+            runtime_model=runtime_model,
+        )
+
+
 def _build_deepseek_v4_model_config(
     model_id: str,
     config_data: dict,
@@ -442,7 +583,11 @@ class ModelLoader:
 
     def __init__(self, format_loaders: list[ModelFormatLoader] | None = None) -> None:
         """Create a loader registry with optional custom format loaders."""
-        self._format_loaders = format_loaders or [DeepSeekV4W8A8DirectoryLoader(), HuggingFaceDirectoryLoader()]
+        self._format_loaders = format_loaders or [
+            DeepSeekV4W8A8DirectoryLoader(),
+            Qwen38W8A8DirectoryLoader(),
+            HuggingFaceDirectoryLoader(),
+        ]
 
     def register(self, format_loader: ModelFormatLoader) -> None:
         """Register an additional model format loader."""

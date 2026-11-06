@@ -37,11 +37,17 @@ def test_async_llm_engine_generates_structured_offline_batch():
 def test_engine_config_resolves_model_runtime_requirements():
     default_runtime = EngineConfig().resolve_runtime_config()
     assert default_runtime.requires_homogeneous_prefill_decode is False
+    assert default_runtime.preserve_prefill_chunks is False
 
     deepseek_runtime = EngineConfig(
         executor_cls="PyptoDeepSeekV4Executor"
     ).resolve_runtime_config()
     assert deepseek_runtime.requires_homogeneous_prefill_decode is True
+    assert deepseek_runtime.preserve_prefill_chunks is False
+
+    qwen38_runtime = EngineConfig(executor_cls="PyptoQwen38Executor").resolve_runtime_config()
+    assert qwen38_runtime.requires_homogeneous_prefill_decode is True
+    assert qwen38_runtime.preserve_prefill_chunks is True
 
 
 async def _check_async_llm_engine_routes_to_least_pending_tokens():

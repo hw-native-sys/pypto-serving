@@ -99,6 +99,7 @@ nav:
           - Profiling: user-guide/profile.md
       - Models:
           - Qwen3-14B: user-guide/qwen.md
+          - Qwen3.8-27B W8A8: user-guide/qwen38.md
           - DeepSeek V4: user-guide/deepseek-v4.md
   - CLI Reference:
       - Overview: cli-reference/index.md

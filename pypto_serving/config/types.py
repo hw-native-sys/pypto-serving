@@ -164,6 +164,9 @@ class RuntimeConfig:
     # User-selectable scheduler chunk sizes supported by this model. Empty
     # means that the shared scheduler imposes no model-specific allowlist.
     prefill_chunk_size_choices: tuple[int, ...] = ()
+    # Keep full prefill chunks intact when another request leaves a smaller
+    # step budget. Short final spans can still share a step.
+    preserve_prefill_chunks: bool = False
     # Whether speculative decoding can safely consume a prompt produced by
     # more than one prefill dispatch.
     supports_chunked_prefill_with_speculation: bool = True

@@ -202,6 +202,10 @@ class WorkerProcess:
             from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor
 
             return Qwen314BPyptoExecutor
+        if self.config.executor_cls == "PyptoQwen38Executor":
+            from pypto_serving.model.qwen3_8_27b.npu_executor import Qwen38PyptoExecutor
+
+            return Qwen38PyptoExecutor
         if self.config.executor_cls == "PyptoDeepSeekV4Executor":
             from pypto_serving.model.deepseek.npu_executor import DeepSeekV4PyptoExecutor
 

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 
-ModelFamily = Literal["deepseek_v4", "qwen"]
+ModelFamily = Literal["deepseek_v4", "qwen3_8_27b", "qwen"]
 
 
 def read_model_config(model_dir: str | Path) -> dict[str, object]:
@@ -41,6 +41,36 @@ def is_deepseek_v4_config(config_data: dict[str, object]) -> bool:
     return model_type == "deepseek_v4" or "deepseekv4forcausallm" in architectures
 
 
+def qwen38_text_config(config_data: dict[str, object]) -> dict[str, object]:
+    """Return the text model fields from a flat or multimodal Qwen config."""
+    text = config_data.get("text_config")
+    return text if isinstance(text, dict) else config_data
+
+
+def is_qwen38_config(config_data: dict[str, object]) -> bool:
+    """Recognise the hybrid Qwen3.8 family before the Qwen3-14B fallback."""
+    text = qwen38_text_config(config_data)
+    model_type = str(config_data.get("model_type") or text.get("model_type") or "").lower()
+    architectures = config_data.get("architectures") or ()
+    names = {model_type}
+    if isinstance(architectures, (list, tuple)):
+        names.update(str(name).lower() for name in architectures)
+    hybrid = "linear_num_value_heads" in text or "full_attention_interval" in text
+    named = any("qwen3_8" in name or "qwen3.8" in name for name in names)
+    # Some multimodal configs expose only the text dimensions. Keep those on
+    # this family so validation can reject a malformed checkpoint explicitly.
+    identified_dimensions = (
+        text.get("hidden_size") == 5120
+        and text.get("num_hidden_layers") == 64
+        and text.get("num_attention_heads") == 24
+    )
+    return named or (hybrid and identified_dimensions)
+
+
 def detect_model_family(config_data: dict[str, object]) -> ModelFamily:
     """Return the serving model family inferred from config metadata."""
-    return "deepseek_v4" if is_deepseek_v4_config(config_data) else "qwen"
+    if is_deepseek_v4_config(config_data):
+        return "deepseek_v4"
+    if is_qwen38_config(config_data):
+        return "qwen3_8_27b"
+    return "qwen"

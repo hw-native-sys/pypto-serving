@@ -28,6 +28,37 @@ def test_cli_keeps_generic_model_chunk_sizes_unrestricted():
     assert args.long_prefill_token_threshold == 128
 
 
+def test_qwen38_runtime_uses_kernel_capabilities(tmp_path):
+    (tmp_path / "config.json").write_text('{"model_type":"qwen3_8"}')
+    args = _parse_cli_args([
+        "--model", str(tmp_path), "--max-model-len", "4096", "--max-num-seqs", "2",
+        "--max-num-batched-tokens", "2048", "--long-prefill-token-threshold", "2048",
+    ])
+    engine = cli.build_serving_engine_config(args)
+    assert engine.executor_cls == "PyptoQwen38Executor"
+    runtime = engine.runtime_config
+    assert runtime.max_prefill_tokens_per_request == 2048
+    assert runtime.requires_homogeneous_prefill_decode is True
+    assert runtime.preserve_prefill_chunks is True
+    assert tuple(group.name for group in runtime.kv_cache_groups) == ("attn_kv", "gdn_state")
+
+
+@pytest.mark.parametrize(("option", "value", "message"), [
+    ("--max-model-len", "1024", "prefill requires"),
+    ("--long-prefill-token-threshold", "2049", "multiple of 2048"),
+    ("--block-size", "64", "block-size 128"),
+    ("--max-num-seqs", "129", "max-num-seqs 128"),
+])
+def test_qwen38_cli_rejects_incompatible_kernel_shapes(tmp_path, option, value, message):
+    (tmp_path / "config.json").write_text('{"model_type":"qwen3_8"}')
+    args = _parse_cli_args([
+        "--model", str(tmp_path), "--max-model-len", "4096", "--max-num-batched-tokens", "4096",
+        "--long-prefill-token-threshold", "2048", option, value,
+    ])
+    with pytest.raises(ValueError, match=message):
+        cli.build_serving_engine_config(args)
+
+
 def test_cli_keeps_dspark_chunk_sizes_under_its_kernel_contract():
     args = _parse_cli_args(
         ["--model", "model", "--long-prefill-token-threshold", "128"]
