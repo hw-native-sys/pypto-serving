@@ -131,6 +131,10 @@ class EngineConfig:
             self.executor_cls, self.resolve_runtime_config().num_speculative_tokens
         )
 
+    def validate_generate_config(self, config) -> None:
+        if self.sampling_capabilities().greedy_only and not config.temperature <= 0:
+            raise ValueError("V4.1 K5 DSpark supports greedy sampling only; set temperature=0 or use K0")
+
     def resolve_runtime_config(self) -> RuntimeConfig:
         """Return runtime settings with executor requirements resolved."""
         runtime = self.runtime_config or RuntimeConfig()
@@ -561,6 +565,7 @@ class ReplicaEngineCore:
         constraint_spec: ConstraintSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
+        self.config.validate_generate_config(config)
         with profile_span(
             "ReplicaEngineCore.add_request",
             cat="serving",
@@ -1830,6 +1835,10 @@ class AsyncLLMEngine:
     def kv_cache_manager(self) -> KvCacheManager:
         return self.single_core().kv_cache_manager
 
+    def validate_generate_config(self, config) -> None:
+        """Validate sampling before admission or HTTP streaming headers."""
+        self.config.validate_generate_config(config)
+
     async def add_request(
         self,
         request_id: str,
@@ -1839,6 +1848,7 @@ class AsyncLLMEngine:
         output_parser_spec: OutputParserSpec | None = None,
         constraint_spec: ConstraintSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
+        self.validate_generate_config(config)
         arrival_monotonic = time.monotonic()
         replica_idx = self._select_replica()
         prompt_token_ids = self._tokenize_prompt(prompt)

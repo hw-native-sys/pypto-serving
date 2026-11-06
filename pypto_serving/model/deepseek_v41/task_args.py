@@ -86,8 +86,8 @@ def validate_cache_groups(
         _, block_size, ratio = expected[family]
         if (group.spec.block_size != block_size or group.spec.compress_ratio != ratio
                 or group.spec.storage_block_size != 128 or group.num_partitions != dp_size
-                or group.sliding_window is not None or group.is_eagle_group
-                or group.max_requests_per_partition != 1):
+                or group.max_requests_per_partition != 1
+                or group.sliding_window is not None or group.is_eagle_group):
             raise ValueError(f"V4.1 {family} cache page layout disagrees with the lib ABI")
         required = (max_seq_len + block_size - 1) // block_size
         if (group.max_blocks_per_seq < required
@@ -230,7 +230,7 @@ class RequestLedger:
         self.pending = ForwardStep("prefill", tuple(slices), self.epoch)
         return self.pending
 
-    def begin_decode(self, requests):
+    def begin_decode(self, requests, *, drafts=None):
         if self.poisoned:
             raise RuntimeError("session requires recovery after device reset failure")
         if self.pending is not None:
@@ -244,20 +244,30 @@ class RequestLedger:
                 raise ValueError("decode requires a completed prefill for the same request")
             if type(start) is not int or owner.length != start or owner.partition != partition:
                 raise ValueError("decode must continue at the committed position and DP partition")
-            if start + 1 > self.max_seq_len:
+            tokens = (token, *(() if drafts is None else drafts[key]))
+            if start + len(tokens) > self.max_seq_len:
                 raise ValueError("decode exceeds sequence capacity")
-            slices.append(RequestSlice(key, partition, owner.slot, start, (token,), owner.prompt_length,
+            slices.append(RequestSlice(key, partition, owner.slot, start, tokens, owner.prompt_length,
                                        MappingProxyType({name: tuple(ids) for name, ids in pages.items()})))
         self._validate_page_ownership(slices)
         self.pending = ForwardStep("decode", tuple(slices), self.epoch)
         return self.pending
 
-    def commit(self, step):
+    def commit(self, step, *, accepted_counts=None):
         if step is not self.pending:
             raise ValueError("stale or foreign forward completion")
-        for request in step.requests:
+        counts = ([len(request.token_ids) for request in step.requests]
+                  if accepted_counts is None else list(accepted_counts))
+        if len(counts) != len(step.requests) or any(
+            type(count) is not int or not 1 <= count <= len(request.token_ids)
+            for request, count in zip(step.requests, counts)
+        ):
+            raise ValueError("accepted counts must fit each dispatched token span")
+        for request, count in zip(step.requests, counts):
             owner = self.owners[request.request_id]
-            owner.length, owner.pages = request.end, request.pages
+            # Rejected proposals still wrote the reserved pages. Retain all
+            # ownership until release, but advance only the accepted prefix.
+            owner.length, owner.pages = request.start + count, request.pages
         self.pending = None
         self.epoch += 1
 
