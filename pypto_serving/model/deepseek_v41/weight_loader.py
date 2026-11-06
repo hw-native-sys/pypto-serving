@@ -10,24 +10,28 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
+import importlib
 import json
 import logging
 import math
 import os
 import re
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from threading import Condition
+from types import SimpleNamespace
 
 import torch
 
 from pypto_serving.model.common.weights.store import LazySafetensorsStore
+from pypto_serving.model.common.weights.nz import pack_nz
 from pypto_serving.model.deepseek.weight_loader import (
-    _PREPACKED_MIN_CACHE_RESIDENCY,
     _map_shared_prepacked_tensors,
     _sample_file_page_cache_residency,
 )
@@ -44,6 +48,12 @@ from .weight_spec import (
 # weight_loader
 _BYTES = {"BF16": 2, "F32": 4, "F8_E4M3": 1, "F8_E8M0": 1, "I8": 1}
 _EXPERT = re.compile(r"^layers\.\d+\.ffn\.experts\.(\d+)\.")
+_NZ_PROJECTION_SUFFIXES = (
+    ".attn.wq_a.weight", ".attn.wq_b.weight", ".attn.wkv.weight",
+    ".attn.wo_a.weight", ".attn.wo_b.weight", ".indexer.wq_b.weight",
+    ".compressor.wkv.weight", ".compressor.wgate.weight",
+    ".indexer.wk.weight", ".indexer.weights_proj.weight",
+)
 _TORCH_DTYPES = {
     "BF16": torch.bfloat16,
     "F32": torch.float32,
@@ -71,6 +81,10 @@ def _positive(value, name):
 
 def _validate_shard_paths(model_dir, weight_map):
     filenames = {}
+    shared_root = os.environ.get("PYPTO_V41_SHARED_SHARD_DIR")
+    shared_root = Path(shared_root).resolve() if shared_root else None
+    if shared_root is not None and not shared_root.is_dir():
+        raise ValueError("PYPTO_V41_SHARED_SHARD_DIR must be an existing directory")
     for name, filename in weight_map.items():
         if not isinstance(name, str) or not isinstance(filename, str):
             raise ValueError("weight_map must map names to shard filenames")
@@ -80,8 +94,8 @@ def _validate_shard_paths(model_dir, weight_map):
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError("checkpoint shard path must stay inside model directory")
         path = (model_dir / relative).resolve()
-        if not path.is_relative_to(model_dir):
-            raise ValueError("checkpoint shard path must stay inside model directory")
+        if not path.is_relative_to(model_dir) and (shared_root is None or not path.is_relative_to(shared_root)):
+            raise ValueError("checkpoint shard path must stay inside model or shared shard directory")
 
 
 class _DirectSliceSession(ExitStack):
@@ -342,6 +356,9 @@ class V41WeightLoader:
                 layout = "input_major_dense"
             else:
                 layout = "checkpoint_dense"
+        if name.endswith(_NZ_PROJECTION_SUFFIXES):
+            weight = pack_nz(weight)
+            layout += ";nz"
         return WeightBundle(weight, scale, layout, tuple(item[0] for item in requests),
                             self.tp_rank, self.ep_rank, estimate)
 
@@ -507,14 +524,25 @@ def merge_expert_scales(scales):
     return pack_mx_scale(torch.cat(logical)).view(scales[0].dtype)
 
 
-def mxfp4_pair_lut():
-    """Decode two E2M1 nibbles into two E4M3FN bytes in the lib LUT ABI."""
+def _legacy_mxfp4_pair_lut():
+    """Identify the retired LUT stored by earlier v2 decode sidecars."""
     codes = torch.tensor([0x00, 0x30, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C,
                           0x80, 0xB0, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC], dtype=torch.int64)
     packed = torch.arange(256)
     pair = codes[packed & 15] | (codes[packed >> 4] << 8)
     pair = torch.where(pair < 32768, pair, pair - 65536)
     return pair.to(torch.int16).reshape(1, 256).repeat(2, 1)
+
+
+def load_swa_layer_weights(model_dir, layer_id, topology, *, max_bundle_bytes=32 << 30):
+    """Return stacked Attention and MoE weight maps for one SWA layer.
+
+    The caller owns the results and uploads them once. max_bundle_bytes is a
+    conservative bound on stacking buffers for this call, not process memory
+    or the accumulated weights of other layers. Individual payload reads retain
+    V41WeightLoader's separate pre-read budget.
+    """
+    return _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, swa_only=True)
 
 
 def load_prefill_layer_weights(model_dir, layer_id, topology, *, max_bundle_bytes=32 << 30,
@@ -527,8 +555,7 @@ def load_prefill_layer_weights(model_dir, layer_id, topology, *, max_bundle_byte
     the loader. Index heads are replicated, matching lib's global INDEX_H.
     """
     return _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes,
-                               swa_only=False, loaders=loaders,
-                               parallel_experts=parallel_experts)
+                               swa_only=False, loaders=loaders, parallel_experts=parallel_experts)
 
 
 def _load_routed_projection(loader, layer_id, rank, ep_size, name):
@@ -608,6 +635,15 @@ def _routed_projection_reservation(loader, layer_id, rank, ep_size, name):
     # Match the existing conservative layer check: source bundles plus packed
     # weight and merged scale can be live at the same time in one task.
     return max(1, 3 * source_bytes)
+def load_prefill_attention_weights(model_dir, layer_id, topology, *, max_bundle_bytes=4 << 30):
+    """Read only Attention weights for isolated tracing or bounded preparation.
+
+    Uses the identical packing/placement as the complete layer bundle. In
+    particular, an Attention probe must not read all routed expert payloads.
+    """
+    attention, _ = _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes,
+                                       swa_only=False, include_moe=False)
+    return attention
 
 
 def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_only,
@@ -717,25 +753,20 @@ def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_
                 "correction_bias": "ffn.gate.bias",
             }.items():
                 m[target] = load(source).weight
-            expert_fields, expert_bytes = routed[rank] if routed is not None else (None, 0)
             for name in ("w1", "w2", "w3"):
                 bundle = load(f"ffn.shared_experts.{name}.weight")
                 m["shared_" + name], m["shared_" + name + "_scale"] = bundle.weight, bundle.scale
-                if expert_fields is not None:
-                    m["routed_" + name] = expert_fields["routed_" + name]
-                    m["routed_" + name + "_scale"] = expert_fields["routed_" + name + "_scale"]
-                else:
+                if routed is None:
                     count = loader.text["n_routed_experts"] // topology.world
                     bundles = [load(f"ffn.experts.{expert}.{name}.weight")
                                for expert in range(rank * count, (rank + 1) * count)]
                     m["routed_" + name] = stack_bytes([b.weight for b in bundles])
                     m["routed_" + name + "_scale"] = merge_expert_scales([b.scale for b in bundles])
                     del bundles
-            if expert_fields is not None:
-                held_bytes += expert_bytes
-                if 3 * held_bytes > max_bundle_bytes:
-                    raise ValueError("stacked layer weight budget exceeded")
-            m["mxfp4_pair_lut"] = mxfp4_pair_lut()
+                else:
+                    packed, _retained = routed[rank]
+                    m["routed_" + name] = packed["routed_" + name]
+                    m["routed_" + name + "_scale"] = packed["routed_" + name + "_scale"]
             moe.append(m)
     return ({name: stack_bytes([r[name] for r in attention]) for name in attention[0]},
             {name: stack_bytes([r[name] for r in moe]) for name in moe[0]} if moe else {})
@@ -775,14 +806,12 @@ class DecodeWeightSlice:
 
 def bind_decode_layer_weights(layer, attention, moe, *, kv_sources, index_sources, c2a_sources):
     """Map one loaded layer to the lib's layer/source axes without copying data."""
-    if not attention or not moe or "mxfp4_pair_lut" not in moe:
+    if not attention or not moe:
         raise ValueError("decode requires complete Attention and packed-FP4 MoE weights")
     result = [DecodeWeightSlice(target, layer.layer_id, attention[source])
               for target, source in _ATTENTION.items()]
     result += [DecodeWeightSlice(target, layer.layer_id, moe[source])
                for target, source in _MOE.items()]
-    if layer.layer_id == 0:
-        result.append(DecodeWeightSlice("mxfp4_pair_lut", 0, moe["mxfp4_pair_lut"]))
     if layer.layer_id in kv_sources:
         kv_slot = kv_sources.index(layer.layer_id)
         result.append(DecodeWeightSlice("compressor_norm_weight", kv_slot,
@@ -819,8 +848,9 @@ def iter_decode_weight_slices(model_dir, topology, *, max_bundle_bytes=32 << 30,
     """Yield one layer at a time in checkpoint order for bounded staging."""
     raw = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
     layers = plan_layers(raw)
-    if len(layers) != 40 or (topology.tp, topology.dp, topology.world) not in ((1, 4, 4), (1, 8, 8)):
-        raise ValueError("V4.1 requires a 40-layer TP1/DP4/EP4 or TP1/DP8/EP8 schedule")
+    if (len(layers) != 40 or topology.tp != 1
+            or topology.dp not in (4, 8) or topology.world != topology.dp):
+        raise ValueError("V4.1 requires the 40-layer TP1/DP4/EP4 or TP1/DP8/EP8 schedule")
     text = raw["text_config"]
     kv_sources = tuple(text["kv_source_layer_ids"])
     index_sources = tuple(text["index_source_layer_ids"])
@@ -868,10 +898,10 @@ _AXIS_LAYER = frozenset({
     "wq_a", "wq_b", "wkv", "wo_b", "shared_w1", "shared_w2", "shared_w3",
 })
 _FLAT_KV = frozenset({"compressor_norm_weight"})
-_FLAT_INDEX = frozenset({"index_wk", "index_norm_weight", "index_wq_b_scale"})
-_AXIS_INDEX = frozenset({"index_wq_b", "index_weights_proj"})
+_FLAT_INDEX = frozenset({"index_norm_weight", "index_wq_b_scale"})
+_AXIS_INDEX = frozenset({"index_wk", "index_wq_b", "index_weights_proj"})
 _AXIS_C2A = frozenset({"c2a_compressor_wkv", "c2a_compressor_wgate"})
-_SINGLE = frozenset({"c1a_compressor_wkv", "mxfp4_pair_lut"})
+_SINGLE = frozenset({"c1a_compressor_wkv"})
 _ALL = (_FLAT_LAYER | _AXIS_LAYER | _FLAT_KV | _FLAT_INDEX |
         _AXIS_INDEX | _AXIS_C2A | _SINGLE)
 _LAYER_ABI_ALIASES = {
@@ -912,7 +942,12 @@ class DecodeWeightLayout:
     tp_size: int = 1
 
     @classmethod
-    def from_lib(cls, abi, *, tp_size):
+    def from_lib(cls, abi, *, tp_size=None):
+        # V4.1 decode_fwd is TP1 by contract and intentionally does not
+        # export TP_SIZE. Keep the loader compatible with that ABI while
+        # honoring an explicit value from future lib revisions.
+        if tp_size is None:
+            tp_size = int(getattr(abi, "TP_SIZE", 1))
         return cls(abi.N_LAYERS, abi.KV_SOURCE_COUNT, abi.INDEX_SOURCE_COUNT,
                    abi.C2A_SOURCE_COUNT, abi.EP_SIZE, tp_size)
 
@@ -1093,7 +1128,6 @@ class ResidentDecodeWeights:
                      for target, source in _ATTENTION.items()}
         moe = {source: self.view(target, layer.layer_id)
                for target, source in _MOE.items()}
-        moe["mxfp4_pair_lut"] = self.view("mxfp4_pair_lut", 0)
         if layer.layer_id in kv_sources:
             source = kv_sources.index(layer.layer_id)
             attention["compressor_norm_weight"] = self.view("compressor_norm_weight", source)
@@ -1149,13 +1183,7 @@ class ResidentFullDecodeWeights(ResidentDecodeWeights):
                 slot_bytes = host[0, 0].numel() * host.element_size()
                 shards = []
                 try:
-                    rank_major = getattr(bank, "rank_major_uploads", {}).get(name)
                     for rank in range(self.layout.world):
-                        if rank_major is not None:
-                            source = rank_major[rank].view(full_shape)
-                            shards.append(worker.alloc_tensor(full_shape, host.dtype,
-                                                              init=source, worker_id=rank))
-                            continue
                         base = worker.alloc_tensor(full_shape, host.dtype, worker_id=rank)
                         shards.append(base)
                         for slot in range(slots):
@@ -1204,13 +1232,14 @@ class ResidentFullDecodeWeights(ResidentDecodeWeights):
 
 # weight_sidecar
 _LOG = logging.getLogger(__name__)
-_FORMAT = "pypto-deepseek-v41-decode-slot-major-v1"
+_FORMAT = "pypto-deepseek-v41-decode-slot-major-v2"
 _FLOAT8 = {"float8_e4m3fn": torch.float8_e4m3fn,
            "float8_e8m0fnu": torch.float8_e8m0fnu}
 
 
-def sidecar_path(model_dir, world=8):
-    return Path(model_dir) / f"pypto-deepseek-v41-decode-r{world}.safetensors"
+def sidecar_path(model_dir):
+    override = os.environ.get("PYPTO_V41_PREPACKED_WEIGHTS")
+    return Path(override) if override else Path(model_dir) / "pypto-deepseek-v41-decode-r8.safetensors"
 
 
 def source_fingerprint(model_dir, layout):
@@ -1233,7 +1262,7 @@ def source_fingerprint(model_dir, layout):
 
 
 def load_prepacked_bank(model_dir, layout, parameter_names, *, path=None):
-    path = sidecar_path(model_dir, layout.world) if path is None else Path(path)
+    path = sidecar_path(model_dir) if path is None else Path(path)
     if not path.is_file():
         return None
     from safetensors import safe_open
@@ -1243,10 +1272,6 @@ def load_prepacked_bank(model_dir, layout, parameter_names, *, path=None):
         residency = _sample_file_page_cache_residency(fd, path)
         _LOG.info("V4.1 weight sidecar page-cache residency: %s",
                   "unknown" if residency is None else f"{100 * residency:.1f}%")
-        if residency is None or residency < _PREPACKED_MIN_CACHE_RESIDENCY:
-            _LOG.info("Skipping cold V4.1 weight sidecar %s (requires %.1f%% page-cache residency)",
-                      path, 100 * _PREPACKED_MIN_CACHE_RESIDENCY)
-            return None
         with safe_open(f"/proc/self/fd/{fd}", framework="pt", device="cpu") as reader:
             metadata = reader.metadata() or {}
             if metadata.get("format") != _FORMAT or metadata.get("source_fingerprint") != source_fingerprint(
@@ -1254,13 +1279,22 @@ def load_prepacked_bank(model_dir, layout, parameter_names, *, path=None):
                 _LOG.warning("Ignoring stale V4.1 weight sidecar %s", path)
                 return None
             names = frozenset(reader.keys())
-            if names != _ALL:
+            legacy_lut = "mxfp4_pair_lut"
+            if names not in (_ALL, _ALL | {legacy_lut}):
                 _LOG.warning("Ignoring V4.1 weight sidecar with wrong fields: %s", path)
                 return None
+            if legacy_lut in names:
+                source = reader.get_slice(legacy_lut)
+                if tuple(source.get_shape()) != (layout.world, 2, 256) or source.get_dtype() != "I16":
+                    raise ValueError("V4.1 sidecar has invalid legacy MXFP4 LUT shape/dtype")
+                expected_lut = _legacy_mxfp4_pair_lut().unsqueeze(0).expand(layout.world, -1, -1)
+                if not torch.equal(reader.get_tensor(legacy_lut), expected_lut):
+                    raise ValueError("V4.1 sidecar has invalid legacy MXFP4 LUT values")
+                _LOG.info("Skipping verified legacy MXFP4 LUT in V4.1 v2 sidecar %s", path)
             float8_fields = json.loads(metadata.get("float8_fields", "{}"))
             if any(name not in _ALL or dtype not in _FLOAT8 for name, dtype in float8_fields.items()):
                 raise ValueError("V4.1 weight sidecar has invalid float8 metadata")
-            for name in names:
+            for name in _ALL:
                 source = reader.get_slice(name)
                 shape = tuple(source.get_shape())
                 if (shape[0] != (layout.world if name in _SINGLE else layout.slots(name))
@@ -1268,9 +1302,14 @@ def load_prepacked_bank(model_dir, layout, parameter_names, *, path=None):
                     raise ValueError(f"V4.1 sidecar weight has invalid rank/slot shape: {name}")
                 if name in float8_fields and source.get_dtype() != "U8":
                     raise ValueError(f"V4.1 sidecar float8 weight is not byte-backed: {name}")
-        tensors = _map_shared_prepacked_tensors(fd, names)
+        tensors = _map_shared_prepacked_tensors(fd, _ALL)
         for name, dtype in float8_fields.items():
             tensors[name] = tensors[name].view(_FLOAT8[dtype])
+        gate_weight = tensors["gate_weight"]
+        if gate_weight.dtype == torch.float32:
+            tensors["gate_weight"] = gate_weight.to(torch.bfloat16).share_memory_()
+        elif gate_weight.dtype != torch.bfloat16:
+            raise ValueError("V4.1 sidecar router weights must be FP32 or BF16")
         bank = DecodeWeightBank(layout)
         bank.tensors = tensors
         bank.allocated_bytes = sum(value.numel() * value.element_size() for value in tensors.values())
@@ -1282,3 +1321,103 @@ def load_prepacked_bank(model_dir, layout, parameter_names, *, path=None):
         return bank
     finally:
         os.close(fd)
+
+
+def _prefill_bank_metadata(model_dir, layout, lib_revision, manifest):
+    return {
+        "format": "pypto-deepseek-v41-prefill-bank-v1",
+        "source_fingerprint": source_fingerprint(model_dir, layout),
+        "lib_revision": lib_revision,
+        "ranks": manifest.ranks,
+        "banks": {name: {"shape": list(shape), "dtype": str(dtype),
+                         "nbytes": math.prod(shape) * torch.empty((), dtype=dtype).element_size()}
+                  for name, (shape, dtype) in manifest.tensor_layouts.items()},
+    }
+
+
+class PrepackedPrefillBank:
+    """Read a complete rank-major prefill bank produced from this checkpoint and lib."""
+
+    def __init__(self, path, model_dir, layout, lib_revision, manifest):
+        self.path = Path(path)
+        expected = _prefill_bank_metadata(model_dir, layout, lib_revision, manifest)
+        recorded = json.loads((self.path / "manifest.json").read_text(encoding="utf-8"))
+        if recorded != expected:
+            raise ValueError("V4.1 prefill bank sidecar is stale or has another layout")
+        for rank in range(manifest.ranks):
+            for name, spec in expected["banks"].items():
+                if (self.path / f"rank{rank}-{name}.bin").stat().st_size != spec["nbytes"]:
+                    raise ValueError(f"V4.1 prefill bank sidecar is truncated: rank {rank} {name}")
+        self.ranks = manifest.ranks
+        self.tensor_layouts = manifest.tensor_layouts
+        self.bytes_per_rank = manifest.bytes_per_rank
+
+    def upload(self, worker, rank, handles):
+        if not 0 <= rank < self.ranks:
+            raise ValueError("prefill bank rank is out of range")
+        for name, (shape, dtype) in self.tensor_layouts.items():
+            size = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+            mapped = torch.from_file(str(self.path / f"rank{rank}-{name}.bin"),
+                                     shared=False, size=size, dtype=torch.uint8)
+            for offset in range(0, size, 64 << 20):
+                count = min(64 << 20, size - offset)
+                worker.copy_to(handles[name].data_ptr, mapped.data_ptr() + offset,
+                               count, dst_offset=offset, worker_id=rank)
+
+
+def prepack_prefill_bank(manifest, model_dir, layout, lib_revision, path):
+    """Create the reusable prefill bank without holding NPU devices."""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    metadata = _prefill_bank_metadata(model_dir, layout, lib_revision, manifest)
+    marker = path / "manifest.json"
+    if marker.exists():
+        PrepackedPrefillBank(path, model_dir, layout, lib_revision, manifest)
+        return
+
+    class HostCopy:
+        @staticmethod
+        def copy_to(dst_ptr, src_ptr, count, *, dst_offset, worker_id):
+            ctypes.memmove(dst_ptr + dst_offset, src_ptr, count)
+
+    for rank in range(manifest.ranks):
+        tensors = {}
+        handles = {}
+        for name, spec in metadata["banks"].items():
+            target = path / f"rank{rank}-{name}.bin"
+            with target.open("wb") as output:
+                output.truncate(spec["nbytes"])
+            tensor = torch.from_file(str(target), shared=True,
+                                     size=spec["nbytes"], dtype=torch.uint8)
+            tensors[name] = tensor
+            handles[name] = SimpleNamespace(data_ptr=tensor.data_ptr())
+        manifest.upload(HostCopy(), rank, handles)
+        for name in tensors:
+            with (path / f"rank{rank}-{name}.bin").open("r+b") as output:
+                os.fsync(output.fileno())
+        tensors.clear()
+        _LOG.info("Packed V4.1 prefill bank rank %d/%d", rank + 1, manifest.ranks)
+    pending = path / "manifest.json.tmp"
+    pending.write_text(json.dumps(metadata, sort_keys=True), encoding="utf-8")
+    pending.replace(marker)
+
+
+def _prepack_prefill_main():
+    if len(sys.argv) != 5 or sys.argv[1] != "--prefill-bank":
+        raise SystemExit("usage: python -m pypto_serving.model.deepseek_v41.weight_loader "
+                         "--prefill-bank MODEL_DIR LIB_ROOT OUTPUT_DIR")
+    model_dir, lib_root, output = map(Path, sys.argv[2:])
+    from .npu_runner import SegmentTopology, load_segment_modules, _revision
+
+    topology = SegmentTopology.for_decode()
+    load_segment_modules(lib_root, topology)
+    abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
+    utils = importlib.import_module("models.deepseek_v4_1_flash.utils")
+    layout = DecodeWeightLayout.from_lib(abi)
+    manifest = utils.ResidentPrefillWeights(utils.PrefillCheckpoint(model_dir),
+                                            ep_size=topology.world)
+    prepack_prefill_bank(manifest, model_dir, layout, _revision(lib_root), output)
+
+
+if __name__ == "__main__":
+    _prepack_prefill_main()
