@@ -1217,9 +1217,9 @@ _FLOAT8 = {"float8_e4m3fn": torch.float8_e4m3fn,
            "float8_e8m0fnu": torch.float8_e8m0fnu}
 
 
-def sidecar_path(model_dir):
+def sidecar_path(model_dir, world=8):
     override = os.environ.get("PYPTO_V41_PREPACKED_WEIGHTS")
-    return Path(override) if override else Path(model_dir) / "pypto-deepseek-v41-decode-r8.safetensors"
+    return Path(override) if override else Path(model_dir) / f"pypto-deepseek-v41-decode-r{world}.safetensors"
 
 
 def source_fingerprint(model_dir, layout):
@@ -1242,7 +1242,7 @@ def source_fingerprint(model_dir, layout):
 
 
 def load_prepacked_bank(model_dir, layout, parameter_names, *, path=None):
-    path = sidecar_path(model_dir) if path is None else Path(path)
+    path = sidecar_path(model_dir, layout.world) if path is None else Path(path)
     if not path.is_file():
         return None
     from safetensors import safe_open
