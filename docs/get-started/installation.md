@@ -8,6 +8,24 @@ Prepare a Linux host with Ascend NPUs visible to the serving user, an Ascend-com
 
 Checkpoint format and device requirements depend on the model. See the [Qwen3-14B](../models/qwen3-14b.md#checkpoint) and [DeepSeek V4](../models/deepseek-v4/index.md) guides for the currently supported paths.
 
+## Select the Runtime Build Target
+
+When installing PyPTO's `runtime/` submodule (simpler), select the NPU platform
+that serving will use. For A2/A3, after activating the matching CANN environment:
+
+```bash
+python -m pip install --no-build-isolation /path/to/pypto/runtime \
+  --config-settings=build.targets=build_package_a2a3
+```
+
+Use `build_package_a5` for A5, with a CANN SDK that provides the required HCCL
+channel-config APIs. The host CPU architecture (`aarch64` or `x86_64`) does not
+select the NPU platform. An unrestricted runtime build can also attempt A5 on
+an A2/A3 host and fail because its SDK lacks those APIs.
+
+The CI setup action takes the same choice through `runtime-platform`; the
+A2/A3 serving job selects `a2a3`, and the V4.1 A5 job selects `a5`.
+
 ## Clone
 
 Clone the repository and initialize the kernel submodule:
