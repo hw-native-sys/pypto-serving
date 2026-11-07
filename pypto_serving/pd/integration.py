@@ -14,8 +14,8 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 import json
 import logging
-import multiprocessing
 import os
+import socket
 from types import SimpleNamespace
 import uuid
 
@@ -30,8 +30,8 @@ from pypto_serving.serving.server.server import ChatCompletionRequest, Completio
 from pypto_serving.serving.server.serving_worker import spawn_worker
 from .adapter import select_adapter
 from .config import Config, log_context
-from .protocol import Binding, Continuation, Node, decode
-from .service import NodeUnavailable, Service
+from .protocol import Binding, CapacityExhausted, Continuation, Node, decode
+from .service import ExecutionError, NodeUnavailable, Service
 from .worker import Progress, Services, WorkerSettings
 
 
@@ -72,10 +72,21 @@ class Server(ServingServer):
     def _register_exception_handlers(self):
         super()._register_exception_handlers()
         self.app.add_exception_handler(NodeUnavailable, self.unavailable)
+        self.app.add_exception_handler(ExecutionError, self.execution_error)
+        self.app.add_exception_handler(CapacityExhausted, self.capacity_exhausted)
+
+    @staticmethod
+    async def capacity_exhausted(request, exc):
+        return JSONResponse(dict(object="error", code="capacity_exhausted", message=str(exc)), status_code=503)
 
     @staticmethod
     async def unavailable(request, exc):
         return JSONResponse(dict(object="error", code="pd_node_unavailable", message=str(exc)), status_code=503)
+
+    @staticmethod
+    async def execution_error(request, exc):
+        return JSONResponse(dict(object="error", code="pd_execution_error", message=str(exc),
+                                 request_id=exc.request_id), status_code=500)
 
     def _register_routes(self):
         super()._register_routes()
@@ -190,11 +201,12 @@ class Application:
         self.config = config
         progress = channel = None
         if role == "prefill":
-            parent, channel = multiprocessing.get_context("spawn").Pipe(duplex=True)
-            progress = Progress(parent, config.handoff_timeout)
+            parent, channel = socket.socketpair()
+            progress = Progress(parent, config.handoff_timeout, config.capacity)
         self.channel, self.progress = channel, progress
         settings = WorkerSettings(self.boot, endpoint.transfer_hostname or endpoint.host,
-                                  config.provider, config.capacity, len(config.prefill) + len(config.decode))
+                                  config.provider, config.capacity, len(config.prefill) + len(config.decode),
+                                  config.handoff_timeout)
         tokens = 0 if role == "prefill" else 7
         engine_config = replace(engine_config,
             runtime_config=replace(engine_config.runtime_config, num_speculative_tokens=tokens),

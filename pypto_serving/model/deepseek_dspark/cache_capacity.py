@@ -55,8 +55,17 @@ def plan_cache_pages(groups, budget, *, active_requests, step_tokens, filler_pag
                 # Keep the complete ring, in-flight replacements and a bounded
                 # checkpoint for every budgeted request. Do not shorten rings.
                 working = (step_tokens + page - 1) // page
+                if group.is_checkpoint_state:
+                    # Include both boundary pages for recurrent-state writes.
+                    working = (step_tokens + 2 * page - 2) // page
                 checkpoint = group.sliding_window // page
-                counts[group.name] = requests * (group.max_blocks_per_seq + working + checkpoint)
+                if group.preserve_prefill_history:
+                    # Two output generations and their entry histories can
+                    # coexist. Do not assume their pins share checkpoint pages.
+                    entry = (group.sliding_window + 2 * page - 2) // page
+                    counts[group.name] = requests * (2 * group.max_blocks_per_seq + 2 * entry + checkpoint)
+                else:
+                    counts[group.name] = requests * (group.max_blocks_per_seq + working + checkpoint)
         return counts
 
     counts = request_counts(1)

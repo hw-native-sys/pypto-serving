@@ -25,11 +25,12 @@ GEOMETRY = (
 )
 
 
-def manager(enabled=True, slots=3, partitions=4):
+def manager(enabled=True, slots=3, partitions=4, checkpoint_state=False):
     # Exact max_seq_len=655360, prefill=128, four partitions and 3 capacity
     # slots. Tensor widths are irrelevant to the Host page/ref-count contract.
     groups = tuple(KVCacheGroupSpec(name, (0,), KVCacheSpec(tokens, tokens // ratio, ratio),
-        blocks, num_partitions=partitions, sliding_window=window)
+        blocks, num_partitions=partitions, sliding_window=window,
+        is_checkpoint_state=checkpoint_state and name.endswith("state"))
         for name, tokens, ratio, blocks, window in GEOMETRY)
     cache = KvCacheManager(enable_prefix_cache=enabled)
     cache.init_groups(groups, max_batch_size=slots, primary_num_blocks=9 * slots)
@@ -106,8 +107,11 @@ def _finish_prefill(scheduler, request, *, expected_hit=None):
 @pytest.mark.parametrize("length", [8192, 8193, 8205, 8319, 8320])
 @pytest.mark.parametrize("speculative,asynchronous", [(0, False), (7, False), (7, True)],
     ids=["prefill-target-only", "replica-k7-sync", "replica-k7-async"])
-def test_request_checkpoint_matches_full_prompt_replay_boundary(partitions, length, speculative, asynchronous):
-    cache = manager(partitions=partitions)
+@pytest.mark.parametrize("checkpoint_state", [False, True])
+def test_request_checkpoint_matches_full_prompt_replay_boundary(
+    partitions, length, speculative, asynchronous, checkpoint_state,
+):
+    cache = manager(partitions=partitions, checkpoint_state=checkpoint_state)
     scheduler = _prefill_scheduler(cache, speculative=speculative, asynchronous=asynchronous)
     for group in range(8):
         # Keep two documents per local partition, including in the larger topology.
@@ -145,13 +149,17 @@ def test_request_checkpoint_loses_joint_validity_when_a_member_is_evicted(name):
     assert cache._group_pools["cmp_c128"].hash_to_block
 
 
-def paged_manager(partitions=4, enabled=True):
+def paged_manager(partitions=4, enabled=True, compact_state=False):
     from pypto_serving.model.deepseek_dspark.cache_capacity import cache_pool_bytes, plan_cache_pages
     cache = manager(partitions=partitions)
     # Same real ring/table geometry, lightweight per-page widths. Index data
     # and scale bytes retain their actual 128:4 allocation ratio.
     groups = tuple(replace(g, spec=replace(g.spec, page_size_bytes=132 if g.name == "idx" else 128))
                    for g in cache.group_specs)
+    if compact_state:
+        pages = {"hca_state": 35, "csa_state": 77, "csa_inner_state": 77}
+        groups = tuple(replace(g, max_blocks_per_seq=pages.get(g.name, g.max_blocks_per_seq),
+                               is_checkpoint_state=g.name in pages) for g in groups)
     budget = cache_pool_bytes(groups, {g.name: g.max_blocks_per_seq for g in groups}, filler_pages=64) * 3 // 2
     counts = plan_cache_pages(groups, budget, active_requests=max(1, 8 // partitions), step_tokens=8,
                              filler_pages=64)
@@ -162,8 +170,9 @@ def paged_manager(partitions=4, enabled=True):
 
 @pytest.mark.parametrize("partitions", [4, 16])
 @pytest.mark.parametrize("enabled", [False, True], ids=["prefix-off", "prefix-on"])
-def test_paged_decode_keeps_depth_two_and_eight_group_prefixes(partitions, enabled):
-    cache = paged_manager(partitions, enabled)
+@pytest.mark.parametrize("compact_state", [False, True])
+def test_paged_decode_keeps_depth_two_and_eight_group_prefixes(partitions, enabled, compact_state):
+    cache = paged_manager(partitions, enabled, compact_state)
     scheduler = Scheduler(SchedulerConfig(max_num_running_reqs=8, max_num_scheduled_tokens=8192,
         max_seq_len=655360, num_speculative_tokens=7, speculative_prefix_cache_replay_tokens=128,
         async_scheduling=True, enable_prefix_cache=enabled), cache)
@@ -223,11 +232,11 @@ def test_external_decode_capacity_waits_for_snapshot_then_fails_without_local_pr
     # A detached in-flight table occupies the last pages. No rejection until
     # its FIFO completion has had the opportunity to return those references.
     held = cache.ensure_group_blocks("inflight", 30)
-    cache.retain_group_block_snapshot(held, 0)
+    snapshot = cache.retain_group_block_snapshot(held, 0)
     cache.release_all_group_requests("inflight")
     waiting = scheduler.schedule(allow_reject_stalled=False)
     assert not waiting.rejected_requests and request in scheduler.running and not scheduler.waiting
-    cache.release_group_block_snapshot(held, 0)
+    cache.release_group_block_snapshot(snapshot)
     resumed = scheduler.schedule()
     assert [s.request.request_id for s in resumed.scheduled_requests] == ["external"]
     scheduler.advance_after_schedule(resumed)
@@ -244,8 +253,9 @@ def test_external_decode_capacity_waits_for_snapshot_then_fails_without_local_pr
 
 
 @pytest.mark.parametrize("uncertain", [False, True], ids=["cancel", "unknown"])
-def test_paged_receive_failure_keeps_healthy_shared_prefix(uncertain):
-    cache = paged_manager(16)
+@pytest.mark.parametrize("compact_state", [False, True])
+def test_paged_receive_failure_keeps_healthy_shared_prefix(uncertain, compact_state):
+    cache = paged_manager(16, compact_state=compact_state)
     tokens = list(range(8205))
     def receive(request, prompt):
         return cache.reserve_group_cache(request, request, len(prompt) + 131072, prompt_token_count=len(prompt),

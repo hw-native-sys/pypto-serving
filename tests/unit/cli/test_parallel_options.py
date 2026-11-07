@@ -209,3 +209,19 @@ def test_worker_only_exports_explicit_build_directory(monkeypatch, requested):
     directory = worker._configure_pypto_build_dir((3, 4))
     assert directory == (Path(requested) / "serving_dp2_d3_4" if requested else None)
     assert os.environ.get("PYPTO_PROG_BUILD_DIR") == (str(directory) if requested else requested)
+
+
+@pytest.mark.parametrize("role,budget,threshold,pages", [
+    ("prefill", 8192, 8192, (145, 517, 517)), ("decode", 2048, 128, (35, 77, 77)),
+    ("decode", 16384, 8192, (35, 77, 77)), (None, 8192, 8192, (1041, 4101, 4101)),
+])
+def test_role_specific_state_rings_do_not_change_the_chunk_contract(role, budget, threshold, pages):
+    argv = ["--model", "model", "--max-model-len", "1048576", "--max-num-batched-tokens", str(budget),
+            "--long-prefill-token-threshold", str(threshold),
+            "--speculative-config", '{"method":"dspark","num_speculative_tokens":7}']
+    if role:
+        argv += ["--pd-role", role]
+    runtime = cli._build_runtime_config(_parse_cli_args(argv), model_family="deepseek_v4",
+        config_data={"num_hidden_layers": 43, "compress_ratios": [0, 0] + [4] * 21 + [128] * 20})
+    assert runtime.max_prefill_tokens_per_request == (min(budget, 8192) if role == "decode" else threshold)
+    assert tuple(g.max_blocks_per_seq for g in runtime.kv_cache_groups if g.name.endswith("state")) == pages

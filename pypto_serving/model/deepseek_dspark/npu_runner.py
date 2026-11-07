@@ -63,6 +63,7 @@ from pypto_serving.model.deepseek_dspark.weight_loader import (
     DSparkWeightStore,
 )
 from pypto_serving.serving.sampling.stop_rules import blocked_token_ids
+from pypto_serving.serving.memory.kv_cache import aligned_prefix_cache_boundary
 from pypto_serving.tools.profile import profile_span
 
 logger = logging.getLogger(__name__)
@@ -436,6 +437,7 @@ _PREFILL_PAGE_TABLE_SPECS = {
 
 _PREFILL_REQUEST_DYNAMIC_NAMES = frozenset(
     {
+        "state_checkpoint_ends",
         "ori_block_table", "hca_cmp_block_table", "csa_cmp_block_table", "idx_block_table",
         "hca_compress_state_block_table", "csa_compress_state_block_table",
         "csa_inner_compress_state_block_table",
@@ -502,6 +504,8 @@ def build_dspark_cache_group_specs(
     max_seq_len: int = DSPARK_MAX_SEQ_LEN,
     max_prefill_tokens: int = DSPARK_PREFILL_MAX_TOKENS,
     partitions: int = DSPARK_CACHE_PARTITIONS,
+    decode_only: bool = False,
+    prefill_only: bool = False,
 ) -> tuple[KVCacheGroupSpec, ...]:
     """Describe the seven DSpark cache families as scheduler-visible groups.
 
@@ -509,6 +513,9 @@ def build_dspark_cache_group_specs(
     not the rank count: the four ranks of one group hold identical replicated
     pools, so a block allocated in partition g exists -- with the same id -- on
     every rank of group g.
+
+    Dedicated deployments bound recurrent state independently of the chunk:
+    Decode retains continuation state; Prefill uses two 512-token state tiles.
     """
     for name, value in (("max_seq_len", max_seq_len), ("max_prefill_tokens", max_prefill_tokens)):
         if not isinstance(value, int) or isinstance(value, bool):
@@ -522,12 +529,19 @@ def build_dspark_cache_group_specs(
         )
     if not 0 < max_prefill_tokens <= DSPARK_PREFILL_MAX_TOKENS:
         raise ValueError(f"max_prefill_tokens must be in [1, {DSPARK_PREFILL_MAX_TOKENS}]")
+    if decode_only and prefill_only:
+        raise ValueError("A cache deployment cannot be both Prefill-only and Decode-only")
     # Prefill publishes its entire chunk before reading the historical window.
     # Keep both resident, including a boundary page for unaligned chunks.
     in_flight_tokens = max(min(max_prefill_tokens, max_seq_len), DSPARK_DECODE_SEQ)
 
-    def ring_blocks(history: int, page_tokens: int) -> int:
-        return math.ceil((history - 1 + in_flight_tokens) / page_tokens) + 1
+    def ring_blocks(history: int, page_tokens: int, *, state: bool = False) -> int:
+        # Two in-flight K7 steps plus the common checkpoint alignment span.
+        writes = min(max_seq_len, DSPARK_COMPRESSED_BLOCK_TOKENS + 2 * DSPARK_DECODE_SEQ)
+        writes = max(DSPARK_DECODE_SEQ, writes) if state and decode_only else in_flight_tokens
+        if state and prefill_only:
+            writes = min(in_flight_tokens, 1024)
+        return math.ceil((history - 1 + writes) / page_tokens) + 1
 
     all_layers = tuple(range(int(num_hidden_layers)))
     ratios = tuple(int(ratio) for ratio in (compress_ratios or ()))[:num_hidden_layers]
@@ -545,6 +559,7 @@ def build_dspark_cache_group_specs(
         compress_ratio: int = 1,
         extra_row_bytes: int = 0,
         sliding_window: int | None = None,
+        is_checkpoint_state: bool = False,
     ) -> KVCacheGroupSpec:
         storage_rows = block_size // compress_ratio
         return KVCacheGroupSpec(
@@ -560,6 +575,8 @@ def build_dspark_cache_group_specs(
             max_blocks_per_seq=int(max_blocks_per_seq),
             num_partitions=partitions,
             sliding_window=sliding_window,
+            is_checkpoint_state=is_checkpoint_state,
+            preserve_prefill_history=is_checkpoint_state and prefill_only,
         )
 
     c128_blocks_per_seq = math.ceil(max_seq_len / DSPARK_COMPRESSED_BLOCK_TOKENS)
@@ -609,8 +626,9 @@ def build_dspark_cache_group_specs(
             block_size=DSPARK_C128_STATE_PAGE_TOKENS,
             element_bytes=4,
             row_width=DSPARK_HCA_STATE_DIM,
-            max_blocks_per_seq=ring_blocks(DSPARK_SLIDING_WINDOW, DSPARK_C128_STATE_PAGE_TOKENS),
+            max_blocks_per_seq=ring_blocks(DSPARK_SLIDING_WINDOW, DSPARK_C128_STATE_PAGE_TOKENS, state=True),
             sliding_window=DSPARK_SLIDING_WINDOW,
+            is_checkpoint_state=True,
         ),
         group(
             "csa_state",
@@ -618,8 +636,9 @@ def build_dspark_cache_group_specs(
             block_size=DSPARK_C4_STATE_PAGE_TOKENS,
             element_bytes=4,
             row_width=DSPARK_CSA_STATE_DIM,
-            max_blocks_per_seq=ring_blocks(8, DSPARK_C4_STATE_PAGE_TOKENS),
+            max_blocks_per_seq=ring_blocks(8, DSPARK_C4_STATE_PAGE_TOKENS, state=True),
             sliding_window=8,
+            is_checkpoint_state=True,
         ),
         group(
             "csa_inner_state",
@@ -627,8 +646,9 @@ def build_dspark_cache_group_specs(
             block_size=DSPARK_C4_STATE_PAGE_TOKENS,
             element_bytes=4,
             row_width=DSPARK_CSA_INNER_STATE_DIM,
-            max_blocks_per_seq=ring_blocks(8, DSPARK_C4_STATE_PAGE_TOKENS),
+            max_blocks_per_seq=ring_blocks(8, DSPARK_C4_STATE_PAGE_TOKENS, state=True),
             sliding_window=8,
+            is_checkpoint_state=True,
         ),
     )
 
@@ -1095,6 +1115,7 @@ class DSparkPreparedPrefillInputs:
     # Packed request boundaries per rank; repeated terminal entries pad groups
     # with fewer requests to the dispatch's common request-axis extent.
     query_start_loc: torch.Tensor
+    state_checkpoint_ends: torch.Tensor
     rope_tables: dict[str, torch.Tensor]
     slot_mappings: dict[str, torch.Tensor]
     block_tables: dict[str, torch.Tensor]
@@ -1578,6 +1599,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 runtime.max_num_batched_tokens,
             ),
             partitions=self._compiled.layout.partitions,
+            decode_only=self._compiled.prefill is None,
+            prefill_only=self._compiled.prefill is not None and self._compiled.decode is None,
         )
         names = tuple(spec.name for spec in specs)
         if names != DSPARK_CACHE_GROUP_NAMES:
@@ -3124,6 +3147,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             )
         if len(batch.cache_partitions) != request_count:
             raise ValueError("DSpark prefill requires one cache partition per request")
+        if batch.read_block_ids_by_group and len(batch.read_block_ids_by_group) != request_count:
+            raise ValueError("DSpark prefill requires one entry read view per request")
         groups = tuple(int(group) for group in batch.cache_partitions)
         if min(groups) < 0 or max(groups) >= layout.partitions:
             raise ValueError(
@@ -3184,6 +3209,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         query_start_loc = torch.zeros(
             (layout.ranks, request_rows + 1), dtype=torch.int32
         )
+        state_checkpoint_ends = torch.zeros((layout.ranks, request_rows), dtype=torch.int32)
         slot_mappings = {
             name: torch.full((layout.ranks, tokens), -1, dtype=torch.int64)
             for name in (
@@ -3331,13 +3357,28 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 logit_row_indices[group * layout.tp_size, ordinal] = packed_end - 1
 
             blocks = group_rows[index]
+            read_blocks = batch.read_block_ids_by_group[index] if batch.read_block_ids_by_group else {}
             tables = {}
             for name, (group_name, max_depth, ring) in _PREFILL_PAGE_TABLE_SPECS.items():
                 ids = blocks[group_name]
                 if any(page < 0 for page in ids) or len(ids) > max_depth or (ring and not ids):
                     raise ValueError(f"Invalid DSpark page list for {group_name}")
                 lower = builder.ring_table if ring else builder.absolute_table
-                table = lower(ids, depth=max_depth)
+                if read_blocks and group_name.endswith("state"):
+                    page = DSPARK_C128_STATE_PAGE_TOKENS if group_name == "hca_state" else DSPARK_C4_STATE_PAGE_TOKENS
+                    history = DSPARK_SLIDING_WINDOW if group_name == "hca_state" else 8
+                    pages = read_blocks.get(group_name, {})
+                    expected = set(range(max(0, chunk_start - history) // page,
+                                         (chunk_start + page - 1) // page))
+                    if (set(pages) != expected or len(set(pages.values())) != len(pages)
+                            or any(q < 0 or q >= max_depth or not 0 <= value < self._cache_group_num_blocks[group_name]
+                                   for q, value in pages.items())):
+                        raise ValueError(f"Invalid DSpark entry history for {group_name}")
+                    table = torch.full((max_depth,), -1, dtype=torch.int32)
+                    if pages:
+                        table[list(pages)] = torch.tensor(list(pages.values()), dtype=torch.int32)
+                else:
+                    table = lower(ids, depth=max_depth)
                 tables[name] = table
             logical_positions_c = positions_c[:actual_tokens].reshape(1, -1)
             mappings = {
@@ -3350,10 +3391,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     tables["hca_cmp_block_table"].unsqueeze(0),
                     compress_ratio=128,
                 ),
-                "hca_state_slot_mapping_full": builder.state_slot_mapping(
+                "hca_state_slot_mapping_full": builder.ring_slot_mapping(
                     logical_positions_c,
-                    tables["hca_compress_state_block_table"].unsqueeze(0),
-                    state_page_tokens=DSPARK_C128_STATE_PAGE_TOKENS,
+                    [blocks["hca_state"]],
+                    block_size=DSPARK_C128_STATE_PAGE_TOKENS,
                 ),
                 "csa_cmp_slot_mapping_full": builder.compressed_slot_mapping(
                     logical_positions_c,
@@ -3365,19 +3406,23 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     tables["idx_block_table"].unsqueeze(0),
                     compress_ratio=4,
                 ),
-                "csa_state_slot_mapping_full": builder.state_slot_mapping(
+                "csa_state_slot_mapping_full": builder.ring_slot_mapping(
                     logical_positions_c,
-                    tables["csa_compress_state_block_table"].unsqueeze(0),
-                    state_page_tokens=DSPARK_C4_STATE_PAGE_TOKENS,
+                    [blocks["csa_state"]],
+                    block_size=DSPARK_C4_STATE_PAGE_TOKENS,
                 ),
-                "csa_inner_state_slot_mapping_full": builder.state_slot_mapping(
+                "csa_inner_state_slot_mapping_full": builder.ring_slot_mapping(
                     logical_positions_c,
-                    tables["csa_inner_compress_state_block_table"].unsqueeze(0),
-                    state_page_tokens=DSPARK_C4_STATE_PAGE_TOKENS,
+                    [blocks["csa_inner_state"]],
+                    block_size=DSPARK_C4_STATE_PAGE_TOKENS,
                 ),
             }
             for rank in ranks:
                 query_start_loc[rank, ordinal + 1:] = packed_end
+                state_checkpoint_ends[rank, ordinal] = aligned_prefix_cache_boundary(
+                    prompt_len, DSPARK_COMPRESSED_BLOCK_TOKENS,
+                    replay_tokens=model.runtime.speculative_prefix_cache_replay_tokens,
+                )
                 for name, table in tables.items():
                     block_tables[name][rank, ordinal] = table
                 for name, mapping in mappings.items():
@@ -3430,6 +3475,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             position_ids_local=position_ids_local,
             position_ids_full=position_ids_full,
             query_start_loc=query_start_loc,
+            state_checkpoint_ends=state_checkpoint_ends,
             rope_tables=rope_tables,
             slot_mappings=slot_mappings,
             block_tables=block_tables,
@@ -3523,6 +3569,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             "position_ids_local": inputs.position_ids_local,
             "position_ids_full": inputs.position_ids_full,
             "query_start_loc": inputs.query_start_loc,
+            "state_checkpoint_ends": inputs.state_checkpoint_ends,
             "logit_row_indices": inputs.logit_row_indices,
         }
         values.update(inputs.rope_tables)

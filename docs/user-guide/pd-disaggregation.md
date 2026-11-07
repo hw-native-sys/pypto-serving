@@ -29,14 +29,18 @@ pypto-serving \
   --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
   --dp 4 --ep 16 --tp 4 --block-size 32 \
   --max-model-len 655360 --max-num-batched-tokens 8192 \
-  --long-prefill-token-threshold 128 \
+  --long-prefill-token-threshold 8192 \
   --speculative-config '{"method":"dspark","num_speculative_tokens":7}' \
   --ring-heap 1073741824,1073741824,1073741824,1073741824 \
   --generate-config '{"max_new_tokens":131072,"temperature":0}' \
   --pd-config examples/pd.json --pd-role prefill --host 0.0.0.0 --port 8000
 ```
 
-Use `--pd-role decode` on D; both launchers specify K7, while P internally runs target-only prefill. The context limit covers **prompt plus output**: 655360 allows a 524288-token prompt plus 131072 generated tokens, subject to actual device memory. Configuring this limit is not a full-length validation.
+Use `--pd-role decode` on D; both launchers specify K7, while P internally runs target-only prefill. D can use `--max-num-batched-tokens 2048 --long-prefill-token-threshold 2048` while P keeps 8192. These local budgets plan conservative ring capacities; D still validates eight positions per request and does not run a local Prefill. The global scheduling budget does not force a batch to fill it.
+
+P and D rings may differ in length. Handoff selects the model's required logical tail and checkpoint state, then maps each page through the two local tables; D receives directly into its reservation without copying or shrinking a ring at takeover. Full-history compressed KV and index suffixes retain their normal coverage, and final request-local state/bootstrap still transfers on a full KV hit. A model-contract fingerprint distinguishes this state policy from older whole-ring senders. Unequal ring capacities have Host coverage; real-weight validation remains required.
+
+The context limit covers **prompt plus output**: 655360 allows a 524288-token prompt plus 131072 generated tokens, subject to actual device memory. Configuring this limit is not a full-length validation.
 
 When omitted, `--max-num-seqs` defaults to **16 on P** and **72 on D**.
 The value configures both the local request limit and cache-pool planning;
@@ -138,6 +142,41 @@ Handoff records use the same `request` and `plan_digest` as the worker job, incl
 owner-side `pd.native.write` durations and bytes. Byte counts include physical TP
 copies; they are not unique KV-content sizes. Logging/profiling failures do not
 authorize writes, change completion checks or release resources.
+
+Existing handoff records include `plan_ms` / `plan_thread_cpu_ms` on P completion,
+`lower_ms` / `lower_thread_cpu_ms` on worker submission, and
+`validation_ms` / `validation_thread_cpu_ms` on D plan authorization. Worker RPC
+records also include request encoding time. Thread CPU is measured only around
+synchronous preparation, not across asynchronous waits.
+
+P submission, final-state lookup and completion polling share one independent,
+bounded worker channel, so ready transfers need not wait behind unrelated compute.
+Final metadata is published after confirmed capture and retired with the request's
+lease. A submit acknowledgement is not native completion. Registry installation,
+D state reservation, bootstrap and retirement retain their existing ordering.
+The local channel bounds lock waiting, frame writes and complete frame reads by
+one handoff deadline; uncertain I/O closes the channel without releasing source
+pins. A rejected final metadata result fails its own handoff, while unrelated
+requests in the same successfully computed batch can continue.
+Profile spans `pd.progress.wait_channel`, `pd.progress.roundtrip` and
+`pd.progress.handle` separate channel waiting from handling;
+`pd.source.ready` / `pd.source.read` identify final metadata publication and lookup.
+
+On-demand profiling separates plan build/validation, worker and owner encoding/
+decoding, transfer lowering, owner call/RPC, provider address construction and
+`MooncakeTransferEngine.batch_transfer_sync_write`. The latter surrounds the native
+call; `pd.native.write` still covers the whole owner-side provider write. The
+bootstrap span also separates waiting for prior dispatches from bootstrap execution.
+Nested spans overlap and must not be added as independent latency components.
+Detailed spans add no default log records or per-request timing history.
+
+Region indexes and registry fingerprints are reused only within their node boot;
+accepted plan digests live only with the active request. Peer registrations are
+bounded, but old peer boots currently remain installed until the local node
+retires. Repeated peer restarts can exhaust that capacity even after their control
+sessions close; coordinate node retirement rather than evicting a registry that
+may still be referenced by native work. Log and trace files are not automatically
+rotated. Use bounded profiling windows and manage file retention externally.
 
 ### Internal request status
 

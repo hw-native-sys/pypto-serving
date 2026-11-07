@@ -74,13 +74,15 @@ def valid_from(groups, components, p_hit, d_hit, end, source, destination):
     return floors
 
 
-def page_indices(group, component, start, end, final, source_table, p_hit, d_hit, publication_floor):
+def page_indices(group, component, start, end, final, table, p_hit, d_hit, publication_floor, state_ranges):
     capacity = group.spec.token_capacity
     logical_end = (end + capacity - 1) // capacity
     if component.final:
         if not final:
             return ()
-        indices = range(max(0, logical_end - len(source_table)), logical_end)
+        indices = range(*state_ranges[group.name])
+        if not 0 <= indices.start <= indices.stop == logical_end:
+            raise ValueError("invalid final state range")
     else:
         if group.sliding_window is not None:
             if not final:
@@ -89,6 +91,9 @@ def page_indices(group, component, start, end, final, source_table, p_hit, d_hit
         else:
             floor = max(start, d_hit)
         indices = range(floor // capacity, end // capacity)
+    if group.sliding_window is not None and indices:
+        if indices.start < max(0, logical_end - len(table)):
+            raise ValueError("rolling snapshot cannot cover required logical pages")
     rows = {i: group.spec.storage_block_size for i in indices}
     remainder = end % capacity
     if final and remainder and (component.final or end > d_hit):
@@ -105,7 +110,44 @@ def physical(group, table, logical):
     return table[slot]
 
 
-def plan_chunk(binding, chunk, placement, contract, groups, source, destination, p_hit, mapping, continuation_digest):
+def page_ranges(pages):
+    """Canonical half-open intervals for a set of physical page IDs."""
+    ranges = []
+    for page in sorted(set(pages)):
+        if ranges and ranges[-1][1] == page:
+            ranges[-1] = (ranges[-1][0], page + 1)
+        else:
+            ranges.append((page, page + 1))
+    return tuple(ranges)
+
+
+def merge_ranges(ranges, *, reject_overlap=False):
+    """Normalize coverage, rejecting repeated writes before merging adjacency."""
+    result = []
+    for start, end in sorted(ranges):
+        if result and start <= result[-1][1]:
+            if reject_overlap and start < result[-1][1]:
+                raise ValueError("write aliases shared Prefix or another write")
+            result[-1] = (result[-1][0], max(result[-1][1], end))
+        else:
+            result.append((start, end))
+    return tuple(result)
+
+
+def _mapped_runs(pages):
+    """Merge only page pairs contiguous in both source and destination order."""
+    runs = []
+    for source, destination in sorted(pages):
+        if runs and (runs[-1][0] + runs[-1][2], runs[-1][1] + runs[-1][2]) == (source, destination):
+            a, b, count = runs[-1]
+            runs[-1] = (a, b, count + 1)
+        else:
+            runs.append((source, destination, 1))
+    return tuple(runs)
+
+
+def plan_chunk(binding, chunk, placement, contract, groups, source, destination, p_hit, mapping,
+               continuation_digest, state_ranges):
     specs = {g.name: g for g in groups}
     src = {g.name: g for g in source}
     dst = {g.name: g for g in destination}
@@ -122,7 +164,7 @@ def plan_chunk(binding, chunk, placement, contract, groups, source, destination,
             raise ValueError("invalid physical block table")
     floors = (valid_from(groups, contract.components, p_hit, placement.hit, chunk.end,
                          chunk.blocks, placement.blocks) if chunk.final else {})
-    copies, units = [], []
+    copies, units, mapped = [], [], {}
     for sr, dr in mapping:
         for component in contract.components:
             if component.final and not chunk.final:
@@ -131,21 +173,29 @@ def plan_chunk(binding, chunk, placement, contract, groups, source, destination,
             if a.layout != b.layout or min(a.blocks, b.blocks) <= 0:
                 raise ValueError("incompatible source/destination geometry")
             units.append((dr, component.name))
-            if component.group in specs:
-                group = specs[component.group]
-                pages = tuple((physical(group, chunk.blocks[group.name], logical),
-                               physical(group, placement.blocks[group.name], logical))
-                              for logical, _ in page_indices(group, component, start, chunk.end, chunk.final,
-                                  chunk.blocks[group.name], p_hit, placement.hit, floors))
-            else:
-                pages = ((chunk.state_slots[component.group], placement.state_slots[component.group]),)
-            if any(min(sb, db) < 0 or sb >= a.blocks or db >= b.blocks for sb, db in pages):
+            key = component.group, component.final
+            if key not in mapped:
+                if component.group in specs:
+                    group = specs[component.group]
+                    indices = page_indices(group, component, start, chunk.end, chunk.final,
+                        chunk.blocks[group.name], p_hit, placement.hit, floors, state_ranges)
+                    if group.sliding_window is not None and len(indices) > len(placement.blocks[group.name]):
+                        raise ValueError("destination ring cannot cover required logical pages")
+                    pages = ((physical(group, chunk.blocks[group.name], logical),
+                              physical(group, placement.blocks[group.name], logical))
+                             for logical, _ in indices)
+                else:
+                    pages = ((chunk.state_slots[component.group], placement.state_slots[component.group]),)
+                mapped[key] = _mapped_runs(pages)
+            runs = mapped[key]
+            if any(min(sb, db) < 0 or sb + count > a.blocks or db + count > b.blocks
+                   for sb, db, count in runs):
                 raise ValueError("physical block outside registered region")
             for layer in range(len(a.layers)):
-                for sb, db in sorted(pages):
+                for sb, db, count in runs:
                     # Final partial pages are exclusively reserved and copied whole.
                     copy = Copy(component.name, sr, dr, (layer * a.blocks + sb) * a.page_bytes,
-                                (layer * b.blocks + db) * b.page_bytes, a.page_bytes)
+                                (layer * b.blocks + db) * b.page_bytes, count * a.page_bytes)
                     if copies and copies[-1].component == copy.component:
                         previous = copies[-1]
                         if (previous.source_rank == sr and previous.destination_rank == dr
@@ -166,10 +216,7 @@ class SourcePins:
     def retain(self, chunk):
         if chunk.request in self.active:
             raise RuntimeError("one transfer per request may be in flight")
-        tables = {k: list(v) for k, v in chunk.blocks.items()}
-        self.cache.retain_group_block_snapshot(tables, chunk.partition)
-        self.active[chunk.request] = (tables, chunk.partition)
+        self.active[chunk.request] = self.cache.retain_group_block_snapshot(chunk.blocks, chunk.partition)
 
     def release(self, request):
-        tables, partition = self.active.pop(request)
-        self.cache.release_group_block_snapshot(tables, partition)
+        self.cache.release_group_block_snapshot(self.active.pop(request))

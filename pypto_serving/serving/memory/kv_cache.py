@@ -12,16 +12,23 @@ from __future__ import annotations
 import hashlib
 import math
 import struct
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 
 import torch
 
 from pypto_serving.config.types import KVCacheGroupSpec, KvAllocation, ModelConfig, RuntimeConfig
+from pypto_serving.tools.profile import profile_span
 from .checkpoint import GroupPrefixCheckpoints
 from .reservation import GroupCacheReservation, GroupedCacheReservations
 
 
 NONE_HASH = hashlib.sha256(b"pypto-serving-prefix-root/v1").digest()
+
+
+def aligned_prefix_cache_boundary(token_count: int, alignment: int, *, replay_tokens: int = 0) -> int:
+    """Return the common page boundary before the required local replay."""
+    return max(0, token_count - max(1, replay_tokens)) // alignment * alignment
 
 
 class KVCacheCapacityError(RuntimeError):
@@ -161,6 +168,14 @@ class _GroupBlockPool:
                 f"Invalid local block ID {block_id} for cache group {self.spec.name!r}"
             )
         return self.blocks[partition * self.blocks_per_partition + block_id]
+
+
+@dataclass(slots=True, eq=False)
+class GroupBlockSnapshot:
+    """Host-only pin returned by the cache manager; release through that manager."""
+
+    _owner: KvCacheManager | None = field(repr=False)
+    _groups: tuple[tuple[FreeKVCacheBlockQueue, tuple[KVCacheBlock, ...]], ...] = field(repr=False)
 
 
 class KvCacheManager:
@@ -751,7 +766,7 @@ class KvCacheManager:
     def group_prefix_cache_boundary(self, token_count: int, *, replay_tokens: int = 0) -> int:
         """Align a complete prompt's reuse limit after its required local replay."""
         alignment = self.group_prefix_cache_alignment
-        return max(0, token_count - max(1, replay_tokens)) // alignment * alignment
+        return aligned_prefix_cache_boundary(token_count, alignment, replay_tokens=replay_tokens)
 
     @property
     def has_eagle_groups(self) -> bool:
@@ -1013,7 +1028,14 @@ class KvCacheManager:
                 safe_computed_tokens // pool.spec.spec.token_capacity,
                 len(hashes),
             )
+            if pool.spec.is_checkpoint_state:
+                if checkpoint_boundary is None:
+                    continue
+                completed = min(completed, checkpoint_boundary // pool.spec.spec.token_capacity)
             start = min(cached_counts.get(name, 0), completed)
+            if pool.spec.is_checkpoint_state:
+                start = max(start, max(0, checkpoint_boundary - pool.spec.sliding_window)
+                            // pool.spec.spec.token_capacity)
             if valid_from is not None:
                 token_capacity = pool.spec.spec.token_capacity
                 start = max(start, (valid_from.get(name, 0) + token_capacity - 1) // token_capacity)
@@ -1036,11 +1058,39 @@ class KvCacheManager:
                                            valid_from, checkpoint_boundary)
         return cached_counts
 
+    def retain_group_prefill_history(
+        self, request_id: str, token_count: int,
+    ) -> tuple[dict[str, dict[int, int]], GroupBlockSnapshot | None]:
+        """Retain entry state before an entire Prefill chunk rebinds its ring."""
+        if token_count <= 0:
+            return {}, None
+        read_blocks = {}
+        pin_blocks = {name: [] for name in self._group_pools}
+        for name, pool in self._group_pools.items():
+            if not pool.spec.preserve_prefill_history:
+                continue
+            page = pool.spec.spec.token_capacity
+            owned = pool.request_blocks.get(request_id, ())
+            pages = {}
+            for logical in range(max(0, token_count - pool.spec.sliding_window) // page,
+                                 (token_count + page - 1) // page):
+                slot = logical % pool.spec.max_blocks_per_seq
+                block = owned[slot] if slot < len(owned) else None
+                if block is None:
+                    raise RuntimeError(f"Missing Prefill history for {name}:{logical}")
+                pages[logical] = pool.local_block_id(block)
+            read_blocks[name] = pages
+            pin_blocks[name] = list(dict.fromkeys(pages.values()))
+        if not read_blocks:
+            return {}, None
+        partition = self._group_request_partitions[request_id]
+        return read_blocks, self.retain_group_block_snapshot(pin_blocks, partition)
+
     def retain_group_block_snapshot(
         self,
-        block_ids_by_group: dict[str, list[int]],
+        block_ids_by_group: dict[str, Sequence[int]],
         partition: int,
-    ) -> None:
+    ) -> GroupBlockSnapshot:
         """Pin one scheduled grouped block-table snapshot until its step settles.
 
         Async scheduling may advance a rolling request table before an older
@@ -1048,45 +1098,54 @@ class KvCacheManager:
         until that step is confirmed or discarded, matching vLLM's in-flight
         block lifetime fence.
         """
-        if not block_ids_by_group:
-            return
-        if set(block_ids_by_group) != set(self._group_pools):
-            raise ValueError("Grouped block snapshot does not match configured cache groups")
+        with profile_span("cache.snapshot.retain", cat="cache"):
+            if block_ids_by_group and set(block_ids_by_group) != set(self._group_pools):
+                raise ValueError("Grouped block snapshot does not match configured cache groups")
 
-        blocks = []
-        for name, block_ids in block_ids_by_group.items():
-            pool = self._group_pools[name]
-            if len(block_ids) != len(set(block_ids)):
-                raise ValueError(f"Cache group {name!r} snapshot contains duplicate block IDs")
-            for block_id in block_ids:
-                block = pool.block_from_local_id(partition, block_id)
-                if block.ref_cnt <= 0:
-                    raise RuntimeError(
-                        f"Cannot retain unowned grouped KV block {name}:{block_id}"
-                    )
-                blocks.append(block)
+            groups = []
+            for name, block_ids in block_ids_by_group.items():
+                pool = self._group_pools[name]
+                if not 0 <= partition < len(pool.free_queues):
+                    raise ValueError(f"Invalid cache partition {partition}")
+                if len(block_ids) != len(set(block_ids)):
+                    raise ValueError(f"Cache group {name!r} snapshot contains duplicate block IDs")
+                blocks = []
+                for block_id in block_ids:
+                    block = pool.block_from_local_id(partition, block_id)
+                    if block.ref_cnt <= 0:
+                        raise RuntimeError(
+                            f"Cannot retain unowned grouped KV block {name}:{block_id}"
+                        )
+                    blocks.append(block)
+                groups.append((pool.free_queues[partition], tuple(blocks)))
 
-        for block in blocks:
-            block.ref_cnt += 1
+            # Resolve and validate everything before acquiring any references.
+            snapshot = GroupBlockSnapshot(self, tuple(groups))
+            for _, blocks in snapshot._groups:
+                for block in blocks:
+                    block.ref_cnt += 1
+            return snapshot
 
     def release_group_block_snapshot(
         self,
-        block_ids_by_group: dict[str, list[int]],
-        partition: int,
+        snapshot: GroupBlockSnapshot,
     ) -> None:
         """Release pins acquired by :meth:`retain_group_block_snapshot`."""
-        for name, block_ids in block_ids_by_group.items():
-            pool = self._group_pools[name]
-            for block_id in block_ids:
-                block = pool.block_from_local_id(partition, block_id)
-                if block.ref_cnt <= 0:
-                    raise RuntimeError(
-                        f"Grouped KV snapshot block {name}:{block_id} has "
-                        f"invalid ref_cnt={block.ref_cnt}"
-                    )
-                block.ref_cnt -= 1
-                if block.ref_cnt == 0:
-                    pool.free_queues[partition].append(block)
+        with profile_span("cache.snapshot.release", cat="cache"):
+            if snapshot._owner is not self:
+                raise RuntimeError("Grouped KV snapshot belongs to another manager or was already released")
+            for queue, blocks in snapshot._groups:
+                for block in blocks:
+                    if block.ref_cnt <= 0:
+                        raise RuntimeError(
+                            f"Grouped KV snapshot block {block.block_id} has invalid ref_cnt={block.ref_cnt}"
+                        )
+                    block.ref_cnt -= 1
+                    if block.ref_cnt == 0:
+                        queue.append(block)
+            # A retired handle must not keep the manager or its pages alive.
+            snapshot._groups = ()
+            snapshot._owner = None
 
     def cache_group_blocks_from_snapshot(
         self,
@@ -1124,7 +1183,17 @@ class KvCacheManager:
                 safe_computed_tokens // pool.spec.spec.token_capacity,
                 len(hashes),
             )
+            if pool.spec.is_checkpoint_state:
+                if checkpoint_boundary is None:
+                    continue
+                completed = min(completed, checkpoint_boundary // pool.spec.spec.token_capacity)
             start = min(cached_counts.get(name, 0), completed)
+            if pool.spec.is_checkpoint_state:
+                start = max(start, max(0, checkpoint_boundary - pool.spec.sliding_window)
+                            // pool.spec.spec.token_capacity)
+                # A snapshot may already have wrapped beyond the checkpoint.
+                capacity = pool.spec.spec.token_capacity
+                start = max(start, (num_computed_tokens + capacity - 1) // capacity - len(block_ids))
             if valid_from is not None:
                 token_capacity = pool.spec.spec.token_capacity
                 start = max(start, (valid_from.get(name, 0) + token_capacity - 1) // token_capacity)
