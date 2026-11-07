@@ -139,8 +139,12 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             device_ids=device_ids,
             pypto_build_dir=pypto_build_dir,
         )
+        self._configure_compiler("tensormap_and_ringbuffer")
+
+    def _configure_compiler(self, runtime: str) -> None:
         self._compiler = KernelCompiler(
             run_config=build_pypto_run_config(
+                runtime=runtime,
                 platform=self._platform,
                 device_ids=self._device_ids,
                 pypto_build_dir=self._pypto_build_dir,
@@ -173,6 +177,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
         """Compile Qwen3-14B PyPTO kernels and pack runtime artifacts."""
+        self._configure_compiler(model.runtime.chip_runtime)
         kernel_dir = _find_pypto_lib_qwen14b_dir()
         qwen3_prefill_fwd = _load_pypto_lib_qwen14b_module("prefill_fwd", kernel_dir)
         # The fused all-layer decode lives in decode_fwd.decode_fwd. It is

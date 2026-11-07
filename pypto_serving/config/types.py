@@ -211,6 +211,12 @@ class RuntimeConfig:
     ring_dep_pool: int | list[int] | None = None
     ring_task_window: int | list[int] | None = None
     ring_heap: int | list[int] | None = None
+    # Chip scheduler policy, independent of backend and onboard/simulation mode.
+    chip_runtime: Literal["tensormap_and_ringbuffer", "host_build_graph"] = "tensormap_and_ringbuffer"
+
+    def __post_init__(self) -> None:
+        if self.chip_runtime not in ("tensormap_and_ringbuffer", "host_build_graph"):
+            raise ValueError(f"Unsupported chip runtime: {self.chip_runtime}")
 
 
 @dataclass(frozen=True)

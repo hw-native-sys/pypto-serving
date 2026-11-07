@@ -208,3 +208,25 @@ def test_explicit_output_base_keeps_programs_separate(tmp_path):
         compiler.compile(name, jit_fn)
         assert jit_fn.last_config.save_kernels_dir == str(tmp_path / name)
     assert config.save_kernels_dir == str(tmp_path)
+
+
+@pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
+@pytest.mark.parametrize("platform", ["a2a3", "a2a3sim"])
+def test_chip_runtime_survives_compiler_config_replacement(runtime, platform):
+    from pypto.runtime import ExecutionMode
+
+    config = build_pypto_run_config(platform=platform, device_ids=(2,), runtime=runtime)
+    jit_fn = _FakeJitFn(MagicMock(spec=DistributedCompiledProgram))
+    compiler = KernelCompiler(run_config=config, enable_scope_stats=True)
+    compiler.compile("decode", jit_fn)
+    assert jit_fn.last_config.distributed_config.runtime == runtime
+    assert jit_fn.last_config.distributed_config.device_ids == [2]
+    assert jit_fn.last_config.execution_mode == (
+        ExecutionMode.SIM if platform.endswith("sim") else ExecutionMode.ONBOARD
+    )
+
+
+def test_chip_runtime_default_and_invalid_value():
+    assert _base_run_config().distributed_config.runtime == "tensormap_and_ringbuffer"
+    with pytest.raises(ValueError, match="Unsupported chip runtime"):
+        build_pypto_run_config(platform="a2a3", device_ids=(0,), runtime="unknown")

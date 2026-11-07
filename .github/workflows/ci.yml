@@ -97,6 +97,18 @@ jobs:
           build-namespace: pypto-serving
           pip-cache-name: pip-pypto-serving
 
+      - name: Run compiler runtime CPU guards
+        env:
+          TORCH_DEVICE_BACKEND_AUTOLOAD: '0'
+        run: |
+          source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
+          cd "$GITHUB_WORKSPACE/dist-checkout"
+          python -m pytest -q \
+            tests/unit/test_ci_runtime_build.py \
+            tests/unit/model/common/test_kernel_compiler.py \
+            tests/unit/model/common/test_kernel_compiler_codegen.py \
+            tests/unit/model/qwen/test_npu_executor.py
+
       - name: Run Qwen3 accuracy guard
         env:
           PYTHONPATH: ${{ github.workspace }}/dist-checkout
