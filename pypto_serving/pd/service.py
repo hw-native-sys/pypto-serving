@@ -329,6 +329,11 @@ class Service:
             entry.prefix = prefix
             entry.normalized_digest = digest(continuation)
             try:
+                if self.cache.tiering is not None:
+                    await self.cache.tiering.restore(
+                        request, {k: [bytes.fromhex(h) for h in hashes] for k, hashes in prefix.hashes.items()},
+                        len(continuation.tokens), maximum=len(continuation.tokens), groups=tuple(prefix.hashes),
+                        cancelled=lambda: entry.cancelled or not self.is_ready())
                 if not self.is_ready():
                     raise NodeUnavailable("PD node is unavailable")
                 if (sum(r.reservation is not None for r in self.requests.values())

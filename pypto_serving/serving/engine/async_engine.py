@@ -258,6 +258,13 @@ class ReplicaEngineCore:
             block_size=block_size,
             enable_prefix_cache=self.config.enable_prefix_cache,
         )
+        self._cache_tiering = None
+        if runtime.kv_offload_bytes < 0:
+            raise ValueError("DDR offload capacity must not be negative")
+        if runtime.kv_offload_bytes:
+            from pypto_serving.serving.memory.tiering.integration import Session
+            self._cache_tiering = Session(self)
+            self.config = self._cache_tiering.configure(self.config)
         self._async_scheduling = self.config.resolve_async_scheduling()
         scheduler_config = SchedulerConfig(
             max_num_running_reqs=self.config.max_num_running_reqs,
@@ -410,6 +417,8 @@ class ReplicaEngineCore:
                     self._runtime.page_size,
                 )
 
+        if self._cache_tiering is not None:
+            await self._cache_tiering.start()
         # The KV-cache block pool, scheduler tables and tokenizer are now
         # resident. Freeze the engine-process heap so the GC won't rescan them
         # during serving (see gc_utils). Per-process: the worker freezes its
@@ -445,6 +454,8 @@ class ReplicaEngineCore:
         """
         self._running = False
         await self._drain_loop_task()
+        if self._cache_tiering is not None:
+            await self._cache_tiering.close()
         reaped = await asyncio.to_thread(self._shutdown_worker, timeout=30)
         if reaped:
             logger.info("ReplicaEngineCore stopped")
@@ -803,6 +814,8 @@ class ReplicaEngineCore:
         """
         logger.info("Engine loop started (async_scheduling=%s)", self._async_scheduling)
         while self._running:
+            if self._cache_tiering is not None:
+                self._cache_tiering.progress()
             dispatched = False
             if len(self._batch_queue) < self._max_in_flight and self.scheduler.has_work():
                 dispatched = self._try_dispatch_step()

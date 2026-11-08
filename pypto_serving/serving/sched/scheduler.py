@@ -424,6 +424,8 @@ class Scheduler:
         request = self.requests.get(request_id)
         if request is None:
             return
+        if self.kv_cache_manager.tiering is not None:
+            self.kv_cache_manager.tiering.cancel(request_id)
         request.status = RequestStatus.FINISHED_ABORTED
         self._free_request_blocks(request)
         self.running = [r for r in self.running if r.request_id != request_id]
@@ -586,6 +588,13 @@ class Scheduler:
             # Prefix cache lookup
             if self.config.enable_prefix_cache:
                 if self.kv_cache_manager.has_groups:
+                    tiering = self.kv_cache_manager.tiering
+                    if tiering is not None and not tiering.prepare(
+                        request.request_id, request.group_block_hashes, request.num_prompt_tokens,
+                        maximum=request.group_checkpoint_boundary,
+                    ):
+                        remaining_waiting.append(request)
+                        continue
                     (
                         request.allocated_group_block_ids,
                         request.num_computed_tokens,

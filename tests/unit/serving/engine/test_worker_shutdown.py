@@ -83,6 +83,7 @@ def _core(process, queue=None) -> ReplicaEngineCore:
     core._worker_stranded = False
     core._running = True
     core._loop_task = None
+    core._cache_tiering = None
     return core
 
 
