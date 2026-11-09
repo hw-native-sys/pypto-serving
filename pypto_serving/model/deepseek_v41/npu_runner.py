@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
@@ -982,11 +983,19 @@ def prepare_compressed_metadata(
             if pages:
                 tables[group, batch_row, :len(pages)] = torch.tensor(pages, dtype=torch.int32)
             starts[group, batch_row + 1:] = offset + count
-            for local, position in enumerate(range(request.start, request.end)):
-                if (position + 1) % ratio == 0:
-                    logical = position // ratio
-                    writes[group, offset + local] = pages[logical // 128] * 128 + logical % 128
-                    rope[group, offset + local] = position + 1 - ratio
+            # Scalar writes are cheaper for decode and very short prefill slices.
+            if count < 32:
+                for local, position in enumerate(range(request.start, request.end)):
+                    if (position + 1) % ratio == 0:
+                        logical = position // ratio
+                        writes[group, offset + local] = pages[logical // 128] * 128 + logical % 128
+                        rope[group, offset + local] = position + 1 - ratio
+            else:
+                completed = (p + 1) % ratio == 0
+                logical = p[completed].long() // ratio
+                page_ids = torch.tensor(pages, dtype=torch.int64)
+                writes[group, section][completed] = page_ids[logical // 128] * 128 + logical % 128
+                rope[group, section][completed] = p[completed] + 1 - ratio
     def replicate(tensor):
         return tensor.repeat_interleave(topology.tp, dim=0)
     return CompressedMetadata(*(replicate(t) for t in (positions, ids, starts, lens, writes, rope, tables, states)),
@@ -1295,20 +1304,16 @@ class SegmentInputs:
     group_counts: tuple[int, ...]
 
 
-def prepare_segment_inputs(
-    embeddings: torch.Tensor,
-    step: ForwardStep,
-    topology: SegmentTopology,
-    *,
-    max_prepare_bytes: int = 4 << 30,
-) -> SegmentInputs:
-    """Pack fresh embedding inputs without depending on request batch order.
+@dataclass(frozen=True)
+class SegmentInputLayout:
+    row_indices: torch.Tensor
+    request_last_rows: tuple[tuple[int, int], ...]
+    group_counts: tuple[int, ...]
+    source_ranges: tuple[tuple[int, int, int, int], ...]
 
-    Each DP group contains contiguous local-capacity TP slabs, including empty
-    slabs. Padding is zero in both residual and pre_mix. row_indices supplies the
-    same mapping for positions and other token metadata. This does not lower
-    cache pages or initialize a production all-mode model adapter.
-    """
+
+def _prepare_segment_layout(embeddings, step, topology, *, max_prepare_bytes=4 << 30):
+    """Validate packed inputs and map rows without allocating residual streams."""
     if type(max_prepare_bytes) is not int or max_prepare_bytes <= 0:
         raise ValueError("max_prepare_bytes must be a positive integer")
     if not isinstance(step, ForwardStep) or not isinstance(topology, SegmentTopology):
@@ -1348,19 +1353,47 @@ def prepare_segment_inputs(
         raise ValueError(f"segment preparation requires estimated {estimate} bytes; budget={max_prepare_bytes}")
     if not bool(torch.isfinite(embeddings).all()):
         raise ValueError("embeddings must be finite")
-    residual = torch.zeros(topology.dp, topology.capacity, 4, hidden, dtype=torch.float32)
-    pre_mix = torch.zeros(topology.dp, topology.capacity, 4, dtype=torch.float32)
     row_indices = torch.full((topology.dp, topology.capacity), -1, dtype=torch.int64)
     for partition, start, source, count in source_ranges:
-        residual[partition, start:start + count].copy_(embeddings[source:source + count, None])
-        pre_mix[partition, start:start + count, 0] = 1
         row_indices[partition, start:start + count] = torch.arange(source, source + count)
-    return SegmentInputs(
-        residual.reshape(topology.world, topology.local_capacity, 4, hidden),
-        pre_mix.reshape(topology.world, topology.local_capacity, 4),
+    return SegmentInputLayout(
         row_indices.reshape(topology.world, topology.local_capacity),
-        tuple(last_rows), tuple(counts),
+        tuple(last_rows), tuple(counts), tuple(source_ranges),
     )
+
+
+def prepare_segment_inputs(
+    embeddings: torch.Tensor,
+    step: ForwardStep,
+    topology: SegmentTopology,
+    *,
+    max_prepare_bytes: int = 4 << 30,
+) -> SegmentInputs:
+    """Pack fresh embedding inputs without depending on request batch order.
+
+    Each DP group contains contiguous local-capacity TP slabs, including empty
+    slabs. Padding is zero in both residual and pre_mix. row_indices supplies the
+    same mapping for positions and other token metadata. This does not lower
+    cache pages or initialize a production all-mode model adapter.
+    """
+    layout = _prepare_segment_layout(embeddings, step, topology, max_prepare_bytes=max_prepare_bytes)
+    hidden = embeddings.shape[1]
+    residual = torch.empty(topology.world, topology.local_capacity, 4, hidden, dtype=torch.float32)
+    pre_mix = torch.empty(topology.world, topology.local_capacity, 4, dtype=torch.float32)
+    return _pack_segment_inputs(embeddings, topology, layout, residual, pre_mix)
+
+
+def _pack_segment_inputs(embeddings, topology, layout, residual, pre_mix):
+    """Fill phase-owned buffers; callers validate the input layout before writing."""
+    residual.zero_()
+    pre_mix.zero_()
+    rows = residual.view(topology.dp, topology.capacity, 4, embeddings.shape[1])
+    mix = pre_mix.view(topology.dp, topology.capacity, 4)
+    for partition, start, source, count in layout.source_ranges:
+        rows[partition, start:start + count].copy_(embeddings[source:source + count, None])
+        mix[partition, start:start + count, 0] = 1
+    return SegmentInputs(residual, pre_mix, layout.row_indices,
+                         layout.request_last_rows, layout.group_counts)
 
 
 # swa_metadata
@@ -1424,11 +1457,20 @@ class HostEngramResources:
             raise ValueError("Engram lookup capacity disagrees with the forward ABI")
         target.zero_()
         offsets = [0] * topology.dp
+        first_tokens, first_values = None, None
         for request in step.requests:
             start = offsets[request.partition]
-            values = self.host.lookup(request.token_ids, topology.capacity,
-                                      request.start, request_id=request.request_id)
             count = len(request.token_ids)
+            tokens = tuple(request.token_ids)
+            if request.start == 0 and tokens == first_tokens:
+                # Identical first chunks share table rows, but retain private histories.
+                self.host.hash_ids(tokens, request.start, request_id=request.request_id)
+                values = first_values
+            else:
+                values = self.host.lookup(tokens, count, request.start, request_id=request.request_id)
+                if request.start == 0:
+                    # Keep only one lookup, bounded by a single request's active rows.
+                    first_tokens, first_values = tokens, values
             for tp_rank in range(topology.tp):
                 rank = request.partition * topology.tp + tp_rank
                 target[rank, :, start:start + count].copy_(values[:, :count])
@@ -1556,14 +1598,33 @@ def prepare_swa_window_metadata(
     positions = torch.zeros(topology.dp, topology.capacity, dtype=torch.int64)
     slots = torch.full_like(positions, -1)
     indices = torch.full((topology.dp, topology.capacity, 128), -1, dtype=torch.int32)
+    window_offsets = None
     for group, row, start, count, pages in ranges:
-        for local in range(count):
-            position = start + local
-            positions[group, row + local] = position
-            slots[group, row + local] = pages[position // 128] * 128 + position % 128
-            visible = range(max(0, position - 127), position + 1)
-            addresses = [pages[p // 128] * 128 + p % 128 for p in visible]
-            indices[group, row + local, :len(addresses)] = torch.tensor(addresses, dtype=torch.int32)
+        if count < 8:
+            for local in range(count):
+                position = start + local
+                positions[group, row + local] = position
+                slots[group, row + local] = pages[position // 128] * 128 + position % 128
+                visible = range(max(0, position - 127), position + 1)
+                addresses = [pages[p // 128] * 128 + p % 128 for p in visible]
+                indices[group, row + local, :len(addresses)] = torch.tensor(addresses, dtype=torch.int32)
+            continue
+        if window_offsets is None:
+            window_offsets = torch.arange(128, dtype=torch.int64)
+        page_ids = torch.tensor(pages, dtype=torch.int64)
+        # Bound vectorized scratch to one 128-row tile, including long chunks.
+        for begin in range(0, count, 128):
+            end = min(begin + 128, count)
+            p = torch.arange(start + begin, start + end, dtype=torch.int64)
+            section = slice(row + begin, row + end)
+            positions[group, section] = p
+            slots[group, section] = page_ids[p // 128] * 128 + p % 128
+            visible = (p - 127).clamp_min(0)[:, None] + window_offsets
+            active = visible <= p[:, None]
+            visible.masked_fill_(~active, 0)
+            addresses = page_ids[visible // 128] * 128 + visible % 128
+            addresses.masked_fill_(~active, -1)
+            indices[group, section] = addresses.to(torch.int32)
     return SwaWindowMetadata(
         positions.repeat_interleave(topology.tp, dim=0),
         slots.repeat_interleave(topology.tp, dim=0),
@@ -1678,9 +1739,9 @@ class InputStateRuntime:
     def stage(self, embeddings: torch.Tensor, step: ForwardStep) -> tuple[LayerState, SegmentInputs]:
         if self.failed:
             raise RuntimeError("input upload failed; recreate the worker before reuse")
-        packed = prepare_segment_inputs(embeddings, step, self.host.topology)
-        self.host.residual.copy_(packed.residual)
-        self.host.pre_mix.copy_(packed.pre_mix)
+        layout = _prepare_segment_layout(embeddings, step, self.host.topology)
+        packed = _pack_segment_inputs(embeddings, self.host.topology, layout,
+                                      self.host.residual, self.host.pre_mix)
         try:
             for source, destination in ((self.host.residual, self.residual),
                                         (self.host.pre_mix, self.pre_mix)):
@@ -1691,9 +1752,7 @@ class InputStateRuntime:
         except BaseException:
             self.failed = True
             raise
-        inputs = SegmentInputs(self.host.residual, self.host.pre_mix,
-                               packed.row_indices, packed.request_last_rows, packed.group_counts)
-        return LayerState(self.residual, self.pre_mix, "tp_local_token"), inputs
+        return LayerState(self.residual, self.pre_mix, "tp_local_token"), packed
 
     def close(self):
         for tensor in reversed(self._resident):
@@ -1845,7 +1904,7 @@ class PrefillMetadataResources:
         if embeddings.shape[-1] != self.full_hidden_size:
             raise ValueError("full prefill embedding width disagrees with the checkpoint")
         counts = self.stage(step, engram)
-        packed = prepare_segment_inputs(embeddings, step, self.topology)
+        packed = _prepare_segment_layout(embeddings, step, self.topology)
         f = self.fields
         f["full_embedding"].zero_()
         active = packed.row_indices >= 0
@@ -2117,6 +2176,7 @@ class V41ResidentResources:
         self._inputs = None
         self._output_rows = None
         self._group_counts = None
+        self._padding_executor = None
         self._prefill_fwd = None
         self._decode_fwd = None
         self._decode_binding = None
@@ -2178,6 +2238,27 @@ class V41ResidentResources:
             self.worker, program, names, run_config, self.decode_host.topology,
             counts_are_tensor, self.weights, self.cache, self.decode_host, self.final, self.engram)
 
+    def _reset_padding(self, partitions):
+        """Overlap independent chip copies and drain every reset before dispatch."""
+        if len(partitions) < 2:
+            for partition in partitions:
+                self.cache.reset_padding(partition)
+            return
+        if self._padding_executor is None:
+            self._padding_executor = ThreadPoolExecutor(
+                max_workers=self.cache.plan.buffers[0].shape[0],
+                thread_name_prefix="v41-padding-reset",
+            )
+        futures = []
+        try:
+            for partition in partitions:
+                futures.append(self._padding_executor.submit(self.cache.reset_padding, partition))
+            for future in futures:
+                future.result()
+        finally:
+            # A failed copy must not leave another rank mutating cache during abort.
+            wait(futures)
+
     def begin_step(self, embeddings, step):
         if self.closed or self._step is not None:
             raise RuntimeError("V4.1 worker is closed or a step is already active")
@@ -2189,8 +2270,7 @@ class V41ResidentResources:
         if step.phase == "decode":
             dispatch_step, embeddings, padding_partitions = pad_single_decode(
                 step, embeddings, self.cache.plan)
-            for partition in padding_partitions:
-                self.cache.reset_padding(partition)
+            self._reset_padding(padding_partitions)
         host = self.prefill_host if step.phase == "prefill" else self.decode_host
         counts = (host.stage_full(dispatch_step, embeddings, self.engram_host)
                   if step.phase == "prefill" and self._prefill_fwd is not None else
@@ -2253,6 +2333,9 @@ class V41ResidentResources:
             return
         self._step = self._inputs = self._group_counts = self._output_rows = None
         try:
+            if self._padding_executor is not None:
+                self._padding_executor.shutdown(wait=True)
+                self._padding_executor = None
             if self._prefill_fwd is not None:
                 self._prefill_fwd.close()
                 self._prefill_fwd = None
