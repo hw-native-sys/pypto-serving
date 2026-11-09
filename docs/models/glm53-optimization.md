@@ -1,5 +1,63 @@
 # GLM-5.3-Flash 优化计划与进展
 
+## 基于 PR #286 的分支整理与实测（2026-11-09）
+
+- Serving：[PR #314](https://github.com/hw-native-sys/pypto-serving/pull/314)，
+  分支 `feat/glm53-optimize-after-pr286`，从 #286 的 `60c87737` 原样建立。
+  原 Serving `feat/next_glm53_optimize` 与该提交完全相同，没有额外提交可 cherry-pick。
+  #314 新增的是当前 Lib 接口适配，默认固定已在主线的 Lib `79be1fd`。
+  #286 合入前保持草稿，PR内提供了仅查看新增内容的比较链接。
+- Lib：[PR #1752](https://github.com/hw-native-sys/pypto-lib/pull/1752)，
+  分支 `perf/glm53-optimize-latest-main`，提交 `b177bc4`，基于主线 `79be1fd`。
+  移植旧优化提交 `a6f6e3a` 时处理了 `decode_fwd.py`、`kda.py`、`layer.py`、
+  `prefill_fwd.py` 的冲突，保留主线 ABI11、MTP/verify、KDA状态快照及逐层ring scope。
+  **最终计算内核与主线一致**；保留全专家权重头预检、按shard缓存shape/dtype、
+  共享FFN权重名称解析和golden输出存储隔离。
+- Serving同步主线的32请求槽、640-token缓存页、最小192行query容量、
+  INT8 MLA latent、BF16 pooled index和BF16 LM-head；
+  重置参数按当前缓存表绑定，prefix checkpoint使用 `KDA_CHECKPOINT_BASE`，
+  避开新增的快照工作区。
+
+验证已完成179项golden runner测试、43项GLM专项测试与470项其他相关CPU测试，
+两仓pre-commit通过。TP8/TP16发布权重预检通过，并验证末层末专家错误dtype会提前报错。
+8卡对照覆盖并发1/4，每档1轮预热、3轮正式；每版执行96次完整forward。
+
+本轮是**旧优化移植到最新主线后的比较**，未直接运行旧ABI的 `a6f6e3a`。
+设备固定为A3的8个逻辑设备、TP8/EP8、W8A8发布权重、160输入/8输出、
+query容量192、context640、每请求chunk32。计时包含host准备、分发和等待，
+排除编译与权重加载；这是Serving runner口径，采用同步forward和私有请求缓存。
+工具链固定为PyPTO `ff2e0a4`、runtime `31f9e72`、ISA `f83d4b7`、
+PTOAS0.72、CANN9.0。CPU配额无限制，各轮实验前后限流计数增量为0。
+
+| 并发 | 主线 token/s | K128+输出tile128实验版 | 只撤回K128的隔离版 |
+| ---: | ---: | ---: | ---: |
+| 1 | 0.3878 | 0.4832（+24.6%） | 0.3877 |
+| 4 | 1.1046 | 1.2854（+16.4%） | 1.1051 |
+
+- K128实验版的8个生成token在各轮一致，但最终logits相对主线的L2差异为
+  11.77%/11.98%，去均值后仍为15.98%/16.17%，不能以整体平移解释。
+  短续写KL差异约0.000014/0.000048，仍不足以替代一般prompt精度验收。
+- 只撤回K128后，全部8轮、20条序列的最终logits与主线逐元素一致，生成token也一致。
+  因此K128未纳入最终提交；上表的24.6%/16.4%不是可合入收益。
+- 单独输出tile128的吞吐变化不足0.1%，没有稳定的整网收益，也已撤回。
+  最终分支不宣称新增forward提速，计算实现和主线保持一致。
+- 主线相同输入在不同batch行也观察到约7%～8%的logits差异；该既有现象另行记录，
+  不将它归因于本次移植。本轮NPU样本不覆盖640-token边界的prefix命中或TP16整网。
+
+权重加载前的CPU预检另测1轮预热/5轮正式：主线中位2.778秒，新版本中位1.393秒，
+缩短49.9%；新版本同时增加了所有专家投影的dtype/scale/offset头检查。
+该项在aarch64、320逻辑CPU的主机上使用相同CPU Python环境测量，仅加载头信息，
+不是NPU forward的提速。两版每卡权重规划相同：TP8为41,301,335,480字节，
+TP16为20,946,958,232字节，不包含缓存、工作区和runtime开销。
+
+复测时对两份Lib使用同一Serving #314、SDK、权重和tokenizer，
+通过 `PYPTO_LIB_ROOT` 切换源码并分别重新启动进程。
+输入取以下文本重复20遍后的前160个token：
+`Explain the difference between tensor parallelism and expert parallelism. Give a short practical example and explain how matrix shapes change. `
+使用 `Glm53ModelRunner.forward_chunks()` 分5次提交32-token prefill，
+再执行7次单token decode，分别测并发1和4，完整保留1轮预热和3轮正式结果。
+最终计算代码恢复主线后不复用K128的吞吐数字；下文历史160输入/32输出HTTP数据也不作为本轮结果。
+
 ## 优化分支提审（2026-11-05）
 
 - Lib 提交为 [PR #1710](https://github.com/hw-native-sys/pypto-lib/pull/1710)，

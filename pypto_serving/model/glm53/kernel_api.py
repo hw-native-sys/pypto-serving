@@ -20,7 +20,9 @@ import sys
 from pypto_serving.config.types import RuntimeConfig
 
 
-KERNEL_BATCH = 16
+KERNEL_BATCH = 32
+CACHE_PAGE_SIZE = 640
+MIN_CAPACITY = 192
 PREFILL_CHUNK_ALIGNMENT = 16
 MAX_CAPACITY = 8192
 # Keep the supported budget range unchanged when reducing query padding.
@@ -34,8 +36,8 @@ def build_glm53_runtime_config(
     enable_chunk_prefill: bool, long_prefill_token_threshold: int,
 ) -> RuntimeConfig:
     """Apply GLM cache geometry and prefill limits for CLI and Python callers."""
-    if runtime.page_size != 128:
-        raise ValueError("GLM W8A8 serving requires page_size=128 (--block-size 128)")
+    if runtime.page_size != CACHE_PAGE_SIZE:
+        raise ValueError("GLM W8A8 serving requires page_size=640 (--block-size 640)")
     if runtime.weight_dtype != "bfloat16":
         raise ValueError("GLM W8A8 serving requires weight_dtype='bfloat16' (--dtype bfloat16)")
     validate_serving_limits(runtime.max_batch_size, runtime.max_seq_len, runtime.max_num_batched_tokens)
@@ -71,20 +73,22 @@ def build_glm53_cache_group_specs(max_seq_len, max_num_batched_tokens, *, tp_siz
     validate_topology(tp_size, tp_size)
     if not 1 <= max_num_batched_tokens <= MAX_CAPACITY:
         raise ValueError("GLM cache groups require 1..8192 query rows")
-    capacity = ((max_num_batched_tokens + 63) // 64) * 64
-    blocks = (max_seq_len + 127) // 128
-    attention_pages = min(16 * blocks, 1048576 // 128) if cache_tokens is None else cache_tokens // 128
-    state_blocks = min(blocks, (capacity + 127) // 128 + 2)
+    capacity = max(MIN_CAPACITY, ((max_num_batched_tokens + 63) // 64) * 64)
+    blocks = (max_seq_len + CACHE_PAGE_SIZE - 1) // CACHE_PAGE_SIZE
+    max_pages = (1048576 + CACHE_PAGE_SIZE - 1) // CACHE_PAGE_SIZE
+    attention_pages = min(KERNEL_BATCH * blocks, max_pages) if cache_tokens is None else cache_tokens // CACHE_PAGE_SIZE
+    state_blocks = min(blocks, (capacity + CACHE_PAGE_SIZE - 1) // CACHE_PAGE_SIZE + 2)
     state_pages = KERNEL_BATCH * (state_blocks + 2)
     sparse_layers = tuple(range(3, 44, 4)) + (45,)
     kda_layers = tuple(layer for layer in range(45) if layer not in sparse_layers)
-    attention_bytes = len(sparse_layers) * (128 * (512 * 2 + 256 * 4) + 32 * (128 + 8 * 4))
+    # MLA stores 512 INT8 values plus four FP32 scales; pooled index keys are BF16.
+    attention_bytes = len(sparse_layers) * (CACHE_PAGE_SIZE * (512 + 4 * 4) + CACHE_PAGE_SIZE // 4 * 128 * 2)
     state_bytes = len(kda_layers) * (3 * (3 * 64 * 128 // tp_size) * 2 + (64 // tp_size) * 128**2 * 4)
     return (
-        KVCacheGroupSpec("attention", sparse_layers, KVCacheSpec(128, attention_bytes), blocks,
+        KVCacheGroupSpec("attention", sparse_layers, KVCacheSpec(CACHE_PAGE_SIZE, attention_bytes), blocks,
                          num_blocks=attention_pages, max_requests_per_partition=KERNEL_BATCH),
-        KVCacheGroupSpec("kda_state", kda_layers, KVCacheSpec(128, state_bytes, 128), state_blocks,
-                         num_blocks=state_pages, sliding_window=128,
+        KVCacheGroupSpec("kda_state", kda_layers, KVCacheSpec(CACHE_PAGE_SIZE, state_bytes, CACHE_PAGE_SIZE), state_blocks,
+                         num_blocks=state_pages, sliding_window=CACHE_PAGE_SIZE,
                          max_requests_per_partition=KERNEL_BATCH),
     )
 
@@ -98,10 +102,10 @@ def validate_topology(tp_size: int, ep_size: int, dp_size: int = 1, device_ids=N
 
 
 def packed_capacity(max_num_batched_tokens: int) -> int:
-    """Round the scheduler's new-token budget to 64 rows without extra slot padding."""
+    """Round query rows to 64, reserving the complete-forward head buffer."""
     if max_num_batched_tokens <= 0 or max_num_batched_tokens > MAX_NUM_BATCHED_TOKENS:
         raise ValueError(f"GLM max-num-batched-tokens must be 1..{MAX_NUM_BATCHED_TOKENS}")
-    return ((int(max_num_batched_tokens) + 63) // 64) * 64
+    return max(MIN_CAPACITY, ((int(max_num_batched_tokens) + 63) // 64) * 64)
 
 
 def validate_serving_limits(max_requests: int, max_seq_len: int, max_num_batched_tokens: int) -> None:

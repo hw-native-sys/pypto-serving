@@ -10,9 +10,9 @@ Direct Python callers prepare the model runtime with
 ## Supported configuration
 
 - Eight devices use overlapped TP8/EP8/DP1; sixteen use TP16/EP16/DP1.
-- `--max-num-seqs` supports 1 to 16 concurrent requests.
+- `--max-num-seqs` supports 1 to 32 concurrent requests.
 - `--max-model-len` supports a context bound up to 8192 tokens.
-- The checkpoint path requires `--block-size 128` and `--dtype bfloat16`,
+- The checkpoint path requires `--block-size 640` and `--dtype bfloat16`,
   which are selected by default for GLM.
 - Serving supports text generation. Speculative decoding, vision inputs and
   model-specific reasoning/tool parsing are not provided.
@@ -31,7 +31,7 @@ to a multiple of 16; the final chunk can have any length. Disabling chunked
 prefill requires the complete prompt to fit in one dispatch.
 
 Prefix caching is enabled by default. Reuse requires a matching cached prefix
-at a 128-token boundary that is shorter than the prompt. Use
+at a 640-token boundary that is shorter than the prompt. Use
 `--no-enable-prefix-caching` to disable it.
 
 ## Offline generation
@@ -71,3 +71,7 @@ curl --noproxy '*' http://127.0.0.1:8899/v1/completions \
 The `/v1/chat/completions` endpoint also accepts text messages. Chat stops on
 any published EOS ID unless `ignore_eos` is enabled. The raw `/v1/completions`
 route ignores EOS, matching the existing server behavior.
+
+The complete-forward ABI uses 32 request slots, at least 192 query rows,
+640-token cache pages, packed INT8 MLA latents and BF16 pooled index keys.
+The vocabulary projection retains BF16 weights and BF16 result rounding.

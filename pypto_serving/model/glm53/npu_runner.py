@@ -406,7 +406,7 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
             for slot in range(2)
         ]
         self._logits_by_slot = [
-            shared_empty((api.RANKS, api.BATCH, api.FP32_HEAD_VOCAB_PAD), torch.float32,
+            shared_empty((api.RANKS, api.LOGIT_ROWS, api.HEAD_VOCAB_PAD), torch.float32,
                          name=f"glm_logits_{slot}")
             for slot in range(2)
         ]
@@ -447,12 +447,12 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
                 list(executor.map(upload, range(api.RANKS)))
             head = weights.lm_head()
             for rank, tensors in enumerate(per_rank):
-                shard = torch.zeros((api.FP32_HEAD_VOCAB_PAD, api.D), dtype=torch.float32)
+                shard = torch.zeros((api.HEAD_VOCAB_PAD, api.D), dtype=torch.bfloat16)
                 shard[:api.LOCAL_VOCAB].copy_(head[rank * api.LOCAL_VOCAB:(rank + 1) * api.LOCAL_VOCAB])
                 tensors["lm_head_weight"] = runtime.alloc_tensor(shard.shape, shard.dtype, init=shard,
                                                                 worker_id=rank)
                 tensors["final_norm"] = tensors["norm.final_norm"]
-            print("GLM_DEVICE_LM_HEAD_BYTES_PER_RANK", api.FP32_HEAD_VOCAB_PAD * api.D * 4, flush=True)
+            print("GLM_DEVICE_LM_HEAD_BYTES_PER_RANK", api.HEAD_VOCAB_PAD * api.D * 2, flush=True)
 
             def stack(tensors, name):
                 return StackedDeviceTensor([rank[name] for rank in tensors],
@@ -461,10 +461,8 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
             stacked = {name: stack(per_rank, name) for name in per_rank[0]}
             self.stacked = stacked
             self._reset_program = self.auxiliary_programs["reset"]
-            self._run_l3(self._reset_program, *(stacked[name] for name in (
-                "mla_latent_cache", "index_raw_cache", "index_pool_cache", "index_pool_scale",
-                "kda_conv_state", "kda_recurrent_state")),
-                -1, config=config)
+            self._run_l3(self._reset_program, *(stacked[name] for name in api.CACHE_LAYOUTS),
+                         -1, config=config)
             self._phase_tensors = []
             for slot in range(2):
                 phases = {}
@@ -529,12 +527,7 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
         slot_mask = sum(1 << slot for slot in slots)
         self._run_l3(
             self._reset_program,
-            self.stacked["mla_latent_cache"],
-            self.stacked["index_raw_cache"],
-            self.stacked["index_pool_cache"],
-            self.stacked["index_pool_scale"],
-            self.stacked["kda_conv_state"],
-            self.stacked["kda_recurrent_state"],
+            *(self.stacked[name] for name in api.CACHE_LAYOUTS),
             slot_mask,
             config=self.config,
         )
@@ -600,12 +593,12 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
             self.cache_pages.table[slot, :len(attention)] = torch.tensor(attention, dtype=torch.int32)
             if slot in self._prefix_seed_slots:
                 logical = (start - 1) // api.BLOCK_SIZE
-                state_rows[slot, 0] = api.BATCH + states[logical % api.KDA_STATE_BLOCKS]
+                state_rows[slot, 0] = api.KDA_CHECKPOINT_BASE + states[logical % api.KDA_STATE_BLOCKS]
             for chunk in range((end - start + api.CHUNK_TILE - 1) // api.CHUNK_TILE):
                 endpoint = min(start + (chunk + 1) * api.CHUNK_TILE, end)
                 if endpoint % api.BLOCK_SIZE == 0:
                     logical = endpoint // api.BLOCK_SIZE - 1
-                    state_rows[slot, chunk + 2] = api.BATCH + states[logical % api.KDA_STATE_BLOCKS]
+                    state_rows[slot, chunk + 2] = api.KDA_CHECKPOINT_BASE + states[logical % api.KDA_STATE_BLOCKS]
         return state_rows
 
     def forward_chunks(
