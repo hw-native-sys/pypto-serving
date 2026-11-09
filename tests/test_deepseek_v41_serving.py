@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Four-device V4.1 HTTP answer smoke test."""
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -27,25 +28,25 @@ MODEL_NAME = "deepseek-v41-st"
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def _prompt(tokenizer, question):
+def _prompt(tokenizer, question, max_tokens=4096):
     from pypto_serving.model.deepseek_v41.encoding import encode_messages
 
     prefix = "Read this context and then answer the final question.\n"
     suffix = "\nQuestion: " + question
-    # A long but semantically neutral context exercises the 8K prefill path.
+    # Fill one prefill dispatch with semantically neutral background context.
     unit = " The context is background information."
     lo, hi = 0, 4000
     while lo < hi:
         middle = (lo + hi + 1) // 2
         content = prefix + unit * middle + suffix
         count = len(tokenizer.encode(encode_messages([{"role": "user", "content": content}])))
-        if count <= 8192:
+        if count <= max_tokens:
             lo = middle
         else:
             hi = middle - 1
     content = prefix + unit * lo + suffix
     count = len(tokenizer.encode(encode_messages([{"role": "user", "content": content}])))
-    assert 8000 <= count <= 8192, count
+    assert max_tokens - 96 <= count <= max_tokens, count
     return content
 
 
@@ -65,6 +66,8 @@ def test_v41_dp4_http_answer(tmp_path):
     if not model_path or not Path(model_path).is_dir():
         pytest.fail("PYPTO_DSV41_MODEL_DIR is not set to a model directory")
     model_dir = Path(model_path)
+    prefill_tokens = int(os.environ.get("PYPTO_DSV41_PREFILL_TOKENS", "4096"))
+    assert 128 <= prefill_tokens <= 4096
     devices = tuple(part.strip() for part in os.environ.get("TASK_DEVICE", "").split(","))
     assert len(devices) == 4 and len(set(devices)) == 4 and all(part.isdecimal() for part in devices)
 
@@ -78,8 +81,8 @@ def test_v41_dp4_http_answer(tmp_path):
         sys.executable, "-m", "pypto_serving.cli", "--model", str(model_dir),
         "--served-model-name", MODEL_NAME, "--backend", "npu", "--platform", "a5",
         "--devices", ",".join(devices), "--tp", "1", "--dp", "4", "--ep", "4",
-        "--block-size", "128", "--max-model-len", "8320", "--max-num-seqs", "1",
-        "--max-num-batched-tokens", "80", "--host", "127.0.0.1", "--port", str(port),
+        "--block-size", "128", "--max-model-len", "8320", "--max-num-seqs", "8",
+        "--max-num-batched-tokens", str(prefill_tokens), "--host", "127.0.0.1", "--port", str(port),
         "--show-startup-logs",
     ]
     log_path = tmp_path / "server.log"
@@ -103,7 +106,7 @@ def test_v41_dp4_http_answer(tmp_path):
                 pytest.fail(f"V4.1 server did not become healthy; log: {log_path}")
 
             question = "What is 17 times 19? Answer with the number and one sentence."
-            payload = {"model": MODEL_NAME, "messages": [{"role": "user", "content": _prompt(tokenizer, question)}],
+            payload = {"model": MODEL_NAME, "messages": [{"role": "user", "content": _prompt(tokenizer, question, prefill_tokens)}],
                        "max_tokens": 128, "temperature": 0.0, "top_p": 1.0, "stream": False}
             request = urllib.request.Request(
                 f"http://127.0.0.1:{port}/v1/chat/completions",
@@ -120,8 +123,31 @@ def test_v41_dp4_http_answer(tmp_path):
                 "usage": result["usage"], "finish_reason": choice["finish_reason"]}, ensure_ascii=False), flush=True)
             assert choice["finish_reason"] == "stop", result
             assert re.search(r"\b323\b", answer), result
-            assert 8000 <= result["usage"]["prompt_tokens"] <= 8192
+            assert prefill_tokens - 96 <= result["usage"]["prompt_tokens"] <= prefill_tokens
             assert result["usage"]["completion_tokens"] > 0
+
+            def concurrent_answer(index):
+                number = 20 + index
+                body = {"model": MODEL_NAME, "messages": [{"role": "user", "content":
+                    f"What is {number} times 19? Answer with the number and one sentence."}],
+                    "max_tokens": 128, "temperature": 0.0, "stream": False}
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}, method="POST")
+                with OPENER.open(request, timeout=400) as response:
+                    result = json.load(response)
+                answer = result["choices"][0]["message"]["content"]
+                assert re.search(rf"\b{number * 19}\b", answer), result
+                assert result["usage"]["completion_tokens"] > 0, result
+                assert result["usage"]["total_tokens"] == (
+                    result["usage"]["prompt_tokens"] + result["usage"]["completion_tokens"]), result
+                return result
+
+            for wave in range(2):
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    results = list(pool.map(concurrent_answer, range(wave * 8, (wave + 1) * 8)))
+                print("CONCURRENT_WAVE", wave, json.dumps(results, ensure_ascii=False), flush=True)
         finally:
             _stop_server(process)
             print("\n--- V4.1 server log (tail) ---", flush=True)

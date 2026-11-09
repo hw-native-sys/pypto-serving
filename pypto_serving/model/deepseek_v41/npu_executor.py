@@ -23,9 +23,9 @@ from pypto_serving.model.model_loader import SafetensorsDirectoryLoader, _build_
 from pypto_serving.model.tokenizer import load_tokenizer
 
 from .npu_runner import (
+    MAX_PREFILL_TOKENS_PER_DP,
     BuildOptions,
     MissingCompositeInterface,
-    SegmentTopology,
     V41ModelRunner,
     load_composite_bindings,
 )
@@ -85,7 +85,7 @@ class DeepSeekV41DirectoryLoader(SafetensorsDirectoryLoader):
         elif len(layers) == 40:
             runtime = replace(runtime, kv_cache_groups=build_cache_groups(layers, runtime.max_seq_len))
         if len(layers) == 40:
-            capacity = SegmentTopology.for_decode().capacity
+            capacity = MAX_PREFILL_TOKENS_PER_DP
             runtime = replace(
                 runtime,
                 max_num_batched_tokens=min(runtime.max_num_batched_tokens, capacity),

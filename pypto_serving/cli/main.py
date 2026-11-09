@@ -211,7 +211,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-num-seqs", type=int, default=None,
         help="Max concurrent requests (default: 16; PD decode: 72).",
     )
-    parser.add_argument("--max-num-batched-tokens", type=int, default=4096, help="Max tokens scheduled per iteration (default: 4096).")
+    parser.add_argument("--max-num-batched-tokens", type=int, default=4096, help=("Max tokens scheduled per iteration (default: 4096). "
+              "V4.1 uses at most 4096 tokens and requires each prompt to fit in one iteration."))
     parser.add_argument(
         "--long-prefill-token-threshold",
         type=int,
@@ -232,7 +233,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--enable-chunked-prefill",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Enable chunked prefill (default: True). Use --no-enable-chunked-prefill to disable.",
+        help=("Enable chunked prefill (default: True). Use --no-enable-chunked-prefill to disable. "
+              "V4.1 always disables chunked prefill."),
     )
 
     # Profiling
@@ -365,7 +367,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     """
     from pypto_serving.config.types import KVCacheGroupSpec
     from pypto_serving.model.deepseek_v41.npu_runner import (
-        MissingCompositeInterface, load_composite_bindings,
+        MAX_PREFILL_TOKENS_PER_DP, MissingCompositeInterface, SegmentTopology, load_composite_bindings,
     )
     from pypto_serving.model.deepseek_v41.encoding import V41TextConfig
     from pypto_serving.model.deepseek_v41.weight_loader import RankPlacement, plan_layers
@@ -401,7 +403,9 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     bindings.require(plan_layers(raw), RankPlacement(0, tp_size=1, dp_size=topology[1], ep_size=topology[2]))
     if bindings.segment_topology is None:
         raise MissingCompositeInterface("V4.1 bindings must declare the selected lib decode capacity")
-    step_tokens = min(args.max_num_batched_tokens, bindings.segment_topology.capacity)
+    prefill_topology = SegmentTopology.for_prefill(
+        dp=topology[1], max_tokens=min(args.max_num_batched_tokens, MAX_PREFILL_TOKENS_PER_DP))
+    step_tokens = min(args.max_num_batched_tokens, prefill_topology.capacity)
     groups = tuple(bindings.cache_groups)
     if not groups or any(not isinstance(group, KVCacheGroupSpec) for group in groups):
         raise MissingCompositeInterface("V4.1 bindings must provide concrete grouped cache specifications")
@@ -428,12 +432,13 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         profile_config=_build_profile_config(args),
         max_num_running_reqs=args.max_num_seqs,
         max_num_scheduled_tokens=step_tokens,
-        long_prefill_token_threshold=args.long_prefill_token_threshold,
+        long_prefill_token_threshold=0,
         # Prefix restore needs both KV pages and matching compressor state.
         # Pipelining needs independently owned mutable snapshots and tickets.
         enable_prefix_cache=False,
         async_scheduling=False,
-        enable_chunk_prefill=args.enable_chunked_prefill,
+        # The current serving prefill path requires the complete prompt in one dispatch.
+        enable_chunk_prefill=False,
     )
 
 
