@@ -89,6 +89,7 @@ jobs:
         with:
           checkout-path: dist-checkout
           needs-device: 'true'
+          runtime-platform: a2a3
           toolchain: bundle
           # CI_CACHE_ROOT is shared with pypto and pypto-lib, whose jobs already
           # claim `serving` / `pip-serving`. Name both after this repo so the two
@@ -188,6 +189,7 @@ jobs:
         with:
           checkout-path: dist-checkout
           needs-device: 'true'
+          runtime-platform: a5
           toolchain: bundle
           build-namespace: pypto-serving-v41-a5
           pip-cache-name: pip-pypto-serving-v41-a5

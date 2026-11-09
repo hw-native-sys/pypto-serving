@@ -403,6 +403,8 @@ DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS = 8
 
 # ---- prefill geometry ----
 DSPARK_PREFILL_MAX_TOKENS = 8192
+DSPARK_CHECKPOINT_TILE = 512
+DSPARK_CHECKPOINTS_PER_TILE = 6
 # Maximum backing allocation; dispatches bind a compact TP-aligned prefix.
 DSPARK_PREFILL_DISPATCH_TOKENS = DSPARK_PREFILL_MAX_TOKENS
 DSPARK_PREFILL_LOCAL_TOKENS = DSPARK_PREFILL_DISPATCH_TOKENS // DSPARK_TP_SIZE
@@ -436,6 +438,7 @@ _PREFILL_PAGE_TABLE_SPECS = {
 
 _PREFILL_REQUEST_DYNAMIC_NAMES = frozenset(
     {
+        "state_checkpoint_ends",
         "ori_block_table", "hca_cmp_block_table", "csa_cmp_block_table", "idx_block_table",
         "hca_compress_state_block_table", "csa_compress_state_block_table",
         "csa_inner_compress_state_block_table",
@@ -1095,6 +1098,7 @@ class DSparkPreparedPrefillInputs:
     # Packed request boundaries per rank; repeated terminal entries pad groups
     # with fewer requests to the dispatch's common request-axis extent.
     query_start_loc: torch.Tensor
+    state_checkpoint_ends: torch.Tensor
     rope_tables: dict[str, torch.Tensor]
     slot_mappings: dict[str, torch.Tensor]
     block_tables: dict[str, torch.Tensor]
@@ -3184,6 +3188,11 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         query_start_loc = torch.zeros(
             (layout.ranks, request_rows + 1), dtype=torch.int32
         )
+        # Zero boundaries retain terminal-state publication without requesting extra checkpoints.
+        state_checkpoint_ends = torch.zeros(
+            (layout.ranks, request_rows, math.ceil(layout.prefill_tokens / DSPARK_CHECKPOINT_TILE),
+             DSPARK_CHECKPOINTS_PER_TILE), dtype=torch.int32,
+        )
         slot_mappings = {
             name: torch.full((layout.ranks, tokens), -1, dtype=torch.int64)
             for name in (
@@ -3430,6 +3439,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             position_ids_local=position_ids_local,
             position_ids_full=position_ids_full,
             query_start_loc=query_start_loc,
+            state_checkpoint_ends=state_checkpoint_ends,
             rope_tables=rope_tables,
             slot_mappings=slot_mappings,
             block_tables=block_tables,
@@ -3523,6 +3533,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             "position_ids_local": inputs.position_ids_local,
             "position_ids_full": inputs.position_ids_full,
             "query_start_loc": inputs.query_start_loc,
+            "state_checkpoint_ends": inputs.state_checkpoint_ends,
             "logit_row_indices": inputs.logit_row_indices,
         }
         values.update(inputs.rope_tables)
