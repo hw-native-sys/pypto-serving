@@ -368,9 +368,12 @@ def test_prefill_to_decode_staging_contract() -> None:
     prepared_prefill = runner.prepare_prefill_inputs(
         SimpleNamespace(runtime=SimpleNamespace(max_seq_len=512)), prefill
     )
+    runner._prefill_task_args.tensors["state_checkpoint_ends"].fill_(128)
     runner._stage_prefill_inputs(prepared_prefill)
     staged_prefill = runner._prefill_task_args.tensors
     assert prepared_prefill.physical_tokens == 96
+    checkpoint_ends = runner._packed_host_prefix(staged_prefill["state_checkpoint_ends"], 1)
+    assert torch.count_nonzero(checkpoint_ends).item() == 0
 
     x_hc = runner._packed_host_prefix(staged_prefill["x_hc"], 96)
     expected_0 = embeddings[:tokens].unsqueeze(1).expand(-1, layout.hc_mult, -1)
@@ -685,7 +688,7 @@ def test_dspark_task_arg_orders_match_pypto_lib_abis() -> None:
     assert tuple(arg.arg for arg in decode.args.args) == (
         task_args_module._DECODE_TENSOR_ORDER
     )
-    assert len(task_args_module._PREFILL_TENSOR_ORDER) == 102
+    assert len(task_args_module._PREFILL_TENSOR_ORDER) == 103
     assert len(task_args_module._DECODE_TENSOR_ORDER) == 110
 
 
