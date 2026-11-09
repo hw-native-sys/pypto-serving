@@ -90,6 +90,11 @@ inputs:
       The runner name in the path covers concurrency (an instance runs one job at
       a time, so each tree has a single writer); this input covers the rest.
     required: true
+  runtime-platform:
+    description: >-
+      Simpler runtime to build: a2a3, a5, a2a3sim, or a5sim. Select the
+      job's NPU target explicitly; the CPU architecture does not identify it.
+    required: true
   needs-device:
     description: >-
       When 'true' the job talks to an NPU: verify a card is visible (npu-smi) and
@@ -123,12 +128,18 @@ runs:
       shell: bash
       env:
         NEEDS_DEVICE: ${{ inputs.needs-device }}
+        RUNTIME_PLATFORM: ${{ inputs.runtime-platform }}
         CCACHE_NAME: ${{ inputs.ccache-name }}
         PIP_CACHE_NAME: ${{ inputs.pip-cache-name }}
         BUILD_NAMESPACE: ${{ inputs.build-namespace }}
         TOOLCHAIN_IN: ${{ inputs.toolchain }}
       run: |
         set -uo pipefail
+        case "$NEEDS_DEVICE:$RUNTIME_PLATFORM" in
+          true:a2a3|true:a5|false:a2a3sim|false:a5sim) ;;
+          *) echo "::error::runtime-platform must match needs-device (a2a3/a5 for device, a2a3sim/a5sim for sim)"
+             exit 1 ;;
+        esac
         # Prerequisites CI does not create, so they must already be there. Model
         # dirs are checked by the test steps that read them, not here.
         required=""
@@ -578,6 +589,8 @@ runs:
       # the toolchain pins were read from).
       shell: bash
       working-directory: ${{ inputs.checkout-path }}
+      env:
+        RUNTIME_PLATFORM: ${{ inputs.runtime-platform }}
       run: |
         source activate.sh
         python -m pip install --upgrade pip
@@ -635,7 +648,8 @@ runs:
         # the failed attempt can't poison the retry.
         retry_build() {
           local target="$1" attempt=0
-          until pip install --no-build-isolation "$target"; do
+          shift
+          until pip install --no-build-isolation "$target" "$@"; do
             attempt=$((attempt + 1))
             if [ "$attempt" -ge 3 ]; then
               echo "build of '$target' failed after $attempt attempts"; return 1
@@ -649,7 +663,10 @@ runs:
           done
         }
         retry_build "$PYPTO_SRC" || exit 1
-        retry_build "$PYPTO_SRC/runtime" || exit 1
+        # Build only this job's runtime. Auto-detection also selects A5 on
+        # A2/A3 hosts whose CANN SDK lacks the required A5 HCCL APIs.
+        retry_build "$PYPTO_SRC/runtime" \
+          --config-settings="build.targets=build_package_${RUNTIME_PLATFORM}" || exit 1
 
     - name: Install pypto-serving and its dependencies
       shell: bash
