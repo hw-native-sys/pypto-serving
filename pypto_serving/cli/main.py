@@ -211,8 +211,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-num-seqs", type=int, default=None,
         help="Max concurrent requests (default: 16; PD decode: 72).",
     )
-    parser.add_argument("--max-num-batched-tokens", type=int, default=4096, help=("Max tokens scheduled per iteration (default: 4096). "
-              "V4.1 uses at most 4096 tokens and requires each prompt to fit in one iteration."))
+    parser.add_argument(
+        "--max-num-batched-tokens", type=int, default=None,
+        help=(
+            "Max tokens scheduled per iteration (default: V4.1 1024, other models 4096). "
+            "V4.1 uses at most 4096 tokens and requires each prompt to fit in one iteration."
+        ),
+    )
     parser.add_argument(
         "--long-prefill-token-threshold",
         type=int,
@@ -220,7 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Maximum tokens per request in one chunked-prefill scheduling step. "
             "DeepSeek V4 accepts 1024, 2048, 4096, or 8192; the final prompt "
-            "chunk may be smaller (default: 2048)."
+            "chunk may be smaller (default: 2048). V4.1 ignores this option."
         ),
     )
     parser.add_argument(
@@ -285,6 +290,8 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
+    if args.max_num_batched_tokens is None:
+        args.max_num_batched_tokens = 1024 if model_family == "deepseek_v41" else 4096
     if model_family == "deepseek_v41":
         return _build_v41_engine_config(args, model_dir, model_config_data, devices)
     model_variant = _resolve_model_variant(args)

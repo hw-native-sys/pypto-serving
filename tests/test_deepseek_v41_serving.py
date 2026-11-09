@@ -28,7 +28,7 @@ MODEL_NAME = "deepseek-v41-st"
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def _prompt(tokenizer, question, max_tokens=4096):
+def _prompt(tokenizer, question, max_tokens=1024):
     from pypto_serving.model.deepseek_v41.encoding import encode_messages
 
     prefix = "Read this context and then answer the final question.\n"
@@ -66,7 +66,7 @@ def test_v41_dp4_http_answer(tmp_path):
     if not model_path or not Path(model_path).is_dir():
         pytest.fail("PYPTO_DSV41_MODEL_DIR is not set to a model directory")
     model_dir = Path(model_path)
-    prefill_tokens = int(os.environ.get("PYPTO_DSV41_PREFILL_TOKENS", "4096"))
+    prefill_tokens = int(os.environ.get("PYPTO_DSV41_PREFILL_TOKENS", "1024"))
     assert 128 <= prefill_tokens <= 4096
     devices = tuple(part.strip() for part in os.environ.get("TASK_DEVICE", "").split(","))
     assert len(devices) == 4 and len(set(devices)) == 4 and all(part.isdecimal() for part in devices)
