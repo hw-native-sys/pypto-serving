@@ -410,7 +410,11 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     )
     # This resolver intentionally raises while the lib adapter is missing.
     # No default generic KV layout may be substituted for the V4.1 pools.
-    bindings = load_composite_bindings(model_dir, args.max_model_len, dp_size=dp_size)
+    if args.max_num_seqs > 12 * dp_size:
+        raise ValueError("V4.1 supports at most 12 requests per DP partition")
+    request_slots = (args.max_num_seqs + dp_size - 1) // dp_size
+    bindings = load_composite_bindings(
+        model_dir, args.max_model_len, dp_size=dp_size, request_slots=request_slots)
     bindings.require(plan_layers(raw), RankPlacement(0, tp_size=1, dp_size=dp_size, ep_size=dp_size))
     if bindings.segment_topology is None:
         raise MissingCompositeInterface("V4.1 bindings must declare the selected lib decode capacity")
