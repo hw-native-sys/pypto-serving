@@ -905,6 +905,57 @@ def test_grouped_cache_preemption_removes_victim_from_running_queue():
     assert [request.request_id for request in scheduler.waiting] == ["newer"]
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_preempted_request_replays_emitted_tokens_before_sampling_again(async_scheduling):
+    from pypto_serving.serving.engine.async_engine import ReplicaEngineCore
+
+    scheduler = _prefill_scheduler(
+        num_blocks=8,
+        block_size=1,
+        max_num_running_reqs=1,
+        max_num_scheduled_tokens=2,
+        long_prefill_token_threshold=2,
+        max_seq_len=16,
+        async_scheduling=async_scheduling,
+    )
+    request = Request(
+        "replay", [1, 2], max_new_tokens=3, status=RequestStatus.RUNNING,
+        num_computed_tokens=3, output_token_ids=[7, 8],
+    )
+    scheduler.running = [request]
+    scheduler.requests = {request.request_id: request}
+    assert scheduler._preempt_lowest_priority(Request("other", [1], 1), set(), {}, SchedulerOutput())
+
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._request_contexts = {}
+    core._worker_known_req_ids = {request.request_id}
+    first = scheduler.schedule()
+    first_cmd = core._build_step_command(first, finished_ids=[request.request_id])
+    assert first_cmd.new_requests[0].prompt_token_ids == [1, 2, 7, 8]
+    assert first_cmd.new_requests[0].initial_output_tokens == 2
+    assert first_cmd.prefill_requests[0].chunk_tokens == [1, 2]
+    assert request.num_prompt_tokens == 2
+
+    if async_scheduling:
+        scheduler.advance_after_schedule(first)
+        second = scheduler.schedule()
+        scheduler.advance_after_schedule(second)
+        assert scheduler.update_from_output(first, {}) == []
+        assert request.num_output_placeholders == 1
+    else:
+        assert scheduler.update_from_output(first, {}) == []
+        second = scheduler.schedule()
+    second_cmd = core._build_step_command(second, finished_ids=[])
+    assert not second_cmd.new_requests
+    assert second_cmd.prefill_requests[0].chunk_tokens == [7, 8]
+    assert second_cmd.prefill_requests[0].num_computed_tokens == 2
+
+    outputs = scheduler.update_from_output(second, {request.request_id: 9})
+    assert [(item.new_token_id, item.finished) for item in outputs] == [(9, True)]
+    assert request.output_token_ids == [7, 8, 9]
+    assert request.num_output_placeholders == 0
+
+
 def test_constrained_request_is_not_recomputed_without_grammar_replay():
     manager = KvCacheManager(num_blocks=4, block_size=1, enable_prefix_cache=False)
     scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=False), manager)

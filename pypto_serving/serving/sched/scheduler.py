@@ -161,10 +161,21 @@ class Request:
     scheduling_held: bool = False
     cache_reservation_id: str = ""
     requires_initial_step: bool = False
+    num_replay_tokens: int = 0
 
     @property
     def num_prompt_tokens(self) -> int:
         return len(self.prompt_token_ids)
+
+    @property
+    def num_prefill_tokens(self) -> int:
+        return self.num_prompt_tokens + self.num_replay_tokens
+
+    @property
+    def prefill_token_ids(self) -> list[int]:
+        if self.num_replay_tokens:
+            return self.prompt_token_ids + self.output_token_ids[:self.num_replay_tokens]
+        return self.prompt_token_ids
 
     @property
     def num_tokens(self) -> int:
@@ -179,7 +190,7 @@ class Request:
 
     @property
     def is_prefill(self) -> bool:
-        return self.num_computed_tokens < self.num_prompt_tokens
+        return self.num_computed_tokens < self.num_prefill_tokens
 
     @property
     def all_token_ids(self) -> list[int]:
@@ -735,7 +746,7 @@ class Scheduler:
         """Return an admission error when the uncached prompt cannot run in one step."""
         if not self._requires_single_prefill_dispatch():
             return None
-        uncached_tokens = max(1, request.num_prompt_tokens - request.num_computed_tokens)
+        uncached_tokens = max(1, request.num_prefill_tokens - request.num_computed_tokens)
         single_dispatch_limit = self._single_prefill_dispatch_limit()
         if uncached_tokens <= single_dispatch_limit:
             return None
@@ -842,7 +853,7 @@ class Scheduler:
                 scheduled.group_blocks_retained = True
             completes_prompt = (
                 request.num_computed_tokens + scheduled.num_new_tokens
-                >= request.num_prompt_tokens
+                >= request.num_prefill_tokens
             )
             request.num_computed_tokens += scheduled.num_new_tokens
             # Do NOT publish prefix-cache blocks here: this runs at dispatch,
@@ -924,7 +935,7 @@ class Scheduler:
             if (
                 scheduled.is_prefill
                 and scheduled.num_computed_tokens + scheduled.num_new_tokens
-                >= request.num_prompt_tokens
+                >= request.num_prefill_tokens
             ):
                 request.terminal_prefill_in_flight = False
             token_value = new_token_ids.get(request.request_id)
@@ -943,7 +954,7 @@ class Scheduler:
             elif scheduled.is_prefill:
                 request.num_computed_tokens += scheduled.num_new_tokens
                 self._cache_completed_blocks(request)
-                if request.num_computed_tokens < request.num_prompt_tokens:
+                if request.num_computed_tokens < request.num_prefill_tokens:
                     continue
                 for token_id in token_ids:
                     request.output_token_ids.append(token_id)
@@ -1032,11 +1043,11 @@ class Scheduler:
         than reserved. Reconcile both directions to match the synchronous path.
         """
         # This step reserved placeholders iff it sampled: a decode step, or a
-        # prefill chunk that completed the prompt. num_computed_tokens was already
-        # advanced, so "completed the prompt" == num_computed >= prompt.
+        # prefill chunk that completed the input, including a replayed suffix.
+        # Use this step's range because a later chunk may already be in flight.
         sampled_this_step = (
             not scheduled.is_prefill
-            or request.num_computed_tokens >= request.num_prompt_tokens
+            or scheduled.num_computed_tokens + scheduled.num_new_tokens >= request.num_prefill_tokens
         )
         reserved = (
             1 + self._speculative_tokens_for(request, scheduled)
@@ -1168,9 +1179,8 @@ class Scheduler:
         if not self.running:
             return None
         # The current worker can reconstruct a grammar only from an intact
-        # request lifetime. Serving's recompute preemption does not replay
-        # previously generated tokens into a fresh prefill, so never silently
-        # restart a constrained request at the wrong grammar position.
+        # request lifetime. Rebuilding KV does not restore the worker's
+        # grammar state, so constrained requests stay out of recompute.
         candidates = [
             r
             for r in self.running
@@ -1206,6 +1216,8 @@ class Scheduler:
 
         self._free_request_blocks(victim)
         victim.status = RequestStatus.PREEMPTED
+        # The committed output is part of the model context on restart.
+        victim.num_replay_tokens = len(victim.output_token_ids)
         victim.num_computed_tokens = 0
         victim.cached_block_ids = []
         victim.allocated_block_ids = []
