@@ -127,7 +127,7 @@ def test_page_budget_uses_fractional_slot_without_changing_rings(tp_size):
 
 
 def _runner(*, speculative: bool = False, max_position: int = 512, extension_factory=None,
-            tp_size: int = 4) -> DSparkModelRunner:
+            tp_size: int = 4, prefill_tokens: int = 128) -> DSparkModelRunner:
     rows = torch.arange(max_position * 64, dtype=torch.float32).reshape(max_position, 64)
     rope = DSparkRopeTables(
         max_position=max_position,
@@ -143,8 +143,8 @@ def _runner(*, speculative: bool = False, max_position: int = 512, extension_fac
     # Keep the production topology but shrink prefill's token and hidden axes.
     layout = replace(
         DSparkCacheLayout.for_ranks(16, tp_size=tp_size),
-        prefill_tokens=128,
-        prefill_local_tokens=128 // tp_size,
+        prefill_tokens=prefill_tokens,
+        prefill_local_tokens=prefill_tokens // tp_size,
         prefill_requests=2,
         hidden_size=4,
     )
@@ -506,8 +506,10 @@ def _packed_prefill_batch(lengths=(5, 7, 6), groups=(0, 2, 0), starts=(0, 32, 64
     )
 
 
-def test_packed_prefill_keeps_request_boundaries_and_reuses_compact_buffers(monkeypatch):
-    runner = _runner()
+@pytest.mark.parametrize("prefill_tokens", [128, 1024])
+def test_packed_prefill_keeps_request_boundaries_and_reuses_compact_buffers(monkeypatch, prefill_tokens):
+    runner = _runner(prefill_tokens=prefill_tokens)
+    checkpoint_tiles = (prefill_tokens + 511) // 512
     model = SimpleNamespace(runtime=SimpleNamespace(max_seq_len=512))
     batch = _packed_prefill_batch()
     inputs = runner.prepare_prefill_inputs(model, batch)
@@ -516,6 +518,9 @@ def test_packed_prefill_keeps_request_boundaries_and_reuses_compact_buffers(monk
     assert inputs.query_start_loc[0].tolist() == [0, 5, 11]
     assert inputs.query_start_loc[8].tolist() == [0, 7, 7]
     assert inputs.query_start_loc[4].tolist() == [0, 0, 0]
+    assert inputs.state_checkpoint_ends.dtype == torch.int32
+    assert inputs.state_checkpoint_ends.shape == (16, 2, checkpoint_tiles, 6)
+    assert not bool(inputs.state_checkpoint_ends.any())
     assert inputs.sampled_slots == ((0, 0), (8, 0), (0, 1))
     assert inputs.logit_row_indices[0, :2].tolist() == [4, 10]
     assert inputs.logit_row_indices[8, :2].tolist() == [6, -1]
@@ -557,6 +562,8 @@ def test_packed_prefill_keeps_request_boundaries_and_reuses_compact_buffers(monk
     ))
     args = dict(zip(runner._prefill_task_args.names, runner._prefill_dispatch_args(12, 2)))
     assert args["query_start_loc"].shape == (16, 3)
+    assert args["state_checkpoint_ends"].shape == (16, 2, checkpoint_tiles, 6)
+    assert not bool(args["state_checkpoint_ends"].any())
     assert args["ori_block_table"].shape[:2] == (16, 2)
     assert args["input_ids"].shape == (16, 3)
 
@@ -566,6 +573,8 @@ def test_packed_prefill_keeps_request_boundaries_and_reuses_compact_buffers(monk
     args = dict(zip(runner._prefill_task_args.names, runner._prefill_dispatch_args(4, 1)))
     assert args["query_start_loc"][0].tolist() == [0, 3]
     assert args["query_start_loc"][8].tolist() == [0, 0]
+    assert args["state_checkpoint_ends"].shape == (16, 1, checkpoint_tiles, 6)
+    assert not bool(args["state_checkpoint_ends"].any())
     assert args["ori_block_table"].shape[:2] == (16, 1)
     assert bool((args["ori_block_table"][8] == -1).all())
     assert bool((args["logit_row_indices"][0, 1:] == -1).all())
@@ -685,8 +694,10 @@ def test_dspark_task_arg_orders_match_pypto_lib_abis() -> None:
     assert tuple(arg.arg for arg in decode.args.args) == (
         task_args_module._DECODE_TENSOR_ORDER
     )
-    assert len(task_args_module._PREFILL_TENSOR_ORDER) == 102
+    assert len(task_args_module._PREFILL_TENSOR_ORDER) == 103
     assert len(task_args_module._DECODE_TENSOR_ORDER) == 110
+    checkpoint = next(arg for arg in prefill.args.args if arg.arg == "state_checkpoint_ends")
+    assert ast.unparse(checkpoint.annotation.slice.elts[1]) == "pl.INT32"
 
 
 def test_fused_dspark_target_args_match_pypto_lib_abi() -> None:
