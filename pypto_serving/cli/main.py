@@ -215,7 +215,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-num-batched-tokens", type=int, default=None,
         help=(
             "Max tokens scheduled per iteration (default: V4.1 1024, other models 4096). "
-            "V4.1 uses at most 4096 tokens and requires each prompt to fit in one iteration."
+            "V4.1 uses at most 4096 tokens per prefill iteration."
         ),
     )
     parser.add_argument(
@@ -225,7 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Maximum tokens per request in one chunked-prefill scheduling step. "
             "DeepSeek V4 accepts 1024, 2048, 4096, or 8192; the final prompt "
-            "chunk may be smaller (default: 2048). V4.1 ignores this option."
+            "chunk may be smaller (default: 2048)."
         ),
     )
     parser.add_argument(
@@ -238,8 +238,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--enable-chunked-prefill",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help=("Enable chunked prefill (default: True). Use --no-enable-chunked-prefill to disable. "
-              "V4.1 always disables chunked prefill."),
+        help="Enable chunked prefill (default: True). Use --no-enable-chunked-prefill to disable.",
     )
 
     # Profiling
@@ -439,13 +438,12 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         profile_config=_build_profile_config(args),
         max_num_running_reqs=args.max_num_seqs,
         max_num_scheduled_tokens=step_tokens,
-        long_prefill_token_threshold=0,
+        long_prefill_token_threshold=args.long_prefill_token_threshold,
         # Prefix restore needs both KV pages and matching compressor state.
         # Pipelining needs independently owned mutable snapshots and tickets.
         enable_prefix_cache=False,
         async_scheduling=False,
-        # The current serving prefill path requires the complete prompt in one dispatch.
-        enable_chunk_prefill=False,
+        enable_chunk_prefill=args.enable_chunked_prefill,
     )
 
 

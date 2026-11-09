@@ -31,9 +31,10 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def _prompt(tokenizer, question, max_tokens=1024):
     from pypto_serving.model.deepseek_v41.encoding import encode_messages
 
-    prefix = "Read this context and then answer the final question.\n"
+    prefix = ("Read this context and then answer the final question.\n"
+              "The two factors for the final calculation are 17 and 19. Remember both factors.\n")
     suffix = "\nQuestion: " + question
-    # Fill one prefill dispatch with semantically neutral background context.
+    # Separate the initial facts from the final question across prefill chunks.
     unit = " The context is background information."
     lo, hi = 0, 4000
     while lo < hi:
@@ -68,6 +69,8 @@ def test_v41_dp4_http_answer(tmp_path):
     model_dir = Path(model_path)
     prefill_tokens = int(os.environ.get("PYPTO_DSV41_PREFILL_TOKENS", "1024"))
     assert 128 <= prefill_tokens <= 4096
+    prompt_tokens = int(os.environ.get("PYPTO_DSV41_PROMPT_TOKENS", str(min(8192, 3 * prefill_tokens))))
+    assert prefill_tokens < prompt_tokens <= 8192
     devices = tuple(part.strip() for part in os.environ.get("TASK_DEVICE", "").split(","))
     assert len(devices) == 4 and len(set(devices)) == 4 and all(part.isdecimal() for part in devices)
 
@@ -83,6 +86,7 @@ def test_v41_dp4_http_answer(tmp_path):
         "--devices", ",".join(devices), "--tp", "1", "--dp", "4", "--ep", "4",
         "--block-size", "128", "--max-model-len", "8320", "--max-num-seqs", "8",
         "--max-num-batched-tokens", str(prefill_tokens), "--host", "127.0.0.1", "--port", str(port),
+        "--enable-chunked-prefill", "--long-prefill-token-threshold", str(prefill_tokens),
         "--show-startup-logs",
     ]
     log_path = tmp_path / "server.log"
@@ -105,8 +109,9 @@ def test_v41_dp4_http_answer(tmp_path):
             else:
                 pytest.fail(f"V4.1 server did not become healthy; log: {log_path}")
 
-            question = "What is 17 times 19? Answer with the number and one sentence."
-            payload = {"model": MODEL_NAME, "messages": [{"role": "user", "content": _prompt(tokenizer, question, prefill_tokens)}],
+            question = ("What is the product of the two factors given at the beginning of the context? "
+                        "Answer with the number and one sentence.")
+            payload = {"model": MODEL_NAME, "messages": [{"role": "user", "content": _prompt(tokenizer, question, prompt_tokens)}],
                        "max_tokens": 128, "temperature": 0.0, "top_p": 1.0, "stream": False}
             request = urllib.request.Request(
                 f"http://127.0.0.1:{port}/v1/chat/completions",
@@ -123,8 +128,11 @@ def test_v41_dp4_http_answer(tmp_path):
                 "usage": result["usage"], "finish_reason": choice["finish_reason"]}, ensure_ascii=False), flush=True)
             assert choice["finish_reason"] == "stop", result
             assert re.search(r"\b323\b", answer), result
-            assert prefill_tokens - 96 <= result["usage"]["prompt_tokens"] <= prefill_tokens
+            assert prompt_tokens - 96 <= result["usage"]["prompt_tokens"] <= prompt_tokens
+            assert result["usage"]["prompt_tokens"] > prefill_tokens
             assert result["usage"]["completion_tokens"] > 0
+            assert result["usage"]["total_tokens"] == (
+                result["usage"]["prompt_tokens"] + result["usage"]["completion_tokens"]), result
 
             def concurrent_answer(index):
                 number = 20 + index
