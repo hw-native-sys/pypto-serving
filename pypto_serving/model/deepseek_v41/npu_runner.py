@@ -485,11 +485,12 @@ class CompositeBindings:
             raise ValueError("V4.1 serving requires TP1/DP4/EP4 or TP1/DP8/EP8")
 
 
-def load_composite_bindings(model_dir=None, max_seq_len=None, *, dp_size=8) -> CompositeBindings:
+def load_composite_bindings(model_dir=None, max_seq_len=None, *, dp_size=8, request_slots=1) -> CompositeBindings:
     """Resolve the model-specific contract without opening a device."""
     if model_dir is None or max_seq_len is None:
         raise ValueError("V4.1 composite bindings require a model directory and context length")
-    return make_production_bindings(model_dir, max_seq_len, dp_size=dp_size)
+    return make_production_bindings(
+        model_dir, max_seq_len, dp_size=dp_size, request_slots=request_slots)
 
 
 # decode_padding
@@ -622,7 +623,7 @@ def _validate_dp_capacity(partitions, token_counts, *, phase, dp_size):
         requests[partition] += 1
         tokens[partition] += count
     if any(count > _MAX_REQUESTS_PER_DP for count in requests):
-        raise ValueError("V4.1 lib supports at most 32 requests per DP partition")
+        raise ValueError("V4.1 lib supports at most 12 requests per DP partition")
     if phase == "prefill" and any(count > _MAX_PREFILL_TOKENS_PER_DP for count in tokens):
         raise ValueError("V4.1 lib supports at most 4096 prefill tokens per DP partition")
 
@@ -1064,8 +1065,11 @@ class DecodeForwardSegment:
             raise RuntimeError("full decode failed; close the worker before retrying")
         if state.layout != "tp_local_token":
             raise ValueError("full decode requires TP-local state")
-        if len(group_counts) != self.topology.dp or len(set(group_counts)) != 1 or group_counts[0] <= 0:
-            raise ValueError("full decode requires equal nonempty token rows on all DP ranks")
+        if (len(group_counts) != self.topology.dp or
+                any(count <= 0 or count > self.topology.capacity for count in group_counts)):
+            raise ValueError("full decode requires nonempty token rows within capacity on all DP ranks")
+        if not self.counts_are_tensor and len(set(group_counts)) != 1:
+            raise ValueError("scalar-count full decode requires equal token rows on all DP ranks")
         bound = dict(self.arguments, x_hc=state.residual, pre_mix=state.pre_mix)
         if not self.counts_are_tensor:
             bound["attention_num_tokens"] = ctypes.c_int32(group_counts[0])
@@ -1151,9 +1155,10 @@ class V41ModelRunner:
     def _request_ledger(self):
         self.preflight()
         if self.ledger is None:
-            self.ledger = RequestLedger(max_requests=self.runtime.max_batch_size,
-                                        max_seq_len=self.runtime.max_seq_len,
-                                        partitions=self.plan.placement.dp_size)
+            self.ledger = RequestLedger(
+                max_requests=self.bindings.cache_groups[0].max_requests_per_partition,
+                max_seq_len=self.runtime.max_seq_len,
+                partitions=self.plan.placement.dp_size)
         return self.ledger
 
     def _reset_request(self, key, owner):
@@ -2324,11 +2329,11 @@ def _check_runtime_binaries(platform):
         builder.get_binaries(runtime)
 
 
-def make_production_bindings(model_dir, max_seq_len, *, dp_size=8):
+def make_production_bindings(model_dir, max_seq_len, *, dp_size=8, request_slots=1):
     model_dir = Path(model_dir).resolve()
     raw = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     layers = plan_layers(raw)
-    groups = build_cache_groups(layers, max_seq_len, dp_size=dp_size)
+    groups = build_cache_groups(layers, max_seq_len, dp_size=dp_size, request_slots=request_slots)
     root = _lib_root()
     revision = _revision(root)
     topology = selected_decode_topology(root, dp_size=dp_size)
@@ -2408,8 +2413,8 @@ def make_production_bindings(model_dir, max_seq_len, *, dp_size=8):
         compressed_tables = rope.precompute_rope_tables(max_seq_len, True)
         cache_plan = plan_decode_cache_pools(
             layers, groups, max_seq_len=max_seq_len,
-            primary_num_blocks=groups[0].max_blocks_per_seq,
-            request_slots=1, abi=abi, dp_size=topology.dp,
+            primary_num_blocks=groups[0].max_blocks_per_seq * request_slots,
+            request_slots=request_slots, abi=abi, dp_size=topology.dp,
         )
         if (runtime.total_kv_pages is not None and
                 runtime.total_kv_pages < cache_plan.primary_num_blocks):
