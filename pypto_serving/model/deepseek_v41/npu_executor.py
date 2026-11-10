@@ -23,9 +23,9 @@ from pypto_serving.model.model_loader import SafetensorsDirectoryLoader, _build_
 from pypto_serving.model.tokenizer import load_tokenizer
 
 from .npu_runner import (
+    MAX_PREFILL_TOKENS_PER_DP,
     BuildOptions,
     MissingCompositeInterface,
-    SegmentTopology,
     V41ModelRunner,
     load_composite_bindings,
 )
@@ -85,7 +85,7 @@ class DeepSeekV41DirectoryLoader(SafetensorsDirectoryLoader):
         elif len(layers) == 40:
             runtime = replace(runtime, kv_cache_groups=build_cache_groups(layers, runtime.max_seq_len))
         if len(layers) == 40:
-            capacity = SegmentTopology.for_decode().capacity
+            capacity = MAX_PREFILL_TOKENS_PER_DP
             runtime = replace(
                 runtime,
                 max_num_batched_tokens=min(runtime.max_num_batched_tokens, capacity),
@@ -134,7 +134,8 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
             raise ValueError("model already registered")
         bindings = self.bindings or load_composite_bindings(
             record.runtime_model.extra["model_dir"], record.runtime.max_seq_len,
-            dp_size=len(self.device_ids))
+            dp_size=len(self.device_ids),
+            request_slots=(record.runtime.max_batch_size + len(self.device_ids) - 1) // len(self.device_ids))
         if not bindings.cache_groups:
             raise MissingCompositeInterface("V4.1 requires explicit grouped cache layouts and capacities")
         if record.runtime.kv_cache_groups != bindings.cache_groups:

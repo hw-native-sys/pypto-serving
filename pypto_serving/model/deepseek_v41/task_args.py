@@ -28,7 +28,7 @@ class V41CacheGroups:
 
 
 def build_cache_groups(layers: tuple[LayerPlan, ...], max_seq_len: int, *,
-                       dp_size: int = 8) -> tuple[KVCacheGroupSpec, ...]:
+                       dp_size: int = 8, request_slots: int = 1) -> tuple[KVCacheGroupSpec, ...]:
     """Declare the three scheduler page namespaces from checkpoint producers."""
     if len(layers) != 40 or tuple(layer.layer_id for layer in layers) != tuple(range(40)):
         raise ValueError("V4.1 cache groups require the complete ordered backbone")
@@ -36,6 +36,8 @@ def build_cache_groups(layers: tuple[LayerPlan, ...], max_seq_len: int, *,
         raise ValueError("V4.1 cache groups require a positive context length")
     if type(dp_size) is not int or dp_size <= 0:
         raise ValueError("V4.1 cache groups require a positive DP size")
+    if type(request_slots) is not int or not 1 <= request_slots <= 12:
+        raise ValueError("V4.1 requires 1 to 12 request slots per DP partition")
     producers = {
         "window": tuple(range(40)),
         "c2a": tuple(layer.layer_id for layer in layers
@@ -46,7 +48,7 @@ def build_cache_groups(layers: tuple[LayerPlan, ...], max_seq_len: int, *,
     groups = tuple(KVCacheGroupSpec(
         name, producers[name], KVCacheSpec(block_size, 16, ratio),
         (max_seq_len + block_size - 1) // block_size, num_partitions=dp_size,
-        max_requests_per_partition=1,
+        max_requests_per_partition=request_slots,
     ) for name, block_size, ratio in (("window", 128, 1), ("c2a", 256, 2), ("c1a", 128, 1)))
     validate_cache_groups(layers, groups, max_seq_len, dp_size=dp_size)
     return groups
@@ -87,7 +89,9 @@ def validate_cache_groups(
         if (group.spec.block_size != block_size or group.spec.compress_ratio != ratio
                 or group.spec.storage_block_size != 128 or group.num_partitions != dp_size
                 or group.sliding_window is not None or group.is_eagle_group
-                or group.max_requests_per_partition != 1):
+                or type(group.max_requests_per_partition) is not int
+                or not 1 <= group.max_requests_per_partition <= 12
+                or group.max_requests_per_partition != groups[0].max_requests_per_partition):
             raise ValueError(f"V4.1 {family} cache page layout disagrees with the lib ABI")
         required = (max_seq_len + block_size - 1) // block_size
         if (group.max_blocks_per_seq < required
