@@ -306,8 +306,12 @@ runs:
           git init -q "$PYPTO_SRC"
           git -C "$PYPTO_SRC" remote add origin https://github.com/hw-native-sys/pypto.git
         fi
-        retry git -C "$PYPTO_SRC" fetch --depth=1 origin "$PYPTO_REVISION" || exit 1
-        git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
+        pypto_commit="$PYPTO_REVISION"
+        if [ "$PYPTO_REVISION" = HEAD ] || ! git -C "$PYPTO_SRC" cat-file -e "${PYPTO_REVISION}^{commit}" 2>/dev/null; then
+          retry git -C "$PYPTO_SRC" -c http.version=HTTP/1.1 fetch --depth=1 origin "$PYPTO_REVISION" || exit 1
+          pypto_commit=FETCH_HEAD
+        fi
+        git -C "$PYPTO_SRC" reset --hard "$pypto_commit"
         git -C "$PYPTO_SRC" clean -ffdx
         git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
         retry git -C "$PYPTO_SRC" submodule update --init --recursive --depth=1 || exit 1
