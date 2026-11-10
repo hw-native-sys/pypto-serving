@@ -138,6 +138,27 @@ jobs:
           run_cmd="$run_cmd python -m pytest tests/test_qwen3_serving.py -q -s"
           task-submit --device auto --timeout 0 --max-time 1800 --run "$run_cmd"
 
+      - name: Fetch Qwen HBG model kernels
+        uses: actions/checkout@v4
+        with:
+          repository: hw-native-sys/pypto-lib
+          ref: da5350d2bfc40ce12edeaafd44b698050f6dc85b
+          path: qwen-hbg-lib
+          persist-credentials: false
+
+      - name: Run Qwen3 HBG serving guard (prefix cache, chunked prefill, multi-batch)
+        run: |
+          source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
+          printf -v lib_root '%q' "$GITHUB_WORKSPACE/qwen-hbg-lib"
+          run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
+          run_cmd="$run_cmd && source activate.sh"
+          run_cmd="$run_cmd && DEVICE_ID=\$TASK_DEVICE"
+          run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout"
+          run_cmd="$run_cmd PYPTO_QWEN3_MODEL_DIR=$PYPTO_QWEN3_MODEL_DIR"
+          run_cmd="$run_cmd PYPTO_QWEN3_RUNTIME=host_build_graph PYPTO_LIB_ROOT=$lib_root"
+          run_cmd="$run_cmd python -m pytest tests/test_qwen3_serving.py -q -s"
+          task-submit --device auto --timeout 0 --max-time 1800 --run "$run_cmd"
+
       - name: Run DSpark HTTP guard (K=7, one 8-card server)
         env:
           PYPTO_RUNTIME_LOG: error

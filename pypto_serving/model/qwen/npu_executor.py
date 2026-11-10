@@ -142,6 +142,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         self._configure_compiler("tensormap_and_ringbuffer")
 
     def _configure_compiler(self, runtime: str) -> None:
+        self._chip_runtime = runtime
         self._compiler = KernelCompiler(
             run_config=build_pypto_run_config(
                 runtime=runtime,
@@ -150,6 +151,11 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 pypto_build_dir=self._pypto_build_dir,
             ),
         )
+
+    @property
+    def max_prefill_batch_size(self) -> int | None:
+        """Bound HBG graph scratch to one active prefill row."""
+        return 1 if self._chip_runtime == "host_build_graph" else None
 
     @property
     def supports_device_sampling(self) -> bool:
@@ -173,6 +179,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         return Qwen314BModelRunner(
             compiled=compiled,
             device_id=self._device_ids[0],
+            hbg_prefill=self._chip_runtime == "host_build_graph",
         )
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
@@ -180,6 +187,15 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         self._configure_compiler(model.runtime.chip_runtime)
         kernel_dir = _find_pypto_lib_qwen14b_dir()
         qwen3_prefill_fwd = _load_pypto_lib_qwen14b_module("prefill_fwd", kernel_dir)
+        if self._chip_runtime == "host_build_graph":
+            prefill_host = getattr(qwen3_prefill_fwd, "qwen3_prefill_hbg_host", None)
+            if prefill_host is None:
+                raise RuntimeError(
+                    "Qwen3-14B HBG requires a pypto-lib checkout with qwen3_prefill_hbg_host. "
+                    "Set PYPTO_LIB_ROOT to a compatible checkout."
+                )
+        else:
+            prefill_host = qwen3_prefill_fwd.qwen3_prefill_host
         # The fused all-layer decode lives in decode_fwd.decode_fwd. It is
         # PAGED: it consumes block_table + slot_mapping and reads/writes the SAME
         # device-resident paged KV pool prefill writes (self._kv_caches), so no
@@ -268,7 +284,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         sampled_ids_width = int(getattr(qwen3_decode_fwd, "SAMPLED_IDS_PAD", 1))
         page_size = model.runtime.page_size
         max_blocks_per_seq = (model.runtime.max_seq_len + page_size - 1) // page_size
-        prefill = self._compile_jit_fwd_callable("prefill_fwd", qwen3_prefill_fwd.qwen3_prefill_host)
+        prefill = self._compile_jit_fwd_callable("prefill_fwd", prefill_host)
         decode = self._compile_jit_fwd_callable("decode_fwd", qwen3_decode_fwd.qwen3_decode_host)
         topk_select = self._compile_jit_fwd_callable(
             "topk_select_fwd", qwen3_topk_select.qwen3_topk_select_host

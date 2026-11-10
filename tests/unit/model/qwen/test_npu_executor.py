@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
 
@@ -96,3 +97,51 @@ def test_loaded_model_selects_compiler_before_weight_work(monkeypatch, runtime):
     assert captured["config"].distributed_config.runtime == runtime
     assert captured["config"].distributed_config.device_ids == [3]
     assert captured["runtime"] == runtime
+    assert executor.max_prefill_batch_size == (1 if runtime == "host_build_graph" else None)
+
+
+def test_hbg_requires_compatible_lib_before_compiling_other_kernels(monkeypatch):
+    from pypto_serving.config.types import RuntimeConfig
+    from pypto_serving.model.qwen import npu_executor
+
+    monkeypatch.setattr(npu_executor, "_find_pypto_lib_qwen14b_dir", lambda: Path("."))
+
+    def load_legacy_prefill(name, kernel_dir):
+        assert name == "prefill_fwd"
+        return SimpleNamespace(qwen3_prefill_host=object())
+
+    monkeypatch.setattr(npu_executor, "_load_pypto_lib_qwen14b_module", load_legacy_prefill)
+    model = SimpleNamespace(runtime=RuntimeConfig(chip_runtime="host_build_graph"))
+    with pytest.raises(RuntimeError, match="PYPTO_LIB_ROOT"):
+        PyptoExecutor(device_ids=(0,))._compile_model(model)
+
+
+@pytest.mark.parametrize("hbg", [False, True])
+def test_prefill_control_slots_follow_the_selected_lib_entry(monkeypatch, hbg):
+    from pypto_serving.model.qwen import task_args
+    from pypto_serving.model.qwen.npu_runner import Qwen314BModelRunner, _PrefillInputs
+
+    monkeypatch.setattr(task_args, "_static_weight", lambda runner, name: name)
+    monkeypatch.setattr(task_args, "_decode_weight", lambda runner, name: name)
+    layout = SimpleNamespace(kernel_batch=2, max_seq_len=8, max_blocks_per_seq=1, padded_vocab=8)
+    runner = SimpleNamespace(
+        _compiled=SimpleNamespace(layout=layout),
+        _active_kv_cache=SimpleNamespace(key_pages=object(), value_pages=object()),
+        _hbg_prefill=hbg,
+    )
+    args = task_args.prefill_task_args(runner, hbg=hbg)
+    args.allocate_host_shared(layout)
+    runner._prefill_task_args = args
+    args.tensors["chunk_lens"].copy_(torch.tensor([3, 1]))
+    args.tensors["chunk_offsets"].copy_(torch.tensor([0, 3]))
+    inputs = _PrefillInputs(2, torch.arange(4), torch.arange(4))
+    actual = Qwen314BModelRunner._prefill_kernel_args(runner, inputs)
+
+    if hbg:
+        assert args.names[-3:] == ("logits", "host_chunk_lens", "host_chunk_offsets")
+        for source, copied in zip(actual[2:4], actual[-2:]):
+            torch.testing.assert_close(copied, source)
+            assert copied.data_ptr() != source.data_ptr()
+    else:
+        assert len(actual) == 25
+        assert args.names[-1] == "logits"

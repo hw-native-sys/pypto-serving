@@ -70,8 +70,11 @@ For Qwen3-14B Program execution, `EngineConfig(runtime_config=RuntimeConfig(chip
 
 The existing replica configuration, worker model loader and `RuntimeModel.runtime` carry this value. Qwen configures its shared compiler from the loaded model before compiling all three stages; the shared run-config builder passes the selection into `DistributedConfig.runtime`. The existing compiled-program worker consumes that configuration. No additional engine, executor or process environment selection is involved.
 
-This selection supports eager Program requests only. CPU configuration tests do not establish HBG model numerics or capture/replay support.
+HBG prefill uses the `qwen3_prefill_hbg_host` entry from pypto-lib, which takes separate HOST control tensors. Set `PYPTO_LIB_ROOT` to a checkout with that entry if the bundled Lib revision predates it.
 
+For Qwen3-14B on one A3, use chunked prefill and set both `RuntimeConfig.max_num_batched_tokens` and `EngineConfig.max_num_scheduled_tokens` to 80 for the validated long-prompt setup. The worker partitions prefill into single-request calls to bound graph scratch. Decode continues to use the configured batch size.
+
+The Qwen serving CI guard runs the same single-request, multi-batch, chunked-prefill and prefix-cache cases for both runtimes. The HBG invocation sets `PYPTO_QWEN3_RUNTIME=host_build_graph` for the test harness and selects a pinned Lib checkout through `PYPTO_LIB_ROOT`.
 
 The shared `KernelCompiler` activates the selected chip runtime through PyPTO's
 public `PassContext` before JIT cache lookup and code generation. The same value
