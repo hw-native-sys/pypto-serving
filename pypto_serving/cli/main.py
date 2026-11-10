@@ -215,7 +215,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-num-seqs", type=int, default=None,
         help="Max concurrent requests (default: 16; PD decode: 72).",
     )
-    parser.add_argument("--max-num-batched-tokens", type=int, default=4096, help="Max tokens scheduled per iteration (default: 4096).")
+    parser.add_argument(
+        "--max-num-batched-tokens", type=int, default=None,
+        help=(
+            "Max tokens scheduled per iteration (default: V4.1 1024, other models 4096). "
+            "V4.1 uses at most 4096 tokens per prefill iteration."
+        ),
+    )
     parser.add_argument(
         "--long-prefill-token-threshold",
         type=int,
@@ -287,6 +293,8 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
+    if args.max_num_batched_tokens is None:
+        args.max_num_batched_tokens = 1024 if model_family == "deepseek_v41" else 4096
     if model_family == "deepseek_v41":
         return _build_v41_engine_config(args, model_dir, model_config_data, devices)
     model_variant = _resolve_model_variant(args)
@@ -369,7 +377,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     """
     from pypto_serving.config.types import KVCacheGroupSpec
     from pypto_serving.model.deepseek_v41.npu_runner import (
-        MissingCompositeInterface, load_composite_bindings,
+        MAX_PREFILL_TOKENS_PER_DP, MissingCompositeInterface, SegmentTopology, load_composite_bindings,
     )
     from pypto_serving.model.deepseek_v41.encoding import V41TextConfig
     from pypto_serving.model.deepseek_v41.weight_loader import RankPlacement, plan_layers
@@ -418,7 +426,9 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     bindings.require(plan_layers(raw), RankPlacement(0, tp_size=1, dp_size=dp_size, ep_size=dp_size))
     if bindings.segment_topology is None:
         raise MissingCompositeInterface("V4.1 bindings must declare the selected lib decode capacity")
-    step_tokens = min(args.max_num_batched_tokens, bindings.segment_topology.capacity)
+    prefill_topology = SegmentTopology.for_prefill(
+        dp=topology[1], max_tokens=min(args.max_num_batched_tokens, MAX_PREFILL_TOKENS_PER_DP))
+    step_tokens = min(args.max_num_batched_tokens, prefill_topology.capacity)
     groups = tuple(bindings.cache_groups)
     if not groups or any(not isinstance(group, KVCacheGroupSpec) for group in groups):
         raise MissingCompositeInterface("V4.1 bindings must provide concrete grouped cache specifications")
