@@ -90,6 +90,9 @@ jobs:
           checkout-path: dist-checkout
           needs-device: 'true'
           runtime-platform: a2a3
+          # This compiler passed the A3 guards with the bundled Lib. Drop the
+          # pin after its DSpark kernels migrate to explicit AIV splitting.
+          pypto-revision: 1dedb26c329407360c5c5ce6ecb495565c2f154e
           toolchain: bundle
           # CI_CACHE_ROOT is shared with pypto and pypto-lib, whose jobs already
           # claim `serving` / `pip-serving`. Name both after this repo so the two

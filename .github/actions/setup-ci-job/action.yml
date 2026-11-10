@@ -95,6 +95,10 @@ inputs:
       Simpler runtime to build: a2a3, a5, a2a3sim, or a5sim. Select the
       job's NPU target explicitly; the CPU architecture does not identify it.
     required: true
+  pypto-revision:
+    description: PyPTO commit to build. HEAD follows the upstream default branch.
+    required: false
+    default: HEAD
   needs-device:
     description: >-
       When 'true' the job talks to an NPU: verify a card is visible (npu-smi) and
@@ -274,6 +278,8 @@ runs:
       # revision. pypto owns ptoas (toolchain/versions.env) and pins pto-isa via
       # its runtime submodule (runtime/pto_isa.pin); read both.
       shell: bash
+      env:
+        PYPTO_REVISION: ${{ inputs.pypto-revision }}
       run: |
         # $PYPTO_SRC is the per-job build tree exported by the loader step.
         # github.com clones/fetches over this runner's link drop mid-transfer
@@ -295,20 +301,15 @@ runs:
             sleep $((attempt * 10))
           done
         }
-        # Follow the latest commit on pypto's default branch on every CI run.
-        if [ -d "$PYPTO_SRC/.git" ]; then
-          echo "Cache hit — updating pypto"
-          retry git -C "$PYPTO_SRC" fetch --depth=1 origin HEAD || exit 1
-          git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
-          git -C "$PYPTO_SRC" clean -ffdx
-          git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
-        else
-          echo "Cache miss — cloning pypto"
-          mkdir -p "$(dirname "$PYPTO_SRC")"
-          # rm before each attempt so a retried clone never hits a partial dir.
-          clone_pypto() { rm -rf "$PYPTO_SRC"; git clone --depth=1 https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"; }
-          retry clone_pypto || exit 1
+        if [ ! -d "$PYPTO_SRC/.git" ]; then
+          echo "Cache miss — initializing pypto"
+          git init -q "$PYPTO_SRC"
+          git -C "$PYPTO_SRC" remote add origin https://github.com/hw-native-sys/pypto.git
         fi
+        retry git -C "$PYPTO_SRC" fetch --depth=1 origin "$PYPTO_REVISION" || exit 1
+        git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
+        git -C "$PYPTO_SRC" clean -ffdx
+        git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
         retry git -C "$PYPTO_SRC" submodule update --init --recursive --depth=1 || exit 1
         rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
         echo "pypto under test: $(git -C "$PYPTO_SRC" rev-parse HEAD)"
