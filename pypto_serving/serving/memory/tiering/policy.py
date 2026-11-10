@@ -9,6 +9,7 @@
 """Retention order only; allocation and transfer references belong to the manager."""
 
 from collections import OrderedDict
+from collections.abc import Iterable
 from typing import Hashable, Protocol
 
 
@@ -16,7 +17,7 @@ class RetentionPolicy(Protocol):
     def on_publish(self, key: Hashable, now: float) -> None: ...
     def on_access(self, key: Hashable, now: float) -> None: ...
     def on_remove(self, key: Hashable) -> None: ...
-    def candidates(self, now: float) -> tuple[Hashable, ...]: ...
+    def candidates(self, now: float) -> Iterable[Hashable]: ...
 
 
 class LRU:
@@ -35,4 +36,4 @@ class LRU:
         self._order.pop(key, None)
 
     def candidates(self, now):
-        return tuple(self._order)
+        return iter(self._order)

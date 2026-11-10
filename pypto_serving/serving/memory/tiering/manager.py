@@ -169,6 +169,14 @@ class CacheTier:
             return True
         return False
 
+    def _reap_retired(self):
+        for handle, (page, future) in tuple(self.retiring.items()):
+            if future.done():
+                future.result()
+                self.used -= page.charge
+                self.counters["evicted_bytes"] += page.charge
+                del self.retiring[handle]
+
     def pump(self):
         if self.error:
             raise RuntimeError("DDR work is quarantined") from self.error
@@ -190,12 +198,7 @@ class CacheTier:
                     keys = self.pending_units[identity]
                     if all(self.pages[key].ready for key in keys):
                         self._publish_ready(identity, keys)
-            for handle, (page, future) in tuple(self.retiring.items()):
-                if future.done():
-                    future.result()
-                    self.used -= page.charge
-                    self.counters["evicted_bytes"] += page.charge
-                    del self.retiring[handle]
+            self._reap_retired()
             while self.queued and not self.closing:
                 page = self.queued[0]
                 if (self.used + page.charge > self.capacity
@@ -204,6 +207,7 @@ class CacheTier:
                     if retiring and self.used + page.charge - retiring <= self.capacity:
                         break
                     if self._evict():
+                        self._reap_retired()
                         if self.retiring:
                             break
                         continue

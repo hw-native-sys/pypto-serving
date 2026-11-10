@@ -64,9 +64,9 @@ def test_lru_touch_miss_remove_and_policy_is_separate():
     policy.on_publish("b", 1)
     policy.on_access("a", 2)
     policy.on_access("missing", 3)
-    assert policy.candidates(4) == ("b", "a")
+    assert tuple(policy.candidates(4)) == ("b", "a")
     policy.on_remove("b")
-    assert policy.candidates(5) == ("a",)
+    assert tuple(policy.candidates(5)) == ("a",)
     assert not hasattr(policy, "backend")
 
 
@@ -122,6 +122,27 @@ def test_pending_native_retirement_prevents_excess_eviction(incoming_size):
         future.set_result(None)
     settle(tier)
     assert tier.lookup("next") and tier.lookup("c") and tier.used == 6
+
+
+@pytest.mark.parametrize("reader", (False, True))
+def test_completed_retirement_admits_available_pages_in_same_tick(reader):
+    tier, _ = setup()
+    for key in ("a", "b"):
+        capture(tier, key)
+    settle(tier)
+    lease = tier.acquire(["a"]) if reader else None
+    for key in ("x", "y"):
+        capture(tier, key)
+    tier.pump()
+    assert not tier.retiring
+    assert len(tier.inflight) == (1 if reader else 2)
+    assert len(tier.queued) == int(reader)
+    assert tier.used == 4
+    if reader:
+        assert tier.lookup("a") is not None
+        tier.release(lease)
+    settle(tier)
+    assert tier.lookup("x") and tier.lookup("y") and not tier.queued
 
 
 def test_checkpoint_members_evict_together_and_busy_load_can_progress():
