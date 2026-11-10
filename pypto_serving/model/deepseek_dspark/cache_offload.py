@@ -30,7 +30,7 @@ class OwnerServices:
             service.close()
 
 
-def owner_factory(endpoints, rank, previous, context):
+def owner_factory(endpoints, rank, previous, pool, context):
     for index, endpoint in enumerate(endpoints):
         endpoint.parent.close()
         if index != rank:
@@ -38,13 +38,14 @@ def owner_factory(endpoints, rank, previous, context):
     services = []
     if previous is not None:
         services.append(previous(context))
-    services.append(CopyService(context, endpoints[rank].child))
+    services.append(CopyService(context, endpoints[rank].child, pool))
     return OwnerServices(services)
 
 
 class CacheOffloadExtension:
-    def __init__(self, runner, endpoints, metadata, previous=None):
+    def __init__(self, runner, endpoints, metadata, pool, previous=None):
         self.runner, self.endpoints, self.metadata = runner, endpoints, metadata
+        self.pool = pool
         self.previous = previous(runner=runner) if previous is not None else None
         self.tokens = []
 
@@ -64,7 +65,7 @@ class CacheOffloadExtension:
         options = self.previous.worker_options() if self.previous is not None else {}
         previous = options.get("chip_service_factories", {})
         options["chip_service_factories"] = {
-            rank: partial(owner_factory, self.endpoints, rank, previous.get(rank))
+            rank: partial(owner_factory, self.endpoints, rank, previous.get(rank), self.pool)
             for rank in range(len(self.endpoints))}
         return options
 

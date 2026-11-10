@@ -6,20 +6,30 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Independent owner endpoints and asynchronous cache-storage backend."""
+"""Independent owner endpoints and pooled asynchronous cache transfers."""
 
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from itertools import count
 from mmap import PAGESIZE
-from queue import PriorityQueue
+from queue import Empty, PriorityQueue
+import logging
 import threading
+import time
 from typing import Protocol
+
+from .pool import Extents
+
+BATCH_BYTES = 256 << 20
+BATCH_DESCRIPTORS = 8192
+logger = logging.getLogger(__name__)
 
 
 class StorageBackend(Protocol):
     def size(self, source: object) -> int: ...
     def footprint(self, source: object) -> int: ...
+    def reserve(self, handle: int, source: object) -> bool: ...
     def store(self, handle: int, source: object) -> Future: ...
     def load(self, handle: int, destination: object) -> Future: ...
     def release(self, handle: int) -> Future: ...
@@ -36,6 +46,8 @@ class Endpoint:
 
     def call(self, operation, payload=None):
         with self.lock:
+            if self.stopped.value:
+                raise RuntimeError("cache owner already stopped")
             self.sequence.value += 1
             sequence = self.sequence.value
             self.parent.send((sequence, operation, payload))
@@ -59,14 +71,43 @@ def endpoints(context, ranks):
     return tuple(result)
 
 
+@dataclass
+class Storage:
+    ranks: tuple
+    spans: tuple
+    size: int
+    extents: tuple
+    active: int = 0
+    complete: bool = False
+    uncertain: bool = False
+
+
+@dataclass
+class Job:
+    future: Future
+    operation: str
+    handle: int
+    spans: tuple
+    storage: Storage
+    enqueued: int
+
+
 class SimplerBackend:
-    def __init__(self, owners, geometry):
+    def __init__(self, owners, geometry, capacity):
         self.owners, self.geometry = owners, geometry
         self.tp = geometry["tp"]
+        self.extents = Extents(capacity)
         self.queue = PriorityQueue()
         self.sequence = count()
         self.records = {}
+        self.lock = threading.RLock()
+        self.wake = threading.Event()
         self.accepting = True
+        self.closing = False
+        self.close_error = None
+        self.metrics = {direction: dict(batches=0, pages=0, bytes=0, rpc_ns=0, native_ns=0,
+                                       submit_ns=0, wait_ns=0, queue_ns=0)
+                        for direction in ("store", "load")}
         self.thread = threading.Thread(target=self._run, name="cache-transfer-progress", daemon=False)
         self.thread.start()
 
@@ -90,71 +131,165 @@ class SimplerBackend:
             offset += layers * page_bytes
         return tuple(range(partition * self.tp, (partition + 1) * self.tp)), tuple(spans), offset
 
-    def _submit(self, priority, operation, handle=None, payload=None):
-        if not self.accepting:
-            raise RuntimeError("cache backend is closing")
-        future = Future()
-        self.queue.put_nowait((priority, next(self.sequence), future, operation, handle, payload))
-        return future
+    def reserve(self, handle, source):
+        ranks, spans, size = self.plan(source)
+        if sum(span[4] for span in spans) > BATCH_DESCRIPTORS:
+            raise ValueError("cache page exceeds native descriptor limit")
+        with self.lock:
+            if not self.accepting:
+                raise RuntimeError("cache backend is closing")
+            extents = self.extents.reserve(handle, len(ranks), size)
+            if extents is None:
+                return False
+            self.records[handle] = Storage(ranks, spans, size, extents)
+            return True
+
+    def _submit(self, operation, handle, source):
+        ranks, spans, size = self.plan(source)
+        with self.lock:
+            if not self.accepting:
+                raise RuntimeError("cache backend is closing")
+            storage = self.records[handle]
+            if (ranks != storage.ranks or size != storage.size or storage.uncertain
+                    or (operation == "load" and not storage.complete)
+                    or (operation == "store" and (storage.complete or storage.active))):
+                raise ValueError("cache storage layout or generation mismatch")
+            future = Future()
+            job = Job(future, operation, handle, spans, storage, time.monotonic_ns())
+            storage.active += 1
+            self.queue.put_nowait((0 if operation == "load" else 1, next(self.sequence), job))
+            self.wake.set()
+            return future
 
     def store(self, handle, source):
-        return self._submit(2, "store", handle, source)
+        return self._submit("store", handle, source)
 
     def load(self, handle, destination):
-        return self._submit(0, "load", handle, destination)
+        return self._submit("load", handle, destination)
 
     def release(self, handle):
-        return self._submit(0, "release", handle)
+        future = Future()
+        with self.lock:
+            storage = self.records[handle]
+            if storage.active or storage.uncertain or not storage.complete:
+                raise RuntimeError("cache storage still has native users")
+            self.extents.release(handle)
+            del self.records[handle]
+        future.set_result(None)
+        return future
+
+    def _finish(self, jobs, calls, dispatched):
+        try:
+            replies = [call.result() for call in calls]
+            for reply in replies:
+                if tuple(row["handle"] for row in reply["pages"]) != tuple(job.handle for job in jobs):
+                    raise RuntimeError("cache batch completion identity mismatch")
+            for index, job in enumerate(jobs):
+                results = [reply["pages"][index] for reply in replies]
+                if any(not row["stopped"] or not row["native_completed"]
+                       or row["bytes"] != job.storage.size for row in results):
+                    raise RuntimeError("cache batch has incomplete native proof")
+            for job in jobs:
+                with self.lock:
+                    job.storage.active -= 1
+                    job.storage.complete = True
+                job.future.set_result(dict(bytes=self.tp * job.storage.size,
+                                           stopped=True, native_completed=True))
+            logger.debug("kv_offload_batch direction=%s pages=%d owners=%d bytes=%d rpc_ms=%.3f",
+                         jobs[0].operation, len(jobs), len(replies),
+                         self.tp * sum(job.storage.size for job in jobs),
+                         (time.monotonic_ns() - dispatched) / 1e6)
+            stats = self.metrics[jobs[0].operation]
+            stats["batches"] += len(replies)
+            stats["pages"] += len(jobs)
+            stats["bytes"] += self.tp * sum(job.storage.size for job in jobs)
+            stats["rpc_ns"] += (time.monotonic_ns() - dispatched) * len(replies)
+            stats["queue_ns"] += sum(dispatched - job.enqueued for job in jobs)
+            for reply in replies:
+                stats["native_ns"] += reply["completed_ns"] - reply["started_ns"]
+                stats["submit_ns"] += reply["submitted_ns"] - reply["started_ns"]
+                stats["wait_ns"] += reply["completed_ns"] - reply["submitted_ns"]
+        except BaseException as error:
+            # An uncertain batch retains all ranges and the caller's HBM pins.
+            for job in jobs:
+                job.storage.uncertain = True
+                if not job.future.done():
+                    job.future.set_exception(error)
 
     def _run(self):
-        with ThreadPoolExecutor(max_workers=len(self.owners), thread_name_prefix="cache-owner-rpc") as pool:
+        pending = [dict(store=deque(), load=deque()) for _ in range(len(self.owners) // self.tp)]
+        previous_direction = {}
+        active = {}
+        with ThreadPoolExecutor(max_workers=len(self.owners), thread_name_prefix="cache-owner-rpc") as executor:
             while True:
-                _, _, future, operation, handle, source = self.queue.get()
-                if not future.set_running_or_notify_cancel():
-                    continue
-                try:
-                    if operation == "stop":
-                        if self.records:
-                            raise RuntimeError("DDR allocations remain during backend shutdown")
-                        calls = [pool.submit(owner.call, "stop") for owner in self.owners]
-                    elif operation == "release":
-                        ranks, _ = self.records[handle]
-                        calls = [pool.submit(self.owners[rank].call, "release", handle) for rank in ranks]
-                    else:
-                        ranks, spans, size = self.plan(source)
-                        if operation == "store":
-                            if handle in self.records:
-                                raise ValueError("duplicate DDR storage generation")
-                            self.records[handle] = (ranks, size)
-                            allocation = (size + PAGESIZE - 1) // PAGESIZE * PAGESIZE
-                            reservations = [pool.submit(self.owners[rank].call, "reserve", (handle, allocation))
-                                            for rank in ranks]
-                            for reservation in reservations:
-                                reservation.result()
-                        elif self.records[handle] != (ranks, size):
-                            raise ValueError("LOAD layout differs from stored content")
-                        calls = [pool.submit(self.owners[rank].call, operation, (handle, spans)) for rank in ranks]
-                    results = [call.result() for call in calls]
-                    if operation == "release":
-                        del self.records[handle]
-                    if operation in ("store", "load"):
-                        result = dict(bytes=sum(item["bytes"] for item in results),
-                                      stopped=all(item["stopped"] for item in results),
-                                      native_completed=all(item["native_completed"] for item in results))
-                    else:
-                        result = None
-                    future.set_result(result)
-                except BaseException as error:
-                    future.set_exception(error)
-                if operation == "stop":
+                self.wake.clear()
+                for partition, (jobs, calls, dispatched) in tuple(active.items()):
+                    if all(call.done() for call in calls):
+                        self._finish(jobs, calls, dispatched)
+                        del active[partition]
+                while True:
+                    try:
+                        item = self.queue.get_nowait()
+                    except Empty:
+                        break
+                    job = item[2]
+                    pending[job.storage.ranks[0] // self.tp][job.operation].append(job)
+                for partition, waiting in enumerate(pending):
+                    if partition in active or not any(waiting.values()):
+                        continue
+                    direction = ("load" if waiting["load"] and
+                                 (previous_direction.get(partition) != "load" or not waiting["store"])
+                                 else "store")
+                    queue = waiting[direction]
+                    jobs, payload_bytes, descriptors = [], 0, 0
+                    while queue:
+                        job = queue.popleft()
+                        size, count = job.storage.size, sum(span[4] for span in job.spans)
+                        if jobs and (payload_bytes + size > BATCH_BYTES
+                                     or descriptors + count > BATCH_DESCRIPTORS):
+                            queue.appendleft(job)
+                            break
+                        if not job.future.set_running_or_notify_cancel():
+                            with self.lock:
+                                job.storage.active -= 1
+                                if job.operation == "store":
+                                    self.extents.release(job.handle)
+                                    del self.records[job.handle]
+                            continue
+                        jobs.append(job)
+                        payload_bytes += size
+                        descriptors += count
+                    if not jobs:
+                        continue
+                    dispatched = time.monotonic_ns()
+                    calls = []
+                    for copy_index, rank in enumerate(jobs[0].storage.ranks):
+                        payload = tuple((job.handle, *job.storage.extents[copy_index], job.spans) for job in jobs)
+                        call = executor.submit(self.owners[rank].call, "copy_batch", (direction, payload))
+                        call.add_done_callback(lambda _: self.wake.set())
+                        calls.append(call)
+                    active[partition] = jobs, calls, dispatched
+                    previous_direction[partition] = direction
+                if self.closing and not active and self.queue.empty() and all(not any(q.values()) for q in pending):
+                    try:
+                        if any(storage.active or storage.uncertain for storage in self.records.values()):
+                            raise RuntimeError("cache owner work is still uncertain")
+                        calls = [executor.submit(owner.call, "stop") for owner in self.owners]
+                        for call in calls:
+                            call.result()
+                        self.records.clear()
+                        self.extents.allocations.clear()
+                    except BaseException as error:
+                        self.close_error = error
                     return
+                self.wake.wait(.01)
 
     def close(self):
-        future = self._submit(3, "stop")
         self.accepting = False
-        future.result(timeout=120)
-        self.thread.join(5)
-        if self.thread.is_alive():
-            raise RuntimeError("cache progress thread is still active")
+        self.closing = True
+        self.wake.set()
+        self.thread.join()
+        if self.close_error is not None:
+            raise self.close_error
         for owner in self.owners:
             owner.parent.close()

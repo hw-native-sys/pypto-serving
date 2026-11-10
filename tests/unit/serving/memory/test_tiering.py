@@ -24,6 +24,9 @@ class Backend:
     def __init__(self):
         self.live, self.released = {}, []
 
+    def reserve(self, handle, source):
+        return True
+
     def store(self, handle, size):
         self.live[handle] = size
         return finished(dict(bytes=size, stopped=True, native_completed=True))
@@ -35,6 +38,9 @@ class Backend:
 
     def load(self, handle, destination):
         return finished(dict(bytes=self.live[handle], stopped=True, native_completed=True))
+
+    def close(self):
+        self.live.clear()
 
 
 def setup(capacity=4):
@@ -90,6 +96,32 @@ def test_lru_skips_active_reader_and_reclaims_only_required_space():
     assert tier.lookup("a") and tier.lookup("c") and tier.lookup("b") is None
     assert len(tier.backend.released) == 1 and tier.used == 4
     tier.release(reader)
+
+
+@pytest.mark.parametrize("incoming_size", (2, 4))
+def test_pending_native_retirement_prevents_excess_eviction(incoming_size):
+    tier, _ = setup(6)
+    for key in ("a", "b", "c"):
+        capture(tier, key)
+    settle(tier)
+    pending = {}
+
+    def release(handle):
+        pending[handle] = Future()
+        return pending[handle]
+
+    tier.backend.release = release
+    capture(tier, "next", incoming_size)
+    for _ in range(10):
+        tier.pump()
+    assert len(pending) == incoming_size // 2
+    assert tier.lookup("c") and tier.used == 6
+    assert len(tier.queued) == 1 and tier.lookup("next") is None
+    for handle, future in pending.items():
+        del tier.backend.live[handle]
+        future.set_result(None)
+    settle(tier)
+    assert tier.lookup("next") and tier.lookup("c") and tier.used == 6
 
 
 def test_checkpoint_members_evict_together_and_busy_load_can_progress():
@@ -176,5 +208,23 @@ def test_normal_close_releases_queued_and_completed_entries_once():
     for _ in range(5):
         if tier.close_ready():
             break
+    assert tier.pages and tier.used == 2  # Residency stays until the backend ACK.
+    tier.backend.close()
+    tier.finish_close()
     assert not tier.pages and not tier.retiring and tier.used == 0
     assert sorted(released) == ["a", "b"] and not tier.backend.live
+
+
+def test_close_waits_for_current_readers_before_retiring_storage():
+    tier, _ = setup()
+    capture(tier, "a")
+    settle(tier)
+    reader = tier.acquire(["a"])
+    tier.begin_close()
+    assert not tier.close_ready()
+    with pytest.raises(RuntimeError, match="must drain"):
+        tier.finish_close()
+    tier.release(reader)
+    assert tier.close_ready() and tier.lookup("a") is not None
+    tier.backend.close()
+    tier.finish_close()

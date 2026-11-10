@@ -29,33 +29,65 @@ class Owner:
 
     def call(self, operation, payload=None):
         self.calls.append((operation, payload, threading.get_ident()))
-        if operation in ("store", "load"):
-            return dict(bytes=sum(span[3] * span[4] for span in payload[1]), stopped=True, native_completed=True)
+        if operation == "copy_batch":
+            _, pages = payload
+            return dict(pages=tuple(dict(handle=h, bytes=sum(s[3] * s[4] for s in spans),
+                                         stopped=True, native_completed=True)
+                                    for h, _, _, spans in pages),
+                        started_ns=1, submitted_ns=2, completed_ns=3)
 
 
 @pytest.mark.parametrize("tp", [1, 4])
 def test_index_scale_is_one_job_and_tp_copies_are_charged_to_one_instance_budget(tp):
     owners = tuple(Owner() for _ in range(2 * tp))
     geometry = dict(tp=tp, groups={"idx": (("k", 2, 7, 128), ("scale", 2, 7, 4))})
-    backend = SimplerBackend(owners, geometry)
+    backend = SimplerBackend(owners, geometry, 16 * PAGESIZE)
     source = "idx", 1, 3
     assert backend.size(source) == tp * 2 * 132
     assert backend.footprint(source) == tp * PAGESIZE
     try:
+        assert backend.reserve(1, source)
         result = backend.store(1, source).result(2)
         assert result == dict(bytes=tp * 264, stopped=True, native_completed=True)
         assert backend.load(1, ("idx", 1, 5)).result(2) == result
         assert not any(owner.calls for owner in owners[:tp])
         for owner in owners[tp:]:
-            reserve, store, load = owner.calls
-            assert reserve[:2] == ("reserve", (1, PAGESIZE))
-            assert store[1][1] == (("k", 384, 0, 128, 2, 896), ("scale", 12, 256, 4, 2, 28))
-            assert load[1][1][0] == ("k", 640, 0, 128, 2, 896)
+            store, load = owner.calls
+            assert store[0] == load[0] == "copy_batch"
+            assert store[1][0] == "store" and load[1][0] == "load"
+            assert store[1][1][0][3] == (("k", 384, 0, 128, 2, 896), ("scale", 12, 256, 4, 2, 28))
+            assert load[1][1][0][3][0] == ("k", 640, 0, 128, 2, 896)
             assert store[2] != threading.get_ident()
         backend.release(1).result(2)
     finally:
         backend.close()
     assert all(owner.calls[-1][0] == "stop" for owner in owners)
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_close_retains_pool_on_unknown_batch_and_otherwise_stops_once(failed):
+    owners = (Owner(), Owner())
+    backend = SimplerBackend(owners, dict(tp=1, groups={"kv": (("k", 1, 8, 4),)}), 8 * PAGESIZE)
+    if failed:
+        original = owners[0].call
+        def call(operation, payload=None):
+            if operation == "copy_batch":
+                raise RuntimeError("owner completion unknown")
+            return original(operation, payload)
+        owners[0].call = call
+    assert backend.reserve(1, ("kv", 0, 0))
+    future = backend.store(1, ("kv", 0, 0))
+    if failed:
+        with pytest.raises(RuntimeError, match="unknown"):
+            future.result(2)
+        with pytest.raises(RuntimeError, match="uncertain"):
+            backend.close()
+        assert backend.records and not any(c[0] == "stop" for owner in owners for c in owner.calls)
+    else:
+        future.result(2)
+        backend.close()
+        assert not backend.records
+        assert all([c[0] for c in owner.calls].count("stop") == 1 for owner in owners)
 
 
 def test_actual_allocation_alignment_limits_residency_not_native_payload():
@@ -79,11 +111,11 @@ def test_invalid_spans_never_enter_native_submission(span):
     native = NativeCopy.__new__(NativeCopy)
     native.thread = threading.get_ident()
     native.closed = native.poisoned = False
-    native.buffers = {1: (SimpleNamespace(nbytes=16), 100)}
+    native.pool = SimpleNamespace(nbytes=16, base=100)
     native.regions = {"k": ("token", 200, 16)}
     native._call = lambda *args: pytest.fail("invalid span reached native DMA")
     with pytest.raises(ValueError):
-        native.copy(1, (span,), store=True)
+        native.copy_batch("store", ((1, 0, 16, (span,)),))
 
 
 @pytest.mark.parametrize("store", [True, False])
@@ -91,16 +123,19 @@ def test_one_pitched_command_preserves_layer_offsets_and_dense_ddr_packing(store
     native = NativeCopy.__new__(NativeCopy)
     native.thread = threading.get_ident()
     native.closed = native.poisoned = False
-    native.buffers = {1: (SimpleNamespace(nbytes=32), 100)}
+    native.pool = SimpleNamespace(nbytes=32, base=100)
+    native.device = SimpleNamespace(value=0)
     native.regions = {"k": ("token", 200, 2048)}
     native.stream = "stream"
     calls = []
     native._call = lambda *args: calls.append(args)
-    proof = native.copy(1, (("k", 16, 0, 4, 3, 128),), store=store)
-    expected = (100, 4, 216, 128) if store else (216, 128, 100, 4)
-    assert calls == [("aclrtMemcpy2dAsync", *expected, 4, 3, 2 if store else 1, "stream"),
-                     ("aclrtSynchronizeStream", "stream")]
-    assert proof["bytes"] == 12 and proof["stopped"] and proof["native_completed"]
+    proof = native.copy_batch("store" if store else "load", ((1, 0, 32, (("k", 16, 0, 4, 3, 128),)),))
+    assert [call[0] for call in calls] == ["aclrtMemcpyBatchAsync", "aclrtSynchronizeStream"]
+    batch = calls[0]
+    assert list(batch[1]) == ([100, 104, 108] if store else [216, 344, 472])
+    assert list(batch[3]) == ([216, 344, 472] if store else [100, 104, 108])
+    assert list(batch[4]) == [4, 4, 4]
+    assert proof["pages"] == (dict(handle=1, bytes=12, stopped=True, native_completed=True),)
 
 
 def test_offload_extension_composes_existing_pd_factory_and_hooks():
@@ -116,7 +151,7 @@ def test_offload_extension_composes_existing_pd_factory_and_hooks():
         def wrap_dispatch(self, dispatch):
             return ("wrapped", dispatch)
 
-    extension = CacheOffloadExtension("runner", (object(), object()), object(), previous=Existing)
+    extension = CacheOffloadExtension("runner", (object(), object()), object(), {}, previous=Existing)
     options = extension.worker_options()
     assert options["untouched"] == "setting"
     assert options["chip_service_factories"][0].args[2] is factory
@@ -171,16 +206,48 @@ def test_shutdown_bounds_inactivity_without_timing_out_a_progressing_drain(monke
                             backend=SimpleNamespace(close=lambda: closed.append(True)))
     session = Session.__new__(Session)
     session.cache = cache
+    session.pool = SimpleNamespace(close=lambda: None)
     session.core = SimpleNamespace(kv_cache_manager=SimpleNamespace(tiering=cache))
     tier.counters = {}
+    tier.finish_close = lambda: closed.append("metadata")
     if progressing:
         asyncio.run(session.close())
-        assert clock[0] > 120 and closed == [True]
+        assert clock[0] > 120 and closed == [True, "metadata"]
         assert session.core.kv_cache_manager.tiering is None
     else:
         with pytest.raises(RuntimeError, match="drain incomplete"):
             asyncio.run(session.close())
         assert not closed and session.core.kv_cache_manager.tiering is cache
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_shutdown_forgets_residency_only_after_backend_ack(failed):
+    tier, _ = setup()
+    tier.capture("page", 2, 2, "source")
+    tier.pump()
+    tier.pump()
+
+    def close():
+        assert tier.pages and tier.used == 2
+        if failed:
+            raise RuntimeError("owner completion unknown")
+        tier.backend.live.clear()
+
+    tier.backend.close = close
+    cache = SimpleNamespace(tier=tier, backend=tier.backend, loads={},
+                            begin_close=tier.begin_close, close_ready=tier.close_ready)
+    session = Session.__new__(Session)
+    session.pool = SimpleNamespace(close=lambda: None)
+    session.cache, session.core = cache, SimpleNamespace(kv_cache_manager=SimpleNamespace(tiering=cache))
+    if failed:
+        with pytest.raises(RuntimeError, match="unknown"):
+            asyncio.run(session.close())
+        assert tier.pages and tier.used == 2 and session.core.kv_cache_manager.tiering is cache
+        with pytest.raises(RuntimeError, match="quarantined"):
+            tier.pump()
+    else:
+        asyncio.run(session.close())
+        assert not tier.pages and tier.used == 0 and session.core.kv_cache_manager.tiering is None
 
 
 @pytest.mark.parametrize("has_backing", [False, True])
@@ -197,6 +264,9 @@ def test_owner_teardown_can_close_an_unused_service_but_keeps_live_backing(monke
         def __init__(self, context):
             pass
 
+        def initialize_pool(self, pool):
+            pass
+
         def close(self):
             if has_backing:
                 raise RuntimeError("backing still live")
@@ -205,7 +275,7 @@ def test_owner_teardown_can_close_an_unused_service_but_keeps_live_backing(monke
     monkeypatch.setattr(simpler.ctypes, "CDLL", lambda _: SimpleNamespace(aclrtSetCurrentContext=Function()))
     monkeypatch.setattr(simpler, "NativeCopy", Provider)
     service = CopyService.__new__(CopyService)
-    service.context = service.acl_context = None
+    service.context = service.acl_context = service.pool = None
     service.channel = SimpleNamespace(poll=lambda _: False, close=lambda: None)
     service.started, service.close_requested = threading.Event(), threading.Event()
     service.stopped, service.error = False, None
@@ -219,3 +289,79 @@ def test_owner_teardown_can_close_an_unused_service_but_keeps_live_backing(monke
     else:
         service.close()
         assert closed == [True] and service.stopped
+
+
+@pytest.mark.parametrize("copies", [1, 4])
+def test_pool_atomic_reservation_fragmentation_and_generation_reuse(copies):
+    from pypto_serving.serving.memory.tiering.pool import Extents
+    pool = Extents(8 * PAGESIZE + 13)
+    first = pool.reserve(1, copies, 1)
+    assert len(first) == copies and len(set(first)) == copies
+    before = list(pool.free)
+    assert pool.reserve(2, 9, 1) is None
+    assert pool.free == before and set(pool.allocations) == {1}
+    pool.release(1)
+    assert pool.free == [(0, 8 * PAGESIZE)]
+    assert pool.reserve(2, copies, 1) == first
+    with pytest.raises(KeyError):
+        pool.release(1)
+    pool.release(2)
+    a = pool.reserve(3, 4, 1)
+    pool.reserve(4, 1, 4 * PAGESIZE)
+    pool.release(3)
+    assert pool.reserve(5, 1, 5 * PAGESIZE) is None
+    assert sum(size for _, size in a) == 4 * PAGESIZE
+
+
+def test_waiting_store_does_not_hold_load_progress_and_native_users_prevent_reuse():
+    owner = Owner()
+    original, entered, proceed = owner.call, threading.Event(), threading.Event()
+    def call(operation, payload=None):
+        if operation == "copy_batch" and payload[0] == "store":
+            entered.set()
+            assert proceed.wait(2)
+        return original(operation, payload)
+    owner.call = call
+    backend = SimplerBackend((owner,), dict(tp=1, groups={"kv": (("k", 1, 16, 4),)}), 2 * PAGESIZE)
+    try:
+        assert backend.reserve(1, ("kv", 0, 0))
+        store = backend.store(1, ("kv", 0, 0))
+        assert entered.wait(2)
+        with pytest.raises(RuntimeError, match="native users"):
+            backend.release(1)
+        assert backend.reserve(2, ("kv", 0, 1))
+        assert not backend.reserve(3, ("kv", 0, 2))
+        proceed.set()
+        store.result(2)
+        result = backend.load(1, ("kv", 0, 8)).result(2)
+        assert result["native_completed"]
+        backend.release(1).result(2)
+        assert backend.reserve(3, ("kv", 0, 2))
+    finally:
+        proceed.set()
+        backend.close()
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_pool_placement_precedes_physical_touch_and_startup_failure_closes_backing(monkeypatch, failed):
+    from pypto_serving.serving.memory.tiering import pool
+    import simpler.buffer
+    calls = []
+    buffer = SimpleNamespace(base=4096, nbytes=8192, close=lambda: calls.append("close"))
+    monkeypatch.setattr(simpler.buffer, "create_host_shared_buffer", lambda *args: buffer)
+    monkeypatch.setattr(pool.Path, "read_text", lambda *args, **kwargs: "Mems_allowed_list:\t0-7\n")
+    class Bind:
+        def __call__(self, base, size, mode, mask, maximum, flags):
+            assert base == 4096 and size == 8192 and mode == 3
+            assert mask[0] == 255 and maximum == 9 and flags == 0
+            calls.append("policy")
+            return -1 if failed else 0
+    monkeypatch.setattr(pool.ctypes, "CDLL", lambda *args, **kwargs: SimpleNamespace(mbind=Bind()))
+    monkeypatch.setattr(pool.ctypes, "memset", lambda *args: calls.append("touch"))
+    if failed:
+        with pytest.raises(OSError, match="interleave"):
+            pool.allocate_pool(8192)
+        assert calls == ["policy", "close"]
+    else:
+        assert pool.allocate_pool(8192) is buffer
+        assert calls == ["policy", "touch"]

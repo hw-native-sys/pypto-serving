@@ -198,7 +198,11 @@ class CacheTier:
                     del self.retiring[handle]
             while self.queued and not self.closing:
                 page = self.queued[0]
-                if self.used + page.charge > self.capacity:
+                if (self.used + page.charge > self.capacity
+                        or not self.backend.reserve(page.handle, page.source)):
+                    retiring = sum(old.charge for old, _ in self.retiring.values())
+                    if retiring and self.used + page.charge - retiring <= self.capacity:
+                        break
                     if self._evict():
                         if self.retiring:
                             break
@@ -238,7 +242,16 @@ class CacheTier:
 
     def close_ready(self):
         self.pump()
-        while self._evict():
-            pass
-        self.pump()
-        return not self.pages and not self.retiring
+        return (not self.queued and not self.inflight and not self.retiring
+                and all(page.ready and not page.readers for page in self.pages.values()))
+
+    def finish_close(self):
+        """Forget residency only after the backend confirms owner storage is closed."""
+        if not self.closing or not self.close_ready():
+            raise RuntimeError("DDR work must drain before storage retirement")
+        for page in self.pages.values():
+            self.policy.on_remove(("page", page.handle))
+        self.pages.clear()
+        self.by_handle.clear()
+        self.counters["evicted_bytes"] += self.used
+        self.used = 0

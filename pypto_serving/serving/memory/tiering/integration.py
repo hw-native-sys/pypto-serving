@@ -17,6 +17,7 @@ import time
 
 from .backend import SimplerBackend, endpoints
 from .cache import TieredCache
+from .pool import allocate_pool
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +41,19 @@ class Session:
         self.owners = endpoints(context, len(config.worker_device_ids()))
         self.metadata = context.Queue(maxsize=1)
         self.cache = None
+        from .simpler import descriptor_wire
+        capacity = config.runtime_config.kv_offload_bytes // 4096 * 4096
+        if capacity <= 0:
+            raise ValueError("DDR pool is smaller than one physical page")
+        self.pool = allocate_pool(capacity)
+        self.pool_wire = descriptor_wire(self.pool.to_descriptor())
 
     def configure(self, config):
         from pypto_serving.model.deepseek_dspark.cache_offload import CacheOffloadExtension
         kwargs = dict(config.executor_kwargs)
         previous = kwargs.get("runner_extension_factory")
         kwargs["runner_extension_factory"] = partial(CacheOffloadExtension,
-            endpoints=self.owners, metadata=self.metadata, previous=previous)
+            endpoints=self.owners, metadata=self.metadata, pool=self.pool_wire, previous=previous)
         return replace(config, executor_kwargs=kwargs)
 
     async def start(self):
@@ -58,8 +65,8 @@ class Session:
                 or manager.group_partition_count * geometry["tp"] != len(self.owners)
                 or set(geometry["groups"]) != set(manager.group_names)):
             raise RuntimeError("offload worker/cache-manager geometry mismatch")
-        backend = SimplerBackend(self.owners, geometry)
-        self.cache = TieredCache(manager, backend, self.core.config.runtime_config.kv_offload_bytes)
+        backend = SimplerBackend(self.owners, geometry, self.pool.nbytes)
+        self.cache = TieredCache(manager, backend, self.pool.nbytes)
         manager.tiering = self.cache
         logger.info("kv_offload_ready backend=simpler capacity_bytes=%d ranks=%d tp=%d",
                     self.cache.tier.capacity, geometry["ranks"], geometry["tp"])
@@ -89,6 +96,12 @@ class Session:
             elif now >= deadline:
                 raise RuntimeError("DDR drain incomplete; owner allocations remain retained")
             await asyncio.sleep(.002)
-        await asyncio.to_thread(self.cache.backend.close)
+        try:
+            await asyncio.to_thread(self.cache.backend.close)
+        except BaseException as error:
+            self.cache.tier.error = error
+            raise
+        self.pool.close()
+        self.cache.tier.finish_close()
         self.core.kv_cache_manager.tiering = None
         logger.info("kv_offload_closed counters=%s", self.cache.tier.counters)

@@ -34,6 +34,9 @@ class MemoryBackend:
     def footprint(self, source):
         return 1
 
+    def reserve(self, handle, source):
+        return True
+
     def store(self, handle, source):
         self.live[handle] = self.device.setdefault(source, ("bytes", source))
         return finished(dict(bytes=1, stopped=True, native_completed=True))
@@ -50,6 +53,9 @@ class MemoryBackend:
     def release(self, handle):
         del self.live[handle]
         return finished(None)
+
+    def close(self):
+        self.live.clear()
 
 
 def fixture(*, state=True, partitions=1):
@@ -316,5 +322,7 @@ def test_eight_groups_restore_joint_boundaries_across_partitions_and_growth():
     for _ in range(4):
         if tier.close_ready():
             break
+    tier.backend.close()
+    tier.tier.finish_close()
     assert not tier.tier.pages and not tier.loads and tier.tier.used == 0
     assert all(b.ref_cnt == 0 for pool in cache._group_pools.values() for b in pool.blocks)

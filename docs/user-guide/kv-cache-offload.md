@@ -1,0 +1,66 @@
+# DDR prefix-cache offload
+
+DSpark can retain immutable prefix-cache pages and their matching compression
+state in host DDR. Ordinary serving, Prefill and Decode use the same cache
+manager and offload implementation. The default is disabled. Contents are volatile
+and are not recovered after a process restart.
+
+Add these options when starting each model process:
+
+```bash
+--enable-prefix-caching --kv-offload-bytes 200000000000
+```
+
+For PD, configure each P/D process independently; the Router has no DDR pool.
+`--kv-offload-bytes` is the physical budget for the entire instance, including
+alignment and TP replicas, rounded down to a system page. It is not a per-rank
+budget. The current backend is `--kv-offload-backend simpler`.
+
+The backend requires Linux, the matching PyPTO/Simpler owner-service and retained
+tensor interfaces, CANN's Ascend `aclrtMemcpyBatchAsync`, and enough host memory
+for the configured pool. On a host with multiple NUMA nodes, `libnuma.so.1` and permission
+to apply `mbind` to the pool mapping are required. The pool is interleaved across
+allowed memory nodes before first touch; other allocations keep their existing
+memory policy. Registration and physical allocation happen during startup.
+
+## Execution and ownership
+
+One shared HOST backing is allocated per instance. Each rank owner imports and
+registers it once. DDR extents for different ranks and requests never overlap
+while live. Owner-local copy threads use a stream separate from computation;
+neither the API thread nor the compute submission thread waits for native DMA.
+
+New immutable pages enter a metadata queue with their source HBM references held.
+An idle owner immediately batches available pages, up to 256 MiB and 8192 native
+descriptors. There is one batch in flight per owner. A batch has one final native
+completion; a logical page becomes ready only after all required components and
+TP copies complete. An index page includes both index KV and scale data.
+
+Lookup uses the normal grouped prefix boundaries. A hit must include the required
+KV and compression state. A missing HBM page can be restored from DDR into pages
+reserved by the existing cache manager. Concurrent readers share restoration;
+cancelling a reader cannot release another reader's resources. In PD, DDR restore
+finishes before the affected destination pages become writable by the peer.
+D matches only its shareable KV groups; request-local final state and bootstrap
+data still arrive from P, including when D has a full KV hit.
+
+DDR uses LRU eviction of eligible content. Readers and in-flight operations keep
+their ranges until confirmed complete. There is no offload queue-length limit:
+under pressure, queued stores can retain HBM pages and delay allocation for new
+work. A finite DDR budget does not guarantee retention of every prefix.
+
+Shutdown drains native work, unregisters the pool inside each owner, and then
+closes the backing. An unknown completion keeps the corresponding ranges and
+pins isolated; a timeout is not evidence that memory can be reused.
+
+## Measurement
+
+`kv_offload_ready` reports the effective pool budget; `kv_offload_restore` records
+actual restores, and `kv_offload_closed` reports completed byte/page counters.
+Debug logging adds per-batch completion summaries. Native bytes count TP replicas;
+they must be distinguished from logical pages and token hit rates.
+
+Measure cold, HBM-hit and DDR-hit requests separately. Exclude startup, data
+readback and correctness hashing from bandwidth measurements. Report Host step
+time separately from kernel time, and use native completion rather than HTTP
+success as the transfer boundary.

@@ -31,6 +31,14 @@ def _descriptor(wire):
                             body=wire["body"], owner_worker_path_id=wire["owner_worker_path_id"])
 
 
+class Location(ctypes.Structure):
+    _fields_ = [("id", ctypes.c_uint32), ("type", ctypes.c_int)]
+
+
+class CopyAttributes(ctypes.Structure):
+    _fields_ = [("destination", Location), ("source", Location), ("reserved", ctypes.c_uint8 * 16)]
+
+
 class NativeCopy:
     """One owner thread, one independent copy stream, allocation-scoped registrations."""
 
@@ -43,8 +51,11 @@ class NativeCopy:
             "aclrtCreateStream": [ctypes.POINTER(pointer)],
             "aclrtDestroyStream": [pointer],
             "aclrtSynchronizeStream": [pointer],
-            "aclrtMemcpy2dAsync": [pointer, ctypes.c_size_t, pointer, ctypes.c_size_t,
-                                   ctypes.c_size_t, ctypes.c_size_t, ctypes.c_int, pointer],
+            "aclrtMemcpyBatchAsync": [ctypes.POINTER(pointer), ctypes.POINTER(ctypes.c_size_t),
+                                      ctypes.POINTER(pointer), ctypes.POINTER(ctypes.c_size_t), ctypes.c_size_t,
+                                      ctypes.POINTER(CopyAttributes), ctypes.POINTER(ctypes.c_size_t),
+                                      ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t), pointer],
+            "aclrtGetDevice": [ctypes.POINTER(ctypes.c_int)],
             "aclrtHostRegister": [pointer, ctypes.c_uint64, ctypes.c_int, ctypes.POINTER(pointer)],
             "aclrtHostUnregister": [pointer],
         }
@@ -54,7 +65,7 @@ class NativeCopy:
         self.stream = pointer()
         self._call("aclrtCreateStream", ctypes.byref(self.stream))
         self.regions = {}
-        self.buffers = {}
+        self.pool = None
         self.poisoned = self.closed = False
 
     def _call(self, name, *args):
@@ -73,68 +84,83 @@ class NativeCopy:
         address, extent = self.context.pin(token, descriptor)
         self.regions[name] = (token, address, extent)
 
-    def reserve(self, key, size):
-        from simpler.buffer import create_host_shared_buffer, mint_owner_instance_id
+    def initialize_pool(self, wire):
+        from simpler.buffer import ImportContext, ImportRegistry
+        from simpler.comm_endpoints import HOST_CPU
 
         self._check()
-        if key in self.buffers or type(size) is not int or size <= 0:
-            raise ValueError("invalid DDR allocation")
-        buffer = create_host_shared_buffer(size, mint_owner_instance_id(), 1)
-        address = ctypes.addressof(ctypes.c_char.from_buffer(buffer.shm.buf))
+        self.registry = ImportRegistry(ImportContext(deployment=HOST_CPU))
+        self.pool = self.registry.materialize(_descriptor(wire))
         mapped = ctypes.c_void_p()
-        try:
-            self._call("aclrtHostRegister", address, size, 0, ctypes.byref(mapped))
-        except BaseException:
-            buffer.close()
-            raise
-        self.buffers[key] = (buffer, address)
+        self._call("aclrtHostRegister", self.pool.base, self.pool.nbytes, 0, ctypes.byref(mapped))
+        self.device = ctypes.c_int()
+        self._call("aclrtGetDevice", ctypes.byref(self.device))
 
-    def copy(self, key, spans, *, store):
-        """Spans are (region, device offset, DDR offset, row bytes, rows, device pitch)."""
+    def copy_batch(self, operation, pages):
+        """All descriptors are validated before any native use of the shared pool."""
         self._check()
-        buffer, host = self.buffers[key]
-        ranges = []
-        for name, device_offset, host_offset, width, rows, pitch in spans:
-            if (any(type(value) is not int for value in (device_offset, host_offset, width, rows, pitch))
-                    or device_offset < 0 or host_offset < 0 or width <= 0 or rows <= 0 or pitch < width):
-                raise ValueError("invalid copy span")
-            _, address, extent = self.regions[name]
-            if (device_offset + (rows - 1) * pitch + width > extent
-                    or host_offset + rows * width > buffer.nbytes):
-                raise ValueError("copy exceeds registered allocation")
-            ranges.append((address + device_offset, host + host_offset, width, rows, pitch))
-        if not ranges:
-            raise ValueError("empty cache transfer")
+        if operation not in ("store", "load") or not pages:
+            raise ValueError("invalid cache batch")
+        ranges, entries, handles = [], [], set()
+        for handle, offset, allocation, spans in pages:
+            if (type(handle) is not int or handle <= 0 or handle in handles
+                    or any(type(v) is not int for v in (offset, allocation))
+                    or offset < 0 or allocation <= 0 or offset + allocation > self.pool.nbytes):
+                raise ValueError("invalid DDR range or storage generation")
+            handles.add(handle)
+            ranges.append((offset, offset + allocation))
+            host_ranges, size = [], 0
+            for name, device_offset, host_offset, width, rows, pitch in spans:
+                if (any(type(v) is not int for v in (device_offset, host_offset, width, rows, pitch))
+                        or device_offset < 0 or host_offset < 0 or width <= 0 or rows <= 0 or pitch < width):
+                    raise ValueError("invalid copy span")
+                _, address, extent = self.regions[name]
+                if (device_offset + (rows - 1) * pitch + width > extent
+                        or host_offset + rows * width > allocation):
+                    raise ValueError("copy exceeds registered allocation")
+                host_ranges.append((host_offset, host_offset + rows * width))
+                for row in range(rows):
+                    entries.append((address + device_offset + row * pitch,
+                                    self.pool.base + offset + host_offset + row * width, width))
+                size += rows * width
+            if not size or any(left[1] > right[0] for left, right in
+                               zip(sorted(host_ranges), sorted(host_ranges)[1:])):
+                raise ValueError("empty or overlapping cache page")
+        if (len(entries) > 8192 or any(left[1] > right[0] for left, right in
+                                      zip(sorted(ranges), sorted(ranges)[1:]))):
+            raise ValueError("overlapping DDR ranges or oversized native batch")
+        store = operation == "store"
+        count = len(entries)
+        pointers, sizes = ctypes.c_void_p * count, ctypes.c_size_t * count
+        destinations = pointers(*(host if store else device for device, host, _ in entries))
+        sources = pointers(*(device if store else host for device, host, _ in entries))
+        lengths = sizes(*(width for _, _, width in entries))
+        attributes = CopyAttributes()
+        host, device = Location(0, 0), Location(self.device.value, 1)
+        attributes.destination, attributes.source = (host, device) if store else (device, host)
+        index, failed = ctypes.c_size_t(0), ctypes.c_size_t(-1)
         started = time.monotonic_ns()
         try:
-            for device, host, width, rows, pitch in ranges:
-                destination, source = (host, device) if store else (device, host)
-                destination_pitch, source_pitch = (width, pitch) if store else (pitch, width)
-                self._call("aclrtMemcpy2dAsync", destination, destination_pitch, source, source_pitch,
-                           width, rows, 2 if store else 1, self.stream)
-            # Only the dedicated copy thread waits; compute uses another stream and IPC lane.
+            self._call("aclrtMemcpyBatchAsync", destinations, lengths, sources, lengths, count,
+                       ctypes.byref(attributes), ctypes.byref(index), 1, ctypes.byref(failed), self.stream)
+            submitted = time.monotonic_ns()
+            # Only the owner copy thread waits. No compute stream or main-thread fence.
             self._call("aclrtSynchronizeStream", self.stream)
         except BaseException:
             self.poisoned = True
             raise
-        return dict(bytes=sum(width * rows for _, _, width, rows, _ in ranges), stopped=True, native_completed=True,
-                    started_ns=started, completed_ns=time.monotonic_ns())
-
-    def release(self, key):
-        self._check()
-        buffer, address = self.buffers[key]
-        try:
-            self._call("aclrtHostUnregister", address)
-            buffer.close()
-        except BaseException:
-            self.poisoned = True
-            raise
-        del self.buffers[key]
+        completed = time.monotonic_ns()
+        return dict(pages=tuple(dict(handle=handle, bytes=sum(s[3] * s[4] for s in spans),
+                                     stopped=True, native_completed=True)
+                                for handle, _, _, spans in pages),
+                    started_ns=started, submitted_ns=submitted, completed_ns=completed)
 
     def close(self):
         self._check()
-        if self.buffers:
-            raise RuntimeError("DDR cache entries must retire before owner close")
+        if self.pool is not None:
+            self._call("aclrtHostUnregister", self.pool.base)
+            self.registry.unregister(self.pool.identity)
+            self.pool = None
         for token, _, _ in self.regions.values():
             self.context.unpin(token)
         self.regions.clear()
@@ -145,8 +171,8 @@ class NativeCopy:
 class CopyService:
     """Independent child-owner endpoint. All Buffer and native work stays in its thread."""
 
-    def __init__(self, context, channel):
-        self.context, self.channel = context, channel
+    def __init__(self, context, channel, pool):
+        self.context, self.channel, self.pool = context, channel, pool
         acl = ctypes.CDLL("libascendcl.so")
         self.acl_context = ctypes.c_void_p()
         acl.aclrtGetCurrentContext.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
@@ -158,7 +184,8 @@ class CopyService:
         self.stopped = False
         self.thread = threading.Thread(target=self._run, name="cache-copy-owner", daemon=False)
         self.thread.start()
-        if not self.started.wait(30) or self.error is not None:
+        import os
+        if not self.started.wait(float(os.environ.get("PYPTO_WORKER_INIT_TIMEOUT", "600"))) or self.error is not None:
             raise RuntimeError("cache copy owner initialization failed") from self.error
 
     def _run(self):
@@ -169,11 +196,12 @@ class CopyService:
                 raise RuntimeError("cannot attach cache-copy thread to owner context")
             provider = NativeCopy(self.context)
             self.provider = provider
+            provider.initialize_pool(self.pool)
             self.started.set()
             expected = 0
             while not self.stopped:
                 if self.close_requested.is_set():
-                    provider.close()  # Rejects live backing or uncertain DMA.
+                    provider.close()  # Rejects uncertain DMA.
                     self.stopped = True
                     break
                 if not self.channel.poll(.1):
@@ -191,13 +219,8 @@ class CopyService:
                     if operation == "register":
                         name, token, descriptor = payload
                         result = provider.register(name, token, _descriptor(descriptor))
-                    elif operation == "reserve":
-                        result = provider.reserve(*payload)
-                    elif operation in ("store", "load"):
-                        key, spans = payload
-                        result = provider.copy(key, spans, store=operation == "store")
-                    elif operation == "release":
-                        result = provider.release(payload)
+                    elif operation == "copy_batch":
+                        result = provider.copy_batch(*payload)
                     elif operation == "stop":
                         result = provider.close()
                         self.stopped = True
