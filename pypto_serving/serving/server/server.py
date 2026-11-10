@@ -327,7 +327,7 @@ class ServingServer:
             if isinstance(request, ChatCompletionRequest) and request.min_tokens is not None
             else defaults.min_tokens
         )
-        return GenerateConfig(
+        config = GenerateConfig(
             max_new_tokens=max_new_tokens,
             min_tokens=min_tokens,
             temperature=request.temperature
@@ -344,6 +344,10 @@ class ServingServer:
                 else defaults.ignore_eos
             ),
         )
+        validate = getattr(self.engine, "validate_generate_config", None)
+        if callable(validate):
+            validate(config)
+        return config
 
     def prepare_completion(self, request):
         config = dataclasses.replace(self._resolve_generate_config(request), ignore_eos=True)

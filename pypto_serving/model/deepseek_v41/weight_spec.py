@@ -35,11 +35,15 @@ def pack_fp4_tiles(payload, tile=256):
     k = half_k * 2
     if k % tile or n % tile:
         raise ValueError("routed FP4 weights require complete 256x256 tiles")
-    pairs = source.reshape(n // tile, tile // 2, 2, k // tile, tile // 2)
-    even, odd = pairs[:, :, 0], pairs[:, :, 1]
     output = torch.empty((n // tile, k // tile, tile, tile // 2), dtype=torch.uint8)
-    output[:, :, 0::2] = ((even & 15) | ((odd & 15) << 4)).permute(0, 2, 3, 1)
-    output[:, :, 1::2] = ((even >> 4) | (odd & 0xF0)).permute(0, 2, 3, 1)
+    for nb in range(n // tile):
+        for kb in range(k // tile):
+            block = source[nb*tile:(nb+1)*tile, kb*(tile//2):(kb+1)*(tile//2)]
+            codes = torch.empty((tile, tile), dtype=torch.uint8)
+            codes[:, 0::2] = block & 15
+            codes[:, 1::2] = block >> 4
+            transposed = codes.T
+            output[nb, kb] = transposed[:, 0::2] | (transposed[:, 1::2] << 4)
     return output.reshape(k * n // tile, tile // 2)
 
 
@@ -198,18 +202,17 @@ def backbone_weight_specs(config: Mapping[str, Any]) -> dict[str, TensorSpec]:
             add(f"{base}.hc_{sublayer}_fn", (mix, hc * dim), "F32")
             add(f"{base}.hc_{sublayer}_base", (mix,), "F32")
             add(f"{base}.hc_{sublayer}_scale", (3,), "F32")
-        add(base + ".ffn.gate.weight", (experts, dim), "BF16", "cast_to_fp32_for_routing")
+        add(base + ".ffn.gate.weight", (experts, dim), "BF16")
         add(base + ".ffn.gate.bias", (experts,), "F32")
         for expert_id in range(experts):
             expert(f"{base}.ffn.experts.{expert_id}", routed=True)
         expert(base + ".ffn.shared_experts", routed=False)
         if layer in kv_sources:
             prefix = attn + ".compressor"
-            promotion = "cast_bf16_to_fp32" if ratios[layer] > 1 else "identity"
-            add(prefix + ".wkv.weight", (head_dim, dim), "BF16", promotion)
+            add(prefix + ".wkv.weight", (head_dim, dim), "BF16")
             add(prefix + ".norm.weight", (head_dim,), "BF16")
             if ratios[layer] > 1:
-                add(prefix + ".wgate.weight", (head_dim, dim), "BF16", promotion)
+                add(prefix + ".wgate.weight", (head_dim, dim), "BF16")
         if layer in index_sources:
             prefix = attn + ".indexer"
             # C1A/C2A composites at lib fbe92bfc compute complete index scores

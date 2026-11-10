@@ -403,6 +403,8 @@ DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS = 8
 
 # ---- prefill geometry ----
 DSPARK_PREFILL_MAX_TOKENS = 8192
+DSPARK_CHECKPOINT_TILE_TOKENS = 512
+DSPARK_CHECKPOINTS_PER_TILE = 6
 # Maximum backing allocation; dispatches bind a compact TP-aligned prefix.
 DSPARK_PREFILL_DISPATCH_TOKENS = DSPARK_PREFILL_MAX_TOKENS
 DSPARK_PREFILL_LOCAL_TOKENS = DSPARK_PREFILL_DISPATCH_TOKENS // DSPARK_TP_SIZE
@@ -436,6 +438,7 @@ _PREFILL_PAGE_TABLE_SPECS = {
 
 _PREFILL_REQUEST_DYNAMIC_NAMES = frozenset(
     {
+        "state_checkpoint_ends",
         "ori_block_table", "hca_cmp_block_table", "csa_cmp_block_table", "idx_block_table",
         "hca_compress_state_block_table", "csa_compress_state_block_table",
         "csa_inner_compress_state_block_table",
@@ -3518,6 +3521,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         if task_args is None:
             raise RuntimeError("DSpark prefill TaskArgs are not staged")
         tensors = task_args.tensors
+        # A zero boundary keeps the existing terminal-state publication.
+        request_rows = inputs.query_start_loc.shape[1] - 1
+        self._packed_host_prefix(tensors["state_checkpoint_ends"], request_rows).zero_()
         values: dict[str, torch.Tensor] = {
             "input_ids": inputs.input_ids,
             "position_ids_local": inputs.position_ids_local,
