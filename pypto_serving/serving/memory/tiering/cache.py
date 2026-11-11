@@ -53,6 +53,11 @@ class TieredCache:
         self.quarantined = []
 
     def capture(self, name, partition, block):
+        # Rolling pages are reusable only with a confirmed joint checkpoint.
+        if self.cache._group_pools[name].spec.sliding_window is None:
+            self._capture(name, partition, block)
+
+    def _capture(self, name, partition, block):
         key = partition, name, block.block_hash
         if key in self.tier.pages:
             return
@@ -83,9 +88,15 @@ class TieredCache:
             return
         keys = []
         for name, (values, end) in checkpoints.histories[identity].items():
-            keys.extend((partition, name, value) for value in values[:end])
+            pool = self.cache._group_pools[name]
+            for value in values[:end]:
+                key = partition, name, value
+                if key not in self.tier.pages:
+                    self._capture(name, partition, pool.hash_to_block[partition, value])
+                keys.append(key)
         for name, block_id in checkpoints.checkpoints[identity]:
             block = self.cache._group_pools[name].blocks[block_id]
+            self._capture(name, partition, block)
             keys.append((partition, name, block.block_hash))
         self.tier.publish(identity, keys)
 

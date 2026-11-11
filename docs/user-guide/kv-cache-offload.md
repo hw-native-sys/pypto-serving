@@ -35,9 +35,12 @@ registers it once. DDR extents for different ranks and requests never overlap
 while live. Owner-local copy threads use a stream separate from computation;
 neither the API thread nor the compute submission thread waits for native DMA.
 
-New immutable pages enter a metadata queue with their source HBM references held.
-An idle owner immediately batches available pages, up to 256 MiB and 8192 native
-descriptors. There is one batch in flight per owner. A batch has one final native
+New immutable full-history pages enter a metadata queue with their source HBM
+references held. Rolling KV and compression state enter only as members of a
+confirmed joint checkpoint; overlapping checkpoint windows share their pages.
+Decode-only PD retains its shareable history, while active final state stays request-local.
+An idle owner immediately batches available pages, up to 256 MiB and 8192 expanded
+row entries before command merging. There is one batch in flight per owner. A batch has one final native
 completion; a logical page becomes ready only after all required components and
 TP copies complete. An index page includes both index KV and scale data.
 The planner compares layer rows within a page with regular runs across pages,

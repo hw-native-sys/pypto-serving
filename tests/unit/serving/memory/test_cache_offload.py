@@ -326,3 +326,44 @@ def test_eight_groups_restore_joint_boundaries_across_partitions_and_growth():
     tier.tier.finish_close()
     assert not tier.tier.pages and not tier.loads and tier.tier.used == 0
     assert all(b.ref_cnt == 0 for pool in cache._group_pools.values() for b in pool.blocks)
+
+
+@pytest.mark.parametrize("length", [8192, 8205, 8319, 8320])
+def test_ddr_rolling_pages_are_exactly_the_confirmed_checkpoint_union(length):
+    cache, tier, _ = fixture()
+    tokens = prompt(0, length)
+    warm(cache, tier, tokens)
+    checkpoints = cache._group_checkpoints
+    expected = set()
+    for identity, members in checkpoints.checkpoints.items():
+        for name, local in members:
+            block = cache._group_pools[name].blocks[local]
+            expected.add((identity[0], name, block.block_hash))
+    actual = {key for key in tier.tier.pages if cache._group_pools[key[1]].spec.sliding_window is not None}
+    assert actual == expected
+    assert actual and tier.tier.units
+    # A repeated publication must neither copy pages twice nor acquire more pins.
+    before = tier.tier.counters.copy()
+    for identity in checkpoints.checkpoints:
+        hashes = cache.compute_group_block_hashes(tokens)
+        tier.publish_checkpoint(hashes, length, identity[0], identity[1])
+    tier.progress()
+    assert tier.tier.counters == before and not tier.tier.queued
+
+
+def test_d_only_captures_history_and_keeps_rolling_state_request_local():
+    from pypto_serving.pd.adapter import DeepSeekDSpark
+    cache, tier, _ = fixture()
+    tokens = prompt(0, 513)
+    hashes = cache.compute_group_block_hashes(tokens, group_names=tuple(
+        DeepSeekDSpark().prefix_spec(tokens, cache).hashes))
+    reservation = cache.reserve_group_cache("d", "d", 1024, prompt_token_count=len(tokens),
+        prefix_block_hashes=hashes, shareable_group_names=tuple(hashes))
+    cache.authorize_group_cache_write("d")
+    cache.commit_group_cache("d")
+    tier.progress()
+    tier.progress()
+    assert {key[1] for key in tier.tier.pages} == set(hashes)
+    assert all(reservation.block_ids_by_group[name] for name in cache.group_names)
+    cache.release_group_cache("d", confirmed_stopped=True)
+    assert all(b.ref_cnt == 0 for pool in cache._group_pools.values() for b in pool.blocks)
