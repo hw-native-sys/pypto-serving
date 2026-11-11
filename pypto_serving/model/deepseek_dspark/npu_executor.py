@@ -30,7 +30,7 @@ from pathlib import Path
 
 import torch
 
-from pypto_serving.config.types import RuntimeModel
+from pypto_serving.config.types import EplbConfig, RuntimeModel
 from pypto_serving.model.common.compiler.compiler import KernelCompiler
 from pypto_serving.model.common.executor.pypto_executor import PyptoExecutor as CorePyptoExecutor
 from pypto_serving.model.common.executor.utils import build_pypto_run_config
@@ -77,6 +77,8 @@ _DSPARK_IMPORT_MODULES = (
     "dspark_drafter",
     "dspark_markov",
     "expert_routed",
+    "eplb_routing",
+    "eplb_transfer",
     "expert_shared",
     "gate",
     "hc_head",
@@ -150,6 +152,8 @@ def _dspark_import_context(
     weight_bank_size: int,
     dp: int = 1,
     lm_head_tp: int = 4,
+    enable_eplb: bool = False,
+    num_redundant_experts: int = 0,
 ):
     """Import kernels with one node's independent attention and head shapes."""
     old_argv = list(sys.argv)
@@ -173,6 +177,8 @@ def _dspark_import_context(
         "--dp", str(int(dp)),
         "--weight-bank-size", str(int(weight_bank_size)),
     ]
+    if enable_eplb:
+        sys.argv.extend(("--enable-eplb", "--num-redundant-experts", str(num_redundant_experts)))
     sys.path.insert(0, str(kernel_dir))
     sys.path.insert(0, str(pypto_lib_root))
     try:
@@ -212,6 +218,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         num_speculative_tokens: int = 0,
         capture_prefill_tail: bool = False,
         runner_extension_factory=None,
+        eplb_config: EplbConfig | None = None,
     ) -> None:
         worker_device_ids = tuple(device_ids) if device_ids is not None else (int(device_id),)
         super().__init__(
@@ -234,6 +241,11 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             raise ValueError("invalid DSpark execution role")
         self._execution_role = execution_role
         self._runner_extension_factory = runner_extension_factory
+        self._eplb_config = eplb_config or EplbConfig()
+        if self._eplb_config.enabled:
+            self._eplb_config.validate_topology(
+                logical_experts=256, ranks=cache_ranks, tp_size=tp_size, execution_role=execution_role,
+            )
         if self._num_speculative_tokens not in (0, DSPARK_SPECULATIVE_TOKENS):
             raise ValueError(
                 "DSpark speculation is fixed at K="
@@ -251,6 +263,19 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                 pypto_build_dir=self._pypto_build_dir,
             ),
         )
+
+    @property
+    def eplb_enabled(self) -> bool:
+        return self._eplb_config.enabled
+
+    def take_ready_eplb_plan(self, model: RuntimeModel):
+        return self._runners[model.config.model_id].take_ready_eplb_plan()
+
+    def validate_eplb_plan(self, model: RuntimeModel, plan) -> None:
+        self._runners[model.config.model_id].validate_eplb_plan(plan)
+
+    def apply_eplb_plan(self, model: RuntimeModel, plan) -> None:
+        self._runners[model.config.model_id].apply_eplb_plan(plan)
 
     @property
     def max_prefill_batch_size(self) -> int:
@@ -363,6 +388,18 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         n_routed_experts = (
             int(config_data.get("n_routed_experts", 256)) if isinstance(config_data, dict) else 256
         )
+        eplb_placement = None
+        if self._eplb_config.enabled:
+            from pypto_serving.model.deepseek_dspark.eplb.state import Placement
+
+            self._eplb_config.validate_topology(
+                logical_experts=n_routed_experts, ranks=layout.ranks,
+                tp_size=layout.tp_size, execution_role=self._execution_role,
+            )
+            eplb_placement = Placement.initial(
+                layers=model.config.num_hidden_layers, logical_experts=n_routed_experts, ranks=layout.ranks,
+                redundant_experts=self._eplb_config.num_redundant_experts,
+            )
         num_hash_layers = (
             int(config_data.get("num_hash_layers", 3)) if isinstance(config_data, dict) else 3
         )
@@ -423,12 +460,18 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         if prefill_async and (not speculative or (device_bootstrap and not device_bootstrap_metadata)):
             raise ValueError("Async DSpark prefill requires K=7 and Host metadata; device bootstrap needs metadata")
         decode = None
+        eplb_transfer = None
         rope: DSparkRopeTables | None = None
         if self._compile_kernels:
             modules = self._load_kernel_modules(layout, speculative=speculative)
+            if eplb_placement is not None:
+                from pypto_serving.model.deepseek_dspark.eplb.abi import validate_kernel_contract
+
+                validate_kernel_contract(modules, eplb_placement)
+            suffix = "_eplb" if self._eplb_config.enabled else ""
             if self._execution_role != "decode":
                 prefill = self._compile_l3_callable(
-                    "dspark_prefill", modules["prefill_fwd"].l3_prefill_fwd,
+                    "dspark_prefill", getattr(modules["prefill_fwd"], "l3_prefill_fwd" + suffix),
                 )
             if prefill_device_tail:
                 prefill_capture = self._compile_l3_callable(
@@ -445,12 +488,19 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             if speculative:
                 decode = self._compile_l3_callable(
                     "dspark_decode_one_l2",
-                    modules["decode_fwd_dspark"].l3_decode_fwd_dspark,
+                    getattr(modules["decode_fwd_dspark"], "l3_decode_fwd_dspark" + suffix),
                 )
             elif self._execution_role != "prefill":
                 decode = self._compile_l3_callable(
-                    "dspark_decode", modules["decode_fwd"].l3_decode_fwd
+                    "dspark_decode", getattr(modules["decode_fwd"], "l3_decode_fwd" + suffix),
                 )
+            if eplb_placement is not None:
+                transfer = modules["eplb_transfer"].make_eplb_transfer(
+                    ranks=layout.ranks, local_slots=eplb_placement.local_slots,
+                    hidden_size=model.config.hidden_size,
+                    intermediate_size=int(config_data["moe_intermediate_size"]),
+                )
+                eplb_transfer = self._compile_l3_callable("dspark_eplb_transfer", transfer)
             if device_bootstrap:
                 bootstrap_tokens = self._compile_l3_callable(
                     "dspark_bootstrap_tokens", modules["prefill_bootstrap"].l3_prepare_bootstrap_tokens
@@ -498,6 +548,9 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             layer_plan=layer_plan,
             kernel_dir=str(self._kernel_dir),
             runtime_model=model,
+            eplb_config=self._eplb_config,
+            eplb_placement=eplb_placement,
+            eplb_transfer=eplb_transfer,
             prefill=prefill,
             prefill_async=prefill_async,
             bootstrap_one_l2_enabled=bootstrap_one_l2_enabled,
@@ -563,6 +616,8 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             weight_bank_size=DSPARK_FWD_NUM_LAYERS,
             dp=layout.partitions,
             lm_head_tp=layout.lm_head_tp_size,
+            enable_eplb=self._eplb_config.enabled,
+            num_redundant_experts=self._eplb_config.num_redundant_experts,
         ):
             config = importlib.import_module("config")
             utils = importlib.import_module("utils")
@@ -576,6 +631,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                 "prefill_state": importlib.import_module("prefill_state"),
                 "prefill_bootstrap": importlib.import_module("prefill_bootstrap"),
                 "prefill_bootstrap_metadata": importlib.import_module("prefill_bootstrap_metadata"),
+                "eplb_transfer": importlib.import_module("eplb_transfer"),
             }
             if speculative:
                 modules["prefill_bootstrap_one_l2"] = importlib.import_module("prefill_bootstrap_one_l2")

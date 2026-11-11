@@ -114,6 +114,9 @@ def _prefill_slots(layout, *, host_hidden: bool = False) -> dict[str, tuple[torc
         "query_start_loc": (
             torch.int32, (ranks, requests + 1),
         ),
+        "state_checkpoint_ends": (
+            torch.int32, (ranks, requests, (tokens + 511) // 512, 6),
+        ),
         "hca_compress_state_block_table": (
             torch.int32,
             (ranks, requests, DSPARK_PREFILL_HCA_STATE_TABLE_BLOCKS),
@@ -248,6 +251,7 @@ def prefill_task_args(runner: DSparkModelRunner) -> TaskArgs:
             ta.add_arg(name, scratch[name])
         else:
             ta.add_arg(name, lambda n=name: runner._require_stacked_weights()[n])
+    _add_eplb_args(ta, runner)
     return ta
 
 
@@ -414,7 +418,20 @@ def decode_task_args(runner: DSparkModelRunner) -> TaskArgs:
             )
         else:
             ta.add_arg(name, lambda n=name: runner._require_stacked_weights()[n])
+    _add_eplb_args(ta, runner)
     return ta
+
+
+def _add_eplb_args(ta: TaskArgs, runner: DSparkModelRunner) -> None:
+    if runner._eplb is None:
+        return
+    placement = runner._compiled.eplb_placement
+    ranks, layers = placement.ranks, placement.layers
+    padded_slots = (placement.local_slots + 15) // 16 * 16
+    for name in ("eplb_mapping", "eplb_replicas"):
+        ta.add_arg(name, lambda n=name: runner._eplb.table(runner._shared_l3_worker(), n))
+    for name, shape in (("eplb_load", (ranks, layers, padded_slots)), ("eplb_control", (ranks, 2))):
+        ta.add_slot(Slot(name, Placement.HOST_SHARED, torch.int32, lambda _, s=shape: s))
 
 
 # Argument order for the packed all-43-layer ``l3_prefill_fwd`` kernel
@@ -426,6 +443,7 @@ def decode_task_args(runner: DSparkModelRunner) -> TaskArgs:
 _PREFILL_TENSOR_ORDER = (
     "x_hc",
     "query_start_loc",
+    "state_checkpoint_ends",
     "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
     "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
     "kv_cache", "attn_sink", "wo_a", "wo_b", "wo_b_scale",

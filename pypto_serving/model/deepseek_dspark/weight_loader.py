@@ -156,6 +156,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         include_tid2eid: bool = False,
         include_gate_bias: bool = False,
         expert_ids=None,
+        physical_to_logical=None,
         destinations: Mapping[str, torch.Tensor] | None = None,
     ) -> DeepSeekV4PackedLayerWeights:
         """Pack one layer under the DSpark rank layout (TP o-proj, padded HC)."""
@@ -176,6 +177,9 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
             dspark_shard_policy,
         )
 
+        expert_policy = dspark_expert_parallel(
+            int(ranks), int(n_routed_experts), physical_to_logical=physical_to_logical,
+        )
         all_experts = range(n_routed_experts) if expert_ids is None else tuple(expert_ids)
         raw = self.load_many(
             deepseek_v4_layer_weight_names(
@@ -201,7 +205,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
             raw,
             context,
             policy=dspark_shard_policy(int(ranks), tp_size=tp_size),
-            expert_policy=dspark_expert_parallel(int(ranks), int(n_routed_experts)),
+            expert_policy=expert_policy,
             factories=dspark_factories(),
             destinations=destinations,
             missing_source_error=DSPARK_SOURCE_MISSING_ERROR,
@@ -219,6 +223,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         num_hash_layers: int,
         tp_size: int = 4,
         use_prepacked: bool = True,
+        expert_placement=None,
     ) -> DSparkStackedLayerWeights:
         """Load every hidden layer once and stack the DSpark weight banks.
 
@@ -246,6 +251,14 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         num_hidden_layers = len(compress_ratios)
         if num_hidden_layers <= 0:
             raise ValueError("compress_ratios must include at least one entry per hidden layer")
+        if expert_placement is not None and (
+            expert_placement.layers != num_hidden_layers or expert_placement.ranks != ranks
+            or expert_placement.logical_experts != n_routed_experts
+        ):
+            raise ValueError("DSpark expert placement does not match the target weight bank")
+
+        def layer_placement(layer_id):
+            return None if expert_placement is None else expert_placement.physical_to_logical[layer_id]
 
         first = self.load_packed_layer_weights(
             0,
@@ -255,6 +268,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
             compress_ratio=int(compress_ratios[0]),
             include_tid2eid=num_hash_layers > 0,
             include_gate_bias=num_hash_layers <= 0,
+            physical_to_logical=layer_placement(0),
         )
 
         def pack_into(layer_id: int, destinations: Mapping[str, torch.Tensor]) -> None:
@@ -266,6 +280,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
                 compress_ratio=int(compress_ratios[layer_id]),
                 include_tid2eid=layer_id < num_hash_layers,
                 include_gate_bias=layer_id >= num_hash_layers,
+                physical_to_logical=layer_placement(layer_id),
                 destinations=destinations,
             )
 
