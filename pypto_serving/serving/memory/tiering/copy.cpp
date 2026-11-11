@@ -70,6 +70,8 @@ static std::vector<Copy> plan(const Span *spans, size_t count)
             }
         }
         runs.push_back({a.device, a.host, a.width, end-i, dp, hp});
+        // More runs cannot improve a plan that already exceeds the page plan.
+        if (runs.size() > pages.size()) return pages;
         i = end;
     }
     return runs.size() <= pages.size() ? runs : pages;

@@ -18,8 +18,7 @@ class Extents:
     def __init__(self, capacity):
         if type(capacity) is not int or capacity < PAGESIZE:
             raise ValueError("DDR pool must hold at least one physical page")
-        self.capacity = capacity // PAGESIZE * PAGESIZE
-        self.free = [(0, self.capacity)]
+        self.free = [(0, capacity // PAGESIZE * PAGESIZE)]
         self.allocations = {}
 
     def reserve(self, handle, copies, size):

@@ -49,7 +49,6 @@ class NativeCopy:
             "aclrtCreateStream": [ctypes.POINTER(pointer)],
             "aclrtDestroyStream": [pointer],
             "aclrtSynchronizeStream": [pointer],
-            "aclrtGetDevice": [ctypes.POINTER(ctypes.c_int)],
             "aclrtHostRegisterV2": [pointer, ctypes.c_uint64, ctypes.c_uint32],
             "aclrtHostUnregister": [pointer],
         }

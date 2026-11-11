@@ -11,9 +11,8 @@
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from itertools import count
 from mmap import PAGESIZE
-from queue import Empty, PriorityQueue
+from queue import Empty, SimpleQueue
 import logging
 import threading
 import time
@@ -74,7 +73,6 @@ def endpoints(context, ranks):
 @dataclass
 class Storage:
     ranks: tuple
-    spans: tuple
     size: int
     extents: tuple
     active: int = 0
@@ -97,12 +95,10 @@ class SimplerBackend:
         self.owners, self.geometry = owners, geometry
         self.tp = geometry["tp"]
         self.extents = Extents(capacity)
-        self.queue = PriorityQueue()
-        self.sequence = count()
+        self.queue = SimpleQueue()
         self.records = {}
         self.lock = threading.RLock()
         self.wake = threading.Event()
-        self.accepting = True
         self.closing = False
         self.close_error = None
         self.metrics = {direction: dict(batches=0, pages=0, bytes=0, rpc_ns=0, native_ns=0,
@@ -136,18 +132,18 @@ class SimplerBackend:
         if size > BATCH_BYTES or len(spans) > BATCH_SPANS:
             raise ValueError("cache page exceeds native batch capacity")
         with self.lock:
-            if not self.accepting:
+            if self.closing:
                 raise RuntimeError("cache backend is closing")
             extents = self.extents.reserve(handle, len(ranks), size)
             if extents is None:
                 return False
-            self.records[handle] = Storage(ranks, spans, size, extents)
+            self.records[handle] = Storage(ranks, size, extents)
             return True
 
     def _submit(self, operation, handle, source):
         ranks, spans, size = self.plan(source)
         with self.lock:
-            if not self.accepting:
+            if self.closing:
                 raise RuntimeError("cache backend is closing")
             storage = self.records[handle]
             if (ranks != storage.ranks or size != storage.size or storage.uncertain
@@ -157,7 +153,7 @@ class SimplerBackend:
             future = Future()
             job = Job(future, operation, handle, spans, storage, time.monotonic_ns())
             storage.active += 1
-            self.queue.put_nowait((0 if operation == "load" else 1, next(self.sequence), job))
+            self.queue.put_nowait(job)
             self.wake.set()
             return future
 
@@ -229,10 +225,9 @@ class SimplerBackend:
                         del active[partition]
                 while True:
                     try:
-                        item = self.queue.get_nowait()
+                        job = self.queue.get_nowait()
                     except Empty:
                         break
-                    job = item[2]
                     pending[job.storage.ranks[0] // self.tp][job.operation].append(job)
                 for partition, waiting in enumerate(pending):
                     if partition in active or not any(waiting.values()):
@@ -285,8 +280,8 @@ class SimplerBackend:
                 self.wake.wait(.01)
 
     def close(self):
-        self.accepting = False
-        self.closing = True
+        with self.lock:
+            self.closing = True
         self.wake.set()
         self.thread.join()
         if self.close_error is not None:

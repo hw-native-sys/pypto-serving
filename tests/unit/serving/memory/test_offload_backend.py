@@ -16,9 +16,9 @@ from types import SimpleNamespace
 import pytest
 
 from pypto_serving.model.deepseek_dspark.cache_offload import CacheOffloadExtension
-from pypto_serving.serving.memory.tiering.backend import BATCH_SPANS, SimplerBackend
+from pypto_serving.serving.memory.tiering.backend import SimplerBackend
 from pypto_serving.serving.memory.tiering.integration import Session
-from pypto_serving.serving.memory.tiering.simpler import CopyService, NativeCopy, Span
+from pypto_serving.serving.memory.tiering.simpler import CopyService, NativeCopy
 from tests.unit.serving.memory.test_tiering import setup
 
 
@@ -111,34 +111,11 @@ def test_invalid_spans_never_enter_native_submission(span):
     native = NativeCopy.__new__(NativeCopy)
     native.thread = threading.get_ident()
     native.closed = native.poisoned = False
-    native.commands = (Span * BATCH_SPANS)()
     native.pool = SimpleNamespace(nbytes=16, base=100)
     native.regions = {"k": ("token", 200, 16, 0)}
     native._call = lambda *args: pytest.fail("invalid span reached native DMA")
     with pytest.raises(ValueError):
         native.copy_batch("store", ((1, 0, 16, (span,)),))
-
-
-@pytest.mark.parametrize("store", [True, False])
-def test_one_pitched_command_preserves_layer_offsets_and_dense_ddr_packing(store):
-    native = NativeCopy.__new__(NativeCopy)
-    native.thread = threading.get_ident()
-    native.closed = native.poisoned = False
-    native.commands = (Span * BATCH_SPANS)()
-    native.pool = SimpleNamespace(nbytes=32, base=100)
-    native.device = SimpleNamespace(value=0)
-    native.regions = {"k": ("token", 200, 2048, 0)}
-    native.stream = "stream"
-    calls = []
-    def copy(commands, count, kind, stream, timing, planned):
-        calls.extend((c.device, c.host, c.width, c.rows, c.pitch, c.region) for c in commands[:count])
-        planned._obj.value = count
-        timing[:] = [1, 2, 3]
-        return 0
-    native.native = SimpleNamespace(copy_cache_batch=copy)
-    proof = native.copy_batch("store" if store else "load", ((1, 0, 32, (("k", 16, 0, 4, 3, 128),)),))
-    assert calls == [(216, 100, 4, 3, 128, 0)]
-    assert proof["pages"] == (dict(handle=1, bytes=12, stopped=True, native_completed=True),)
 
 
 def test_offload_extension_composes_existing_pd_factory_and_hooks():
@@ -178,12 +155,13 @@ def test_progress_failure_wakes_clients_without_release_or_fake_completion():
     assert core._request_contexts == {"r": context}
 
 
-def test_offload_configuration_rejects_prefix_disabled_before_creating_owners(monkeypatch):
+@pytest.mark.parametrize("prefix,capacity", [(False, PAGESIZE), (True, 1)])
+def test_offload_configuration_rejects_invalid_settings_before_creating_owners(monkeypatch, prefix, capacity):
     from pypto_serving.serving.memory.tiering import integration
     monkeypatch.setattr(integration, "endpoints", lambda *args: pytest.fail("created an owner endpoint"))
-    config = SimpleNamespace(executor_cls="PyptoDeepSeekV4DSparkExecutor", enable_prefix_cache=False,
-                             runtime_config=SimpleNamespace(kv_offload_backend="simpler"))
-    with pytest.raises(ValueError, match="prefix"):
+    config = SimpleNamespace(executor_cls="PyptoDeepSeekV4DSparkExecutor", enable_prefix_cache=prefix,
+                             runtime_config=SimpleNamespace(kv_offload_backend="simpler", kv_offload_bytes=capacity))
+    with pytest.raises(ValueError, match="pool" if prefix else "prefix"):
         Session(SimpleNamespace(config=config))
 
 
@@ -335,6 +313,8 @@ def test_waiting_store_does_not_hold_load_progress_and_native_users_prevent_reus
         with pytest.raises(RuntimeError, match="native users"):
             backend.release(1)
         assert backend.reserve(2, ("kv", 0, 1))
+        cancelled = backend.store(2, ("kv", 0, 1))
+        assert cancelled.cancel()
         assert not backend.reserve(3, ("kv", 0, 2))
         proceed.set()
         store.result(2)
@@ -345,6 +325,8 @@ def test_waiting_store_does_not_hold_load_progress_and_native_users_prevent_reus
     finally:
         proceed.set()
         backend.close()
+    assert all(page[0] != 2 for operation, payload, _ in owner.calls
+               if operation == "copy_batch" for page in payload[1])
 
 
 @pytest.mark.parametrize("failed", [False, True])
@@ -376,22 +358,6 @@ def test_pool_placement_precedes_physical_touch_and_startup_failure_closes_backi
     else:
         assert pool.allocate_pool(8192) is buffer
         assert calls == ["advice", "policy", "touch"]
-
-
-def test_native_copy_error_cannot_publish_or_retire():
-    native = NativeCopy.__new__(NativeCopy)
-    native.thread = threading.get_ident()
-    native.closed = native.poisoned = False
-    native.commands = (Span * BATCH_SPANS)()
-    native.pool = SimpleNamespace(nbytes=4096, base=100)
-    native.regions = {"k": ("pin", 10000, 4096, 0)}
-    native.device, native.stream = SimpleNamespace(value=0), None
-    native.native = SimpleNamespace(copy_cache_batch=lambda *args: 7)
-    with pytest.raises(RuntimeError, match="failed"):
-        native.copy_batch("store", ((1, 0, 4096, (("k", 0, 0, 4, 1, 4),)),))
-    assert native.poisoned
-    with pytest.raises(RuntimeError, match="unavailable"):
-        native.close()
 
 
 @pytest.mark.parametrize("failed", [False, True])

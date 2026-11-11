@@ -204,6 +204,8 @@ def test_d_begin_waits_for_ddr_before_publishing_placement_and_reserving_state(c
             await node.abort(entry, stopped=True)
             with pytest.raises(ValueError, match="cancelled"):
                 await task
+            assert not tier.pending and tier.loads
+            assert all(load.block.ref_cnt > 0 for load in tier.loads.values())
         for future in backend.waiting:
             future.set_result(dict(bytes=1, stopped=True, native_completed=True))
         tier.progress()
@@ -234,33 +236,6 @@ def test_missing_ddr_state_cannot_claim_complete_resume():
     hashes = cache.compute_group_block_hashes(tokens)
     assert tier.prepare("query", hashes, len(tokens), maximum=boundary)
     assert cache.acquire_group_prefix_blocks("query", hashes, max_cache_hit_tokens=boundary)[1] == 0
-
-
-def test_cancelled_d_restore_does_not_proceed_to_reservation():
-    cache, tier, backend = fixture()
-    tokens = prompt(0, 513)
-    boundary = warm(cache, tier, tokens)
-    evict(cache)
-    backend.hold = True
-    hashes = cache.compute_group_block_hashes(tokens)
-
-    async def scenario():
-        stopped = False
-        task = asyncio.create_task(tier.restore("d", hashes, len(tokens), maximum=boundary,
-                                                cancelled=lambda: stopped))
-        await asyncio.sleep(.01)
-        stopped = True
-        with pytest.raises(ValueError, match="cancelled"):
-            await task
-
-    asyncio.run(scenario())
-    assert not tier.pending and not cache._group_request_partitions
-    assert tier.loads and all(load.block.ref_cnt > 0 for load in tier.loads.values())
-    for future in backend.waiting:
-        future.set_result(dict(bytes=1, stopped=True, native_completed=True))
-    tier.progress()
-    assert not tier.loads
-    assert all(b.ref_cnt == 0 for pool in cache._group_pools.values() for b in pool.blocks)
 
 
 def test_unknown_load_keeps_destination_and_ddr_reference_without_publishing():

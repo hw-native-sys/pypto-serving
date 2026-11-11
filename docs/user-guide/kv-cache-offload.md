@@ -72,6 +72,8 @@ pins isolated; a timeout is not evidence that memory can be reused.
 actual restores, and `kv_offload_closed` reports completed byte/page counters.
 Debug logging adds per-batch completion summaries. Native bytes count TP replicas;
 they must be distinguished from logical pages and token hit rates.
+Native timing includes command planning, submission and stream completion; it is
+not isolated DMA time.
 
 Measure cold, HBM-hit and DDR-hit requests separately. Exclude startup, data
 readback and correctness hashing from bandwidth measurements. Report Host step

@@ -11,6 +11,7 @@
 import asyncio
 from dataclasses import replace
 from functools import partial
+from mmap import PAGESIZE
 import logging
 import multiprocessing as mp
 from pathlib import Path
@@ -39,14 +40,14 @@ class Session:
                 or config.runtime_config.kv_offload_backend != "simpler"
                 or not config.enable_prefix_cache):
             raise ValueError("DDR offload requires DSpark prefix caching and the simpler backend")
+        capacity = config.runtime_config.kv_offload_bytes // PAGESIZE * PAGESIZE
+        if capacity <= 0:
+            raise ValueError("DDR pool is smaller than one physical page")
         context = mp.get_context("spawn")
         self.owners = endpoints(context, len(config.worker_device_ids()))
         self.metadata = context.Queue(maxsize=1)
         self.cache = None
         from .simpler import descriptor_wire
-        capacity = config.runtime_config.kv_offload_bytes // 4096 * 4096
-        if capacity <= 0:
-            raise ValueError("DDR pool is smaller than one physical page")
         self.copy_library = build_copy_library()
         try:
             self.pool = allocate_pool(capacity)
