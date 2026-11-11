@@ -221,7 +221,6 @@ def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
     head, index, world = abi.HEAD_DIM, abi.INDEX_DIM, abi.EP_SIZE
     if (world not in (4, 8) or any(type(value) is not int or value <= 0 for value in
                        (head, index, abi.STATE_CAPACITY, abi.STATE_WIDTH))
-            or head % abi.WINDOW_CACHE_GROUP or head % abi.COMPRESSED_CACHE_GROUP
             or index % abi.INDEX_CACHE_GROUP):
         raise ValueError("decode cache dimensions disagree with the V4.1 EP4/EP8 topology")
     block = abi.BLOCK_SIZE
@@ -231,16 +230,10 @@ def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
     compressed_pages = max(physical_group_blocks[resolved.c2a],
                            physical_group_blocks[resolved.c1a])
     buffers = (
-        CacheBufferSpec("window_cache_pool", (world, len(layers) * window_pages, block, 1, head),
-                        torch.float8_e4m3fn),
-        CacheBufferSpec("window_cache_scale_pool", (
-            world, len(layers) * window_pages, block, 1, head // abi.WINDOW_CACHE_GROUP),
-                        torch.bfloat16),
+        CacheBufferSpec("window_cache_pool", (
+            world, len(layers) * window_pages, block, 1, abi.WINDOW_CACHE_BYTES), torch.uint8),
         CacheBufferSpec("compressed_cache_pool", (
-            world, kv_sources * compressed_pages, block, 1, head // 2), torch.uint8),
-        CacheBufferSpec("compressed_cache_scale_pool", (
-            world, kv_sources * compressed_pages, block, 1, head // abi.COMPRESSED_CACHE_GROUP),
-                        torch.bfloat16),
+            world, kv_sources * compressed_pages, block, 1, abi.COMPRESSED_CACHE_BYTES), torch.uint8),
         CacheBufferSpec("index_cache_pool", (
             world, index_sources * compressed_pages, block, 1, index // 2), torch.uint8),
         CacheBufferSpec("index_cache_scale_pool", (
@@ -267,8 +260,11 @@ def make_cache_page_reset_buffers(plan: DecodeCachePlan) -> dict[str, torch.Tens
             continue
         page = torch.empty((spec.shape[0], *spec.shape[2:]), dtype=spec.dtype).share_memory_()
         page.view(torch.uint8).zero_()
-        if spec.name in ("window_cache_scale_pool", "compressed_cache_scale_pool"):
-            page.fill_(1)
+        if spec.name in ("window_cache_pool", "compressed_cache_pool"):
+            from models.deepseek_v4_1_flash.quant import unpack_quantized_cache
+
+            _, factors = unpack_quantized_cache(page, spec.name == "compressed_cache_pool")
+            factors.fill_(1)
         elif spec.name == "index_cache_scale_pool":
             page.view(torch.uint8).fill_(127)
         result[spec.name] = page
@@ -346,13 +342,12 @@ class DecodeCachePools:
         """Resolve a layer's physical producer pools for its lib prefill entry."""
         result = {
             "window_cache": self.view("window_cache_pool", layer.layer_id),
-            "window_cache_scale": self.view("window_cache_scale_pool", layer.layer_id),
         }
         if layer.mode == "swa":
             return result
         kv_slot = kv_sources.index(layer.kv_source)
         index_slot = index_sources.index(layer.index_source)
-        for name in ("compressed_cache", "compressed_cache_scale", "index_cache", "index_cache_scale"):
+        for name in ("compressed_cache", "index_cache", "index_cache_scale"):
             slot = kv_slot if name.startswith("compressed_") else index_slot
             result[name] = self.view(name + "_pool", slot)
         if layer.mode == "c2a_full":
@@ -392,8 +387,8 @@ class DecodeCachePools:
                 (not padding and not 0 <= owner.slot < self.plan.request_slots)):
             raise ValueError("request state slot is outside its cache family")
         fields = {
-            "window": ("window_cache_pool", "window_cache_scale_pool"),
-            "compressed": ("compressed_cache_pool", "compressed_cache_scale_pool"),
+            "window": ("window_cache_pool",),
+            "compressed": ("compressed_cache_pool",),
             "index": ("index_cache_pool", "index_cache_scale_pool"),
         }
         specs = {spec.name: spec for spec in self.plan.buffers}
@@ -493,9 +488,7 @@ class DecodeFullCachePools(DecodeCachePools):
             raise ValueError("lib prefill requires one common cache page extent")
         names = {
             "window_cache": "window_cache_pool",
-            "window_scales": "window_cache_scale_pool",
             "compressed_cache": "compressed_cache_pool",
-            "compressed_scales": "compressed_cache_scale_pool",
             "index_cache": "index_cache_pool",
             "index_scales": "index_cache_scale_pool",
             "state_cache": "state_cache_pool",
@@ -2225,7 +2218,7 @@ def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
         raise ValueError(f"final output host buffers require {required_bytes} bytes")
 
     norm = torch.empty((topology.world, hidden), dtype=torch.bfloat16).share_memory_()
-    head = torch.empty((topology.world, shard_rows, hidden), dtype=torch.bfloat16).share_memory_()
+    head = torch.empty((topology.world, hidden, shard_rows), dtype=torch.bfloat16).share_memory_()
     indices = torch.full((topology.world, max_logit_rows), -1, dtype=torch.int32).share_memory_()
     logits = torch.zeros((topology.world, max_logit_rows, vocab), dtype=torch.float32).share_memory_()
     sampled = torch.full((topology.world, max_logit_rows, sampled_pad), -1,
@@ -2235,6 +2228,8 @@ def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
     if norm_value.dtype != torch.bfloat16 or tuple(norm_value.shape) != (hidden,):
         raise ValueError("checkpoint final Norm weight disagrees with the lib output ABI")
     norm.copy_(norm_value.expand_as(norm))
+    from models.deepseek_v4_1_flash.quant import pack_bf16_nz
+
     for tp_rank in range(topology.tp):
         rank_loader = (loader if tp_rank == 0 else V41WeightLoader(
             model_dir, tp_size=topology.tp, tp_rank=tp_rank,
@@ -2244,7 +2239,8 @@ def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
             value = rank_loader.load_rows("head.weight", start, stop).weight
             if value.dtype != torch.bfloat16 or tuple(value.shape) != (stop - start, hidden):
                 raise ValueError("checkpoint LM-head shard disagrees with the lib output ABI")
-            head[tp_rank, start:stop].copy_(value)
+            head[tp_rank, :, start:stop].copy_(value.t())
+        head[tp_rank].copy_(pack_bf16_nz(head[tp_rank]))
     for dp_rank in range(1, topology.dp):
         for tp_rank in range(topology.tp):
             head[dp_rank * topology.tp + tp_rank].copy_(head[tp_rank])
@@ -2264,11 +2260,11 @@ class FinalOutputWeights:
         world = topology.world
         if any(not tensor.is_shared() for tensor in host.all_host_tensors):
             raise ValueError("final output host buffers must be shared before worker creation")
-        if (host.norm_weight.dtype != torch.bfloat16 or host.norm_weight.shape != (world, host.head_weight.shape[-1])
+        if (host.norm_weight.dtype != torch.bfloat16 or host.norm_weight.shape != (world, host.head_weight.shape[1])
                 or host.head_weight.dtype != torch.bfloat16 or host.head_weight.shape[0] != world
                 or host.logit_row_indices.dtype != torch.int32 or host.logit_row_indices.shape != (world, 16)
                 or host.logits.dtype != torch.float32
-                or host.logits.shape != (world, 16, host.head_weight.shape[1] * topology.tp)
+                or host.logits.shape != (world, 16, host.head_weight.shape[-1] * topology.tp)
                 or host.sampled_ids.dtype != torch.int32 or host.sampled_ids.shape != (world, 16, 8)):
             raise ValueError("final output host buffers disagree with the lib TP1/DP ABI")
         self.worker, self.host, self.topology = worker, host, topology
@@ -2301,7 +2297,7 @@ class PrefillForwardSegment:
         try:
             self.residual = alloc_device_buffer(
                 worker, (topology.world, topology.local_capacity, 4,
-                         final.host.head_weight.shape[-1]), torch.float32, stacked=True)
+                         final.host.head_weight.shape[1]), torch.float32, stacked=True)
             self._owned.append(self.residual)
             self.pre_mix = alloc_device_buffer(
                 worker, (topology.world, topology.local_capacity, 4),
@@ -2494,18 +2490,16 @@ class ResidentDSparkCache:
 
     def __init__(self, worker, world, max_seq_len):
         from .dspark_resources import DSPARK_DRAFT_LAYERS, DSPARK_WINDOW
+        from models.deepseek_v4_1_flash.config import WINDOW_CACHE_BYTES
 
         self.worker = worker
         blocks = DSPARK_MAX_BATCH_PER_DP * ((max_seq_len + DSPARK_WINDOW - 1) // DSPARK_WINDOW)
         self.window_cache = alloc_device_buffer(
-            worker, (world, DSPARK_DRAFT_LAYERS, blocks, DSPARK_WINDOW, 1, 512),
-            torch.float8_e4m3fn, stacked=True)
-        self.window_cache_scale = alloc_device_buffer(
-            worker, (world, DSPARK_DRAFT_LAYERS, blocks, DSPARK_WINDOW, 1, 16),
-            torch.bfloat16, stacked=True)
+            worker, (world, DSPARK_DRAFT_LAYERS, blocks, DSPARK_WINDOW, 1, WINDOW_CACHE_BYTES),
+            torch.uint8, stacked=True)
 
     def close(self):
-        for name in ("window_cache", "window_cache_scale"):
+        for name in ("window_cache",):
             tensor = getattr(self, name, None)
             if tensor is not None:
                 self.worker.free_stacked_tensor(tensor)
@@ -2999,7 +2993,6 @@ class V41ResidentResources:
                   if name in self.dspark_weights.tensors}
         draft["embedding_weight"] = self.dspark_embedding.tensor
         draft["window_cache"] = self.dspark_cache.window_cache
-        draft["window_cache_scale"] = self.dspark_cache.window_cache_scale
         heads = self.dspark_weights
         markov = {name: heads.full(name) for name in _MARKOV_MODEL_KEYS
                   if name in heads.tensors}
