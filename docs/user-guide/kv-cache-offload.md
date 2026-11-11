@@ -40,8 +40,8 @@ An idle owner immediately batches available pages, up to 256 MiB and 8192 native
 descriptors. There is one batch in flight per owner. A batch has one final native
 completion; a logical page becomes ready only after all required components and
 TP copies complete. An index page includes both index KV and scale data.
-Validated pages with regular source and destination strides are submitted as
-two-dimensional copies. Isolated fragments use batch copy. This changes command
+The planner compares layer rows within a page with regular runs across pages,
+using the plan with fewer two-dimensional copies. Isolated fragments use batch copy. This changes command
 grouping without changing page layout or copying gaps between authorized pages.
 
 Lookup uses the normal grouped prefix boundaries. A hit must include the required

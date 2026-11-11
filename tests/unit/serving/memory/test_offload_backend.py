@@ -401,6 +401,29 @@ def test_native_copy_error_cannot_publish_or_retire():
         native.close()
 
 
+@pytest.mark.parametrize("store", [False, True])
+def test_fragmented_pages_keep_layer_rows_together(store):
+    native = NativeCopy.__new__(NativeCopy)
+    native.thread = threading.get_ident()
+    native.closed = native.poisoned = False
+    native.pool = SimpleNamespace(nbytes=4096, base=1000)
+    native.regions = {"k": ("pin", 10000, 1024)}
+    native.device, native.stream = SimpleNamespace(value=0), None
+    captured = []
+    def copy(commands, count, kind, attributes, stream, timing):
+        captured.extend((v.dst, v.src, v.width, v.height, v.dst_pitch, v.src_pitch) for v in commands)
+        timing[:] = [1, 2, 3]
+        return 0
+    native.native = SimpleNamespace(copy_cache_batch=copy)
+    native.copy_batch("store" if store else "load", tuple(
+        (i+1, i*12, 12, (("k", p*4, 0, 4, 3, 64),)) for i, p in enumerate((2, 0, 5))))
+    expected = sorted((10000+p*4+j*64, 1000+i*12+j*4, 4)
+                      for i, p in enumerate((2, 0, 5)) for j in range(3))
+    actual = sorted((s+j*sp, d+j*dp, w) if store else (d+j*dp, s+j*sp, w)
+                    for d, s, w, rows, dp, sp in captured for j in range(rows))
+    assert len(captured) == 3 and actual == expected
+
+
 @pytest.mark.parametrize("failed", [False, True])
 def test_copy_helper_builds_before_owners_and_cleans_failed_build(monkeypatch, failed):
     from pathlib import Path

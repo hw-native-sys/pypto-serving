@@ -132,7 +132,7 @@ class NativeCopy:
         self._check()
         if operation not in ("store", "load") or not pages:
             raise ValueError("invalid cache batch")
-        ranges, entries, handles = [], [], set()
+        ranges, entries, handles, page_rectangles = [], [], set(), []
         for handle, offset, allocation, spans in pages:
             if (type(handle) is not int or handle <= 0 or handle in handles
                     or any(type(v) is not int for v in (offset, allocation))
@@ -150,6 +150,8 @@ class NativeCopy:
                         or host_offset + rows * width > allocation):
                     raise ValueError("copy exceeds registered allocation")
                 host_ranges.append((host_offset, host_offset + rows * width))
+                page_rectangles.append((address + device_offset, self.pool.base + offset + host_offset,
+                                        width, rows, pitch, width))
                 for row in range(rows):
                     entries.append((name, address + device_offset + row * pitch,
                                     self.pool.base + offset + host_offset + row * width, width))
@@ -161,7 +163,8 @@ class NativeCopy:
                                       zip(sorted(ranges), sorted(ranges)[1:]))):
             raise ValueError("overlapping DDR ranges or oversized native batch")
         store = operation == "store"
-        planned = rectangles(entries)
+        # Fragmented page mappings can make a page's layer rows cheaper to submit together.
+        planned = min((rectangles(entries), page_rectangles), key=len)
         commands = (Copy * len(planned))(*(Copy(host if store else device, device if store else host,
             width, rows, host_pitch if store else device_pitch, device_pitch if store else host_pitch)
             for device, host, width, rows, device_pitch, host_pitch in planned))
