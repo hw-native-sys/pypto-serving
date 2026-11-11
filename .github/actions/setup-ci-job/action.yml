@@ -90,6 +90,15 @@ inputs:
       The runner name in the path covers concurrency (an instance runs one job at
       a time, so each tree has a single writer); this input covers the rest.
     required: true
+  runtime-platform:
+    description: >-
+      Simpler runtime to build: a2a3, a5, a2a3sim, or a5sim. Select the
+      job's NPU target explicitly; the CPU architecture does not identify it.
+    required: true
+  pypto-revision:
+    description: PyPTO commit to build. HEAD follows the upstream default branch.
+    required: false
+    default: HEAD
   needs-device:
     description: >-
       When 'true' the job talks to an NPU: verify a card is visible (npu-smi) and
@@ -123,12 +132,18 @@ runs:
       shell: bash
       env:
         NEEDS_DEVICE: ${{ inputs.needs-device }}
+        RUNTIME_PLATFORM: ${{ inputs.runtime-platform }}
         CCACHE_NAME: ${{ inputs.ccache-name }}
         PIP_CACHE_NAME: ${{ inputs.pip-cache-name }}
         BUILD_NAMESPACE: ${{ inputs.build-namespace }}
         TOOLCHAIN_IN: ${{ inputs.toolchain }}
       run: |
         set -uo pipefail
+        case "$NEEDS_DEVICE:$RUNTIME_PLATFORM" in
+          true:a2a3|true:a5|false:a2a3sim|false:a5sim) ;;
+          *) echo "::error::runtime-platform must match needs-device (a2a3/a5 for device, a2a3sim/a5sim for sim)"
+             exit 1 ;;
+        esac
         # Prerequisites CI does not create, so they must already be there. Model
         # dirs are checked by the test steps that read them, not here.
         required=""
@@ -263,6 +278,8 @@ runs:
       # revision. pypto owns ptoas (toolchain/versions.env) and pins pto-isa via
       # its runtime submodule (runtime/pto_isa.pin); read both.
       shell: bash
+      env:
+        PYPTO_REVISION: ${{ inputs.pypto-revision }}
       run: |
         # $PYPTO_SRC is the per-job build tree exported by the loader step.
         # github.com clones/fetches over this runner's link drop mid-transfer
@@ -284,20 +301,19 @@ runs:
             sleep $((attempt * 10))
           done
         }
-        # Follow the latest commit on pypto's default branch on every CI run.
-        if [ -d "$PYPTO_SRC/.git" ]; then
-          echo "Cache hit — updating pypto"
-          retry git -C "$PYPTO_SRC" fetch --depth=1 origin HEAD || exit 1
-          git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
-          git -C "$PYPTO_SRC" clean -ffdx
-          git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
-        else
-          echo "Cache miss — cloning pypto"
-          mkdir -p "$(dirname "$PYPTO_SRC")"
-          # rm before each attempt so a retried clone never hits a partial dir.
-          clone_pypto() { rm -rf "$PYPTO_SRC"; git clone --depth=1 https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"; }
-          retry clone_pypto || exit 1
+        if [ ! -d "$PYPTO_SRC/.git" ]; then
+          echo "Cache miss — initializing pypto"
+          git init -q "$PYPTO_SRC"
+          git -C "$PYPTO_SRC" remote add origin https://github.com/hw-native-sys/pypto.git
         fi
+        pypto_commit="$PYPTO_REVISION"
+        if [ "$PYPTO_REVISION" = HEAD ] || ! git -C "$PYPTO_SRC" cat-file -e "${PYPTO_REVISION}^{commit}" 2>/dev/null; then
+          retry git -C "$PYPTO_SRC" -c http.version=HTTP/1.1 fetch --depth=1 origin "$PYPTO_REVISION" || exit 1
+          pypto_commit=FETCH_HEAD
+        fi
+        git -C "$PYPTO_SRC" reset --hard "$pypto_commit"
+        git -C "$PYPTO_SRC" clean -ffdx
+        git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
         retry git -C "$PYPTO_SRC" submodule update --init --recursive --depth=1 || exit 1
         rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
         echo "pypto under test: $(git -C "$PYPTO_SRC" rev-parse HEAD)"
@@ -578,6 +594,8 @@ runs:
       # the toolchain pins were read from).
       shell: bash
       working-directory: ${{ inputs.checkout-path }}
+      env:
+        RUNTIME_PLATFORM: ${{ inputs.runtime-platform }}
       run: |
         source activate.sh
         python -m pip install --upgrade pip
@@ -635,7 +653,8 @@ runs:
         # the failed attempt can't poison the retry.
         retry_build() {
           local target="$1" attempt=0
-          until pip install --no-build-isolation "$target"; do
+          shift
+          until pip install --no-build-isolation "$target" "$@"; do
             attempt=$((attempt + 1))
             if [ "$attempt" -ge 3 ]; then
               echo "build of '$target' failed after $attempt attempts"; return 1
@@ -649,7 +668,10 @@ runs:
           done
         }
         retry_build "$PYPTO_SRC" || exit 1
-        retry_build "$PYPTO_SRC/runtime" || exit 1
+        # Build only this job's runtime. Auto-detection also selects A5 on
+        # A2/A3 hosts whose CANN SDK lacks the required A5 HCCL APIs.
+        retry_build "$PYPTO_SRC/runtime" \
+          --config-settings="build.targets=build_package_${RUNTIME_PLATFORM}" || exit 1
 
     - name: Install pypto-serving and its dependencies
       shell: bash

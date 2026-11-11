@@ -28,10 +28,10 @@ jobs:
 
   unit-tests:
     runs-on: [self-hosted, linux, arm64, npu]
-    # The DeepSeek matrix client waits up to 2400 seconds while the daemon caps
-    # the task at 3600 seconds. The venv no longer inherits a base env's torch,
-    # so a cold pip cache is paid here too. 90 left no headroom for both at once.
-    timeout-minutes: 120
+    # Shared devices can stay occupied for more than an hour. Let Qwen guards
+    # wait within this job budget, with separate 30-minute execution limits.
+    # The always() cleanup cancels this job's tasks when the job times out.
+    timeout-minutes: 420
     env:
       PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
       PTO_ISA_ROOT: ${{ github.workspace }}/dist-checkout/pto-isa
@@ -89,12 +89,28 @@ jobs:
         with:
           checkout-path: dist-checkout
           needs-device: 'true'
+          runtime-platform: a2a3
+          # This compiler passed the A3 guards with the bundled Lib. Drop the
+          # pin after its DSpark kernels migrate to explicit AIV splitting.
+          pypto-revision: 1dedb26c329407360c5c5ce6ecb495565c2f154e
           toolchain: bundle
           # CI_CACHE_ROOT is shared with pypto and pypto-lib, whose jobs already
           # claim `serving` / `pip-serving`. Name both after this repo so the two
           # never land on one dir.
           build-namespace: pypto-serving
           pip-cache-name: pip-pypto-serving
+
+      - name: Run compiler runtime CPU guards
+        env:
+          TORCH_DEVICE_BACKEND_AUTOLOAD: '0'
+        run: |
+          source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
+          cd "$GITHUB_WORKSPACE/dist-checkout"
+          python -m pytest -q \
+            tests/unit/test_ci_runtime_build.py \
+            tests/unit/model/common/test_kernel_compiler.py \
+            tests/unit/model/common/test_kernel_compiler_codegen.py \
+            tests/unit/model/qwen/test_npu_executor.py
 
       - name: Run Qwen3 accuracy guard
         env:
@@ -107,7 +123,7 @@ jobs:
           run_cmd="$run_cmd PYTHONPATH=$PYTHONPATH"
           run_cmd="$run_cmd PYPTO_QWEN3_MODEL_DIR=$PYPTO_QWEN3_MODEL_DIR"
           run_cmd="$run_cmd python -m pytest tests/test_qwen3_accuracy.py -q -s"
-          task-submit --device auto --timeout 1200 --max-time 1800 --run "$run_cmd"
+          task-submit --device auto --timeout 0 --max-time 1800 --run "$run_cmd"
 
       - name: Run Qwen3 serving guard (prefix cache, chunked prefill, multi-batch)
         env:
@@ -120,7 +136,7 @@ jobs:
           run_cmd="$run_cmd PYTHONPATH=$PYTHONPATH"
           run_cmd="$run_cmd PYPTO_QWEN3_MODEL_DIR=$PYPTO_QWEN3_MODEL_DIR"
           run_cmd="$run_cmd python -m pytest tests/test_qwen3_serving.py -q -s"
-          task-submit --device auto --timeout 1200 --max-time 1800 --run "$run_cmd"
+          task-submit --device auto --timeout 0 --max-time 1800 --run "$run_cmd"
 
       - name: Run DSpark HTTP guard (K=7, one 8-card server)
         env:
@@ -157,6 +173,7 @@ jobs:
 
   v41-a5-smoke:
     # The A5 runner must provide PYPTO_DSV41_MODEL_DIR.
+    # It may also provide PYPTO_V41_PREPACKED_WEIGHTS for the same DP4 checkpoint.
     runs-on: [self-hosted, linux, npu-a5]
     timeout-minutes: 180
     env:
@@ -188,21 +205,35 @@ jobs:
         with:
           checkout-path: dist-checkout
           needs-device: 'true'
+          runtime-platform: a5
+          # The K5 guard passed with this compiler and the bundled Lib. Revisit
+          # after the V4.1 dynamic-shape bindings compile on PyPTO main.
+          pypto-revision: e1508f6ddad12dbe0640e1c22b644c14ce088395
           toolchain: bundle
           build-namespace: pypto-serving-v41-a5
           pip-cache-name: pip-pypto-serving-v41-a5
 
-      - name: Run V4.1 DP4 HTTP answer guard
+      - name: Run V4.1 DSpark HTTP guard (K=5, one 4-card server)
+        env:
+          # Cold K5 startup compiles the draft programs and stages real weights.
+          PYPTO_WORKER_INIT_TIMEOUT: '3600'
         run: |
           source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
+          printf -v cache_dir '%q' "$CI_CACHE_ROOT/jit-pypto-serving-v41-$RUNNER_NAME"
           run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
           run_cmd="$run_cmd && source activate.sh"
           run_cmd="$run_cmd && TASK_DEVICE=\$TASK_DEVICE"
           run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout"
           run_cmd="$run_cmd PYPTO_DSV41_MODEL_DIR=$PYPTO_DSV41_MODEL_DIR"
-          run_cmd="$run_cmd python -m pytest tests/test_deepseek_v41_serving.py::test_v41_dp4_http_answer -q -s"
+          run_cmd="$run_cmd PYPTO_WORKER_INIT_TIMEOUT=$PYPTO_WORKER_INIT_TIMEOUT"
+          run_cmd="$run_cmd PYPTO_CACHE=1 PYPTO_CACHE_READONLY=0 PYPTO_CACHE_DIR=$cache_dir"
+          if [ -n "${PYPTO_V41_PREPACKED_WEIGHTS:-}" ]; then
+            printf -v sidecar '%q' "$PYPTO_V41_PREPACKED_WEIGHTS"
+            run_cmd="$run_cmd PYPTO_V41_PREPACKED_WEIGHTS=$sidecar"
+          fi
+          run_cmd="$run_cmd python -m pytest 'tests/test_deepseek_v41_serving.py::test_v41_dp4_http_answer[k5]' -q -s"
           task-submit --device auto --device-num 4 \
-            --timeout 3600 --max-time 3600 --run "$run_cmd"
+            --timeout 4500 --max-time 4500 --run "$run_cmd"
 
       - name: Kill orphaned task-submit tasks
         if: always()

@@ -60,7 +60,8 @@ def _stop_server(process):
         process.wait(timeout=10)
 
 
-def test_v41_dp4_http_answer(tmp_path):
+@pytest.mark.parametrize("num_speculative_tokens", [0, 5], ids=["k0", "k5"])
+def test_v41_dp4_http_answer(tmp_path, num_speculative_tokens):
     model_path = os.environ.get("PYPTO_DSV41_MODEL_DIR")
     if not model_path or not Path(model_path).is_dir():
         pytest.fail("PYPTO_DSV41_MODEL_DIR is not set to a model directory")
@@ -82,13 +83,22 @@ def test_v41_dp4_http_answer(tmp_path):
         "--max-num-batched-tokens", "80", "--host", "127.0.0.1", "--port", str(port),
         "--show-startup-logs",
     ]
+    env = os.environ.copy()
+    metrics_dir = tmp_path / "decode-metrics"
+    if num_speculative_tokens:
+        command.extend([
+            "--speculative-config",
+            json.dumps({"method": "dspark", "num_speculative_tokens": num_speculative_tokens}),
+        ])
+        env["PYPTO_SERVING_DECODE_METRICS_DIR"] = str(metrics_dir)
     log_path = tmp_path / "server.log"
     started = time.monotonic()
     with log_path.open("w", encoding="utf-8") as log:
-        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+        process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
                                    start_new_session=True)
         try:
-            deadline = started + 2400
+            worker_timeout = float(env.get("PYPTO_WORKER_INIT_TIMEOUT", "0"))
+            deadline = started + max(2400, worker_timeout + 120)
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     pytest.fail(f"V4.1 server exited {process.returncode}; log: {log_path}")
@@ -126,3 +136,11 @@ def test_v41_dp4_http_answer(tmp_path):
             _stop_server(process)
             print("\n--- V4.1 server log (tail) ---", flush=True)
             print(log_path.read_text(encoding="utf-8", errors="replace")[-20000:], flush=True)
+
+    if num_speculative_tokens:
+        assert any(
+            request["proposed_drafts"] > 0
+            for path in metrics_dir.glob("decode-steps.*.jsonl")
+            for line in path.read_text(encoding="utf-8").splitlines()
+            for request in json.loads(line)["requests"]
+        ), "The HTTP request did not verify any DSpark drafts"

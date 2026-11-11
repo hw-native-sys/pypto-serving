@@ -405,6 +405,8 @@ DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS = 8
 
 # ---- prefill geometry ----
 DSPARK_PREFILL_MAX_TOKENS = 8192
+DSPARK_CHECKPOINT_TILE_TOKENS = 512
+DSPARK_CHECKPOINTS_PER_TILE = 6
 # Maximum backing allocation; dispatches bind a compact TP-aligned prefix.
 DSPARK_PREFILL_DISPATCH_TOKENS = DSPARK_PREFILL_MAX_TOKENS
 DSPARK_PREFILL_LOCAL_TOKENS = DSPARK_PREFILL_DISPATCH_TOKENS // DSPARK_TP_SIZE
@@ -3272,8 +3274,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         query_start_loc = torch.zeros(
             (layout.ranks, request_rows + 1), dtype=torch.int32
         )
-        checkpoint_tiles = (layout.prefill_tokens + 511) // 512
-        checkpoint_ends = torch.zeros((layout.ranks, request_rows, checkpoint_tiles, 6), dtype=torch.int32)
+        checkpoint_tiles = (layout.prefill_tokens + DSPARK_CHECKPOINT_TILE_TOKENS - 1) // DSPARK_CHECKPOINT_TILE_TOKENS
+        checkpoint_ends = torch.zeros(
+            (layout.ranks, request_rows, checkpoint_tiles, DSPARK_CHECKPOINTS_PER_TILE), dtype=torch.int32
+        )
         slot_mappings = {
             name: torch.full((layout.ranks, tokens), -1, dtype=torch.int64)
             for name in (
@@ -3374,9 +3378,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 boundaries.append(end_position)
             tile_counts: dict[int, int] = {}
             for boundary in boundaries:
-                tile = (boundary - chunk_start - 1) // 512
+                tile = (boundary - chunk_start - 1) // DSPARK_CHECKPOINT_TILE_TOKENS
                 column = tile_counts.get(tile, 0)
-                if column >= 6:
+                if column >= DSPARK_CHECKPOINTS_PER_TILE:
                     raise ValueError("Too many DSpark compressor checkpoints in one projection tile")
                 for rank in ranks:
                     checkpoint_ends[rank, ordinal, tile, column] = boundary
@@ -3622,6 +3626,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         if task_args is None:
             raise RuntimeError("DSpark prefill TaskArgs are not staged")
         tensors = task_args.tensors
+        # A zero boundary keeps the existing terminal-state publication.
+        request_rows = inputs.query_start_loc.shape[1] - 1
+        self._packed_host_prefix(tensors["state_checkpoint_ends"], request_rows).zero_()
         values: dict[str, torch.Tensor] = {
             "input_ids": inputs.input_ids,
             "position_ids_local": inputs.position_ids_local,

@@ -34,6 +34,7 @@ def build_pypto_run_config(
     pypto_build_dir: str | None = None,
     aicpu_thread_num: int = 4,
     num_sub_workers: int = 0,
+    runtime: str = "tensormap_and_ringbuffer",
 ) -> RunConfig:
     """Build a PyPTO ``RunConfig`` (with ``DistributedConfig``) for compile/run.
 
@@ -52,6 +53,8 @@ def build_pypto_run_config(
 
     if platform not in ("a2a3", "a2a3sim", "a5", "a5sim"):
         raise ValueError(f"Unsupported PyPTO platform: {platform}")
+    if runtime not in ("tensormap_and_ringbuffer", "host_build_graph"):
+        raise ValueError(f"Unsupported chip runtime: {runtime}")
     device_ids = list(device_ids)
     return RunConfig(
         device_id=device_ids[0],
@@ -61,6 +64,7 @@ def build_pypto_run_config(
         save_kernels=pypto_build_dir is not None,
         save_kernels_dir=pypto_build_dir,
         distributed_config=DistributedConfig(
+            runtime=runtime,
             device_ids=device_ids,
             num_sub_workers=num_sub_workers,
             aicpu_thread_num=aicpu_thread_num,

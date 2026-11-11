@@ -283,6 +283,12 @@ class RuntimeConfig:
     ring_dep_pool: int | list[int] | None = None
     ring_task_window: int | list[int] | None = None
     ring_heap: int | list[int] | None = None
+    # Chip scheduler policy, independent of backend and onboard/simulation mode.
+    chip_runtime: Literal["tensormap_and_ringbuffer", "host_build_graph"] = "tensormap_and_ringbuffer"
+
+    def __post_init__(self) -> None:
+        if self.chip_runtime not in ("tensormap_and_ringbuffer", "host_build_graph"):
+            raise ValueError(f"Unsupported chip runtime: {self.chip_runtime}")
 
 
 @dataclass(frozen=True)
@@ -413,6 +419,9 @@ class PrefillBatch:
     # Opaque request-local generation constraints, interpreted only by capable runners.
     constraint_states: dict[str, object] = field(default_factory=dict)
     stop_token_masks: dict[str, StopTokenMask] = field(default_factory=dict)
+    # Optional serving-owned DSpark stage arguments.  The V4.1 adapter accepts
+    # only already-bound lib composite arguments; it never rebuilds operators.
+    dspark_stages: object | None = None
 
 
 @dataclass
@@ -455,6 +464,9 @@ class DecodeBatch:
     # its embedding (shape ``[B, hidden]``). Left ``None`` for single-token decoders.
     prev_token_ids: torch.Tensor | None = None
     prev_hidden_states: torch.Tensor | None = None
+    # Optional serving-owned DSpark stage arguments for one complete target ->
+    # accept -> drafter -> Markov -> commit round.
+    dspark_stages: object | None = None
 
 
 @dataclass

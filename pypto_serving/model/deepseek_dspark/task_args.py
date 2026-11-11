@@ -9,7 +9,7 @@
 """DSpark per-dispatch-class :class:`TaskArgs` builders.
 
 The ``_PREFILL_TENSOR_ORDER`` / ``_DECODE_TENSOR_ORDER`` tuples below ARE the
-positional contracts of ``l3_prefill_fwd`` (102 args) and ``l3_decode_fwd``
+positional contracts of ``l3_prefill_fwd`` (103 args) and ``l3_decode_fwd``
 (110 args). Fused decode also binds K=7 draft counts and resident state.
 Every argument declares its
 kind at registration: host-shared slots (per-step metadata), static weights
@@ -38,6 +38,8 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_DECODE_LOCAL_TOKENS,
     DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS,
     DSPARK_BLOCK_SIZE,
+    DSPARK_CHECKPOINT_TILE_TOKENS,
+    DSPARK_CHECKPOINTS_PER_TILE,
     DSPARK_DRAFTER_CONTEXT_ROWS,
     DSPARK_DRAFTER_BATCHES,
     DSPARK_DRAFTER_TABLE_BLOCKS,
@@ -106,6 +108,7 @@ def _prefill_slots(layout, *, host_hidden: bool = False) -> dict[str, tuple[torc
     tokens = layout.prefill_tokens
     local_tokens = layout.prefill_local_tokens
     requests = layout.prefill_requests
+    checkpoint_tiles = (tokens + DSPARK_CHECKPOINT_TILE_TOKENS - 1) // DSPARK_CHECKPOINT_TILE_TOKENS
     group_rope = (tokens, DSPARK_ROPE_HEAD_DIM)
     slot_specs = {
         "x_hc": (torch.float32, (ranks, tokens, DSPARK_HC_MULT, layout.hidden_size)),
@@ -115,7 +118,7 @@ def _prefill_slots(layout, *, host_hidden: bool = False) -> dict[str, tuple[torc
             torch.int32, (ranks, requests + 1),
         ),
         "state_checkpoint_ends": (
-            torch.int32, (ranks, requests, (tokens + 511) // 512, 6),
+            torch.int32, (ranks, requests, checkpoint_tiles, DSPARK_CHECKPOINTS_PER_TILE),
         ),
         "hca_compress_state_block_table": (
             torch.int32,
