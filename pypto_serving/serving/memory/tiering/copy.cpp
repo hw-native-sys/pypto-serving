@@ -7,14 +7,26 @@
 // See LICENSE in the root of the software repository for the full text of the License.
 // -----------------------------------------------------------------------------------------------------------
 #include <acl/acl.h>
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <tuple>
 #include <vector>
 
+struct Span {
+    uintptr_t device, host;
+    size_t width, rows, pitch, region;
+};
 struct Copy {
-    void *dst, *src;
-    size_t width, height, dst_pitch, src_pitch;
+    uintptr_t device, host;
+    size_t width, rows, device_pitch, host_pitch;
+};
+struct Row {
+    size_t region;
+    uintptr_t device, host;
+    size_t width;
+    auto key() const { return std::tie(region, device, host, width); }
 };
 static uint64_t now()
 {
@@ -33,36 +45,56 @@ extern "C" uint64_t prefault_read(const void *base, size_t bytes)
     }
     return value;
 }
-extern "C" int copy_cache_batch(const Copy *commands, size_t count, int kind,
-    aclrtMemcpyBatchAttr *attr, aclrtStream stream, uint64_t *ticks)
+static std::vector<Copy> plan(const Span *spans, size_t count)
 {
-    std::vector<void *> dst, src;
-    std::vector<size_t> sizes;
-    dst.reserve(count);
-    src.reserve(count);
-    sizes.reserve(count);
-    int code = 0;
-    ticks[0] = now();
-    for (size_t i = 0; i < count && !code; ++i) {
-        const auto &c = commands[i];
-        if (c.height == 1) {
-            dst.push_back(c.dst);
-            src.push_back(c.src);
-            sizes.push_back(c.width);
-        } else if (c.src_pitch == c.width && c.dst_pitch == c.width) {
-            const auto bytes = c.width * c.height;
-            code = aclrtMemcpyAsync(c.dst, bytes, c.src, bytes, static_cast<aclrtMemcpyKind>(kind), stream);
-        } else {
-            code = aclrtMemcpy2dAsync(c.dst, c.dst_pitch, c.src, c.src_pitch, c.width, c.height,
-                                    static_cast<aclrtMemcpyKind>(kind), stream);
+    std::vector<Row> rows;
+    std::vector<Copy> pages, runs;
+    for (size_t i = 0; i < count; ++i) {
+        const auto &s = spans[i];
+        pages.push_back({s.device, s.host, s.width, s.rows, s.pitch, s.width});
+        for (size_t r = 0; r < s.rows; ++r) {
+            rows.push_back({s.region, s.device + r*s.pitch, s.host + r*s.width, s.width});
         }
     }
-    if (!code && sizes.size() == 1) {
-        code = aclrtMemcpyAsync(dst[0], sizes[0], src[0], sizes[0], static_cast<aclrtMemcpyKind>(kind), stream);
-    } else if (!code && !sizes.empty()) {
-        size_t index = 0, failed = SIZE_MAX;
-        code = aclrtMemcpyBatchAsync(dst.data(), sizes.data(), src.data(), sizes.data(), sizes.size(),
-                                    attr, &index, 1, &failed, stream);
+    std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) { return a.key() < b.key(); });
+    for (size_t i = 0; i < rows.size();) {
+        const auto a = rows[i];
+        size_t end = i + 1, dp = a.width, hp = a.width;
+        if (end < rows.size() && rows[end].region == a.region && rows[end].width == a.width &&
+            rows[end].device >= a.device + a.width && rows[end].host >= a.host + a.width) {
+            dp = rows[end].device - a.device;
+            hp = rows[end].host - a.host;
+            while (end < rows.size() && rows[end].region == a.region && rows[end].width == a.width &&
+                   rows[end].device == a.device + (end-i)*dp && rows[end].host == a.host + (end-i)*hp) {
+                ++end;
+            }
+        }
+        runs.push_back({a.device, a.host, a.width, end-i, dp, hp});
+        i = end;
+    }
+    return runs.size() <= pages.size() ? runs : pages;
+}
+extern "C" int copy_cache_batch(const Span *spans, size_t count, int kind,
+    aclrtStream stream, uint64_t *ticks, size_t *planned)
+{
+    ticks[0] = now();
+    const auto commands = plan(spans, count);
+    *planned = commands.size();
+    int code = 0;
+    const bool store = kind == ACL_MEMCPY_DEVICE_TO_HOST;
+    for (const auto &c : commands) {
+        void *dst = reinterpret_cast<void *>(store ? c.host : c.device);
+        void *src = reinterpret_cast<void *>(store ? c.device : c.host);
+        const size_t dp = store ? c.host_pitch : c.device_pitch;
+        const size_t sp = store ? c.device_pitch : c.host_pitch;
+        if (c.rows == 1 || (dp == c.width && sp == c.width)) {
+            const auto bytes = c.width * c.rows;
+            code = aclrtMemcpyAsync(dst, bytes, src, bytes, static_cast<aclrtMemcpyKind>(kind), stream);
+        } else {
+            code = aclrtMemcpy2dAsync(dst, dp, src, sp, c.width, c.rows,
+                                    static_cast<aclrtMemcpyKind>(kind), stream);
+        }
+        if (code) break;
     }
     ticks[1] = now();
     // Even an accepted prefix must be stopped before a failed batch can retire.

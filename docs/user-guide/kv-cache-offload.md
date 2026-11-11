@@ -39,13 +39,15 @@ New immutable full-history pages enter a metadata queue with their source HBM
 references held. Rolling KV and compression state enter only as members of a
 confirmed joint checkpoint; overlapping checkpoint windows share their pages.
 Decode-only PD retains its shareable history, while active final state stays request-local.
-An idle owner immediately batches available pages, up to 256 MiB and 8192 expanded
-row entries before command merging. There is one batch in flight per owner. A batch has one final native
+An idle owner immediately batches available pages, up to 256 MiB of useful payload
+and 32768 compact component spans. Its command table is allocated once at startup;
+layer rows are expanded and planned inside the native helper. There is one batch in flight per owner. A batch has one final native
 completion; a logical page becomes ready only after all required components and
 TP copies complete. An index page includes both index KV and scale data.
-The planner compares layer rows within a page with regular runs across pages,
-using the plan with fewer two-dimensional copies. Isolated fragments use batch copy. This changes command
+The native planner compares layer rows within a page with regular runs across pages,
+using the plan with fewer two-dimensional copies. Contiguous ranges use asynchronous memcpy. This changes command
 grouping without changing page layout or copying gaps between authorized pages.
+There is no HBM staging buffer, data packing, or selectable legacy copy path.
 
 Lookup uses the normal grouped prefix boundaries. A hit must include the required
 KV and compression state. A missing HBM page can be restored from DDR into pages

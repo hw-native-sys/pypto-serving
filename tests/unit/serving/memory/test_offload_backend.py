@@ -16,9 +16,9 @@ from types import SimpleNamespace
 import pytest
 
 from pypto_serving.model.deepseek_dspark.cache_offload import CacheOffloadExtension
-from pypto_serving.serving.memory.tiering.backend import SimplerBackend
+from pypto_serving.serving.memory.tiering.backend import BATCH_SPANS, SimplerBackend
 from pypto_serving.serving.memory.tiering.integration import Session
-from pypto_serving.serving.memory.tiering.simpler import CopyService, NativeCopy, rectangles
+from pypto_serving.serving.memory.tiering.simpler import CopyService, NativeCopy, Span
 from tests.unit.serving.memory.test_tiering import setup
 
 
@@ -111,8 +111,9 @@ def test_invalid_spans_never_enter_native_submission(span):
     native = NativeCopy.__new__(NativeCopy)
     native.thread = threading.get_ident()
     native.closed = native.poisoned = False
+    native.commands = (Span * BATCH_SPANS)()
     native.pool = SimpleNamespace(nbytes=16, base=100)
-    native.regions = {"k": ("token", 200, 16)}
+    native.regions = {"k": ("token", 200, 16, 0)}
     native._call = lambda *args: pytest.fail("invalid span reached native DMA")
     with pytest.raises(ValueError):
         native.copy_batch("store", ((1, 0, 16, (span,)),))
@@ -123,18 +124,20 @@ def test_one_pitched_command_preserves_layer_offsets_and_dense_ddr_packing(store
     native = NativeCopy.__new__(NativeCopy)
     native.thread = threading.get_ident()
     native.closed = native.poisoned = False
+    native.commands = (Span * BATCH_SPANS)()
     native.pool = SimpleNamespace(nbytes=32, base=100)
     native.device = SimpleNamespace(value=0)
-    native.regions = {"k": ("token", 200, 2048)}
+    native.regions = {"k": ("token", 200, 2048, 0)}
     native.stream = "stream"
     calls = []
-    def copy(commands, count, kind, attributes, stream, timing):
-        calls.extend((c.dst, c.src, c.width, c.height, c.dst_pitch, c.src_pitch) for c in commands)
+    def copy(commands, count, kind, stream, timing, planned):
+        calls.extend((c.device, c.host, c.width, c.rows, c.pitch, c.region) for c in commands[:count])
+        planned._obj.value = count
         timing[:] = [1, 2, 3]
         return 0
     native.native = SimpleNamespace(copy_cache_batch=copy)
     proof = native.copy_batch("store" if store else "load", ((1, 0, 32, (("k", 16, 0, 4, 3, 128),)),))
-    assert calls == ([(100, 216, 4, 3, 4, 128)] if store else [(216, 100, 4, 3, 128, 4)])
+    assert calls == [(216, 100, 4, 3, 128, 0)]
     assert proof["pages"] == (dict(handle=1, bytes=12, stopped=True, native_completed=True),)
 
 
@@ -375,23 +378,13 @@ def test_pool_placement_precedes_physical_touch_and_startup_failure_closes_backi
         assert calls == ["advice", "policy", "touch"]
 
 
-def test_copy_rectangles_preserve_all_pages_and_never_cross_allocations():
-    entries = [("a", layer*512*32 + page*32, 100000+page*43*32+layer*32, 32)
-               for layer in range(43) for page in range(190)]
-    entries += [("b", 0, 900000, 4), ("b", 8, 900016, 4)]
-    planned = rectangles(entries)
-    expanded = sorted((d+i*dp, h+i*hp, w) for d,h,w,n,dp,hp in planned for i in range(n))
-    assert expanded == sorted((d,h,w) for name,d,h,w in entries)
-    assert len(planned) == 44
-    assert all(dp >= w and hp >= w for d,h,w,n,dp,hp in planned)
-
-
 def test_native_copy_error_cannot_publish_or_retire():
     native = NativeCopy.__new__(NativeCopy)
     native.thread = threading.get_ident()
     native.closed = native.poisoned = False
+    native.commands = (Span * BATCH_SPANS)()
     native.pool = SimpleNamespace(nbytes=4096, base=100)
-    native.regions = {"k": ("pin", 10000, 4096)}
+    native.regions = {"k": ("pin", 10000, 4096, 0)}
     native.device, native.stream = SimpleNamespace(value=0), None
     native.native = SimpleNamespace(copy_cache_batch=lambda *args: 7)
     with pytest.raises(RuntimeError, match="failed"):
@@ -399,29 +392,6 @@ def test_native_copy_error_cannot_publish_or_retire():
     assert native.poisoned
     with pytest.raises(RuntimeError, match="unavailable"):
         native.close()
-
-
-@pytest.mark.parametrize("store", [False, True])
-def test_fragmented_pages_keep_layer_rows_together(store):
-    native = NativeCopy.__new__(NativeCopy)
-    native.thread = threading.get_ident()
-    native.closed = native.poisoned = False
-    native.pool = SimpleNamespace(nbytes=4096, base=1000)
-    native.regions = {"k": ("pin", 10000, 1024)}
-    native.device, native.stream = SimpleNamespace(value=0), None
-    captured = []
-    def copy(commands, count, kind, attributes, stream, timing):
-        captured.extend((v.dst, v.src, v.width, v.height, v.dst_pitch, v.src_pitch) for v in commands)
-        timing[:] = [1, 2, 3]
-        return 0
-    native.native = SimpleNamespace(copy_cache_batch=copy)
-    native.copy_batch("store" if store else "load", tuple(
-        (i+1, i*12, 12, (("k", p*4, 0, 4, 3, 64),)) for i, p in enumerate((2, 0, 5))))
-    expected = sorted((10000+p*4+j*64, 1000+i*12+j*4, 4)
-                      for i, p in enumerate((2, 0, 5)) for j in range(3))
-    actual = sorted((s+j*sp, d+j*dp, w) if store else (d+j*dp, s+j*sp, w)
-                    for d, s, w, rows, dp, sp in captured for j in range(rows))
-    assert len(captured) == 3 and actual == expected
 
 
 @pytest.mark.parametrize("failed", [False, True])
@@ -449,3 +419,33 @@ def test_copy_helper_builds_before_owners_and_cleans_failed_build(monkeypatch, f
         assert (Path(library.name) / "libcache_copy.so").read_bytes() == b"library"
         library.cleanup()
     assert len(directories) == 1 and not directories[0].exists()
+
+
+@pytest.mark.parametrize("layers,width,pages,expected", [
+    (20, 1024, 512, [1, 512]), (1, 1 << 20, 260, [1, 256, 4]),
+])
+def test_batches_use_payload_bytes_and_compact_spans(layers, width, pages, expected):
+    owner = Owner()
+    original, entered, proceed = owner.call, threading.Event(), threading.Event()
+    def call(operation, payload=None):
+        if operation == "copy_batch" and not entered.is_set():
+            entered.set()
+            assert proceed.wait(5)
+        return original(operation, payload)
+    owner.call = call
+    backend = SimplerBackend((owner,), dict(tp=1, groups={"kv": (("k", layers, pages+1, width),)}),
+                             (pages+1) * layers * width)
+    try:
+        assert backend.reserve(1, ("kv", 0, 0))
+        futures = [backend.store(1, ("kv", 0, 0))]
+        assert entered.wait(5)
+        for i in range(1, pages+1):
+            assert backend.reserve(i+1, ("kv", 0, i))
+            futures.append(backend.store(i+1, ("kv", 0, i)))
+        proceed.set()
+        for future in futures:
+            assert future.result(5)["native_completed"]
+        assert [len(c[1][1]) for c in owner.calls] == expected
+    finally:
+        proceed.set()
+        backend.close()

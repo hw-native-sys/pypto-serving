@@ -22,7 +22,7 @@ from typing import Protocol
 from .pool import Extents
 
 BATCH_BYTES = 256 << 20
-BATCH_DESCRIPTORS = 8192
+BATCH_SPANS = 32768
 logger = logging.getLogger(__name__)
 
 
@@ -133,8 +133,8 @@ class SimplerBackend:
 
     def reserve(self, handle, source):
         ranks, spans, size = self.plan(source)
-        if sum(span[4] for span in spans) > BATCH_DESCRIPTORS:
-            raise ValueError("cache page exceeds native descriptor limit")
+        if size > BATCH_BYTES or len(spans) > BATCH_SPANS:
+            raise ValueError("cache page exceeds native batch capacity")
         with self.lock:
             if not self.accepting:
                 raise RuntimeError("cache backend is closing")
@@ -244,9 +244,9 @@ class SimplerBackend:
                     jobs, payload_bytes, descriptors = [], 0, 0
                     while queue:
                         job = queue.popleft()
-                        size, count = job.storage.size, sum(span[4] for span in job.spans)
+                        size, count = job.storage.size, len(job.spans)
                         if jobs and (payload_bytes + size > BATCH_BYTES
-                                     or descriptors + count > BATCH_DESCRIPTORS):
+                                     or descriptors + count > BATCH_SPANS):
                             queue.appendleft(job)
                             break
                         if not job.future.set_running_or_notify_cancel():

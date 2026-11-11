@@ -14,6 +14,7 @@ import ctypes
 import threading
 
 from .pool import advise
+from .backend import BATCH_BYTES, BATCH_SPANS
 
 
 def descriptor_wire(descriptor):
@@ -32,39 +33,8 @@ def _descriptor(wire):
                             body=wire["body"], owner_worker_path_id=wire["owner_worker_path_id"])
 
 
-class Location(ctypes.Structure):
-    _fields_ = [("id", ctypes.c_uint32), ("type", ctypes.c_int)]
-
-
-class CopyAttributes(ctypes.Structure):
-    _fields_ = [("destination", Location), ("source", Location), ("reserved", ctypes.c_uint8 * 16)]
-
-
-class Copy(ctypes.Structure):
-    _fields_ = [("dst", ctypes.c_void_p), ("src", ctypes.c_void_p),
-                ("width", ctypes.c_size_t), ("height", ctypes.c_size_t),
-                ("dst_pitch", ctypes.c_size_t), ("src_pitch", ctypes.c_size_t)]
-
-
-def rectangles(entries):
-    entries = sorted(entries)
-    result, index = [], 0
-    while index < len(entries):
-        name, device, host, width = entries[index]
-        end, device_pitch, host_pitch = index + 1, width, width
-        if end < len(entries) and entries[end][0] == name and entries[end][3] == width:
-            device_pitch = entries[end][1] - device
-            host_pitch = entries[end][2] - host
-            if device_pitch >= width and host_pitch >= width:
-                while end < len(entries) and entries[end] == (
-                        name, device + (end - index) * device_pitch,
-                        host + (end - index) * host_pitch, width):
-                    end += 1
-        if end == index + 1:
-            device_pitch = host_pitch = width
-        result.append((device, host, width, end - index, device_pitch, host_pitch))
-        index = end
-    return result
+class Span(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_size_t) for name in ("device", "host", "width", "rows", "pitch", "region")]
 
 
 class NativeCopy:
@@ -89,6 +59,7 @@ class NativeCopy:
         self.stream = pointer()
         self._call("aclrtCreateStream", ctypes.byref(self.stream))
         self.regions = {}
+        self.commands = (Span * BATCH_SPANS)()
         self.pool = None
         self.poisoned = self.closed = False
 
@@ -106,7 +77,7 @@ class NativeCopy:
         if name in self.regions:
             raise ValueError("duplicate cache allocation")
         address, extent = self.context.pin(token, descriptor)
-        self.regions[name] = (token, address, extent)
+        self.regions[name] = (token, address, extent, len(self.regions))
 
     def initialize_pool(self, wire):
         from simpler.buffer import ImportContext, ImportRegistry
@@ -121,18 +92,17 @@ class NativeCopy:
         self.native.prefault_read.restype = ctypes.c_uint64
         self.native.prefault_read(self.pool.base, self.pool.nbytes)
         self._call("aclrtHostRegisterV2", self.pool.base, self.pool.nbytes, 0x10000000)
-        self.native.copy_cache_batch.argtypes = [ctypes.POINTER(Copy), ctypes.c_size_t, ctypes.c_int,
-            ctypes.POINTER(CopyAttributes), ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
+        self.native.copy_cache_batch.argtypes = [ctypes.POINTER(Span), ctypes.c_size_t, ctypes.c_int,
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_size_t)]
         self.native.copy_cache_batch.restype = ctypes.c_int
-        self.device = ctypes.c_int()
-        self._call("aclrtGetDevice", ctypes.byref(self.device))
 
     def copy_batch(self, operation, pages):
         """All descriptors are validated before any native use of the shared pool."""
         self._check()
         if operation not in ("store", "load") or not pages:
             raise ValueError("invalid cache batch")
-        ranges, entries, handles, page_rectangles = [], [], set(), []
+        ranges, handles, sizes = [], set(), []
+        count = total = 0
         for handle, offset, allocation, spans in pages:
             if (type(handle) is not int or handle <= 0 or handle in handles
                     or any(type(v) is not int for v in (offset, allocation))
@@ -145,46 +115,40 @@ class NativeCopy:
                 if (any(type(v) is not int for v in (device_offset, host_offset, width, rows, pitch))
                         or device_offset < 0 or host_offset < 0 or width <= 0 or rows <= 0 or pitch < width):
                     raise ValueError("invalid copy span")
-                _, address, extent = self.regions[name]
+                _, address, extent, region = self.regions[name]
                 if (device_offset + (rows - 1) * pitch + width > extent
                         or host_offset + rows * width > allocation):
                     raise ValueError("copy exceeds registered allocation")
                 host_ranges.append((host_offset, host_offset + rows * width))
-                page_rectangles.append((address + device_offset, self.pool.base + offset + host_offset,
-                                        width, rows, pitch, width))
-                for row in range(rows):
-                    entries.append((name, address + device_offset + row * pitch,
-                                    self.pool.base + offset + host_offset + row * width, width))
+                if count == BATCH_SPANS:
+                    raise ValueError("too many compact copy spans")
+                self.commands[count] = Span(address + device_offset, self.pool.base + offset + host_offset,
+                                            width, rows, pitch, region)
+                count += 1
                 size += rows * width
-            if not size or any(left[1] > right[0] for left, right in
-                               zip(sorted(host_ranges), sorted(host_ranges)[1:])):
+            host_ranges.sort()
+            if not size or any(left[1] > right[0] for left, right in zip(host_ranges, host_ranges[1:])):
                 raise ValueError("empty or overlapping cache page")
-        if (len(entries) > 8192 or any(left[1] > right[0] for left, right in
-                                      zip(sorted(ranges), sorted(ranges)[1:]))):
+            total += size
+            sizes.append(size)
+        ranges.sort()
+        if total > BATCH_BYTES or any(left[1] > right[0] for left, right in zip(ranges, ranges[1:])):
             raise ValueError("overlapping DDR ranges or oversized native batch")
-        store = operation == "store"
-        # Fragmented page mappings can make a page's layer rows cheaper to submit together.
-        planned = min((rectangles(entries), page_rectangles), key=len)
-        commands = (Copy * len(planned))(*(Copy(host if store else device, device if store else host,
-            width, rows, host_pitch if store else device_pitch, device_pitch if store else host_pitch)
-            for device, host, width, rows, device_pitch, host_pitch in planned))
-        attributes = CopyAttributes()
-        host, device = Location(0, 0), Location(self.device.value, 1)
-        attributes.destination, attributes.source = (host, device) if store else (device, host)
         timing = (ctypes.c_uint64 * 3)()
+        planned = ctypes.c_size_t()
         try:
-            code = self.native.copy_cache_batch(commands, len(commands), 2 if store else 1,
-                                                ctypes.byref(attributes), self.stream, timing)
+            code = self.native.copy_cache_batch(self.commands, count, 2 if operation == "store" else 1,
+                                                self.stream, timing, ctypes.byref(planned))
             if code:
                 raise RuntimeError(f"cache native copy failed: {code}")
         except BaseException:
             self.poisoned = True
             raise
-        return dict(pages=tuple(dict(handle=handle, bytes=sum(s[3] * s[4] for s in spans),
+        return dict(pages=tuple(dict(handle=page[0], bytes=size,
                                      stopped=True, native_completed=True)
-                                for handle, _, _, spans in pages),
+                                for page, size in zip(pages, sizes)),
                     started_ns=timing[0], submitted_ns=timing[1], completed_ns=timing[2],
-                    native_commands=len(planned))
+                    native_commands=planned.value)
 
     def close(self):
         self._check()
@@ -192,7 +156,7 @@ class NativeCopy:
             self._call("aclrtHostUnregister", self.pool.base)
             self.registry.unregister(self.pool.identity)
             self.pool = None
-        for token, _, _ in self.regions.values():
+        for token, _, _, _ in self.regions.values():
             self.context.unpin(token)
         self.regions.clear()
         self._call("aclrtDestroyStream", self.stream)
