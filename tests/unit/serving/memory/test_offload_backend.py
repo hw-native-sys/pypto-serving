@@ -18,7 +18,7 @@ import pytest
 from pypto_serving.model.deepseek_dspark.cache_offload import CacheOffloadExtension
 from pypto_serving.serving.memory.tiering.backend import SimplerBackend
 from pypto_serving.serving.memory.tiering.integration import Session
-from pypto_serving.serving.memory.tiering.simpler import CopyService, NativeCopy
+from pypto_serving.serving.memory.tiering.simpler import CopyService, NativeCopy, rectangles
 from tests.unit.serving.memory.test_tiering import setup
 
 
@@ -128,13 +128,13 @@ def test_one_pitched_command_preserves_layer_offsets_and_dense_ddr_packing(store
     native.regions = {"k": ("token", 200, 2048)}
     native.stream = "stream"
     calls = []
-    native._call = lambda *args: calls.append(args)
+    def copy(commands, count, kind, attributes, stream, timing):
+        calls.extend((c.dst, c.src, c.width, c.height, c.dst_pitch, c.src_pitch) for c in commands)
+        timing[:] = [1, 2, 3]
+        return 0
+    native.native = SimpleNamespace(copy_cache_batch=copy)
     proof = native.copy_batch("store" if store else "load", ((1, 0, 32, (("k", 16, 0, 4, 3, 128),)),))
-    assert [call[0] for call in calls] == ["aclrtMemcpyBatchAsync", "aclrtSynchronizeStream"]
-    batch = calls[0]
-    assert list(batch[1]) == ([100, 104, 108] if store else [216, 344, 472])
-    assert list(batch[3]) == ([216, 344, 472] if store else [100, 104, 108])
-    assert list(batch[4]) == [4, 4, 4]
+    assert calls == ([(100, 216, 4, 3, 4, 128)] if store else [(216, 100, 4, 3, 128, 4)])
     assert proof["pages"] == (dict(handle=1, bytes=12, stopped=True, native_completed=True),)
 
 
@@ -207,6 +207,7 @@ def test_shutdown_bounds_inactivity_without_timing_out_a_progressing_drain(monke
     session = Session.__new__(Session)
     session.cache = cache
     session.pool = SimpleNamespace(close=lambda: None)
+    session.copy_library = SimpleNamespace(cleanup=lambda: None)
     session.core = SimpleNamespace(kv_cache_manager=SimpleNamespace(tiering=cache))
     tier.counters = {}
     tier.finish_close = lambda: closed.append("metadata")
@@ -238,6 +239,7 @@ def test_shutdown_forgets_residency_only_after_backend_ack(failed):
                             begin_close=tier.begin_close, close_ready=tier.close_ready)
     session = Session.__new__(Session)
     session.pool = SimpleNamespace(close=lambda: None)
+    session.copy_library = SimpleNamespace(cleanup=lambda: None)
     session.cache, session.core = cache, SimpleNamespace(kv_cache_manager=SimpleNamespace(tiering=cache))
     if failed:
         with pytest.raises(RuntimeError, match="unknown"):
@@ -356,12 +358,71 @@ def test_pool_placement_precedes_physical_touch_and_startup_failure_closes_backi
             assert mask[0] == 255 and maximum == 9 and flags == 0
             calls.append("policy")
             return -1 if failed else 0
-    monkeypatch.setattr(pool.ctypes, "CDLL", lambda *args, **kwargs: SimpleNamespace(mbind=Bind()))
+    class Advice:
+        def __call__(self, base, size, flag):
+            assert base == 4096 and size == 8192 and flag == 14
+            calls.append("advice")
+            return 0
+    monkeypatch.setattr(pool.ctypes, "CDLL", lambda *args, **kwargs:
+                        SimpleNamespace(mbind=Bind(), madvise=Advice()))
     monkeypatch.setattr(pool.ctypes, "memset", lambda *args: calls.append("touch"))
     if failed:
         with pytest.raises(OSError, match="interleave"):
             pool.allocate_pool(8192)
-        assert calls == ["policy", "close"]
+        assert calls == ["advice", "policy", "close"]
     else:
         assert pool.allocate_pool(8192) is buffer
-        assert calls == ["policy", "touch"]
+        assert calls == ["advice", "policy", "touch"]
+
+
+def test_copy_rectangles_preserve_all_pages_and_never_cross_allocations():
+    entries = [("a", layer*512*32 + page*32, 100000+page*43*32+layer*32, 32)
+               for layer in range(43) for page in range(190)]
+    entries += [("b", 0, 900000, 4), ("b", 8, 900016, 4)]
+    planned = rectangles(entries)
+    expanded = sorted((d+i*dp, h+i*hp, w) for d,h,w,n,dp,hp in planned for i in range(n))
+    assert expanded == sorted((d,h,w) for name,d,h,w in entries)
+    assert len(planned) == 44
+    assert all(dp >= w and hp >= w for d,h,w,n,dp,hp in planned)
+
+
+def test_native_copy_error_cannot_publish_or_retire():
+    native = NativeCopy.__new__(NativeCopy)
+    native.thread = threading.get_ident()
+    native.closed = native.poisoned = False
+    native.pool = SimpleNamespace(nbytes=4096, base=100)
+    native.regions = {"k": ("pin", 10000, 4096)}
+    native.device, native.stream = SimpleNamespace(value=0), None
+    native.native = SimpleNamespace(copy_cache_batch=lambda *args: 7)
+    with pytest.raises(RuntimeError, match="failed"):
+        native.copy_batch("store", ((1, 0, 4096, (("k", 0, 0, 4, 1, 4),)),))
+    assert native.poisoned
+    with pytest.raises(RuntimeError, match="unavailable"):
+        native.close()
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_copy_helper_builds_before_owners_and_cleans_failed_build(monkeypatch, failed):
+    from pathlib import Path
+    import subprocess
+    from pypto_serving.serving.memory.tiering import native
+
+    directories = []
+    monkeypatch.setenv("ASCEND_HOME_PATH", "/toolkit")
+    def build(command, **kwargs):
+        output = Path(command[-1])
+        directories.append(output.parent)
+        assert command[-2] == "-o" and output.name == "libcache_copy.so"
+        assert "-I/toolkit/include" in command and "-lascendcl" in command
+        if failed:
+            raise subprocess.CalledProcessError(1, command, stderr="compiler failure")
+        output.write_bytes(b"library")
+    monkeypatch.setattr(native.subprocess, "run", build)
+    if failed:
+        with pytest.raises(RuntimeError, match="compiler failure"):
+            native.build_copy_library()
+    else:
+        library = native.build_copy_library()
+        assert (Path(library.name) / "libcache_copy.so").read_bytes() == b"library"
+        library.cleanup()
+    assert len(directories) == 1 and not directories[0].exists()

@@ -17,11 +17,16 @@ alignment and TP replicas, rounded down to a system page. It is not a per-rank
 budget. The current backend is `--kv-offload-backend simpler`.
 
 The backend requires Linux, the matching PyPTO/Simpler owner-service and retained
-tensor interfaces, CANN's Ascend `aclrtMemcpyBatchAsync`, and enough host memory
+tensor interfaces, CANN's Ascend asynchronous copy APIs and `aclrtHostRegisterV2`, and enough host memory
 for the configured pool. On a host with multiple NUMA nodes, `libnuma.so.1` and permission
 to apply `mbind` to the pool mapping are required. The pool is interleaved across
 allowed memory nodes before first touch; other allocations keep their existing
-memory policy. Registration and physical allocation happen during startup.
+memory policy. Each persistent mapping requests transparent hugepages before
+prefaulting and PINNED registration. Actual hugepage coverage depends on the host
+configuration. Registration and physical allocation happen during startup.
+A C++17 compiler (`CXX`, default `g++`) and CANN headers under `ASCEND_HOME_PATH`
+are required when offload is enabled. A small temporary copy helper is built
+before owners start and removed after they retire; disabled offload does not build it.
 
 ## Execution and ownership
 
@@ -35,6 +40,9 @@ An idle owner immediately batches available pages, up to 256 MiB and 8192 native
 descriptors. There is one batch in flight per owner. A batch has one final native
 completion; a logical page becomes ready only after all required components and
 TP copies complete. An index page includes both index KV and scale data.
+Validated pages with regular source and destination strides are submitted as
+two-dimensional copies. Isolated fragments use batch copy. This changes command
+grouping without changing page layout or copying gaps between authorized pages.
 
 Lookup uses the normal grouped prefix boundaries. A hit must include the required
 KV and compression state. A missing HBM page can be restored from DDR into pages

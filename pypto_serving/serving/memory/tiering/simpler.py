@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import ctypes
 import threading
-import time
+
+from .pool import advise
 
 
 def descriptor_wire(descriptor):
@@ -39,6 +40,33 @@ class CopyAttributes(ctypes.Structure):
     _fields_ = [("destination", Location), ("source", Location), ("reserved", ctypes.c_uint8 * 16)]
 
 
+class Copy(ctypes.Structure):
+    _fields_ = [("dst", ctypes.c_void_p), ("src", ctypes.c_void_p),
+                ("width", ctypes.c_size_t), ("height", ctypes.c_size_t),
+                ("dst_pitch", ctypes.c_size_t), ("src_pitch", ctypes.c_size_t)]
+
+
+def rectangles(entries):
+    entries = sorted(entries)
+    result, index = [], 0
+    while index < len(entries):
+        name, device, host, width = entries[index]
+        end, device_pitch, host_pitch = index + 1, width, width
+        if end < len(entries) and entries[end][0] == name and entries[end][3] == width:
+            device_pitch = entries[end][1] - device
+            host_pitch = entries[end][2] - host
+            if device_pitch >= width and host_pitch >= width:
+                while end < len(entries) and entries[end] == (
+                        name, device + (end - index) * device_pitch,
+                        host + (end - index) * host_pitch, width):
+                    end += 1
+        if end == index + 1:
+            device_pitch = host_pitch = width
+        result.append((device, host, width, end - index, device_pitch, host_pitch))
+        index = end
+    return result
+
+
 class NativeCopy:
     """One owner thread, one independent copy stream, allocation-scoped registrations."""
 
@@ -51,12 +79,8 @@ class NativeCopy:
             "aclrtCreateStream": [ctypes.POINTER(pointer)],
             "aclrtDestroyStream": [pointer],
             "aclrtSynchronizeStream": [pointer],
-            "aclrtMemcpyBatchAsync": [ctypes.POINTER(pointer), ctypes.POINTER(ctypes.c_size_t),
-                                      ctypes.POINTER(pointer), ctypes.POINTER(ctypes.c_size_t), ctypes.c_size_t,
-                                      ctypes.POINTER(CopyAttributes), ctypes.POINTER(ctypes.c_size_t),
-                                      ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t), pointer],
             "aclrtGetDevice": [ctypes.POINTER(ctypes.c_int)],
-            "aclrtHostRegister": [pointer, ctypes.c_uint64, ctypes.c_int, ctypes.POINTER(pointer)],
+            "aclrtHostRegisterV2": [pointer, ctypes.c_uint64, ctypes.c_uint32],
             "aclrtHostUnregister": [pointer],
         }
         for name, args in signatures.items():
@@ -91,8 +115,15 @@ class NativeCopy:
         self._check()
         self.registry = ImportRegistry(ImportContext(deployment=HOST_CPU))
         self.pool = self.registry.materialize(_descriptor(wire))
-        mapped = ctypes.c_void_p()
-        self._call("aclrtHostRegister", self.pool.base, self.pool.nbytes, 0, ctypes.byref(mapped))
+        advise(self.pool.base, self.pool.nbytes)
+        self.native = ctypes.CDLL(wire["copy_library"])
+        self.native.prefault_read.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        self.native.prefault_read.restype = ctypes.c_uint64
+        self.native.prefault_read(self.pool.base, self.pool.nbytes)
+        self._call("aclrtHostRegisterV2", self.pool.base, self.pool.nbytes, 0x10000000)
+        self.native.copy_cache_batch.argtypes = [ctypes.POINTER(Copy), ctypes.c_size_t, ctypes.c_int,
+            ctypes.POINTER(CopyAttributes), ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
+        self.native.copy_cache_batch.restype = ctypes.c_int
         self.device = ctypes.c_int()
         self._call("aclrtGetDevice", ctypes.byref(self.device))
 
@@ -120,7 +151,7 @@ class NativeCopy:
                     raise ValueError("copy exceeds registered allocation")
                 host_ranges.append((host_offset, host_offset + rows * width))
                 for row in range(rows):
-                    entries.append((address + device_offset + row * pitch,
+                    entries.append((name, address + device_offset + row * pitch,
                                     self.pool.base + offset + host_offset + row * width, width))
                 size += rows * width
             if not size or any(left[1] > right[0] for left, right in
@@ -130,30 +161,27 @@ class NativeCopy:
                                       zip(sorted(ranges), sorted(ranges)[1:]))):
             raise ValueError("overlapping DDR ranges or oversized native batch")
         store = operation == "store"
-        count = len(entries)
-        pointers, sizes = ctypes.c_void_p * count, ctypes.c_size_t * count
-        destinations = pointers(*(host if store else device for device, host, _ in entries))
-        sources = pointers(*(device if store else host for device, host, _ in entries))
-        lengths = sizes(*(width for _, _, width in entries))
+        planned = rectangles(entries)
+        commands = (Copy * len(planned))(*(Copy(host if store else device, device if store else host,
+            width, rows, host_pitch if store else device_pitch, device_pitch if store else host_pitch)
+            for device, host, width, rows, device_pitch, host_pitch in planned))
         attributes = CopyAttributes()
         host, device = Location(0, 0), Location(self.device.value, 1)
         attributes.destination, attributes.source = (host, device) if store else (device, host)
-        index, failed = ctypes.c_size_t(0), ctypes.c_size_t(-1)
-        started = time.monotonic_ns()
+        timing = (ctypes.c_uint64 * 3)()
         try:
-            self._call("aclrtMemcpyBatchAsync", destinations, lengths, sources, lengths, count,
-                       ctypes.byref(attributes), ctypes.byref(index), 1, ctypes.byref(failed), self.stream)
-            submitted = time.monotonic_ns()
-            # Only the owner copy thread waits. No compute stream or main-thread fence.
-            self._call("aclrtSynchronizeStream", self.stream)
+            code = self.native.copy_cache_batch(commands, len(commands), 2 if store else 1,
+                                                ctypes.byref(attributes), self.stream, timing)
+            if code:
+                raise RuntimeError(f"cache native copy failed: {code}")
         except BaseException:
             self.poisoned = True
             raise
-        completed = time.monotonic_ns()
         return dict(pages=tuple(dict(handle=handle, bytes=sum(s[3] * s[4] for s in spans),
                                      stopped=True, native_completed=True)
                                 for handle, _, _, spans in pages),
-                    started_ns=started, submitted_ns=submitted, completed_ns=completed)
+                    started_ns=timing[0], submitted_ns=timing[1], completed_ns=timing[2],
+                    native_commands=len(planned))
 
     def close(self):
         self._check()

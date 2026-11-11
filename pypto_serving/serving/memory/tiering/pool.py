@@ -59,12 +59,21 @@ class Extents:
             self._return(offset, size)
 
 
+def advise(address, size):
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    libc.madvise.restype = ctypes.c_int
+    if libc.madvise(address, size, 14):  # Linux MADV_HUGEPAGE, on the persistent VMA.
+        raise OSError(ctypes.get_errno(), "cannot prepare DDR hugepage mapping")
+
+
 def allocate_pool(capacity):
     """Materialize shared backing without concentrating it on the launch CPU's NUMA node."""
     from simpler.buffer import create_host_shared_buffer, mint_owner_instance_id
 
     buffer = create_host_shared_buffer(capacity, mint_owner_instance_id(), 1)
     try:
+        advise(buffer.base, buffer.nbytes)
         allowed = next(line.split(":", 1)[1].strip() for line in Path("/proc/self/status").read_text().splitlines()
                        if line.startswith("Mems_allowed_list:"))
         nodes = []

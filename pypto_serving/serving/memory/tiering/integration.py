@@ -13,10 +13,12 @@ from dataclasses import replace
 from functools import partial
 import logging
 import multiprocessing as mp
+from pathlib import Path
 import time
 
 from .backend import SimplerBackend, endpoints
 from .cache import TieredCache
+from .native import build_copy_library
 from .pool import allocate_pool
 
 logger = logging.getLogger(__name__)
@@ -45,8 +47,14 @@ class Session:
         capacity = config.runtime_config.kv_offload_bytes // 4096 * 4096
         if capacity <= 0:
             raise ValueError("DDR pool is smaller than one physical page")
-        self.pool = allocate_pool(capacity)
+        self.copy_library = build_copy_library()
+        try:
+            self.pool = allocate_pool(capacity)
+        except BaseException:
+            self.copy_library.cleanup()
+            raise
         self.pool_wire = descriptor_wire(self.pool.to_descriptor())
+        self.pool_wire["copy_library"] = str(Path(self.copy_library.name) / "libcache_copy.so")
 
     def configure(self, config):
         from pypto_serving.model.deepseek_dspark.cache_offload import CacheOffloadExtension
@@ -102,6 +110,7 @@ class Session:
             self.cache.tier.error = error
             raise
         self.pool.close()
+        self.copy_library.cleanup()
         self.cache.tier.finish_close()
         self.core.kv_cache_manager.tiering = None
         logger.info("kv_offload_closed counters=%s", self.cache.tier.counters)
