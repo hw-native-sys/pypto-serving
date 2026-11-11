@@ -318,6 +318,31 @@ def test_scheduler_does_not_readmit_an_async_preemption_in_the_same_step():
     assert restarted.scheduled_requests[0].num_computed_tokens == 0
 
 
+@pytest.mark.parametrize("speculative", [0, 7])
+def test_replay_chunk_reclaim_preserves_the_later_terminal_placeholder(speculative):
+    scheduler = _prefill_scheduler(
+        num_blocks=32, block_size=2, max_num_scheduled_tokens=16,
+        long_prefill_token_threshold=2, async_scheduling=True,
+        num_speculative_tokens=speculative, supports_chunked_prefill_with_speculation=True,
+    )
+    request = Request("replay", [1, 2], max_new_tokens=6,
+                      output_token_ids=[3, 4], recompute_output_tokens=2)
+    scheduler.add_request(request)
+    first = scheduler.schedule()
+    scheduler.advance_after_schedule(first)
+    assert request.num_output_placeholders == 0
+    terminal = scheduler.schedule()
+    scheduler.advance_after_schedule(terminal)
+    assert request.num_output_placeholders == 1
+    assert scheduler.update_from_output(first, {}) == []
+    assert request.num_output_placeholders == 1
+    assert request.output_token_ids == [3, 4]
+    emitted = scheduler.update_from_output(terminal, {"replay": [5]})
+    assert [output.new_token_id for output in emitted] == [5]
+    assert request.num_output_placeholders == 0
+    assert request.output_token_ids == [3, 4, 5]
+
+
 def _scheduled_tuple(item):
     return item.request.request_id, item.num_computed_tokens, item.num_new_tokens
 
