@@ -3685,12 +3685,14 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         slot = inputs.buffer_slot
         task_args = self._decode_task_args[slot]
         masks = task_args.tensors["grammar_mask"]
-        counts = task_args.tensors["valid_draft_counts"]
+        speculative_tokens = getattr(self._compiled, "num_speculative_tokens", DSPARK_DRAFTER_QUERY_WIDTH)
+        counts = task_args.tensors["valid_draft_counts"] if speculative_tokens > 0 else None
         previous = self._decode_grammar_rows[slot]
         self._decode_grammar_rows[slot] = set()
-        counts.fill_(DSPARK_DRAFTER_QUERY_WIDTH)
+        if counts is not None:
+            counts.fill_(DSPARK_DRAFTER_QUERY_WIDTH)
         active: set[tuple[int, int]] = set()
-        limits = [DSPARK_DRAFTER_QUERY_WIDTH] * len(inputs.request_ids)
+        limits = [min(speculative_tokens, DSPARK_DRAFTER_QUERY_WIDTH)] * len(inputs.request_ids)
         layout = self._compiled.layout
         try:
             for index, (request_id, group, ordinal, (rank, row)) in enumerate(zip(
@@ -3704,17 +3706,14 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 if constraint is None and mask is None:
                     continue
                 if constraint is None:
-                    valid = min(
-                        getattr(self._compiled, "num_speculative_tokens", DSPARK_DRAFTER_QUERY_WIDTH),
-                        DSPARK_DRAFTER_QUERY_WIDTH,
-                    )
+                    valid = min(speculative_tokens, DSPARK_DRAFTER_QUERY_WIDTH)
                     # Unprotected rows already use the immutable all-allowed mask.
                     row_count = min(valid + 1, mask.remaining_tokens)
                     rows = np.full((row_count, DSPARK_VOCAB_SIZE // 32), -1, dtype=np.int32)
                 else:
                     drafts = (
                         self._drafter_state(request_id).pending_draft_tokens
-                        if getattr(self._compiled, "num_speculative_tokens", DSPARK_DRAFTER_QUERY_WIDTH) > 0
+                        if speculative_tokens > 0
                         else []
                     )
                     valid, rows = constraint.plan_draft_rows(drafts)
@@ -3726,14 +3725,16 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 if mask is not None:
                     rows = rows.copy()
                     self._apply_stop_token_mask(rows, mask, preserve_nonempty=constraint is not None)
-                counts[group * layout.tp_size : (group + 1) * layout.tp_size, ordinal] = valid
+                if counts is not None:
+                    counts[group * layout.tp_size : (group + 1) * layout.tp_size, ordinal] = valid
                 limits[index] = valid
                 active.update((rank, row + offset) for offset in range(row_count))
                 self._copy_grammar_mask_rows(masks[rank, row:row + row_count], rows)
         except Exception:
             for rank, row in previous | active:
                 masks[rank, row].fill_(-1)
-            counts.fill_(DSPARK_DRAFTER_QUERY_WIDTH)
+            if counts is not None:
+                counts.fill_(DSPARK_DRAFTER_QUERY_WIDTH)
             raise
         # Rows overwritten by the new plan need no intermediate all-allowed fill.
         for rank, row in previous - active:
