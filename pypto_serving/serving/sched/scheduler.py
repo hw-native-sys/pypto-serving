@@ -161,10 +161,21 @@ class Request:
     scheduling_held: bool = False
     cache_reservation_id: str = ""
     requires_initial_step: bool = False
+    num_replay_tokens: int = 0
 
     @property
     def num_prompt_tokens(self) -> int:
         return len(self.prompt_token_ids)
+
+    @property
+    def num_prefill_tokens(self) -> int:
+        return self.num_prompt_tokens + self.num_replay_tokens
+
+    @property
+    def prefill_token_ids(self) -> list[int]:
+        if self.num_replay_tokens:
+            return self.prompt_token_ids + self.output_token_ids[:self.num_replay_tokens]
+        return self.prompt_token_ids
 
     @property
     def num_tokens(self) -> int:
@@ -179,7 +190,7 @@ class Request:
 
     @property
     def is_prefill(self) -> bool:
-        return self.num_computed_tokens < self.num_prompt_tokens
+        return self.num_computed_tokens < self.num_prefill_tokens
 
     @property
     def all_token_ids(self) -> list[int]:
@@ -430,7 +441,7 @@ class Scheduler:
         scheduled_req_ids: set[str] = set()
         num_scheduled_tokens: dict[str, int] = {}
         running_to_keep: list[Request] = []
-        stalled_non_recomputable: list[Request] = []
+        stalled_non_recomputable: list[tuple[Request, str]] = []
         for request in self.running:
             # A request later in this snapshot may have been preempted while
             # scheduling an earlier request. Do not schedule it again from the
@@ -481,8 +492,9 @@ class Scheduler:
                     request, scheduled_req_ids, num_scheduled_tokens, output
                 )
                 if preempted is None:
-                    if request.constraint_spec is not None or request.cache_reservation_id:
-                        stalled_non_recomputable.append(request)
+                    reason = self._recompute_rejection(request)
+                    if reason is not None:
+                        stalled_non_recomputable.append((request, reason))
                     running_to_keep.append(request)
                     continue
                 token_budget += preempted.get("returned_tokens", 0)
@@ -533,11 +545,9 @@ class Scheduler:
             )
         ):
             # No running request can free a block or produce an in-flight result.
-            # Neither a constrained matcher nor an external Prefill can be
-            # reconstructed by local recompute. Reject rather than spin forever.
-            victim = stalled_non_recomputable[-1]
-            reason = ("external Prefill cannot be recomputed locally" if victim.cache_reservation_id
-                      else "constrained recompute preemption is not supported")
+            # Requests whose state or complete context cannot be reconstructed
+            # by local recompute must be rejected rather than spin forever.
+            victim, reason = stalled_non_recomputable[-1]
             self.abort_request(victim.request_id)
             output.rejected_requests[victim.request_id] = (
                 f"Request {victim.request_id} cannot allocate KV blocks; {reason}"
@@ -735,7 +745,7 @@ class Scheduler:
         """Return an admission error when the uncached prompt cannot run in one step."""
         if not self._requires_single_prefill_dispatch():
             return None
-        uncached_tokens = max(1, request.num_prompt_tokens - request.num_computed_tokens)
+        uncached_tokens = max(1, request.num_prefill_tokens - request.num_computed_tokens)
         single_dispatch_limit = self._single_prefill_dispatch_limit()
         if uncached_tokens <= single_dispatch_limit:
             return None
@@ -751,6 +761,21 @@ class Scheduler:
             f"the single-dispatch limit is {single_dispatch_limit}. Disable speculative "
             "decoding or shorten the uncached prompt suffix."
         )
+
+    def _recompute_rejection(self, request: Request) -> str | None:
+        """Return why the committed context cannot be recovered by cold prefill."""
+        if request.constraint_spec is not None:
+            return "constrained recompute preemption is not supported"
+        if request.cache_reservation_id:
+            return "external Prefill cannot be recomputed locally"
+        if self._requires_single_prefill_dispatch():
+            # Prefix entries can be evicted before recovery. Include every
+            # committed output token and do not rely on the current cache hit.
+            replay_tokens = request.num_prompt_tokens + len(request.output_token_ids)
+            limit = self._single_prefill_dispatch_limit()
+            if replay_tokens > limit:
+                return f"replay length {replay_tokens} exceeds the single-dispatch prefill limit {limit}"
+        return None
 
     def _limit_scheduled_tokens(
         self,
@@ -842,7 +867,7 @@ class Scheduler:
                 scheduled.group_blocks_retained = True
             completes_prompt = (
                 request.num_computed_tokens + scheduled.num_new_tokens
-                >= request.num_prompt_tokens
+                >= request.num_prefill_tokens
             )
             request.num_computed_tokens += scheduled.num_new_tokens
             # Do NOT publish prefix-cache blocks here: this runs at dispatch,
@@ -924,7 +949,7 @@ class Scheduler:
             if (
                 scheduled.is_prefill
                 and scheduled.num_computed_tokens + scheduled.num_new_tokens
-                >= request.num_prompt_tokens
+                >= request.num_prefill_tokens
             ):
                 request.terminal_prefill_in_flight = False
             token_value = new_token_ids.get(request.request_id)
@@ -943,7 +968,7 @@ class Scheduler:
             elif scheduled.is_prefill:
                 request.num_computed_tokens += scheduled.num_new_tokens
                 self._cache_completed_blocks(request)
-                if request.num_computed_tokens < request.num_prompt_tokens:
+                if request.num_computed_tokens < request.num_prefill_tokens:
                     continue
                 for token_id in token_ids:
                     request.output_token_ids.append(token_id)
@@ -1032,11 +1057,11 @@ class Scheduler:
         than reserved. Reconcile both directions to match the synchronous path.
         """
         # This step reserved placeholders iff it sampled: a decode step, or a
-        # prefill chunk that completed the prompt. num_computed_tokens was already
-        # advanced, so "completed the prompt" == num_computed >= prompt.
+        # prefill chunk that completed the input, including a replayed suffix.
+        # Use this step's range because a later chunk may already be in flight.
         sampled_this_step = (
             not scheduled.is_prefill
-            or request.num_computed_tokens >= request.num_prompt_tokens
+            or scheduled.num_computed_tokens + scheduled.num_new_tokens >= request.num_prefill_tokens
         )
         reserved = (
             1 + self._speculative_tokens_for(request, scheduled)
@@ -1167,15 +1192,12 @@ class Scheduler:
         """
         if not self.running:
             return None
-        # The current worker can reconstruct a grammar only from an intact
-        # request lifetime. Serving's recompute preemption does not replay
-        # previously generated tokens into a fresh prefill, so never silently
-        # restart a constrained request at the wrong grammar position.
+        # Preserve requests whose state or complete replay cannot be recovered
+        # before releasing any KV pages.
         candidates = [
             r
             for r in self.running
-            if r.request_id != exclude.request_id and r.constraint_spec is None
-            and not r.cache_reservation_id
+            if r.request_id != exclude.request_id and self._recompute_rejection(r) is None
             and not r.prefill_complete and not r.scheduling_held
         ]
         if self.kv_cache_manager.has_groups:
@@ -1206,6 +1228,8 @@ class Scheduler:
 
         self._free_request_blocks(victim)
         victim.status = RequestStatus.PREEMPTED
+        # The committed output is part of the model context on restart.
+        victim.num_replay_tokens = len(victim.output_token_ids)
         victim.num_computed_tokens = 0
         victim.cached_block_ids = []
         victim.allocated_block_ids = []

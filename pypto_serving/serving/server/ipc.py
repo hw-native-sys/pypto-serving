@@ -44,7 +44,7 @@ class NewRequestData(msgspec.Struct):
     """Full request data sent when a request is scheduled or restarted.
 
     The worker caches this and references it by ``request_id`` for the lifetime
-    of the registration. ``prompt_token_ids`` are not re-sent until a restart.
+    of the registration. ``prompt_token_ids`` includes committed tokens on a recompute restart.
     """
 
     request_id: str

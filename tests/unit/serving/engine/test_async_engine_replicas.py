@@ -10,16 +10,46 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
 from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig
-from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig, TokenOutput
+from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig, ReplicaEngineCore, TokenOutput
+from pypto_serving.serving.sched.scheduler import Request, RequestStatus
 
 
 def test_async_llm_engine_routes_to_least_pending_tokens():
     asyncio.run(_check_async_llm_engine_routes_to_least_pending_tokens())
+
+
+def test_replica_routing_counts_unfinished_replay_context():
+    replay = Request(
+        "replay", [1, 2], max_new_tokens=4, output_token_ids=[7, 8, 9],
+        num_replay_tokens=3, status=RequestStatus.PREEMPTED,
+    )
+    other = Request("other", [1], max_new_tokens=2)
+    engine = AsyncLLMEngine.__new__(AsyncLLMEngine)
+    engine._cores = []
+    engine._route_extra_load = [0, 0]
+    engine._route_counter = 0
+    for request in (replay, other):
+        core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+        core.scheduler = SimpleNamespace(requests={request.request_id: request})
+        engine._cores.append(core)
+
+    assert engine._cores[1].pending_token_load() == 3
+    assert engine._select_replica() == 1
+    replay.status = RequestStatus.RUNNING
+    replay.num_computed_tokens = 2
+    assert engine._select_replica() == 1
+    replay.num_computed_tokens = 4
+    assert engine._select_replica() == 0
+    replay.num_computed_tokens = 8
+    assert engine._cores[0].pending_token_load() == 1
+    replay.status = RequestStatus.FINISHED_LENGTH
+    assert engine._cores[0].pending_token_load() == 0
 
 
 def test_async_llm_engine_does_not_double_count_admitted_requests():

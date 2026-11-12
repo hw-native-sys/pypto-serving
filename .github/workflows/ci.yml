@@ -112,6 +112,14 @@ jobs:
             tests/unit/model/common/test_kernel_compiler_codegen.py \
             tests/unit/model/qwen/test_npu_executor.py
 
+      - name: Run Serving scheduler and worker CPU guards
+        env:
+          TORCH_DEVICE_BACKEND_AUTOLOAD: '0'
+        run: |
+          source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
+          cd "$GITHUB_WORKSPACE/dist-checkout"
+          python -m pytest tests/unit/serving -q
+
       - name: Run Qwen3 accuracy guard
         env:
           PYTHONPATH: ${{ github.workspace }}/dist-checkout
@@ -219,6 +227,17 @@ jobs:
           if [ -z "${PYPTO_DSV41_MODEL_DIR:-}" ] || [ ! -d "$PYPTO_DSV41_MODEL_DIR" ]; then
             echo "::error::PYPTO_DSV41_MODEL_DIR must point to the V4.1 checkpoint on this A5 runner"
             exit 1
+          fi
+
+      - name: Resolve duplicated CANN root for this job
+        # Remove after the A5 runner CANN_ROOT values are repaired.
+        run: |
+          root="${CANN_ROOT:-}"
+          parent="${root%/*}"
+          if [ ! -d "$root" ] && [ -n "$parent" ] && \
+             [ "${root##*/}" = "${parent##*/}" ] && [ -f "$parent/set_env.sh" ]; then
+            printf 'Using installed CANN root for this job: %s\n' "$parent"
+            printf 'CANN_ROOT=%s\n' "$parent" >> "$GITHUB_ENV"
           fi
 
       - name: Setup CI job

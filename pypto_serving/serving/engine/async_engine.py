@@ -550,7 +550,7 @@ class ReplicaEngineCore:
         for request in self.scheduler.requests.values():
             if request.status.is_finished:
                 continue
-            prompt_remaining = max(0, request.num_prompt_tokens - request.num_computed_tokens)
+            prompt_remaining = max(0, request.num_prefill_tokens - request.num_computed_tokens)
             generation_remaining = max(0, request.max_new_tokens - len(request.output_token_ids))
             load += prompt_remaining + generation_remaining
         return load
@@ -978,8 +978,8 @@ class ReplicaEngineCore:
     ) -> StepCommand:
         """Build a lightweight StepCommand from the scheduler output.
 
-        Prompt tokens for requests that the worker has not yet seen are shipped
-        as ``NewRequestData`` entries exactly once; subsequent steps carry only
+        Prefill tokens for each worker registration, including committed tokens
+        after preemption, are shipped once as ``NewRequestData``. Later steps carry only
         per-request deltas (~1 KB total at batch 16).
 
         In async mode a decode input token for step N+1 may not be sampled yet
@@ -1014,7 +1014,7 @@ class ReplicaEngineCore:
                     receipt.clear()
                 new_requests.append(NewRequestData(
                     request_id=req_id,
-                    prompt_token_ids=list(req.prompt_token_ids),
+                    prompt_token_ids=list(req.prefill_token_ids),
                     temperature=req.temperature,
                     top_p=req.top_p,
                     top_k=req.top_k,
@@ -1033,7 +1033,7 @@ class ReplicaEngineCore:
             if sr.is_prefill:
                 num_computed = sr.num_computed_tokens
                 num_new = sr.num_new_tokens
-                chunk_tokens = req.prompt_token_ids[num_computed: num_computed + num_new]
+                chunk_tokens = req.prefill_token_ids[num_computed: num_computed + num_new]
                 prefill_requests.append(PrefillRequest(
                     request_id=req_id,
                     chunk_tokens=list(chunk_tokens),
