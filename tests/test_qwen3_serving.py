@@ -44,6 +44,7 @@ MODEL_DIR_ENV = os.environ.get("PYPTO_QWEN3_MODEL_DIR")
 MODEL_DIR = Path(MODEL_DIR_ENV) if MODEL_DIR_ENV else None
 MODEL_ID = "qwen3-14b-serving"
 PLATFORM = os.environ.get("PYPTO_QWEN3_PLATFORM", "a2a3")
+CHIP_RUNTIME = os.environ.get("PYPTO_QWEN3_RUNTIME", "tensormap_and_ringbuffer")
 DEVICE_ID_ENV = os.environ.get("DEVICE_ID")
 DEVICE_ID = int(DEVICE_ID_ENV) if DEVICE_ID_ENV is not None else None
 
@@ -56,6 +57,7 @@ MAX_SEQ_LEN = 512
 # Compile-time generation ceiling baked into the runner; per-request
 # GenerateConfig stays at or below this.
 RUNTIME_MAX_NEW_TOKENS = 16
+PREFILL_BUDGET = 80 if CHIP_RUNTIME == "host_build_graph" else 4096
 
 # Same greedy prompt / expected tokens as the offline accuracy guard. The
 # serving path shares the executor kernels, so greedy output must match.
@@ -125,7 +127,7 @@ def harness():
 
     tokenizer = load_tokenizer(str(MODEL_DIR))
     # Default to no chunking; the chunked-prefill test lowers this per-request.
-    default_threshold = MAX_SEQ_LEN
+    default_threshold = min(MAX_SEQ_LEN, PREFILL_BUDGET)
     config = EngineConfig(
         model_id=MODEL_ID,
         model_dir=str(MODEL_DIR),
@@ -140,6 +142,8 @@ def harness():
             device="cpu",
             kv_dtype="bfloat16",
             weight_dtype="float32",
+            chip_runtime=CHIP_RUNTIME,
+            max_num_batched_tokens=PREFILL_BUDGET,
             # Simpler ring sizing (per-dispatch RunConfig). The CI-era
             # PTO2_RING_* value 16384 exhausts the dep pool mid-run
             # ("raise runtime_env.ring_dep_pool"); 262144 is the Qwen
@@ -150,6 +154,7 @@ def harness():
             ring_heap=1073741824,
         ),
         max_num_running_reqs=MAX_BATCH_SIZE,
+        max_num_scheduled_tokens=PREFILL_BUDGET,
         long_prefill_token_threshold=default_threshold,
         enable_prefix_cache=True,
         enable_chunk_prefill=True,
@@ -218,10 +223,6 @@ def harness():
             asyncio.set_event_loop(None)
 
 
-def _max_batch_width(events: list[list[tuple[str, bool, int]]]) -> int:
-    return max((len(event) for event in events), default=0)
-
-
 def test_serving_single_request_matches_expected_tokens(harness):
     """Baseline: the serving path reproduces the offline greedy output."""
     harness.reset()
@@ -236,9 +237,9 @@ def test_serving_single_request_matches_expected_tokens(harness):
 
 
 def test_multi_batch_matches_single_request(harness):
-    """Several concurrent requests are co-batched and each matches the baseline."""
+    """A full decode batch matches the single-request baseline."""
     harness.reset()
-    num_requests = 4
+    num_requests = MAX_BATCH_SIZE
 
     async def _run_all():
         return await asyncio.gather(
@@ -254,11 +255,14 @@ def test_multi_batch_matches_single_request(harness):
             f"actual:   {tokens}"
         )
 
-    # Prove the scheduler actually co-batched at least two requests in one step.
-    max_width = _max_batch_width(harness.schedule_events)
-    assert max_width >= 2, (
-        f"Expected the scheduler to co-batch >=2 requests in one step, "
-        f"but the widest step had {max_width} request(s)."
+    # Require an actual full decode batch after prefill.
+    max_width = max(
+        (sum(not is_prefill for _, is_prefill, _ in event) for event in harness.schedule_events),
+        default=0,
+    )
+    assert max_width == MAX_BATCH_SIZE, (
+        f"Expected a {MAX_BATCH_SIZE}-request decode batch, "
+        f"but the widest decode step had {max_width} request(s)."
     )
 
 
