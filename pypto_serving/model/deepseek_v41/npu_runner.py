@@ -32,6 +32,7 @@ import torch
 
 from pypto_serving.config.types import DecodeResult, KVCacheGroupSpec, PrefillResult
 from pypto_serving.model.common.runner.buffer_set import alloc_device_buffer
+from pypto_serving.model.common.weights.nz import pack_nz
 
 from .task_args import (
     ForwardStep,
@@ -2182,6 +2183,18 @@ class PrefillMetadataResources:
         return {name: f[source] for name, source in names.items()}
 
 # final_output_resources
+def _lib_head_weight_layout(lib_root) -> str:
+    """Read the selected V4.1 head's explicit physical weight contract."""
+    expected = Path(lib_root).resolve() / "models/deepseek_v4_1_flash/lm_head.py"
+    module = importlib.import_module("lm_head")
+    if Path(module.__file__).resolve() != expected:
+        raise RuntimeError("LM-head metadata resolved to a different lib checkout or model")
+    layout = getattr(module, "LM_HEAD_WEIGHT_LAYOUT", "nd_nk")
+    if layout not in ("nd_nk", "bf16_nz_kn"):
+        raise ValueError(f"unsupported V4.1 LM-head weight layout: {layout!r}")
+    return layout
+
+
 @dataclass(frozen=True)
 class FinalOutputHostResources:
     norm_weight: torch.Tensor
@@ -2189,6 +2202,11 @@ class FinalOutputHostResources:
     logit_row_indices: torch.Tensor
     logits: torch.Tensor
     sampled_ids: torch.Tensor
+    head_layout: str = "nd_nk"
+
+    @property
+    def hidden_size(self):
+        return self.norm_weight.shape[-1]
 
     @property
     def inherited_host_tensors(self):
@@ -2202,7 +2220,8 @@ class FinalOutputHostResources:
 
 def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
                                      max_logit_rows: int = 16, chunk_rows: int = 64,
-                                     max_host_bytes: int = 16 << 30) -> FinalOutputHostResources:
+                                     max_host_bytes: int = 16 << 30,
+                                     head_layout: str = "nd_nk") -> FinalOutputHostResources:
     """Load one TP vocabulary shard at a time before the worker forks."""
     if (not isinstance(topology, SegmentTopology) or topology.tp != 1
             or topology.dp not in (4, 8)):
@@ -2210,12 +2229,18 @@ def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
     if any(type(value) is not int or value <= 0 for value in
            (max_logit_rows, chunk_rows, max_host_bytes)):
         raise ValueError("final output capacities and memory budget must be positive")
+    if head_layout not in ("nd_nk", "bf16_nz_kn"):
+        raise ValueError(f"unsupported V4.1 LM-head weight layout: {head_layout!r}")
     loader = V41WeightLoader(model_dir, tp_size=topology.tp, tp_rank=0,
                              ep_size=topology.world, ep_rank=0)
     vocab, hidden = loader.config.vocab_size, loader.config.hidden_size
     if vocab % topology.tp:
         raise ValueError("LM-head vocabulary must divide TP size")
     shard_rows = vocab // topology.tp
+    if head_layout == "bf16_nz_kn":
+        if hidden % 16 or shard_rows % 16 or chunk_rows < 16:
+            raise ValueError("NZ LM-head weights require 16-aligned dimensions and chunks of at least 16 rows")
+        chunk_rows = chunk_rows // 16 * 16
     sampled_pad = 8
     required_bytes = (topology.world * shard_rows * hidden * 2
                       + topology.world * hidden * 2
@@ -2225,7 +2250,9 @@ def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
         raise ValueError(f"final output host buffers require {required_bytes} bytes")
 
     norm = torch.empty((topology.world, hidden), dtype=torch.bfloat16).share_memory_()
-    head = torch.empty((topology.world, shard_rows, hidden), dtype=torch.bfloat16).share_memory_()
+    head_shape = ((topology.world, hidden, shard_rows) if head_layout == "bf16_nz_kn"
+                  else (topology.world, shard_rows, hidden))
+    head = torch.empty(head_shape, dtype=torch.bfloat16).share_memory_()
     indices = torch.full((topology.world, max_logit_rows), -1, dtype=torch.int32).share_memory_()
     logits = torch.zeros((topology.world, max_logit_rows, vocab), dtype=torch.float32).share_memory_()
     sampled = torch.full((topology.world, max_logit_rows, sampled_pad), -1,
@@ -2244,11 +2271,15 @@ def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
             value = rank_loader.load_rows("head.weight", start, stop).weight
             if value.dtype != torch.bfloat16 or tuple(value.shape) != (stop - start, hidden):
                 raise ValueError("checkpoint LM-head shard disagrees with the lib output ABI")
-            head[tp_rank, start:stop].copy_(value)
+            if head_layout == "bf16_nz_kn":
+                packed = pack_nz(value.transpose(-2, -1).contiguous())
+                head[tp_rank].view(-1)[start * hidden : stop * hidden].copy_(packed.reshape(-1))
+            else:
+                head[tp_rank, start:stop].copy_(value)
     for dp_rank in range(1, topology.dp):
         for tp_rank in range(topology.tp):
             head[dp_rank * topology.tp + tp_rank].copy_(head[tp_rank])
-    return FinalOutputHostResources(norm, head, indices, logits, sampled)
+    return FinalOutputHostResources(norm, head, indices, logits, sampled, head_layout)
 
 
 class FinalOutputWeights:
@@ -2264,11 +2295,21 @@ class FinalOutputWeights:
         world = topology.world
         if any(not tensor.is_shared() for tensor in host.all_host_tensors):
             raise ValueError("final output host buffers must be shared before worker creation")
-        if (host.norm_weight.dtype != torch.bfloat16 or host.norm_weight.shape != (world, host.head_weight.shape[-1])
-                or host.head_weight.dtype != torch.bfloat16 or host.head_weight.shape[0] != world
+        if host.head_layout not in ("nd_nk", "bf16_nz_kn"):
+            raise ValueError("unsupported V4.1 LM-head weight layout")
+        if (host.norm_weight.ndim != 2 or host.head_weight.ndim != 3 or host.logits.ndim != 3
+                or host.logit_row_indices.ndim != 2 or host.sampled_ids.ndim != 3):
+            raise ValueError("final output host tensor ranks disagree with the lib TP1/DP ABI")
+        hidden = host.hidden_size
+        vocab = host.logits.shape[-1]
+        head_shape = ((world, hidden, vocab // topology.tp) if host.head_layout == "bf16_nz_kn"
+                      else (world, vocab // topology.tp, hidden))
+        if (host.norm_weight.dtype != torch.bfloat16 or host.norm_weight.shape != (world, hidden)
+                or vocab % topology.tp or host.head_weight.dtype != torch.bfloat16
+                or tuple(host.head_weight.shape) != head_shape
                 or host.logit_row_indices.dtype != torch.int32 or host.logit_row_indices.shape != (world, 16)
                 or host.logits.dtype != torch.float32
-                or host.logits.shape != (world, 16, host.head_weight.shape[1] * topology.tp)
+                or host.logits.shape != (world, 16, vocab)
                 or host.sampled_ids.dtype != torch.int32 or host.sampled_ids.shape != (world, 16, 8)):
             raise ValueError("final output host buffers disagree with the lib TP1/DP ABI")
         self.worker, self.host, self.topology = worker, host, topology
@@ -2301,7 +2342,7 @@ class PrefillForwardSegment:
         try:
             self.residual = alloc_device_buffer(
                 worker, (topology.world, topology.local_capacity, 4,
-                         final.host.head_weight.shape[-1]), torch.float32, stacked=True)
+                         final.host.hidden_size), torch.float32, stacked=True)
             self._owned.append(self.residual)
             self.pre_mix = alloc_device_buffer(
                 worker, (topology.world, topology.local_capacity, 4),
@@ -3638,6 +3679,7 @@ def make_production_bindings(
         else:
             dspark_programs, dspark_param_names = {}, {}
         abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
+        head_layout = _lib_head_weight_layout(root)
         kv_sources, index_sources, c2a_sources = _sources(layers)
         layout = DecodeWeightLayout.from_lib(abi, tp_size=topology.tp)
         if (layout.layers, layout.kv_sources, layout.index_sources,
@@ -3708,7 +3750,7 @@ def make_production_bindings(
         decode_host = PrefillMetadataResources(topology, **host_kwargs)
         input_host = make_input_host_resources(topology, plan.weights.config.hidden_size)
         decode_input_host = make_input_host_resources(topology, plan.weights.config.hidden_size)
-        final_host = load_final_output_host_resources(model_dir, topology)
+        final_host = load_final_output_host_resources(model_dir, topology, head_layout=head_layout)
         prefill_host = PrefillMetadataResources(
             topology, **host_kwargs, full_hidden_size=plan.weights.config.hidden_size)
         engram_host = None
