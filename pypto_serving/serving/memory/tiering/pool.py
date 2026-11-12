@@ -14,6 +14,17 @@ from pathlib import Path
 from mmap import PAGESIZE
 
 
+def host_views(pool, extents, *, writable=False):
+    """Borrow ranges of an existing backing; callers retain their allocation leases."""
+    views = []
+    for offset, size in extents:
+        if offset < 0 or size <= 0 or offset + size > pool.nbytes:
+            raise ValueError("Host range exceeds shared backing")
+        view = memoryview((ctypes.c_ubyte * size).from_address(pool.base + offset)).cast("B")
+        views.append(view if writable else view.toreadonly())
+    return tuple(views)
+
+
 class Extents:
     def __init__(self, capacity):
         if type(capacity) is not int or capacity < PAGESIZE:

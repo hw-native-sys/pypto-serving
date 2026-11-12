@@ -10,10 +10,11 @@
 
 import asyncio
 from dataclasses import dataclass, field
+from itertools import chain
 import logging
 import time
 
-from ..kv_cache import KVCacheCapacityError
+from ..kv_cache import KVCacheCapacityError, KVCacheRestoreError
 from .manager import CacheTier, Page
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,9 @@ class Load:
     waiters: set = field(default_factory=set)
     ready: bool = False
     request: str | None = None
+    disk: bool = False
+    error: object = None
+    file_reader: object = None
 
 
 @dataclass
@@ -57,6 +61,7 @@ class TieredCache:
         self.tier = CacheTier(capacity, backend, cache.release_group_block_snapshot, trace=trace, notify=notify)
         self.pending, self.loads = {}, {}
         self.quarantined = []
+        self.archive = None
 
     def capture(self, name, partition, block):
         # Rolling pages are reusable only with a confirmed joint checkpoint.
@@ -65,7 +70,7 @@ class TieredCache:
 
     def _capture(self, name, partition, block):
         key = partition, name, block.block_hash
-        if key in self.tier.pages:
+        if key in self.tier.pages or (key in self.loads and self.loads[key].disk):
             return
         pool = self.cache._group_pools[name]
         source = name, partition, pool.local_block_id(block)
@@ -125,29 +130,42 @@ class TieredCache:
             pending.changed.set()
 
     def _progress(self):
+        if self.archive is not None:
+            self.archive.pump()
         self.tier.pump()
         reaped_pages = reaped_bytes = published_pages = 0
         requests = set()
-        for handle in self.backend.pop_completed("load"):
-            page = self.tier.by_handle[handle]
-            key = page.key
+        keys = (self.tier.by_handle[handle].key for handle in self.backend.pop_completed("load"))
+        if self.archive is not None:
+            keys = chain(keys, self.archive.pop_restored())
+        for key in keys:
             load = self.loads.get(key)
             if load is None or load.ready:
                 continue
             try:
                 self.tier.completed(load.future, load.page.size)
+            except KVCacheRestoreError as error:
+                load.error = error
+                if self.trace is not None:
+                    self.trace.emit("restore_failed", requests=sorted(load.waiters), stage="file",
+                                    error_type=type(error).__name__, native_submitted=False)
             except BaseException as error:
                 if self.trace is not None:
                     self.trace.emit("restore_failed", requests=sorted(load.waiters),
                                     error_type=type(error).__name__, native_completed=False)
                 raise
-            if load.waiters:
+            if load.waiters and load.error is None:
                 pool = self.cache._group_pools[key[1]]
                 self.cache._cache_group_block(pool, load.partition, load.block, key[2])
                 published_pages += 1
-            self.tier.counters["loads"] += 1
-            self.tier.counters["loaded_bytes"] += load.page.size
-            self.tier.release((load.page,))
+            if load.error is None:
+                self.tier.counters["loads"] += 1
+                self.tier.counters["loaded_bytes"] += load.page.size
+            if not load.disk:
+                self.tier.release((load.page,))
+            elif load.file_reader is not None:
+                self.archive.files.release(load.file_reader)
+                load.file_reader = None
             load.ready = True
             if self.trace is not None:
                 reaped_pages += 1
@@ -168,7 +186,11 @@ class TieredCache:
 
     def _lookup(self, pool, partition, value):
         resident = pool.hash_to_block.get((partition, value))
-        return resident if resident is not None else self.tier.lookup((partition, pool.spec.name, value))
+        if resident is not None:
+            return resident
+        key = partition, pool.spec.name, value
+        page = self.tier.lookup(key)
+        return page if page is not None or self.archive is None else self.archive.lookup(key)
 
     def prepare(self, request, hashes, tokens, *, maximum, groups=None, partition=None):
         started_ns = time.monotonic_ns() if self.trace is not None else 0
@@ -178,15 +200,21 @@ class TieredCache:
         if pending is not None:
             if pending.remaining:
                 return False
+            error = next((self.loads[key].error for key in pending.loads if self.loads[key].error), None)
+            if error is not None:
+                self.cancel(request)
+                raise error
             self.cache._protect_group_checkpoint(None, pending.hashes, pending.tokens,
                                                  pending.partition, {}, pending.boundary)
             self.cancel(request, completed=True)
             return True
-        if not self.tier.pages:
+        if not self.tier.pages and (self.archive is None or not self.archive.pages):
             return True
         checkpoints = self.cache._group_checkpoints
         candidates = set(checkpoints.checkpoints if checkpoints is not None else ())
         candidates.update(self.tier.units)
+        if self.archive is not None:
+            candidates.update(self.archive.units)
         tables, boundary, selected = self.cache.select_group_prefix_blocks(
             hashes, max_cache_hit_tokens=maximum, shareable_group_names=groups, partition=partition,
             lookup=self._lookup, checkpoint_keys=candidates)
@@ -205,19 +233,29 @@ class TieredCache:
         fresh = {key: page for key, page in missing.items() if key not in self.loads}
         shared_with = ({self.loads[key].request for key in missing if key not in fresh}
                        if self.trace is not None else set())
+        disk_keys = tuple(key for key, page in fresh.items() if self.tier.lookup(key) is not page)
+        disk_readers = self.archive.acquire(disk_keys) if disk_keys else {}
+        if disk_readers is None:
+            self.cache.release_group_block_snapshot(source_pin)
+            return True  # A source was evicted before admission: a normal cache miss.
         targets = target_pin = None
         try:
             if fresh:
                 targets, target_pin = self.cache.reserve_group_restore_pages(
                     tuple((key[1], key[2]) for key in fresh), selected)
-                readers = self.tier.acquire(fresh)
                 pins = RestorePins(target_pin, len(fresh))
-                for page in readers:
+                for page in fresh.values():
                     key = page.key
                     block = targets[key[1], key[2]]
                     destination = key[1], selected, self.cache._group_pools[key[1]].local_block_id(block)
-                    self.loads[key] = Load(page, block, selected, pins,
-                        self.tier.load(page, destination, request=request), request=request)
+                    disk = self.tier.lookup(key) is not page
+                    if disk:
+                        future = self.archive.load(page, destination, disk_readers[key], request=request)
+                    else:
+                        self.tier.acquire((key,))
+                        future = self.tier.load(page, destination, request=request)
+                    self.loads[key] = Load(page, block, selected, pins, future, request=request,
+                                           disk=disk, file_reader=disk_readers.get(key))
             for key in missing:
                 self.loads[key].waiters.add(request)
             self.pending[request] = PendingPrefix(hashes, tokens, boundary, selected, source_pin,
@@ -237,6 +275,8 @@ class TieredCache:
             return False
         except KVCacheCapacityError:
             self.cache.release_group_block_snapshot(source_pin)
+            for reader in disk_readers.values():
+                self.archive.files.release(reader)
             if self.trace is not None:
                 self.trace.emit("restore_skipped", request_id=request, reason="hbm_capacity",
                                 prefix_tokens=boundary, partition=selected)
@@ -277,10 +317,18 @@ class TieredCache:
                 unconfirmed_pages=remaining)
 
     def begin_close(self):
+        if self.archive is not None:
+            self.archive.begin_close()
         for request in tuple(self.pending):
             self.cancel(request)
         self.tier.begin_close()
 
     def close_ready(self):
         self.progress()
-        return not self.loads and self.tier.close_ready()
+        return (not self.loads and self.tier.close_ready()
+                and (self.archive is None or self.archive.idle()))
+
+    def close_storage(self):
+        if self.archive is not None:
+            self.archive.close()
+        self.backend.close()

@@ -189,6 +189,8 @@ class RuntimeConfig:
     npu_memory_utilization: float = 0.90
     kv_offload_bytes: int = 0
     kv_offload_backend: str = "simpler"
+    kv_ssd_bytes: int = 0
+    kv_ssd_path: str | None = None
     # Max tokens processed per scheduling step (chunked-prefill granularity).
     max_num_batched_tokens: int = 4096
     # Optional model/kernel limit for one request's active prefill tokens in a
