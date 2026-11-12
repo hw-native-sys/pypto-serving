@@ -477,7 +477,7 @@ def test_packed_prefill_executor_limits_follow_runtime(monkeypatch, max_batch_si
     assert compiled.layout.tp_size == tp_size and compiled.layout.lm_head_tp_size == 4
     assert compiled.layout.partitions == 16 // tp_size
     assert compiled.layout.decode_capacity == 16 * tp_size
-    assert compiled.layout.decode_batch == 64  # Frozen ABI, not usable capacity.
+    assert compiled.layout.decode_batch == 16 * tp_size
     assert compiled.layout.prefill_batch == max_batch_size
     assert executor.max_prefill_requests_per_partition == per_group
     assert executor.max_prefill_batch_size == max_batch_size

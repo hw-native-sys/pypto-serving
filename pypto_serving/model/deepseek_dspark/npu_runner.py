@@ -10,8 +10,8 @@
 
 Serves the Lib target/K7 programs with model-local attention/cache groups
 and an independent vocabulary-head TP. A cache partition is replicated over
-its attention group. Each owner has 16 decode request slots; the kernel's
-64-row group ABI remains padded even when the attention TP is smaller.
+its attention group. Each owner has 16 decode request slots; the Lib's group
+batch is configured from that owner capacity and the local attention TP.
 """
 
 from __future__ import annotations
@@ -298,11 +298,10 @@ DSPARK_DRAFT_LAYERS = 3
 # Per-lease ring: a 128-deep sliding window plus the seven query rows fits in
 # ceil((31 + 128 + 7) / 32) = 6 blocks for any window alignment.
 DSPARK_DRAFTER_RING_BLOCKS = 6
-DSPARK_DRAFTER_LEASES_PER_GROUP = 64
-# 64 leases * 6 blocks per layer; the trailing shared range is a read-only,
-# zero-initialized filler history that no live lease can reach.
+# The fixed 512-block Lib pool reserves filler after the largest TP4 group.
+# Live lease capacity follows layout.decode_batch, including smaller TP groups.
 DSPARK_DRAFTER_FILLER_BLOCK_BASE = (
-    DSPARK_DRAFTER_LEASES_PER_GROUP * DSPARK_DRAFTER_RING_BLOCKS
+    DSPARK_DRAFTER_MAX_BATCH * DSPARK_TP_SIZE * DSPARK_DRAFTER_RING_BLOCKS
 )
 # Block tables are [ranks, layers, batch, ORI_MAX_BLOCKS] with ORI_MAX_BLOCKS
 # covering the 1M-position ceiling at 32-token pages.
@@ -312,12 +311,14 @@ DSPARK_DRAFTER_TABLE_BLOCKS = 32768
 DSPARK_DRAFTER_KV_BLOCKS = 512
 # Max per-rank context rows the drafter accepts: max(decode 16*8, prefill
 # 512/4) -- both land on the same 128-row extent.
-DSPARK_DRAFTER_CONTEXT_ROWS = 128
+DSPARK_DRAFTER_CONTEXT_ROWS = DSPARK_DRAFTER_MAX_BATCH * (1 + DSPARK_DRAFTER_QUERY_WIDTH)
 # The group-context tensors and block tables stage through one shared buffer
 # per extent (their dynamic axis is not a per-rank storage prefix, so a view
 # cannot cross the L3 wire).  Decode lands on batch*8 naturally; prefill
 # seeding rounds its tail up to the next bucket.
-DSPARK_DRAFTER_CONTEXT_BUCKETS = (32, 64, 96, 128)
+DSPARK_DRAFTER_CONTEXT_BUCKETS = tuple(
+    batch * (1 + DSPARK_DRAFTER_QUERY_WIDTH) for batch in DSPARK_DRAFTER_BATCHES
+)
 
 # ---- paging ----
 DSPARK_BLOCK_SIZE = 32
@@ -327,13 +328,13 @@ DSPARK_SLIDING_WINDOW = 128
 DSPARK_C128_STATE_PAGE_TOKENS = 8
 DSPARK_C4_STATE_PAGE_TOKENS = 2
 
-# ---- decode tile (fixed at the device-validated shape) ----
-DSPARK_DECODE_SEQ = 8
-DSPARK_DECODE_BATCH = 64  # requests per TP group
-DSPARK_DECODE_LOCAL_BATCH = DSPARK_DECODE_BATCH // DSPARK_TP_SIZE
+# ---- decode tile (one fixed-capacity slab per owner) ----
+DSPARK_DECODE_SEQ = 1 + DSPARK_DRAFTER_QUERY_WIDTH
+DSPARK_DECODE_LOCAL_BATCH = DSPARK_DRAFTER_MAX_BATCH
+DSPARK_DECODE_BATCH = DSPARK_DECODE_LOCAL_BATCH * DSPARK_TP_SIZE
 DSPARK_DECODE_TOKENS = DSPARK_DECODE_BATCH * DSPARK_DECODE_SEQ
 DSPARK_DECODE_LOCAL_TOKENS = DSPARK_DECODE_LOCAL_BATCH * DSPARK_DECODE_SEQ
-DSPARK_MOE_TOKENS = 128
+DSPARK_MOE_TOKENS = DSPARK_DECODE_LOCAL_TOKENS
 # The LM-head / greedy-sampling windows cover one owner's rows per rank
 # (pypto-lib#1182 right-sized them from the whole step's DECODE_TOKENS to
 # MOE_TOKENS): decode packs at most local_batch * decode_seq = 128 logit
@@ -683,7 +684,7 @@ class DSparkCacheLayout:
         cls, ranks: int, *, tp_size: int = DSPARK_TP_SIZE,
         lm_head_tp_size: int = DSPARK_LM_HEAD_TP_SIZE,
     ) -> "DSparkCacheLayout":
-        """Derive local cache groups without changing the per-owner decode slab."""
+        """Derive the Lib group batch while preserving the per-owner decode slab."""
         ranks = int(ranks)
         if ranks not in (8, 16) or tp_size not in (1, 2, 4) or ranks % tp_size:
             raise ValueError("DSpark requires 8 or 16 ranks and attention TP 1, 2 or 4")
@@ -697,6 +698,8 @@ class DSparkCacheLayout:
             tp_size=tp_size,
             lm_head_tp_size=lm_head_tp_size,
             partitions=partitions,
+            decode_batch=group_batch,
+            decode_tokens=group_batch * DSPARK_DECODE_SEQ,
             prefill_local_tokens=DSPARK_PREFILL_DISPATCH_TOKENS // tp_size,
             prefill_batch=partitions * group_batch,
             prefill_requests=group_batch,
@@ -1517,11 +1520,11 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         # the decode backbone tap.
         self._drafter_states: dict[str, _DSparkDraftRequestState] = {}
         self._drafter_free_leases: dict[int, list[int]] = {
-            group: list(range(DSPARK_DRAFTER_LEASES_PER_GROUP))
+            group: list(range(compiled.layout.decode_batch))
             for group in range(compiled.layout.partitions)
         }
         self._drafter_lease_generations: list[list[int]] = [
-            [0] * DSPARK_DRAFTER_LEASES_PER_GROUP
+            [0] * compiled.layout.decode_batch
             for _ in range(compiled.layout.partitions)
         ]
         self._dspark_device_state_tokens: StackedDeviceTensor | None = None
@@ -1679,12 +1682,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         counts = plan_cache_pages(
             self._cache_group_specs, min(budgets),
             active_requests=math.ceil(runtime.max_batch_size / layout.partitions),
-            step_tokens=step, filler_pages=DSPARK_DECODE_BATCH,
+            step_tokens=step, filler_pages=layout.decode_batch,
             retention_interval=runtime.prefix_cache_retention_interval if self._compiled.prefill is not None else 0,
         )
         logger.info("DSpark cache budget=%d bytes, planned=%d bytes including filler/alignment",
                     min(budgets), cache_pool_bytes(self._cache_group_specs, counts,
-                                                  filler_pages=DSPARK_DECODE_BATCH))
+                                                  filler_pages=layout.decode_batch))
         return counts
 
     def _check_memory_target(self, runtime: RuntimeConfig) -> None:
@@ -1698,7 +1701,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
 
     def _physical_cache_num_blocks(self, group_name: str) -> int:
         try:
-            return self._cache_group_num_blocks[group_name] + DSPARK_DECODE_BATCH
+            return self._cache_group_num_blocks[group_name] + self._compiled.layout.decode_batch
         except KeyError as exc:
             raise RuntimeError("DSpark KV cache capacity is not initialized") from exc
 
@@ -2458,9 +2461,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         if self._compiled.prefill_capture is not None:
             ranks = self._compiled.layout.ranks
             for name, shape, dtype in (
-                ("hidden", (ranks, DSPARK_DRAFTER_LEASES_PER_GROUP, DSPARK_SLIDING_WINDOW,
+                ("hidden", (ranks, self._compiled.layout.decode_batch, DSPARK_SLIDING_WINDOW,
                             DSPARK_MAIN_HIDDEN_DIM), torch.bfloat16),
-                ("positions", (ranks, DSPARK_DRAFTER_LEASES_PER_GROUP, DSPARK_SLIDING_WINDOW), torch.int32),
+                ("positions", (ranks, self._compiled.layout.decode_batch, DSPARK_SLIDING_WINDOW), torch.int32),
                 ("context", (ranks, max(DSPARK_DRAFTER_CONTEXT_ROWS,
                                        DSPARK_DRAFTER_BATCHES[0] * DSPARK_SLIDING_WINDOW
                                        // self._compiled.layout.tp_size),
@@ -3712,7 +3715,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             name="dspark_default_grammar_mask",
         )
         mask.fill_(-1)
-        counts = shared_empty((ranks, DSPARK_DECODE_BATCH), torch.int32, name="dspark_default_draft_counts")
+        counts = shared_empty((ranks, self._compiled.layout.decode_batch), torch.int32,
+                              name="dspark_default_draft_counts")
         counts.fill_(DSPARK_DRAFTER_QUERY_WIDTH)
         self._default_grammar_args = {
             "grammar_mask": StaticDeviceTensor(mask),
@@ -5795,7 +5799,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         scratch: dict[str, tuple[int, ...]] = {}
         for name in DSPARK_CACHE_GROUP_NAMES:
             base = self._cache_group_num_blocks[name]
-            scratch[name] = tuple(base + row for row in range(DSPARK_DECODE_BATCH))
+            scratch[name] = tuple(base + row for row in range(self._compiled.layout.decode_batch))
         return scratch
 
     def _normalize_group_block_ids(
@@ -5829,7 +5833,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                         f"grouped KV block IDs for {name} must be in "
                         f"[0, {self._cache_group_num_blocks[name]}); "
                         f"[{self._cache_group_num_blocks[name]}, "
-                        f"{self._cache_group_num_blocks[name] + DSPARK_DECODE_BATCH}) "
+                        f"{self._cache_group_num_blocks[name] + self._compiled.layout.decode_batch}) "
                         "is reserved for kernel padding"
                     )
                 entry[name] = blocks
@@ -5863,7 +5867,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         if not free:
             raise RuntimeError(
                 f"DSpark drafter leases exhausted for TP group {group} "
-                f"({DSPARK_DRAFTER_LEASES_PER_GROUP} live requests per group)"
+                f"({self._compiled.layout.decode_batch} live requests per group)"
             )
         lease = free[-1]
         dirty_key = (group, lease)
@@ -5898,7 +5902,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             raise RuntimeError("DSpark drafter KV pool is not materialized")
         if not 0 <= group < self._compiled.layout.partitions:
             raise ValueError("DSpark drafter group is outside the runtime topology")
-        if not 0 <= lease < DSPARK_DRAFTER_LEASES_PER_GROUP:
+        if not 0 <= lease < self._compiled.layout.decode_batch:
             raise ValueError("DSpark drafter lease is outside the private pool")
 
         block_nbytes = DSPARK_BLOCK_SIZE * DSPARK_HEAD_DIM * 2
@@ -6828,7 +6832,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             state = self._alloc_empty_stacked_tensor(
                 (
                     self._compiled.layout.ranks,
-                    DSPARK_DRAFTER_LEASES_PER_GROUP,
+                    self._compiled.layout.decode_batch,
                     DSPARK_STATE_TOKEN_WIDTH,
                 ),
                 torch.long,
@@ -6843,7 +6847,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             state = self._alloc_empty_stacked_tensor(
                 (
                     self._compiled.layout.ranks,
-                    DSPARK_DRAFTER_LEASES_PER_GROUP,
+                    self._compiled.layout.decode_batch,
                     DSPARK_STATE_META_WIDTH,
                 ),
                 torch.int32,
@@ -6913,7 +6917,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     "dspark_seed_state_tokens",
                     (
                         self._compiled.layout.ranks,
-                        DSPARK_DRAFTER_LEASES_PER_GROUP,
+                        self._compiled.layout.decode_batch,
                         DSPARK_STATE_TOKEN_WIDTH,
                     ),
                     torch.long,
@@ -6923,7 +6927,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     "dspark_seed_state_meta",
                     (
                         self._compiled.layout.ranks,
-                        DSPARK_DRAFTER_LEASES_PER_GROUP,
+                        self._compiled.layout.decode_batch,
                         DSPARK_STATE_META_WIDTH,
                     ),
                     torch.int32,

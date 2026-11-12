@@ -4,7 +4,12 @@ DSpark serves the converted DeepSeek V4 Flash W8A8 checkpoint with TP4 groups. I
 
 ## Prepare the Checkpoint
 
-Use the same [checkpoint conversion](mtp.md#checkpoint-conversion) as the eight-device MTP path. Set `--block-size 32` for DSpark. The CLI validates the topology and caps `--max-num-seqs` at 64 requests per TP group (256 on 16 devices, 128 on eight). `--max-model-len` cannot exceed 1,048,576 or the checkpoint's `max_position_embeddings`. DSpark currently supports greedy sampling only, so use `temperature: 0`.
+Use the same [checkpoint conversion](mtp.md#checkpoint-conversion) as the eight-device MTP path. Set `--block-size 32` for DSpark. The CLI validates the topology and caps `--max-num-seqs` at 16 times the device count (256 on 16 devices, 128 on eight). `--max-model-len` cannot exceed 1,048,576 or the checkpoint's `max_position_embeddings`. DSpark currently supports greedy sampling only, so use `temperature: 0`.
+
+Serving configures Lib's Decode group batch before importing kernels: B=16 at
+TP1 and B=64 at TP4, with S=8 in both cases. Decode, drafter, bootstrap and
+LM-head share a 128-token owner capacity; independent LM-head TP shards the
+vocabulary and does not divide that capacity again.
 
 ## Start the Server
 

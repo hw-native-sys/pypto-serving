@@ -43,11 +43,11 @@ def _fused_runner(tp):
               **{name: runner._decode_state_table_depth(name) for name in
                  ("hca_state", "csa_state", "csa_inner_state")}}
     for _ in range(2):
-        buffers = {f"group_{field}_block_tables": torch.empty((16, 64, depths[name]), dtype=torch.int32)
+        buffers = {f"group_{field}_block_tables": torch.empty((16, layout.decode_batch, depths[name]), dtype=torch.int32)
                    for name, field in _FIELDS.items()}
         buffers.update({name: torch.empty((16, rows), dtype=torch.int32) for name, rows in (
             ("state_slot_ids", layout.decode_local_batch), ("state_generations", layout.decode_local_batch),
-            ("group_state_slot_ids", 64), ("group_state_generations", 64))})
+            ("group_state_slot_ids", layout.decode_batch), ("group_state_generations", layout.decode_batch))})
         runner._dspark_state_buffers.append(SimpleNamespace(**buffers))
     runner._fused_drafter_block_tables = [{4: torch.empty((16, 3, 4, mod.DSPARK_DRAFTER_TABLE_BLOCKS),
                                                        dtype=torch.int32)} for _ in range(2)]
@@ -70,7 +70,7 @@ def _check_full_reference(runner, plan):
         for name, field in _FIELDS.items():
             tables = getattr(plan, f"group_{field}_block_tables")
             depth = tables.shape[-1]
-            expected = np.full((64, depth), -1, dtype=np.int32)
+            expected = np.full((layout.decode_batch, depth), -1, dtype=np.int32)
             for row, index in enumerate(group_plan.request_indices):
                 ids = (scratch[name][row],) if index is None else plan.request_blocks[index][name]
                 if name not in _OWNER:
