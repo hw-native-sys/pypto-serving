@@ -229,6 +229,17 @@ jobs:
             exit 1
           fi
 
+      - name: Resolve duplicated CANN root for this job
+        # Remove after the A5 runner CANN_ROOT values are repaired.
+        run: |
+          root="${CANN_ROOT:-}"
+          parent="${root%/*}"
+          if [ ! -d "$root" ] && [ -n "$parent" ] && \
+             [ "${root##*/}" = "${parent##*/}" ] && [ -f "$parent/set_env.sh" ]; then
+            printf 'Using installed CANN root for this job: %s\n' "$parent"
+            printf 'CANN_ROOT=%s\n' "$parent" >> "$GITHUB_ENV"
+          fi
+
       - name: Setup CI job
         uses: ./.github/actions/setup-ci-job
         with:
