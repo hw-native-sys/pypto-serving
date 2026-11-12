@@ -20,6 +20,7 @@ import time
 from typing import Protocol
 
 from .pool import Extents
+from .pool import host_views
 
 BATCH_BYTES = 256 << 20
 BATCH_SPANS = 32768
@@ -101,11 +102,13 @@ class Job:
     enqueued: int
     group: str
     request: str | None
+    work: bool = False
 
 
 class SimplerBackend:
-    def __init__(self, owners, geometry, capacity, *, trace=None):
+    def __init__(self, owners, geometry, capacity, *, pool=None, trace=None):
         self.owners, self.geometry = owners, geometry
+        self.pool = pool
         self.tp = geometry["tp"]
         minimum = max(self.footprint((name, 0, 0)) for name in geometry["groups"])
         if capacity < minimum:
@@ -115,6 +118,7 @@ class SimplerBackend:
         self.completed = {operation: SimpleQueue() for operation in ("store", "load")}
         self.notify = None
         self.records = {}
+        self.work = {}
         self.lock = threading.RLock()
         self.wake = threading.Event()
         self.closing = False
@@ -181,7 +185,7 @@ class SimplerBackend:
             future = Future()
             job = Job(future, operation, handle, spans, storage, time.monotonic_ns(), source[0], request)
             storage.active += 1
-            self.queue.put_nowait(job)
+            self.queue.put_nowait((job,))
             self.wake.set()
             return future
 
@@ -190,6 +194,51 @@ class SimplerBackend:
 
     def load(self, handle, destination, *, request=None):
         return self._submit("load", handle, destination, request=request)
+
+    def host_ranges(self, handle, *, writable=False):
+        with self.lock:
+            storage = self.records[handle]
+            if storage.uncertain or (not writable and not storage.complete):
+                raise RuntimeError("DDR range has no confirmed contents")
+            return host_views(self.pool, storage.extents, writable=writable)
+
+    def host_ready(self, handle):
+        with self.lock:
+            storage = self.records[handle]
+            if storage.active or storage.complete or storage.uncertain:
+                raise RuntimeError("DDR host initialization identity mismatch")
+            storage.complete = True
+
+    def discard_host(self, handle):
+        with self.lock:
+            storage = self.records[handle]
+            if storage.active or storage.uncertain:
+                raise RuntimeError("cannot discard a Host range used by native work")
+            self.extents.release(handle)
+            del self.records[handle]
+
+    def load_host_batch(self, pages):
+        """Submit preauthorized, initialized work ranges through the existing copy queue."""
+        jobs = []
+        handles = set()
+        with self.lock:
+            if self.closing:
+                raise RuntimeError("cache backend is closing")
+            for handle, destination, extents, request in pages:
+                if handle in self.work or handle in handles:
+                    raise ValueError("work handle is already in flight")
+                handles.add(handle)
+                ranks, spans, size = self.plan(destination)
+                if len(extents) != len(ranks) or any(length < size for _, length in extents):
+                    raise ValueError("work range does not match native geometry")
+                storage = Storage(ranks, size, extents, active=1, complete=True)
+                jobs.append(Job(Future(), "load", handle, spans, storage, time.monotonic_ns(),
+                                destination[0], request, work=True))
+            for job in jobs:
+                self.work[job.handle] = job.storage
+            self.queue.put_nowait(tuple(jobs))
+        self.wake.set()
+        return tuple(job.future for job in jobs)
 
     def release(self, handle):
         future = Future()
@@ -217,6 +266,8 @@ class SimplerBackend:
                 with self.lock:
                     job.storage.active -= 1
                     job.storage.complete = True
+                    if self.work.get(job.handle) is job.storage:
+                        del self.work[job.handle]
                 job.future.set_result(dict(bytes=self.tp * job.storage.size,
                                            stopped=True, native_completed=True))
             logger.debug("kv_offload_batch direction=%s pages=%d owners=%d bytes=%d rpc_ms=%.3f",
@@ -236,10 +287,12 @@ class SimplerBackend:
             return
         finally:
             # One notification per batch, after every TP owner has returned.
-            self.completed[jobs[0].operation].put(tuple(job.handle for job in jobs))
-            notify = self.notify
-            if notify is not None:
-                notify()
+            handles = tuple(job.handle for job in jobs if not job.work)
+            if handles:
+                self.completed[jobs[0].operation].put(handles)
+                notify = self.notify
+                if notify is not None:
+                    notify()
         if self.trace is not None:
             try:
                 ended = time.monotonic_ns()
@@ -274,10 +327,11 @@ class SimplerBackend:
                         del active[partition]
                 while True:
                     try:
-                        job = self.queue.get_nowait()
+                        jobs = self.queue.get_nowait()
                     except Empty:
                         break
-                    pending[job.storage.ranks[0] // self.tp][job.operation].append(job)
+                    for job in jobs:
+                        pending[job.storage.ranks[0] // self.tp][job.operation].append(job)
                 for partition, waiting in enumerate(pending):
                     if partition in active or not any(waiting.values()):
                         continue
@@ -296,6 +350,8 @@ class SimplerBackend:
                         if not job.future.set_running_or_notify_cancel():
                             with self.lock:
                                 job.storage.active -= 1
+                                if self.work.get(job.handle) is job.storage:
+                                    del self.work[job.handle]
                                 if job.operation == "store":
                                     self.extents.release(job.handle)
                                     del self.records[job.handle]
@@ -316,7 +372,8 @@ class SimplerBackend:
                     previous_direction[partition] = direction
                 if self.closing and not active and self.queue.empty() and all(not any(q.values()) for q in pending):
                     try:
-                        if any(storage.active or storage.uncertain for storage in self.records.values()):
+                        if any(storage.active or storage.uncertain
+                               for storage in (*self.records.values(), *self.work.values())):
                             raise RuntimeError("cache owner work is still uncertain")
                         calls = [executor.submit(owner.call, "stop") for owner in self.owners]
                         for call in calls:

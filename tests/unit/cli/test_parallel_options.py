@@ -19,6 +19,14 @@ def _parse_cli_args(argv: list[str]):
     return cli.build_parser().parse_args(argv)
 
 
+@pytest.mark.parametrize("capacity", [0, 1000000000])
+def test_ssd_options_reach_runtime_without_initializing_storage(tmp_path, capacity):
+    args = _parse_cli_args(["--model", str(tmp_path), "--kv-offload-bytes", "200000000000",
+                           "--kv-ssd-bytes", str(capacity), "--kv-ssd-path", str(tmp_path)])
+    runtime = cli.build_serving_engine_config(args).runtime_config
+    assert runtime.kv_ssd_bytes == capacity and runtime.kv_ssd_path == str(tmp_path)
+
+
 @pytest.mark.parametrize(("role", "specified", "expected"), [
     (None, None, 16), ("prefill", None, 16), ("decode", None, 72),
     (None, 32, 32), ("prefill", 8, 8), ("decode", 16, 16),

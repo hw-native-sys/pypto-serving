@@ -134,3 +134,29 @@ their sum, for aggregate active-window bandwidth. Native submission can overlap
 DMA, so the final completion wait is not the entire copy time. Monotonic clocks
 are local to a host. Decode dispatch-to-reclaim spans can show Host-step envelope
 overlap, but do not establish overlap with actual device kernels.
+
+## Optional SSD cache
+
+An optional local SSD tier retains the same reusable contents as DDR. Enable it
+per model process with an existing directory:
+
+```bash
+--enable-prefix-caching --kv-offload-bytes 200000000000 \
+--kv-ssd-bytes 1000000000 --kv-ssd-path /data/cache
+```
+
+SSD defaults to zero capacity and creates no SSD threads, files or work windows
+when disabled. A positive capacity requires DDR offload and prefix caching.
+Both budgets include alignment and TP replicas across the entire instance.
+Bounded SSD work windows are reserved inside the DDR budget.
+
+Only contents eligible for DDR enter SSD. Reads reuse HBM and DDR first, reading
+only missing members from SSD. File I/O runs in background threads; owner-local
+H2D uses the existing compact copy queue. DDR promotion runs separately and does
+not delay an otherwise completed HBM restore. Read references protect file slots
+and DDR ranges until their users finish. LRU reclaims eligible SSD contents.
+
+The directory must support direct I/O, preallocation and hole punching. Each
+process owns a private file namespace, removed after its I/O drains. Contents are
+volatile; there is no index recovery after restart. This implementation has Host
+and CPU-stub qualification; model/device qualification remains pending.

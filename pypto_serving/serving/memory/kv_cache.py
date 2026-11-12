@@ -35,6 +35,10 @@ class KVCacheCapacityError(RuntimeError):
     """Raised when a cache allocation cannot fit in the physical pools."""
 
 
+class KVCacheRestoreError(RuntimeError):
+    """A stopped external read failed; the request may fail without poisoning the owner."""
+
+
 def hash_block_tokens(parent_hash: bytes, token_ids: tuple[int, ...]) -> bytes:
     """Return a stable chained digest suitable for cross-process identity."""
     digest = hashlib.sha256()

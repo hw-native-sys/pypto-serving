@@ -85,10 +85,18 @@ class Session:
                 or set(geometry["groups"]) != set(manager.group_names)):
             raise RuntimeError("offload worker/cache-manager geometry mismatch")
         self.trace = OffloadTrace.from_env()
-        backend = SimplerBackend(self.owners, geometry, self.pool.nbytes, trace=self.trace)
+        self.trace = OffloadTrace.from_env()
+        backend = SimplerBackend(self.owners, geometry, self.pool.nbytes, pool=self.pool, trace=self.trace)
         self._loop = asyncio.get_running_loop()
         self.cache = TieredCache(manager, backend, self.pool.nbytes, trace=self.trace, notify=self._notify)
         backend.set_notify(self._notify)
+        runtime = self.core.config.runtime_config
+        if runtime.kv_ssd_bytes:
+            from .archive import SSDArchive
+            self.cache.archive = await asyncio.to_thread(
+                SSDArchive, self.cache.tier, self.pool, runtime.kv_ssd_path, runtime.kv_ssd_bytes)
+            logger.info("kv_ssd_ready capacity_bytes=%d work_bytes=%d window_bytes=%d",
+                        runtime.kv_ssd_bytes, self.cache.archive.work_bytes, self.cache.archive.window_bytes)
         manager.tiering = self.cache
         if self.trace is not None:
             self.trace.emit("ready", capacity_bytes=self.pool.nbytes, ranks=geometry["ranks"],
@@ -147,6 +155,9 @@ class Session:
             while not self.cache.close_ready():
                 tier = self.cache.tier
                 progress = tier.used, len(tier.inflight), len(tier.retiring), len(self.cache.loads)
+                if self.cache.archive is not None:
+                    archive = self.cache.archive
+                    progress += (len(archive.writers), archive.running, *archive.files.counters.values())
                 now = time.monotonic()
                 if progress != previous:
                     previous, deadline = progress, now + 120
@@ -156,7 +167,7 @@ class Session:
             drained = True
         finally:
             try:
-                await asyncio.to_thread(self.cache.backend.close)
+                await asyncio.to_thread(self.cache.close_storage if drained else self.cache.backend.close)
             except BaseException as error:
                 if drained:
                     self.cache.tier.error = error

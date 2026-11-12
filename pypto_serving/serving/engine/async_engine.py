@@ -261,6 +261,10 @@ class ReplicaEngineCore:
         self._cache_tiering = None
         if runtime.kv_offload_bytes < 0:
             raise ValueError("DDR offload capacity must not be negative")
+        if runtime.kv_ssd_bytes < 0 or (runtime.kv_ssd_bytes and not runtime.kv_offload_bytes):
+            raise ValueError("SSD caching requires a nonnegative budget and enabled DDR offload")
+        if runtime.kv_ssd_bytes and not runtime.kv_ssd_path:
+            raise ValueError("SSD caching requires --kv-ssd-path")
         if runtime.kv_offload_bytes:
             from pypto_serving.serving.memory.tiering.integration import Session
             self._cache_tiering = Session(self)
@@ -863,7 +867,7 @@ class ReplicaEngineCore:
             logger.warning("request %s rejected during scheduling: %s", request_id, reason)
             ctx = self._request_contexts.get(request_id)
             if ctx is not None:
-                ctx.queue.put_nowait(ValueError(reason))
+                ctx.queue.put_nowait(reason if isinstance(reason, Exception) else ValueError(reason))
             if request_id in self._worker_known_req_ids:
                 self._schedule_worker_free(request_id)
         self._record_scheduler_stats(scheduler_output)
