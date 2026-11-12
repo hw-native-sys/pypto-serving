@@ -598,6 +598,7 @@ def load_composite_bindings(
     *,
     dp_size=None,
     dspark_lowering_provider=None,
+    request_slots=1,
 ) -> CompositeBindings:
     """Resolve the model-specific contract without opening a device."""
     if model_dir is None or max_seq_len is None:
@@ -608,6 +609,7 @@ def load_composite_bindings(
         tokenizer=tokenizer,
         dp_size=dp_size,
         dspark_lowering_provider=dspark_lowering_provider,
+        request_slots=request_slots,
     )
 
 
@@ -729,7 +731,7 @@ def lookup_token_embeddings(
 
 # metadata
 _MAX_REQUESTS_PER_DP = 12
-_MAX_PREFILL_TOKENS_PER_DP = 4096
+MAX_PREFILL_TOKENS_PER_DP = 4096
 
 
 def _validate_dp_capacity(partitions, token_counts, *, phase, dp_size):
@@ -741,8 +743,8 @@ def _validate_dp_capacity(partitions, token_counts, *, phase, dp_size):
         requests[partition] += 1
         tokens[partition] += count
     if any(count > _MAX_REQUESTS_PER_DP for count in requests):
-        raise ValueError("V4.1 lib supports at most 32 requests per DP partition")
-    if phase == "prefill" and any(count > _MAX_PREFILL_TOKENS_PER_DP for count in tokens):
+        raise ValueError("V4.1 lib supports at most 12 requests per DP partition")
+    if phase == "prefill" and any(count > MAX_PREFILL_TOKENS_PER_DP for count in tokens):
         raise ValueError("V4.1 lib supports at most 4096 prefill tokens per DP partition")
 
 
@@ -892,6 +894,15 @@ class SegmentTopology:
     tp: int = 1
     dp: int = 8
     local_capacity: int = 16
+
+    @classmethod
+    def for_prefill(cls, *, dp: int, max_tokens: int):
+        """Keep prefill rows independent of the fixed decode ABI."""
+        if type(max_tokens) is not int or not 0 < max_tokens <= MAX_PREFILL_TOKENS_PER_DP:
+            raise ValueError("V4.1 prefill capacity must be between 1 and 4096 tokens")
+        # Shared MoE kernels retain decode's extent even for a smaller token budget.
+        return cls(tp=1, dp=dp, local_capacity=max(
+            cls.for_decode(dp=dp).local_capacity, (max_tokens + 15) // 16 * 16))
 
     @classmethod
     def for_decode(cls, *, tp: int = 1, dp: int = 8):
@@ -1219,8 +1230,11 @@ class DecodeForwardSegment:
             raise RuntimeError("full decode failed; close the worker before retrying")
         if state.layout != "tp_local_token":
             raise ValueError("full decode requires TP-local state")
-        if len(group_counts) != self.topology.dp or len(set(group_counts)) != 1 or group_counts[0] <= 0:
-            raise ValueError("full decode requires equal nonempty token rows on all DP ranks")
+        if (len(group_counts) != self.topology.dp or
+                any(count <= 0 or count > self.topology.capacity for count in group_counts)):
+            raise ValueError("full decode requires nonempty token rows within capacity on all DP ranks")
+        if not self.counts_are_tensor and len(set(group_counts)) != 1:
+            raise ValueError("scalar-count full decode requires equal token rows on all DP ranks")
         bound = dict(self.arguments, x_hc=state.residual, pre_mix=state.pre_mix)
         if not self.counts_are_tensor:
             bound["attention_num_tokens"] = ctypes.c_int32(group_counts[0])
@@ -1306,9 +1320,10 @@ class V41ModelRunner:
     def _request_ledger(self):
         self.preflight()
         if self.ledger is None:
-            self.ledger = RequestLedger(max_requests=self.runtime.max_batch_size,
-                                        max_seq_len=self.runtime.max_seq_len,
-                                        partitions=self.plan.placement.dp_size)
+            self.ledger = RequestLedger(
+                max_requests=self.bindings.cache_groups[0].max_requests_per_partition,
+                max_seq_len=self.runtime.max_seq_len,
+                partitions=self.plan.placement.dp_size)
         if getattr(self.resources, "dspark", None) is not None:
             self.resources.ledger = self.ledger
         return self.ledger
@@ -1527,16 +1542,20 @@ class V41ModelRunner:
 
 def compile_prefill_fwd(compiler, lib_root, topology):
     """Compile the lib's complete CED prefill at the serving row capacity."""
-    load_segment_modules(lib_root, topology)
+    decode_topology = SegmentTopology.for_decode(tp=topology.tp, dp=topology.dp)
+    load_segment_modules(lib_root, decode_topology)
     previous_argv = sys.argv[:]
     try:
         sys.argv = [previous_argv[0], "--tp", str(topology.tp), "--ep", str(topology.world),
-                    "--dp", str(topology.dp), "--capacity", str(topology.local_capacity)]
+                    "--dp", str(topology.dp), "--capacity", str(topology.local_capacity),
+                    "--moe-tokens", str(decode_topology.local_capacity)]
         module = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd")
     finally:
         sys.argv = previous_argv
     if (module.CAPACITY, module.RANKS) != (topology.local_capacity, topology.world):
         raise ValueError("lib prefill_fwd was imported for another capacity or EP topology")
+    if module.MOE_TOKENS != decode_topology.local_capacity:
+        raise ValueError("lib prefill MoE extent disagrees with the shared decode kernels")
     entry = module.l3_prefill_fwd
     return compiler.compile("v41_prefill_fwd", entry), tuple(entry.param_names)
 
@@ -1558,7 +1577,7 @@ def prepare_segment_inputs(
     step: ForwardStep,
     topology: SegmentTopology,
     *,
-    max_prepare_bytes: int = 1 << 30,
+    max_prepare_bytes: int = 4 << 30,
 ) -> SegmentInputs:
     """Pack fresh embedding inputs without depending on request batch order.
 
@@ -1677,7 +1696,8 @@ class HostEngramResources:
         self.host.release_request(request_id)
 
     def stage_lookup(self, target, step, topology, *, row_stride=None):
-        if tuple(target.shape[1:]) != tuple(self.lookup.shape[1:]):
+        if (target.shape[1] != self.lookup.shape[1] or target.shape[3] != self.lookup.shape[3]
+                or target.shape[2] > self.lookup.shape[2]):
             raise ValueError("Engram lookup capacity disagrees with the forward ABI")
         target.zero_()
         offsets = [0] * topology.dp
@@ -2067,8 +2087,9 @@ class PrefillMetadataResources:
         return result_cos, result_sin
 
     def stage(self, step, engram=None):
+        # DP8 at the maximum 4096-row capacity needs 33 MiB of SWA scratch.
         swa = prepare_swa_window_metadata(
-            step, self.topology, cache_pages=self.window_pages)
+            step, self.topology, cache_pages=self.window_pages, max_prepare_bytes=64 << 20)
         self.fields["window_slots"].copy_(swa.window_slots)
         self.fields["window_indices"].copy_(swa.window_indices)
         cos, sin = gather_swa_rope_rows(
@@ -2691,7 +2712,7 @@ class V41ResidentResources:
         self._decode_binding = None
         self._weight_bank = weight_bank
         self._weight_param_names = tuple(weight_param_names)
-        self._prefill_binding = (prefill_program, prefill_param_names, run_config, topology)
+        self._prefill_binding = (prefill_program, prefill_param_names, run_config, prefill_host.topology)
         self.dspark_programs = dict(dspark_programs or {})
         self.dspark_param_names = dict(dspark_param_names or {})
         if self.dspark_programs:
@@ -3569,6 +3590,17 @@ def _check_runtime_binaries(platform):
         builder.get_binaries(runtime)
 
 
+def prefill_ring_heap(capacity):
+    """Redistribute the existing 10 GiB budget for complete long prefills.
+
+    A 4K attention scope exhausts ring 1 at 2 GiB. The worker reserves two
+    resource sets, so growing their total footprint crowds out DP4 weights.
+    Move space from the deepest ring while keeping the total budget fixed.
+    """
+    attention_heap = max(2 << 30, capacity * (1 << 20))
+    return (2 << 30, attention_heap, 2 << 30, (6 << 30) - attention_heap)
+
+
 def make_production_bindings(
     model_dir,
     max_seq_len,
@@ -3576,6 +3608,7 @@ def make_production_bindings(
     tokenizer=None,
     dp_size=None,
     dspark_lowering_provider=None,
+    request_slots=1,
 ):
     model_dir = Path(model_dir).resolve()
     raw = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
@@ -3584,7 +3617,7 @@ def make_production_bindings(
                if dp_size is None else dp_size)
     if dp_size not in (4, 8):
         raise ValueError("PYPTO_DSV41_DP_SIZE must be 4 or 8")
-    groups = build_cache_groups(layers, max_seq_len, dp_size=dp_size)
+    groups = build_cache_groups(layers, max_seq_len, dp_size=dp_size, request_slots=request_slots)
     root = _lib_root()
     revision = _revision(root)
     topology = selected_decode_topology(root, dp_size=dp_size)
@@ -3613,16 +3646,21 @@ def make_production_bindings(
             # large three-layer draft bank is intentionally packed lazily by
             # the stage-argument provider and is never materialized here.
             dspark_weight_contract.validate_index()
+        prefill_topology = SegmentTopology.for_prefill(
+            dp=topology.dp, max_tokens=min(runtime.max_num_batched_tokens, MAX_PREFILL_TOKENS_PER_DP))
         run_config = replace(
             build_pypto_run_config(
                 platform=options.platform,
                 device_ids=device_ids,
                 pypto_build_dir=options.pypto_build_dir,
             ),
-            ring_heap=2 * 1024 * 1024 * 1024,
+            ring_heap=(runtime.ring_heap if runtime.ring_heap is not None
+                       else prefill_ring_heap(prefill_topology.capacity)),
+            # DP4's 8K prefill can exhaust ring 2's default dependency pool.
+            ring_dep_pool=((16384, 16384, 32764, 16384)
+                           if topology.dp == 4 else None),
         )
         compiler = KernelCompiler(run_config=run_config)
-        prefill, prefill_names = compile_prefill_fwd(compiler, root, topology)
         decode, decode_names, decode_counts_are_tensor = compile_decode_fwd(
             compiler, root, topology)
         if runtime.num_speculative_tokens:
@@ -3630,6 +3668,7 @@ def make_production_bindings(
                 compiler, root, topology)
         else:
             dspark_programs, dspark_param_names = {}, {}
+        prefill, prefill_names = compile_prefill_fwd(compiler, root, prefill_topology)
         abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
         kv_sources, index_sources, c2a_sources = _sources(layers)
         layout = DecodeWeightLayout.from_lib(abi, tp_size=topology.tp)
@@ -3678,8 +3717,8 @@ def make_production_bindings(
         compressed_tables = rope.precompute_rope_tables(max_seq_len, True)
         cache_plan = plan_decode_cache_pools(
             layers, groups, max_seq_len=max_seq_len,
-            primary_num_blocks=groups[0].max_blocks_per_seq,
-            request_slots=1, abi=abi,
+            primary_num_blocks=groups[0].max_blocks_per_seq * request_slots,
+            request_slots=request_slots, abi=abi,
         )
         if (runtime.total_kv_pages is not None and
                 runtime.total_kv_pages < cache_plan.primary_num_blocks):
@@ -3699,11 +3738,11 @@ def make_production_bindings(
             dspark_hidden_size=getattr(abi, "DSPARK_MAIN_IN", None),
         )
         decode_host = PrefillMetadataResources(topology, **host_kwargs)
-        input_host = make_input_host_resources(topology, plan.weights.config.hidden_size)
+        input_host = make_input_host_resources(prefill_topology, plan.weights.config.hidden_size)
         decode_input_host = make_input_host_resources(topology, plan.weights.config.hidden_size)
         final_host = load_final_output_host_resources(model_dir, topology)
         prefill_host = PrefillMetadataResources(
-            topology, **host_kwargs, full_hidden_size=plan.weights.config.hidden_size)
+            prefill_topology, **host_kwargs, full_hidden_size=plan.weights.config.hidden_size)
         engram_host = None
         if "engram_lookup" in set(decode_names) | set(prefill_names):
             tokenizer_adapter = tokenizer
@@ -3714,7 +3753,7 @@ def make_production_bindings(
             tokenizer_impl = getattr(tokenizer_adapter, "tokenizer", tokenizer_adapter)
             tokenizer_impl = getattr(tokenizer_impl, "_tokenizer", tokenizer_impl)
             engram_host = HostEngramResources(
-                model_dir, topology, tokenizer_impl, capacity=topology.capacity)
+                model_dir, topology, tokenizer_impl, capacity=max(prefill_topology.capacity, topology.capacity))
         dspark_host = None
         if runtime.num_speculative_tokens:
             from .dspark_resources import DSparkResourceLayout, allocate_dspark_host_resources

@@ -32,9 +32,9 @@ from pypto_serving.model.model_loader import SafetensorsDirectoryLoader, _build_
 from pypto_serving.model.tokenizer import load_tokenizer
 
 from .npu_runner import (
+    MAX_PREFILL_TOKENS_PER_DP,
     BuildOptions,
     MissingCompositeInterface,
-    SegmentTopology,
     V41ModelRunner,
     load_composite_bindings,
 )
@@ -109,10 +109,11 @@ class DeepSeekV41DirectoryLoader(SafetensorsDirectoryLoader):
                 runtime,
                 kv_cache_groups=build_cache_groups(
                     layers, runtime.max_seq_len, dp_size=dp_size,
+                    request_slots=(runtime.max_batch_size + dp_size - 1) // dp_size,
                 ),
             )
         if len(layers) == 40:
-            capacity = SegmentTopology.for_decode().capacity
+            capacity = MAX_PREFILL_TOKENS_PER_DP
             runtime = replace(
                 runtime,
                 max_num_batched_tokens=min(runtime.max_num_batched_tokens, capacity),
@@ -162,11 +163,17 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         if model_id in self.runners:
             raise ValueError("model already registered")
         dp_size = (record.runtime.kv_cache_groups[0].num_partitions
-                   if record.runtime.kv_cache_groups else None)
+                   if record.runtime.kv_cache_groups else len(self.device_ids))
+        request_slots = (record.runtime.kv_cache_groups[0].max_requests_per_partition
+                         if record.runtime.kv_cache_groups else
+                         (record.runtime.max_batch_size + dp_size - 1) // dp_size)
+        if request_slots * dp_size < record.runtime.max_batch_size:
+            raise ValueError("V4.1 cache request slots cannot cover max_batch_size")
         bindings = self.bindings or load_composite_bindings(
             record.runtime_model.extra["model_dir"], record.runtime.max_seq_len,
             tokenizer=record.tokenizer, dp_size=dp_size,
-            dspark_lowering_provider=self.dspark_lowering_provider)
+            dspark_lowering_provider=self.dspark_lowering_provider,
+            request_slots=request_slots)
         if not bindings.cache_groups:
             raise MissingCompositeInterface("V4.1 requires explicit grouped cache layouts and capacities")
         if record.runtime.kv_cache_groups != bindings.cache_groups:
