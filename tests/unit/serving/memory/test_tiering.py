@@ -178,6 +178,47 @@ def test_shared_history_bytes_are_not_reclaimed_twice():
     tier.release(reader)
 
 
+def test_pending_checkpoints_complete_out_of_order_without_rescanning_history():
+    tier, released = setup(128)
+    futures = {}
+
+    def store(handle, source):
+        futures[source] = Future()
+        return futures[source]
+
+    tier.backend.store = store
+    for key in range(100):
+        tier.capture(key, key, 1, key)
+    tier.pump()
+    proof = dict(bytes=1, stopped=True, native_completed=True)
+    for key in range(90):
+        futures[key].set_result(proof)
+    tier.pump()
+    tier.publish("long", range(100))
+    tier.publish("short", range(96))
+    tier.publish("long", range(100))  # Re-publication cannot double-count completions.
+
+    class Pages(dict):
+        reads = 0
+
+        def __getitem__(self, key):
+            self.reads += 1
+            return super().__getitem__(key)
+
+    tier.pages = Pages(tier.pages)
+    for key in range(90, 96):
+        futures[key].set_result(proof)
+        tier.pump()
+    assert "short" in tier.units and "long" not in tier.units
+    for key in reversed(range(96, 100)):
+        futures[key].set_result(proof)
+        tier.pump()
+    assert set(tier.units) == {"short", "long"}
+    assert not tier.pending_units and not tier.pending_by_page
+    assert sorted(released) == list(range(100))
+    assert tier.pages.reads <= 2 * 100  # Visit members at publication, not at every completion.
+
+
 def test_incomplete_checkpoint_does_not_deadlock_a_smaller_ddr_pool():
     tier, released = setup(2)
     for key in ("history", "state"):

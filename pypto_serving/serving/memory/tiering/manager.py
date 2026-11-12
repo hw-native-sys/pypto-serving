@@ -16,6 +16,12 @@ import time
 from .policy import LRU
 
 
+@dataclass
+class PendingUnit:
+    keys: tuple
+    remaining: int
+
+
 @dataclass(eq=False)
 class Page:
     key: tuple
@@ -72,15 +78,16 @@ class CacheTier:
         keys = tuple(dict.fromkeys(keys))
         if not keys or any(key not in self.pages for key in keys):
             return
-        if not all(self.pages[key].ready for key in keys):
-            self.pending_units[identity] = keys
+        remaining = sum(not self.pages[key].ready for key in keys)
+        if remaining:
+            self.pending_units[identity] = PendingUnit(keys, remaining)
             for key in keys:
                 self.pending_by_page.setdefault(key, set()).add(identity)
             return
         self._publish_ready(identity, keys)
 
     def _forget_pending(self, identity):
-        for key in self.pending_units.pop(identity):
+        for key in self.pending_units.pop(identity).keys:
             awaiting = self.pending_by_page[key]
             awaiting.remove(identity)
             if not awaiting:
@@ -195,9 +202,10 @@ class CacheTier:
                 if not page.units:
                     self.policy.on_publish(("page", page.handle), self.clock())
                 for identity in tuple(self.pending_by_page.get(page.key, ())):
-                    keys = self.pending_units[identity]
-                    if all(self.pages[key].ready for key in keys):
-                        self._publish_ready(identity, keys)
+                    pending = self.pending_units[identity]
+                    pending.remaining -= 1
+                    if pending.remaining == 0:
+                        self._publish_ready(identity, pending.keys)
             self._reap_retired()
             while self.queued and not self.closing:
                 page = self.queued[0]
