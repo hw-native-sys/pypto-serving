@@ -16,6 +16,7 @@ dependencies = []
 
 [project.optional-dependencies]
 pd = ["fastapi", "httpx", "msgspec>=0.19", "uvicorn"]
+vision = ["Pillow>=10"]
 
 [project.urls]
 Repository = "https://github.com/hw-native-sys/pypto-serving"

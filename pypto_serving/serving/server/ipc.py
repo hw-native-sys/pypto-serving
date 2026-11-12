@@ -62,6 +62,7 @@ class NewRequestData(msgspec.Struct):
     initialize_from_cache: bool = False
     # Tokens committed before this worker request was registered (PD adoption).
     initial_output_token_ids: tuple[int, ...] = ()
+    multimodal_inputs: list[dict[str, Any]] = msgspec.field(default_factory=list)
 
 
 class PrefillRequest(msgspec.Struct):

@@ -20,6 +20,16 @@ from pypto_serving.model.model_family import detect_model_family, read_model_con
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class MultimodalPrompt:
+    """Expanded prompt IDs and request-owned image records for worker registration."""
+
+    text: str
+    token_ids: tuple[int, ...]
+    images: tuple[dict, ...]
+    cache_salt: bytes
+
+
 class TokenizerAdapter:
     """Minimal tokenizer interface required by the generation engine."""
 
@@ -220,11 +230,12 @@ def load_tokenizer(model_dir: str | Path, *, trust_remote_code: bool = False) ->
     else:
         adapter_cls = TransformersTokenizerAdapter
     if (model_path / "tokenizer.json").exists():
-        return adapter_cls.from_tokenizer_file(str(model_path))
-    return adapter_cls.from_pretrained(
-        str(model_path),
-        trust_remote_code=trust_remote_code,
-    )
+        adapter = adapter_cls.from_tokenizer_file(str(model_path))
+    else:
+        adapter = adapter_cls.from_pretrained(str(model_path), trust_remote_code=trust_remote_code)
+    if family == "deepseek_v41":
+        adapter.model_config = model_config
+    return adapter
 
 def _token_content(value: object) -> str | None:
     """Extract a special token string from tokenizer_config JSON."""
