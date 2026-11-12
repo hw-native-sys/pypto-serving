@@ -112,6 +112,14 @@ jobs:
             tests/unit/model/common/test_kernel_compiler_codegen.py \
             tests/unit/model/qwen/test_npu_executor.py
 
+      - name: Run Serving scheduler and worker CPU guards
+        env:
+          TORCH_DEVICE_BACKEND_AUTOLOAD: '0'
+        run: |
+          source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
+          cd "$GITHUB_WORKSPACE/dist-checkout"
+          python -m pytest tests/unit/serving -q
+
       - name: Run Qwen3 accuracy guard
         env:
           PYTHONPATH: ${{ github.workspace }}/dist-checkout

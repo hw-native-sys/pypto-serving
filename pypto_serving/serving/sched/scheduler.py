@@ -441,7 +441,7 @@ class Scheduler:
         scheduled_req_ids: set[str] = set()
         num_scheduled_tokens: dict[str, int] = {}
         running_to_keep: list[Request] = []
-        stalled_non_recomputable: list[Request] = []
+        stalled_non_recomputable: list[tuple[Request, str]] = []
         for request in self.running:
             # A request later in this snapshot may have been preempted while
             # scheduling an earlier request. Do not schedule it again from the
@@ -492,8 +492,9 @@ class Scheduler:
                     request, scheduled_req_ids, num_scheduled_tokens, output
                 )
                 if preempted is None:
-                    if request.constraint_spec is not None or request.cache_reservation_id:
-                        stalled_non_recomputable.append(request)
+                    reason = self._recompute_rejection(request)
+                    if reason is not None:
+                        stalled_non_recomputable.append((request, reason))
                     running_to_keep.append(request)
                     continue
                 token_budget += preempted.get("returned_tokens", 0)
@@ -544,11 +545,9 @@ class Scheduler:
             )
         ):
             # No running request can free a block or produce an in-flight result.
-            # Neither a constrained matcher nor an external Prefill can be
-            # reconstructed by local recompute. Reject rather than spin forever.
-            victim = stalled_non_recomputable[-1]
-            reason = ("external Prefill cannot be recomputed locally" if victim.cache_reservation_id
-                      else "constrained recompute preemption is not supported")
+            # Requests whose state or complete context cannot be reconstructed
+            # by local recompute must be rejected rather than spin forever.
+            victim, reason = stalled_non_recomputable[-1]
             self.abort_request(victim.request_id)
             output.rejected_requests[victim.request_id] = (
                 f"Request {victim.request_id} cannot allocate KV blocks; {reason}"
@@ -762,6 +761,21 @@ class Scheduler:
             f"the single-dispatch limit is {single_dispatch_limit}. Disable speculative "
             "decoding or shorten the uncached prompt suffix."
         )
+
+    def _recompute_rejection(self, request: Request) -> str | None:
+        """Return why the committed context cannot be recovered by cold prefill."""
+        if request.constraint_spec is not None:
+            return "constrained recompute preemption is not supported"
+        if request.cache_reservation_id:
+            return "external Prefill cannot be recomputed locally"
+        if self._requires_single_prefill_dispatch():
+            # Prefix entries can be evicted before recovery. Include every
+            # committed output token and do not rely on the current cache hit.
+            replay_tokens = request.num_prompt_tokens + len(request.output_token_ids)
+            limit = self._single_prefill_dispatch_limit()
+            if replay_tokens > limit:
+                return f"replay length {replay_tokens} exceeds the single-dispatch prefill limit {limit}"
+        return None
 
     def _limit_scheduled_tokens(
         self,
@@ -1178,14 +1192,12 @@ class Scheduler:
         """
         if not self.running:
             return None
-        # The current worker can reconstruct a grammar only from an intact
-        # request lifetime. Rebuilding KV does not restore the worker's
-        # grammar state, so constrained requests stay out of recompute.
+        # Preserve requests whose state or complete replay cannot be recovered
+        # before releasing any KV pages.
         candidates = [
             r
             for r in self.running
-            if r.request_id != exclude.request_id and r.constraint_spec is None
-            and not r.cache_reservation_id
+            if r.request_id != exclude.request_id and self._recompute_rejection(r) is None
             and not r.prefill_complete and not r.scheduling_held
         ]
         if self.kv_cache_manager.has_groups:

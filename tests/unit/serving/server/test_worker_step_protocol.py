@@ -25,6 +25,8 @@ from pypto_serving.serving.sched.scheduler import (
     Request,
     RequestStatus,
     ScheduledRequest,
+    Scheduler,
+    SchedulerConfig,
     SchedulerOutput,
 )
 from pypto_serving.serving.server import serving_worker
@@ -52,7 +54,9 @@ def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
     request = Request(
         request_id="req",
         prompt_token_ids=[1, 2],
-        max_new_tokens=1,
+        max_new_tokens=4,
+        output_token_ids=[7, 8],
+        num_replay_tokens=2,
         status=RequestStatus.RUNNING,
     )
     scheduled = ScheduledRequest(
@@ -69,11 +73,105 @@ def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
 
     assert [item.request_id for item in decoded.new_requests] == ["req"]
     assert decoded.finished_request_ids == ["req"]
+    assert decoded.new_requests[0].prompt_token_ids == [1, 2, 7, 8]
+    assert decoded.new_requests[0].initial_output_tokens == 2
     assert decoded.prefill_requests[0].block_ids_by_group == {
         "ori": [3, 4],
         "state": [5],
     }
     assert decoded.prefill_requests[0].cache_partition == 2
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_worker_replays_committed_context_without_resampling_intermediate_chunks(async_scheduling):
+    manager = KvCacheManager(num_blocks=8, block_size=1, enable_prefix_cache=False)
+    scheduler = Scheduler(SchedulerConfig(
+        enable_prefix_cache=False, max_num_running_reqs=1,
+        max_num_scheduled_tokens=2, max_prefill_tokens_per_request=2,
+        long_prefill_token_threshold=2, max_seq_len=16,
+        async_scheduling=async_scheduling,
+    ), manager)
+    released = []
+
+    class ReplayExecutor(_ImmediateEosExecutor):
+        def release_finished_requests(self, request_ids):
+            released.extend(request_ids)
+
+    model = _model(max_batch_size=1, page_size=1, eos_token_id=0)
+    executor = ReplayExecutor(manager)
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
+    worker.executor = executor
+    worker.sampler = _FixedSampler(token_id=7)
+    worker.model_record = SimpleNamespace(config=model.config, runtime_model=model)
+    worker._req_cache = {}
+    worker._last_tokens = {}
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._request_contexts = {}
+    core._worker_known_req_ids = set()
+    request = Request("replay", [1, 2], max_new_tokens=2, min_tokens=2, eos_token_id=0)
+    scheduler.add_request(request)
+
+    initial = scheduler.schedule()
+    initial_cmd = core._build_step_command(initial, finished_ids=[])
+    if async_scheduling:
+        scheduler.advance_after_schedule(initial)
+    initial_result = worker._run_step_command(decode_command(encode_command(initial_cmd)), None)
+    assert initial_result.error is None
+    scheduler.update_from_output(initial, initial_result.new_tokens)
+    assert request.output_token_ids == [7]
+
+    if async_scheduling:
+        stale = scheduler.schedule()
+        stale_cmd = core._build_step_command(stale, finished_ids=[])
+        scheduler.advance_after_schedule(stale)
+        worker.sampler.token_id = 8
+        stale_result = worker._run_step_command(stale_cmd, None)
+        assert stale_result.error is None and stale_result.new_tokens == {"replay": [8]}
+        assert worker._stop_token_mask("replay") is None
+    victim = scheduler._preempt_lowest_priority(Request("other", [3], 1), set(), {}, SchedulerOutput())
+    assert victim is not None and victim["request"] is request
+    if async_scheduling:
+        assert scheduler.update_from_output(stale, stale_result.new_tokens) == []
+    assert request.output_token_ids == [7]
+
+    first = scheduler.schedule()
+    first_cmd = core._build_step_command(first, finished_ids=["replay"])
+    if async_scheduling:
+        scheduler.advance_after_schedule(first)
+        terminal = scheduler.schedule()
+        scheduler.advance_after_schedule(terminal)
+    first_result = worker._run_step_command(decode_command(encode_command(first_cmd)), None)
+    assert first_result.error is None and first_result.new_tokens == {}
+    assert released == ["replay"]
+    assert worker._req_cache["replay"].prompt_token_ids == [1, 2, 7]
+    assert worker._accepted_output_lengths["replay"] == 1
+    assert worker._last_tokens == {}
+    assert worker._sampling_params("replay").forbidden_token_ids == (0,)
+    assert worker.sampler.sample_calls == (2 if async_scheduling else 1)
+    assert executor.finalized_prefills == [(["replay"], [7])]
+    assert scheduler.update_from_output(first, first_result.new_tokens) == []
+
+    if not async_scheduling:
+        terminal = scheduler.schedule()
+    terminal_cmd = core._build_step_command(terminal, finished_ids=[])
+    assert not terminal_cmd.new_requests
+    assert terminal_cmd.prefill_requests[0].chunk_tokens == [7]
+    if async_scheduling:
+        assert request.num_output_placeholders == 1
+    worker.sampler.token_id = 9
+    terminal_result = worker._run_step_command(decode_command(encode_command(terminal_cmd)), None)
+    assert terminal_result.error is None and terminal_result.new_tokens == {"replay": [9]}
+    resumed = scheduler.update_from_output(terminal, terminal_result.new_tokens)
+
+    assert [(item.new_token_id, item.finished) for item in resumed] == [(9, True)]
+    assert request.output_token_ids == [7, 9]
+    assert request.num_output_placeholders == 0
+    assert worker._accepted_output_lengths["replay"] == 2
+    assert worker._stop_token_mask("replay") is None
+    assert executor.prefill_batches[-1].stop_token_masks["replay"].remaining_tokens == 1
+    assert executor.finalized_prefills == [(["replay"], [7]), (["replay"], [9])]
 
 
 def test_partitioned_prefill_chunks_keep_cache_partitions_unique():
