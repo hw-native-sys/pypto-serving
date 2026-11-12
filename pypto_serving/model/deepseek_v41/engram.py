@@ -172,20 +172,28 @@ class HostEngram:
     def release_request(self, request_id) -> None:
         self.history.pop(request_id, None)
 
-    def hash_ids(self, token_ids, start_pos: int = 0, *, request_id=0) -> torch.Tensor:
+    def hash_ids(self, token_ids, start_pos: int = 0, *, request_id=0, token_mask=None) -> torch.Tensor:
         ids = torch.as_tensor(token_ids, dtype=torch.int64, device="cpu")
         if ids.ndim != 1 or bool(((ids < 0) | (ids >= self.token_map.numel())).any()):
             raise ValueError("Engram requires a one-dimensional sequence of valid token IDs")
         history = self.history.get(request_id, torch.empty(0, dtype=torch.int64))
         if isinstance(start_pos, bool) or not isinstance(start_pos, int) or not 0 <= start_pos <= history.numel():
             raise ValueError("Engram continuation requires all preceding token history")
-        compressed = torch.cat((history[:start_pos], self.token_map[ids]))
+        current = self.token_map[ids]
+        if token_mask is not None:
+            mask = torch.as_tensor(token_mask, device="cpu")
+            if mask.dtype != torch.bool or mask.shape != ids.shape:
+                raise ValueError("Engram token_mask must be a boolean vector matching token IDs")
+            current = torch.where(mask, current, -1)
+        compressed = torch.cat((history[:start_pos], current))
         positions = torch.arange(start_pos, compressed.numel(), dtype=torch.int64)
         lookback = []
+        blocked = torch.zeros_like(positions, dtype=torch.bool)
         for shift in range(self.layout.max_ngram_size):
             source = (positions - shift).clamp_min(0)
             values = compressed[source]
-            lookback.append(torch.where(positions >= shift, values, self.pad_id))
+            blocked |= (positions < shift) | (values == -1)
+            lookback.append(torch.where(blocked, self.pad_id, values))
         tokens = torch.stack(lookback, dim=-1)
         products = tokens.unsqueeze(0) * self.multipliers.unsqueeze(1)
         rolling, hashes = products[..., 0], []
@@ -195,20 +203,25 @@ class HostEngram:
         self.history[request_id] = compressed
         return torch.cat(hashes, dim=-1) + self.offsets.unsqueeze(1)
 
-    def lookup(self, token_ids, capacity: int, start_pos: int = 0, *, request_id=0) -> torch.Tensor:
+    def lookup(self, token_ids, capacity: int, start_pos: int = 0, *, request_id=0, token_mask=None) -> torch.Tensor:
         if len(token_ids) > capacity or capacity <= 0:
             raise ValueError("Engram rows must fit the current-token capacity")
-        hashes = self.hash_ids(token_ids, start_pos, request_id=request_id)
+        hashes = self.hash_ids(token_ids, start_pos, request_id=request_id, token_mask=token_mask)
+        active = torch.ones(len(token_ids), dtype=torch.bool)
+        if token_mask is not None:
+            active = torch.as_tensor(token_mask, device="cpu")
         result = torch.zeros((len(self.layout.layer_ids), capacity, self.layout.lookup_width), dtype=torch.bfloat16)
         for slot, layer in enumerate(self.layout.layer_ids):
             prefix = f"layers.{layer}.engram.embed."
-            rows = self.checkpoint.tensor_rows(prefix + "weight", hashes[slot])
-            scales = self.checkpoint.tensor_rows(prefix + "scale", hashes[slot])
+            if not bool(active.any()):
+                continue
+            rows = self.checkpoint.tensor_rows(prefix + "weight", hashes[slot, active])
+            scales = self.checkpoint.tensor_rows(prefix + "scale", hashes[slot, active])
             if rows.dtype != torch.float8_e4m3fn or rows.shape[-1] != self.layout.head_dim:
                 raise ValueError(f"unsupported native Engram table layout: {prefix}weight")
             if scales.dtype != torch.float8_e8m0fnu or scales.shape[-1] != self.layout.head_dim // 32:
                 raise ValueError(f"unsupported native Engram table scales: {prefix}scale")
             scale_values = torch.exp2(scales.view(torch.uint8).float() - 127.0)
             values = rows.float() * scale_values.repeat_interleave(32, dim=-1)
-            result[slot, :len(token_ids)] = values.flatten(1).to(torch.bfloat16)
+            result[slot, :len(token_ids)][active] = values.flatten(1).to(torch.bfloat16)
         return result

@@ -1051,6 +1051,11 @@ class WorkerProcess:
             for pr in terminal
             if (state := getattr(self, "_constraint_states", {}).get(pr.request_id)) is not None
         }
+        batch.multimodal_inputs = {
+            pr.request_id: cached.multimodal_inputs
+            for pr in scheduled
+            if getattr((cached := self._req_cache[pr.request_id]), "multimodal_inputs", ())
+        }
         batch.stop_token_masks = {
             pr.request_id: mask
             for pr in terminal

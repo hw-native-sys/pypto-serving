@@ -960,12 +960,13 @@ def load_segment_modules(lib_root, topology):
         for path in (root, root / "models/deepseek_v4_1_flash"):
             if str(path) not in sys.path:
                 sys.path.insert(0, str(path))
-        sys.argv = [old_argv[0], "--tp", str(topology.tp), "--ep", str(topology.world)]
+        sys.argv = [old_argv[0], "--cp", "1", "--lm-head-tp", str(topology.tp),
+                    "--ep", str(topology.world)]
         config = importlib.import_module(package + ".config")
         if Path(config.__file__).resolve() != expected:
             raise RuntimeError("import resolved to a different lib checkout")
-        if (config.TP_SIZE, config.EP_SIZE, config.MOE_TOKENS) != (
-            topology.tp, topology.world, topology.local_capacity
+        if (config.CP_SIZE, config.LM_HEAD_TP_SIZE, config.EP_SIZE, config.MOE_TOKENS) != (
+            1, topology.tp, topology.world, topology.local_capacity
         ):
             raise ValueError("lib topology/MOE_TOKENS disagrees with the segment capacity")
         if not (root / "models/deepseek_v4_1_flash/moe.py").is_file():
@@ -1546,7 +1547,7 @@ def compile_prefill_fwd(compiler, lib_root, topology):
     load_segment_modules(lib_root, decode_topology)
     previous_argv = sys.argv[:]
     try:
-        sys.argv = [previous_argv[0], "--tp", str(topology.tp), "--ep", str(topology.world),
+        sys.argv = [previous_argv[0], "--cp", "1", "--lm-head-tp", str(topology.tp), "--ep", str(topology.world),
                     "--dp", str(topology.dp), "--capacity", str(topology.local_capacity),
                     "--moe-tokens", str(decode_topology.local_capacity)]
         module = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd")
@@ -1660,6 +1661,7 @@ class HostEngramResources:
         # The adapter follows the official model's raw tokenizer ABI. It owns
         # host hashing/history; pypto-lib contributes only device kernels.
         self.host = HostEngram(loader, tokenizer, config)
+        self.vision = None
         layers = self.host.layout.layer_ids
         if len(layers) != 2:
             raise ValueError("V4.1 serving currently requires two Engram layers")
@@ -1703,8 +1705,12 @@ class HostEngramResources:
         offsets = [0] * topology.dp
         for request in step.requests:
             start = offsets[request.partition]
+            options = {}
+            if self.vision is not None and request.request_id in self.vision.requests:
+                options["token_mask"] = ~self.vision.mask(
+                    request.request_id, request.start, len(request.token_ids))
             values = self.host.lookup(request.token_ids, topology.capacity,
-                                      request.start, request_id=request.request_id)
+                                      request.start, request_id=request.request_id, **options)
             count = len(request.token_ids)
             if row_stride is not None and count > row_stride:
                 raise ValueError("Engram active rows exceed the request stride")
@@ -2657,7 +2663,7 @@ class V41ResidentResources:
     def __init__(self, programs, run_config, *, weight_bank, weight_param_names,
                  cache_plan, state_reset, page_resets, input_host, final_host,
                  prefill_host, topology,
-                 engram_host=None,
+                 engram_host=None, vision_host=None,
                  decode_input_host=None, decode_host=None, worker_factory=make_segment_worker,
                  prefill_program=None, prefill_param_names=None,
                  dspark_programs=None, dspark_param_names=None, max_seq_len=None,
@@ -2672,6 +2678,7 @@ class V41ResidentResources:
                      + prefill_host.inherited_host_tensors
                      + (() if decode_host is None else decode_host.inherited_host_tensors)
                      + (() if engram_host is None else engram_host.inherited_host_tensors)
+                     + (() if vision_host is None else vision_host.inherited_host_tensors)
                      + final_host.all_host_tensors
                      + (() if dspark_host_resources is None
                         else tuple(dspark_host_resources.state.values())
@@ -2693,6 +2700,9 @@ class V41ResidentResources:
                                final_host, dspark_host_resources, state_reset, page_resets)
         self.prefill_host = prefill_host
         self.engram_host = engram_host
+        self.vision_host = vision_host
+        if engram_host is not None:
+            engram_host.vision = vision_host
         self.decode_host = decode_host
         self.dspark_host_resources = dspark_host_resources
         self.dspark_weights = None
@@ -3118,6 +3128,14 @@ class V41ResidentResources:
             self._activate_prefill()
         elif step.phase == "decode":
             self._activate_decode()
+        vision = self.vision_host
+        if step.phase == "prefill" and vision is not None:
+            if any(request.request_id in vision.requests for request in step.requests):
+                embeddings = vision.inject(step, embeddings)
+                vision.stage_bias(step)
+                self._prefill_fwd.arguments["correction_bias"] = vision.routing_bias
+            else:
+                self._prefill_fwd.arguments["correction_bias"] = self.weights.full("correction_bias")
         dispatch_step = step
         if step.phase == "decode":
             dispatch_step, embeddings, padding_partitions = pad_single_decode(
@@ -3207,7 +3225,7 @@ class V41ResidentResources:
             # These windows persist across both bootstrap and decode. Allocate
             # epochs at dispatch, so repeated lowering cannot consume them and
             # replaying an already lowered payload cannot reuse old signals.
-            bound = dict(arguments, attention_epoch=epoch, moe_epoch=epoch)
+            bound = dict(arguments, moe_epoch=epoch)
         if reset_windows:
             previous_reset = self.worker._reset_persistent_windows
             self.worker._reset_persistent_windows = True
@@ -3250,7 +3268,6 @@ class V41ResidentResources:
         runner = _DSparkOrchestratorRunner(self, phase)
         try:
             kwargs = dict(
-                attention_epoch=lowered.attention_epoch,
                 moe_epoch=lowered.moe_epoch,
                 logits_epoch=lowered.logits_epoch,
             )
@@ -3490,11 +3507,15 @@ class V41ResidentResources:
     def release_request(self, request_id):
         if self.engram_host is not None:
             self.engram_host.release_request(request_id)
+        if self.vision_host is not None:
+            self.vision_host.release_request(request_id)
 
     def close(self):
         if self.closed:
             return
         self._step = self._inputs = self._group_counts = self._output_rows = None
+        if self.vision_host is not None:
+            self.vision_host.close()
         try:
             if self._prefill_fwd is not None:
                 self._prefill_fwd.close()
@@ -3539,14 +3560,14 @@ def selected_decode_topology(lib_root=None, *, dp_size=None):
             continue
         target = statement.targets[0]
         if not isinstance(target, ast.Name) or target.id not in (
-                "MAX_BATCH_PER_DP", "DSPARK_SPEC_TOKENS", "DECODE_ROWS_PER_REQUEST"):
+                "DECODE_BATCH", "DSPARK_SPEC_TOKENS", "DECODE_SEQ"):
             continue
         if target.id in values:
             raise MissingCompositeInterface(f"duplicate V4.1 lib decode config: {target.id}")
         values[target.id] = statement.value
-    batch = values.get("MAX_BATCH_PER_DP")
+    batch = values.get("DECODE_BATCH")
     spec = values.get("DSPARK_SPEC_TOKENS")
-    rows = values.get("DECODE_ROWS_PER_REQUEST")
+    rows = values.get("DECODE_SEQ")
     if (not isinstance(batch, ast.Constant) or type(batch.value) is not int or batch.value != 12
             or not isinstance(spec, ast.Constant) or type(spec.value) is not int or spec.value != 5
             or not isinstance(rows, ast.BinOp) or not isinstance(rows.op, ast.Add)
@@ -3755,6 +3776,11 @@ def make_production_bindings(
             engram_host = HostEngramResources(
                 model_dir, topology, tokenizer_impl, capacity=max(prefill_topology.capacity, topology.capacity))
         dspark_host = None
+        vision_host = None
+        if raw.get("vision_config"):
+            from .vision import V41VisionResources
+
+            vision_host = V41VisionResources(model_dir, raw, prefill_topology, device_ids[0], plan.weights)
         if runtime.num_speculative_tokens:
             from .dspark_resources import DSparkResourceLayout, allocate_dspark_host_resources
 
@@ -3779,6 +3805,7 @@ def make_production_bindings(
             prefill_host=prefill_host, decode_host=decode_host,
             final_host=final_host,
             engram_host=engram_host,
+            vision_host=vision_host,
             topology=topology, prefill_program=prefill, prefill_param_names=prefill_names,
             dspark_programs=dspark_programs, dspark_param_names=dspark_param_names,
             max_seq_len=max_seq_len,

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -162,6 +163,8 @@ class Request:
     cache_reservation_id: str = ""
     requires_initial_step: bool = False
     num_replay_tokens: int = 0
+    multimodal_inputs: list[dict] = field(default_factory=list)
+    cache_salt: bytes = b""
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -304,6 +307,13 @@ class Scheduler:
                 request.block_hashes = self.kv_cache_manager.compute_block_hashes(
                     request.prompt_token_ids
                 )
+        if request.cache_salt:
+            request.block_hashes = [hashlib.sha256(request.cache_salt + value).digest()
+                                    for value in request.block_hashes]
+            request.group_block_hashes = {
+                name: [hashlib.sha256(request.cache_salt + value).digest() for value in values]
+                for name, values in request.group_block_hashes.items()
+            }
         request.status = RequestStatus.WAITING
         self.waiting.append(request)
         self.requests[request.request_id] = request

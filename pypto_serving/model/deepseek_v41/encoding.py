@@ -199,6 +199,10 @@ class DeepSeekV41TokenizerAdapter(TransformersTokenizerAdapter):
         return "deepseek_v41"
 
     def apply_chat_template(self, messages: Sequence[Mapping[str, object]], **kwargs):
+        if any(isinstance(message.get("content"), list) for message in messages):
+            from .vision import prepare_chat
+
+            return prepare_chat(messages, self, kwargs)
         allowed = {
             "thinking",
             "enable_thinking",
