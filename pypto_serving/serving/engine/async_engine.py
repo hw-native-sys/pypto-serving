@@ -550,7 +550,7 @@ class ReplicaEngineCore:
         for request in self.scheduler.requests.values():
             if request.status.is_finished:
                 continue
-            prompt_remaining = max(0, request.num_prompt_tokens - request.num_computed_tokens)
+            prompt_remaining = max(0, request.num_prefill_tokens - request.num_computed_tokens)
             generation_remaining = max(0, request.max_new_tokens - len(request.output_token_ids))
             load += prompt_remaining + generation_remaining
         return load
