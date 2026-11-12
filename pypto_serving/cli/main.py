@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 from pypto_serving.config.parallel import ParallelConfig, parse_device_ids
 from pypto_serving.config.types import (
     PREFILL_CHUNK_SIZE_CHOICES,
+    EplbConfig,
     GenerateConfig,
     RuntimeConfig,
 )
@@ -103,6 +104,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--lm-head-tp", type=int, default=4,
         help="DSpark vocabulary head TP, independent of attention TP (default: 4).",
     )
+    parser.add_argument("--enable-eplb", action="store_true",
+                        help="Enable non-PD DSpark expert load balancing on TP4/EP8 or TP4/EP16.")
+    parser.add_argument("--eplb-config", default=None,
+                        help="EPLB JSON options; requires --enable-eplb and a positive max_migration_bytes.")
     # Dtype
     parser.add_argument("--dtype", default="bfloat16", help="Weight data type (default: bfloat16).")
     parser.add_argument("--kv-cache-dtype", default="bfloat16", help="KV cache data type. 'auto' follows --dtype (default: bfloat16).")
@@ -287,6 +292,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
+    eplb_config = _resolve_eplb_config(args, model_family, model_config_data)
     if model_family == "deepseek_v41":
         return _build_v41_engine_config(args, model_dir, model_config_data, devices)
     model_variant = _resolve_model_variant(args)
@@ -313,6 +319,8 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         executor_kwargs["cache_ranks"] = args.expert_parallel_size
         executor_kwargs["tp_size"] = args.tensor_parallel_size
         executor_kwargs["lm_head_tp_size"] = args.lm_head_tp
+        if eplb_config is not None:
+            executor_kwargs["eplb_config"] = eplb_config
     parallel_config = ParallelConfig(
         data_parallel_size=1 if dspark_variant else args.data_parallel_size,
         tensor_parallel_size=1 if dspark_variant else args.tensor_parallel_size,
@@ -359,6 +367,31 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         enable_prefix_cache=enable_prefix_cache,
         enable_chunk_prefill=args.enable_chunked_prefill,
     )
+
+
+def _resolve_eplb_config(args, model_family, model_config_data) -> EplbConfig | None:
+    enabled = bool(getattr(args, "enable_eplb", False))
+    raw = getattr(args, "eplb_config", None)
+    if not enabled:
+        if raw is not None:
+            raise ValueError("--eplb-config requires --enable-eplb")
+        return None
+    if model_family != "deepseek_v4" or _resolve_model_variant(args) != "dspark":
+        raise ValueError("--enable-eplb requires the DeepSeek V4 DSpark model variant")
+    try:
+        values = {} if raw is None else json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError("--eplb-config must be a JSON object") from error
+    allowed = {field.name for field in dataclasses.fields(EplbConfig)} - {"enabled"}
+    if not isinstance(values, dict) or set(values) - allowed:
+        raise ValueError("--eplb-config contains unknown fields or is not a JSON object")
+    config = EplbConfig(enabled=True, **values)
+    config.validate_topology(
+        logical_experts=int(model_config_data.get("n_routed_experts", 256)),
+        ranks=args.expert_parallel_size, tp_size=args.tensor_parallel_size,
+        execution_role=getattr(args, "pd_role", None) or "mixed",
+    )
+    return config
 
 
 def _build_v41_engine_config(args, model_dir, raw, devices):

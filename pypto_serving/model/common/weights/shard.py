@@ -74,6 +74,8 @@ class ExpertParallel:
     n_experts: int
     local_ids: Callable[..., Sequence[int]]
     mismatch_error: str = "packed destination {name} shape/dtype mismatch: expected={expected}, got={got}"
+    # Physical slots may exceed the logical checkpoint partition when experts are replicated.
+    local_capacity: int | None = None
 
     def _ids_for(self, rank: int) -> Sequence[int]:
         return self.local_ids(rank=rank, ranks=self.ranks, n_routed_experts=self.n_experts)
@@ -87,8 +89,13 @@ class ExpertParallel:
         destination: torch.Tensor | None,
     ) -> torch.Tensor:
         """Stack each rank's local experts, into ``destination`` when one is given."""
+        local_experts = self.n_experts // self.ranks if self.local_capacity is None else self.local_capacity
+        ids = [tuple(self._ids_for(rank)) for rank in range(self.ranks)]
+        if local_experts <= 0 or any(len(local) != local_experts for local in ids):
+            raise ValueError("Expert placement must fill the declared per-rank capacity")
+        if any(expert_id < 0 or expert_id >= self.n_experts for local in ids for expert_id in local):
+            raise ValueError("Expert placement refers to an invalid logical checkpoint ID")
         if destination is not None:
-            local_experts = self.n_experts // self.ranks
             expected_shape = (self.ranks, local_experts, *lookup(0).shape)
             if tuple(destination.shape) != expected_shape or destination.dtype != dtype:
                 raise ValueError(
@@ -99,13 +106,13 @@ class ExpertParallel:
                     )
                 )
             for rank in range(self.ranks):
-                for local_index, expert_id in enumerate(self._ids_for(rank)):
+                for local_index, expert_id in enumerate(ids[rank]):
                     destination[rank, local_index].copy_(lookup(expert_id))
             return destination
 
         per_rank = [
             torch.stack(
-                [lookup(expert_id).to(dtype=dtype).contiguous().cpu() for expert_id in self._ids_for(rank)],
+                [lookup(expert_id).to(dtype=dtype).contiguous().cpu() for expert_id in ids[rank]],
                 dim=0,
             )
             for rank in range(self.ranks)

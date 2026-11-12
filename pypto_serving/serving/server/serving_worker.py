@@ -17,6 +17,7 @@ import sys
 import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
+from time import perf_counter
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -133,6 +134,14 @@ class _ControlBarrier:
     completed: threading.Event
 
 
+@dataclass
+class _EplbDrainBarrier:
+    """Acknowledge prior output consumption without moving work to the output lane."""
+
+    completed: threading.Event
+    error: str | None = None
+
+
 class WorkerProcess:
     """Dedicated process that owns a single NPU device and executes model inference.
 
@@ -174,6 +183,8 @@ class WorkerProcess:
         self._constraint_states: dict[str, ConstraintState] = {}
         self._accepted_output_lengths: dict[str, int] = {}
         self._xgrammar_provider: XGrammarProvider | None = None
+        self._eplb_reclaim_error: str | None = None
+        self._executor_fatal_error: str | None = None
 
     def init_device_and_model(self) -> int:
         from pypto_serving.config.types import ModelRecord
@@ -319,6 +330,17 @@ class WorkerProcess:
                 self._handle_control_command(cmd)
                 continue
 
+            if getattr(self, "_executor_fatal_error", None) is None:
+                try:
+                    self._maintain_eplb()
+                except Exception as exc:
+                    logger.error("Worker EPLB maintenance failed; stopping model submissions", exc_info=True)
+                    self._executor_fatal_error = f"EPLB maintenance failed: {exc}"
+            if getattr(self, "_executor_fatal_error", None) is not None:
+                self.output_queue.put(encode_result(StepResult(
+                    new_tokens={}, error=self._executor_fatal_error, step_id=cmd.step_id,
+                )))
+                continue
             self._handle_step_command(cmd)
 
     def _pipelined_busy_loop(self) -> None:
@@ -444,6 +466,18 @@ class WorkerProcess:
                 barrier.completed.wait()
                 continue
             assert isinstance(cmd, StepCommand)
+            if getattr(self, "_executor_fatal_error", None) is None:
+                try:
+                    self._maintain_eplb(output_work_queue)
+                except Exception as exc:
+                    logger.error("Worker EPLB maintenance failed; stopping model submissions", exc_info=True)
+                    self._executor_fatal_error = f"EPLB maintenance failed: {exc}"
+            if getattr(self, "_executor_fatal_error", None) is not None:
+                output_work_queue.put(_CompletedStepOutput(
+                    StepResult(new_tokens={}, error=self._executor_fatal_error, step_id=cmd.step_id),
+                    buffer_slot=prepared.buffer_slot if prepared is not None else None,
+                ))
+                continue
             try:
                 self._wait_for_pending_decode_reclaims(cmd.finished_request_ids)
                 accepted_lengths = getattr(self, "_accepted_output_lengths", {})
@@ -566,6 +600,10 @@ class WorkerProcess:
             work = output_work_queue.get()
             if isinstance(work, ShutdownCommand):
                 return
+            if isinstance(work, _EplbDrainBarrier):
+                work.error = getattr(self, "_eplb_reclaim_error", None)
+                work.completed.set()
+                continue
             if isinstance(work, _ProfileBarrier):
                 try:
                     self._handle_profile_command(work.command)
@@ -587,17 +625,45 @@ class WorkerProcess:
                 finally:
                     self._finish_pending_decode_reclaims(work.scheduled)
                 buffer_slot = work.buffer_slot
+                if result.error:
+                    self._eplb_reclaim_error = result.error
             elif isinstance(work, _PendingPrefillOutput):
                 try:
                     result = self._reclaim_pending_prefill(work)
                 finally:
                     self._finish_pending_prefill_reclaims(work.scheduled)
                 buffer_slot = work.buffer_slot
+                if result.error:
+                    self._eplb_reclaim_error = result.error
             else:
                 raise TypeError(f"unexpected output work item: {type(work).__name__}")
             if buffer_slot is not None:
                 slot_ownership[buffer_slot].release()
             self.output_queue.put(encode_result(result))
+
+    def _maintain_eplb(self, output_work_queue: queue.Queue[object] | None = None) -> None:
+        if getattr(self.executor, "eplb_enabled", False) is not True:
+            return
+        model = self.model_record.runtime_model
+        plan = self.executor.take_ready_eplb_plan(model)
+        if plan is None:
+            return
+        pause_started = perf_counter()
+        self.executor.validate_eplb_plan(model, plan)
+        if output_work_queue is not None:
+            barrier = _EplbDrainBarrier(threading.Event())
+            output_work_queue.put(barrier)
+            barrier.completed.wait()
+            if barrier.error is not None:
+                raise RuntimeError(f"EPLB output drain failed: {barrier.error}")
+        # A serial step has already reclaimed all outputs before returning.
+        # Run on the execution lane, after output buffers and request refs retire.
+        maintenance_started = perf_counter()
+        self.executor.apply_eplb_plan(model, plan)
+        resumed = perf_counter()
+        logger.info("[eplb] resumed submissions drain_ms=%.3f maintenance_ms=%.3f pause_ms=%.3f",
+                    (maintenance_started - pause_started) * 1000,
+                    (resumed - maintenance_started) * 1000, (resumed - pause_started) * 1000)
 
     def _track_pending_decode_requests(self, requests: list[DecodeRequest]) -> None:
         """Retain request lifecycle state until this decode is reclaimed."""

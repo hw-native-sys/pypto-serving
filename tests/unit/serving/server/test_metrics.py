@@ -54,7 +54,7 @@ def test_worker_preserves_speculation_metadata_in_serial_and_reclaim_results(rec
         reclaim_prepared_decode=lambda pending: result,
     )
     worker.model_record = SimpleNamespace(runtime_model=object())
-    worker._make_decode_batch = lambda *args, **kwargs: object()
+    worker._make_decode_batch = lambda *args, **kwargs: SimpleNamespace(dspark_stages=None)
     worker._allow_device_sampled_ids = lambda scheduled, *, phase: True
     worker._allow_device_topk_sampling = lambda scheduled, *, phase: False
     worker._last_tokens = {}

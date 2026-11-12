@@ -35,6 +35,7 @@ variant in three ways:
 from __future__ import annotations
 
 from dataclasses import replace
+import operator
 
 import torch
 
@@ -281,9 +282,25 @@ def dspark_shard_policy(ranks: int, *, tp_size: int = DSPARK_TP_SIZE) -> DSParkS
     return DSParkShardPolicy(ranks=ranks, tp_size=tp_size)
 
 
-def dspark_expert_parallel(ranks: int, n_routed_experts: int):
-    """The expert placement policy (identical to the MTP variant)."""
-    return deepseek_v4_expert_parallel(ranks, n_routed_experts)
+def dspark_expert_parallel(ranks: int, n_routed_experts: int, *, physical_to_logical=None):
+    """Shard checkpoint IDs into fixed physical slots, including optional replicas."""
+    if physical_to_logical is None:
+        return deepseek_v4_expert_parallel(ranks, n_routed_experts)
+    from pypto_serving.model.common.weights.shard import ExpertParallel
+
+    mapping = tuple(operator.index(expert) for expert in physical_to_logical)
+    if ranks <= 0 or not mapping or len(mapping) % ranks:
+        raise ValueError("Invalid DSpark physical expert capacity")
+    capacity = len(mapping) // ranks
+    if (capacity > n_routed_experts or set(mapping) != set(range(n_routed_experts))
+            or any(len(set(mapping[rank * capacity:(rank + 1) * capacity])) != capacity
+                   for rank in range(ranks))):
+        raise ValueError("Invalid DSpark physical-to-logical expert placement")
+
+    def local_ids(*, rank, ranks, n_routed_experts):
+        return mapping[rank * capacity:(rank + 1) * capacity]
+
+    return ExpertParallel(ranks, n_routed_experts, local_ids, local_capacity=capacity)
 
 
 def dspark_factories() -> dict[str, object]:

@@ -45,6 +45,8 @@ class NewRequestData(msgspec.Struct):
 
     The worker caches this and references it by ``request_id`` for the lifetime
     of the registration. ``prompt_token_ids`` are not re-sent until a restart.
+    On recompute they include the confirmed generated prefix needed to rebuild
+    model state; ``initial_output_tokens`` still counts already emitted tokens.
     """
 
     request_id: str

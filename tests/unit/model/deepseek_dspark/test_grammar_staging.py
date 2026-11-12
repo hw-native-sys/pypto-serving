@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Host-side mask repacking and K7 rank/row staging contracts."""
+"""Host-side mask repacking and K0/K7 rank/row staging contracts."""
 
 from types import SimpleNamespace
 
@@ -137,6 +137,41 @@ def test_k7_mask_rows_and_draft_caps_are_isolated() -> None:
     assert int(masks[6, 40, 0, 0]) == -1
     assert int(masks[6, 40, 0, -1]) == -1
     assert int(masks[6, 48, 0, -1]) == 0
+
+
+@pytest.mark.parametrize("reject_empty", [False, True])
+def test_k0_constraint_staging_uses_only_the_anchor_without_draft_buffers(reject_empty):
+    class State:
+        def plan_draft_rows(self, drafts):
+            assert drafts == []
+            rows = np.full((1, DSPARK_VOCAB_SIZE // 32), -1, dtype=np.int32)
+            rows[0, 0] = -2
+            if reject_empty:
+                rows.fill(0)
+            return 0, rows
+
+    runner = DSparkModelRunner.__new__(DSparkModelRunner)
+    masks = torch.full((1, 3, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS), -1,
+                       dtype=torch.int16)
+    runner._compiled = SimpleNamespace(num_speculative_tokens=0, layout=SimpleNamespace(tp_size=1))
+    runner._decode_task_args = [SimpleNamespace(tensors={"grammar_mask": masks})]
+    runner._decode_grammar_rows = [{(0, 0)}]
+    masks[0, 0].fill_(0)
+    inputs = SimpleNamespace(buffer_slot=0, request_ids=("r",), groups=(0,), group_ordinals=(0,),
+                             sampled_slots=((0, 1),))
+    batch = SimpleNamespace(constraint_states={"r": State()})
+    if reject_empty:
+        with pytest.raises(ValueError, match="no allowed token"):
+            runner._stage_decode_grammar(batch, inputs)
+        assert torch.all(masks == -1)
+        assert runner._decode_grammar_rows == [set()]
+    else:
+        assert runner._stage_decode_grammar(batch, inputs) == (0,)
+        assert torch.all(masks[0, 0] == -1)
+        assert int(masks[0, 1, 0, 0]) == -2
+        assert int(masks[0, 1, 0, -1]) == 0
+        assert torch.all(masks[0, 2] == -1)
+        assert runner._decode_grammar_rows == [{(0, 1)}]
 
 
 def test_ordinary_dispatch_reuses_immutable_device_defaults() -> None:
