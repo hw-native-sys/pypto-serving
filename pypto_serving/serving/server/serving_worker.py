@@ -1044,6 +1044,10 @@ class WorkerProcess:
             allow_device_topk_sampling=self._allow_device_topk_sampling(terminal, phase="prefill"),
             block_ids=[pr.block_ids for pr in scheduled],
             block_ids_by_group=[pr.block_ids_by_group for pr in scheduled],
+            read_block_ids_by_group=[pr.read_block_ids_by_group for pr in scheduled],
+            checkpoint_ends=[pr.checkpoint_ends for pr in scheduled],
+            state_write_block_ids_by_group=[pr.state_write_block_ids_by_group for pr in scheduled],
+            checkpoint_block_ids_by_group=[pr.checkpoint_block_ids_by_group for pr in scheduled],
             cache_partitions=[pr.cache_partition for pr in scheduled],
         )
         batch.constraint_states = {

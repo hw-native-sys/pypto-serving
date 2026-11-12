@@ -4,7 +4,7 @@ PD is opt-in. Without `--pd-role`, Serving does not load PD or Mooncake, create 
 
 ## Requirements
 
-The initial adapter supports DeepSeek V4 Flash DSpark K7, greedy sampling, identical model weights and compatible cache formats on P and D. Use Serving's pinned PyPTO-Lib, which includes the independent-head support from [Lib PR #1542](https://github.com/hw-native-sys/pypto-lib/pull/1542).
+The initial adapter supports DeepSeek V4 Flash DSpark K7, greedy sampling, identical model weights and compatible cache formats on P and D. Use Serving's pinned PyPTO-Lib, which includes independent-head support from [Lib PR #1542](https://github.com/hw-native-sys/pypto-lib/pull/1542) and the matching checkpoint-publication ABI from [Lib PR #1707](https://github.com/hw-native-sys/pypto-lib/pull/1707).
 
 Use matching PyPTO/Simpler source builds with owner-local service and allocation-retain hooks; these hooks are not upstream APIs yet. PyPTO must expose `chip_service_factories`, `retain_service_tensor`, and `release_service_tensor`, backed by Simpler's owner-local allocation pinning. Its `RunConfig` must support explicit `backend_type` and `execution_mode` fields. These are required interfaces, not a fallback to an older runtime.
 
@@ -29,14 +29,18 @@ pypto-serving \
   --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
   --dp 4 --ep 16 --tp 4 --block-size 32 \
   --max-model-len 655360 --max-num-batched-tokens 8192 \
-  --long-prefill-token-threshold 128 \
+  --long-prefill-token-threshold 8192 \
   --speculative-config '{"method":"dspark","num_speculative_tokens":7}' \
   --ring-heap 1073741824,1073741824,1073741824,1073741824 \
   --generate-config '{"max_new_tokens":131072,"temperature":0}' \
   --pd-config examples/pd.json --pd-role prefill --host 0.0.0.0 --port 8000
 ```
 
-Use `--pd-role decode` on D; both launchers specify K7, while P internally runs target-only prefill. The context limit covers **prompt plus output**: 655360 allows a 524288-token prompt plus 131072 generated tokens, subject to actual device memory. Configuring this limit is not a full-length validation.
+Use `--pd-role decode` on D; both launchers specify K7, while P internally runs target-only prefill. D can use `--max-num-batched-tokens 2048` while P keeps 8192. D plans rolling KV from the smaller of its token budget and 8192, and ignores `--long-prefill-token-threshold`; continuation-state rings are budgeted separately. D still validates eight positions per request and does not run a local Prefill. The global scheduling budget does not force a batch to fill it.
+
+P and D rings may differ in length. Handoff selects the model's required logical tail and checkpoint state, then maps each page through the two local tables; D receives directly into its reservation without copying or shrinking a ring at takeover. Full-history compressed KV and index suffixes retain their normal coverage, and final request-local state/bootstrap still transfers on a full KV hit. A model-contract fingerprint checks byte layouts and the matching/state policy. Host and real-weight validation cover TP4-to-TP4 and TP4-to-TP1 handoff.
+
+The context limit covers **prompt plus output**: 655360 allows a 524288-token prompt plus 131072 generated tokens, subject to actual device memory. Configuring this limit is not a full-length validation.
 
 When omitted, `--max-num-seqs` defaults to **16 on P** and **72 on D**.
 The value configures both the local request limit and cache-pool planning;
@@ -56,12 +60,25 @@ Smaller attention TP does not multiply batch capacity: every rank still owns
 
 Real-weight K7 validation covers ordinary DP4TP4, homogeneous PD DP4TP4,
 and asymmetric P DP4TP4 to D DP16TP1 with head TP4 and prefix caching enabled.
-It includes cache/state replay, rolling boundaries, cancellation and both
-streaming and non-streaming APIs. Repeat compilation and hardware validation
-after changes to the SDK or the model kernels; these results do not validate
-other parallel layouts or full-length context stress.
+It includes cache/state replay, rolling boundaries, cancellation, streaming
+and non-streaming APIs, and inputs through 1048320 tokens. Legal input/output
+boundaries of 1048575+1 and 1048560+16 are also covered. Other layouts and
+capacity/concurrency combinations require their own validation. Repeat
+compilation and hardware validation after SDK or model-kernel changes.
 
 Each node independently accepts `--no-enable-prefix-caching`; all four P/D combinations are supported. No prefix mode belongs in JSON. P cache hits reduce computation; D hits reduce network traffic, independently.
+
+P restores only complete history KV, ori and recurrent-state checkpoints.
+It retains evictable periodic boundaries based on the effective Prefill chunk,
+the request replay boundary and discovered shared boundaries. An unseen branch
+may replay from an earlier checkpoint before materializing its shared boundary
+for later requests. These pages use the existing cache pools and snapshot/COW
+lifetime rules; retention remains bounded by available capacity.
+
+D matches only the complete-history `cmp_c128`, `cmp_c4` and `idx` groups.
+It independently receives the current request's rolling KV, final state and
+bootstrap data, including when all complete history is shared. P and D hits
+need not agree; the Router does not query or manage physical cache.
 
 The common Serving Router uses `role: "prefill"` and `role: "decode"` in its `replicas` table. Entries without a role remain ordinary complete replicas. PD requires both roles and uses statically launched nodes; mixing complete replicas, PD nodes or launchable `hosts` is rejected. The Router never starts or stops these external P/D processes.
 
@@ -138,6 +155,41 @@ Handoff records use the same `request` and `plan_digest` as the worker job, incl
 owner-side `pd.native.write` durations and bytes. Byte counts include physical TP
 copies; they are not unique KV-content sizes. Logging/profiling failures do not
 authorize writes, change completion checks or release resources.
+
+Existing handoff records include `plan_ms` / `plan_thread_cpu_ms` on P completion,
+`lower_ms` / `lower_thread_cpu_ms` on worker submission, and
+`validation_ms` / `validation_thread_cpu_ms` on D plan authorization. Worker RPC
+records also include request encoding time. Thread CPU is measured only around
+synchronous preparation, not across asynchronous waits.
+
+P submission, final-state lookup and completion polling share one independent,
+bounded worker channel, so ready transfers need not wait behind unrelated compute.
+Final metadata is published after confirmed capture and retired with the request's
+lease. A submit acknowledgement is not native completion. Registry installation,
+D state reservation, bootstrap and retirement retain their existing ordering.
+The local channel bounds lock waiting, frame writes and complete frame reads by
+one handoff deadline; uncertain I/O closes the channel without releasing source
+pins. A rejected final metadata result fails its own handoff, while unrelated
+requests in the same successfully computed batch can continue.
+Profile spans `pd.progress.wait_channel`, `pd.progress.roundtrip` and
+`pd.progress.handle` separate channel waiting from handling;
+`pd.source.ready` / `pd.source.read` identify final metadata publication and lookup.
+
+On-demand profiling separates plan build/validation, worker and owner encoding/
+decoding, transfer lowering, owner call/RPC, provider address construction and
+`MooncakeTransferEngine.batch_transfer_sync_write`. The latter surrounds the native
+call; `pd.native.write` still covers the whole owner-side provider write. The
+bootstrap span also separates waiting for prior dispatches from bootstrap execution.
+Nested spans overlap and must not be added as independent latency components.
+Detailed spans add no default log records or per-request timing history.
+
+Region indexes and registry fingerprints are reused only within their node boot;
+accepted plan digests live only with the active request. Peer registrations are
+bounded, but old peer boots currently remain installed until the local node
+retires. Repeated peer restarts can exhaust that capacity even after their control
+sessions close; coordinate node retirement rather than evicting a registry that
+may still be referenced by native work. Log and trace files are not automatically
+rotated. Use bounded profiling windows and manage file retention externally.
 
 ### Internal request status
 

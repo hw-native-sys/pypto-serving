@@ -223,7 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Maximum tokens per request in one chunked-prefill scheduling step. "
             "DeepSeek V4 accepts 1024, 2048, 4096, or 8192; the final prompt "
-            "chunk may be smaller (default: 2048)."
+            "chunk may be smaller (default: 2048). Ignored by PD decode nodes."
         ),
     )
     parser.add_argument(
@@ -231,6 +231,10 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable prefix caching (default: True). Use --no-enable-prefix-caching to disable.",
+    )
+    parser.add_argument(
+        "--prefix-cache-retention-interval", type=int, default=8192,
+        help="DSpark sparse checkpoint interval in source tokens (default: 8192; 0 disables periodic points).",
     )
     parser.add_argument(
         "--enable-chunked-prefill",
@@ -483,7 +487,8 @@ def _build_runtime_config(
             compress_ratios = None
         num_hidden_layers = int(config_data.get("num_hidden_layers", 43))
         max_prefill_tokens_per_request = min(DSPARK_PREFILL_MAX_TOKENS, args.max_num_batched_tokens)
-        if args.enable_chunked_prefill and args.long_prefill_token_threshold > 0:
+        if (args.pd_role != "decode" and args.enable_chunked_prefill
+                and args.long_prefill_token_threshold > 0):
             max_prefill_tokens_per_request = min(
                 max_prefill_tokens_per_request, args.long_prefill_token_threshold,
             )
@@ -493,6 +498,8 @@ def _build_runtime_config(
             max_seq_len=args.max_model_len,
             max_prefill_tokens=max_prefill_tokens_per_request,
             partitions=args.expert_parallel_size // args.tensor_parallel_size,
+            decode_only=args.pd_role == "decode",
+            prefill_only=args.pd_role == "prefill",
         )
         if num_speculative_tokens:
             speculative_prefix_cache_replay_tokens = DSPARK_SLIDING_WINDOW
@@ -540,6 +547,7 @@ def _build_runtime_config(
         prefill_chunk_size_choices=prefill_chunk_size_choices,
         supports_chunked_prefill_with_speculation=supports_chunked_prefill_with_speculation,
         speculative_prefix_cache_replay_tokens=speculative_prefix_cache_replay_tokens,
+        prefix_cache_retention_interval=args.prefix_cache_retention_interval,
         requires_homogeneous_prefill_decode=requires_homogeneous_prefill_decode,
         num_speculative_tokens=num_speculative_tokens,
         kv_cache_groups=kv_cache_groups,

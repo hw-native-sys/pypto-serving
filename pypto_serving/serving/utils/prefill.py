@@ -30,6 +30,10 @@ def pack_prefill_batch(
     kv_allocations: Sequence[KvAllocation] = (),
     block_ids: Sequence[Sequence[int]] = (),
     block_ids_by_group: Sequence[dict[str, list[int]]] = (),
+    read_block_ids_by_group: Sequence[dict[str, dict[int, int]]] = (),
+    checkpoint_ends: Sequence[tuple[int, ...]] = (),
+    state_write_block_ids_by_group: Sequence[dict[str, list[int]]] = (),
+    checkpoint_block_ids_by_group: Sequence[dict[str, dict[int, int]]] = (),
     cache_partitions: Sequence[int | None] = (),
 ) -> PrefillBatch:
     """Pack request chunks and optionally look up all host embeddings once."""
@@ -62,5 +66,9 @@ def pack_prefill_batch(
         kv_allocations=list(kv_allocations),
         block_ids=[list(row) for row in block_ids],
         block_ids_by_group=list(block_ids_by_group),
+        read_block_ids_by_group=list(read_block_ids_by_group),
+        checkpoint_ends=list(checkpoint_ends),
+        state_write_block_ids_by_group=list(state_write_block_ids_by_group),
+        checkpoint_block_ids_by_group=list(checkpoint_block_ids_by_group),
         cache_partitions=list(cache_partitions),
     )

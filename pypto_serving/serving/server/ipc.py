@@ -77,6 +77,11 @@ class PrefillRequest(msgspec.Struct):
     # Model-specific grouped cache tables and their stable rank partition.
     block_ids_by_group: dict[str, list[int]] = msgspec.field(default_factory=dict)
     cache_partition: int | None = None
+    # Absolute logical page -> retained physical page, only for entry history.
+    read_block_ids_by_group: dict[str, dict[int, int]] = msgspec.field(default_factory=dict)
+    checkpoint_ends: tuple[int, ...] = ()
+    state_write_block_ids_by_group: dict[str, list[int]] = msgspec.field(default_factory=dict)
+    checkpoint_block_ids_by_group: dict[str, dict[int, int]] = msgspec.field(default_factory=dict)
 
 
 class DecodeRequest(msgspec.Struct):

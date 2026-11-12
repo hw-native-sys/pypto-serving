@@ -209,3 +209,51 @@ def test_worker_only_exports_explicit_build_directory(monkeypatch, requested):
     directory = worker._configure_pypto_build_dir((3, 4))
     assert directory == (Path(requested) / "serving_dp2_d3_4" if requested else None)
     assert os.environ.get("PYPTO_PROG_BUILD_DIR") == (str(directory) if requested else requested)
+
+
+@pytest.mark.parametrize("role,budget,threshold,pages", [
+    ("prefill", 8192, 8192, (145, 517, 517)), ("decode", 2048, 128, (35, 77, 77)),
+    ("decode", 16384, 8192, (35, 77, 77)), (None, 8192, 8192, (1041, 4101, 4101)),
+])
+def test_role_specific_state_rings_do_not_change_the_chunk_contract(role, budget, threshold, pages):
+    argv = ["--model", "model", "--max-model-len", "1048576", "--max-num-batched-tokens", str(budget),
+            "--long-prefill-token-threshold", str(threshold),
+            "--speculative-config", '{"method":"dspark","num_speculative_tokens":7}']
+    if role:
+        argv += ["--pd-role", role]
+    runtime = cli._build_runtime_config(_parse_cli_args(argv), model_family="deepseek_v4",
+        config_data={"num_hidden_layers": 43, "compress_ratios": [0, 0] + [4] * 21 + [128] * 20})
+    assert runtime.max_prefill_tokens_per_request == (min(budget, 8192) if role == "decode" else threshold)
+    assert tuple(g.max_blocks_per_seq for g in runtime.kv_cache_groups if g.name.endswith("state")) == pages
+
+
+@pytest.mark.parametrize("interval", [0, 128, 2048, 8192, 16384])
+@pytest.mark.parametrize("prefix", [False, True])
+def test_retention_interval_reaches_runtime_and_scheduler(interval, prefix):
+    from pypto_serving.serving.engine.async_engine import EngineConfig
+    from pypto_serving.serving.sched.scheduler import SchedulerConfig
+
+    argv = ["--model", "model", "--prefix-cache-retention-interval", str(interval),
+            "--speculative-config", '{"method":"dspark","num_speculative_tokens":7}']
+    runtime = cli._build_runtime_config(_parse_cli_args(argv), model_family="deepseek_v4")
+    config = EngineConfig(runtime_config=runtime, enable_prefix_cache=prefix)
+    runtime = config.resolve_runtime_config()
+    assert runtime.prefix_cache_retention_interval == (interval if prefix else 0)
+    scheduler = SchedulerConfig(prefix_cache_retention_interval=runtime.prefix_cache_retention_interval)
+    scheduler.validate_cache_groups(runtime.kv_cache_groups)
+    assert _parse_cli_args(["--model", "model"]).prefix_cache_retention_interval == 8192
+
+
+@pytest.mark.parametrize("interval", [-1, True, 1.5, 129])
+def test_invalid_retention_interval_is_rejected_before_worker_startup(interval):
+    from pypto_serving.config.types import RuntimeConfig
+    from pypto_serving.model.deepseek_dspark.npu_runner import build_dspark_cache_group_specs
+    from pypto_serving.serving.sched.scheduler import SchedulerConfig
+
+    with pytest.raises(ValueError, match="retention_interval"):
+        RuntimeConfig(prefix_cache_retention_interval=interval)
+        config = SchedulerConfig(prefix_cache_retention_interval=interval)
+        config.validate_cache_groups(build_dspark_cache_group_specs(43))
+
+    with pytest.raises(ValueError, match="Unsupported chip runtime"):
+        RuntimeConfig(chip_runtime="invalid")

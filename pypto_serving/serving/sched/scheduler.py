@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -18,7 +19,7 @@ from enum import Enum, auto
 
 from pypto_serving.config.types import KVCacheGroupSpec
 from pypto_serving.serving.constraints import ConstraintSpec
-from pypto_serving.serving.memory.kv_cache import KVCacheCapacityError, KvCacheManager
+from pypto_serving.serving.memory.kv_cache import GroupBlockSnapshot, KVCacheCapacityError, KvCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ class SchedulerConfig:
     num_speculative_tokens: int = 0
     supports_chunked_prefill_with_speculation: bool = True
     speculative_prefix_cache_replay_tokens: int = 0
+    prefix_cache_retention_interval: int = 8192
     requires_homogeneous_prefill_decode: bool = False
     # Async (pipelined) scheduling: schedule step N+1 before step N's sampled
     # token returns, advancing request state optimistically via placeholders.
@@ -66,6 +68,9 @@ class SchedulerConfig:
     stop_after_prefill: bool = False
 
     def __post_init__(self) -> None:
+        interval = self.prefix_cache_retention_interval
+        if type(interval) is not int or interval < 0:
+            raise ValueError("prefix_cache_retention_interval must be a nonnegative integer")
         if (
             not isinstance(self.speculative_prefix_cache_replay_tokens, int)
             or isinstance(self.speculative_prefix_cache_replay_tokens, bool)
@@ -99,6 +104,10 @@ class SchedulerConfig:
 
     def validate_cache_groups(self, groups: Sequence[KVCacheGroupSpec]) -> None:
         """Require enough replay to rebuild non-EAGLE rolling history."""
+        if self.enable_prefix_cache and any(g.is_checkpoint_state for g in groups):
+            alignment = math.lcm(*(g.spec.token_capacity for g in groups))
+            if self.prefix_cache_retention_interval % alignment:
+                raise ValueError(f"prefix_cache_retention_interval must be a multiple of {alignment}")
         if (
             not groups
             or not self.enable_prefix_cache
@@ -144,6 +153,7 @@ class Request:
     # Fixed from the complete prompt, not the latest confirmed/in-flight chunk.
     # Externally populated requests keep their allocator-owned checkpoint policy.
     group_checkpoint_boundary: int | None = None
+    group_shared_prefix_boundary: int = 0
     # Earliest valid KV position after a model skips the beginning of a
     # prefill chunk. Keep this across decode so partial pages stay unpublished.
     group_cache_valid_from: dict[str, int] = field(default_factory=dict)
@@ -207,7 +217,10 @@ class ScheduledRequest:
     block_ids_by_group: dict[str, list[int]] = field(default_factory=dict)
     cache_partition: int | None = None
     resumed_from_preemption: bool = False
-    group_blocks_retained: bool = False
+    group_block_snapshot: GroupBlockSnapshot | None = field(default=None, repr=False, compare=False)
+    read_block_ids_by_group: dict[str, dict[int, int]] = field(default_factory=dict)
+    group_read_snapshot: GroupBlockSnapshot | None = field(default=None, repr=False, compare=False)
+    checkpoint_plan: object | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -487,7 +500,9 @@ class Scheduler:
                 running_to_keep.append(request)
                 continue
 
-            if not self._try_allocate_request_blocks(request, scheduled_tokens):
+            scheduled = ScheduledRequest(request, num_new, is_prefill,
+                                         num_computed_tokens=request.num_computed_tokens)
+            if not self._try_allocate_request_blocks(request, scheduled_tokens, scheduled=scheduled):
                 preempted = self._preempt_lowest_priority(
                     request, scheduled_req_ids, num_scheduled_tokens, output
                 )
@@ -499,25 +514,17 @@ class Scheduler:
                     continue
                 token_budget += preempted.get("returned_tokens", 0)
                 output.preempted_requests.append(preempted["request"])
-                if not self._try_allocate_request_blocks(request, scheduled_tokens):
+                if not self._try_allocate_request_blocks(request, scheduled_tokens, scheduled=scheduled):
                     running_to_keep.append(request)
                     continue
 
             all_block_ids = request.cached_block_ids + request.allocated_block_ids
-            output.scheduled_requests.append(
-                ScheduledRequest(
-                    request=request,
-                    num_new_tokens=num_new,
-                    is_prefill=is_prefill,
-                    num_computed_tokens=request.num_computed_tokens,
-                    block_ids=list(all_block_ids),
-                    block_ids_by_group={
-                        name: list(block_ids)
-                        for name, block_ids in request.allocated_group_block_ids.items()
-                    },
-                    cache_partition=request.cache_partition,
-                )
-            )
+            scheduled.block_ids = list(all_block_ids)
+            scheduled.block_ids_by_group = {
+                name: list(block_ids) for name, block_ids in request.allocated_group_block_ids.items()
+            }
+            scheduled.cache_partition = request.cache_partition
+            output.scheduled_requests.append(scheduled)
             scheduled_req_ids.add(request.request_id)
             num_scheduled_tokens[request.request_id] = scheduled_tokens
             if is_prefill:
@@ -588,6 +595,9 @@ class Scheduler:
                         request.group_block_hashes,
                         max_cache_hit_tokens=request.group_checkpoint_boundary,
                     )
+                    request.group_shared_prefix_boundary = self.kv_cache_manager.group_history_prefix_hit(
+                        request.group_block_hashes, request.group_checkpoint_boundary,
+                    )
                     request.num_group_blocks_cached = (
                         self.kv_cache_manager.published_group_block_counts(
                             request.num_computed_tokens
@@ -642,7 +652,8 @@ class Scheduler:
                     remaining_waiting.append(request)
                     continue
 
-            allocated = self._try_allocate_request_blocks(request, num_new)
+            scheduled = ScheduledRequest(request, num_new, True)
+            allocated = self._try_allocate_request_blocks(request, num_new, scheduled=scheduled)
             if not allocated and grouped_prefix_hit:
                 # A grouped hit is rank-local. If its partition cannot hold the
                 # uncached suffix, release the hit and retry cold so an idle
@@ -655,6 +666,7 @@ class Scheduler:
                     allocated = self._try_allocate_request_blocks(
                         request,
                         cold_num_new,
+                        scheduled=scheduled,
                     )
                     if allocated:
                         logger.info(
@@ -686,20 +698,14 @@ class Scheduler:
             request.status = RequestStatus.RUNNING
             self.running.append(request)
             all_block_ids = request.cached_block_ids + request.allocated_block_ids
-            output.scheduled_requests.append(
-                ScheduledRequest(
-                    request=request,
-                    num_new_tokens=num_new,
-                    is_prefill=True,
-                    num_computed_tokens=request.num_computed_tokens,
-                    block_ids=list(all_block_ids),
-                    block_ids_by_group={
-                        name: list(block_ids)
-                        for name, block_ids in request.allocated_group_block_ids.items()
-                    },
-                    cache_partition=request.cache_partition,
-                )
-            )
+            scheduled.num_new_tokens = num_new
+            scheduled.num_computed_tokens = request.num_computed_tokens
+            scheduled.block_ids = list(all_block_ids)
+            scheduled.block_ids_by_group = {
+                name: list(block_ids) for name, block_ids in request.allocated_group_block_ids.items()
+            }
+            scheduled.cache_partition = request.cache_partition
+            output.scheduled_requests.append(scheduled)
             output.num_prefill_tokens += num_new
             token_budget -= num_new
 
@@ -860,11 +866,10 @@ class Scheduler:
             if scheduled.block_ids_by_group:
                 if scheduled.cache_partition is None:
                     raise RuntimeError("Grouped async step has no cache partition")
-                self.kv_cache_manager.retain_group_block_snapshot(
+                scheduled.group_block_snapshot = self.kv_cache_manager.retain_group_block_snapshot(
                     scheduled.block_ids_by_group,
                     scheduled.cache_partition,
                 )
-                scheduled.group_blocks_retained = True
             completes_prompt = (
                 request.num_computed_tokens + scheduled.num_new_tokens
                 >= request.num_prefill_tokens
@@ -967,7 +972,14 @@ class Scheduler:
                 self._reconcile_async_output(request, scheduled, token_ids, outputs)
             elif scheduled.is_prefill:
                 request.num_computed_tokens += scheduled.num_new_tokens
-                self._cache_completed_blocks(request)
+                try:
+                    self._cache_completed_blocks(request)
+                    self.kv_cache_manager.checkpoint_writer.complete(
+                        request.request_id, request.group_block_hashes, request.num_computed_tokens,
+                        scheduled.checkpoint_plan,
+                    )
+                finally:
+                    self._release_scheduled_group_blocks(scheduled)
                 if request.num_computed_tokens < request.num_prefill_tokens:
                     continue
                 for token_id in token_ids:
@@ -1089,6 +1101,9 @@ class Scheduler:
                         checkpoint_boundary=request.group_checkpoint_boundary,
                     )
                 )
+                self.kv_cache_manager.checkpoint_writer.complete(
+                    request.request_id, request.group_block_hashes, confirmed_tokens, scheduled.checkpoint_plan,
+                )
             else:
                 self._cache_completed_blocks(request, confirmed_tokens)
         finally:
@@ -1118,15 +1133,14 @@ class Scheduler:
             request.num_computed_tokens += accepted_speculative - (reserved - 1)
 
     def _release_scheduled_group_blocks(self, scheduled: ScheduledRequest) -> None:
-        if not scheduled.group_blocks_retained:
-            return
-        if scheduled.cache_partition is None:
-            raise RuntimeError("Retained grouped async step has no cache partition")
-        self.kv_cache_manager.release_group_block_snapshot(
-            scheduled.block_ids_by_group,
-            scheduled.cache_partition,
-        )
-        scheduled.group_blocks_retained = False
+        if scheduled.checkpoint_plan is not None:
+            self.kv_cache_manager.release_group_block_snapshot(scheduled.checkpoint_plan.snapshot)
+            scheduled.checkpoint_plan = None
+        for name in ("group_block_snapshot", "group_read_snapshot"):
+            snapshot = getattr(scheduled, name)
+            if snapshot is not None:
+                self.kv_cache_manager.release_group_block_snapshot(snapshot)
+                setattr(scheduled, name, None)
 
     def discard_scheduled_request(self, scheduled: ScheduledRequest) -> None:
         """Drop one failed/stale async step without publishing its KV hashes."""
@@ -1160,10 +1174,17 @@ class Scheduler:
         request.allocated_block_ids.extend(block_ids)
         return True
 
-    def _try_allocate_request_blocks(self, request: Request, num_new_tokens: int) -> bool:
+    def _try_allocate_request_blocks(
+        self, request: Request, num_new_tokens: int, *, scheduled: ScheduledRequest | None = None,
+    ) -> bool:
         """Grow either grouped or generic cache blocks for one scheduling step."""
         if self.kv_cache_manager.has_groups:
             total_tokens = request.num_computed_tokens + num_new_tokens
+            read_blocks, read_snapshot = ({}, None)
+            if scheduled is not None and scheduled.is_prefill:
+                read_blocks, read_snapshot = self.kv_cache_manager.retain_group_prefill_history(
+                    request.request_id, request.num_computed_tokens,
+                )
             try:
                 request.allocated_group_block_ids = self.kv_cache_manager.ensure_group_blocks(
                     request.request_id,
@@ -1173,8 +1194,26 @@ class Scheduler:
                 request.cache_partition = self.kv_cache_manager.group_request_partition(
                     request.request_id
                 )
-            except KVCacheCapacityError:
-                return False
+            except Exception as error:
+                if read_snapshot is not None:
+                    self.kv_cache_manager.release_group_block_snapshot(read_snapshot)
+                if isinstance(error, KVCacheCapacityError):
+                    return False
+                raise
+            if scheduled is not None:
+                scheduled.read_block_ids_by_group = read_blocks
+                scheduled.group_read_snapshot = read_snapshot
+                if scheduled.is_prefill and request.group_checkpoint_boundary is not None:
+                    try:
+                        scheduled.checkpoint_plan = self.kv_cache_manager.checkpoint_writer.prepare(
+                            request.request_id, request.num_computed_tokens, total_tokens, request.num_prompt_tokens,
+                            request.group_checkpoint_boundary, request.group_shared_prefix_boundary,
+                            self.config.prefix_cache_retention_interval,
+                            request.allocated_group_block_ids, read_blocks,
+                        )
+                    except Exception:
+                        self._release_scheduled_group_blocks(scheduled)
+                        raise
             return True
         return self._try_allocate_blocks(request, self._blocks_needed(request, num_new_tokens))
 
@@ -1218,6 +1257,9 @@ class Scheduler:
         if victim.request_id in scheduled_req_ids:
             scheduled_req_ids.discard(victim.request_id)
             returned_tokens = num_scheduled_tokens.pop(victim.request_id, 0)
+            for scheduled in output.scheduled_requests:
+                if scheduled.request.request_id == victim.request_id:
+                    self._release_scheduled_group_blocks(scheduled)
             output.scheduled_requests = [
                 s for s in output.scheduled_requests if s.request.request_id != victim.request_id
             ]
