@@ -211,7 +211,27 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         return self.runners[model.config.model_id].lookup_embeddings(token_ids)
 
     def run_prefill(self, model, batch):
-        return self.runners[model.config.model_id].run_prefill(model, batch)
+        runner = self.runners[model.config.model_id]
+        images = getattr(batch, "multimodal_inputs", {})
+        if images:
+            runner.preflight()
+            vision = getattr(runner.resources, "vision_host", None)
+            if vision is None:
+                raise ValueError("the selected V4.1 binding has no vision resources")
+            added = []
+            try:
+                for request_id, prompt_length in zip(batch.request_ids, batch.prompt_lens, strict=True):
+                    if request_id in images:
+                        known = request_id in vision.requests
+                        vision.register(request_id, images[request_id], prompt_length)
+                        if not known:
+                            added.append(request_id)
+                return runner.run_prefill(model, batch)
+            except BaseException:
+                for request_id in added:
+                    vision.release_request(request_id)
+                raise
+        return runner.run_prefill(model, batch)
 
     @property
     def max_prefill_batch_size(self) -> int | None:

@@ -94,6 +94,7 @@ nav:
       - Inference and Serving:
           - Offline Inference: user-guide/offline-inference.md
           - Online Serving: user-guide/online-serving.md
+          - DeepSeek V4.1 Images: user-guide/deepseek-v41-vision.md
           - Tool Calling: user-guide/tool-calling.md
           - PD Disaggregation: user-guide/pd-disaggregation.md
           - Parallelism and Scaling: user-guide/parallel.md

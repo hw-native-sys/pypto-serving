@@ -23,6 +23,7 @@ import msgspec
 
 from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
+from pypto_serving.model.tokenizer import MultimodalPrompt
 from pypto_serving.observability import InMemoryStatLogger, IterationStats, SchedulerStats
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
@@ -587,6 +588,8 @@ class ReplicaEngineCore:
                 top_k=config.top_k,
                 seed=config.seed,
                 constraint_spec=constraint_spec,
+                multimodal_inputs=list(prompt.images) if isinstance(prompt, MultimodalPrompt) else [],
+                cache_salt=prompt.cache_salt if isinstance(prompt, MultimodalPrompt) else b"",
             )
 
             if request_id in self._request_contexts:
@@ -1018,6 +1021,7 @@ class ReplicaEngineCore:
                     temperature=req.temperature,
                     top_p=req.top_p,
                     top_k=req.top_k,
+                    multimodal_inputs=getattr(req, "multimodal_inputs", []),
                     seed=req.seed,
                     min_tokens=req.min_tokens,
                     eos_token_id=req.eos_token_id,
@@ -1947,7 +1951,8 @@ class AsyncLLMEngine:
         return self._cores[0]
 
     def _tokenize_prompt(self, prompt: str) -> Sequence[int] | None:
-        prompt_token_ids = self.tokenizer.encode(prompt)
+        prompt_token_ids = (list(prompt.token_ids) if isinstance(prompt, MultimodalPrompt)
+                            else self.tokenizer.encode(prompt))
         if not prompt_token_ids and self.tokenizer.bos_token_id is not None:
             prompt_token_ids = [self.tokenizer.bos_token_id]
         if not prompt_token_ids:
