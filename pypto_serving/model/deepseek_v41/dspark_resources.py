@@ -58,7 +58,7 @@ _DRAFT_MODEL_KEYS = frozenset({
     "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight",
     "wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale",
     "wkv", "wkv_scale", "kv_norm_weight", "attn_sink", "wo_a", "wo_a_scale",
-    "wo_b", "wo_b_scale", "window_cache", "window_cache_scale",
+    "wo_b", "wo_b_scale", "window_cache",
     "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "ffn_norm_weight",
     "gate_weight", "correction_bias", "routed_w1", "routed_w1_scale",
     "routed_w2", "routed_w2_scale", "routed_w3", "routed_w3_scale",

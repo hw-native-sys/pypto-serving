@@ -90,9 +90,8 @@ jobs:
           checkout-path: dist-checkout
           needs-device: 'true'
           runtime-platform: a2a3
-          # This compiler passed the A3 guards with the bundled Lib. Drop the
-          # pin after its DSpark kernels migrate to explicit AIV splitting.
-          pypto-revision: 1dedb26c329407360c5c5ce6ecb495565c2f154e
+          # Match the Lib's explicit AIV shards and external-call specialization.
+          pypto-revision: 7302cd7ffeb552b3bec7c0e5bd92f164ba9fbd4b
           toolchain: bundle
           # CI_CACHE_ROOT is shared with pypto and pypto-lib, whose jobs already
           # claim `serving` / `pip-serving`. Name both after this repo so the two
@@ -248,7 +247,7 @@ jobs:
           runtime-platform: a5
           # The K5 guard passed with this compiler and the bundled Lib. Revisit
           # after the V4.1 dynamic-shape bindings compile on PyPTO main.
-          pypto-revision: e1508f6ddad12dbe0640e1c22b644c14ce088395
+          pypto-revision: 7302cd7ffeb552b3bec7c0e5bd92f164ba9fbd4b
           toolchain: bundle
           build-namespace: pypto-serving-v41-a5
           pip-cache-name: pip-pypto-serving-v41-a5
