@@ -11,6 +11,7 @@
 import asyncio
 from dataclasses import dataclass, field
 import logging
+import time
 
 from ..kv_cache import KVCacheCapacityError
 from .manager import CacheTier, Page
@@ -33,6 +34,7 @@ class Load:
     future: object
     waiters: set = field(default_factory=set)
     ready: bool = False
+    request: str | None = None
 
 
 @dataclass
@@ -43,12 +45,14 @@ class PendingPrefix:
     partition: int
     snapshot: object
     loads: tuple
+    started_ns: int = 0
 
 
 class TieredCache:
-    def __init__(self, cache, backend, capacity):
+    def __init__(self, cache, backend, capacity, *, trace=None):
         self.cache, self.backend = cache, backend
-        self.tier = CacheTier(capacity, backend, cache.release_group_block_snapshot)
+        self.trace = trace
+        self.tier = CacheTier(capacity, backend, cache.release_group_block_snapshot, trace=trace)
         self.pending, self.loads = {}, {}
         self.quarantined = []
 
@@ -109,6 +113,9 @@ class TieredCache:
                 self.tier.completed(load.future, load.page.size)
             except BaseException as error:
                 self.tier.error = error
+                if self.trace is not None:
+                    self.trace.emit("restore_failed", requests=sorted(load.waiters),
+                                    error_type=type(error).__name__, native_completed=False)
                 raise
             if load.waiters:
                 pool = self.cache._group_pools[key[1]]
@@ -119,12 +126,15 @@ class TieredCache:
             load.ready = True
             if not load.waiters:
                 self._finish_load(key)
+        if self.trace is not None:
+            self.trace.snapshot(self)
 
     def _lookup(self, pool, partition, value):
         resident = pool.hash_to_block.get((partition, value))
         return resident if resident is not None else self.tier.lookup((partition, pool.spec.name, value))
 
     def prepare(self, request, hashes, tokens, *, maximum, groups=None, partition=None):
+        started_ns = time.monotonic_ns() if self.trace is not None else 0
         if self.tier.error:
             raise RuntimeError("DDR work is quarantined") from self.tier.error
         pending = self.pending.get(request)
@@ -133,7 +143,7 @@ class TieredCache:
                 return False
             self.cache._protect_group_checkpoint(None, pending.hashes, pending.tokens,
                                                  pending.partition, {}, pending.boundary)
-            self.cancel(request)
+            self.cancel(request, completed=True)
             return True
         if not self.tier.pages:
             return True
@@ -156,6 +166,8 @@ class TieredCache:
                     for name, values in tables.items()}
         source_pin = self.cache.pin_cached_group_blocks(resident, selected)
         fresh = {key: page for key, page in missing.items() if key not in self.loads}
+        shared_with = ({self.loads[key].request for key in missing if key not in fresh}
+                       if self.trace is not None else set())
         targets = target_pin = None
         try:
             if fresh:
@@ -167,20 +179,37 @@ class TieredCache:
                     key = page.key
                     block = targets[key[1], key[2]]
                     destination = key[1], selected, self.cache._group_pools[key[1]].local_block_id(block)
-                    self.loads[key] = Load(page, block, selected, pins, self.tier.load(page, destination))
+                    self.loads[key] = Load(page, block, selected, pins,
+                        self.tier.load(page, destination, request=request), request=request)
             for key in missing:
                 self.loads[key].waiters.add(request)
-            self.pending[request] = PendingPrefix(hashes, tokens, boundary, selected, source_pin, tuple(missing))
+            self.pending[request] = PendingPrefix(hashes, tokens, boundary, selected, source_pin,
+                                                  tuple(missing), started_ns)
+            if self.trace is not None:
+                counts = {}
+                for key in missing:
+                    counts[key[1]] = counts.get(key[1], 0) + 1
+                self.trace.emit("restore_start", request_id=request, prompt_tokens=tokens,
+                    prefix_tokens=boundary, partition=selected, pages=len(missing),
+                    new_pages=len(fresh), groups=counts,
+                    restore_bytes=sum(page.size for page in missing.values()),
+                    shared_with=sorted(shared_with), prepare_ns=time.monotonic_ns()-started_ns)
             logger.info("kv_offload_restore request_id=%s prefix_tokens=%d partition=%d pages=%d",
                         request, boundary, selected, len(missing))
             return False
         except KVCacheCapacityError:
             self.cache.release_group_block_snapshot(source_pin)
+            if self.trace is not None:
+                self.trace.emit("restore_skipped", request_id=request, reason="hbm_capacity",
+                                prefix_tokens=boundary, partition=selected)
             return True
         except BaseException as error:
             # Once submitted, native LOAD owns its targets even if later submission fails.
             self.quarantined.append((source_pin, target_pin, tuple(fresh)))
             self.tier.error = error
+            if self.trace is not None:
+                self.trace.emit("restore_failed", requests=[request], error_type=type(error).__name__,
+                                native_completed=False)
             raise
 
     def _finish_load(self, key):
@@ -189,16 +218,24 @@ class TieredCache:
         if load.pins.remaining == 0:
             self.cache.release_group_block_snapshot(load.pins.snapshot)
 
-    def cancel(self, request):
+    def cancel(self, request, *, completed=False):
         pending = self.pending.pop(request, None)
         if pending is None:
             return
         self.cache.release_group_block_snapshot(pending.snapshot)
+        remaining = 0
         for key in pending.loads:
             load = self.loads[key]
+            remaining += not load.ready
             load.waiters.discard(request)
             if load.ready and not load.waiters:
                 self._finish_load(key)
+        if self.trace is not None:
+            self.trace.emit("restore_ready" if completed else "restore_cancelled",
+                request_id=request, prefix_tokens=pending.boundary, partition=pending.partition,
+                started_ns=pending.started_ns, elapsed_ns=time.monotonic_ns()-pending.started_ns,
+                pages=len(pending.loads),
+                unconfirmed_pages=remaining)
 
     def begin_close(self):
         for request in tuple(self.pending):

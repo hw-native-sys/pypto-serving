@@ -11,6 +11,7 @@
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from itertools import count
 from mmap import PAGESIZE
 from queue import Empty, SimpleQueue
 import logging
@@ -30,7 +31,7 @@ class StorageBackend(Protocol):
     def footprint(self, source: object) -> int: ...
     def reserve(self, handle: int, source: object) -> bool: ...
     def store(self, handle: int, source: object) -> Future: ...
-    def load(self, handle: int, destination: object) -> Future: ...
+    def load(self, handle: int, destination: object, *, request=None) -> Future: ...
     def release(self, handle: int) -> Future: ...
     def close(self) -> None: ...
 
@@ -88,10 +89,12 @@ class Job:
     spans: tuple
     storage: Storage
     enqueued: int
+    group: str
+    request: str | None
 
 
 class SimplerBackend:
-    def __init__(self, owners, geometry, capacity):
+    def __init__(self, owners, geometry, capacity, *, trace=None):
         self.owners, self.geometry = owners, geometry
         self.tp = geometry["tp"]
         self.extents = Extents(capacity)
@@ -101,6 +104,8 @@ class SimplerBackend:
         self.wake = threading.Event()
         self.closing = False
         self.close_error = None
+        self.trace = trace
+        self.batch_ids = count(1)
         self.metrics = {direction: dict(batches=0, pages=0, bytes=0, rpc_ns=0, native_ns=0,
                                        submit_ns=0, wait_ns=0, queue_ns=0)
                         for direction in ("store", "load")}
@@ -140,7 +145,7 @@ class SimplerBackend:
             self.records[handle] = Storage(ranks, size, extents)
             return True
 
-    def _submit(self, operation, handle, source):
+    def _submit(self, operation, handle, source, *, request=None):
         ranks, spans, size = self.plan(source)
         with self.lock:
             if self.closing:
@@ -151,7 +156,7 @@ class SimplerBackend:
                     or (operation == "store" and (storage.complete or storage.active))):
                 raise ValueError("cache storage layout or generation mismatch")
             future = Future()
-            job = Job(future, operation, handle, spans, storage, time.monotonic_ns())
+            job = Job(future, operation, handle, spans, storage, time.monotonic_ns(), source[0], request)
             storage.active += 1
             self.queue.put_nowait(job)
             self.wake.set()
@@ -160,8 +165,8 @@ class SimplerBackend:
     def store(self, handle, source):
         return self._submit("store", handle, source)
 
-    def load(self, handle, destination):
-        return self._submit("load", handle, destination)
+    def load(self, handle, destination, *, request=None):
+        return self._submit("load", handle, destination, request=request)
 
     def release(self, handle):
         future = Future()
@@ -174,7 +179,7 @@ class SimplerBackend:
         future.set_result(None)
         return future
 
-    def _finish(self, jobs, calls, dispatched):
+    def _finish(self, jobs, calls, dispatched, batch_id):
         try:
             replies = [call.result() for call in calls]
             for reply in replies:
@@ -211,6 +216,31 @@ class SimplerBackend:
                 job.storage.uncertain = True
                 if not job.future.done():
                     job.future.set_exception(error)
+            if self.trace is not None:
+                self.trace.emit("batch_failed", batch_id=batch_id, direction=jobs[0].operation,
+                    requests=sorted({job.request for job in jobs if job.request is not None}),
+                    pages=len(jobs), native_completed=False, error_type=type(error).__name__)
+            return
+        if self.trace is not None:
+            try:
+                ended = time.monotonic_ns()
+                groups = {}
+                for job in jobs:
+                    groups[job.group] = groups.get(job.group, 0) + 1
+                common = dict(batch_id=batch_id, direction=jobs[0].operation, pages=len(jobs),
+                    bytes=sum(job.storage.size for job in jobs), groups=groups,
+                    requests=sorted({job.request for job in jobs if job.request is not None}),
+                    queue_ns=sum(dispatched-job.enqueued for job in jobs),
+                    queue_max_ns=max(dispatched-job.enqueued for job in jobs),
+                    rpc_start_ns=dispatched, rpc_end_ns=ended)
+                for rank, reply in zip(jobs[0].storage.ranks, replies):
+                    self.trace.emit("batch", **common, partition=rank // self.tp, owner=rank,
+                        prepare_start_ns=reply["prepare_start_ns"], prepare_end_ns=reply["prepare_end_ns"],
+                        native_start_ns=reply["started_ns"], submitted_ns=reply["submitted_ns"],
+                        completed_ns=reply["completed_ns"], native_commands=reply["native_commands"])
+            except Exception:
+                self.trace.emit("diagnostic_failed", batch_id=batch_id, reason="batch_metadata")
+                logger.warning("DDR batch diagnostics unavailable; native result is unchanged", exc_info=True)
 
     def _run(self):
         pending = [dict(store=deque(), load=deque()) for _ in range(len(self.owners) // self.tp)]
@@ -219,9 +249,9 @@ class SimplerBackend:
         with ThreadPoolExecutor(max_workers=len(self.owners), thread_name_prefix="cache-owner-rpc") as executor:
             while True:
                 self.wake.clear()
-                for partition, (jobs, calls, dispatched) in tuple(active.items()):
+                for partition, (jobs, calls, dispatched, batch_id) in tuple(active.items()):
                     if all(call.done() for call in calls):
-                        self._finish(jobs, calls, dispatched)
+                        self._finish(jobs, calls, dispatched, batch_id)
                         del active[partition]
                 while True:
                     try:
@@ -263,7 +293,7 @@ class SimplerBackend:
                         call = executor.submit(self.owners[rank].call, "copy_batch", (direction, payload))
                         call.add_done_callback(lambda _: self.wake.set())
                         calls.append(call)
-                    active[partition] = jobs, calls, dispatched
+                    active[partition] = jobs, calls, dispatched, next(self.batch_ids)
                     previous_direction[partition] = direction
                 if self.closing and not active and self.queue.empty() and all(not any(q.values()) for q in pending):
                     try:

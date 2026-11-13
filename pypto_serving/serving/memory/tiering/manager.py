@@ -34,10 +34,11 @@ class Page:
     ready: bool = False
     readers: int = 0
     units: set = field(default_factory=set)
+    queued_ns: int = 0
 
 
 class CacheTier:
-    def __init__(self, capacity, backend, release_pin, *, policy=None, clock=time.monotonic):
+    def __init__(self, capacity, backend, release_pin, *, policy=None, clock=time.monotonic, trace=None):
         if type(capacity) is not int or capacity <= 0:
             raise ValueError("DDR capacity must be positive")
         self.capacity, self.backend, self.release_pin = capacity, backend, release_pin
@@ -51,6 +52,7 @@ class CacheTier:
         self.used = 0
         self.error = None
         self.closing = False
+        self.trace = trace
         self.counters = dict(stored_bytes=0, loaded_bytes=0, evicted_bytes=0, stores=0, loads=0)
 
     def capture(self, key, source, size, lease, *, charge=None):
@@ -67,6 +69,8 @@ class CacheTier:
             self.release_pin(lease)
             raise ValueError("a cache page exceeds the DDR capacity")
         page = Page(key, next(self.sequence), size, source, lease, charge)
+        if self.trace is not None:
+            page.queued_ns = time.monotonic_ns()
         self.pages[key] = page
         self.by_handle[page.handle] = page
         self.queued.append(page)
@@ -133,10 +137,10 @@ class CacheTier:
         for page in pages:
             page.readers -= 1
 
-    def load(self, page, destination):
+    def load(self, page, destination, *, request=None):
         if self.pages.get(page.key) is not page or not page.ready or page.readers <= 0:
             raise ValueError("LOAD requires a current DDR reader")
-        return self.backend.load(page.handle, destination)
+        return self.backend.load(page.handle, destination, request=request)
 
     @staticmethod
     def completed(future, expected):
@@ -188,6 +192,7 @@ class CacheTier:
         if self.error:
             raise RuntimeError("DDR work is quarantined") from self.error
         try:
+            reaped_pages = reaped_bytes = max_pin_age_ns = 0
             for page in tuple(self.inflight.values()):
                 if not page.future.done():
                     continue
@@ -199,6 +204,10 @@ class CacheTier:
                 page.lease = page.source = None
                 self.counters["stored_bytes"] += page.size
                 self.counters["stores"] += 1
+                if self.trace is not None:
+                    reaped_pages += 1
+                    reaped_bytes += page.size
+                    max_pin_age_ns = max(max_pin_age_ns, time.monotonic_ns()-page.queued_ns)
                 if not page.units:
                     self.policy.on_publish(("page", page.handle), self.clock())
                 for identity in tuple(self.pending_by_page.get(page.key, ())):
@@ -206,6 +215,9 @@ class CacheTier:
                     pending.remaining -= 1
                     if pending.remaining == 0:
                         self._publish_ready(identity, pending.keys)
+            if self.trace is not None and reaped_pages:
+                self.trace.emit("store_reaped", pages=reaped_pages, bytes=reaped_bytes,
+                                max_source_pin_age_ns=max_pin_age_ns)
             self._reap_retired()
             while self.queued and not self.closing:
                 page = self.queued[0]

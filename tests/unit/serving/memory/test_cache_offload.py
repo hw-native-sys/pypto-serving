@@ -41,7 +41,7 @@ class MemoryBackend:
         self.live[handle] = self.device.setdefault(source, ("bytes", source))
         return finished(dict(bytes=1, stopped=True, native_completed=True))
 
-    def load(self, handle, destination):
+    def load(self, handle, destination, *, request=None):
         self.device[destination] = self.live[handle]
         future = Future()
         if self.hold:

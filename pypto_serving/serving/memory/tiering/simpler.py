@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ctypes
 import threading
+import time
 
 from .pool import advise
 from .backend import BATCH_BYTES, BATCH_SPANS
@@ -97,6 +98,7 @@ class NativeCopy:
 
     def copy_batch(self, operation, pages):
         """All descriptors are validated before any native use of the shared pool."""
+        prepare_start_ns = time.monotonic_ns()
         self._check()
         if operation not in ("store", "load") or not pages:
             raise ValueError("invalid cache batch")
@@ -135,6 +137,7 @@ class NativeCopy:
             raise ValueError("overlapping DDR ranges or oversized native batch")
         timing = (ctypes.c_uint64 * 3)()
         planned = ctypes.c_size_t()
+        prepare_end_ns = time.monotonic_ns()
         try:
             code = self.native.copy_cache_batch(self.commands, count, 2 if operation == "store" else 1,
                                                 self.stream, timing, ctypes.byref(planned))
@@ -147,6 +150,7 @@ class NativeCopy:
                                      stopped=True, native_completed=True)
                                 for page, size in zip(pages, sizes)),
                     started_ns=timing[0], submitted_ns=timing[1], completed_ns=timing[2],
+                    prepare_start_ns=prepare_start_ns, prepare_end_ns=prepare_end_ns,
                     native_commands=planned.value)
 
     def close(self):

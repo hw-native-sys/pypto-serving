@@ -21,6 +21,7 @@ from .backend import SimplerBackend, endpoints
 from .cache import TieredCache
 from .native import build_copy_library
 from .pool import allocate_pool
+from .trace import OffloadTrace
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ class Session:
         self.owners = endpoints(context, len(config.worker_device_ids()))
         self.metadata = context.Queue(maxsize=1)
         self.cache = None
+        self.trace = None
         from .simpler import descriptor_wire
         self.copy_library = build_copy_library()
         try:
@@ -74,9 +76,14 @@ class Session:
                 or manager.group_partition_count * geometry["tp"] != len(self.owners)
                 or set(geometry["groups"]) != set(manager.group_names)):
             raise RuntimeError("offload worker/cache-manager geometry mismatch")
-        backend = SimplerBackend(self.owners, geometry, self.pool.nbytes)
-        self.cache = TieredCache(manager, backend, self.pool.nbytes)
+        self.trace = OffloadTrace.from_env()
+        backend = SimplerBackend(self.owners, geometry, self.pool.nbytes, trace=self.trace)
+        self.cache = TieredCache(manager, backend, self.pool.nbytes, trace=self.trace)
         manager.tiering = self.cache
+        if self.trace is not None:
+            self.trace.emit("ready", capacity_bytes=self.pool.nbytes, ranks=geometry["ranks"],
+                            tp=geometry["tp"], groups=geometry["groups"])
+            self.trace.snapshot(self.cache, force=True)
         logger.info("kv_offload_ready backend=simpler capacity_bytes=%d ranks=%d tp=%d",
                     self.cache.tier.capacity, geometry["ranks"], geometry["tp"])
 
@@ -91,6 +98,15 @@ class Session:
             raise
 
     async def close(self):
+        try:
+            await self._close()
+        finally:
+            if self.trace is not None:
+                if self.cache is not None:
+                    self.trace.snapshot(self.cache, force=True)
+                self.trace.close()
+
+    async def _close(self):
         if self.cache is None:
             return
         self.cache.begin_close()
@@ -114,4 +130,6 @@ class Session:
         self.copy_library.cleanup()
         self.cache.tier.finish_close()
         self.core.kv_cache_manager.tiering = None
+        if self.trace is not None:
+            self.trace.emit("shutdown", resources_closed=True)
         logger.info("kv_offload_closed counters=%s", self.cache.tier.counters)

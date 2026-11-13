@@ -34,7 +34,8 @@ class Owner:
             return dict(pages=tuple(dict(handle=h, bytes=sum(s[3] * s[4] for s in spans),
                                          stopped=True, native_completed=True)
                                     for h, _, _, spans in pages),
-                        started_ns=1, submitted_ns=2, completed_ns=3)
+                        started_ns=1, submitted_ns=2, completed_ns=3,
+                        prepare_start_ns=0, prepare_end_ns=1, native_commands=len(pages))
 
 
 @pytest.mark.parametrize("tp", [1, 4])
@@ -148,6 +149,7 @@ def test_progress_failure_wakes_clients_without_release_or_fake_completion():
         raise RuntimeError("native result unknown")
 
     session = Session.__new__(Session)
+    session.trace = None
     session.core, session.cache = core, SimpleNamespace(progress=failed)
     with pytest.raises(RuntimeError, match="unknown"):
         session.progress()
@@ -186,6 +188,7 @@ def test_shutdown_bounds_inactivity_without_timing_out_a_progressing_drain(monke
     cache = SimpleNamespace(tier=tier, loads={}, begin_close=lambda: None, close_ready=ready,
                             backend=SimpleNamespace(close=lambda: closed.append(True)))
     session = Session.__new__(Session)
+    session.trace = None
     session.cache = cache
     session.pool = SimpleNamespace(close=lambda: None)
     session.copy_library = SimpleNamespace(cleanup=lambda: None)
@@ -220,6 +223,7 @@ def test_shutdown_forgets_residency_only_after_backend_ack(failed):
                             begin_close=tier.begin_close, close_ready=tier.close_ready)
     session = Session.__new__(Session)
     session.pool = SimpleNamespace(close=lambda: None)
+    session.trace = None
     session.copy_library = SimpleNamespace(cleanup=lambda: None)
     session.cache, session.core = cache, SimpleNamespace(kv_cache_manager=SimpleNamespace(tiering=cache))
     if failed:

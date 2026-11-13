@@ -36,7 +36,7 @@ class Backend:
         del self.live[handle]
         return finished(None)
 
-    def load(self, handle, destination):
+    def load(self, handle, destination, *, request=None):
         return finished(dict(bytes=self.live[handle], stopped=True, native_completed=True))
 
     def close(self):
