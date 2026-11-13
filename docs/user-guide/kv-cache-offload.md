@@ -158,5 +158,9 @@ and DDR ranges until their users finish. LRU reclaims eligible SSD contents.
 
 The directory must support direct I/O, preallocation and hole punching. Each
 process owns a private file namespace, removed after its I/O drains. Contents are
-volatile; there is no index recovery after restart. This implementation has Host
-and CPU-stub qualification; model/device qualification remains pending.
+volatile; there is no index recovery after restart. Host tests cover the actual
+compact planner with CPU ACL stubs and real direct file I/O. Earlier no-weight
+TP1/TP4 device round trips passed byte/guard checks across all eight DSpark
+regions and independent compute/copy progress, before later diagnostic changes.
+Device qualification of the aligned stack and full ordinary-serving/PD model
+qualification remain pending.
