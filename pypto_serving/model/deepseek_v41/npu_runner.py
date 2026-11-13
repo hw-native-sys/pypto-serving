@@ -30,6 +30,8 @@ from typing import Callable
 
 import torch
 
+from pypto_serving.tools.profile import profile_span
+
 from pypto_serving.config.types import DecodeResult, KVCacheGroupSpec, PrefillResult
 from pypto_serving.model.common.runner.buffer_set import alloc_device_buffer
 
@@ -1040,88 +1042,89 @@ def prepare_compressed_metadata(
     position. An odd-length chunk leaves its tail in the request's state block.
     The formulas match lib metadata.paged_slots/compressor_metadata at fbe92bfc.
     """
-    if not isinstance(step, ForwardStep) or not isinstance(topology, SegmentTopology):
-        raise ValueError("compressed metadata requires a ForwardStep and SegmentTopology")
-    if type(ratio) is not int or ratio not in (1, 2):
-        raise ValueError("compression ratio must be 1 or 2")
-    if (type(cache_pages) is not int or not 0 < cache_pages <= (2**31 - 1) // 128
-            or type(max_requests) is not int or max_requests <= 0
-            or type(state_blocks) is not int or not 0 < state_blocks <= 2**31 - 1
-            or type(max_prepare_bytes) is not int or max_prepare_bytes <= 0):
-        raise ValueError("cache, request, state and allocation capacities must be positive and fit the ABI")
-    if not isinstance(compressed_group, str) or not compressed_group:
-        raise ValueError("compressed_group must identify a jointly numbered KV/index pool")
-    if step.phase not in ("prefill", "decode"):
-        raise ValueError("unsupported forward phase")
-    groups = [[] for _ in range(topology.dp)]
-    counts, owners, slots, names = [0] * topology.dp, set(), set(), set()
-    columns = 1
-    for request in step.requests:
-        group, count = request.partition, len(request.token_ids)
-        if (type(group) is not int or not 0 <= group < topology.dp or count <= 0
-                or type(request.start) is not int or not 0 <= request.start < request.end <= 2**31 - 1):
-            raise ValueError("invalid compressed request partition or extent")
-        if request.request_id in names:
-            raise ValueError("duplicate request in forward step")
-        names.add(request.request_id)
-        if step.phase == "decode" and count != 1:
-            raise ValueError("decode requires one token per request")
-        if counts[group] + count > topology.capacity or len(groups[group]) >= max_requests:
-            raise ValueError("compressed requests exceed token or request capacity")
-        if type(request.state_slot) is not int or not 0 <= request.state_slot < state_blocks:
-            raise ValueError("request state slot is outside the compressor pool")
-        key = (group, request.state_slot)
-        if ratio == 2 and key in slots:
-            raise ValueError("requests must own distinct compressor state slots")
-        slots.add(key)
-        pages = request.pages.get(compressed_group)
-        needed = (request.end // ratio + 127) // 128
-        if not isinstance(pages, (tuple, list)) or len(pages) < needed:
-            raise ValueError("compressed pages must cover all completed history")
-        for page in pages:
-            if type(page) is not int or not 0 <= page < cache_pages:
-                raise ValueError("compressed page is outside the joint KV/index pool")
-            if (group, page) in owners:
-                raise ValueError("compressed pages must be private within each DP group")
-            owners.add((group, page))
-        columns = max(columns, len(pages))
-        groups[group].append((request, counts[group], tuple(pages)))
-        counts[group] += count
-    # Include DP scratch plus replicated TP outputs and conservative small work arrays.
-    estimate = topology.dp * (topology.capacity * 40 + max_requests * (columns + 4) * 4) * (topology.tp + 1)
-    if estimate > max_prepare_bytes:
-        raise ValueError("compressed metadata exceeds its allocation budget")
-    shape = (topology.dp, topology.capacity)
-    positions = torch.zeros(shape, dtype=torch.int32)
-    ids = torch.full(shape, -1, dtype=torch.int32)
-    lens = torch.zeros(shape, dtype=torch.int32)
-    writes = torch.full(shape, -1, dtype=torch.int64)
-    rope = torch.full(shape, -1, dtype=torch.int32)
-    starts = torch.zeros(topology.dp, max_requests + 1, dtype=torch.int32)
-    tables = torch.full((topology.dp, max_requests, columns), -1, dtype=torch.int32)
-    states = torch.full((topology.dp, max_requests, 1), -1, dtype=torch.int32)
-    for group, requests in enumerate(groups):
-        for batch_row, (request, offset, pages) in enumerate(requests):
-            count = len(request.token_ids)
-            section = slice(offset, offset + count)
-            p = torch.arange(request.start, request.end, dtype=torch.int32)
-            positions[group, section] = p
-            ids[group, section] = batch_row
-            lens[group, section] = (p + 1) // ratio
-            if ratio == 2:
-                states[group, batch_row, 0] = request.state_slot
-            if pages:
-                tables[group, batch_row, :len(pages)] = torch.tensor(pages, dtype=torch.int32)
-            starts[group, batch_row + 1:] = offset + count
-            for local, position in enumerate(range(request.start, request.end)):
-                if (position + 1) % ratio == 0:
-                    logical = position // ratio
-                    writes[group, offset + local] = pages[logical // 128] * 128 + logical % 128
-                    rope[group, offset + local] = position + 1 - ratio
-    def replicate(tensor):
-        return tensor.repeat_interleave(topology.tp, dim=0)
-    return CompressedMetadata(*(replicate(t) for t in (positions, ids, starts, lens, writes, rope, tables, states)),
-                              tuple(counts))
+    with profile_span('v41.prepare_compressed_metadata', cat='v41.host', level='verbose'):
+        if not isinstance(step, ForwardStep) or not isinstance(topology, SegmentTopology):
+            raise ValueError("compressed metadata requires a ForwardStep and SegmentTopology")
+        if type(ratio) is not int or ratio not in (1, 2):
+            raise ValueError("compression ratio must be 1 or 2")
+        if (type(cache_pages) is not int or not 0 < cache_pages <= (2**31 - 1) // 128
+                or type(max_requests) is not int or max_requests <= 0
+                or type(state_blocks) is not int or not 0 < state_blocks <= 2**31 - 1
+                or type(max_prepare_bytes) is not int or max_prepare_bytes <= 0):
+            raise ValueError("cache, request, state and allocation capacities must be positive and fit the ABI")
+        if not isinstance(compressed_group, str) or not compressed_group:
+            raise ValueError("compressed_group must identify a jointly numbered KV/index pool")
+        if step.phase not in ("prefill", "decode"):
+            raise ValueError("unsupported forward phase")
+        groups = [[] for _ in range(topology.dp)]
+        counts, owners, slots, names = [0] * topology.dp, set(), set(), set()
+        columns = 1
+        for request in step.requests:
+            group, count = request.partition, len(request.token_ids)
+            if (type(group) is not int or not 0 <= group < topology.dp or count <= 0
+                    or type(request.start) is not int or not 0 <= request.start < request.end <= 2**31 - 1):
+                raise ValueError("invalid compressed request partition or extent")
+            if request.request_id in names:
+                raise ValueError("duplicate request in forward step")
+            names.add(request.request_id)
+            if step.phase == "decode" and count != 1:
+                raise ValueError("decode requires one token per request")
+            if counts[group] + count > topology.capacity or len(groups[group]) >= max_requests:
+                raise ValueError("compressed requests exceed token or request capacity")
+            if type(request.state_slot) is not int or not 0 <= request.state_slot < state_blocks:
+                raise ValueError("request state slot is outside the compressor pool")
+            key = (group, request.state_slot)
+            if ratio == 2 and key in slots:
+                raise ValueError("requests must own distinct compressor state slots")
+            slots.add(key)
+            pages = request.pages.get(compressed_group)
+            needed = (request.end // ratio + 127) // 128
+            if not isinstance(pages, (tuple, list)) or len(pages) < needed:
+                raise ValueError("compressed pages must cover all completed history")
+            for page in pages:
+                if type(page) is not int or not 0 <= page < cache_pages:
+                    raise ValueError("compressed page is outside the joint KV/index pool")
+                if (group, page) in owners:
+                    raise ValueError("compressed pages must be private within each DP group")
+                owners.add((group, page))
+            columns = max(columns, len(pages))
+            groups[group].append((request, counts[group], tuple(pages)))
+            counts[group] += count
+        # Include DP scratch plus replicated TP outputs and conservative small work arrays.
+        estimate = topology.dp * (topology.capacity * 40 + max_requests * (columns + 4) * 4) * (topology.tp + 1)
+        if estimate > max_prepare_bytes:
+            raise ValueError("compressed metadata exceeds its allocation budget")
+        shape = (topology.dp, topology.capacity)
+        positions = torch.zeros(shape, dtype=torch.int32)
+        ids = torch.full(shape, -1, dtype=torch.int32)
+        lens = torch.zeros(shape, dtype=torch.int32)
+        writes = torch.full(shape, -1, dtype=torch.int64)
+        rope = torch.full(shape, -1, dtype=torch.int32)
+        starts = torch.zeros(topology.dp, max_requests + 1, dtype=torch.int32)
+        tables = torch.full((topology.dp, max_requests, columns), -1, dtype=torch.int32)
+        states = torch.full((topology.dp, max_requests, 1), -1, dtype=torch.int32)
+        for group, requests in enumerate(groups):
+            for batch_row, (request, offset, pages) in enumerate(requests):
+                count = len(request.token_ids)
+                section = slice(offset, offset + count)
+                p = torch.arange(request.start, request.end, dtype=torch.int32)
+                positions[group, section] = p
+                ids[group, section] = batch_row
+                lens[group, section] = (p + 1) // ratio
+                if ratio == 2:
+                    states[group, batch_row, 0] = request.state_slot
+                if pages:
+                    tables[group, batch_row, :len(pages)] = torch.tensor(pages, dtype=torch.int32)
+                starts[group, batch_row + 1:] = offset + count
+                for local, position in enumerate(range(request.start, request.end)):
+                    if (position + 1) % ratio == 0:
+                        logical = position // ratio
+                        writes[group, offset + local] = pages[logical // 128] * 128 + logical % 128
+                        rope[group, offset + local] = position + 1 - ratio
+        def replicate(tensor):
+            return tensor.repeat_interleave(topology.tp, dim=0)
+        return CompressedMetadata(*(replicate(t) for t in (positions, ids, starts, lens, writes, rope, tables, states)),
+                                  tuple(counts))
 
 
 # decode_backbone
@@ -1232,32 +1235,34 @@ class DecodeForwardSegment:
         self.failed = False
 
     def run(self, state, *, group_counts):
-        if self.failed:
-            raise RuntimeError("full decode failed; close the worker before retrying")
-        if state.layout != "tp_local_token":
-            raise ValueError("full decode requires TP-local state")
-        if (len(group_counts) != self.topology.dp or
-                any(count <= 0 or count > self.topology.capacity for count in group_counts)):
-            raise ValueError("full decode requires nonempty token rows within capacity on all DP ranks")
-        if not self.counts_are_tensor and len(set(group_counts)) != 1:
-            raise ValueError("scalar-count full decode requires equal token rows on all DP ranks")
-        bound = dict(self.arguments, x_hc=state.residual, pre_mix=state.pre_mix)
-        if not self.counts_are_tensor:
-            bound["attention_num_tokens"] = ctypes.c_int32(group_counts[0])
-        if not getattr(self.worker, "_persistent", False) or not hasattr(
-                self.worker, "_reset_persistent_windows"):
-            raise RuntimeError("full decode requires a persistent worker")
-        previous_reset = self.worker._reset_persistent_windows
-        self.worker._reset_persistent_windows = False
-        try:
-            self.worker.run(self.program.compiled,
-                            *(bound[name] for name in self.param_names), config=self.run_config)
-        except BaseException:
-            self.failed = True
-            raise
-        finally:
-            self.worker._reset_persistent_windows = previous_reset
-        return state
+        with profile_span('v41.DecodeForwardSegment.run', cat='v41.host', level='verbose'):
+            if self.failed:
+                raise RuntimeError("full decode failed; close the worker before retrying")
+            if state.layout != "tp_local_token":
+                raise ValueError("full decode requires TP-local state")
+            if (len(group_counts) != self.topology.dp or
+                    any(count <= 0 or count > self.topology.capacity for count in group_counts)):
+                raise ValueError("full decode requires nonempty token rows within capacity on all DP ranks")
+            if not self.counts_are_tensor and len(set(group_counts)) != 1:
+                raise ValueError("scalar-count full decode requires equal token rows on all DP ranks")
+            bound = dict(self.arguments, x_hc=state.residual, pre_mix=state.pre_mix)
+            if not self.counts_are_tensor:
+                bound["attention_num_tokens"] = ctypes.c_int32(group_counts[0])
+            if not getattr(self.worker, "_persistent", False) or not hasattr(
+                    self.worker, "_reset_persistent_windows"):
+                raise RuntimeError("full decode requires a persistent worker")
+            previous_reset = self.worker._reset_persistent_windows
+            self.worker._reset_persistent_windows = False
+            try:
+                with profile_span("v41.worker.run", cat="v41.host", level="verbose"):
+                    self.worker.run(self.program.compiled,
+                                    *(bound[name] for name in self.param_names), config=self.run_config)
+            except BaseException:
+                self.failed = True
+                raise
+            finally:
+                self.worker._reset_persistent_windows = previous_reset
+            return state
 
 
 # npu_runner
@@ -1305,7 +1310,8 @@ class V41ModelRunner:
             self.resources = resources
             if resources is None or type(pages) is not int or pages <= 0:
                 raise ValueError("composite allocator must return resources and a positive page capacity")
-            self.bindings.wait(resources)
+            with profile_span("v41.wait", cat="v41.host", level="verbose"):
+                self.bindings.wait(resources)
             self.num_pages = pages
         except Exception:
             self.failed = True
@@ -1318,7 +1324,8 @@ class V41ModelRunner:
             return
         if self.resources is not None:
             # Do not free or reuse storage if completion itself fails.
-            self.bindings.wait(self.resources)
+            with profile_span("v41.wait", cat="v41.host", level="verbose"):
+                self.bindings.wait(self.resources)
             self.bindings.close(self.resources)
             self.resources = None
         self.closed = True
@@ -1335,26 +1342,31 @@ class V41ModelRunner:
         return self.ledger
 
     def _reset_request(self, key, owner):
-        self.bindings.reset_request(self.resources, key, owner)
-        self.bindings.wait(self.resources)
-        self.resources.release_request(key)
+        with profile_span('v41.V41ModelRunner._reset_request', cat='v41.host', level='verbose'):
+            self.bindings.reset_request(self.resources, key, owner)
+            with profile_span("v41.wait", cat="v41.host", level="verbose"):
+                self.bindings.wait(self.resources)
+            self.resources.release_request(key)
 
     def run_prefill(self, model, batch):
-        with self._lock:
-            ledger = self._request_ledger()
-            requests = prefill_requests(batch, model.config, self.runtime, self.bindings.cache_groups)
-            step = ledger.begin_prefill(requests)
-            return self._run_transaction(step, batch.input_embeddings)
+        with profile_span('v41.V41ModelRunner.run_prefill', cat='v41.host', level='verbose'):
+            with self._lock:
+                ledger = self._request_ledger()
+                requests = prefill_requests(batch, model.config, self.runtime, self.bindings.cache_groups)
+                step = ledger.begin_prefill(requests)
+                return self._run_transaction(step, batch.input_embeddings)
 
     def _run_transaction(self, step, embeddings):
         try:
             result = self._execute_step(step, embeddings)
-            self.bindings.wait(self.resources)
+            with profile_span("v41.wait", cat="v41.host", level="verbose"):
+                self.bindings.wait(self.resources)
             self.ledger.commit(step)
             return result
         except Exception:
             try:
-                self.bindings.wait(self.resources)
+                with profile_span("v41.wait", cat="v41.host", level="verbose"):
+                    self.bindings.wait(self.resources)
             except Exception:
                 self.failed = True
                 self.ledger.poisoned = True
@@ -1370,8 +1382,9 @@ class V41ModelRunner:
 
     def lookup_embeddings(self, token_ids):
         # A complete TP vocabulary exists in each DP group; read it once on host.
-        plans = self._rank_plans()[:self.plan.placement.tp_size]
-        return lookup_token_embeddings([plan.weights for plan in plans], token_ids)
+        with profile_span('v41.V41ModelRunner.lookup_embeddings', cat='v41.host', level='verbose'):
+            plans = self._rank_plans()[:self.plan.placement.tp_size]
+            return lookup_token_embeddings([plan.weights for plan in plans], token_ids)
 
     def _check_state(self, state):
         if not isinstance(state, LayerState) or state.residual is None or state.pre_mix is None:
@@ -1381,65 +1394,75 @@ class V41ModelRunner:
         return state
 
     def _run_layers(self, step, embeddings):
-        config = self.plan.weights.config
-        if embeddings is None:
-            embeddings = self.lookup_embeddings(torch.tensor(step.token_ids, dtype=torch.int64))
-        if (not isinstance(embeddings, torch.Tensor) or embeddings.device.type != "cpu"
-                or embeddings.dtype != torch.bfloat16
-                or tuple(embeddings.shape) != (len(step.token_ids), config.hidden_size)):
-            raise ValueError("input embeddings must be packed CPU BF16 [active_tokens, hidden_size]")
-        plans = self._rank_plans()
-        state = self.bindings.initialize(embeddings, step, self.resources)
-        self.bindings.wait(self.resources)
-        self._check_state(state)
-        backbone = (self.bindings.prefill_backbone if step.phase == "prefill"
-                    else self.bindings.decode_backbone)
-        if backbone is not None:
-            state = backbone(state, step, self.resources, plans)
-            self.bindings.wait(self.resources)
-            return self._check_state(state)
-        for layer in self.plan.layers:
-            # The adapter chooses bounded staging or residency; payloads stay packed.
-            weights = self.bindings.prepare_weights(plans, layer, self.resources)
-            self.bindings.wait(self.resources)
-            state = self.bindings.entries[(step.phase, layer.mode)](
-                layer, state, step, self.resources, weights)
-            self.bindings.wait(self.resources)
+        with profile_span('v41.V41ModelRunner._run_layers', cat='v41.host', level='verbose'):
+            config = self.plan.weights.config
+            if embeddings is None:
+                embeddings = self.lookup_embeddings(torch.tensor(step.token_ids, dtype=torch.int64))
+            if (not isinstance(embeddings, torch.Tensor) or embeddings.device.type != "cpu"
+                    or embeddings.dtype != torch.bfloat16
+                    or tuple(embeddings.shape) != (len(step.token_ids), config.hidden_size)):
+                raise ValueError("input embeddings must be packed CPU BF16 [active_tokens, hidden_size]")
+            plans = self._rank_plans()
+            state = self.bindings.initialize(embeddings, step, self.resources)
+            with profile_span("v41.wait", cat="v41.host", level="verbose"):
+                self.bindings.wait(self.resources)
             self._check_state(state)
-        return state
+            backbone = (self.bindings.prefill_backbone if step.phase == "prefill"
+                        else self.bindings.decode_backbone)
+            if backbone is not None:
+                state = backbone(state, step, self.resources, plans)
+                with profile_span("v41.wait", cat="v41.host", level="verbose"):
+                    self.bindings.wait(self.resources)
+                return self._check_state(state)
+            for layer in self.plan.layers:
+                # The adapter chooses bounded staging or residency; payloads stay packed.
+                weights = self.bindings.prepare_weights(plans, layer, self.resources)
+                with profile_span("v41.wait", cat="v41.host", level="verbose"):
+                    self.bindings.wait(self.resources)
+                state = self.bindings.entries[(step.phase, layer.mode)](
+                    layer, state, step, self.resources, weights)
+                with profile_span("v41.wait", cat="v41.host", level="verbose"):
+                    self.bindings.wait(self.resources)
+                self._check_state(state)
+            return state
 
     def _execute_step(self, step, embeddings):
         state = self._run_layers(step, embeddings)
         return self._finish_step(state, step)
 
     def _finish_step(self, state, step):
-        logits = self.bindings.output(state, step, self.resources)
-        self.bindings.wait(self.resources)
-        shape = (len(step.requests), self.plan.weights.config.vocab_size)
-        if (not isinstance(logits, torch.Tensor) or logits.device.type != "cpu"
-                or tuple(logits.shape) != shape or logits.dtype not in (
-                    torch.float32, torch.bfloat16, torch.float16)):
-            raise ValueError("output composite must return CPU logits [requests, vocabulary] in request order")
-        if not bool(torch.isfinite(logits).all()):
-            raise ValueError("output composite returned non-finite logits")
-        # Shared workers may sample after the next dispatch reuses device output
-        # scratch. Keep returned host logits independent of adapter-owned buffers.
-        owned_logits = logits.detach().clone()
-        if step.phase == "prefill":
-            return PrefillResult(last_hidden=None, logits=owned_logits)
-        return DecodeResult(hidden_states=None, logits=owned_logits)
+        with profile_span('v41.V41ModelRunner._finish_step', cat='v41.host', level='verbose'):
+            logits = self.bindings.output(state, step, self.resources)
+            with profile_span("v41.wait", cat="v41.host", level="verbose"):
+                self.bindings.wait(self.resources)
+            shape = (len(step.requests), self.plan.weights.config.vocab_size)
+            if (not isinstance(logits, torch.Tensor) or logits.device.type != "cpu"
+                    or tuple(logits.shape) != shape or logits.dtype not in (
+                        torch.float32, torch.bfloat16, torch.float16)):
+                raise ValueError("output composite must return CPU logits [requests, vocabulary] in request order")
+            if not bool(torch.isfinite(logits).all()):
+                raise ValueError("output composite returned non-finite logits")
+            # Shared workers may sample after the next dispatch reuses device output
+            # scratch. Keep returned host logits independent of adapter-owned buffers.
+            with profile_span("v41.logits.clone", cat="v41.host", level="verbose"):
+                owned_logits = logits.detach().clone()
+            if step.phase == "prefill":
+                return PrefillResult(last_hidden=None, logits=owned_logits)
+            return DecodeResult(hidden_states=None, logits=owned_logits)
 
     def run_decode(self, model, batch):
-        with self._lock:
-            ledger = self._request_ledger()
-            requests = decode_requests(batch, model.config, self.runtime, self.bindings.cache_groups)
-            step = ledger.begin_decode(requests)
-            return self._run_transaction(step, batch.hidden_states)
+        with profile_span('v41.V41ModelRunner.run_decode', cat='v41.host', level='verbose'):
+            with self._lock:
+                ledger = self._request_ledger()
+                requests = decode_requests(batch, model.config, self.runtime, self.bindings.cache_groups)
+                step = ledger.begin_decode(requests)
+                return self._run_transaction(step, batch.hidden_states)
 
     def release_finished_requests(self, request_ids):
         with self._lock:
             if self.ledger is not None:
-                self.bindings.wait(self.resources)
+                with profile_span("v41.wait", cat="v41.host", level="verbose"):
+                    self.bindings.wait(self.resources)
                 self.ledger.release(request_ids, self._reset_request)
 
     def run_dspark_prefill(self, request_id, *, slot, generation, prompt_length,
@@ -1534,12 +1557,14 @@ class V41ModelRunner:
                     lowered=dispatch.lowered,
                     request_ranks=dispatch.request_ranks,
                 )
-                self.bindings.wait(self.resources)
+                with profile_span("v41.wait", cat="v41.host", level="verbose"):
+                    self.bindings.wait(self.resources)
                 ledger.commit(step, accepted_counts=[len(tokens) for tokens in result.accepted_token_ids])
                 return result
             except Exception:
                 try:
-                    self.bindings.wait(self.resources)
+                    with profile_span("v41.wait", cat="v41.host", level="verbose"):
+                        self.bindings.wait(self.resources)
                 except Exception:
                     self.failed = ledger.poisoned = True
                     raise
@@ -1592,58 +1617,59 @@ def prepare_segment_inputs(
     same mapping for positions and other token metadata. This does not lower
     cache pages or initialize a production all-mode model adapter.
     """
-    if type(max_prepare_bytes) is not int or max_prepare_bytes <= 0:
-        raise ValueError("max_prepare_bytes must be a positive integer")
-    if not isinstance(step, ForwardStep) or not isinstance(topology, SegmentTopology):
-        raise ValueError("segment input preparation requires a ForwardStep and SegmentTopology")
-    if (not isinstance(embeddings, torch.Tensor) or embeddings.layout != torch.strided
-            or embeddings.device.type != "cpu" or embeddings.dtype != torch.bfloat16
-            or embeddings.ndim != 2 or embeddings.shape[1] <= 0):
-        raise ValueError("embeddings must be packed CPU BF16 [active_tokens, hidden_size]")
-    counts = [0] * topology.dp
-    source_ranges, last_rows = [], []
-    offset = 0
-    request_ids = set()
-    for request in step.requests:
-        partition, count = request.partition, len(request.token_ids)
-        if type(partition) is not int or not 0 <= partition < topology.dp or count <= 0:
-            raise ValueError("requests require valid DP partitions and nonempty token slices")
-        if request.request_id in request_ids:
-            raise ValueError("duplicate request in forward step")
-        request_ids.add(request.request_id)
-        start = counts[partition]
-        if start + count > topology.capacity:
-            raise ValueError("DP token count exceeds segment capacity; split the step first")
-        if step.phase == "decode" and count != 1:
-            raise ValueError("decode requires one fresh token per request")
-        source_ranges.append((partition, start, offset, count))
-        owner, row = divmod(start + count - 1, topology.local_capacity)
-        last_rows.append((partition * topology.tp + owner, row))
-        counts[partition] += count
-        offset += count
-    if step.phase not in ("prefill", "decode") or embeddings.shape[0] != offset:
-        raise ValueError("embedding rows must match a prefill/decode forward step")
-    hidden = embeddings.shape[1]
-    # Include output storage and the largest temporary expanded FP32 row block.
-    allocated_rows = topology.world * topology.local_capacity
-    estimate = allocated_rows * (4 * hidden * 4 + 4 * 4 + 8) + offset * hidden * 4
-    if estimate > max_prepare_bytes:
-        raise ValueError(f"segment preparation requires estimated {estimate} bytes; budget={max_prepare_bytes}")
-    if not bool(torch.isfinite(embeddings).all()):
-        raise ValueError("embeddings must be finite")
-    residual = torch.zeros(topology.dp, topology.capacity, 4, hidden, dtype=torch.float32)
-    pre_mix = torch.zeros(topology.dp, topology.capacity, 4, dtype=torch.float32)
-    row_indices = torch.full((topology.dp, topology.capacity), -1, dtype=torch.int64)
-    for partition, start, source, count in source_ranges:
-        residual[partition, start:start + count].copy_(embeddings[source:source + count, None])
-        pre_mix[partition, start:start + count, 0] = 1
-        row_indices[partition, start:start + count] = torch.arange(source, source + count)
-    return SegmentInputs(
-        residual.reshape(topology.world, topology.local_capacity, 4, hidden),
-        pre_mix.reshape(topology.world, topology.local_capacity, 4),
-        row_indices.reshape(topology.world, topology.local_capacity),
-        tuple(last_rows), tuple(counts),
-    )
+    with profile_span('v41.prepare_segment_inputs', cat='v41.host', level='verbose'):
+        if type(max_prepare_bytes) is not int or max_prepare_bytes <= 0:
+            raise ValueError("max_prepare_bytes must be a positive integer")
+        if not isinstance(step, ForwardStep) or not isinstance(topology, SegmentTopology):
+            raise ValueError("segment input preparation requires a ForwardStep and SegmentTopology")
+        if (not isinstance(embeddings, torch.Tensor) or embeddings.layout != torch.strided
+                or embeddings.device.type != "cpu" or embeddings.dtype != torch.bfloat16
+                or embeddings.ndim != 2 or embeddings.shape[1] <= 0):
+            raise ValueError("embeddings must be packed CPU BF16 [active_tokens, hidden_size]")
+        counts = [0] * topology.dp
+        source_ranges, last_rows = [], []
+        offset = 0
+        request_ids = set()
+        for request in step.requests:
+            partition, count = request.partition, len(request.token_ids)
+            if type(partition) is not int or not 0 <= partition < topology.dp or count <= 0:
+                raise ValueError("requests require valid DP partitions and nonempty token slices")
+            if request.request_id in request_ids:
+                raise ValueError("duplicate request in forward step")
+            request_ids.add(request.request_id)
+            start = counts[partition]
+            if start + count > topology.capacity:
+                raise ValueError("DP token count exceeds segment capacity; split the step first")
+            if step.phase == "decode" and count != 1:
+                raise ValueError("decode requires one fresh token per request")
+            source_ranges.append((partition, start, offset, count))
+            owner, row = divmod(start + count - 1, topology.local_capacity)
+            last_rows.append((partition * topology.tp + owner, row))
+            counts[partition] += count
+            offset += count
+        if step.phase not in ("prefill", "decode") or embeddings.shape[0] != offset:
+            raise ValueError("embedding rows must match a prefill/decode forward step")
+        hidden = embeddings.shape[1]
+        # Include output storage and the largest temporary expanded FP32 row block.
+        allocated_rows = topology.world * topology.local_capacity
+        estimate = allocated_rows * (4 * hidden * 4 + 4 * 4 + 8) + offset * hidden * 4
+        if estimate > max_prepare_bytes:
+            raise ValueError(f"segment preparation requires estimated {estimate} bytes; budget={max_prepare_bytes}")
+        if not bool(torch.isfinite(embeddings).all()):
+            raise ValueError("embeddings must be finite")
+        residual = torch.zeros(topology.dp, topology.capacity, 4, hidden, dtype=torch.float32)
+        pre_mix = torch.zeros(topology.dp, topology.capacity, 4, dtype=torch.float32)
+        row_indices = torch.full((topology.dp, topology.capacity), -1, dtype=torch.int64)
+        for partition, start, source, count in source_ranges:
+            residual[partition, start:start + count].copy_(embeddings[source:source + count, None])
+            pre_mix[partition, start:start + count, 0] = 1
+            row_indices[partition, start:start + count] = torch.arange(source, source + count)
+        return SegmentInputs(
+            residual.reshape(topology.world, topology.local_capacity, 4, hidden),
+            pre_mix.reshape(topology.world, topology.local_capacity, 4),
+            row_indices.reshape(topology.world, topology.local_capacity),
+            tuple(last_rows), tuple(counts),
+        )
 
 
 # swa_metadata
@@ -1702,22 +1728,23 @@ class HostEngramResources:
         self.host.release_request(request_id)
 
     def stage_lookup(self, target, step, topology, *, row_stride=None):
-        if (target.shape[1] != self.lookup.shape[1] or target.shape[3] != self.lookup.shape[3]
-                or target.shape[2] > self.lookup.shape[2]):
-            raise ValueError("Engram lookup capacity disagrees with the forward ABI")
-        target.zero_()
-        offsets = [0] * topology.dp
-        for request in step.requests:
-            start = offsets[request.partition]
-            values = self.host.lookup(request.token_ids, topology.capacity,
-                                      request.start, request_id=request.request_id)
-            count = len(request.token_ids)
-            if row_stride is not None and count > row_stride:
-                raise ValueError("Engram active rows exceed the request stride")
-            for tp_rank in range(topology.tp):
-                rank = request.partition * topology.tp + tp_rank
-                target[rank, :, start:start + count].copy_(values[:, :count])
-            offsets[request.partition] += count if row_stride is None else row_stride
+        with profile_span('v41.HostEngramResources.stage_lookup', cat='v41.engram', level='verbose'):
+            if (target.shape[1] != self.lookup.shape[1] or target.shape[3] != self.lookup.shape[3]
+                    or target.shape[2] > self.lookup.shape[2]):
+                raise ValueError("Engram lookup capacity disagrees with the forward ABI")
+            target.zero_()
+            offsets = [0] * topology.dp
+            for request in step.requests:
+                start = offsets[request.partition]
+                values = self.host.lookup(request.token_ids, topology.capacity,
+                                          request.start, request_id=request.request_id)
+                count = len(request.token_ids)
+                if row_stride is not None and count > row_stride:
+                    raise ValueError("Engram active rows exceed the request stride")
+                for tp_rank in range(topology.tp):
+                    rank = request.partition * topology.tp + tp_rank
+                    target[rank, :, start:start + count].copy_(values[:, :count])
+                offsets[request.partition] += count if row_stride is None else row_stride
 
 
 class ResidentEngramWeights:
@@ -1801,59 +1828,60 @@ def prepare_swa_window_metadata(
     TP peers receive the same group-global metadata. No cache contents, RoPE,
     request ownership or completion state are changed by this host preparation.
     """
-    if not isinstance(step, ForwardStep) or not isinstance(topology, SegmentTopology):
-        raise ValueError("SWA metadata requires a ForwardStep and SegmentTopology")
-    if type(cache_pages) is not int or not 0 < cache_pages <= (2**31 - 1) // 128:
-        raise ValueError("cache_pages must fit the INT32 window-index ABI")
-    if type(max_prepare_bytes) is not int or max_prepare_bytes <= 0:
-        raise ValueError("max_prepare_bytes must be a positive integer")
-    if step.phase not in ("prefill", "decode"):
-        raise ValueError("unsupported forward phase")
-    counts, ranges, owners, requests = [0] * topology.dp, [], set(), set()
-    for request in step.requests:
-        group, count = request.partition, len(request.token_ids)
-        if (type(group) is not int or not 0 <= group < topology.dp or count <= 0
-                or type(request.start) is not int or request.start < 0):
-            raise ValueError("request partition, start and token count must be valid")
-        if request.request_id in requests:
-            raise ValueError("duplicate request in forward step")
-        requests.add(request.request_id)
-        if step.phase == "decode" and count != 1:
-            raise ValueError("decode requires one token per request")
-        if counts[group] + count > topology.capacity:
-            raise ValueError("DP token count exceeds SWA capacity")
-        pages = request.pages.get(window_group)
-        if not isinstance(pages, (tuple, list)) or len(pages) < (request.end + 127) // 128:
-            raise ValueError("SWA requires a full-history physical page table through the chunk end")
-        for page in pages:
-            if type(page) is not int or not 0 <= page < cache_pages:
-                raise ValueError("SWA physical page is outside its partition cache pool")
-            key = (group, page)
-            if key in owners:
-                raise ValueError("SWA pages must be private; shared or repeated physical pages are unsupported")
-            owners.add(key)
-        ranges.append((group, counts[group], request.start, count, tuple(pages)))
-        counts[group] += count
-    rows = topology.dp * topology.capacity
-    estimate = rows * (128 * 4 + 2 * 8) * (topology.tp + 1)
-    if estimate > max_prepare_bytes:
-        raise ValueError(f"SWA metadata requires estimated {estimate} bytes; budget={max_prepare_bytes}")
-    positions = torch.zeros(topology.dp, topology.capacity, dtype=torch.int64)
-    slots = torch.full_like(positions, -1)
-    indices = torch.full((topology.dp, topology.capacity, 128), -1, dtype=torch.int32)
-    for group, row, start, count, pages in ranges:
-        for local in range(count):
-            position = start + local
-            positions[group, row + local] = position
-            slots[group, row + local] = pages[position // 128] * 128 + position % 128
-            visible = range(max(0, position - 127), position + 1)
-            addresses = [pages[p // 128] * 128 + p % 128 for p in visible]
-            indices[group, row + local, :len(addresses)] = torch.tensor(addresses, dtype=torch.int32)
-    return SwaWindowMetadata(
-        positions.repeat_interleave(topology.tp, dim=0),
-        slots.repeat_interleave(topology.tp, dim=0),
-        indices.repeat_interleave(topology.tp, dim=0), tuple(counts),
-    )
+    with profile_span('v41.prepare_swa_window_metadata', cat='v41.host', level='verbose'):
+        if not isinstance(step, ForwardStep) or not isinstance(topology, SegmentTopology):
+            raise ValueError("SWA metadata requires a ForwardStep and SegmentTopology")
+        if type(cache_pages) is not int or not 0 < cache_pages <= (2**31 - 1) // 128:
+            raise ValueError("cache_pages must fit the INT32 window-index ABI")
+        if type(max_prepare_bytes) is not int or max_prepare_bytes <= 0:
+            raise ValueError("max_prepare_bytes must be a positive integer")
+        if step.phase not in ("prefill", "decode"):
+            raise ValueError("unsupported forward phase")
+        counts, ranges, owners, requests = [0] * topology.dp, [], set(), set()
+        for request in step.requests:
+            group, count = request.partition, len(request.token_ids)
+            if (type(group) is not int or not 0 <= group < topology.dp or count <= 0
+                    or type(request.start) is not int or request.start < 0):
+                raise ValueError("request partition, start and token count must be valid")
+            if request.request_id in requests:
+                raise ValueError("duplicate request in forward step")
+            requests.add(request.request_id)
+            if step.phase == "decode" and count != 1:
+                raise ValueError("decode requires one token per request")
+            if counts[group] + count > topology.capacity:
+                raise ValueError("DP token count exceeds SWA capacity")
+            pages = request.pages.get(window_group)
+            if not isinstance(pages, (tuple, list)) or len(pages) < (request.end + 127) // 128:
+                raise ValueError("SWA requires a full-history physical page table through the chunk end")
+            for page in pages:
+                if type(page) is not int or not 0 <= page < cache_pages:
+                    raise ValueError("SWA physical page is outside its partition cache pool")
+                key = (group, page)
+                if key in owners:
+                    raise ValueError("SWA pages must be private; shared or repeated physical pages are unsupported")
+                owners.add(key)
+            ranges.append((group, counts[group], request.start, count, tuple(pages)))
+            counts[group] += count
+        rows = topology.dp * topology.capacity
+        estimate = rows * (128 * 4 + 2 * 8) * (topology.tp + 1)
+        if estimate > max_prepare_bytes:
+            raise ValueError(f"SWA metadata requires estimated {estimate} bytes; budget={max_prepare_bytes}")
+        positions = torch.zeros(topology.dp, topology.capacity, dtype=torch.int64)
+        slots = torch.full_like(positions, -1)
+        indices = torch.full((topology.dp, topology.capacity, 128), -1, dtype=torch.int32)
+        for group, row, start, count, pages in ranges:
+            for local in range(count):
+                position = start + local
+                positions[group, row + local] = position
+                slots[group, row + local] = pages[position // 128] * 128 + position % 128
+                visible = range(max(0, position - 127), position + 1)
+                addresses = [pages[p // 128] * 128 + p % 128 for p in visible]
+                indices[group, row + local, :len(addresses)] = torch.tensor(addresses, dtype=torch.int32)
+        return SwaWindowMetadata(
+            positions.repeat_interleave(topology.tp, dim=0),
+            slots.repeat_interleave(topology.tp, dim=0),
+            indices.repeat_interleave(topology.tp, dim=0), tuple(counts),
+        )
 
 
 # final_output
@@ -1898,16 +1926,17 @@ def prepare_final_output_rows(inputs: SegmentInputs, indices: torch.Tensor, *,
 
 def collect_final_logits(logits: torch.Tensor, rows: FinalOutputRows) -> torch.Tensor:
     """Return owned CPU logits in request order after output completion."""
-    if (not isinstance(logits, torch.Tensor) or logits.device.type != "cpu"
-            or logits.ndim != 3 or logits.shape[:2] != rows.indices.shape
-            or logits.dtype != torch.float32):
-        raise ValueError("lib output must be CPU FP32 [rank, logit_row, vocabulary]")
-    if not rows.locations:
-        raise ValueError("final output requires at least one request")
-    result = torch.stack([logits[rank, slot] for rank, slot in rows.locations]).clone()
-    if not bool(torch.isfinite(result).all()):
-        raise ValueError("lib output contains non-finite request logits")
-    return result
+    with profile_span('v41.collect_final_logits', cat='v41.host', level='verbose'):
+        if (not isinstance(logits, torch.Tensor) or logits.device.type != "cpu"
+                or logits.ndim != 3 or logits.shape[:2] != rows.indices.shape
+                or logits.dtype != torch.float32):
+            raise ValueError("lib output must be CPU FP32 [rank, logit_row, vocabulary]")
+        if not rows.locations:
+            raise ValueError("final output requires at least one request")
+        result = torch.stack([logits[rank, slot] for rank, slot in rows.locations]).clone()
+        if not bool(torch.isfinite(result).all()):
+            raise ValueError("lib output contains non-finite request logits")
+        return result
 
 
 # input_resources
@@ -1961,24 +1990,25 @@ class InputStateRuntime:
             raise
 
     def stage(self, embeddings: torch.Tensor, step: ForwardStep) -> tuple[LayerState, SegmentInputs]:
-        if self.failed:
-            raise RuntimeError("input upload failed; recreate the worker before reuse")
-        packed = prepare_segment_inputs(embeddings, step, self.host.topology)
-        self.host.residual.copy_(packed.residual)
-        self.host.pre_mix.copy_(packed.pre_mix)
-        try:
-            for source, destination in ((self.host.residual, self.residual),
-                                        (self.host.pre_mix, self.pre_mix)):
-                for rank, shard in enumerate(destination.shards):
-                    row = source[rank]
-                    self.worker.copy_to(shard.data_ptr, row.data_ptr(),
-                                        row.numel() * row.element_size(), worker_id=rank)
-        except BaseException:
-            self.failed = True
-            raise
-        inputs = SegmentInputs(self.host.residual, self.host.pre_mix,
-                               packed.row_indices, packed.request_last_rows, packed.group_counts)
-        return LayerState(self.residual, self.pre_mix, "tp_local_token"), inputs
+        with profile_span('v41.InputStateRuntime.stage', cat='v41.host', level='verbose'):
+            if self.failed:
+                raise RuntimeError("input upload failed; recreate the worker before reuse")
+            packed = prepare_segment_inputs(embeddings, step, self.host.topology)
+            self.host.residual.copy_(packed.residual)
+            self.host.pre_mix.copy_(packed.pre_mix)
+            try:
+                for source, destination in ((self.host.residual, self.residual),
+                                            (self.host.pre_mix, self.pre_mix)):
+                    for rank, shard in enumerate(destination.shards):
+                        row = source[rank]
+                        self.worker.copy_to(shard.data_ptr, row.data_ptr(),
+                                            row.numel() * row.element_size(), worker_id=rank)
+            except BaseException:
+                self.failed = True
+                raise
+            inputs = SegmentInputs(self.host.residual, self.host.pre_mix,
+                                   packed.row_indices, packed.request_last_rows, packed.group_counts)
+            return LayerState(self.residual, self.pre_mix, "tp_local_token"), inputs
 
     def close(self):
         for tensor in reversed(self._resident):
@@ -2094,86 +2124,88 @@ class PrefillMetadataResources:
 
     def stage(self, step, engram=None):
         # DP8 at the maximum 4096-row capacity needs 33 MiB of SWA scratch.
-        swa = prepare_swa_window_metadata(
-            step, self.topology, cache_pages=self.window_pages, max_prepare_bytes=64 << 20)
-        self.fields["window_slots"].copy_(swa.window_slots)
-        self.fields["window_indices"].copy_(swa.window_indices)
-        cos, sin = gather_swa_rope_rows(
-            swa, self.tables[""], max_prepare_bytes=64 << 20)
-        self.fields["rope_cos"].copy_(cos)
-        self.fields["rope_sin"].copy_(sin)
-        attention, moe = self.topology.counts(swa.group_counts)
-        self.fields["attention_counts"][:, 0].copy_(torch.tensor(attention, dtype=torch.int32))
-        self.fields["moe_counts"].copy_(torch.tensor(moe, dtype=torch.int32))
-        if engram is not None:
-            engram.stage_lookup(self.fields["engram_lookup"], step, self.topology)
-        for prefix, ratio in (("c2a", 2), ("c1a", 1)):
-            metadata = prepare_compressed_metadata(
-                step, self.topology, ratio=ratio, compressed_group=prefix,
-                cache_pages=self.compressed_pages[prefix], max_requests=self.max_requests,
-                state_blocks=self.max_requests,
-            )
-            if metadata.group_counts != swa.group_counts:
-                raise ValueError("SWA and compressed metadata token layouts disagree")
-            for name in ("position_ids", "request_ids", "query_start_loc", "compressed_lens",
-                         "compressed_slots", "compressed_rope_positions", "state_block_table"):
-                self.fields[prefix + "_" + name].copy_(getattr(metadata, name))
-            table = self.fields[prefix + "_index_block_table"]
-            source = metadata.index_block_table
-            if source.shape[2] > table.shape[2]:
-                raise ValueError("compressed page table exceeds its pre-fork capacity")
-            table.fill_(-1)
-            table[:, :, :source.shape[2]].copy_(source)
-            rows = self._compressed_rope_rows(metadata.compressed_rope_positions)
-            if prefix == "c2a":
-                self.fields["c2a_compressed_rope_cos"].copy_(rows[0])
-                self.fields["c2a_compressed_rope_sin"].copy_(rows[1])
-            else:
-                self.fields["compressed_rope_cos"].copy_(rows[0])
-                self.fields["compressed_rope_sin"].copy_(rows[1])
-        return swa.group_counts
+        with profile_span('v41.PrefillMetadataResources.stage', cat='v41.host', level='verbose'):
+            swa = prepare_swa_window_metadata(
+                step, self.topology, cache_pages=self.window_pages, max_prepare_bytes=64 << 20)
+            self.fields["window_slots"].copy_(swa.window_slots)
+            self.fields["window_indices"].copy_(swa.window_indices)
+            cos, sin = gather_swa_rope_rows(
+                swa, self.tables[""], max_prepare_bytes=64 << 20)
+            self.fields["rope_cos"].copy_(cos)
+            self.fields["rope_sin"].copy_(sin)
+            attention, moe = self.topology.counts(swa.group_counts)
+            self.fields["attention_counts"][:, 0].copy_(torch.tensor(attention, dtype=torch.int32))
+            self.fields["moe_counts"].copy_(torch.tensor(moe, dtype=torch.int32))
+            if engram is not None:
+                engram.stage_lookup(self.fields["engram_lookup"], step, self.topology)
+            for prefix, ratio in (("c2a", 2), ("c1a", 1)):
+                metadata = prepare_compressed_metadata(
+                    step, self.topology, ratio=ratio, compressed_group=prefix,
+                    cache_pages=self.compressed_pages[prefix], max_requests=self.max_requests,
+                    state_blocks=self.max_requests,
+                )
+                if metadata.group_counts != swa.group_counts:
+                    raise ValueError("SWA and compressed metadata token layouts disagree")
+                for name in ("position_ids", "request_ids", "query_start_loc", "compressed_lens",
+                             "compressed_slots", "compressed_rope_positions", "state_block_table"):
+                    self.fields[prefix + "_" + name].copy_(getattr(metadata, name))
+                table = self.fields[prefix + "_index_block_table"]
+                source = metadata.index_block_table
+                if source.shape[2] > table.shape[2]:
+                    raise ValueError("compressed page table exceeds its pre-fork capacity")
+                table.fill_(-1)
+                table[:, :, :source.shape[2]].copy_(source)
+                rows = self._compressed_rope_rows(metadata.compressed_rope_positions)
+                if prefix == "c2a":
+                    self.fields["c2a_compressed_rope_cos"].copy_(rows[0])
+                    self.fields["c2a_compressed_rope_sin"].copy_(rows[1])
+                else:
+                    self.fields["compressed_rope_cos"].copy_(rows[0])
+                    self.fields["compressed_rope_sin"].copy_(rows[1])
+            return swa.group_counts
 
     def stage_full(self, step, embeddings, engram=None):
         """Lower one chunk into the two-stage lib prefill ABI using scheduler pages."""
-        if self.full_hidden_size is None:
-            raise ValueError("full prefill staging was not allocated before worker startup")
-        if embeddings.shape[-1] != self.full_hidden_size:
-            raise ValueError("full prefill embedding width disagrees with the checkpoint")
-        counts = self.stage(step, engram)
-        packed = prepare_segment_inputs(embeddings, step, self.topology)
-        f = self.fields
-        f["full_embedding"].zero_()
-        active = packed.row_indices >= 0
-        f["full_embedding"][active] = embeddings[packed.row_indices[active]]
-        f["full_embedding_ids"].copy_(
-            torch.arange(self.topology.capacity, dtype=torch.int64).expand(self.topology.world, -1))
-        f["full_initial_pre"].zero_()
-        f["full_initial_pre"][:, :, 0] = 1
-        f["full_identity_rows"].fill_(-1)
-        f["full_replay_rows"].fill_(-1)
-        f["full_counts"].zero_()
-        for rank, count in enumerate(counts):
-            f["full_counts"][rank] = count
-            f["full_identity_rows"][rank, :count] = torch.arange(count, dtype=torch.int32)
-            f["full_replay_rows"][rank, :count] = torch.arange(count, dtype=torch.int32)
-        for stage, family in enumerate(("c2a", "c1a")):
-            f["full_position_ids"][:, stage].copy_(f[family + "_position_ids"])
-            f["full_window_slots"][:, stage].copy_(f["window_slots"])
-            f["full_window_indices"][:, stage].copy_(f["window_indices"])
-            f["full_token_requests"][:, stage].copy_(f[family + "_request_ids"])
-            f["full_query_starts"][:, stage].copy_(f[family + "_query_start_loc"])
-        f["full_logit_rows"].fill_(-1)
-        per_rank = [0] * self.topology.world
-        rows_per_rank = [0] * self.topology.world
-        for request in step.requests:
-            rank = request.partition
-            slot = per_rank[rank]
-            if slot >= 16:
-                raise ValueError("full prefill supports at most 16 output requests per rank")
-            f["full_logit_rows"][rank, slot] = rows_per_rank[rank] + len(request.token_ids) - 1
-            rows_per_rank[rank] += len(request.token_ids)
-            per_rank[rank] += 1
-        return counts
+        with profile_span('v41.PrefillMetadataResources.stage_full', cat='v41.host', level='verbose'):
+            if self.full_hidden_size is None:
+                raise ValueError("full prefill staging was not allocated before worker startup")
+            if embeddings.shape[-1] != self.full_hidden_size:
+                raise ValueError("full prefill embedding width disagrees with the checkpoint")
+            counts = self.stage(step, engram)
+            packed = prepare_segment_inputs(embeddings, step, self.topology)
+            f = self.fields
+            f["full_embedding"].zero_()
+            active = packed.row_indices >= 0
+            f["full_embedding"][active] = embeddings[packed.row_indices[active]]
+            f["full_embedding_ids"].copy_(
+                torch.arange(self.topology.capacity, dtype=torch.int64).expand(self.topology.world, -1))
+            f["full_initial_pre"].zero_()
+            f["full_initial_pre"][:, :, 0] = 1
+            f["full_identity_rows"].fill_(-1)
+            f["full_replay_rows"].fill_(-1)
+            f["full_counts"].zero_()
+            for rank, count in enumerate(counts):
+                f["full_counts"][rank] = count
+                f["full_identity_rows"][rank, :count] = torch.arange(count, dtype=torch.int32)
+                f["full_replay_rows"][rank, :count] = torch.arange(count, dtype=torch.int32)
+            for stage, family in enumerate(("c2a", "c1a")):
+                f["full_position_ids"][:, stage].copy_(f[family + "_position_ids"])
+                f["full_window_slots"][:, stage].copy_(f["window_slots"])
+                f["full_window_indices"][:, stage].copy_(f["window_indices"])
+                f["full_token_requests"][:, stage].copy_(f[family + "_request_ids"])
+                f["full_query_starts"][:, stage].copy_(f[family + "_query_start_loc"])
+            f["full_logit_rows"].fill_(-1)
+            per_rank = [0] * self.topology.world
+            rows_per_rank = [0] * self.topology.world
+            for request in step.requests:
+                rank = request.partition
+                slot = per_rank[rank]
+                if slot >= 16:
+                    raise ValueError("full prefill supports at most 16 output requests per rank")
+                f["full_logit_rows"][rank, slot] = rows_per_rank[rank] + len(request.token_ids) - 1
+                rows_per_rank[rank] += len(request.token_ids)
+                per_rank[rank] += 1
+            return counts
 
     def full_arguments(self):
         if self.full_hidden_size is None:
@@ -2352,24 +2384,26 @@ class PrefillForwardSegment:
             raise
 
     def run(self):
-        if self.failed:
-            raise RuntimeError("full prefill failed; recreate the worker before reuse")
-        if not getattr(self.worker, "_persistent", False) or not hasattr(
-            self.worker, "_reset_persistent_windows"
-        ):
-            raise RuntimeError("full prefill requires a persistent worker")
-        previous_reset = self.worker._reset_persistent_windows
-        self.worker._reset_persistent_windows = False
-        try:
-            self.worker.run(self.program.compiled,
-                            *(self.arguments[name] for name in self.param_names),
-                            config=self.run_config)
-        except BaseException:
-            self.failed = True
-            raise
-        finally:
-            self.worker._reset_persistent_windows = previous_reset
-        return LayerState(self.residual, self.pre_mix, "tp_local_token")
+        with profile_span('v41.PrefillForwardSegment.run', cat='v41.host', level='verbose'):
+            if self.failed:
+                raise RuntimeError("full prefill failed; recreate the worker before reuse")
+            if not getattr(self.worker, "_persistent", False) or not hasattr(
+                self.worker, "_reset_persistent_windows"
+            ):
+                raise RuntimeError("full prefill requires a persistent worker")
+            previous_reset = self.worker._reset_persistent_windows
+            self.worker._reset_persistent_windows = False
+            try:
+                with profile_span("v41.worker.run", cat="v41.host", level="verbose"):
+                    self.worker.run(self.program.compiled,
+                                    *(self.arguments[name] for name in self.param_names),
+                                    config=self.run_config)
+            except BaseException:
+                self.failed = True
+                raise
+            finally:
+                self.worker._reset_persistent_windows = previous_reset
+            return LayerState(self.residual, self.pre_mix, "tp_local_token")
 
     def close(self):
         for tensor in reversed(self._owned):
@@ -2871,74 +2905,75 @@ class V41ResidentResources:
                 slot * pages_per_slot, (slot + 1) * pages_per_slot, dtype=torch.int32)
 
     def _stage_dspark_decode(self, resources, batch):
-        request_ids = tuple(batch.request_ids)
-        partitions = tuple(int(value) for value in batch.cache_partitions)
-        if len(partitions) != len(request_ids):
-            raise ValueError("DSpark decode partitions must match request order")
-        rows_by_rank = {}
-        request_rows = []
-        for rank in partitions:
-            row = rows_by_rank.get(rank, 0)
-            rows_by_rank[rank] = row + 1
-            request_rows.append(row)
-        workspace = resources.decode_workspace
-        for value in workspace.values():
-            if isinstance(value, torch.Tensor):
-                value.zero_()
-        workspace["input_ids"].zero_()
-        workspace["target_positions"].fill_(-1)
-        workspace["active_widths"].zero_()
-        workspace["logit_row_indices"].fill_(-1)
-        workspace["state_block_table"].fill_(-1)
-        tokens = self._host_tensor(batch.token_ids).reshape(-1).tolist()
-        # DecodeBatch.seq_lens includes the sampled anchor token, as in
-        # decode_requests; Engram resumes at the preceding committed length.
-        positions = [int(end) - 1 for end in self._host_tensor(batch.seq_lens).reshape(-1).tolist()]
-        if len(tokens) != len(request_ids) or len(positions) != len(request_ids):
-            raise ValueError("DSpark decode token and position rows must match requests")
-        state = resources.state
-        engram_requests = []
-        for index, (request_id, rank, row) in enumerate(
-                zip(request_ids, partitions, request_rows, strict=True)):
-            if not 0 <= rank < resources.layout.dp_size or row >= DSPARK_MAX_BATCH_PER_DP:
-                raise ValueError("DSpark batch row exceeds the selected DP topology")
-            request_state = self.dspark.states.get(request_id)
-            if positions[index] != request_state.anchor:
-                raise ValueError("DSpark scheduler position disagrees with the committed anchor")
-            if request_state.anchor_token is not None and int(tokens[index]) != request_state.anchor_token:
-                raise ValueError("DSpark scheduler token disagrees with the committed anchor")
-            if len(request_state.draft_ids) not in (0, DSPARK_SPECULATIVE_TOKENS):
-                raise MissingCompositeInterface(
-                    f"DSpark request {request_id!r} has invalid draft state")
-            active_tokens = (int(tokens[index]), *request_state.draft_ids)
-            width = len(active_tokens)
-            if not 0 <= positions[index] < positions[index] + width <= request_state.position_limit:
-                raise ValueError("DSpark active target rows exceed the request position limit")
-            slot, generation = self._resolve_dspark_state(request_id)
-            state.slot_ids[rank, row] = slot
-            state.generations[rank, row] = generation
-            workspace["input_ids"][rank, row, :width] = torch.tensor(active_tokens, dtype=torch.int64)
-            workspace["target_positions"][rank, row, :width] = torch.arange(
-                int(positions[index]), int(positions[index]) + width,
-                dtype=torch.int32)
-            workspace["active_widths"][rank, row] = width
-            workspace["zero_prefill_tokens"][rank, row] = 0
-            workspace["state_block_table"][rank, row, 0] = slot
-            workspace["logit_row_indices"][rank, row] = row * DSPARK_ROWS_PER_REQUEST + width - 1
-            workspace["attention_num_tokens"][rank] = (row + 1) * DSPARK_ROWS_PER_REQUEST
-            workspace["moe_num_tokens"][rank] = (row + 1) * DSPARK_ROWS_PER_REQUEST
-            engram_requests.append(RequestSlice(
-                request_id, rank, slot, int(positions[index]),
-                active_tokens, request_state.prompt_length,
-                batch.block_ids_by_group[index],
-            ))
-        self._stage_dspark_tables(resources, batch, partitions, request_rows)
-        if self.engram_host is not None:
-            self.engram_host.stage_lookup(
-                self.decode_host.fields["engram_lookup"],
-                ForwardStep("decode", tuple(engram_requests), 0), self.decode_host.topology,
-                row_stride=DSPARK_ROWS_PER_REQUEST)
-        return tuple(partitions), tuple(request_rows)
+        with profile_span('v41.V41ResidentResources._stage_dspark_decode', cat='v41.host', level='verbose'):
+            request_ids = tuple(batch.request_ids)
+            partitions = tuple(int(value) for value in batch.cache_partitions)
+            if len(partitions) != len(request_ids):
+                raise ValueError("DSpark decode partitions must match request order")
+            rows_by_rank = {}
+            request_rows = []
+            for rank in partitions:
+                row = rows_by_rank.get(rank, 0)
+                rows_by_rank[rank] = row + 1
+                request_rows.append(row)
+            workspace = resources.decode_workspace
+            for value in workspace.values():
+                if isinstance(value, torch.Tensor):
+                    value.zero_()
+            workspace["input_ids"].zero_()
+            workspace["target_positions"].fill_(-1)
+            workspace["active_widths"].zero_()
+            workspace["logit_row_indices"].fill_(-1)
+            workspace["state_block_table"].fill_(-1)
+            tokens = self._host_tensor(batch.token_ids).reshape(-1).tolist()
+            # DecodeBatch.seq_lens includes the sampled anchor token, as in
+            # decode_requests; Engram resumes at the preceding committed length.
+            positions = [int(end) - 1 for end in self._host_tensor(batch.seq_lens).reshape(-1).tolist()]
+            if len(tokens) != len(request_ids) or len(positions) != len(request_ids):
+                raise ValueError("DSpark decode token and position rows must match requests")
+            state = resources.state
+            engram_requests = []
+            for index, (request_id, rank, row) in enumerate(
+                    zip(request_ids, partitions, request_rows, strict=True)):
+                if not 0 <= rank < resources.layout.dp_size or row >= DSPARK_MAX_BATCH_PER_DP:
+                    raise ValueError("DSpark batch row exceeds the selected DP topology")
+                request_state = self.dspark.states.get(request_id)
+                if positions[index] != request_state.anchor:
+                    raise ValueError("DSpark scheduler position disagrees with the committed anchor")
+                if request_state.anchor_token is not None and int(tokens[index]) != request_state.anchor_token:
+                    raise ValueError("DSpark scheduler token disagrees with the committed anchor")
+                if len(request_state.draft_ids) not in (0, DSPARK_SPECULATIVE_TOKENS):
+                    raise MissingCompositeInterface(
+                        f"DSpark request {request_id!r} has invalid draft state")
+                active_tokens = (int(tokens[index]), *request_state.draft_ids)
+                width = len(active_tokens)
+                if not 0 <= positions[index] < positions[index] + width <= request_state.position_limit:
+                    raise ValueError("DSpark active target rows exceed the request position limit")
+                slot, generation = self._resolve_dspark_state(request_id)
+                state.slot_ids[rank, row] = slot
+                state.generations[rank, row] = generation
+                workspace["input_ids"][rank, row, :width] = torch.tensor(active_tokens, dtype=torch.int64)
+                workspace["target_positions"][rank, row, :width] = torch.arange(
+                    int(positions[index]), int(positions[index]) + width,
+                    dtype=torch.int32)
+                workspace["active_widths"][rank, row] = width
+                workspace["zero_prefill_tokens"][rank, row] = 0
+                workspace["state_block_table"][rank, row, 0] = slot
+                workspace["logit_row_indices"][rank, row] = row * DSPARK_ROWS_PER_REQUEST + width - 1
+                workspace["attention_num_tokens"][rank] = (row + 1) * DSPARK_ROWS_PER_REQUEST
+                workspace["moe_num_tokens"][rank] = (row + 1) * DSPARK_ROWS_PER_REQUEST
+                engram_requests.append(RequestSlice(
+                    request_id, rank, slot, int(positions[index]),
+                    active_tokens, request_state.prompt_length,
+                    batch.block_ids_by_group[index],
+                ))
+            self._stage_dspark_tables(resources, batch, partitions, request_rows)
+            if self.engram_host is not None:
+                self.engram_host.stage_lookup(
+                    self.decode_host.fields["engram_lookup"],
+                    ForwardStep("decode", tuple(engram_requests), 0), self.decode_host.topology,
+                    row_stride=DSPARK_ROWS_PER_REQUEST)
+            return tuple(partitions), tuple(request_rows)
 
     def _retain_dspark_prefill(self, step):
         """Keep only the drafter's visible target taps across prefill chunks."""
@@ -2971,43 +3006,44 @@ class V41ResidentResources:
         self._dspark_prefill_progress = progress
 
     def _stage_dspark_prefill(self, resources, batch, request_ids, sampled_token_ids):
-        if len(request_ids) != 1:
-            raise ValueError("V4.1 DSpark bootstrap currently accepts one terminal request")
-        request_id = str(request_ids[0])
-        partitions = tuple(int(value) for value in getattr(batch, "cache_partitions", (0,)))
-        rank = partitions[0] if partitions else 0
-        slot, generation = self._resolve_dspark_state(request_id)
-        workspace = resources.prefill_workspace
-        for name, value in workspace.items():
-            if name != "prefill_target_hidden" and isinstance(value, torch.Tensor):
-                value.zero_()
-        workspace["sampled_rows"].fill_(-1)
-        workspace["prefill_positions"].fill_(-1)
-        workspace["prefill_request_ids"].fill_(-1)
-        prompt_length = int(batch.prompt_lens[0])
-        if not 0 < prompt_length <= resources.layout.max_seq_len:
-            raise ValueError("DSpark prefill prompt exceeds the configured context capacity")
-        if getattr(self, "_dspark_prefill_progress", {}).get(rank) != (request_id, prompt_length):
-            raise ValueError("DSpark bootstrap requires all target prefill chunks to complete")
-        retained_count = min(prompt_length, resources.layout.max_prefill_tokens, DSPARK_WINDOW)
-        if retained_count < min(prompt_length, DSPARK_WINDOW):
-            raise ValueError("DSpark prefill buffer cannot retain the visible draft context")
-        prefix_start = prompt_length - retained_count
-        workspace["prompt_lengths"][rank, 0] = prompt_length
-        workspace["position_limits"][rank, 0] = resources.layout.max_seq_len
-        workspace["sampled_rows"][rank, 0] = 0
-        workspace["next_prefill_tokens"][rank, 0] = int(sampled_token_ids[0])
-        workspace["prefill_counts"][rank, 0] = retained_count
-        workspace["first_query_positions"][rank, 0] = prompt_length
-        workspace["prefill_positions"][rank, :retained_count] = torch.arange(
-            prefix_start, prompt_length, dtype=torch.int32)
-        workspace["prefill_request_ids"][rank, :retained_count] = 0
-        workspace["prefill_sampled_ids"][rank, 0, 0] = int(sampled_token_ids[0])
-        groups = getattr(batch, "block_ids_by_group", ())
-        if len(groups) != 1:
-            raise ValueError("DSpark bootstrap requires one cache allocation")
-        self._stage_dspark_tables(resources, batch, (rank,), (0,))
-        return request_id, slot, generation
+        with profile_span('v41.V41ResidentResources._stage_dspark_prefill', cat='v41.host', level='verbose'):
+            if len(request_ids) != 1:
+                raise ValueError("V4.1 DSpark bootstrap currently accepts one terminal request")
+            request_id = str(request_ids[0])
+            partitions = tuple(int(value) for value in getattr(batch, "cache_partitions", (0,)))
+            rank = partitions[0] if partitions else 0
+            slot, generation = self._resolve_dspark_state(request_id)
+            workspace = resources.prefill_workspace
+            for name, value in workspace.items():
+                if name != "prefill_target_hidden" and isinstance(value, torch.Tensor):
+                    value.zero_()
+            workspace["sampled_rows"].fill_(-1)
+            workspace["prefill_positions"].fill_(-1)
+            workspace["prefill_request_ids"].fill_(-1)
+            prompt_length = int(batch.prompt_lens[0])
+            if not 0 < prompt_length <= resources.layout.max_seq_len:
+                raise ValueError("DSpark prefill prompt exceeds the configured context capacity")
+            if getattr(self, "_dspark_prefill_progress", {}).get(rank) != (request_id, prompt_length):
+                raise ValueError("DSpark bootstrap requires all target prefill chunks to complete")
+            retained_count = min(prompt_length, resources.layout.max_prefill_tokens, DSPARK_WINDOW)
+            if retained_count < min(prompt_length, DSPARK_WINDOW):
+                raise ValueError("DSpark prefill buffer cannot retain the visible draft context")
+            prefix_start = prompt_length - retained_count
+            workspace["prompt_lengths"][rank, 0] = prompt_length
+            workspace["position_limits"][rank, 0] = resources.layout.max_seq_len
+            workspace["sampled_rows"][rank, 0] = 0
+            workspace["next_prefill_tokens"][rank, 0] = int(sampled_token_ids[0])
+            workspace["prefill_counts"][rank, 0] = retained_count
+            workspace["first_query_positions"][rank, 0] = prompt_length
+            workspace["prefill_positions"][rank, :retained_count] = torch.arange(
+                prefix_start, prompt_length, dtype=torch.int32)
+            workspace["prefill_request_ids"][rank, :retained_count] = 0
+            workspace["prefill_sampled_ids"][rank, 0, 0] = int(sampled_token_ids[0])
+            groups = getattr(batch, "block_ids_by_group", ())
+            if len(groups) != 1:
+                raise ValueError("DSpark bootstrap requires one cache allocation")
+            self._stage_dspark_tables(resources, batch, (rank,), (0,))
+            return request_id, slot, generation
 
     def _dspark_payload(self, *, model, batch, phase, resources, **extra):
         from .dspark_resources import _DRAFT_MODEL_KEYS, _MARKOV_MODEL_KEYS
@@ -3098,57 +3134,60 @@ class V41ResidentResources:
         return dispatch
 
     def _activate_prefill(self):
-        if self._prefill_fwd is not None:
-            return
-        program, names, run_config, topology = self._prefill_binding
-        if program is None:
-            raise RuntimeError("full prefill was not registered")
-        self._prefill_fwd = PrefillForwardSegment(
-            self.worker, program, names, run_config, topology,
-            self.weights, self.prefill_host, self.cache, self.final, self.engram)
+        with profile_span('v41.V41ResidentResources._activate_prefill', cat='v41.host', level='verbose'):
+            if self._prefill_fwd is not None:
+                return
+            program, names, run_config, topology = self._prefill_binding
+            if program is None:
+                raise RuntimeError("full prefill was not registered")
+            self._prefill_fwd = PrefillForwardSegment(
+                self.worker, program, names, run_config, topology,
+                self.weights, self.prefill_host, self.cache, self.final, self.engram)
 
     def _activate_decode(self):
-        if self._decode_fwd is not None:
-            return
-        if self._decode_binding is None:
-            raise RuntimeError("full decode was not registered")
-        program, names, run_config, counts_are_tensor = self._decode_binding
-        self._decode_fwd = DecodeForwardSegment(
-            self.worker, program, names, run_config, self.decode_host.topology,
-            counts_are_tensor, self.weights, self.cache, self.decode_host, self.final, self.engram)
+        with profile_span('v41.V41ResidentResources._activate_decode', cat='v41.host', level='verbose'):
+            if self._decode_fwd is not None:
+                return
+            if self._decode_binding is None:
+                raise RuntimeError("full decode was not registered")
+            program, names, run_config, counts_are_tensor = self._decode_binding
+            self._decode_fwd = DecodeForwardSegment(
+                self.worker, program, names, run_config, self.decode_host.topology,
+                counts_are_tensor, self.weights, self.cache, self.decode_host, self.final, self.engram)
 
     def begin_step(self, embeddings, step):
-        if self.closed or self._step is not None:
-            raise RuntimeError("V4.1 worker is closed or a step is already active")
-        if step.phase == "prefill" and self._prefill_binding[0] is not None:
-            self._activate_prefill()
-        elif step.phase == "decode":
-            self._activate_decode()
-        dispatch_step = step
-        if step.phase == "decode":
-            dispatch_step, embeddings, padding_partitions = pad_single_decode(
-                step, embeddings, self.cache.plan)
-            for partition in padding_partitions:
-                self.cache.reset_padding(partition)
-        host = self.prefill_host if step.phase == "prefill" else self.decode_host
-        counts = (host.stage_full(dispatch_step, embeddings, self.engram_host)
-                  if step.phase == "prefill" and self._prefill_fwd is not None else
-                  host.stage(dispatch_step, self.engram_host) if host is not None else None)
-        input_runtime = self.decode_input if step.phase == "decode" else self.input
-        if input_runtime is None:
-            raise ValueError("decode requires its own TP-local input capacity")
-        state, inputs = input_runtime.stage(embeddings, dispatch_step)
-        if dispatch_step is not step:
-            inputs = replace(inputs, request_last_rows=inputs.request_last_rows[:len(step.requests)])
-        self._output_rows = prepare_final_output_rows(
-            inputs, self.final.host.logit_row_indices,
-            local_capacity=inputs.row_indices.shape[1],
-        )
-        self.final.host.logits.zero_()
-        self.final.host.sampled_ids.fill_(-1)
-        self._step, self._inputs = step, inputs
-        self._group_counts = counts
-        return state
+        with profile_span('v41.V41ResidentResources.begin_step', cat='v41.host', level='verbose'):
+            if self.closed or self._step is not None:
+                raise RuntimeError("V4.1 worker is closed or a step is already active")
+            if step.phase == "prefill" and self._prefill_binding[0] is not None:
+                self._activate_prefill()
+            elif step.phase == "decode":
+                self._activate_decode()
+            dispatch_step = step
+            if step.phase == "decode":
+                dispatch_step, embeddings, padding_partitions = pad_single_decode(
+                    step, embeddings, self.cache.plan)
+                for partition in padding_partitions:
+                    self.cache.reset_padding(partition)
+            host = self.prefill_host if step.phase == "prefill" else self.decode_host
+            counts = (host.stage_full(dispatch_step, embeddings, self.engram_host)
+                      if step.phase == "prefill" and self._prefill_fwd is not None else
+                      host.stage(dispatch_step, self.engram_host) if host is not None else None)
+            input_runtime = self.decode_input if step.phase == "decode" else self.input
+            if input_runtime is None:
+                raise ValueError("decode requires its own TP-local input capacity")
+            state, inputs = input_runtime.stage(embeddings, dispatch_step)
+            if dispatch_step is not step:
+                inputs = replace(inputs, request_last_rows=inputs.request_last_rows[:len(step.requests)])
+            self._output_rows = prepare_final_output_rows(
+                inputs, self.final.host.logit_row_indices,
+                local_capacity=inputs.row_indices.shape[1],
+            )
+            self.final.host.logits.zero_()
+            self.final.host.sampled_ids.fill_(-1)
+            self._step, self._inputs = step, inputs
+            self._group_counts = counts
+            return state
 
     def run_prefill_fwd(self, state, step):
         if (self.closed or step is not self._step or step.phase != "prefill"
@@ -3179,134 +3218,138 @@ class V41ResidentResources:
         ``decode_fwd_dspark`` orchestrator remain the owner of stage ordering;
         serving does not rebuild the drafter or Markov graph from small ops.
         """
-        if self.closed or self.failed:
-            raise RuntimeError("cannot dispatch DSpark on a closed or failed worker")
-        try:
-            program = self.dspark_programs[stage]
-            param_names = self.dspark_param_names[stage]
-        except KeyError as exc:
-            raise MissingCompositeInterface(f"DSpark stage is not compiled: {stage}") from exc
-        supplied = set(arguments)
-        required = set(param_names)
-        if supplied != required:
-            raise ValueError(
-                f"DSpark stage {stage} ABI mismatch: "
-                f"missing={sorted(required - supplied)} extra={sorted(supplied - required)}"
-            )
-        bound = arguments
-        reset_windows = False
-        if stage in ("dspark_drafter", "decode"):
-            module = importlib.import_module("models.deepseek_v4_1_flash.dspark_drafter")
-            hidden_name = "draft_head_hidden" if stage == "decode" else "head_hidden"
-            batch = int(arguments[hidden_name].shape[1])
-            chunks = (batch + module.DSPARK_CHUNK_REQUESTS - 1) // module.DSPARK_CHUNK_REQUESTS
-            stride = chunks * module.DSPARK_DRAFT_LAYERS
-            key = id(program.compiled)
-            epoch = self._dspark_drafter_epochs.get(key, 1)
-            # The pinned A5 int32 AtomicAdd signal stops advancing at 2048.
-            # Reuse the prefill epoch bound before a three-layer call crosses it.
-            reset_windows = epoch + stride - 1 > 512
+        with profile_span('v41.V41ResidentResources.dispatch_dspark', cat='v41.host', level='verbose'):
+            if self.closed or self.failed:
+                raise RuntimeError("cannot dispatch DSpark on a closed or failed worker")
+            try:
+                program = self.dspark_programs[stage]
+                param_names = self.dspark_param_names[stage]
+            except KeyError as exc:
+                raise MissingCompositeInterface(f"DSpark stage is not compiled: {stage}") from exc
+            supplied = set(arguments)
+            required = set(param_names)
+            if supplied != required:
+                raise ValueError(
+                    f"DSpark stage {stage} ABI mismatch: "
+                    f"missing={sorted(required - supplied)} extra={sorted(supplied - required)}"
+                )
+            bound = arguments
+            reset_windows = False
+            if stage in ("dspark_drafter", "decode"):
+                module = importlib.import_module("models.deepseek_v4_1_flash.dspark_drafter")
+                hidden_name = "draft_head_hidden" if stage == "decode" else "head_hidden"
+                batch = int(arguments[hidden_name].shape[1])
+                chunks = (batch + module.DSPARK_CHUNK_REQUESTS - 1) // module.DSPARK_CHUNK_REQUESTS
+                stride = chunks * module.DSPARK_DRAFT_LAYERS
+                key = id(program.compiled)
+                epoch = self._dspark_drafter_epochs.get(key, 1)
+                # The pinned A5 int32 AtomicAdd signal stops advancing at 2048.
+                # Reuse the prefill epoch bound before a three-layer call crosses it.
+                reset_windows = epoch + stride - 1 > 512
+                if reset_windows:
+                    epoch = 1
+                if epoch + stride - 1 > (2**31 - 1) // 2:
+                    raise OverflowError("DSpark communication epoch exhausted; recreate worker")
+                # These windows persist across both bootstrap and decode. Allocate
+                # epochs at dispatch, so repeated lowering cannot consume them and
+                # replaying an already lowered payload cannot reuse old signals.
+                bound = dict(arguments, moe_epoch=epoch)
             if reset_windows:
-                epoch = 1
-            if epoch + stride - 1 > (2**31 - 1) // 2:
-                raise OverflowError("DSpark communication epoch exhausted; recreate worker")
-            # These windows persist across both bootstrap and decode. Allocate
-            # epochs at dispatch, so repeated lowering cannot consume them and
-            # replaying an already lowered payload cannot reuse old signals.
-            bound = dict(arguments, moe_epoch=epoch)
-        if reset_windows:
-            previous_reset = self.worker._reset_persistent_windows
-            self.worker._reset_persistent_windows = True
-        try:
-            self.worker.run(program.compiled,
-                            *(bound[name] for name in param_names), config=self.run_config)
-        finally:
-            if reset_windows:
-                self.worker._reset_persistent_windows = previous_reset
-        if stage in ("dspark_drafter", "decode"):
-            self._dspark_drafter_epochs[key] = epoch + stride
+                previous_reset = self.worker._reset_persistent_windows
+                self.worker._reset_persistent_windows = True
+            try:
+                with profile_span("v41.worker.run", cat="v41.host", level="verbose"):
+                    self.worker.run(program.compiled,
+                                    *(bound[name] for name in param_names), config=self.run_config)
+            finally:
+                if reset_windows:
+                    self.worker._reset_persistent_windows = previous_reset
+            if stage in ("dspark_drafter", "decode"):
+                self._dspark_drafter_epochs[key] = epoch + stride
 
     def _run_dspark_orchestrator(self, lowered: DSparkLoweredInputs, *, phase: str) -> None:
         """Run the lib-owned orchestration against resident compiled stages."""
-        if not isinstance(lowered, DSparkLoweredInputs):
-            raise TypeError("DSpark orchestration requires lowered serving inputs")
-        try:
-            lowered.validate(phase=phase)
-        except (TypeError, ValueError) as exc:
-            raise MissingCompositeInterface(str(exc)) from exc
-        required_mappings = (
-            ("draft_model", lowered.draft_model),
-            ("markov_model", lowered.markov_model),
-            ("cache_tables", lowered.cache_tables),
-            ("rope_tables", lowered.rope_tables),
-        )
-        missing = [name for name, mapping in required_mappings if not mapping]
-        if missing:
-            raise MissingCompositeInterface(
-                "V4.1 DSpark lowering is missing mappings: " + ", ".join(missing)
+        with profile_span('v41.V41ResidentResources._run_dspark_orchestrator', cat='v41.host', level='verbose'):
+            if not isinstance(lowered, DSparkLoweredInputs):
+                raise TypeError("DSpark orchestration requires lowered serving inputs")
+            try:
+                lowered.validate(phase=phase)
+            except (TypeError, ValueError) as exc:
+                raise MissingCompositeInterface(str(exc)) from exc
+            required_mappings = (
+                ("draft_model", lowered.draft_model),
+                ("markov_model", lowered.markov_model),
+                ("cache_tables", lowered.cache_tables),
+                ("rope_tables", lowered.rope_tables),
             )
-        try:
-            module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd_dspark")
-            function = (module.prefill_bootstrap_dspark if phase == "prefill"
-                        else module.decode_fwd_dspark)
-        except (ImportError, AttributeError) as exc:
-            raise MissingCompositeInterface(
-                "V4.1 DSpark lib orchestration entry is unavailable"
-            ) from exc
-        runner = _DSparkOrchestratorRunner(self, phase)
-        try:
-            kwargs = dict(
-                moe_epoch=lowered.moe_epoch,
-                logits_epoch=lowered.logits_epoch,
-            )
-            if phase == "prefill":
-                function(
-                    runner, lowered.state, lowered.workspace, lowered.draft_model,
-                    lowered.markov_model, lowered.cache_tables, lowered.rope_tables,
-                    **kwargs,
+            missing = [name for name, mapping in required_mappings if not mapping]
+            if missing:
+                raise MissingCompositeInterface(
+                    "V4.1 DSpark lowering is missing mappings: " + ", ".join(missing)
                 )
-            else:
-                function(
-                    runner, lowered.state, lowered.workspace, lowered.target_model,
-                    lowered.draft_model, lowered.markov_model, lowered.cache_tables,
-                    lowered.rope_tables, **kwargs,
+            try:
+                module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd_dspark")
+                function = (module.prefill_bootstrap_dspark if phase == "prefill"
+                            else module.decode_fwd_dspark)
+            except (ImportError, AttributeError) as exc:
+                raise MissingCompositeInterface(
+                    "V4.1 DSpark lib orchestration entry is unavailable"
+                ) from exc
+            runner = _DSparkOrchestratorRunner(self, phase)
+            try:
+                kwargs = dict(
+                    moe_epoch=lowered.moe_epoch,
+                    logits_epoch=lowered.logits_epoch,
                 )
-            runner.finish()
-        except MissingCompositeInterface:
-            raise
-        except BaseException as exc:
-            self.failed = True
-            raise RuntimeError(f"V4.1 DSpark {phase} orchestration failed") from exc
+                if phase == "prefill":
+                    function(
+                        runner, lowered.state, lowered.workspace, lowered.draft_model,
+                        lowered.markov_model, lowered.cache_tables, lowered.rope_tables,
+                        **kwargs,
+                    )
+                else:
+                    function(
+                        runner, lowered.state, lowered.workspace, lowered.target_model,
+                        lowered.draft_model, lowered.markov_model, lowered.cache_tables,
+                        lowered.rope_tables, **kwargs,
+                    )
+                runner.finish()
+            except MissingCompositeInterface:
+                raise
+            except BaseException as exc:
+                self.failed = True
+                raise RuntimeError(f"V4.1 DSpark {phase} orchestration failed") from exc
 
     def _read_dspark_output(self, lowered, name):
         """Return an owned CPU copy of one device-produced DSpark output."""
-        value = lowered.outputs.get(name, lowered.workspace.get(name))
-        if value is None:
-            raise MissingCompositeInterface(
-                f"V4.1 DSpark output lowering is missing {name!r}"
-            )
-        if callable(value):
-            value = value()
-        if isinstance(value, torch.Tensor):
-            if value.device.type != "cpu":
+        with profile_span('v41.V41ResidentResources._read_dspark_output', cat='v41.host', level='verbose'):
+            value = lowered.outputs.get(name, lowered.workspace.get(name))
+            if value is None:
                 raise MissingCompositeInterface(
-                    f"V4.1 DSpark output {name!r} needs a serving readback buffer"
+                    f"V4.1 DSpark output lowering is missing {name!r}"
                 )
-            return value.detach().clone()
-        from pypto.runtime import StackedDeviceTensor
+            if callable(value):
+                value = value()
+            if isinstance(value, torch.Tensor):
+                if value.device.type != "cpu":
+                    raise MissingCompositeInterface(
+                        f"V4.1 DSpark output {name!r} needs a serving readback buffer"
+                    )
+                return value.detach().clone()
+            from pypto.runtime import StackedDeviceTensor
 
-        shards = getattr(value, "shards", None)
-        if shards is None or not isinstance(value, StackedDeviceTensor):
-            raise TypeError(f"V4.1 DSpark output {name!r} is not a tensor")
-        result = torch.empty(tuple(value.shape), dtype=value.dtype).share_memory_()
-        for rank, shard in enumerate(shards):
-            destination = result[rank]
-            self.worker.copy_from(
-                destination.data_ptr(), shard.data_ptr,
-                destination.numel() * destination.element_size(),
-                src_offset=0, worker_id=value.worker_ids[rank],
-            )
-        return result
+            shards = getattr(value, "shards", None)
+            if shards is None or not isinstance(value, StackedDeviceTensor):
+                raise TypeError(f"V4.1 DSpark output {name!r} is not a tensor")
+            result = torch.empty(tuple(value.shape), dtype=value.dtype).share_memory_()
+            for rank, shard in enumerate(shards):
+                destination = result[rank]
+                self.worker.copy_from(
+                    destination.data_ptr(), shard.data_ptr,
+                    destination.numel() * destination.element_size(),
+                    src_offset=0, worker_id=value.worker_ids[rank],
+                )
+            return result
 
     @staticmethod
     def _dspark_output_row(value, *, rank, row, kind):
@@ -3463,14 +3506,15 @@ class V41ResidentResources:
             raise
 
     def finish_step(self, state, step):
-        if self.closed or step is not self._step:
-            raise ValueError("final output must use the active request step")
-        try:
-            if step.phase == "prefill" and self.dspark_host_resources is not None:
-                self._retain_dspark_prefill(step)
-            return collect_final_logits(self.final.host.logits, self._output_rows)
-        finally:
-            self._step = self._inputs = self._group_counts = self._output_rows = None
+        with profile_span('v41.V41ResidentResources.finish_step', cat='v41.host', level='verbose'):
+            if self.closed or step is not self._step:
+                raise ValueError("final output must use the active request step")
+            try:
+                if step.phase == "prefill" and self.dspark_host_resources is not None:
+                    self._retain_dspark_prefill(step)
+                return collect_final_logits(self.final.host.logits, self._output_rows)
+            finally:
+                self._step = self._inputs = self._group_counts = self._output_rows = None
 
     def reset_request(self, key, owner):
         self._step = self._inputs = self._group_counts = self._output_rows = None
