@@ -139,23 +139,29 @@ class Session:
             self.pool.close()
             self.copy_library.cleanup()
             return
-        self.cache.begin_close()
-        deadline = time.monotonic() + 120
-        previous = None
-        while not self.cache.close_ready():
-            tier = self.cache.tier
-            progress = tier.used, len(tier.inflight), len(tier.retiring), len(self.cache.loads)
-            now = time.monotonic()
-            if progress != previous:
-                previous, deadline = progress, now + 120
-            elif now >= deadline:
-                raise RuntimeError("DDR drain incomplete; owner allocations remain retained")
-            await asyncio.sleep(.002)
+        drained = False
         try:
-            await asyncio.to_thread(self.cache.backend.close)
-        except BaseException as error:
-            self.cache.tier.error = error
-            raise
+            self.cache.begin_close()
+            deadline = time.monotonic() + 120
+            previous = None
+            while not self.cache.close_ready():
+                tier = self.cache.tier
+                progress = tier.used, len(tier.inflight), len(tier.retiring), len(self.cache.loads)
+                now = time.monotonic()
+                if progress != previous:
+                    previous, deadline = progress, now + 120
+                elif now >= deadline:
+                    raise RuntimeError("DDR drain incomplete; owner allocations remain retained")
+                await asyncio.sleep(.002)
+            drained = True
+        finally:
+            try:
+                await asyncio.to_thread(self.cache.backend.close)
+            except BaseException as error:
+                if drained:
+                    self.cache.tier.error = error
+                    raise
+                logger.exception("DDR backend shutdown also failed; preserving the drain error")
         self.pool.close()
         self.copy_library.cleanup()
         self.cache.tier.finish_close()

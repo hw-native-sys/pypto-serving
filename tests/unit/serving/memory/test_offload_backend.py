@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Batch/TP completion, diagnostics and the engine-loop lifecycle seam."""
 import asyncio
+import ctypes
 from mmap import PAGESIZE
 import threading
 from types import SimpleNamespace
@@ -113,3 +114,44 @@ def test_partial_startup_releases_pool_only_after_owner_ack(started, failed):
             await session.close()
             assert events == (['owner'] if started else []) + ['pool', 'helper']
     asyncio.run(run())
+
+
+def test_drain_failure_stops_progress_thread_and_retains_pool():
+    async def run():
+        owner = Owner(failed=True)
+        backend = SimplerBackend([owner], dict(tp=1, groups={'idx': (('k', 1, 2, 4),)}), PAGESIZE)
+        assert backend.reserve(1, ('idx', 0, 0))
+        with pytest.raises(RuntimeError, match='unknown'):
+            backend.store(1, ('idx', 0, 0)).result(2)
+        _, tier, _ = fixture()
+        tier.backend = backend
+        session, freed = attach(tier), []
+        tier.begin_close = lambda: (_ for _ in ()).throw(RuntimeError('drain failed'))
+        session.pool.close = lambda: freed.append('pool')
+        session.copy_library.cleanup = lambda: freed.append('helper')
+        with pytest.raises(RuntimeError, match='drain failed'):
+            await session.close()
+        assert not backend.thread.is_alive() and backend.records and not freed
+        assert not any(op == 'stop' for op, _ in owner.calls)
+    asyncio.run(run())
+
+
+def test_copy_owner_finishing_initialization_after_timeout_stops(monkeypatch):
+    from pypto_serving.serving.memory.tiering import simpler
+    release, closed = threading.Event(), []
+    def current_context(pointer):
+        ctypes.cast(pointer, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(1)
+        return 0
+    acl = SimpleNamespace(aclrtGetCurrentContext=current_context, aclrtSetCurrentContext=lambda _: 0)
+    monkeypatch.setattr(simpler.ctypes, 'CDLL', lambda _: acl)
+    monkeypatch.setattr(simpler, 'NativeCopy', lambda _: SimpleNamespace(
+        initialize_pool=lambda _: release.wait(2), close=lambda: closed.append(True)))
+    monkeypatch.setenv('PYPTO_WORKER_INIT_TIMEOUT', '0')
+    service = simpler.CopyService.__new__(simpler.CopyService)
+    try:
+        with pytest.raises(RuntimeError, match='initialization failed'):
+            service.__init__(None, SimpleNamespace(close=lambda: None), {})
+    finally:
+        release.set()
+        service.thread.join(2)
+    assert not service.thread.is_alive() and closed == [True]

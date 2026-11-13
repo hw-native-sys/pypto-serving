@@ -221,7 +221,8 @@ def test_cancel_and_unknown_cannot_release_unconfirmed_native_writes():
     asyncio.run(run())
 
 
-def test_cancelled_submit_ack_is_observed_until_native_completion():
+@pytest.mark.parametrize('shutdown', [None, 'drain', 'timeout'])
+def test_cancelled_submit_ack_is_observed_until_native_completion(shutdown):
     async def run():
         plan = handoff(128).plans[-1]
         job, native = digest(plan), Future()
@@ -238,19 +239,35 @@ def test_cancelled_submit_ack_is_observed_until_native_completion():
             return msgspec.msgpack.encode(runtime.poll(msgspec.msgpack.decode(payload)))
         server, progress = ProgressServer(child, handle, 2), Progress(parent, 2, 1)
         task = asyncio.create_task(progress.call('submit', b'plan'))
+        closing = None
         try:
             assert await asyncio.to_thread(accepted.wait, 2)
             task.cancel()
+            if shutdown == 'drain':
+                closing = asyncio.create_task(progress.close())
+                await asyncio.sleep(0)
+                with pytest.raises(TransferError, match='closing'):
+                    await progress.call('submit', b'rejected')
             reply.set()
             with pytest.raises(asyncio.CancelledError):
                 await task
             assert job in runtime.jobs and job in progress.pending
+            if shutdown == 'timeout':
+                progress.timeout = .05
+                with pytest.raises(TransferError, match='drain deadline') as error:
+                    await progress.close()
+                assert error.value.uncertain and job in runtime.jobs
+                return
+            if closing is not None:
+                assert not closing.done()
             native.set_result(None)
             for _ in range(100):
                 if not runtime.jobs and not progress.pending:
                     break
                 await asyncio.sleep(.01)
             assert not runtime.jobs and not progress.pending
+            if closing is not None:
+                await closing
         finally:
             reply.set()
             await progress.close()

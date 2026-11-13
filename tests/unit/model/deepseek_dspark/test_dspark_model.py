@@ -128,6 +128,21 @@ def test_page_budget_uses_fractional_slot_without_changing_rings(tp_size):
     assert {g.name: g.max_blocks_per_seq for g in manager.group_specs} == original
 
 
+@pytest.mark.parametrize("role", ["mixed", "prefill", "decode"])
+def test_empty_cache_geometry_uses_execution_role_even_with_k7_decode_kernel(role):
+    compiled = replace(_runner(speculative=True)._compiled, prefill=object(), decode=object())
+    executor = DeepSeekV4DSparkPyptoExecutor.__new__(DeepSeekV4DSparkPyptoExecutor)
+    executor._execution_role, executor._runner_extension_factory = role, None
+    runner = executor._create_runner("test", compiled)
+    runtime = RuntimeConfig(max_seq_len=1048576, max_num_batched_tokens=32768,
+                            max_prefill_tokens_per_request=8192)
+    specs = runner._resolve_cache_group_specs(SimpleNamespace(num_hidden_layers=43), runtime)
+    expected = build_dspark_cache_group_specs(43, compiled.compress_ratios, max_seq_len=runtime.max_seq_len,
+        max_prefill_tokens=8192, partitions=compiled.layout.partitions,
+        prefill_only=role == "prefill", decode_only=role == "decode")
+    assert specs == expected
+
+
 def _runner(*, speculative: bool = False, max_position: int = 512, extension_factory=None,
             tp_size: int = 4) -> DSparkModelRunner:
     rows = torch.arange(max_position * 64, dtype=torch.float32).reshape(max_position, 64)

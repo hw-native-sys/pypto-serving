@@ -348,6 +348,7 @@ class Progress:
         self.task = None
         self.lock = asyncio.Lock()
         self.sequence = self.calls = 0
+        self.accepting = True
         self.closed = False
         self.error = None
 
@@ -364,7 +365,7 @@ class Progress:
         self.channel.close()
 
     async def call(self, operation, payload):
-        if self.closed:
+        if self.closed or (not self.accepting and operation != "poll"):
             raise TransferError("transfer observer is closing", uncertain=False)
         if operation != "poll" and self.calls >= self.capacity:
             raise TransferError("transfer command capacity exceeded", uncertain=False)
@@ -379,7 +380,7 @@ class Progress:
             try:
                 if self.error is not None:
                     raise self.error
-                if self.closed:
+                if self.closed or (not self.accepting and operation != "poll"):
                     raise TransferError("transfer observer is closing", uncertain=False)
                 packet = msgspec.msgpack.encode((sequence, operation, payload))
                 if len(packet) > MAX_FRAME:
@@ -461,9 +462,21 @@ class Progress:
                     future.set_exception(TransferError(str(exc), uncertain=True))
 
     async def close(self):
-        self.closed = True
-        if self.task is not None:
-            await self.task
-        async with self.lock:
+        self.accepting = False
+        async def drain():
+            async with self.lock:
+                pass  # Finish accepted command replies, including late submit acks.
+            if self.task is not None:
+                await asyncio.shield(self.task)
+        try:
+            await asyncio.wait_for(drain(), self.timeout)
+        except asyncio.TimeoutError as exc:
+            self._fail_channel("native completion drain deadline")
+            for future in tuple(self.pending.values()):
+                if not future.done():
+                    future.set_exception(self.error)
+            raise self.error from exc
+        finally:
+            self.closed = True
             _shutdown(self.channel)
             self.channel.close()

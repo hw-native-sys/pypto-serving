@@ -184,6 +184,7 @@ class CopyService:
         self.thread.start()
         import os
         if not self.started.wait(float(os.environ.get("PYPTO_WORKER_INIT_TIMEOUT", "600"))) or self.error is not None:
+            self.close_requested.set()
             raise RuntimeError("cache copy owner initialization failed") from self.error
 
     def _run(self):
