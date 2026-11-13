@@ -86,7 +86,6 @@ class Session:
                 or set(geometry["groups"]) != set(manager.group_names)):
             raise RuntimeError("offload worker/cache-manager geometry mismatch")
         self.trace = OffloadTrace.from_env()
-        self.trace = OffloadTrace.from_env()
         backend = SimplerBackend(self.owners, geometry, self.pool.nbytes, pool=self.pool, trace=self.trace)
         self._loop = asyncio.get_running_loop()
         self._failure = self._loop.create_future()
