@@ -40,6 +40,20 @@ def merge(serving, simpler):
             flows.setdefault(key, set()).add(e["ph"])
     selected = [e for e in selected if e.get("ph") not in ("s", "t", "f")
                 or {"s", "f"} <= flows[(e.get("cat"), e.get("scope"), str(e.get("id")))]]
+    # Perfetto parses string flow IDs as hexadecimal, so use numeric IDs.
+    used_ids = {int(e[key], 16) if isinstance(e[key], str) else int(e[key])
+                for e in events for key in ("id", "bind_id") if key in e}
+    flow_mapping = {}
+    next_id = 0
+    for e in selected:
+        if "id" in e:
+            key = (e.get("cat"), e.get("scope"), str(e["id"]))
+            if key not in flow_mapping:
+                while next_id in used_ids:
+                    next_id += 1
+                flow_mapping[key] = next_id
+                next_id += 1
+            e["id"] = flow_mapping[key]
     pids = {e["pid"] for e in selected}
     metadata = [copy.deepcopy(e) for e in simpler["traceEvents"]
                 if e.get("ph") == "M" and e.get("pid") in pids]
@@ -55,8 +69,6 @@ def merge(serving, simpler):
             args["name"] = "Simpler | " + args.get("name", str(original))
         if e.get("ph") != "M":
             e["cat"] = "strace." + (e.get("cat") or "host")
-        if "id" in e:
-            e["id"] = "simpler:" + str(e["id"])
     return {"traceEvents": events + metadata + selected, "displayTimeUnit": "ms"}
 
 
