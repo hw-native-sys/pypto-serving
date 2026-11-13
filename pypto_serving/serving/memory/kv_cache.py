@@ -1359,6 +1359,8 @@ class KvCacheManager:
         key = (partition, block.block_hash)
         if pool.hash_to_block.get(key) is block:
             del pool.hash_to_block[key]
+        if self.tiering is not None:
+            self.tiering.evicted(pool.spec.name, partition, block.block_hash)
         block.block_hash = None
 
     def _take_group_block(

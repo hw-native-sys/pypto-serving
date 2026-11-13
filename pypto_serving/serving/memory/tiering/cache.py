@@ -192,6 +192,14 @@ class TieredCache:
         page = self.tier.lookup(key)
         return page if page is not None or self.archive is None else self.archive.lookup(key)
 
+    def resident(self, key):
+        partition, name, value = key
+        return self.cache._group_pools[name].hash_to_block.get((partition, value))
+
+    def evicted(self, name, partition, value):
+        if self.archive is not None:
+            self.archive.removed((partition, name, value))
+
     def prepare(self, request, hashes, tokens, *, maximum, groups=None, partition=None):
         started_ns = time.monotonic_ns() if self.trace is not None else 0
         if self.tier.error:

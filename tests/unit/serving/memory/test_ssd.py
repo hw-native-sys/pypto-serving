@@ -175,7 +175,8 @@ def stack(tmp_path, helper, tp=1, *, cache=None, capacity=2 << 20, trace=None):
     else:
         cache.tiering = TieredCache(cache, backend, capacity, trace=trace)
         tier = cache.tiering.tier
-    archive = SSDArchive(tier, pool, tmp_path, min(16 << 20, 1_000_000_000))
+    archive = SSDArchive(tier, pool, tmp_path, min(16 << 20, 1_000_000_000),
+                         resident=cache.tiering.resident if cache is not None else None)
     if cache is not None:
         cache.tiering.archive = archive
     return pool, backend, tier, archive, owners, regions, pins, buffers
@@ -420,7 +421,7 @@ def test_actual_simpler_host_pool_direct_file_roundtrip(tmp_path):
         pool.close()
 
 
-@pytest.mark.parametrize("outcome", ["success", "file_error", "cancel"])
+@pytest.mark.parametrize("outcome", ["success", "mixed", "mixed_lost", "file_error", "layout_error", "cancel"])
 def test_ssd_events_progress_without_model_ticks(tmp_path, helper, monkeypatch, outcome):
     from tests.unit.serving.test_grouped_prefix_cache import manager, prompt, _prefill_scheduler, _finish_prefill
     from tests.unit.serving.memory.test_cache_offload import attach, evict
@@ -442,9 +443,27 @@ def test_ssd_events_progress_without_model_ticks(tmp_path, helper, monkeypatch, 
             await asyncio.wait_for(until(lambda: not tier.queued and not tier.inflight
                                                and not archive.writers), 10)
             assert all(not page.readers for page in tier.pages.values()) and not model.done()
-            evict(cache)
+            mixed = outcome.startswith("mixed")
+            evict(cache, ("cmp_c128", "cmp_c4", "idx") if mixed else None)
             while tier._evict():
                 tier._reap_retired()
+            if mixed:
+                assert not cache._group_checkpoints.checkpoints
+                identity = max(archive.units, key=lambda key: key[1])
+                state = next(key for key in archive.units[identity] if key[1] == "csa_state")
+                with archive.files.lock:
+                    entry = archive.files.entries[state]
+                    entry.ready = False
+                    archive.files.failed.add(entry)
+                archive.files.wake.set()
+                await asyncio.wait_for(until(lambda: state not in archive.pages), 10)
+                assert identity in archive.units  # The state member is still valid in HBM.
+                if outcome == "mixed_lost":
+                    evict(cache, ("csa_state",))
+                    assert identity not in archive.units  # Its last healthy copy is now gone.
+            if outcome == "layout_error":
+                footprint = backend.footprint
+                monkeypatch.setattr(backend, "footprint", lambda source: footprint(source) * 2)
             original = archive.files._io
             def io(operation, entry, views):
                 if operation == "read" and outcome == "file_error":
@@ -463,17 +482,19 @@ def test_ssd_events_progress_without_model_ticks(tmp_path, helper, monkeypatch, 
                 with pytest.raises(ValueError, match="cancelled"):
                     await asyncio.wait_for(task, 10)
                 gate.set()
-            elif outcome == "file_error":
+            elif outcome in ("file_error", "layout_error"):
                 with pytest.raises(KVCacheRestoreError):
                     await asyncio.wait_for(task, 10)
             else:
                 await asyncio.wait_for(task, 10)
-                assert cache.acquire_group_prefix_blocks("use", hashes, max_cache_hit_tokens=boundary)[1] == boundary
+                hit = cache.acquire_group_prefix_blocks("use", hashes, max_cache_hit_tokens=boundary)[1]
+                assert hit < boundary if outcome == "mixed_lost" else hit == boundary
                 cache.release_all_group_requests("use")
             await asyncio.wait_for(until(lambda: not view.loads and archive.idle() and not tier.inflight), 10)
             assert not view.pending and tier.error is None and session.core._running and not model.done()
             if failed:
                 await asyncio.wait_for(until(lambda: all(key not in archive.pages for key in failed)), 10)
+            if outcome in ("file_error", "layout_error"):
                 assert not any(op == "load" for owner in owners for op, _ in owner.calls)
         finally:
             gate.set()
