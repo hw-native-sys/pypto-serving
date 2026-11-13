@@ -90,7 +90,7 @@ class _Harness:
         return self.loop.run_until_complete(coro)
 
 
-async def _collect(engine, prompt: str, max_new_tokens: int) -> list[int]:
+async def _collect(engine, prompt: str, max_new_tokens: int, *, expected=None) -> list[int]:
     """Drive one request to completion and return its generated token ids.
 
     Streaming is enabled so every generated token is emitted as its own
@@ -107,6 +107,13 @@ async def _collect(engine, prompt: str, max_new_tokens: int) -> list[int]:
         top_k=None,
         stream=True,
     )
+    if expected is not None:
+        from examples.qwen3_program_acceptance import collect_request
+
+        row = {"request_id": request_id, "tokens": [], "token_gate": "not_passed"}
+        await collect_request(engine, prompt, config, expected, len(engine.tokenizer.encode(prompt)), row)
+        assert row["token_gate"] == "passed"
+        return row["tokens"]
     tokens: list[int] = []
     async for output in engine.add_request(request_id, prompt, config):
         if output.token_id is not None:
@@ -227,7 +234,7 @@ def test_serving_single_request_matches_expected_tokens(harness):
     """Baseline: the serving path reproduces the offline greedy output."""
     harness.reset()
 
-    tokens = harness.run(_collect(harness.engine, PROMPT, SHORT_NEW_TOKENS))
+    tokens = harness.run(_collect(harness.engine, PROMPT, SHORT_NEW_TOKENS, expected=EXPECTED_TOKEN_IDS))
 
     assert tokens == EXPECTED_TOKEN_IDS, (
         f"Serving path greedy output diverged from the offline baseline:\n"
@@ -243,7 +250,8 @@ def test_multi_batch_matches_single_request(harness):
 
     async def _run_all():
         return await asyncio.gather(
-            *(_collect(harness.engine, PROMPT, SHORT_NEW_TOKENS) for _ in range(num_requests))
+            *(_collect(harness.engine, PROMPT, SHORT_NEW_TOKENS, expected=EXPECTED_TOKEN_IDS)
+              for _ in range(num_requests))
         )
 
     results = harness.run(_run_all())
@@ -272,7 +280,7 @@ def test_chunked_prefill_matches_single_request(harness):
     # Force chunking: at most 2 prompt tokens are prefilled per scheduler step.
     harness.engine.scheduler.config.long_prefill_token_threshold = 2
 
-    tokens = harness.run(_collect(harness.engine, PROMPT, SHORT_NEW_TOKENS))
+    tokens = harness.run(_collect(harness.engine, PROMPT, SHORT_NEW_TOKENS, expected=EXPECTED_TOKEN_IDS))
 
     assert tokens == EXPECTED_TOKEN_IDS, (
         f"Chunked-prefill output diverged from the baseline:\n"
