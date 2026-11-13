@@ -59,3 +59,11 @@ Append text deltas as they arrive. The final usage event has an empty `choices` 
 ## Observe and Stop
 
 `/metrics` exposes Prometheus text and `/metrics/json` returns engine metrics as JSON. [Profiling](../developer-guide/profile.md#profile-http-serving) describes how to capture internal traces when the server starts with `--profile`. Stop the server with the normal process signal for your environment; graceful shutdown attempts to flush and merge active profile fragments.
+
+## Interactive Coding Frontend
+
+The optional [mini-swe-agent HTTP frontend](../../examples/mini_swe_agent/README.md)
+connects to the Chat API for coding tasks and file-based conversation. It
+supports command confirmation, context budgeting, execution records, and optional
+completion checks. Install its dependencies in a separate client environment;
+the frontend does not start or stop the server.
