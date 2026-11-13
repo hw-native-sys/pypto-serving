@@ -79,7 +79,7 @@ _DRAFT_DYNAMIC_KEYS = frozenset({
     "target_hidden", "num_sampled", "last_sampled", "next_prefill_tokens", "anchor_ids",
     "first_query_positions", "block_tables", "context_slots", "context_rope_cos",
     "context_rope_sin", "query_rope_cos", "query_rope_sin", "head_hidden",
-    "attention_epoch", "moe_epoch",
+    "moe_epoch",
 })
 _MARKOV_DYNAMIC_KEYS = frozenset({
     "head_hidden", "num_sampled", "last_sampled", "next_prefill_tokens", "anchor_ids",

@@ -102,7 +102,6 @@ class DSparkLoweredInputs:
     markov_model: Mapping[str, Any] = field(default_factory=dict)
     cache_tables: Mapping[str, Any] = field(default_factory=dict)
     rope_tables: Mapping[str, Any] = field(default_factory=dict)
-    attention_epoch: int = 1
     moe_epoch: int = 1
     logits_epoch: int = 1
     outputs: Mapping[str, Any] = field(default_factory=dict)
@@ -122,7 +121,7 @@ class DSparkLoweredInputs:
             if not isinstance(mapping, Mapping):
                 raise TypeError(f"DSpark {name} must be a mapping")
             values[name] = mapping
-        for name in ("attention_epoch", "moe_epoch", "logits_epoch"):
+        for name in ("moe_epoch", "logits_epoch"):
             epoch = value.get(name, 1)
             if type(epoch) is not int or epoch <= 0:
                 raise ValueError(f"DSpark {name} must be a positive integer")

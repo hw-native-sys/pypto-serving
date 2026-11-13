@@ -950,24 +950,32 @@ def load_segment_modules(lib_root, topology):
     """
     root = Path(lib_root).resolve()
     package = "models.deepseek_v4_1_flash"
-    existing = sys.modules.get(package + ".config")
     expected = root / "models/deepseek_v4_1_flash/config.py"
-    if existing is not None and Path(existing.__file__).resolve() != expected:
-        raise RuntimeError("V41 lib from another checkout is already imported; use a fresh worker")
+    existing = None
+    for name in ("config", package + ".config"):
+        module = sys.modules.get(name)
+        if module is not None:
+            if Path(module.__file__).resolve() != expected or existing not in (None, module):
+                raise RuntimeError("V41 lib from another checkout is already imported; use a fresh worker")
+            existing = module
     old_argv = sys.argv[:]
     try:
         # The lib's model modules import sibling files by their top-level names.
         for path in (root, root / "models/deepseek_v4_1_flash"):
             if str(path) not in sys.path:
                 sys.path.insert(0, str(path))
-        sys.argv = [old_argv[0], "--tp", str(topology.tp), "--ep", str(topology.world)]
-        config = importlib.import_module(package + ".config")
+        sys.argv = [old_argv[0], "--cp", "1", "--lm-head-tp", str(topology.tp),
+                    "--ep", str(topology.world)]
+        config = existing or importlib.import_module("config")
         if Path(config.__file__).resolve() != expected:
             raise RuntimeError("import resolved to a different lib checkout")
-        if (config.TP_SIZE, config.EP_SIZE, config.MOE_TOKENS) != (
-            topology.tp, topology.world, topology.local_capacity
+        # Lib siblings import `config`; package imports must use that same
+        # object. Prefill and Decode freeze their own, different MoE extents.
+        sys.modules["config"] = sys.modules[package + ".config"] = config
+        if (config.CP_SIZE, config.LM_HEAD_TP_SIZE, config.EP_SIZE, config.DP_SIZE) != (
+            1, topology.tp, topology.world, topology.dp
         ):
-            raise ValueError("lib topology/MOE_TOKENS disagrees with the segment capacity")
+            raise ValueError("lib CP/LM-head/EP/DP topology disagrees with the serving topology")
         if not (root / "models/deepseek_v4_1_flash/moe.py").is_file():
             return None, None
         attention = importlib.import_module(package + ".prefill_swa")
@@ -1159,8 +1167,6 @@ def compile_decode_fwd_dspark(compiler, lib_root, topology):
     for name, entry in entries.items():
         kwargs = {}
         params = set(entry.param_names)
-        if "attention_epoch" in params:
-            kwargs["attention_epoch"] = pl.RUNTIME
         if "moe_epoch" in params:
             kwargs["moe_epoch"] = pl.RUNTIME
         if "logits_epoch" in params:
@@ -3207,7 +3213,7 @@ class V41ResidentResources:
             # These windows persist across both bootstrap and decode. Allocate
             # epochs at dispatch, so repeated lowering cannot consume them and
             # replaying an already lowered payload cannot reuse old signals.
-            bound = dict(arguments, attention_epoch=epoch, moe_epoch=epoch)
+            bound = dict(arguments, moe_epoch=epoch)
         if reset_windows:
             previous_reset = self.worker._reset_persistent_windows
             self.worker._reset_persistent_windows = True
@@ -3250,7 +3256,6 @@ class V41ResidentResources:
         runner = _DSparkOrchestratorRunner(self, phase)
         try:
             kwargs = dict(
-                attention_epoch=lowered.attention_epoch,
                 moe_epoch=lowered.moe_epoch,
                 logits_epoch=lowered.logits_epoch,
             )
@@ -3539,14 +3544,14 @@ def selected_decode_topology(lib_root=None, *, dp_size=None):
             continue
         target = statement.targets[0]
         if not isinstance(target, ast.Name) or target.id not in (
-                "MAX_BATCH_PER_DP", "DSPARK_SPEC_TOKENS", "DECODE_ROWS_PER_REQUEST"):
+                "DECODE_BATCH", "DSPARK_SPEC_TOKENS", "DECODE_SEQ"):
             continue
         if target.id in values:
             raise MissingCompositeInterface(f"duplicate V4.1 lib decode config: {target.id}")
         values[target.id] = statement.value
-    batch = values.get("MAX_BATCH_PER_DP")
+    batch = values.get("DECODE_BATCH")
     spec = values.get("DSPARK_SPEC_TOKENS")
-    rows = values.get("DECODE_ROWS_PER_REQUEST")
+    rows = values.get("DECODE_SEQ")
     if (not isinstance(batch, ast.Constant) or type(batch.value) is not int or batch.value != 12
             or not isinstance(spec, ast.Constant) or type(spec.value) is not int or spec.value != 5
             or not isinstance(rows, ast.BinOp) or not isinstance(rows.op, ast.Add)
