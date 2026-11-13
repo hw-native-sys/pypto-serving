@@ -237,6 +237,9 @@ class WorkerProcess:
             else:
                 raise RuntimeError("Executor has no register_model method")
 
+            if self.config.resolve_runtime_config().kv_offload_bytes:
+                from pypto_serving.serving.memory.tiering.integration import initialize_loaded
+                initialize_loaded(self.executor)
             if self._services_factory is not None:
                 self._services = self._services_factory(
                     self.executor.runtime_extensions(), self._req_cache.__getitem__,

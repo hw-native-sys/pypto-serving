@@ -96,6 +96,7 @@ nav:
           - Online Serving: user-guide/online-serving.md
           - Tool Calling: user-guide/tool-calling.md
           - PD Disaggregation: user-guide/pd-disaggregation.md
+          - DDR Prefix Cache: user-guide/kv-cache-offload.md
           - Parallelism and Scaling: user-guide/parallel.md
           - Multi-Node Routing: user-guide/multi-node-routing.md
           - Troubleshooting: user-guide/troubleshooting.md
