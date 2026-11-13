@@ -1,4 +1,0 @@
-interface:
-  display_name: "Profile DSV4 Aligned GBS32 STRACE"
-  short_description: "Profile fixed DSV4 GBS32 with eight Host STRACE lanes"
-  default_prompt: "Use $profile-dsv4-aligned-gbs32-strace to run the fixed DSV4 GBS32 alignment profile and generate its combined serving and Host STRACE swimlane."

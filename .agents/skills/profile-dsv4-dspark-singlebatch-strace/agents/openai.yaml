@@ -1,4 +1,0 @@
-interface:
-  display_name: "Profile DSV4 DSpark GBS1 STRACE"
-  short_description: "Profile one DSpark k=7 request with 16 Host lanes"
-  default_prompt: "Use $profile-dsv4-dspark-singlebatch-strace to run the fixed DSV4 DSpark k=7 single-batch profile and generate its combined serving and Host STRACE swimlane."
