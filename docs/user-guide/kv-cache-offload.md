@@ -141,8 +141,8 @@ An optional local SSD tier retains the same reusable contents as DDR. Enable it
 per model process with an existing directory:
 
 ```bash
---enable-prefix-caching --kv-offload-bytes 200000000000 \
---kv-ssd-bytes 1000000000 --kv-ssd-path /data/cache
+--enable-prefix-caching --kv-offload-bytes 20000000000 \
+--kv-ssd-bytes 30000000000 --kv-ssd-path /data/cache
 ```
 
 SSD defaults to zero capacity and creates no SSD threads, files or work windows
@@ -164,3 +164,26 @@ TP1/TP4 device round trips passed byte/guard checks across all eight DSpark
 regions and independent compute/copy progress, before later diagnostic changes.
 Device qualification of the aligned stack and full ordinary-serving/PD model
 qualification remain pending.
+
+SSD uses the same optional offload trace. `ssd_file` records one logical page's
+file admission, executor dispatch, I/O start/end, useful/physical bytes and syscall
+count. A vector call covers the TP views up to the system iovec limit; aligned
+partial results advance both the file offset and remaining views. Admission to
+dispatch includes capacity/extent preparation, while dispatch to I/O start is
+executor waiting. The I/O span includes the Python loop and syscall waiting.
+
+`ssd_handoff` records window assignment, staging start, all file reads settling
+and confirmed native readiness. Its cache handles join `batch.work_handles`;
+request IDs remain the original restore IDs. `ssd_promotion` reports independent
+Host copy queue/execution, and `ssd_store_reaped` reports DDR reader retirement.
+`state.ssd` adds bounded queue, window and physical-usage summaries without
+scanning every file page. These intervals can overlap and must not simply be
+summed as request latency. Errors or wakeups alone are not completion proof.
+
+Normal shutdown drains I/O and readers, closes the data file descriptors and
+removes the instance's private directory, unregisters owner mappings and releases
+the shared DDR backing. SSD contents are not retained between runs.
+`ssd_closed.files_removed` confirms file cleanup; `shutdown.resources_closed`
+confirms normal backend/pool retirement. Verify both and process/file references
+when qualifying cleanup. Deleted files held open by another process still occupy
+space; HTTP shutdown or a zero cache counter alone does not prove release.
