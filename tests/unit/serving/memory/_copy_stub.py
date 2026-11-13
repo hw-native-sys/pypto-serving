@@ -43,7 +43,7 @@ extern "C" int aclrtMemcpy2dAsync(void*d,size_t dp,const void*s,size_t sp,size_t
 extern "C" int aclrtSynchronizeStream(aclrtStream){++syncs;return stop_error;}
 ''')
     source = Path(simpler.__file__).with_name("copy.cpp")
-    subprocess.run(["g++", "-std=c++17", "-O2", "-shared", "-fPIC", "-I"+str(root),
+    subprocess.run(["g++", "-std=c++17", "-O2", "-shared", "-fPIC", "-Wl,-Bsymbolic", "-I"+str(root),
                     str(source), str(root / "stub.cpp"), "-o", str(root / "copy.so")], check=True)
     lib = C.CDLL(str(root / "copy.so"))
     lib.copy_cache_batch.argtypes = [C.POINTER(simpler.Span), C.c_size_t, C.c_int, C.c_void_p,

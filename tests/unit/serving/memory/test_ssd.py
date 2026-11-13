@@ -126,6 +126,8 @@ def test_short_write_fails_without_publishing_and_next_write_works(tmp_path, mon
 
 
 class CPUOwner:
+    _copy_lock = threading.Lock()
+
     def __init__(self, helper, pool, regions):
         self.helper, self.pool, self.regions = helper, pool, regions
         self.calls = []
@@ -142,7 +144,8 @@ class CPUOwner:
         native.pool, native.regions = self.pool, self.regions
         native.commands = (Span * BATCH_SPANS)()
         native.native, native.stream = self.helper, None
-        result = native.copy_batch(direction, pages)
+        with self._copy_lock:
+            result = native.copy_batch(direction, pages)
         self.calls.append((direction, len(pages)))
         return result
 
