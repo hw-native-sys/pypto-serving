@@ -105,13 +105,14 @@ def test_cancel_queued_write_and_refuse_close_with_reader(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
-def test_short_write_fails_without_publishing_and_next_write_works(tmp_path, monkeypatch):
+@pytest.mark.parametrize("bad_count", [0, 17, 3 * PAGESIZE])
+def test_short_write_fails_without_publishing_and_next_write_works(tmp_path, monkeypatch, bad_count):
     import os
     source = Backing(PAGESIZE)
     store = FileStore(tmp_path, 2 * PAGESIZE)
     original = os.pwritev
     try:
-        monkeypatch.setattr(os, "pwritev", lambda *args: 17)
+        monkeypatch.setattr(os, "pwritev", lambda *args: bad_count)
         failed = store.write("bad", source.views(7), 7)
         with pytest.raises(OSError, match="aligned"):
             failed.future.result(3)
@@ -123,6 +124,63 @@ def test_short_write_fails_without_publishing_and_next_write_works(tmp_path, mon
     finally:
         store.close()
         source.close()
+
+
+@pytest.mark.parametrize("short", [False, True])
+def test_vector_io_preserves_rank_order_partial_views_and_guards(tmp_path, monkeypatch, short):
+    import os
+    from pypto_serving.serving.memory.tiering import ssd
+    lengths = tuple(n * PAGESIZE for n in (2, 3, 1, 2))
+    size = sum(lengths)
+    source, target = Backing(size + 2 * PAGESIZE), Backing(size + 2 * PAGESIZE)
+    store = FileStore(tmp_path, size)
+    calls = {op: [] for op in ("write", "read")}
+    source.buffer[:] = target.buffer[:] = bytes([91]) * (size + 2 * PAGESIZE)
+    offset, extents = PAGESIZE, []
+    for length in lengths:
+        extents.append((offset, length))
+        offset += length
+    src, dst = host_views(source, extents, writable=True), host_views(target, extents, writable=True)
+    for index, view in enumerate(src):
+        view[:] = bytes([index + 11]) * len(view)
+    if short:
+        monkeypatch.setattr(ssd, "IOV_MAX", 2)
+    def wrap(operation, original):
+        def syscall(fd, vectors, offset):
+            calls[operation].append((offset, tuple(map(len, vectors))))
+            if short and len(calls[operation]) == 1:
+                raise InterruptedError()
+            remaining, batch = 3 * PAGESIZE if short else size, []
+            for view in vectors:
+                if remaining <= 0:
+                    break
+                batch.append(view[:remaining])
+                remaining -= len(batch[-1])
+            return original(fd, batch, offset)
+        return syscall
+    monkeypatch.setattr(os, "pwritev", wrap("write", os.pwritev))
+    monkeypatch.setattr(os, "preadv", wrap("read", os.preadv))
+    try:
+        entry = store.write("ranks", src, size - 17)
+        written = entry.future.result(3)
+        reader = store.hold("ranks")
+        try:
+            read = store.read(reader, dst).result(3)
+        finally:
+            store.release(reader)
+        assert source.buffer[:] == target.buffer[:]
+        for operation, proof in (("write", written), ("read", read)):
+            assert proof["bytes"] == size - 17 and proof["physical_bytes"] == size
+            assert proof["syscalls"] == len(calls[operation])
+            assert len(calls[operation]) > 2 if short else len(calls[operation]) == 1
+            assert len(calls[operation][0][1]) == (2 if short else 4)
+            if short:
+                assert calls[operation][0] == calls[operation][1]  # EINTR cannot advance the cursor.
+    finally:
+        store.close()
+        assert store.used == 0 and not store.entries and not list(tmp_path.iterdir())
+        source.close()
+        target.close()
 
 
 class CPUOwner:
@@ -199,9 +257,11 @@ def close_stack(pool, backend, tier, archive):
 
 
 @pytest.mark.parametrize("tp", [1, 4])
-@pytest.mark.parametrize("traced", [False, True])
+@pytest.mark.parametrize("traced", [False, True, "failed"])
 def test_eight_components_ssd_only_restore_native_batches_and_host_promotion(tmp_path, helper, tp, traced):
     trace = OffloadTrace(tmp_path.parent / (tmp_path.name + "-trace")) if traced else None
+    if traced == "failed":
+        trace.failed = True  # A failed recorder must not change byte copies or retirement.
     pool, backend, tier, archive, owners, regions, pins, buffers = stack(tmp_path, helper, tp, trace=trace)
     names = tuple(backend.geometry["groups"])
     try:
@@ -213,6 +273,9 @@ def test_eight_components_ssd_only_restore_native_batches_and_host_promotion(tmp
                    lambda: drain(tier, archive))
         assert set(pins) == set(names) and archive.units
         assert archive.files.counters["writes"] == 7
+        assert all(entry.future.result()["syscalls"] == 1 for entry in archive.files.entries.values())
+        if trace is not None:
+            trace.snapshot(SimpleNamespace(tier=tier, archive=archive, pending={}, loads={}), force=True)
         saved = {key: archive.lookup(key) for key in tier.pages}
         while tier._evict():
             tier._reap_retired()
@@ -241,10 +304,25 @@ def test_eight_components_ssd_only_restore_native_batches_and_host_promotion(tmp
         close_stack(pool, backend, tier, archive)
         if trace is not None:
             trace.close()
-    if trace is not None:
+    if traced is True:
         rows = [json.loads(line) for line in trace.path.read_text().splitlines()]
         loads = [row for row in rows if row["event"] == "batch" and row["direction"] == "load"]
         assert loads and all(row["requests"] == ["restore"] for row in loads)
+        handoffs = [row for row in rows if row["event"] == "ssd_handoff"]
+        handles = {handle for row in handoffs for handle in row["cache_handles"]}
+        assert handles == {handle for row in loads for handle in row["work_handles"]}
+        assert all(row["assigned_ns"] <= row["started_ns"] <= row["reads_finished_ns"]
+                   <= row["native_submit_ns"] <= row["native_ready_ns"] <= row["completed_ns"] for row in handoffs)
+        files = [row for row in rows if row["event"] == "ssd_file"]
+        assert len(files) == 14 and all(row["syscalls"] == 1 and row["file_completed"] for row in files)
+        assert all(row["enqueued_ns"] <= row["dispatched_ns"] <= row["started_ns"] <= row["completed_ns"]
+                   and row["queue_ns"] >= row["executor_queue_ns"] >= 0 for row in files)
+        assert sum(row["bytes"] for row in files if row["operation"] == "read") == sum(
+            page.size for page in saved.values())
+        assert all(row["queued_ns"] <= row["started_ns"] <= row["completed_ns"] and row["host_completed"]
+                   for row in rows if row["event"] == "ssd_promotion")
+        assert any(row["event"] == "state" and row["ssd"]["used_bytes"] > 0 for row in rows)
+        assert any(row["event"] == "ssd_closed" and row["files_removed"] and row["used_bytes"] == 0 for row in rows)
         assert sum(row["pages"] for row in rows if row["event"] == "store_reaped") == 7
     assert not list(tmp_path.iterdir())
 

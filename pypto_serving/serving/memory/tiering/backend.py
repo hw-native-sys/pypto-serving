@@ -305,6 +305,8 @@ class SimplerBackend:
                     queue_ns=sum(dispatched-job.enqueued for job in jobs),
                     queue_max_ns=max(dispatched-job.enqueued for job in jobs),
                     rpc_start_ns=dispatched, rpc_end_ns=ended)
+                if any(job.work for job in jobs):
+                    common["work_handles"] = [job.handle for job in jobs if job.work]
                 for rank, reply in zip(jobs[0].storage.ranks, replies):
                     self.trace.emit("batch", **common, partition=rank // self.tp, owner=rank,
                         prepare_start_ns=reply["prepare_start_ns"], prepare_end_ns=reply["prepare_end_ns"],

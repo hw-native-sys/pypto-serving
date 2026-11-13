@@ -12,6 +12,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import ctypes
+from itertools import islice
 from mmap import PAGESIZE, mmap
 import os
 from pathlib import Path
@@ -21,6 +22,8 @@ import threading
 import time
 
 from .policy import LRU
+
+IOV_MAX = os.sysconf("SC_IOV_MAX")
 
 
 @dataclass(eq=False)
@@ -41,7 +44,7 @@ class FilePage:
 
 
 class FileStore:
-    def __init__(self, root, capacity, *, policy=None, notify=None):
+    def __init__(self, root, capacity, *, policy=None, notify=None, trace=None):
         if type(capacity) is not int or capacity < PAGESIZE:
             raise ValueError("SSD capacity must hold a physical page")
         if not Path(root).is_dir():
@@ -49,6 +52,7 @@ class FileStore:
         self.capacity, self.used = capacity, 0
         self.policy = LRU() if policy is None else policy
         self.notify = notify
+        self.trace = trace
         self.entries, self.classes = {}, {}
         self.failed = set()
         self.queue, self.evicted = SimpleQueue(), SimpleQueue()
@@ -94,7 +98,7 @@ class FileStore:
             entry.readers -= 1
         self.wake.set()
 
-    def write(self, key, views, valid_bytes):
+    def write(self, key, views, valid_bytes, *, trace_fields=None):
         lengths = tuple(len(view) for view in views)
         if (not lengths or any(length <= 0 or length % PAGESIZE for length in lengths)
                 or not 0 < valid_bytes <= sum(lengths) <= self.capacity):
@@ -109,18 +113,20 @@ class FileStore:
             entry = FilePage(key, lengths, valid_bytes, Future())
             entry.future.add_done_callback(lambda _: self.wake.set())
             self.entries[key] = entry
-            self.queue.put(("write", entry, tuple(views), entry.future))
+            context = dict(trace_fields or {}, enqueued_ns=time.monotonic_ns()) if self.trace else None
+            self.queue.put(("write", entry, tuple(views), entry.future, context))
         self.wake.set()
         return entry
 
-    def read(self, entry, views):
+    def read(self, entry, views, *, trace_fields=None):
         with self.lock:
             if (self.entries.get(entry.key) is not entry or not entry.ready or entry.readers <= 0
                     or tuple(map(len, views)) != entry.lengths):
                 raise OSError("SSD read requires a current reader and matching layout")
             future = Future()
             future.add_done_callback(lambda _: self.wake.set())
-            self.queue.put(("read", entry, tuple(views), future))
+            context = dict(trace_fields or {}, enqueued_ns=time.monotonic_ns()) if self.trace else None
+            self.queue.put(("read", entry, tuple(views), future, context))
         self.wake.set()
         return future
 
@@ -136,19 +142,41 @@ class FileStore:
     def _io(operation, entry, views):
         offset = entry.slot * entry.charge
         syscall = os.pwritev if operation == "write" else os.preadv
-        for view in views:
-            done = 0
-            while done < len(view):
-                try:
-                    count = syscall(entry.fd, [view[done:]], offset + done)
-                except InterruptedError:
-                    continue
-                if count <= 0 or count % PAGESIZE:
-                    raise OSError("SSD I/O made no aligned progress or reached EOF")
-                done += count
-            offset += len(view)
+        pending, calls = deque(views), 0
+        while pending:
+            vectors = list(islice(pending, IOV_MAX))
+            try:
+                calls += 1
+                count = syscall(entry.fd, vectors, offset)
+            except InterruptedError:
+                continue
+            if count <= 0 or count % PAGESIZE or count > sum(map(len, vectors)):
+                raise OSError("SSD I/O made no aligned progress or reached EOF")
+            offset += count
+            while pending and count >= len(pending[0]):
+                count -= len(pending.popleft())
+            if count:
+                pending[0] = pending[0][count:]
         return dict(bytes=entry.valid_bytes, physical_bytes=entry.charge,
-                    file_completed=True, stopped=True)
+                    file_completed=True, stopped=True, syscalls=calls)
+
+    def _execute(self, operation, entry, views, context):
+        if context is None:
+            return self._io(operation, entry, views)
+        started, result, error = time.monotonic_ns(), None, None
+        try:
+            result = self._io(operation, entry, views)
+            return result
+        except BaseException as failure:
+            error = type(failure).__name__
+            raise
+        finally:
+            self.trace.emit("ssd_file", **context, operation=operation, started_ns=started,
+                completed_ns=time.monotonic_ns(), queue_ns=started-context["enqueued_ns"],
+                executor_queue_ns=started-context["dispatched_ns"], requested_bytes=entry.charge,
+                bytes=entry.valid_bytes if result else 0, physical_bytes=entry.charge if result else 0,
+                syscalls=result.get("syscalls") if result else None,
+                file_completed=bool(result and result.get("file_completed")), error_type=error)
 
     def _reserve(self, entry):
         while True:
@@ -251,12 +279,26 @@ class FileStore:
                 if self.stopping and self.idle():
                     break
                 self.wake.wait()
+        released, removed = self.used, False
         try:
             for fd, _, _ in self.classes.values():
                 os.close(fd)
             self.directory.cleanup()
+            removed = not Path(self.directory.name).exists()
+            if not removed:
+                raise OSError("SSD private directory remains after cleanup")
+            with self.lock:
+                for key in self.entries:
+                    self.policy.on_remove(key)
+                self.entries.clear()
+                self.classes.clear()
+                self.used = 0
         except OSError as error:
             self.error = error
+        if self.trace is not None:
+            self.trace.emit("ssd_closed", files_removed=removed,
+                            released_bytes=released if removed else 0, used_bytes=self.used,
+                            error_type=type(self.error).__name__ if self.error else None)
 
     def _progress(self, executor):
         for operation, entry, future, native in tuple(self.active):
@@ -289,21 +331,23 @@ class FileStore:
                 self._discard(entry)
         while True:
             try:
-                operation, entry, views, future = self.queue.get_nowait()
+                operation, entry, views, future, context = self.queue.get_nowait()
             except Empty:
                 break
             if operation == "read":
-                self.read_waiting.append((entry, views, future))
+                self.read_waiting.append((entry, views, future, context))
             else:
-                self.waiting.append((entry, views, future))
+                self.waiting.append((entry, views, future, context))
         while self.read_waiting and len(self.active) < 8:
-            entry, views, future = self.read_waiting.popleft()
+            entry, views, future, context = self.read_waiting.popleft()
             if future.set_running_or_notify_cancel():
-                native = executor.submit(self._io, "read", entry, views)
+                if context is not None:
+                    context["dispatched_ns"] = time.monotonic_ns()
+                native = executor.submit(self._execute, "read", entry, views, context)
                 native.add_done_callback(lambda _: self.wake.set())
                 self.active.append(("read", entry, future, native))
         while self.waiting and len(self.active) < 8:
-            entry, views, future = self.waiting[0]
+            entry, views, future, context = self.waiting[0]
             if future.cancelled():
                 self.waiting.popleft()
                 self._discard(entry)
@@ -329,7 +373,9 @@ class FileStore:
             if not future.set_running_or_notify_cancel():
                 self._discard(entry)
                 continue
-            native = executor.submit(self._io, "write", entry, views)
+            if context is not None:
+                context["dispatched_ns"] = time.monotonic_ns()
+            native = executor.submit(self._execute, "write", entry, views, context)
             native.add_done_callback(lambda _: self.wake.set())
             self.active.append(("write", entry, future, native))
 
