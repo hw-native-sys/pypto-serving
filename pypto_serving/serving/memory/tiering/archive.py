@@ -44,8 +44,9 @@ class Restore:
 
 
 class SSDArchive:
-    def __init__(self, tier, pool, root, capacity):
+    def __init__(self, tier, pool, root, capacity, *, resident=None):
         self.tier, self.backend, self.pool = tier, tier.backend, pool
+        self.resident = resident
         geometry, tp = self.backend.geometry, self.backend.tp
         ranks = len(self.backend.owners)
         maximum = max(self.backend.footprint((name, 0, 0)) // tp for name in geometry["groups"])
@@ -125,6 +126,8 @@ class SSDArchive:
         if key in self.tier.pages or self.files.contains(key):
             return
         self.pages.pop(key, None)
+        if self.resident is not None and self.resident(key) is not None:
+            return  # The shared matcher may still use this member directly from HBM.
         for identity in tuple(self.members.get(key, ())):
             for member in self.units.pop(identity):
                 owners = self.members[member]
@@ -159,6 +162,9 @@ class SSDArchive:
                 raise OSError("SSD page layout does not match owner geometry")
         except OSError as error:
             future.set_exception(KVCacheRestoreError(str(error)))
+            if not release_reader:
+                self.restored.put((page.key,))
+                self._notify()
             return future
         self.queue.put(Restore(page, destination, entry, future,
                                release_reader=release_reader, request=request))

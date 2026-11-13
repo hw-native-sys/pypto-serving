@@ -93,7 +93,8 @@ class Session:
         if runtime.kv_ssd_bytes:
             from .archive import SSDArchive
             self.cache.archive = await asyncio.to_thread(
-                SSDArchive, self.cache.tier, self.pool, runtime.kv_ssd_path, runtime.kv_ssd_bytes)
+                SSDArchive, self.cache.tier, self.pool, runtime.kv_ssd_path, runtime.kv_ssd_bytes,
+                resident=self.cache.resident)
             logger.info("kv_ssd_ready capacity_bytes=%d work_bytes=%d window_bytes=%d",
                         runtime.kv_ssd_bytes, self.cache.archive.work_bytes, self.cache.archive.window_bytes)
         manager.tiering = self.cache
