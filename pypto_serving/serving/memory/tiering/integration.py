@@ -15,6 +15,7 @@ from mmap import PAGESIZE
 import logging
 import multiprocessing as mp
 from pathlib import Path
+import threading
 import time
 
 from .backend import SimplerBackend, endpoints
@@ -49,6 +50,9 @@ class Session:
         self.metadata = context.Queue(maxsize=1)
         self.cache = None
         self.trace = None
+        self._loop = None
+        self._notify_lock = threading.Lock()
+        self._notified = False
         from .simpler import descriptor_wire
         self.copy_library = build_copy_library()
         try:
@@ -78,7 +82,9 @@ class Session:
             raise RuntimeError("offload worker/cache-manager geometry mismatch")
         self.trace = OffloadTrace.from_env()
         backend = SimplerBackend(self.owners, geometry, self.pool.nbytes, trace=self.trace)
-        self.cache = TieredCache(manager, backend, self.pool.nbytes, trace=self.trace)
+        self._loop = asyncio.get_running_loop()
+        self.cache = TieredCache(manager, backend, self.pool.nbytes, trace=self.trace, notify=self._notify)
+        backend.set_notify(self._notify)
         manager.tiering = self.cache
         if self.trace is not None:
             self.trace.emit("ready", capacity_bytes=self.pool.nbytes, ranks=geometry["ranks"],
@@ -87,20 +93,35 @@ class Session:
         logger.info("kv_offload_ready backend=simpler capacity_bytes=%d ranks=%d tp=%d",
                     self.cache.tier.capacity, geometry["ranks"], geometry["tp"])
 
-    def progress(self):
+    def _notify(self):
+        with self._notify_lock:
+            if self._loop is None or self._notified:
+                return
+            self._notified = True
+            self._loop.call_soon_threadsafe(self._consume)
+
+    def _consume(self):
+        with self._notify_lock:
+            self._notified = False
+            if self._loop is None:
+                return
         try:
             self.cache.progress()
         except Exception as error:
-            # Wake clients without retiring pages or pretending that native
-            # work stopped. The failed engine loop also removes readiness.
+            # Wake clients and remove readiness without claiming native stop.
+            self.core._running = False
             for context in self.core._request_contexts.values():
                 context.queue.put_nowait(RuntimeError(f"DDR cache progress failed: {error}"))
-            raise
+            logger.exception("DDR cache completion failed; retained allocations require confirmed retirement")
 
     async def close(self):
         try:
             await self._close()
         finally:
+            if self.cache is not None:
+                self.cache.backend.set_notify(None)
+            with self._notify_lock:
+                self._loop = None
             if self.trace is not None:
                 if self.cache is not None:
                     self.trace.snapshot(self.cache, force=True)

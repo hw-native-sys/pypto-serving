@@ -38,7 +38,8 @@ class Page:
 
 
 class CacheTier:
-    def __init__(self, capacity, backend, release_pin, *, policy=None, clock=time.monotonic, trace=None):
+    def __init__(self, capacity, backend, release_pin, *, policy=None, clock=time.monotonic, trace=None,
+                 notify=None):
         if type(capacity) is not int or capacity <= 0:
             raise ValueError("DDR capacity must be positive")
         self.capacity, self.backend, self.release_pin = capacity, backend, release_pin
@@ -53,6 +54,7 @@ class CacheTier:
         self.error = None
         self.closing = False
         self.trace = trace
+        self.notify = notify
         self.counters = dict(stored_bytes=0, loaded_bytes=0, evicted_bytes=0, stores=0, loads=0)
 
     def capture(self, key, source, size, lease, *, charge=None):
@@ -74,6 +76,8 @@ class CacheTier:
         self.pages[key] = page
         self.by_handle[page.handle] = page
         self.queued.append(page)
+        if self.notify is not None:
+            self.notify()
 
     def publish(self, identity, keys):
         """A unit is the complete logical KV/state recovery set, not a physical allocation."""
@@ -136,6 +140,8 @@ class CacheTier:
                 raise RuntimeError("stale DDR reader")
         for page in pages:
             page.readers -= 1
+        if self.queued and self.notify is not None:
+            self.notify()
 
     def load(self, page, destination, *, request=None):
         if self.pages.get(page.key) is not page or not page.ready or page.readers <= 0:
@@ -193,8 +199,9 @@ class CacheTier:
             raise RuntimeError("DDR work is quarantined") from self.error
         try:
             reaped_pages = reaped_bytes = max_pin_age_ns = 0
-            for page in tuple(self.inflight.values()):
-                if not page.future.done():
+            for handle in self.backend.pop_completed("store"):
+                page = self.inflight.get(handle)
+                if page is None:  # An unsubmitted STORE may have been cancelled during close.
                     continue
                 self.completed(page.future, page.size)
                 page.future = None

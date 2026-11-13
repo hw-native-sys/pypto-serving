@@ -33,6 +33,8 @@ class StorageBackend(Protocol):
     def store(self, handle: int, source: object) -> Future: ...
     def load(self, handle: int, destination: object, *, request=None) -> Future: ...
     def release(self, handle: int) -> Future: ...
+    def pop_completed(self, operation: str): ...
+    def set_notify(self, notify): ...
     def close(self) -> None: ...
 
 
@@ -99,6 +101,8 @@ class SimplerBackend:
         self.tp = geometry["tp"]
         self.extents = Extents(capacity)
         self.queue = SimpleQueue()
+        self.completed = {operation: SimpleQueue() for operation in ("store", "load")}
+        self.notify = None
         self.records = {}
         self.lock = threading.RLock()
         self.wake = threading.Event()
@@ -106,11 +110,19 @@ class SimplerBackend:
         self.close_error = None
         self.trace = trace
         self.batch_ids = count(1)
-        self.metrics = {direction: dict(batches=0, pages=0, bytes=0, rpc_ns=0, native_ns=0,
-                                       submit_ns=0, wait_ns=0, queue_ns=0)
-                        for direction in ("store", "load")}
         self.thread = threading.Thread(target=self._run, name="cache-transfer-progress", daemon=False)
         self.thread.start()
+
+    def set_notify(self, notify):
+        self.notify = notify
+
+    def pop_completed(self, operation):
+        queue = self.completed[operation]
+        while True:
+            try:
+                yield from queue.get_nowait()
+            except Empty:
+                return
 
     def size(self, source):
         group, _, _ = source
@@ -200,16 +212,6 @@ class SimplerBackend:
                          jobs[0].operation, len(jobs), len(replies),
                          self.tp * sum(job.storage.size for job in jobs),
                          (time.monotonic_ns() - dispatched) / 1e6)
-            stats = self.metrics[jobs[0].operation]
-            stats["batches"] += len(replies)
-            stats["pages"] += len(jobs)
-            stats["bytes"] += self.tp * sum(job.storage.size for job in jobs)
-            stats["rpc_ns"] += (time.monotonic_ns() - dispatched) * len(replies)
-            stats["queue_ns"] += sum(dispatched - job.enqueued for job in jobs)
-            for reply in replies:
-                stats["native_ns"] += reply["completed_ns"] - reply["started_ns"]
-                stats["submit_ns"] += reply["submitted_ns"] - reply["started_ns"]
-                stats["wait_ns"] += reply["completed_ns"] - reply["submitted_ns"]
         except BaseException as error:
             # An uncertain batch retains all ranges and the caller's HBM pins.
             for job in jobs:
@@ -221,6 +223,12 @@ class SimplerBackend:
                     requests=sorted({job.request for job in jobs if job.request is not None}),
                     pages=len(jobs), native_completed=False, error_type=type(error).__name__)
             return
+        finally:
+            # One notification per batch, after every TP owner has returned.
+            self.completed[jobs[0].operation].put(tuple(job.handle for job in jobs))
+            notify = self.notify
+            if notify is not None:
+                notify()
         if self.trace is not None:
             try:
                 ended = time.monotonic_ns()

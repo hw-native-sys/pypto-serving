@@ -46,13 +46,15 @@ class PendingPrefix:
     snapshot: object
     loads: tuple
     started_ns: int = 0
+    remaining: int = 0
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class TieredCache:
-    def __init__(self, cache, backend, capacity, *, trace=None):
+    def __init__(self, cache, backend, capacity, *, trace=None, notify=None):
         self.cache, self.backend = cache, backend
         self.trace = trace
-        self.tier = CacheTier(capacity, backend, cache.release_group_block_snapshot, trace=trace)
+        self.tier = CacheTier(capacity, backend, cache.release_group_block_snapshot, trace=trace, notify=notify)
         self.pending, self.loads = {}, {}
         self.quarantined = []
 
@@ -77,7 +79,12 @@ class TieredCache:
                     raise ValueError("request cancelled during cache restore")
                 if self.prepare(request, hashes, tokens, maximum=maximum, groups=groups):
                     return
-                await asyncio.sleep(.002)
+                pending = self.pending[request]
+                pending.changed.clear()
+                if pending.remaining:
+                    await pending.changed.wait()
+                if self.pending.get(request) is not pending:
+                    raise ValueError("request cancelled during cache restore")
         except BaseException:
             self.cancel(request)
             raise
@@ -105,14 +112,31 @@ class TieredCache:
         self.tier.publish(identity, keys)
 
     def progress(self):
+        try:
+            self._progress()
+        except BaseException as error:
+            self.tier.error = error
+            self.wake()
+            raise
+
+    def wake(self):
+        """Recheck existing restore waiters; this is not a completion or stop proof."""
+        for pending in self.pending.values():
+            pending.changed.set()
+
+    def _progress(self):
         self.tier.pump()
-        for key, load in tuple(self.loads.items()):
-            if load.ready or not load.future.done():
+        reaped_pages = reaped_bytes = published_pages = 0
+        requests = set()
+        for handle in self.backend.pop_completed("load"):
+            page = self.tier.by_handle[handle]
+            key = page.key
+            load = self.loads.get(key)
+            if load is None or load.ready:
                 continue
             try:
                 self.tier.completed(load.future, load.page.size)
             except BaseException as error:
-                self.tier.error = error
                 if self.trace is not None:
                     self.trace.emit("restore_failed", requests=sorted(load.waiters),
                                     error_type=type(error).__name__, native_completed=False)
@@ -120,13 +144,26 @@ class TieredCache:
             if load.waiters:
                 pool = self.cache._group_pools[key[1]]
                 self.cache._cache_group_block(pool, load.partition, load.block, key[2])
+                published_pages += 1
             self.tier.counters["loads"] += 1
             self.tier.counters["loaded_bytes"] += load.page.size
             self.tier.release((load.page,))
             load.ready = True
+            if self.trace is not None:
+                reaped_pages += 1
+                reaped_bytes += load.page.size
+                requests.update(load.waiters)
+            for request in load.waiters:
+                pending = self.pending[request]
+                pending.remaining -= 1
+                if pending.remaining == 0:
+                    pending.changed.set()
             if not load.waiters:
                 self._finish_load(key)
         if self.trace is not None:
+            if reaped_pages:
+                self.trace.emit("load_reaped", pages=reaped_pages, bytes=reaped_bytes,
+                                published_pages=published_pages, requests=sorted(requests))
             self.trace.snapshot(self)
 
     def _lookup(self, pool, partition, value):
@@ -139,7 +176,7 @@ class TieredCache:
             raise RuntimeError("DDR work is quarantined") from self.tier.error
         pending = self.pending.get(request)
         if pending is not None:
-            if not all(self.loads[key].ready for key in pending.loads):
+            if pending.remaining:
                 return False
             self.cache._protect_group_checkpoint(None, pending.hashes, pending.tokens,
                                                  pending.partition, {}, pending.boundary)
@@ -184,7 +221,8 @@ class TieredCache:
             for key in missing:
                 self.loads[key].waiters.add(request)
             self.pending[request] = PendingPrefix(hashes, tokens, boundary, selected, source_pin,
-                                                  tuple(missing), started_ns)
+                tuple(missing), started_ns=started_ns,
+                remaining=sum(not self.loads[key].ready for key in missing))
             if self.trace is not None:
                 counts = {}
                 for key in missing:
@@ -222,6 +260,7 @@ class TieredCache:
         pending = self.pending.pop(request, None)
         if pending is None:
             return
+        pending.changed.set()
         self.cache.release_group_block_snapshot(pending.snapshot)
         remaining = 0
         for key in pending.loads:

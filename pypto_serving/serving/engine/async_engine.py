@@ -814,8 +814,6 @@ class ReplicaEngineCore:
         """
         logger.info("Engine loop started (async_scheduling=%s)", self._async_scheduling)
         while self._running:
-            if self._cache_tiering is not None:
-                self._cache_tiering.progress()
             dispatched = False
             if len(self._batch_queue) < self._max_in_flight and self.scheduler.has_work():
                 dispatched = self._try_dispatch_step()

@@ -49,6 +49,11 @@ using the plan with fewer two-dimensional copies. Contiguous ranges use asynchro
 grouping without changing page layout or copying gaps between authorized pages.
 There is no HBM staging buffer, data packing, or selectable legacy copy path.
 
+Completed batches notify the existing engine event loop to publish pages and
+return copy references without waiting for a model step to return. Restore
+waiters use completion notifications instead of periodic page scans. LOAD and
+STORE still share one copy stream per owner.
+
 Lookup uses the normal grouped prefix boundaries. A hit must include the required
 KV and compression state. A missing HBM page can be restored from DDR into pages
 reserved by the existing cache manager. Concurrent readers share restoration;
@@ -106,6 +111,8 @@ HTTP request. No prompts, cache contents, hashes or raw addresses are recorded.
 Queue/source-pin lifetime includes metadata admission and completion consumption;
 `store_inflight` and `unconfirmed_pages` are pending Host confirmation, not a
 claim that the DMA engine is still active.
+`store_reaped` and `load_reaped` mark Host consumption of confirmed transfers;
+page publication, complete restore readiness and scheduling are separate events.
 
 `restore_ready` means the candidate recovery set is readable, not that inference
 succeeded or its resources retired. A cancelled reader can still leave native
