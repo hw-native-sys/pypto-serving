@@ -145,11 +145,8 @@ def _dspark_import_context(
     kernel_dir: Path,
     *,
     pypto_lib_root: Path,
-    tp: int,
-    ep: int,
+    layout: DSparkCacheLayout,
     weight_bank_size: int,
-    dp: int = 1,
-    lm_head_tp: int = 4,
 ):
     """Import kernels with one node's independent attention and head shapes."""
     old_argv = list(sys.argv)
@@ -166,11 +163,11 @@ def _dspark_import_context(
             sys.modules.pop(module_name, None)
     sys.argv = [
         "pypto-serving-dspark",
-        "--tp", str(int(tp)),
-        "--lm-head-tp", str(int(lm_head_tp)),
-        "--ep", str(int(ep)),
+        "--tp", str(layout.tp_size),
+        "--lm-head-tp", str(layout.lm_head_tp_size),
+        "--ep", str(layout.ranks),
         # EP fixes the composed world; attention DP is not head DP.
-        "--dp", str(int(dp)),
+        "--dp", str(layout.partitions),
         "--weight-bank-size", str(int(weight_bank_size)),
     ]
     sys.path.insert(0, str(kernel_dir))
@@ -180,8 +177,22 @@ def _dspark_import_context(
         # replace config's default EP=8 with the requested topology.
         sys.modules.pop("config", None)
         config = importlib.import_module("config")
-        config.EP = int(ep)
-        config.TP = int(tp)
+        config.EP = layout.ranks
+        config.TP = layout.tp_size
+        config.DP = layout.partitions
+        if config.DECODE_SEQ != layout.decode_seq:
+            raise ValueError("DSpark Lib verification width does not match the Serving layout")
+        # Lib derives owner, drafter and head extents from B/S at import.
+        # Configure the existing 16-request owner tile instead of inheriting
+        # B=64 at TP1 and quadrupling padded workspaces and filler execution.
+        config.DECODE_BATCH = layout.decode_batch
+        config.DECODE_TOKENS = layout.decode_tokens
+        config.MOE_TOKENS = layout.moe_tokens
+        config.DECODE_RECV_MAX = layout.ranks * layout.moe_tokens
+        config.RECV_MAX = config.DECODE_RECV_MAX
+        for state in ("HCA", "CSA", "CSA_INNER"):
+            setattr(config, f"{state}_STATE_PHYSICAL_BLOCKS",
+                    layout.decode_batch * getattr(config, f"{state}_STATE_BLOCKS_PER_REQUEST"))
         yield
     finally:
         sys.argv = old_argv
@@ -558,11 +569,8 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         with _dspark_import_context(
             self._kernel_dir,
             pypto_lib_root=pypto_lib_root,
-            tp=layout.tp_size,
-            ep=layout.ranks,
+            layout=layout,
             weight_bank_size=DSPARK_FWD_NUM_LAYERS,
-            dp=layout.partitions,
-            lm_head_tp=layout.lm_head_tp_size,
         ):
             config = importlib.import_module("config")
             utils = importlib.import_module("utils")
@@ -584,6 +592,25 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                 modules["decode_fwd_dspark"] = importlib.import_module(
                     "decode_fwd_dspark"
                 )
+            shapes = [
+                ("Decode owner rows", decode_fwd.MOE_TOKENS, layout.moe_tokens),
+                ("LM-head rows", decode_fwd.MAX_LOGIT_ROWS, layout.max_logit_rows),
+                ("LM-head TP", decode_fwd.LM_HEAD_TP_SIZE, layout.lm_head_tp_size),
+            ]
+            if speculative:
+                fused = modules["decode_fwd_dspark"]
+                shapes.extend((
+                    ("Decode group batch", fused.DECODE_BATCH, layout.decode_batch),
+                    ("Decode local batch", fused.LOCAL_DECODE_BATCH, layout.decode_local_batch),
+                    ("drafter rows", modules["dspark_drafter"].T, layout.moe_tokens),
+                    ("drafter batch", modules["dspark_drafter"].DSPARK_MAX_BATCH, layout.decode_local_batch),
+                    ("Markov rows", modules["dspark_markov"].DSPARK_MOE_TOKENS, layout.moe_tokens),
+                    ("bootstrap batch", modules["prefill_bootstrap_one_l2"].DRAFTER_DSPARK_MAX_BATCH,
+                     layout.decode_local_batch),
+                ))
+            for name, actual, expected in shapes:
+                if actual != expected:
+                    raise ValueError(f"DSpark Lib {name}={actual} does not match Serving capacity={expected}")
         return modules
 
     def _compile_l3_callable(self, name: str, jit_fn: object):

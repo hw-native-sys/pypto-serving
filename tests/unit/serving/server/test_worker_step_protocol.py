@@ -65,6 +65,7 @@ def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
         is_prefill=True,
         block_ids_by_group={"ori": [3, 4], "state": [5]},
         cache_partition=2,
+        read_block_ids_by_group={"state": {1023: 19, 1024: 7}},
     )
     output = SchedulerOutput(scheduled_requests=[scheduled])
 
@@ -80,6 +81,7 @@ def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
         "state": [5],
     }
     assert decoded.prefill_requests[0].cache_partition == 2
+    assert decoded.prefill_requests[0].read_block_ids_by_group == {"state": {1023: 19, 1024: 7}}
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])

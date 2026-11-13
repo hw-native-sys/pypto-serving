@@ -30,7 +30,7 @@ def cache_pool_bytes(groups, counts, *, filler_pages):
     return total
 
 
-def plan_cache_pages(groups, budget, *, active_requests, step_tokens, filler_pages):
+def plan_cache_pages(groups, budget, *, active_requests, step_tokens, filler_pages, retention_interval=0):
     """Reserve live rings, one in-flight replacement and bounded checkpoints.
 
     ``active_requests`` is an upper limit, not guaranteed residency. Size the
@@ -44,6 +44,9 @@ def plan_cache_pages(groups, budget, *, active_requests, step_tokens, filler_pag
     history = [group for group in groups if group.sliding_window is None]
     if not history:
         raise ValueError("DSpark requires full-history cache groups")
+    alignment = math.lcm(*(group.spec.token_capacity for group in groups))
+    if type(retention_interval) is not int or retention_interval < 0 or retention_interval % alignment:
+        raise ValueError(f"retention interval must be zero or a positive multiple of {alignment}")
 
     def request_counts(requests):
         counts = {}
@@ -55,8 +58,17 @@ def plan_cache_pages(groups, budget, *, active_requests, step_tokens, filler_pag
                 # Keep the complete ring, in-flight replacements and a bounded
                 # checkpoint for every budgeted request. Do not shorten rings.
                 working = (step_tokens + page - 1) // page
+                if group.is_checkpoint_state:
+                    # Include both boundary pages for recurrent-state writes.
+                    working = (step_tokens + 2 * page - 2) // page
                 checkpoint = group.sliding_window // page
-                counts[group.name] = requests * (group.max_blocks_per_seq + working + checkpoint)
+                if group.preserve_prefill_history:
+                    # Two output generations and their entry histories can
+                    # coexist. Do not assume their pins share checkpoint pages.
+                    entry = (group.sliding_window + 2 * page - 2) // page
+                    counts[group.name] = requests * (2 * group.max_blocks_per_seq + 2 * entry + checkpoint)
+                else:
+                    counts[group.name] = requests * (group.max_blocks_per_seq + working + checkpoint)
         return counts
 
     counts = request_counts(1)
@@ -78,6 +90,27 @@ def plan_cache_pages(groups, budget, *, active_requests, step_tokens, filler_pag
     # minimum. Bound by the total budget, not by its rounded remaining bytes.
     low, high = 0, budget // increment_bytes
     base = dict(counts)
+    if retention_interval:
+        def covered_counts(extra):
+            tokens = extra * alignment
+            checkpoints = math.ceil(tokens / retention_interval)
+            return {
+                group.name: (max(base[group.name], math.ceil(tokens / group.spec.token_capacity))
+                             if group.sliding_window is None else
+                             base[group.name] + checkpoints * group.sliding_window // group.spec.token_capacity)
+                for group in groups
+            }
+
+        # Preserve live/entry/COW pages and the one-request context guarantee.
+        # First fill the rolling checkpoint deficit beneath that history floor,
+        # then grow all groups to a common source-token coverage.
+        while low < high:
+            extra = (low + high + 1) // 2
+            if cache_pool_bytes(groups, covered_counts(extra), filler_pages=filler_pages) <= budget:
+                low = extra
+            else:
+                high = extra - 1
+        return covered_counts(low)
     while low < high:
         extra = (low + high + 1) // 2
         for group in history:

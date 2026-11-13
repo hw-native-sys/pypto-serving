@@ -144,11 +144,14 @@ class EngineConfig:
         homogeneous_prefill_decode = (
             runtime.requires_homogeneous_prefill_decode or is_deepseek_v4
         )
-        if runtime.requires_homogeneous_prefill_decode == homogeneous_prefill_decode:
+        retention_interval = runtime.prefix_cache_retention_interval if self.enable_prefix_cache else 0
+        if (runtime.requires_homogeneous_prefill_decode == homogeneous_prefill_decode
+                and runtime.prefix_cache_retention_interval == retention_interval):
             return runtime
         return replace(
             runtime,
             requires_homogeneous_prefill_decode=homogeneous_prefill_decode,
+            prefix_cache_retention_interval=retention_interval,
         )
 
     def worker_device_ids(self) -> tuple[int, ...]:
@@ -270,6 +273,7 @@ class ReplicaEngineCore:
                 runtime.supports_chunked_prefill_with_speculation
             ),
             speculative_prefix_cache_replay_tokens=runtime.speculative_prefix_cache_replay_tokens,
+            prefix_cache_retention_interval=runtime.prefix_cache_retention_interval,
             requires_homogeneous_prefill_decode=(
                 runtime.requires_homogeneous_prefill_decode
             ),
@@ -863,10 +867,17 @@ class ReplicaEngineCore:
             cat="scheduler",
             args={"scheduled": len(scheduler_output.scheduled_requests)},
         ):
-            step_cmd = self._build_step_command(
-                scheduler_output, finished_ids, step_id=self._step_counter
-            )
-            self._input_queue.put(encode_command(step_cmd))
+            try:
+                step_cmd = self._build_step_command(
+                    scheduler_output, finished_ids, step_id=self._step_counter
+                )
+                encoded = encode_command(step_cmd)
+            except Exception:
+                # Nothing reached the worker: release pre-dispatch read pins.
+                for scheduled in scheduler_output.scheduled_requests:
+                    self.scheduler.discard_scheduled_request(scheduled)
+                raise
+            self._input_queue.put(encoded)
         reregistered_ids = {
             request.request_id for request in step_cmd.new_requests
         }
@@ -1044,6 +1055,10 @@ class ReplicaEngineCore:
                         for name, block_ids in sr.block_ids_by_group.items()
                     },
                     cache_partition=sr.cache_partition,
+                    read_block_ids_by_group=sr.read_block_ids_by_group,
+                    checkpoint_ends=sr.checkpoint_plan.boundaries if sr.checkpoint_plan else (),
+                    state_write_block_ids_by_group=sr.checkpoint_plan.write_blocks if sr.checkpoint_plan else {},
+                    checkpoint_block_ids_by_group=sr.checkpoint_plan.publication_blocks if sr.checkpoint_plan else {},
                 ))
             else:
                 output_ids = req.output_token_ids

@@ -10,6 +10,7 @@
 
 import ast
 import ctypes
+import weakref
 from dataclasses import make_dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from pypto_serving.config.types import DecodeBatch, PrefillBatch
+from pypto_serving.config.types import DecodeBatch, PrefillBatch, RuntimeConfig
 from pypto_serving.model.deepseek_dspark import task_args as task_args_module
 from pypto_serving.model.deepseek_dspark import npu_executor as executor_module
 from pypto_serving.model.deepseek_dspark import npu_runner as runner_module
@@ -52,7 +53,8 @@ def test_cache_budget_treats_max_num_seqs_as_an_upper_limit(tp_size, prefill_tok
     assert cache_pool_bytes(groups, counts, filler_pages=64) <= budget
     rolling = [g for g in groups if g.sliding_window is not None]
     per_request = {g.name: g.max_blocks_per_seq
-        + (prefill_tokens + g.spec.token_capacity - 1) // g.spec.token_capacity
+        + (prefill_tokens + g.spec.token_capacity - 1
+           + (g.spec.token_capacity - 1 if g.is_checkpoint_state else 0)) // g.spec.token_capacity
         + g.sliding_window // g.spec.token_capacity for g in rolling}
     resident = counts["ori"] // per_request["ori"]
     assert 1 <= resident <= runtime.max_batch_size // partitions
@@ -85,11 +87,12 @@ def test_cache_budget_preserves_async_checkpoint_minimum(resident):
         max_seq_len=310000, max_prefill_tokens=8192, partitions=4)
     minimum_counts = {g.name: max(g.max_blocks_per_seq, resident * (8192 // g.spec.token_capacity))
         if g.sliding_window is None else resident * (g.max_blocks_per_seq
-            + 8192 // g.spec.token_capacity + g.sliding_window // g.spec.token_capacity)
+            + (8192 + g.spec.token_capacity - 1
+               + (g.spec.token_capacity - 1 if g.is_checkpoint_state else 0)) // g.spec.token_capacity
+            + g.sliding_window // g.spec.token_capacity)
         for g in groups}
     budget = cache_pool_bytes(groups, minimum_counts, filler_pages=64)
     if resident == 1:
-        assert budget == 7790919680
         with pytest.raises(RuntimeError, match=f"minimum {budget}"):
             plan_cache_pages(groups, budget - 1, active_requests=64, step_tokens=8192, filler_pages=64)
     counts = plan_cache_pages(groups, budget, active_requests=64, step_tokens=8192, filler_pages=64)
@@ -116,14 +119,100 @@ def test_page_budget_uses_fractional_slot_without_changing_rings(tp_size):
     assert used <= budget
     assert original["cmp_c4"] < counts["cmp_c4"] < 2 * original["cmp_c4"]
     assert counts["ori"] == active * (9 + 1 + 4)
-    assert counts["hca_state"] == active * (33 + 1 + 16)
-    assert counts["csa_state"] == counts["csa_inner_state"] == active * (69 + 4 + 4)
+    assert counts["hca_state"] == active * (33 + 2 + 16)
+    assert counts["csa_state"] == counts["csa_inner_state"] == active * (69 + 5 + 4)
     increment = {g.name: counts[g.name] + (g.sliding_window is None) for g in groups}
     assert cache_pool_bytes(groups, increment, filler_pages=64) > budget
     manager = KvCacheManager()
     manager.initialize(RuntimeConfig(kv_cache_groups=groups), num_blocks=counts["ori"], group_num_blocks=counts)
     assert {g.name: manager.group_num_blocks(g.name) for g in groups} == counts
     assert {g.name: g.max_blocks_per_seq for g in manager.group_specs} == original
+
+
+@pytest.mark.parametrize("interval", [128, 512, 2048, 8192, 16384])
+@pytest.mark.parametrize("budget", [16 << 30, 28 << 30])
+def test_retention_budget_balances_windows_without_reducing_context(interval, budget):
+    from pypto_serving.model.deepseek_dspark.cache_capacity import cache_pool_bytes, plan_cache_pages
+
+    groups = build_dspark_cache_group_specs(43, (0, 0) + (4,) * 21 + (128,) * 20,
+        max_seq_len=1048576, max_prefill_tokens=8192, partitions=4, prefill_only=True)
+    kwargs = dict(active_requests=4, step_tokens=8192, filler_pages=64)
+    baseline = plan_cache_pages(groups, budget, **kwargs)
+    counts = plan_cache_pages(groups, budget, retention_interval=interval, **kwargs)
+    history = [g for g in groups if g.sliding_window is None]
+    rolling = [g for g in groups if g.sliding_window is not None]
+    assert cache_pool_bytes(groups, counts, filler_pages=64) <= budget
+    assert all(counts[g.name] >= g.max_blocks_per_seq for g in history)
+    extras = [(counts[g.name] - baseline[g.name]) // (g.sliding_window // g.spec.token_capacity)
+              for g in rolling]
+    assert len(set(extras)) == 1 and extras[0] > 0
+    coverage = min(extras[0] * interval, *(counts[g.name] * g.spec.token_capacity for g in history))
+    # One further common aligned span cannot fit. Working pools/rings remain intact.
+    proposed = dict(counts)
+    for g in groups:
+        if g.sliding_window is None:
+            proposed[g.name] = max(g.max_blocks_per_seq, (coverage + 128 + g.spec.token_capacity - 1)
+                                   // g.spec.token_capacity)
+        else:
+            points = (coverage + 128 + interval - 1) // interval
+            proposed[g.name] = baseline[g.name] + points * g.sliding_window // g.spec.token_capacity
+    assert cache_pool_bytes(groups, proposed, filler_pages=64) > budget
+
+
+@pytest.mark.parametrize("interval", [0, 128, 512, 1024, 2048, 4096, 8192, 16384])
+@pytest.mark.parametrize("start,length", [(0, 8192), (31, 8192), (513, 8192), (1048445, 131)])
+def test_checkpoint_metadata_is_bounded_per_projection_tile(interval, start, length):
+    end = start + length
+    ends = set(range((start // interval + 1) * interval, end + 1, interval)) if interval else set()
+    ends.update(((end - 128) // 128 * 128, (start + length // 2) // 128 * 128))
+    ends = tuple(sorted(b for b in ends if start < b <= end))
+    tiles = (length + 511) // 512
+    packed = DSparkCacheMetadataBuilder.checkpoint_tiles(ends, start=start, length=length, tiles=tiles)
+    assert packed[packed != 0].tolist() == list(ends) and packed.shape == (tiles, 6)
+    for tile, row in enumerate(packed):
+        assert all(start + tile * 512 < b <= min(end, start + (tile + 1) * 512) for b in row[row > 0])
+
+
+@pytest.mark.parametrize("page", [2, 8])
+@pytest.mark.parametrize("start,length", [(0, 32), (31, 129), (8205, 8192), (1040384, 8192)])
+@pytest.mark.parametrize("view", ["flat", "row", "strided"])
+def test_checkpoint_page_gather_matches_full_scan(page, start, length, view):
+    positions = torch.arange(start, start + length)
+    mapping = positions % 1024
+    if view == "row":
+        positions, mapping = positions.unsqueeze(0), mapping.unsqueeze(0)
+    elif view == "strided":
+        positions = torch.stack((positions, positions), dim=-1)[:, 0].unsqueeze(0)
+        mapping = torch.stack((mapping, mapping), dim=-1)[:, 0].unsqueeze(0)
+    expected = mapping.clone()
+    pages = {q: (q * 17) % 8192 for q in range(max(0, start // page - 16), (start + length) // page, 3)}
+    for q, physical in pages.items():
+        selected = positions // page == q
+        expected[selected] = physical * page + positions[selected] % page
+    DSparkCacheMetadataBuilder.apply_checkpoint_pages(mapping, positions, pages, page_tokens=page, num_blocks=8192)
+    assert torch.equal(mapping, expected)
+    with pytest.raises(ValueError, match="outside the state pool"):
+        DSparkCacheMetadataBuilder.apply_checkpoint_pages(mapping, positions, {0: -1},
+                                                          page_tokens=page, num_blocks=8192)
+
+
+@pytest.mark.parametrize("prefill,prefix", [(True, True), (True, False), (False, True), (False, False)])
+def test_only_prefill_prefix_plans_retention_windows(monkeypatch, prefill, prefix):
+    from pypto_serving.serving.engine.async_engine import EngineConfig
+
+    runner = _runner()
+    runner._compiled.prefill = object() if prefill else None
+    runner._cache_group_specs = build_dspark_cache_group_specs(43, max_seq_len=1048576)
+    runner._l3_worker = SimpleNamespace(device_memory_info=lambda rank: (50 << 30, 64 << 30))
+    calls = []
+    def plan(groups, budget, **kwargs):
+        calls.append(kwargs)
+        return {g.name: g.max_blocks_per_seq for g in groups}
+    monkeypatch.setattr(runner_module, "plan_cache_pages", plan)
+    runtime = EngineConfig(runtime_config=RuntimeConfig(prefix_cache_retention_interval=2048),
+                           enable_prefix_cache=prefix).resolve_runtime_config()
+    runner._compute_kv_cache_pages(runtime)
+    assert calls[0]["retention_interval"] == (2048 if prefill and prefix else 0)
 
 
 def _runner(*, speculative: bool = False, max_position: int = 512, extension_factory=None,
@@ -226,6 +315,140 @@ def _block_rows(count: int) -> list[dict[str, list[int]]]:
     return rows
 
 
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("heap", [None, 1 << 30, [1 << 30, 2 << 30, 4 << 30, 1 << 30]])
+def test_heap_override_covers_profiles_prewarm_and_dispatch(monkeypatch, fused, heap):
+    runner = _runner(speculative=True, tp_size=1)
+    program = SimpleNamespace(compiled=object(), name="host-probe", aicpu_thread_num=1,
+                              block_dim=None, dispatch_args=())
+    runner._compiled.decode = runner._compiled.drafter = runner._compiled.markov = program
+    runner._compiled.bootstrap_tokens = program
+    runner._compiled.decode_full_fused = fused
+    decode_default = runner_module._parse_decode_ring_heap("1073741824,2147483648,1073741824,2147483648")
+    draft_default = (4 << 30, 2 << 30, 4 << 30, 1 << 30)
+    monkeypatch.setattr(runner_module, "DSPARK_DECODE_RING_HEAP", decode_default)
+    monkeypatch.setattr(runner_module, "DSPARK_DRAFTER_RING_HEAP", draft_default)
+    monkeypatch.setenv("PYPTO_DSPARK_ENABLE_DEP_GEN", "1")
+    monkeypatch.setenv("PYPTO_DSPARK_CHIP_SWIMLANE", "1")
+    runtime = RuntimeConfig(max_seq_len=512, ring_heap=heap,
+                            ring_dep_pool=1 << 17, ring_task_window=1 << 17)
+    runner.init_kv_cache("model", SimpleNamespace(num_hidden_layers=43), runtime)
+    profiles = [runner._l3_run_config, runner._decode_run_config,
+                runner._drafter_run_config, runner._markov_run_config]
+    def sizes(value):
+        return [value] * 4 if isinstance(value, int) else list(value) if value is not None else None
+    expected = ([sizes(heap)] * 4 if heap is not None else
+                [None, sizes(draft_default if fused else decode_default),
+                 sizes(draft_default), sizes(runner_module.DSPARK_MARKOV_RING_HEAP)])
+    assert [sizes(p.ring_heap) for p in profiles] == expected
+    assert profiles[0].ring_dep_pool == profiles[0].ring_task_window == 1 << 17
+    assert profiles[1].enable_dep_gen and profiles[1].enable_chip_swimlane == 1
+    calls, warmed = [], []
+    worker = SimpleNamespace(run=lambda *a, config: calls.append(config),
+        submit=lambda *a, config: (calls.append(config) or SimpleNamespace(result=lambda: None)))
+    def create_worker(*args, **kwargs):
+        warmed.append(kwargs["config"])
+        return worker
+    monkeypatch.setattr("pypto.runtime.DistributedWorker", create_worker)
+    for profile in profiles:
+        runner._run_l3(program, config=profile)
+        runner._submit_l3(program, config=profile).wait()
+    assert [sizes(p.ring_heap) for p in calls] == [value for value in expected for _ in range(2)]
+    assert len(warmed) == 1
+    assert sizes(warmed[0].ring_heap) == [max(v) for v in zip(*(v for v in expected if v is not None))]
+    assert warmed[0].ring_dep_pool == 1 << 17
+    # The actual bootstrap token entry uses the generic profile, even on D.
+    monkeypatch.setattr(runner, "_stage_bootstrap_descriptors", lambda ids: 1)
+    monkeypatch.setattr(runner, "_packed_host_prefix", lambda tensor, *a: tensor)
+    monkeypatch.setattr(runner, "_stacked_device_prefix", lambda tensor, *a: tensor)
+    runner._prefill_prepare_buffers = SimpleNamespace(bootstrap_descriptors=object())
+    runner._prefill_prepared_device["sampled_ids"] = object()
+    runner._device_scratch[("bootstrap", "next_prefill_tokens")] = object()
+    assert runner._prepare_device_bootstrap(["request"]) == 1
+    assert calls[-1] is profiles[0]
+
+
+@pytest.mark.parametrize("heap", [0, [-1] * 4, [1 << 30] * 3])
+def test_heap_override_keeps_runtime_validation(heap):
+    runner = _runner()
+    with pytest.raises((TypeError, ValueError)):
+        runner.init_kv_cache("model", SimpleNamespace(num_hidden_layers=43),
+                             RuntimeConfig(max_seq_len=512, ring_heap=heap))
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode", "mixed"])
+@pytest.mark.parametrize("fail_at", [None, 2, 4, 10])
+def test_resident_weights_follow_target_prefill_capability(monkeypatch, role, fail_at):
+    from pypto_serving.model.deepseek_dspark.weight_loader import DSparkStackedLayerWeights
+
+    runner = _runner(speculative=True, tp_size=1)
+    runner._compiled.prefill = None if role == "decode" else object()
+    runner._compiled.decode = None if role == "prefill" else object()
+    runner._compiled.prefill_capture = runner._compiled.prefill_publish = object()
+    runner._compiled.bootstrap_metadata = object()
+    main = {name: torch.zeros((16, 2, 4)) for name in ("wo_a", "shared_w1")}
+    prefill = {name: torch.zeros((16, 2, 4)) for name in
+               ("wo_a", "wo_b", "csa_weights_proj", "hc_attn_fn", "hc_ffn_fn")}
+    prefill_ids = {id(v) for v in prefill.values()}
+    refs = [weakref.ref(v) for v in prefill.values()]
+    weights = DSparkStackedLayerWeights(main, prefill)
+    runner._retain_stacked_host_weights(weights)
+    del weights, prefill
+    assert all((ref() is None) == (role == "decode") for ref in refs)
+    inherited = {id(v) for v in runner._inherited_host_weights()}
+    assert (prefill_ids <= inherited) if role != "decode" else prefill_ids.isdisjoint(inherited)
+    runner._drafter_host_weights = {"drafter": torch.zeros((16, 2, 4))}
+    embed = torch.zeros((8, 4), dtype=torch.bfloat16)
+    runner._global_weights = SimpleNamespace(embed_weight=embed)
+    head = torch.zeros((16, 8, 4), dtype=torch.bfloat16)
+    runner._static_lm_head_weight = head
+    runner._default_grammar_args = {}
+    uploaded, live, freed, closed = [], set(), set(), []
+    def allocate(tensor, *args, **kwargs):
+        uploaded.append(id(kwargs.get("init", tensor)))
+        if len(uploaded) == fail_at:
+            raise RuntimeError("upload failed")
+        handle = (runner_module.DeviceTensor(len(uploaded) * 4096, tensor, args[0])
+                  if args else object())
+        live.add(handle)
+        return handle
+    def free(handle, **kwargs):
+        assert handle in live and handle not in freed
+        live.remove(handle)
+        freed.add(handle)
+    def close():
+        closed.append(True)
+        for handle in tuple(live):
+            free(handle)
+    worker = SimpleNamespace(alloc_stacked_tensor=allocate, alloc_tensor=allocate,
+        free_stacked_tensor=free, free_tensor=free, close=close, release_inherited_host_tensor_refs=lambda: None)
+    runner._l3_worker = worker
+    def scratch(name, shape, dtype, *, scope):
+        return runner._device_scratch.setdefault((scope, name), object())
+    monkeypatch.setattr(runner, "_alloc_zeroed_stacked_tensor", scratch)
+    if fail_at is not None:
+        with pytest.raises(RuntimeError, match="upload failed"):
+            runner._materialize_resident_weights()
+    else:
+        runner._materialize_resident_weights()
+        assert all(id(tensor) in uploaded for tensor in main.values())
+        if role == "decode":
+            assert runner._stacked_prefill_device_weights is None and len(uploaded) == 20
+        else:
+            assert prefill_ids <= set(uploaded)
+        assert runner._require_drafter_weights() is runner._drafter_device_weights
+        assert set(runner._require_stacked_weights()) == set(main)
+        assert uploaded.count(id(embed)) == 16 and uploaded.count(id(head)) == 1
+        assert {("prefill_state", "hidden"), ("prefill_state", "positions")} <= set(runner._device_scratch)
+        assert "sampled_ids" in runner._prefill_prepared_device
+        count = len(uploaded)
+        runner._materialize_resident_weights()
+        assert len(uploaded) == count  # Shared embedding/head and weight banks upload once.
+    runner.close()
+    runner.close()
+    assert not live and len(closed) == 1 and all(ref() is None for ref in refs)
+
+
 @pytest.mark.parametrize("max_batch_size", [1, 32, 256])
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 def test_packed_prefill_executor_limits_follow_runtime(monkeypatch, max_batch_size, tp_size):
@@ -254,11 +477,55 @@ def test_packed_prefill_executor_limits_follow_runtime(monkeypatch, max_batch_si
     assert compiled.layout.tp_size == tp_size and compiled.layout.lm_head_tp_size == 4
     assert compiled.layout.partitions == 16 // tp_size
     assert compiled.layout.decode_capacity == 16 * tp_size
-    assert compiled.layout.decode_batch == 64  # Frozen ABI, not usable capacity.
+    assert compiled.layout.decode_batch == 16 * tp_size
     assert compiled.layout.prefill_batch == max_batch_size
     assert executor.max_prefill_requests_per_partition == per_group
     assert executor.max_prefill_batch_size == max_batch_size
     assert executor.max_prefill_tokens_per_partition == 8192
+
+
+@pytest.mark.parametrize("pd,failure", [(False, None), (True, None), (True, "owner"), (True, "compute")])
+def test_pd_communication_initializes_after_owners_before_worker_is_returned(monkeypatch, pd, failure):
+    from pypto_serving.pd.adapter import DSparkExtension
+
+    events = []
+    def owner_ready():
+        events.append("owners-ready")
+        if failure == "owner":
+            raise RuntimeError("owner failed")
+    def compute_ready():
+        events.append("compute-init")
+        if failure == "compute":
+            raise RuntimeError("compute failed")
+        events.append("compute-ready")
+    class FakeWorker:
+        def __init__(self, compiled, **kwargs):
+            events.append("worker-created")
+            if pd:
+                self._w = SimpleNamespace(_ensure_comm_base=compute_ready)
+    monkeypatch.setattr("pypto.runtime.DistributedWorker", FakeWorker)
+    runner = DSparkModelRunner.__new__(DSparkModelRunner)
+    runner._l3_worker = None
+    runner._l3_run_config = None
+    runner._compiled = SimpleNamespace(l3_callables=lambda: [SimpleNamespace(compiled=object())])
+    runner._inherited_host_weights = lambda: ()
+    runner.runtime_extension = None
+    if pd:
+        extension = DSparkExtension.__new__(DSparkExtension)
+        extension.worker = runner._shared_l3_worker
+        extension.transfer = SimpleNamespace(worker_ready=owner_ready, worker_options=lambda: {})
+        runner.runtime_extension = extension
+    if failure:
+        with pytest.raises(RuntimeError, match=failure + " failed"):
+            runner._shared_l3_worker()
+        assert events == (["worker-created", "owners-ready"] if failure == "owner" else
+                          ["worker-created", "owners-ready", "compute-init"])
+    else:
+        worker = runner._shared_l3_worker()
+        events.append("worker-returned")
+        assert runner._shared_l3_worker() is worker  # No per-request initialization.
+        assert events == (["worker-created", "owners-ready", "compute-init", "compute-ready",
+                           "worker-returned"] if pd else ["worker-created", "worker-returned"])
 
 
 @pytest.mark.parametrize("length", [1, 127, 128, 129, 512, 8064, 8192, 8193, 655359])
@@ -341,10 +608,7 @@ def test_pd_bootstrap_reuses_normal_seed_with_local_generations(monkeypatch, len
     extension.handle("reserve_state", dict(request="reused", partition=1, prompt_len=length))
     reused = runner._drafter_state("reused")
     assert reused.lease == first.lease and reused.generation == old + 1
-    with pytest.raises(RuntimeError, match="complete prompt tail"):
-        extension.handle("source_state", "reused")
-    reused.prefill_tail_positions = torch.arange(max(0, length - 128), length, dtype=torch.int64)
-    assert extension.handle("source_state", "reused") == {"bootstrap": reused.lease}
+    assert reused.prefill_tail_positions is None and not reused.device_state_initialized
 
 
 def test_prefill_to_decode_staging_contract() -> None:
@@ -366,7 +630,7 @@ def test_prefill_to_decode_staging_contract() -> None:
     )
 
     prepared_prefill = runner.prepare_prefill_inputs(
-        SimpleNamespace(runtime=SimpleNamespace(max_seq_len=512)), prefill
+        SimpleNamespace(runtime=RuntimeConfig(max_seq_len=512)), prefill
     )
     runner._prefill_task_args.tensors["state_checkpoint_ends"].fill_(128)
     runner._stage_prefill_inputs(prepared_prefill)
@@ -484,7 +748,7 @@ def test_prefill_context_bound_uses_each_requests_own_length() -> None:
             cache_partitions=[0, 2],
         )
 
-    model = SimpleNamespace(runtime=SimpleNamespace(max_seq_len=512))
+    model = SimpleNamespace(runtime=RuntimeConfig(max_seq_len=512))
     prepared = runner.prepare_prefill_inputs(model, _batch(500))
     assert prepared.physical_tokens == tokens
 
@@ -511,7 +775,7 @@ def _packed_prefill_batch(lengths=(5, 7, 6), groups=(0, 2, 0), starts=(0, 32, 64
 
 def test_packed_prefill_keeps_request_boundaries_and_reuses_compact_buffers(monkeypatch):
     runner = _runner()
-    model = SimpleNamespace(runtime=SimpleNamespace(max_seq_len=512))
+    model = SimpleNamespace(runtime=RuntimeConfig(max_seq_len=512))
     batch = _packed_prefill_batch()
     inputs = runner.prepare_prefill_inputs(model, batch)
     assert inputs.physical_tokens == 12
@@ -591,20 +855,20 @@ def test_packed_prefill_reads_each_requests_sampled_slot(monkeypatch):
         sampled[0, 1, 0] = 30
 
     monkeypatch.setattr(runner, "_run_l3", dispatch)
-    result = runner.run_prefill(SimpleNamespace(runtime=SimpleNamespace(max_seq_len=512)), batch)
+    result = runner.run_prefill(SimpleNamespace(runtime=RuntimeConfig(max_seq_len=512)), batch)
     assert result.sampled_token_ids.tolist() == [10, 20, 30]
 
 
 def test_packed_prefill_validates_group_capacity_not_aggregate_context_length():
     runner = _runner()
-    model = SimpleNamespace(runtime=SimpleNamespace(max_seq_len=64))
+    model = SimpleNamespace(runtime=RuntimeConfig(max_seq_len=64))
     batch = _packed_prefill_batch((64, 64), (0, 0), (0, 0))
     assert runner.prepare_prefill_inputs(model, batch).physical_tokens == 128
     with pytest.raises(ValueError, match="requests per TP group exceed"):
         runner.prepare_prefill_inputs(model, _packed_prefill_batch((1, 1, 1), (0, 0, 0), (0, 0, 0)))
     with pytest.raises(ValueError, match="tokens, got 129"):
         runner.prepare_prefill_inputs(
-            SimpleNamespace(runtime=SimpleNamespace(max_seq_len=512)),
+            SimpleNamespace(runtime=RuntimeConfig(max_seq_len=512)),
             _packed_prefill_batch((64, 65), (0, 0), (0, 0)),
         )
 
@@ -631,7 +895,7 @@ def test_prefill_seeding_uses_independent_waves_for_same_group(monkeypatch):
 def test_packed_prefill_captures_separate_request_tails(monkeypatch):
     runner = _runner()
     batch = _packed_prefill_batch()
-    inputs = runner.prepare_prefill_inputs(SimpleNamespace(runtime=SimpleNamespace(max_seq_len=512)), batch)
+    inputs = runner.prepare_prefill_inputs(SimpleNamespace(runtime=RuntimeConfig(max_seq_len=512)), batch)
     monkeypatch.setattr(runner_module, "DSPARK_MAIN_HIDDEN_DIM", 2)
     device_rows = torch.arange(16 * 3 * 2, dtype=torch.bfloat16).reshape(16, 3, 2)
     device = SimpleNamespace(
@@ -938,12 +1202,12 @@ def test_long_context_compressed_pools_cover_the_configured_limit(max_seq_len):
     assert slot.item() == blocks["cmp_c128"][position // 128]
 
 
-@pytest.mark.parametrize("chunk_tokens", [128, 8192])
-def test_fused_state_descriptors_match_prefill_rings_through_1m(chunk_tokens):
+@pytest.mark.parametrize("chunk_tokens,decode_only", [(128, False), (8192, False), (2048, True)])
+def test_fused_state_descriptors_match_prefill_rings_through_1m(chunk_tokens, decode_only):
     runner = _runner()
     runner._compiled.decode_full_fused = True
     runner._cache_group_specs = build_dspark_cache_group_specs(
-        3, (0, 4, 128), max_prefill_tokens=chunk_tokens,
+        3, (0, 4, 128), max_prefill_tokens=chunk_tokens, decode_only=decode_only,
     )
     runner._cache_group_num_blocks = {name: 32768 for name in DSPARK_CACHE_GROUP_NAMES}
     blocks = {
@@ -1019,7 +1283,7 @@ def test_cached_suffix_prefill_uses_absolute_positions_and_new_compressed_page(c
         block_ids_by_group=[blocks], cache_partitions=[2],
     )
     inputs = runner.prepare_prefill_inputs(
-        SimpleNamespace(runtime=SimpleNamespace(max_seq_len=max_position)), batch,
+        SimpleNamespace(runtime=RuntimeConfig(max_seq_len=max_position)), batch,
     )
     assert inputs.position_ids_full[8].tolist() == list(range(cached_tokens, cached_tokens + 128))
     pages = blocks["cmp_c128"]
@@ -1217,3 +1481,41 @@ def test_run_decode_accepts_and_redrafts(monkeypatch) -> None:
     runner._compiled.num_speculative_tokens = 0
     plain = runner.run_decode(SimpleNamespace(), decode)
     assert plain.num_draft_tokens is None
+
+
+
+
+@pytest.mark.parametrize("tp_size", [1, 4])
+def test_prefill_entry_views_and_checkpoint_reach_the_worker(tp_size):
+    runner = _runner(tp_size=tp_size)
+    runner._cache_group_num_blocks = {name: 1024 for name in DSPARK_CACHE_GROUP_NAMES}
+    batch = _packed_prefill_batch((127,), (0,), (129,))
+    batch.prompt_lens = [512]
+    batch.checkpoint_ends = [(256,)]
+    batch.checkpoint_block_ids_by_group = [{name: {
+        max((129 + page - 1) // page, (256 - history) // page): 900}
+        for name, history, page in (("hca_state", 128, 8), ("csa_state", 8, 2), ("csa_inner_state", 8, 2))}]
+    batch.read_block_ids_by_group = [{name: {q: 100 + q for q in range((129 - history) // page, (129 + page - 1) // page)}
+        for name, history, page in (("hca_state", 128, 8), ("csa_state", 8, 2), ("csa_inner_state", 8, 2))}]
+    model = SimpleNamespace(runtime=RuntimeConfig(max_seq_len=512, speculative_prefix_cache_replay_tokens=128))
+    inputs = runner.prepare_prefill_inputs(model, batch)
+    assert inputs.state_checkpoint_ends[0, 0].tolist() == [[256, 0, 0, 0, 0, 0]]
+    for name, prefix, page in (("hca_state", "hca", 8), ("csa_state", "csa", 2), ("csa_inner_state", "csa_inner", 2)):
+        table = inputs.block_tables[prefix + "_compress_state_block_table"][0, 0]
+        expected = batch.read_block_ids_by_group[0][name]
+        assert {q: int(table[q]) for q in torch.nonzero(table >= 0).flatten().tolist()} == expected
+        positions = torch.arange(129, 256)
+        ids = torch.tensor(batch.block_ids_by_group[0][name])
+        slots = ids[positions // page % len(ids)] * page + positions % page
+        for logical, physical in batch.checkpoint_block_ids_by_group[0][name].items():
+            selected = positions // page == logical
+            slots[selected] = physical * page + positions[selected] % page
+        assert torch.equal(inputs.slot_mappings[name + "_slot_mapping_full"][0, :127], slots)
+    runner._stage_prefill_inputs(inputs)
+    assert runner._prefill_task_args.tensors["state_checkpoint_ends"][0, 0].tolist() == [[256, 0, 0, 0, 0, 0]]
+    smaller = runner.prepare_prefill_inputs(model, _packed_prefill_batch((3,), (0,), (0,)))
+    runner._stage_prefill_inputs(smaller)
+    assert runner._prefill_task_args.tensors["state_checkpoint_ends"][:tp_size, :1].count_nonzero() == 0
+    batch.read_block_ids_by_group[0].pop("hca_state")
+    with pytest.raises(ValueError, match="entry history"):
+        runner.prepare_prefill_inputs(model, batch)
