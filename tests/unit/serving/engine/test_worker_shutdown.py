@@ -277,3 +277,20 @@ def test_one_core_failing_does_not_leave_its_siblings_unstopped():
     reaped, stopped = asyncio.run(scenario())
     assert stopped == [True, True, True], "a sibling was left holding its devices"
     assert reaped is False, "a core that could not say what became of its worker counts"
+
+
+@pytest.mark.parametrize("secondary", [False, True])
+def test_ddr_close_error_still_shuts_worker_and_preserves_original(secondary):
+    core, calls = _core(None), []
+    async def close():
+        raise RuntimeError("DDR drain failed")
+    def shutdown(**kwargs):
+        calls.append(kwargs)
+        if secondary:
+            raise RuntimeError("secondary shutdown error")
+    from types import SimpleNamespace
+    core._cache_tiering = SimpleNamespace(close=close)
+    core._shutdown_worker = shutdown
+    with pytest.raises(RuntimeError, match="DDR drain failed"):
+        asyncio.run(core.stop())
+    assert calls == [{"timeout": 30}]

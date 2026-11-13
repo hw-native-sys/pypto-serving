@@ -45,21 +45,28 @@ class Endpoint:
     sequence: object
     lock: object
     stopped: object
+    failed: object
 
     def call(self, operation, payload=None):
         with self.lock:
             if self.stopped.value:
                 raise RuntimeError("cache owner already stopped")
-            self.sequence.value += 1
-            sequence = self.sequence.value
-            self.parent.send((sequence, operation, payload))
-            if not self.parent.poll(60):
-                raise RuntimeError("cache owner completion unknown: response timeout")
-            received, success, result = self.parent.recv()
-            if received != sequence:
-                raise RuntimeError("cache owner completion identity mismatch")
-            if not success:
-                raise RuntimeError(f"cache owner failed: {result}")
+            if self.failed.value:
+                raise RuntimeError("cache owner endpoint is quarantined")
+            try:
+                self.sequence.value += 1
+                sequence = self.sequence.value
+                self.parent.send((sequence, operation, payload))
+                if not self.parent.poll(60):
+                    raise RuntimeError("cache owner completion unknown: response timeout")
+                received, success, result = self.parent.recv()
+                if received != sequence:
+                    raise RuntimeError("cache owner completion identity mismatch")
+                if not success:
+                    raise RuntimeError(f"cache owner failed: {result}")
+            except Exception:
+                self.failed.value = True
+                raise
             if operation == "stop":
                 self.stopped.value = True
             return result
@@ -69,7 +76,8 @@ def endpoints(context, ranks):
     result = []
     for _ in range(ranks):
         parent, child = context.Pipe()
-        result.append(Endpoint(parent, child, context.Value("Q", 0), context.Lock(), context.Value("b", False)))
+        result.append(Endpoint(parent, child, context.Value("Q", 0), context.Lock(),
+                               context.Value("b", False), context.Value("b", False)))
     return tuple(result)
 
 
@@ -99,6 +107,9 @@ class SimplerBackend:
     def __init__(self, owners, geometry, capacity, *, trace=None):
         self.owners, self.geometry = owners, geometry
         self.tp = geometry["tp"]
+        minimum = max(self.footprint((name, 0, 0)) for name in geometry["groups"])
+        if capacity < minimum:
+            raise ValueError(f"DDR pool capacity {capacity} is smaller than the largest page footprint {minimum}")
         self.extents = Extents(capacity)
         self.queue = SimpleQueue()
         self.completed = {operation: SimpleQueue() for operation in ("store", "load")}

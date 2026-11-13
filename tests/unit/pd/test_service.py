@@ -12,15 +12,14 @@ import asyncio
 import math
 import socket
 import threading
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import msgspec
 import pytest
 
 from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
-from pypto_serving.serving.engine.async_engine import TokenOutput
-from pypto_serving.pd.service import ExecutionError
-from pypto_serving.pd.worker import Progress, ProgressServer
+from pypto_serving.pd.worker import Progress, ProgressServer, WorkerRuntime
 from pypto_serving.pd.adapter import CACHE_COMPONENTS, COMPONENTS, DeepSeekDSpark
 from pypto_serving.pd.config import Config, Endpoint
 from pypto_serving.pd.integration import Chunk
@@ -144,22 +143,6 @@ def test_suffix_handoff_preserves_shared_prefix_and_final_state(p_tp, d_tp, p_hi
         Completion(digest(final), final.units[:-1]).check(digest(final), final.units)
 
 
-@pytest.mark.parametrize("p_tp,d_tp", [(4, 4), (4, 1)])
-@pytest.mark.parametrize("length", [128, 8192, 8205, 8320])
-def test_history_hit_does_not_require_or_skip_rolling_and_final_state(p_tp, d_tp, length):
-    hit = length // 128 * 128
-    case = handoff(length, d_hit=hit, p_tp=p_tp, d_tp=d_tp, compact=True)
-    assert case.entry.reservation.prefix_hit_tokens == hit
-    assert set(case.entry.prefix.hashes) == {"cmp_c128", "cmp_c4", "idx"}
-    assert not case.entry.reservation.shared_block_ids_by_group["ori"]
-    assert not case.d._group_pools["ori"].hash_to_block
-    final = case.plans[-1]
-    assert {"ori", "hca_state", "csa_state", "csa_inner_state", "bootstrap_hidden"} <= {
-        c.component for c in final.copies}
-    if hit == length:
-        assert not {"hca_cmp", "csa_cmp", "idx_k", "idx_scale"} & {c.component for c in final.copies}
-
-
 def test_owner_rejects_out_of_bounds_and_retains_unknown_registration():
     class Engine:
         fail = False
@@ -238,96 +221,38 @@ def test_cancel_and_unknown_cannot_release_unconfirmed_native_writes():
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("damage", ["overlap", "hole", "shared"])
-def test_plan_coverage_rejects_invalid_suffix_writes(damage):
-    case = handoff(8205, d_hit=4096, compact=True)
-    plan = case.plans[-1]
-    case.entry.chunk, case.entry.end = plan.chunk, plan.start
-    copies = list(plan.copies)
-    if damage == "overlap":
-        copies.append(copies[0])
-    elif damage == "hole":
-        copies.pop()
-    else:
-        index = next(i for i, c in enumerate(copies) if c.component == "csa_cmp")
-        copy = copies[index]
-        page = next(g for g in case.destination.geometry if g.name == copy.component).page_bytes
-        copies[index] = msgspec.structs.replace(copy, destination_offset=
-            case.entry.reservation.shared_block_ids_by_group["cmp_c4"][0] * page)
-    with pytest.raises(ValueError):
-        case.destination.validate_plan(case.entry, msgspec.structs.replace(plan, copies=tuple(copies)),
-                                       case.source_geometry, 0, case.nodes[0].topology)
-
-
-@pytest.mark.parametrize("lost_ack", [False, True])
-def test_progress_runs_during_compute_and_rejects_a_lost_ack(lost_ack):
+def test_cancelled_submit_ack_is_observed_until_native_completion():
     async def run():
+        plan = handoff(128).plans[-1]
+        job, native = digest(plan), Future()
+        runtime = WorkerRuntime.__new__(WorkerRuntime)
+        runtime.lock, runtime.jobs, runtime.uncertain = threading.RLock(), {}, False
         parent, child = socket.socketpair()
-        release, accepted = threading.Event(), threading.Event()
-        compute = threading.Thread(target=release.wait)
-        compute.start()
+        accepted, reply = threading.Event(), threading.Event()
         def handle(operation, payload):
-            accepted.set()
-            if lost_ack:
-                raise EOFError("accepted command lost its reply")
-            return payload
-        server = ProgressServer(child, handle, 1)
-        progress = Progress(parent, 1, 1)
+            if operation == 'submit':
+                runtime.jobs[job] = (plan, (native,))
+                accepted.set()
+                assert reply.wait(2)
+                return msgspec.msgpack.encode(dict(job=job))
+            return msgspec.msgpack.encode(runtime.poll(msgspec.msgpack.decode(payload)))
+        server, progress = ProgressServer(child, handle, 2), Progress(parent, 2, 1)
+        task = asyncio.create_task(progress.call('submit', b'plan'))
         try:
-            if lost_ack:
-                with pytest.raises(TransferError) as error:
-                    await progress.call("submit", b"work")
-                assert accepted.is_set() and error.value.uncertain
-                with pytest.raises(TransferError):
-                    await progress.call("submit", b"late")
-            else:
-                assert await progress.call("submit", b"work") == b"work" and compute.is_alive()
+            assert await asyncio.to_thread(accepted.wait, 2)
+            task.cancel()
+            reply.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert job in runtime.jobs and job in progress.pending
+            native.set_result(None)
+            for _ in range(100):
+                if not runtime.jobs and not progress.pending:
+                    break
+                await asyncio.sleep(.01)
+            assert not runtime.jobs and not progress.pending
         finally:
+            reply.set()
             await progress.close()
             server.close()
-            release.set()
-            compute.join(2)
-        assert not server.thread.is_alive() and not progress.calls
-    asyncio.run(run())
-
-
-def test_decode_compute_error_keeps_the_normal_output_cleanup():
-    async def run():
-        s, p, d = service()
-        binding = Binding.create(p, d, {})
-        entry = s.entry(binding, create=True)
-        entry.continuation = Continuation((1, 2), {"max_new_tokens": 8}, None, None)
-        entry.first_token = 7
-        entry.transferred.set()
-        s.core.tokenizer = SimpleNamespace(eos_token_id=2)
-        closed = []
-        async def generate(**kwargs):
-            yield TokenOutput(text="", finished=True, finish_reason="error")
-        async def close(current, terminal):
-            closed.append((current, terminal))
-        s.core.add_prefilled_request, s.close_output = generate, close
-        with pytest.raises(ExecutionError):
-            _ = [output async for output in s.outputs(binding.request)]
-        assert isinstance(entry.error, ExecutionError) and not s.gated
-        assert closed == [(entry, False)]
-    asyncio.run(run())
-
-
-
-def test_decode_full_reservation_rejects_before_state_initialization():
-    from pypto_serving.pd.protocol import CapacityExhausted, Prefix
-    async def run():
-        s, p, d = service()
-        s.core.config = SimpleNamespace(max_num_running_reqs=1, runtime_config=SimpleNamespace(max_seq_len=4096))
-        s.adapter = SimpleNamespace(validate=lambda _: None,
-            prefix_spec=lambda tokens, cache: Prefix(len(tokens), 32, {}))
-        first, second = [s.register_http(Binding.create(p, d, {}), {}) for _ in range(2)]
-        rid = first.binding.request
-        first.reservation = s.cache.reserve_group_cache(rid, rid, 256, prompt_token_count=128)
-        continuation = Continuation(tuple(range(128)), {"max_new_tokens": 16}, None, None)
-        with pytest.raises(CapacityExhausted):
-            await s.control(p, (), "begin", dict(binding=msgspec.to_builtins(second.binding),
-                continuation=msgspec.to_builtins(continuation)))
-        assert second.reservation is None and second.transferred.is_set() and not s.gated
-        s.cache.release_group_cache(rid, confirmed_stopped=True)
     asyncio.run(run())

@@ -403,6 +403,10 @@ class Progress:
                             error = response.exception()
                             if error is not None:
                                 self._fail_channel(error)
+                            elif operation == "submit" and not self.closed:
+                                reply = msgspec.msgpack.decode(response.result())
+                                if "job" in reply:
+                                    self._track(reply["job"])
                         raise
                     except Exception as exc:
                         self._fail_channel(exc)
@@ -415,7 +419,7 @@ class Progress:
         finally:
             self.calls -= counted
 
-    async def wait(self, job):
+    def _track(self, job):
         if self.closed or job in self.pending or len(self.pending) >= self.capacity:
             raise TransferError("completion observer closed, full or duplicate waiter", uncertain=True)
         future = asyncio.get_running_loop().create_future()
@@ -427,6 +431,10 @@ class Progress:
         future.add_done_callback(consume)
         if self.task is None or self.task.done():
             self.task = asyncio.create_task(self._observe())
+        return future
+
+    async def wait(self, job):
+        future = self._track(job)
         try:
             return await asyncio.wait_for(asyncio.shield(future), self.timeout)
         except asyncio.TimeoutError as exc:

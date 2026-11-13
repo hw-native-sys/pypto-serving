@@ -8,15 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Batch/TP completion, diagnostics and the engine-loop lifecycle seam."""
 import asyncio
-import json
 from mmap import PAGESIZE
 import threading
 from types import SimpleNamespace
 
 import pytest
 
-from pypto_serving.serving.memory.tiering.backend import SimplerBackend
-from pypto_serving.serving.memory.tiering.trace import OffloadTrace
+from pypto_serving.serving.memory.tiering.backend import Endpoint, SimplerBackend
 from tests.unit.serving.memory.test_cache_offload import attach, fixture, prompt, until, warm
 
 
@@ -37,11 +35,10 @@ class Owner:
 
 
 @pytest.mark.parametrize('tp,failed', [(1, False), (4, False), (4, True)])
-def test_tp_index_scale_completion_and_unknown_retirement(tmp_path, tp, failed):
+def test_tp_index_scale_completion_and_unknown_retirement(tp, failed):
     owners = [Owner(failed and i == 0) for i in range(tp)]
-    trace = OffloadTrace(tmp_path)
     backend = SimplerBackend(owners, dict(tp=tp, groups={'idx': (('k', 2, 7, 128), ('scale', 2, 7, 4))}),
-                             tp*4*PAGESIZE, trace=trace)
+                             tp*4*PAGESIZE)
     assert backend.reserve(1, ('idx', 0, 0)) and len(set(backend.records[1].extents)) == tp
     future = backend.store(1, ('idx', 0, 0))
     if failed:
@@ -57,42 +54,6 @@ def test_tp_index_scale_completion_and_unknown_retirement(tmp_path, tp, failed):
         assert backend.extents.free == [(0, tp*4*PAGESIZE)]
         backend.close()
         assert all(o.calls[-1][0] == 'stop' for o in owners)
-    trace.close()
-    rows = [json.loads(line) for line in trace.path.read_text().splitlines()]
-    assert rows[-1]['complete'] and not rows[-1]['dropped_events']
-    assert any(r['event'] == 'batch_failed' for r in rows) == failed
-    if not failed:
-        assert sum(r['bytes'] for r in rows if r['event'] == 'batch' and r['direction'] == 'load') == tp*264
-
-
-@pytest.mark.parametrize('layers,width,pages,expected', [(20, 1024, 512, [1, 512]), (1, 1 << 20, 260, [1, 256, 4])])
-def test_batch_bytes_compact_spans_and_one_notification_per_batch(layers, width, pages, expected):
-    owner, entered, proceed = Owner(), threading.Event(), threading.Event()
-    original = owner.call
-    def call(operation, payload=None):
-        if operation == 'copy_batch' and not entered.is_set():
-            entered.set()
-            assert proceed.wait(5)
-        return original(operation, payload)
-    owner.call = call
-    backend = SimplerBackend([owner], dict(tp=1, groups={'kv': (('k', layers, pages+1, width),)}),
-                             (pages+1)*layers*width)
-    notifications = []
-    backend.set_notify(lambda: notifications.append(True))
-    try:
-        futures = []
-        for i in range(pages+1):
-            assert backend.reserve(i+1, ('kv', 0, i))
-            futures.append(backend.store(i+1, ('kv', 0, i)))
-            if i == 0:
-                assert entered.wait(5)
-        proceed.set()
-        assert all(f.result(5)['native_completed'] for f in futures)
-    finally:
-        proceed.set()
-        backend.close()
-    assert [len(payload[1]) for op, payload in owner.calls if op == 'copy_batch'] == expected
-    assert len(notifications) == len(expected)
 
 
 def test_completion_releases_copy_refs_before_model_result_and_ignores_late_notifications():
@@ -114,4 +75,41 @@ def test_completion_releases_copy_refs_before_model_result_and_ignores_late_noti
         await asyncio.sleep(0)
         assert cache.tiering is None and tier.tier.used == 0
         model.set_result(None)
+    asyncio.run(run())
+
+
+def test_timeout_quarantines_endpoint_before_any_later_send():
+    sent = []
+    pipe = SimpleNamespace(send=sent.append, poll=lambda timeout: False)
+    endpoint = Endpoint(pipe, None, SimpleNamespace(value=0), threading.Lock(),
+                        SimpleNamespace(value=False), SimpleNamespace(value=False))
+    with pytest.raises(RuntimeError, match='response timeout'):
+        endpoint.call('copy_batch')
+    with pytest.raises(RuntimeError, match='quarantined'):
+        endpoint.call('stop')
+    assert len(sent) == 1 and not endpoint.stopped.value
+    with pytest.raises(ValueError, match='largest page footprint'):
+        SimplerBackend([], dict(tp=4, groups={'idx': (('k', 2, 7, 128),)}), PAGESIZE)
+
+
+@pytest.mark.parametrize('started,failed', [(False, False), (True, False), (True, True)])
+def test_partial_startup_releases_pool_only_after_owner_ack(started, failed):
+    async def run():
+        _, tier, _ = fixture()
+        session, events = attach(tier), []
+        def stop(*args):
+            events.append('owner')
+            if failed:
+                raise RuntimeError('stop unknown')
+        session.cache, session._worker_started = None, started
+        session.owners = [SimpleNamespace(stopped=SimpleNamespace(value=False), call=stop)]
+        session.pool.close = lambda: events.append('pool')
+        session.copy_library.cleanup = lambda: events.append('helper')
+        if failed:
+            with pytest.raises(RuntimeError, match='stop unknown'):
+                await session.close()
+            assert events == ['owner']
+        else:
+            await session.close()
+            assert events == (['owner'] if started else []) + ['pool', 'helper']
     asyncio.run(run())

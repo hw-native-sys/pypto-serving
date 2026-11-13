@@ -49,6 +49,7 @@ class Session:
         self.owners = endpoints(context, len(config.worker_device_ids()))
         self.metadata = context.Queue(maxsize=1)
         self.cache = None
+        self._worker_started = False
         self.trace = None
         self._loop = None
         self._notify_lock = threading.Lock()
@@ -70,6 +71,9 @@ class Session:
         kwargs["runner_extension_factory"] = partial(CacheOffloadExtension,
             endpoints=self.owners, metadata=self.metadata, pool=self.pool_wire, previous=previous)
         return replace(config, executor_kwargs=kwargs)
+
+    def worker_starting(self):
+        self._worker_started = True
 
     async def start(self):
         for owner in self.owners:
@@ -129,6 +133,11 @@ class Session:
 
     async def _close(self):
         if self.cache is None:
+            if self._worker_started:
+                await asyncio.gather(*(asyncio.to_thread(owner.call, "stop") for owner in self.owners
+                                       if not owner.stopped.value))
+            self.pool.close()
+            self.copy_library.cleanup()
             return
         self.cache.begin_close()
         deadline = time.monotonic() + 120

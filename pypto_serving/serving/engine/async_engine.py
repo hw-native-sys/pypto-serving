@@ -365,6 +365,8 @@ class ReplicaEngineCore:
     async def start(self) -> None:
         """Start worker process and engine loop."""
         with profile_span("AsyncLLMEngine.start", cat="serving"):
+            if self._cache_tiering is not None:
+                self._cache_tiering.worker_starting()
             (
                 process,
                 input_q,
@@ -454,8 +456,15 @@ class ReplicaEngineCore:
         """
         self._running = False
         await self._drain_loop_task()
-        if self._cache_tiering is not None:
-            await self._cache_tiering.close()
+        try:
+            if self._cache_tiering is not None:
+                await self._cache_tiering.close()
+        except BaseException:
+            try:
+                await asyncio.to_thread(self._shutdown_worker, timeout=30)
+            except Exception:
+                logger.exception("Worker shutdown failed after DDR close failed; mappings remain retained")
+            raise
         reaped = await asyncio.to_thread(self._shutdown_worker, timeout=30)
         if reaped:
             logger.info("ReplicaEngineCore stopped")

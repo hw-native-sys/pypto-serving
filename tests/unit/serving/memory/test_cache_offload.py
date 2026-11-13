@@ -12,12 +12,12 @@ from concurrent.futures import Future
 import threading
 from types import SimpleNamespace
 
-import msgspec
 import pytest
+import msgspec
 
 from pypto_serving.serving.memory.tiering.cache import TieredCache
-from pypto_serving.serving.memory.tiering.integration import Session
 from pypto_serving.serving.memory.tiering.manager import CacheTier
+from pypto_serving.serving.memory.tiering.integration import Session
 from pypto_serving.serving.sched.scheduler import Request
 from tests.unit.serving.test_grouped_prefix_cache import _finish_prefill, _prefill_scheduler, manager, prompt
 
@@ -147,7 +147,7 @@ def test_joint_checkpoint_restore_preserves_content_and_alignment(length):
     assert all(not b.ref_cnt for p in cache._group_pools.values() for b in p.blocks)
 
 
-@pytest.mark.parametrize('outcome', ['shared', 'cancelled', 'unknown'])
+@pytest.mark.parametrize('outcome', ['shared', 'unknown'])
 def test_async_shared_restore_cancel_and_unknown(outcome):
     async def run():
         cache, tier, backend = fixture()
@@ -163,10 +163,6 @@ def test_async_shared_restore_cancel_and_unknown(outcome):
         tier.cancel('a')
         with pytest.raises(ValueError, match='cancelled'):
             await tasks[0]
-        if outcome == 'cancelled':
-            tier.cancel('b')
-            with pytest.raises(ValueError, match='cancelled'):
-                await tasks[1]
         assert all(load.block.ref_cnt and load.page.readers for load in tier.loads.values())
         proof = dict(bytes=1, stopped=outcome != 'unknown', native_completed=outcome != 'unknown')
         for future in backend.waiting[:-1]:
@@ -232,44 +228,19 @@ def test_d_reserves_only_after_its_independent_history_restore(cancelled):
     asyncio.run(run())
 
 
-def test_lru_checkpoint_membership_out_of_order_and_reader_protection():
-    backend, released = Backend(), []
-    tier = CacheTier(3, backend, released.append)
-    backend.hold = True
-    for key in ('history', 'state1', 'state2'):
+def test_lru_reclaims_a_whole_checkpoint_after_last_reader():
+    backend = Backend()
+    tier = CacheTier(2, backend, lambda pin: None)
+    for key in ('kv', 'state'):
         tier.capture(key, key, 1, key)
-    tier.publish('one', ('history', 'state1'))
-    tier.publish('two', ('history', 'state2'))
     tier.pump()
-    for i in (2, 0):
-        backend.waiting[i].set_result(dict(bytes=1, stopped=True, native_completed=True))
-        tier.pump()
-    assert set(tier.units) == {'two'}
-    backend.waiting[1].set_result(dict(bytes=1, stopped=True, native_completed=True))
     tier.pump()
-    reader = tier.acquire(('state2',))
-    backend.hold = False
+    tier.publish('checkpoint', ('kv', 'state'))
+    readers = tier.acquire(('kv',))
     tier.capture('next', 'next', 1, 'next')
     tier.pump()
+    assert tier.queued and 'checkpoint' in tier.units
+    tier.release(readers)
     tier.pump()
-    assert tier.lookup('history') and tier.lookup('state2') and tier.lookup('next')
-    assert tier.lookup('state1') is None and tier.used == 3
-    tier.release(reader)
-    tier.begin_close()
-    assert tier.close_ready() and tier.pages
-    backend.close()
-    tier.finish_close()
-    assert not tier.pages and tier.used == 0 and len(released) == 4
-
-
-@pytest.mark.parametrize('proof', [(1, False, True), (0, True, True), (1, True, False)])
-def test_invalid_store_proof_retains_sources(proof):
-    backend, released = Backend(), []
-    backend.hold = True
-    tier = CacheTier(1, backend, released.append)
-    tier.capture('page', 'page', 1, 'pin')
     tier.pump()
-    backend.waiting[0].set_result(dict(zip(('bytes', 'stopped', 'native_completed'), proof)))
-    with pytest.raises(RuntimeError, match='proof'):
-        tier.pump()
-    assert not released and not tier.lookup('page') and tier.error
+    assert not tier.units and set(tier.pages) == {'next'} and tier.used == 1

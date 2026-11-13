@@ -11,6 +11,7 @@
 import pytest
 from dataclasses import replace
 
+from pypto_serving.serving.sched.scheduler import ScheduledRequest
 from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.sched.scheduler import Request, Scheduler, SchedulerConfig
@@ -279,3 +280,23 @@ def test_paged_receive_failure_keeps_healthy_shared_prefix(uncertain, compact_st
     cache.release_group_cache("failed", confirmed_stopped=uncertain)
     assert query(cache, tokens, TARGET) == 8192
     assert all(block.ref_cnt == 0 for pool in cache._group_pools.values() for block in pool.blocks)
+
+
+
+def test_schedule_failure_releases_snapshot_not_running_allocation(monkeypatch):
+    cache = manager(slots=2, checkpoint_state=True)
+    scheduler = _prefill_scheduler(cache)
+    tables = cache.ensure_group_blocks("running", 128)
+    snapshot = cache.retain_group_block_snapshot(tables, 0)
+    scheduled = ScheduledRequest(Request("running", prompt(0, 513), max_new_tokens=16), 128, True,
+                                 group_read_snapshot=snapshot)
+    def fail(output, **kwargs):
+        output.scheduled_requests.append(scheduled)
+        raise RuntimeError("next checkpoint failed")
+    monkeypatch.setattr(scheduler, "_schedule", fail)
+    with pytest.raises(RuntimeError, match="next checkpoint failed"):
+        scheduler.schedule()
+    assert snapshot._owner is None
+    assert all(b.ref_cnt == 1 for pool in cache._group_pools.values()
+               for b in pool.request_blocks['running'] if b is not None)
+    cache.release_all_group_requests("running")

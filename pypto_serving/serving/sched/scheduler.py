@@ -449,6 +449,14 @@ class Scheduler:
 
     def schedule(self, *, allow_reject_stalled: bool = True) -> SchedulerOutput:
         output = SchedulerOutput()
+        try:
+            return self._schedule(output, allow_reject_stalled=allow_reject_stalled)
+        except BaseException:
+            for scheduled in output.scheduled_requests:
+                self._release_scheduled_group_blocks(scheduled)
+            raise
+
+    def _schedule(self, output: SchedulerOutput, *, allow_reject_stalled: bool) -> SchedulerOutput:
         token_budget = self.config.max_num_scheduled_tokens
         grouped_phase = self._grouped_cache_phase()
 
