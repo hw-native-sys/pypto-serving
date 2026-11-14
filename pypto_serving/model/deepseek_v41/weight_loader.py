@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from threading import Condition
+from threading import Condition, Lock
 
 import torch
 
@@ -197,6 +197,10 @@ class V41WeightLoader:
         self.store = _V41SafetensorsStore(model_dir=self.model_dir, weight_map=weight_map,
                                           safe_open_fn=safe_open_fn)
         self.store.require(self.specs)
+        # Safetensors tensors retain their mmap storage after the reader closes.
+        # Cache mapped host-offloaded table views for this loader's lifetime.
+        self._row_tensors: dict[str, torch.Tensor] = {}
+        self._row_tensors_lock = Lock()
 
     def names(self, layer_id=None):
         """Selected rank's names; None lists global weights, excluding deferred modules."""
@@ -270,35 +274,28 @@ class V41WeightLoader:
         V4.1 Engram tables are intentionally outside the resident backbone
         spec.  This bounded reader keeps that data on the host and only
         materializes the hash-selected rows needed by the current request.
+        Cached mmap views live with the loader. Returned rows own their storage.
         """
         rows = torch.as_tensor(rows, dtype=torch.int64, device="cpu")
         if rows.ndim == 0 or bool((rows < 0).any()):
             raise ValueError("tensor row indices must be non-negative")
         if name not in self.store:
             raise KeyError(f"Missing weight tensor in index: {name}")
-        path = self.store.path_for(name)
-        with self.store._safe_open_fn(path, self.store.device) as reader:
-            source = reader.get_slice(name)
-            shape = tuple(source.get_shape())
-            dtype = source.get_dtype()
-            max_row = int(rows.max()) if rows.numel() else -1
-            if len(shape) != 2 or max_row >= shape[0]:
-                raise ValueError(f"row indices exceed tensor {name} shape {shape}")
-            if not rows.numel():
-                values = source[0:0].clone()
-            else:
-                flat = rows.reshape(-1)
-                unique, inverse = torch.unique(flat, sorted=True, return_inverse=True)
-                ids = unique.tolist()
-                pieces = []
-                start = 0
-                while start < len(ids):
-                    stop = start + 1
-                    while stop < len(ids) and ids[stop] == ids[stop - 1] + 1:
-                        stop += 1
-                    pieces.append(source[ids[start]:ids[stop - 1] + 1].clone())
-                    start = stop
-                values = torch.cat(pieces, dim=0).index_select(0, inverse)
+        with self._row_tensors_lock:
+            source = self._row_tensors.get(name)
+            if source is None:
+                path = self.store.path_for(name)
+                with self.store._safe_open_fn(path, self.store.device) as reader:
+                    source = reader.get_tensor(name)
+                if source.ndim != 2:
+                    raise ValueError(f"row indices exceed tensor {name} shape {tuple(source.shape)}")
+                self._row_tensors[name] = source
+        shape = tuple(source.shape)
+        if rows.numel() and int(rows.max()) >= shape[0]:
+            raise ValueError(f"row indices exceed tensor {name} shape {shape}")
+        # CPU index_select is not implemented for every float8 format. Gather
+        # raw bytes once, preserving duplicate order and the original FP8 bits.
+        values = source.view(torch.uint8).index_select(0, rows.reshape(-1)).view(source.dtype)
         return values.reshape(*rows.shape, shape[1])
 
     def load(self, name, *, session=None):
