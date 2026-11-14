@@ -209,6 +209,7 @@ class HostEngram:
             if scales.dtype != torch.float8_e8m0fnu or scales.shape[-1] != self.layout.head_dim // 32:
                 raise ValueError(f"unsupported native Engram table scales: {prefix}scale")
             scale_values = torch.exp2(scales.view(torch.uint8).float() - 127.0)
-            values = rows.float() * scale_values.repeat_interleave(32, dim=-1)
+            blocks = rows.float().unflatten(-1, (-1, 32))
+            values = (blocks * scale_values.unsqueeze(-1)).flatten(-2)
             result[slot, :len(token_ids)] = values.flatten(1).to(torch.bfloat16)
         return result
