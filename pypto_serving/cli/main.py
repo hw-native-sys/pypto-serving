@@ -108,6 +108,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kv-cache-dtype", default="bfloat16", help="KV cache data type. 'auto' follows --dtype (default: bfloat16).")
 
     # Runtime
+    parser.add_argument("--kv-offload-bytes", type=int, default=0,
+                        help="Instance-wide DDR prefix-cache capacity in bytes; zero disables offload.")
+    parser.add_argument("--kv-offload-backend", choices=("simpler",), default="simpler",
+                        help="DDR cache storage/transfer backend (default: simpler).")
+    parser.add_argument("--kv-ssd-bytes", type=int, default=0,
+                        help="Instance-wide SSD prefix-cache budget; zero disables SSD caching.")
+    parser.add_argument("--kv-ssd-path", default=None,
+                        help="Existing local SSD directory; required when SSD caching is enabled.")
     parser.add_argument("--max-model-len", type=int, default=1024, help="Maximum sequence length (prompt + generated; default: 1024).")
     parser.add_argument("--block-size", type=int, default=128, help="KV cache block size (default: 128).")
     parser.add_argument(
@@ -556,6 +564,10 @@ def _build_runtime_config(
         kv_dtype=kv_dtype,
         weight_dtype=args.dtype,
         npu_memory_utilization=args.npu_memory_utilization,
+        kv_offload_bytes=args.kv_offload_bytes,
+        kv_offload_backend=args.kv_offload_backend,
+        kv_ssd_bytes=args.kv_ssd_bytes,
+        kv_ssd_path=args.kv_ssd_path,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_prefill_tokens_per_request=max_prefill_tokens_per_request,
         prefill_chunk_size_choices=prefill_chunk_size_choices,

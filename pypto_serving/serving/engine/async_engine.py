@@ -258,6 +258,17 @@ class ReplicaEngineCore:
             block_size=block_size,
             enable_prefix_cache=self.config.enable_prefix_cache,
         )
+        self._cache_tiering = None
+        if runtime.kv_offload_bytes < 0:
+            raise ValueError("DDR offload capacity must not be negative")
+        if runtime.kv_ssd_bytes < 0 or (runtime.kv_ssd_bytes and not runtime.kv_offload_bytes):
+            raise ValueError("SSD caching requires a nonnegative budget and enabled DDR offload")
+        if runtime.kv_ssd_bytes and not runtime.kv_ssd_path:
+            raise ValueError("SSD caching requires --kv-ssd-path")
+        if runtime.kv_offload_bytes:
+            from pypto_serving.serving.memory.tiering.integration import Session
+            self._cache_tiering = Session(self)
+            self.config = self._cache_tiering.configure(self.config)
         self._async_scheduling = self.config.resolve_async_scheduling()
         scheduler_config = SchedulerConfig(
             max_num_running_reqs=self.config.max_num_running_reqs,
@@ -358,6 +369,8 @@ class ReplicaEngineCore:
     async def start(self) -> None:
         """Start worker process and engine loop."""
         with profile_span("AsyncLLMEngine.start", cat="serving"):
+            if self._cache_tiering is not None:
+                self._cache_tiering.worker_starting()
             (
                 process,
                 input_q,
@@ -410,6 +423,8 @@ class ReplicaEngineCore:
                     self._runtime.page_size,
                 )
 
+        if self._cache_tiering is not None:
+            await self._cache_tiering.start()
         # The KV-cache block pool, scheduler tables and tokenizer are now
         # resident. Freeze the engine-process heap so the GC won't rescan them
         # during serving (see gc_utils). Per-process: the worker freezes its
@@ -445,6 +460,15 @@ class ReplicaEngineCore:
         """
         self._running = False
         await self._drain_loop_task()
+        try:
+            if self._cache_tiering is not None:
+                await self._cache_tiering.close()
+        except BaseException:
+            try:
+                await asyncio.to_thread(self._shutdown_worker, timeout=30)
+            except Exception:
+                logger.exception("Worker shutdown failed after DDR close failed; mappings remain retained")
+            raise
         reaped = await asyncio.to_thread(self._shutdown_worker, timeout=30)
         if reaped:
             logger.info("ReplicaEngineCore stopped")
@@ -843,7 +867,7 @@ class ReplicaEngineCore:
             logger.warning("request %s rejected during scheduling: %s", request_id, reason)
             ctx = self._request_contexts.get(request_id)
             if ctx is not None:
-                ctx.queue.put_nowait(ValueError(reason))
+                ctx.queue.put_nowait(reason if isinstance(reason, Exception) else ValueError(reason))
             if request_id in self._worker_known_req_ids:
                 self._schedule_worker_free(request_id)
         self._record_scheduler_stats(scheduler_output)

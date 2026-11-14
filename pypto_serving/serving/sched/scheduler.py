@@ -19,7 +19,9 @@ from enum import Enum, auto
 
 from pypto_serving.config.types import KVCacheGroupSpec
 from pypto_serving.serving.constraints import ConstraintSpec
-from pypto_serving.serving.memory.kv_cache import GroupBlockSnapshot, KVCacheCapacityError, KvCacheManager
+from pypto_serving.serving.memory.kv_cache import (
+    GroupBlockSnapshot, KVCacheCapacityError, KVCacheRestoreError, KvCacheManager,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -227,7 +229,7 @@ class ScheduledRequest:
 class SchedulerOutput:
     scheduled_requests: list[ScheduledRequest] = field(default_factory=list)
     preempted_requests: list[Request] = field(default_factory=list)
-    rejected_requests: dict[str, str] = field(default_factory=dict)
+    rejected_requests: dict[str, str | Exception] = field(default_factory=dict)
     num_prefill_tokens: int = 0
     num_decode_tokens: int = 0
     prefix_cache_queries: int = 0
@@ -424,6 +426,8 @@ class Scheduler:
         request = self.requests.get(request_id)
         if request is None:
             return
+        if self.kv_cache_manager.tiering is not None:
+            self.kv_cache_manager.tiering.cancel(request_id)
         request.status = RequestStatus.FINISHED_ABORTED
         self._free_request_blocks(request)
         self.running = [r for r in self.running if r.request_id != request_id]
@@ -447,6 +451,14 @@ class Scheduler:
 
     def schedule(self, *, allow_reject_stalled: bool = True) -> SchedulerOutput:
         output = SchedulerOutput()
+        try:
+            return self._schedule(output, allow_reject_stalled=allow_reject_stalled)
+        except BaseException:
+            for scheduled in output.scheduled_requests:
+                self._release_scheduled_group_blocks(scheduled)
+            raise
+
+    def _schedule(self, output: SchedulerOutput, *, allow_reject_stalled: bool) -> SchedulerOutput:
         token_budget = self.config.max_num_scheduled_tokens
         grouped_phase = self._grouped_cache_phase()
 
@@ -586,6 +598,20 @@ class Scheduler:
             # Prefix cache lookup
             if self.config.enable_prefix_cache:
                 if self.kv_cache_manager.has_groups:
+                    tiering = self.kv_cache_manager.tiering
+                    if tiering is not None:
+                        try:
+                            prepared = tiering.prepare(request.request_id, request.group_block_hashes,
+                                request.num_prompt_tokens, maximum=request.group_checkpoint_boundary)
+                        except KVCacheRestoreError as error:
+                            self._release_waiting_prefix_blocks(request)
+                            request.status = RequestStatus.FINISHED_ABORTED
+                            self.requests.pop(request.request_id, None)
+                            output.rejected_requests[request.request_id] = error
+                            continue
+                        if not prepared:
+                            remaining_waiting.append(request)
+                            continue
                     (
                         request.allocated_group_block_ids,
                         request.num_computed_tokens,

@@ -329,6 +329,11 @@ class Service:
             entry.prefix = prefix
             entry.normalized_digest = digest(continuation)
             try:
+                if self.cache.tiering is not None:
+                    await self.cache.tiering.restore(
+                        request, {k: [bytes.fromhex(h) for h in hashes] for k, hashes in prefix.hashes.items()},
+                        len(continuation.tokens), maximum=len(continuation.tokens), groups=tuple(prefix.hashes),
+                        cancelled=lambda: entry.cancelled or not self.is_ready())
                 if not self.is_ready():
                     raise NodeUnavailable("PD node is unavailable")
                 if (sum(r.reservation is not None for r in self.requests.values())
@@ -517,6 +522,8 @@ class Service:
         entry.transferred.set()
         if isinstance(error, TransferError) and error.uncertain:
             self.gated = True
+            if self.cache.tiering is not None:
+                self.cache.tiering.wake()
             if entry.reservation is not None:
                 self.cache.quarantine_group_cache(entry.binding.request)
         self.observe("request.error", entry, error=type(error).__name__,
@@ -524,6 +531,8 @@ class Service:
 
     async def abort(self, entry, stopped=False):
         entry.cancelled = True
+        if self.cache.tiering is not None:
+            self.cache.tiering.cancel(entry.binding.request)
         if self.role == "prefill":
             return
         if stopped:
@@ -686,6 +695,8 @@ class Service:
                 except Exception:
                     logger.exception("sender stop confirmation failed request=%s", request)
                     self.gated = True
+                    if self.cache.tiering is not None:
+                        self.cache.tiering.wake()
                 raise
             finally:
                 if request not in self.pins.active:
@@ -759,6 +770,8 @@ class Service:
 
     async def close(self):
         self.closing = True
+        if self.cache.tiering is not None:
+            self.cache.tiering.wake()
         if self.requests or self.pins.active or self.gated:
             raise RuntimeError("node has active/uncertain handoffs; retire it through external orchestration")
         if self.role == "prefill":

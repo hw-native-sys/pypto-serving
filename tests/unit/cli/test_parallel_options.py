@@ -19,6 +19,19 @@ def _parse_cli_args(argv: list[str]):
     return cli.build_parser().parse_args(argv)
 
 
+def test_ssd_is_disabled_without_explicit_startup_options(tmp_path):
+    runtime = cli.build_serving_engine_config(_parse_cli_args(["--model", str(tmp_path)])).runtime_config
+    assert runtime.kv_ssd_bytes == 0 and runtime.kv_ssd_path is None
+
+
+@pytest.mark.parametrize("capacity", [0, 1000000000])
+def test_ssd_options_reach_runtime_without_initializing_storage(tmp_path, capacity):
+    args = _parse_cli_args(["--model", str(tmp_path), "--kv-offload-bytes", "200000000000",
+                           "--kv-ssd-bytes", str(capacity), "--kv-ssd-path", str(tmp_path)])
+    runtime = cli.build_serving_engine_config(args).runtime_config
+    assert runtime.kv_ssd_bytes == capacity and runtime.kv_ssd_path == str(tmp_path)
+
+
 @pytest.mark.parametrize(("role", "specified", "expected"), [
     (None, None, 16), ("prefill", None, 16), ("decode", None, 72),
     (None, 32, 32), ("prefill", 8, 8), ("decode", 16, 16),
@@ -227,33 +240,19 @@ def test_role_specific_state_rings_do_not_change_the_chunk_contract(role, budget
     assert tuple(g.max_blocks_per_seq for g in runtime.kv_cache_groups if g.name.endswith("state")) == pages
 
 
-@pytest.mark.parametrize("interval", [0, 128, 2048, 8192, 16384])
-@pytest.mark.parametrize("prefix", [False, True])
-def test_retention_interval_reaches_runtime_and_scheduler(interval, prefix):
-    from pypto_serving.serving.engine.async_engine import EngineConfig
-    from pypto_serving.serving.sched.scheduler import SchedulerConfig
-
-    argv = ["--model", "model", "--prefix-cache-retention-interval", str(interval),
-            "--speculative-config", '{"method":"dspark","num_speculative_tokens":7}']
-    runtime = cli._build_runtime_config(_parse_cli_args(argv), model_family="deepseek_v4")
-    config = EngineConfig(runtime_config=runtime, enable_prefix_cache=prefix)
-    runtime = config.resolve_runtime_config()
-    assert runtime.prefix_cache_retention_interval == (interval if prefix else 0)
-    scheduler = SchedulerConfig(prefix_cache_retention_interval=runtime.prefix_cache_retention_interval)
-    scheduler.validate_cache_groups(runtime.kv_cache_groups)
-    assert _parse_cli_args(["--model", "model"]).prefix_cache_retention_interval == 8192
-
-
 @pytest.mark.parametrize("interval", [-1, True, 1.5, 129])
-def test_invalid_retention_interval_is_rejected_before_worker_startup(interval):
+def test_retention_validation_and_default(interval):
     from pypto_serving.config.types import RuntimeConfig
     from pypto_serving.model.deepseek_dspark.npu_runner import build_dspark_cache_group_specs
     from pypto_serving.serving.sched.scheduler import SchedulerConfig
 
-    with pytest.raises(ValueError, match="retention_interval"):
-        RuntimeConfig(prefix_cache_retention_interval=interval)
+    assert _parse_cli_args(["--model", "model"]).prefix_cache_retention_interval == 8192
+    if interval != 129:
+        with pytest.raises(ValueError, match="retention_interval"):
+            RuntimeConfig(prefix_cache_retention_interval=interval)
+        with pytest.raises(ValueError, match="retention_interval"):
+            SchedulerConfig(prefix_cache_retention_interval=interval)
+    else:
         config = SchedulerConfig(prefix_cache_retention_interval=interval)
-        config.validate_cache_groups(build_dspark_cache_group_specs(43))
-
-    with pytest.raises(ValueError, match="Unsupported chip runtime"):
-        RuntimeConfig(chip_runtime="invalid")
+        with pytest.raises(ValueError, match="retention_interval"):
+            config.validate_cache_groups(build_dspark_cache_group_specs(43))

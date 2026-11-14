@@ -187,6 +187,10 @@ class RuntimeConfig:
     total_kv_pages: int | None = None
     # Fraction of total NPU HBM the server is allowed to use (weights + activations + KV).
     npu_memory_utilization: float = 0.90
+    kv_offload_bytes: int = 0
+    kv_offload_backend: str = "simpler"
+    kv_ssd_bytes: int = 0
+    kv_ssd_path: str | None = None
     # Max tokens processed per scheduling step (chunked-prefill granularity).
     max_num_batched_tokens: int = 4096
     # Optional model/kernel limit for one request's active prefill tokens in a
