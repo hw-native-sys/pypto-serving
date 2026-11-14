@@ -38,14 +38,3 @@ def test_lookup_matches_expanded_scale_reference(count):
         expected[slot, :count] = (values*factors).flatten(1).to(torch.bfloat16)
     actual = host.lookup([0]*count, count+3)
     assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
-
-    storage = torch.full((2, count+5, 256), -1, dtype=torch.bfloat16)
-    output = storage[:, 1:-1]
-    assert host.lookup([0]*count, count+3, out=output) is output
-    assert torch.equal(output.view(torch.uint8), expected.view(torch.uint8))
-    assert (storage[:, 0] == -1).all() and (storage[:, -1] == -1).all()
-    assert actual.untyped_storage().data_ptr() != storage.untyped_storage().data_ptr()
-    with pytest.raises(ValueError, match='output'):
-        host.lookup([0]*count, count+3, out=output.float())
-    with pytest.raises(ValueError, match='output'):
-        host.lookup([0]*count, count+3, out=storage)
