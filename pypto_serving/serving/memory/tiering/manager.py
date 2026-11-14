@@ -60,7 +60,7 @@ class CacheTier:
         self.closing = False
         self.trace = trace
         self.notify = notify
-        self.lower = None
+        self.on_store = self.on_remove = None
         self.host_completed = SimpleQueue()
         self.counters = dict(stored_bytes=0, loaded_bytes=0, evicted_bytes=0, stores=0, loads=0)
 
@@ -119,8 +119,6 @@ class CacheTier:
         if identity in self.units or identity in self.pending_units:
             return
         keys = tuple(dict.fromkeys(keys))
-        if self.lower is not None:
-            self.lower.publish(identity, keys)
         if not keys or any(key not in self.pages for key in keys):
             return
         remaining = sum(not self.pages[key].ready for key in keys)
@@ -155,8 +153,6 @@ class CacheTier:
         return page
 
     def touch(self, key):
-        if self.lower is not None:
-            self.lower.touch(key)
         page = self.lookup(key)
         if page is not None:
             for identity in page.units:
@@ -205,8 +201,8 @@ class CacheTier:
             del self.pages[page.key]
             del self.by_handle[page.handle]
             self.retiring[page.handle] = (page, self.backend.release(page.handle))
-            if self.lower is not None:
-                self.lower.removed(page.key)
+            if self.on_remove is not None:
+                self.on_remove(page.key)
 
     def _evict(self):
         for kind, identity in self.policy.candidates(self.clock()):
@@ -255,8 +251,8 @@ class CacheTier:
                             self._forget_pending(identity)
                         del self.pages[page.key], self.by_handle[page.handle], self.inflight[page.handle]
                         self.used -= page.charge
-                        if self.lower is not None:
-                            self.lower.removed(page.key)
+                        if self.on_remove is not None:
+                            self.on_remove(page.key)
                         logger.warning("kv_cache_promotion_failed error=%s", error)
                         continue
                 else:
@@ -264,8 +260,8 @@ class CacheTier:
                 page.future = None
                 del self.inflight[page.handle]
                 page.ready = True
-                if self.lower is not None and not self.closing:
-                    self.lower.stored(page)
+                if self.on_store is not None and not self.closing:
+                    self.on_store(page)
                 if page.lease is not None:
                     self.release_pin(page.lease)
                 page.lease = page.source = None

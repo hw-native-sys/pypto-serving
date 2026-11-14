@@ -74,28 +74,11 @@ class OffloadTrace:
             return
         self.last_snapshot_ns = now
         tier = cache.tier
-        ssd = {}
-        if cache.archive is not None:
-            archive = cache.archive
-            files = archive.files
-            with files.lock:
-                ssd = dict(capacity_bytes=files.capacity, used_bytes=files.used, pages=len(files.entries),
-                           enqueued_operations=files.queue.qsize(), waiting_writes=len(files.waiting),
-                           waiting_reads=len(files.read_waiting), active_operations=len(files.active),
-                           counters=dict(files.counters))
-            with archive.lock:
-                ssd.update(work_bytes=archive.work_bytes, window_bytes=archive.window_bytes,
-                           window_states=[window.state for window in archive.windows],
-                           waiting_loads=sum(map(len, archive.pending)), running_handoffs=archive.running,
-                           write_readers=len(archive.writers))
-        self.emit("state", capacity_bytes=tier.capacity, used_bytes=tier.used,
-                  pages=len(tier.pages), queued_pages=len(tier.queued),
-                  store_inflight=len(tier.inflight), retiring_pages=len(tier.retiring),
-                  joint_checkpoints=len(tier.units), pending_checkpoints=len(tier.pending_units),
+        self.emit("state", **cache.sources[0].snapshot(), primary_tier=cache.sources[0].name,
+                  tiers={source.name: source.snapshot() for source in cache.sources[1:]},
+                  checkpoint_candidates=len(cache.checkpoints.units),
                   restore_requests=len(cache.pending), restore_pages=len(cache.loads),
-                  quarantined=bool(tier.error), counters=dict(tier.counters), dropped_events=self.dropped,
-                  ssd=ssd,
-                  oldest_store_age_ns=now-tier.queued[0].queued_ns if tier.queued else 0)
+                  quarantined=bool(tier.error), dropped_events=self.dropped)
 
     def _write(self):
         try:

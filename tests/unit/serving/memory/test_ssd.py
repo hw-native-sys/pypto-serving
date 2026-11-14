@@ -23,6 +23,7 @@ from pypto_serving.serving.memory.tiering.archive import SSDArchive
 from pypto_serving.serving.memory.tiering.backend import SimplerBackend, BATCH_SPANS
 from pypto_serving.serving.memory.tiering.cache import TieredCache
 from pypto_serving.serving.memory.tiering.manager import CacheTier
+from pypto_serving.serving.memory.tiering.residency import CheckpointIndex, DDRSource
 from pypto_serving.serving.memory.tiering.pool import host_views
 from pypto_serving.serving.memory.tiering.simpler import NativeCopy, Span
 from pypto_serving.serving.memory.tiering.ssd import FileStore
@@ -233,10 +234,11 @@ def stack(tmp_path, helper, tp=1, *, cache=None, capacity=2 << 20, trace=None):
     else:
         cache.tiering = TieredCache(cache, backend, capacity, trace=trace)
         tier = cache.tiering.tier
-    archive = SSDArchive(tier, pool, tmp_path, min(16 << 20, 1_000_000_000),
-                         resident=cache.tiering.resident if cache is not None else None)
+    archive = SSDArchive(tier, pool, tmp_path, min(16 << 20, 1_000_000_000))
     if cache is not None:
-        cache.tiering.archive = archive
+        cache.tiering.add_store(archive)
+    else:
+        tier.on_store, tier.on_remove = archive.stored, archive.removed
     return pool, backend, tier, archive, owners, regions, pins, buffers
 
 
@@ -285,11 +287,12 @@ def test_eight_components_ssd_only_restore_native_batches_and_host_promotion(tmp
         tier.publish("joint", tuple(tier.pages))
         eventually(lambda: tier.counters["stores"] == 7 and not archive.writers,
                    lambda: drain(tier, archive))
-        assert set(pins) == set(names) and archive.units
+        assert set(pins) == set(names) and tier.units
         assert archive.files.counters["writes"] == 7
         assert all(entry.future.result()["syscalls"] == 1 for entry in archive.files.entries.values())
         if trace is not None:
-            trace.snapshot(SimpleNamespace(tier=tier, archive=archive, pending={}, loads={}), force=True)
+            trace.snapshot(SimpleNamespace(tier=tier, sources=[DDRSource(tier), archive],
+                                           checkpoints=CheckpointIndex(), pending={}, loads={}), force=True)
         saved = {key: archive.lookup(key) for key in tier.pages}
         while tier._evict():
             tier._reap_retired()
@@ -335,7 +338,7 @@ def test_eight_components_ssd_only_restore_native_batches_and_host_promotion(tmp
             page.size for page in saved.values())
         assert all(row["queued_ns"] <= row["started_ns"] <= row["completed_ns"] and row["host_completed"]
                    for row in rows if row["event"] == "ssd_promotion")
-        assert any(row["event"] == "state" and row["ssd"]["used_bytes"] > 0 for row in rows)
+        assert any(row["event"] == "state" and row["tiers"]["ssd"]["used_bytes"] > 0 for row in rows)
         assert any(row["event"] == "ssd_closed" and row["files_removed"] and row["used_bytes"] == 0 for row in rows)
         assert sum(row["pages"] for row in rows if row["event"] == "store_reaped") == 7
     assert not list(tmp_path.iterdir())
@@ -388,7 +391,7 @@ def test_real_cache_ssd_only_mixed_prefix_waiters_and_d_reservation(tmp_path, he
         for group in range(8):
             boundary = _finish_prefill(scheduler, Request(f"warm-{group}", prompt(group, length), max_new_tokens=512))
             eventually(lambda: not tier.queued and not tier.inflight and not archive.writers, view.progress)
-        assert archive.units and boundary > 0
+        assert view.checkpoints.units and boundary > 0
         evict(cache, names=("ori", "csa_state"))
         hashes = cache.compute_group_block_hashes(tokens)
         baseline = archive.files.counters["reads"]
@@ -400,9 +403,9 @@ def test_real_cache_ssd_only_mixed_prefix_waiters_and_d_reservation(tmp_path, he
         evict(cache)
         while tier._evict():
             tier._reap_retired()
-        assert not tier.pages and archive.units
+        assert not tier.pages and view.checkpoints.units
         assert not view.prepare("cancelled", hashes, length, maximum=boundary)
-        assert all(archive.files.lookup(key).readers > 0 for key, load in view.loads.items() if load.disk)
+        assert all(archive.files.lookup(key).readers > 0 for key, load in view.loads.items() if load.source.store is archive)
         assert not view.prepare("survivor", hashes, length, maximum=boundary)
         physical_loads = len(view.loads)
         view.cancel("cancelled")
@@ -424,13 +427,13 @@ def test_real_cache_ssd_only_mixed_prefix_waiters_and_d_reservation(tmp_path, he
         eventually(lambda: not tier.inflight and not archive.writers and archive.idle(), view.progress)
         while tier._evict():
             tier._reap_retired()
-        identity, keys = next(iter(archive.units.items()))
+        identity, keys = next(iter(view.checkpoints.units.items()))
         state = next(key for key in keys if key[1].endswith("state"))
         with archive.files.lock:
             record = archive.files.entries.pop(state)
             record.ready = False
         archive.removed(state)
-        assert identity not in archive.units
+        assert identity not in view.checkpoints.units
         assert not view.pending and not view.loads and tier.error is None
     finally:
         view.begin_close()
@@ -468,7 +471,7 @@ def test_checkpoint_republication_reuses_ssd_without_forced_ddr_promotion(tmp_pa
         view.publish_checkpoint(hashes, len(tokens), partition, boundary)
         view.progress()
         assert tier.counters["stores"] == stored and not tier.queued and not backend.records
-        assert archive.units and not view.loads and not view.pending
+        assert view.checkpoints.units and not view.loads and not view.pending
         # An invalidated SSD member must still be captured from its healthy HBM copy.
         name = "csa_state"
         block = next(b for b in tables[name] if b is not None)
@@ -588,18 +591,18 @@ def test_ssd_events_progress_without_model_ticks(tmp_path, helper, monkeypatch, 
                 tier._reap_retired()
             if mixed:
                 assert not cache._group_checkpoints.checkpoints
-                identity = max(archive.units, key=lambda key: key[1])
-                state = next(key for key in archive.units[identity] if key[1] == "csa_state")
+                identity = max(view.checkpoints.units, key=lambda key: key[1])
+                state = next(key for key in view.checkpoints.units[identity] if key[1] == "csa_state")
                 with archive.files.lock:
                     entry = archive.files.entries[state]
                     entry.ready = False
                     archive.files.failed.add(entry)
                 archive.files.wake.set()
                 await asyncio.wait_for(until(lambda: state not in archive.pages), 10)
-                assert identity in archive.units  # The state member is still valid in HBM.
+                assert identity in view.checkpoints.units  # The state member is still valid in HBM.
                 if outcome == "mixed_lost":
                     evict(cache, ("csa_state",))
-                    assert identity not in archive.units  # Its last healthy copy is now gone.
+                    assert identity not in view.checkpoints.units  # Its last healthy copy is now gone.
             if outcome == "layout_error":
                 footprint = backend.footprint
                 monkeypatch.setattr(backend, "footprint", lambda source: footprint(source) * 2)
