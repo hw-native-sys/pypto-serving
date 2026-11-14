@@ -256,6 +256,20 @@ def close_stack(pool, backend, tier, archive):
     pool.close()
 
 
+@pytest.mark.parametrize("tp,capacity,window", [(1, 64 << 20, 16 << 20),
+                                               (1, 256 << 20, 32 << 20),
+                                               (4, 512 << 20, 32 << 20)])
+def test_load_windows_share_the_existing_ddr_budget(tmp_path, helper, tp, capacity, window):
+    pool, backend, tier, archive, *_ = stack(tmp_path, helper, tp, capacity=capacity)
+    try:
+        assert archive.window_bytes == window
+        assert archive.work_bytes == 2 * tp * window
+        assert tier.capacity + archive.work_bytes == capacity
+        assert len(backend.extents.allocations) == 2
+    finally:
+        close_stack(pool, backend, tier, archive)
+
+
 @pytest.mark.parametrize("tp", [1, 4])
 @pytest.mark.parametrize("traced", [False, True, "failed"])
 def test_eight_components_ssd_only_restore_native_batches_and_host_promotion(tmp_path, helper, tp, traced):
@@ -428,6 +442,53 @@ def test_real_cache_ssd_only_mixed_prefix_waiters_and_d_reservation(tmp_path, he
         pool.close()
     assert not list(tmp_path.iterdir())
 
+
+
+def test_checkpoint_republication_reuses_ssd_without_forced_ddr_promotion(tmp_path, helper, monkeypatch):
+    from tests.unit.serving.test_grouped_prefix_cache import manager, prompt, _prefill_scheduler, _finish_prefill
+    from tests.unit.serving.memory.test_cache_offload import evict
+    from pypto_serving.serving.sched.scheduler import Request
+
+    cache = manager(slots=5, checkpoint_state=True)
+    pool, backend, tier, archive, _, _, _, buffers = stack(tmp_path, helper, cache=cache, capacity=8 << 20)
+    view, tokens = cache.tiering, prompt(0, 513)
+    try:
+        boundary = _finish_prefill(_prefill_scheduler(cache, speculative=7),
+                                   Request("seed", tokens, max_new_tokens=512))
+        eventually(lambda: not tier.queued and not tier.inflight and archive.idle(), view.progress)
+        stored = tier.counters["stores"]
+        evict(cache)
+        while tier._evict():
+            tier._reap_retired()
+        monkeypatch.setattr(tier, "warm", lambda *args: None)  # No room for optional DDR promotion.
+        hashes = cache.compute_group_block_hashes(tokens)
+        eventually(lambda: view.prepare("restore", hashes, len(tokens), maximum=boundary), view.progress)
+        tables, hit, partition = cache.select_group_prefix_blocks(hashes, max_cache_hit_tokens=boundary)
+        assert hit == boundary
+        view.publish_checkpoint(hashes, len(tokens), partition, boundary)
+        view.progress()
+        assert tier.counters["stores"] == stored and not tier.queued and not backend.records
+        assert archive.units and not view.loads and not view.pending
+        # An invalidated SSD member must still be captured from its healthy HBM copy.
+        name = "csa_state"
+        block = next(b for b in tables[name] if b is not None)
+        key = partition, name, block.block_hash
+        with archive.files.lock:
+            entry = archive.files.entries[key]
+            entry.ready = False
+            archive.files.failed.add(entry)
+        archive.files.wake.set()
+        eventually(lambda: not archive.files.contains(key), view.progress)
+        view._capture(name, partition, block)
+        eventually(lambda: archive.lookup(key) is not None and archive.idle(), view.progress)
+        assert tier.counters["stores"] == stored + 1
+    finally:
+        view.begin_close()
+        eventually(view.close_ready, view.progress)
+        view.close_storage()
+        tier.finish_close()
+        pool.close()
+    assert not list(tmp_path.iterdir())
 
 
 def test_failed_background_promotion_keeps_restored_hbm_and_ssd_healthy(tmp_path, helper, monkeypatch):

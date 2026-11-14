@@ -72,6 +72,8 @@ class TieredCache:
         key = partition, name, block.block_hash
         if key in self.tier.pages or (key in self.loads and self.loads[key].disk):
             return
+        if self.archive is not None and self.archive.lookup(key) is not None:
+            return  # Reuse durable contents; DDR promotion is already opportunistic.
         pool = self.cache._group_pools[name]
         source = name, partition, pool.local_block_id(block)
         pin = self.cache.pin_cached_group_blocks({name: (block,)}, partition)

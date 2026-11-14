@@ -10,12 +10,14 @@
 import asyncio
 import ctypes
 from mmap import PAGESIZE
+import multiprocessing as mp
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
 
-from pypto_serving.serving.memory.tiering.backend import Endpoint, SimplerBackend
+from pypto_serving.serving.memory.tiering.backend import Endpoint, SimplerBackend, endpoints
 from tests.unit.serving.memory.test_cache_offload import attach, fixture, prompt, until, warm
 
 
@@ -91,6 +93,45 @@ def test_timeout_quarantines_endpoint_before_any_later_send():
     assert len(sent) == 1 and not endpoint.stopped.value
     with pytest.raises(ValueError, match='largest page footprint'):
         SimplerBackend([], dict(tp=4, groups={'idx': (('k', 2, 7, 128),)}), PAGESIZE)
+
+
+def test_rpc_trace_preserves_pipe_completion_and_causal_timestamps():
+    endpoint, = endpoints(mp.get_context("spawn"), 1)
+    records = []
+    def serve():
+        while True:
+            sequence, operation, payload = endpoint.child.recv()
+            received = time.monotonic_ns()
+            result = Owner().call(operation, payload)
+            if operation == "copy_batch":
+                result.update({key: received for key in ("prepare_start_ns", "prepare_end_ns", "started_ns",
+                                                         "submitted_ns", "completed_ns")})
+                result["rpc_timing"] = dict(owner_received_ns=received,
+                                            owner_reply_start_ns=time.monotonic_ns())
+            endpoint.child.send((sequence, True, result))
+            if operation == "stop":
+                endpoint.child.close()
+                return
+    owner = threading.Thread(target=serve)
+    owner.start()
+    trace = SimpleNamespace(emit=lambda event, **fields: records.append((event, fields)))
+    backend = SimplerBackend((endpoint,), dict(tp=1, groups={'idx': (('k', 2, 7, 128),)}),
+                             4 * PAGESIZE, trace=trace)
+    try:
+        assert backend.reserve(1, ('idx', 0, 0))
+        assert backend.store(1, ('idx', 0, 0)).result(2)['native_completed']
+        backend.release(1).result(2)
+    finally:
+        backend.close()
+        owner.join(2)
+    row, = [r for event, r in records if event == "batch"]
+    assert not owner.is_alive() and endpoint.stopped.value and not endpoint.failed.value
+    parent = [row[k] for k in ("rpc_start_ns", "rpc_task_start_ns", "rpc_lock_acquired_ns",
+                               "rpc_send_start_ns", "rpc_send_end_ns", "rpc_recv_end_ns",
+                               "rpc_validated_ns", "rpc_end_ns")]
+    assert parent == sorted(parent)
+    assert row['rpc_send_start_ns'] <= row['owner_received_ns'] <= row['prepare_start_ns']
+    assert row['completed_ns'] <= row['owner_reply_start_ns'] <= row['rpc_recv_end_ns']
 
 
 @pytest.mark.parametrize('started,failed', [(False, False), (True, False), (True, True)])

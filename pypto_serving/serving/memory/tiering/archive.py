@@ -24,6 +24,7 @@ from .pool import host_views
 from .ssd import FileStore
 
 logger = logging.getLogger(__name__)
+LOAD_WINDOW_BYTES = 32 << 20
 
 
 @dataclass(eq=False)
@@ -55,7 +56,7 @@ class SSDArchive:
         maximum = max(self.backend.footprint((name, 0, 0)) // tp for name in geometry["groups"])
         if capacity < maximum * tp:
             raise ValueError("SSD budget is smaller than one complete TP page")
-        self.window_bytes = max(maximum, min(8 << 20, tier.capacity // (4 * ranks))) // PAGESIZE * PAGESIZE
+        self.window_bytes = max(maximum, min(LOAD_WINDOW_BYTES, tier.capacity // (4 * ranks))) // PAGESIZE * PAGESIZE
         work_bytes = 2 * ranks * self.window_bytes
         if work_bytes + maximum * tp > tier.capacity:
             raise ValueError("DDR budget cannot hold SSD work windows and one cache page")
