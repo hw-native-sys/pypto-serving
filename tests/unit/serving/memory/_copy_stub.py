@@ -50,4 +50,3 @@ extern "C" int aclrtSynchronizeStream(aclrtStream){++syncs;return stop_error;}
                                     C.POINTER(C.c_uint64), C.POINTER(C.c_size_t)]
     lib.copy_cache_batch.restype = C.c_int
     return lib
-
