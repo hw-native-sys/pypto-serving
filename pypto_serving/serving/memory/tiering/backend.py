@@ -49,7 +49,10 @@ class Endpoint:
     failed: object
 
     def call(self, operation, payload=None):
+        timing = dict(rpc_task_start_ns=time.monotonic_ns()) if operation == "copy_batch" else None
         with self.lock:
+            if timing is not None:
+                timing["rpc_lock_acquired_ns"] = time.monotonic_ns()
             if self.stopped.value:
                 raise RuntimeError("cache owner already stopped")
             if self.failed.value:
@@ -57,10 +60,16 @@ class Endpoint:
             try:
                 self.sequence.value += 1
                 sequence = self.sequence.value
+                if timing is not None:
+                    timing["rpc_send_start_ns"] = time.monotonic_ns()
                 self.parent.send((sequence, operation, payload))
+                if timing is not None:
+                    timing["rpc_send_end_ns"] = time.monotonic_ns()
                 if not self.parent.poll(60):
                     raise RuntimeError("cache owner completion unknown: response timeout")
                 received, success, result = self.parent.recv()
+                if timing is not None:
+                    timing["rpc_recv_end_ns"] = time.monotonic_ns()
                 if received != sequence:
                     raise RuntimeError("cache owner completion identity mismatch")
                 if not success:
@@ -70,6 +79,9 @@ class Endpoint:
                 raise
             if operation == "stop":
                 self.stopped.value = True
+            if timing is not None:
+                timing["rpc_validated_ns"] = time.monotonic_ns()
+                result.setdefault("rpc_timing", {}).update(timing)
             return result
 
 
@@ -311,7 +323,8 @@ class SimplerBackend:
                     self.trace.emit("batch", **common, partition=rank // self.tp, owner=rank,
                         prepare_start_ns=reply["prepare_start_ns"], prepare_end_ns=reply["prepare_end_ns"],
                         native_start_ns=reply["started_ns"], submitted_ns=reply["submitted_ns"],
-                        completed_ns=reply["completed_ns"], native_commands=reply["native_commands"])
+                        completed_ns=reply["completed_ns"], native_commands=reply["native_commands"],
+                        **reply.get("rpc_timing", {}))
             except Exception:
                 self.trace.emit("diagnostic_failed", batch_id=batch_id, reason="batch_metadata")
                 logger.warning("DDR batch diagnostics unavailable; native result is unchanged", exc_info=True)

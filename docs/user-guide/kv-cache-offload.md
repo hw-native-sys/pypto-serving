@@ -105,6 +105,9 @@ Records include request restore start/ready/cancellation/failure; per-owner batc
 identity, direction, partition, cache groups, physical bytes and initiating LOAD
 request IDs; descriptor preparation, native planning/submission/completion and
 RPC timestamps; and one-second residency/queue/cumulative-counter snapshots.
+Batch timing separates endpoint lock acquisition, send/receive, owner receipt,
+native execution and reply preparation. These are Host timestamps, not a measure
+of Python scheduling or device utilization by themselves.
 Shared restores list their original request IDs rather than counting a shared
 transfer twice. STORE batches are shared cache work and have no invented owning
 HTTP request. No prompts, cache contents, hashes or raw addresses are recorded.
@@ -148,22 +151,23 @@ per model process with an existing directory:
 SSD defaults to zero capacity and creates no SSD threads, files or work windows
 when disabled. A positive capacity requires DDR offload and prefix caching.
 Both budgets include alignment and TP replicas across the entire instance.
-Bounded SSD work windows are reserved inside the DDR budget.
+Two LOAD windows per rank are reserved inside the DDR budget, targeting 32 MiB
+each. Smaller budgets reduce the window size while still fitting the largest
+page. At 16 ranks, full-size windows consume 1 GiB of the stated DDR budget;
+STORE uses the existing cached DDR pages rather than these windows.
 
 Only contents eligible for DDR enter SSD. Reads reuse HBM and DDR first, reading
 only missing members from SSD. File I/O runs in background threads; owner-local
 H2D uses the existing compact copy queue. DDR promotion runs separately and does
 not delay an otherwise completed HBM restore. Read references protect file slots
 and DDR ranges until their users finish. LRU reclaims eligible SSD contents.
+Re-publishing immutable contents already confirmed in SSD does not recapture
+them from HBM merely to populate DDR. Missing or failed SSD copies remain
+eligible for capture.
 
 The directory must support direct I/O, preallocation and hole punching. Each
 process owns a private file namespace, removed after its I/O drains. Contents are
-volatile; there is no index recovery after restart. Host tests cover the actual
-compact planner with CPU ACL stubs and real direct file I/O. Earlier no-weight
-TP1/TP4 device round trips passed byte/guard checks across all eight DSpark
-regions and independent compute/copy progress, before later diagnostic changes.
-Device qualification of the aligned stack and full ordinary-serving/PD model
-qualification remain pending.
+volatile; there is no index recovery after restart.
 
 SSD uses the same optional offload trace. `ssd_file` records one logical page's
 file admission, executor dispatch, I/O start/end, useful/physical bytes and syscall
