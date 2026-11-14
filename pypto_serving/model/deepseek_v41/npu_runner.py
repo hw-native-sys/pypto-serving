@@ -1709,11 +1709,13 @@ class HostEngramResources:
         offsets = [0] * topology.dp
         for request in step.requests:
             start = offsets[request.partition]
-            values = self.host.lookup(request.token_ids, topology.capacity,
-                                      request.start, request_id=request.request_id)
             count = len(request.token_ids)
+            if count > topology.capacity:
+                raise ValueError("Engram rows must fit the current-token capacity")
             if row_stride is not None and count > row_stride:
                 raise ValueError("Engram active rows exceed the request stride")
+            values = self.host.lookup(request.token_ids, max(1, count),
+                                      request.start, request_id=request.request_id)
             for tp_rank in range(topology.tp):
                 rank = request.partition * topology.tp + tp_rank
                 target[rank, :, start:start + count].copy_(values[:, :count])
