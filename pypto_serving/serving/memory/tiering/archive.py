@@ -47,9 +47,11 @@ class Restore:
 
 
 class SSDArchive:
-    def __init__(self, tier, pool, root, capacity, *, resident=None):
+    name = "ssd"
+
+    def __init__(self, tier, pool, root, capacity, *, on_remove=None):
         self.tier, self.backend, self.pool = tier, tier.backend, pool
-        self.resident = resident
+        self.on_remove = on_remove
         self.trace = tier.trace
         geometry, tp = self.backend.geometry, self.backend.tp
         ranks = len(self.backend.owners)
@@ -77,7 +79,7 @@ class SSDArchive:
             raise
         tier.capacity -= work_bytes
         self.work_bytes = work_bytes
-        self.pages, self.writers, self.units, self.members = {}, {}, {}, {}
+        self.pages, self.writers = {}, {}
         self.queue, self.promotions, self.completed = SimpleQueue(), SimpleQueue(), SimpleQueue()
         self.restored = SimpleQueue()
         self.pending = [deque() for _ in range(ranks // tp)]
@@ -86,7 +88,6 @@ class SSDArchive:
         self.running = 0
         self.executor = ThreadPoolExecutor(max_workers=min(8, 2 * ranks // tp), thread_name_prefix="cache-ssd-handoff")
         self.thread = threading.Thread(target=self._run, name="cache-ssd-progress", daemon=False)
-        tier.lower = self
         self.thread.start()
 
     def _notify(self):
@@ -98,7 +99,7 @@ class SSDArchive:
         self.completed.put(key)
         self._notify()
 
-    def pop_restored(self):
+    def pop_loaded(self):
         while True:
             try:
                 yield from self.restored.get_nowait()
@@ -121,31 +122,26 @@ class SSDArchive:
         self.writers[page.key] = reader, entry, queued_ns
         entry.future.add_done_callback(lambda _, key=page.key: self._stored(key))
 
-    def publish(self, identity, keys):
-        if self.closing or identity in self.units or not keys:
-            return
-        self.units[identity] = keys  # Share the existing immutable member tuple.
-        for key in keys:
-            self.members.setdefault(key, set()).add(identity)
-
     def removed(self, key):
-        if key in self.tier.pages or self.files.contains(key):
-            return
-        self.pages.pop(key, None)
-        if self.resident is not None and self.resident(key) is not None:
-            return  # The shared matcher may still use this member directly from HBM.
-        for identity in tuple(self.members.get(key, ())):
-            for member in self.units.pop(identity):
-                owners = self.members[member]
-                owners.remove(identity)
-                if not owners:
-                    del self.members[member]
+        if not self.files.contains(key):
+            self.pages.pop(key, None)
+        if self.on_remove is not None:
+            self.on_remove(key)
+
+    def contains(self, key):
+        return self.files.contains(key)
+
+    def has_pages(self):
+        return bool(self.pages)
 
     def lookup(self, key):
         return self.pages.get(key) if self.files.lookup(key) is not None else None
 
     def touch(self, key):
         self.files.touch(key)
+
+    def release(self, reader):
+        self.files.release(reader)
 
     def acquire(self, keys):
         """Pin selected SSD sources atomically before any destination or native work."""
@@ -370,6 +366,22 @@ class SSDArchive:
                     and all(w.state == "free" for w in self.windows)
                     and self.files.idle())
 
+    def snapshot(self):
+        with self.files.lock:
+            result = dict(capacity_bytes=self.files.capacity, used_bytes=self.files.used,
+                          pages=len(self.files.entries), enqueued_operations=self.files.queue.qsize(),
+                          waiting_writes=len(self.files.waiting), waiting_reads=len(self.files.read_waiting),
+                          active_operations=len(self.files.active), counters=dict(self.files.counters))
+        with self.lock:
+            result.update(work_bytes=self.work_bytes, window_bytes=self.window_bytes,
+                          window_states=[window.state for window in self.windows],
+                          waiting_loads=sum(map(len, self.pending)), running_handoffs=self.running,
+                          write_readers=len(self.writers))
+        return result
+
+    def progress_token(self):
+        return len(self.writers), self.running, *self.files.counters.values()
+
     def close(self):
         if not self.closing or not self.idle():
             raise RuntimeError("SSD handoff and readers must drain before owner retirement")
@@ -385,5 +397,3 @@ class SSDArchive:
         for handle in self.allocations:
             self.backend.extents.release(handle)
         self.pages.clear()
-        self.units.clear()
-        self.members.clear()

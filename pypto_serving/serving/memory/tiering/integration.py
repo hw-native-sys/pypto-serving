@@ -92,11 +92,11 @@ class Session:
         runtime = self.core.config.runtime_config
         if runtime.kv_ssd_bytes:
             from .archive import SSDArchive
-            self.cache.archive = await asyncio.to_thread(
-                SSDArchive, self.cache.tier, self.pool, runtime.kv_ssd_path, runtime.kv_ssd_bytes,
-                resident=self.cache.resident)
+            archive = await asyncio.to_thread(
+                SSDArchive, self.cache.tier, self.pool, runtime.kv_ssd_path, runtime.kv_ssd_bytes)
+            self.cache.add_store(archive)
             logger.info("kv_ssd_ready capacity_bytes=%d work_bytes=%d window_bytes=%d",
-                        runtime.kv_ssd_bytes, self.cache.archive.work_bytes, self.cache.archive.window_bytes)
+                        runtime.kv_ssd_bytes, archive.work_bytes, archive.window_bytes)
         manager.tiering = self.cache
         if self.trace is not None:
             self.trace.emit("ready", capacity_bytes=self.pool.nbytes, ranks=geometry["ranks"],
@@ -155,9 +155,8 @@ class Session:
             while not self.cache.close_ready():
                 tier = self.cache.tier
                 progress = tier.used, len(tier.inflight), len(tier.retiring), len(self.cache.loads)
-                if self.cache.archive is not None:
-                    archive = self.cache.archive
-                    progress += (len(archive.writers), archive.running, *archive.files.counters.values())
+                for store in self.cache.sources[1:]:
+                    progress += store.progress_token()
                 now = time.monotonic()
                 if progress != previous:
                     previous, deadline = progress, now + 120

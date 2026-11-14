@@ -163,7 +163,7 @@ def test_async_shared_restore_cancel_and_unknown(outcome):
         tier.cancel('a')
         with pytest.raises(ValueError, match='cancelled'):
             await tasks[0]
-        assert all(load.block.ref_cnt and load.page.readers for load in tier.loads.values())
+        assert all(load.block.ref_cnt and load.source.page.readers for load in tier.loads.values())
         proof = dict(bytes=1, stopped=outcome != 'unknown', native_completed=outcome != 'unknown')
         for future in backend.waiting[:-1]:
             future.set_result(proof)
@@ -172,7 +172,7 @@ def test_async_shared_restore_cancel_and_unknown(outcome):
             with pytest.raises(RuntimeError, match='quarantined'):
                 await tasks[1]
             assert not session.core._running
-            assert all(load.block.ref_cnt and load.page.readers for load in tier.loads.values())
+            assert all(load.block.ref_cnt and load.source.page.readers for load in tier.loads.values())
             backend.set_notify(None)
             return
         if outcome == 'shared':

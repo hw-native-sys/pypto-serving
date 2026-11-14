@@ -156,6 +156,10 @@ each. Smaller budgets reduce the window size while still fitting the largest
 page. At 16 ranks, full-size windows consume 1 GiB of the stated DDR budget;
 STORE uses the existing cached DDR pages rather than these windows.
 
+The same hierarchy coordinator handles DDR and SSD lookup, source readers,
+shared restores and cancellation. One logical checkpoint member index spans
+the stores; each store retains its own physical allocations and completion proof.
+Evicting one replica does not invalidate healthy copies in another tier.
 Only contents eligible for DDR enter SSD. Reads reuse HBM and DDR first, reading
 only missing members from SSD. File I/O runs in background threads; owner-local
 H2D uses the existing compact copy queue. DDR promotion runs separately and does
@@ -180,7 +184,7 @@ executor waiting. The I/O span includes the Python loop and syscall waiting.
 and confirmed native readiness. Its cache handles join `batch.work_handles`;
 request IDs remain the original restore IDs. `ssd_promotion` reports independent
 Host copy queue/execution, and `ssd_store_reaped` reports DDR reader retirement.
-`state.ssd` adds bounded queue, window and physical-usage summaries without
+`state.tiers.ssd` adds bounded queue, window and physical-usage summaries without
 scanning every file page. These intervals can overlap and must not simply be
 summed as request latency. Errors or wakeups alone are not completion proof.
 
