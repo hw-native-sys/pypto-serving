@@ -1714,9 +1714,10 @@ class HostEngramResources:
                 raise ValueError("Engram rows must fit the current-token capacity")
             if row_stride is not None and count > row_stride:
                 raise ValueError("Engram active rows exceed the request stride")
+            output = target[request.partition * topology.tp, :, start:start + count] if count else None
             values = self.host.lookup(request.token_ids, max(1, count),
-                                      request.start, request_id=request.request_id)
-            for tp_rank in range(topology.tp):
+                                      request.start, request_id=request.request_id, out=output)
+            for tp_rank in range(1, topology.tp):
                 rank = request.partition * topology.tp + tp_rank
                 target[rank, :, start:start + count].copy_(values[:, :count])
             offsets[request.partition] += count if row_stride is None else row_stride

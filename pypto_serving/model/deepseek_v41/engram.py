@@ -195,11 +195,17 @@ class HostEngram:
         self.history[request_id] = compressed
         return torch.cat(hashes, dim=-1) + self.offsets.unsqueeze(1)
 
-    def lookup(self, token_ids, capacity: int, start_pos: int = 0, *, request_id=0) -> torch.Tensor:
+    def lookup(self, token_ids, capacity: int, start_pos: int = 0, *, request_id=0,
+               out: torch.Tensor | None = None) -> torch.Tensor:
+        """Return owned lookup rows, or fill an explicitly supplied CPU BF16 buffer."""
         if len(token_ids) > capacity or capacity <= 0:
             raise ValueError("Engram rows must fit the current-token capacity")
+        shape = (len(self.layout.layer_ids), capacity, self.layout.lookup_width)
+        if out is not None and (out.device.type != "cpu" or out.dtype != torch.bfloat16 or tuple(out.shape) != shape):
+            raise ValueError("Engram output must match the CPU BF16 lookup shape")
         hashes = self.hash_ids(token_ids, start_pos, request_id=request_id)
-        result = torch.zeros((len(self.layout.layer_ids), capacity, self.layout.lookup_width), dtype=torch.bfloat16)
+        result = torch.empty(shape, dtype=torch.bfloat16) if out is None else out
+        result[:, len(token_ids):].zero_()
         for slot, layer in enumerate(self.layout.layer_ids):
             prefix = f"layers.{layer}.engram.embed."
             rows = self.checkpoint.tensor_rows(prefix + "weight", hashes[slot])
