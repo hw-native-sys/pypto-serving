@@ -52,6 +52,7 @@ class Session:
         self._worker_started = False
         self.trace = None
         self._loop = None
+        self._failure = None
         self._notify_lock = threading.Lock()
         self._notified = False
         from .simpler import descriptor_wire
@@ -87,6 +88,7 @@ class Session:
         self.trace = OffloadTrace.from_env()
         backend = SimplerBackend(self.owners, geometry, self.pool.nbytes, trace=self.trace)
         self._loop = asyncio.get_running_loop()
+        self._failure = self._loop.create_future()
         self.cache = TieredCache(manager, backend, self.pool.nbytes, trace=self.trace, notify=self._notify)
         backend.set_notify(self._notify)
         manager.tiering = self.cache
@@ -114,9 +116,22 @@ class Session:
         except Exception as error:
             # Wake clients and remove readiness without claiming native stop.
             self.core._running = False
+            if not self._failure.done():
+                self._failure.set_result(error)
             for context in self.core._request_contexts.values():
                 context.queue.put_nowait(RuntimeError(f"DDR cache progress failed: {error}"))
             logger.exception("DDR cache completion failed; retained allocations require confirmed retirement")
+
+    async def wait_worker_release(self, released):
+        waiter = asyncio.create_task(released.wait())
+        try:
+            await asyncio.wait((waiter, self._failure), return_when=asyncio.FIRST_COMPLETED)
+            if self._failure.done():
+                error = self._failure.result()
+                raise RuntimeError(f"DDR cache progress failed: {error}") from error
+        finally:
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
 
     async def close(self):
         try:

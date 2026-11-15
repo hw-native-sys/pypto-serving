@@ -365,8 +365,8 @@ class ReplicaEngineCore:
     async def start(self) -> None:
         """Start worker process and engine loop."""
         with profile_span("AsyncLLMEngine.start", cat="serving"):
-            if self._cache_tiering is not None:
-                self._cache_tiering.worker_starting()
+            worker_options = ({"on_starting": self._cache_tiering.worker_starting}
+                              if self._cache_tiering is not None else {})
             (
                 process,
                 input_q,
@@ -374,7 +374,7 @@ class ReplicaEngineCore:
                 profile_output_q,
                 ready_event,
                 cache_capacity,
-            ) = self._worker_factory(self.config)
+            ) = self._worker_factory(self.config, **worker_options)
             self._worker_process = process
             self._input_queue = input_q
             self._output_queue = output_q
@@ -659,8 +659,10 @@ class ReplicaEngineCore:
                 output: TokenOutput = queued
                 if output.finished:
                     try:
+                        tiering = getattr(self, "_cache_tiering", None)
                         await asyncio.wait_for(
-                            ctx.worker_release_done.wait(),
+                            tiering.wait_worker_release(ctx.worker_release_done) if tiering is not None
+                            else ctx.worker_release_done.wait(),
                             timeout=self._step_timeout,
                         )
                     except TimeoutError as exc:

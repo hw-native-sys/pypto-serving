@@ -172,7 +172,7 @@ class Service:
             if not create:
                 raise ValueError("unknown PD request")
             if len(self.requests) >= self.config.capacity:
-                raise ValueError("PD request capacity exhausted")
+                raise CapacityExhausted("PD request capacity exhausted. Retry later.")
             entry = self.requests[binding.request] = Request(binding)
         if entry.binding != binding:
             raise ValueError("request binding changed")

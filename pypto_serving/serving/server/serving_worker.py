@@ -1618,7 +1618,7 @@ def _worker_entry(
         get_profiler(initially_active=False).stop()
 
 
-def spawn_worker(config: EngineConfig, *, services_factory=None):
+def spawn_worker(config: EngineConfig, *, services_factory=None, on_starting=None):
     """Spawn a worker process and return its process, queues, and ready state.
 
     ``cache_capacity`` reports primary and optional per-group physical counts
@@ -1646,6 +1646,10 @@ def spawn_worker(config: EngineConfig, *, services_factory=None):
         ),
         daemon=False,
     )
+    # Setup failures above prove that no process borrowed owner resources.
+    # Once start() is attempted, failure remains on the acknowledgement path.
+    if on_starting is not None:
+        on_starting()
     process.start()
     return (
         process,

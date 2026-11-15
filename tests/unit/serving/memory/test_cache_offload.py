@@ -107,6 +107,7 @@ def evict(cache, names=None):
 def attach(cache):
     session = Session.__new__(Session)
     session.__dict__.update(cache=cache, trace=None, _loop=asyncio.get_running_loop(),
+        _failure=asyncio.get_running_loop().create_future(),
         _notify_lock=threading.Lock(), _notified=False,
         core=SimpleNamespace(_running=True, _request_contexts={}, kv_cache_manager=cache.cache),
         pool=SimpleNamespace(close=lambda: None), copy_library=SimpleNamespace(cleanup=lambda: None))
@@ -244,3 +245,34 @@ def test_lru_reclaims_a_whole_checkpoint_after_last_reader():
     tier.pump()
     tier.pump()
     assert not tier.units and set(tier.pages) == {'next'} and tier.used == 1
+
+
+@pytest.mark.parametrize('fatal', [False, True])
+def test_terminal_output_waits_for_real_ack_or_reports_ddr_failure(monkeypatch, fatal):
+    from pypto_serving.serving.engine.async_engine import ReplicaEngineCore, TokenOutput, _RequestContext
+    async def run():
+        cache, tier, _ = fixture()
+        session = attach(tier)
+        core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+        core._running, core._step_timeout, core._cache_tiering = True, 60, session
+        ctx = _RequestContext(Request('r', [1], max_new_tokens=1), terminal_output_queued=True)
+        core._request_contexts = {'r': ctx}
+        session.core = core
+        ctx.queue.put_nowait(TokenOutput(token_id=2, finished=True))
+        consumer = asyncio.create_task(anext(core._iterate_request_output(ctx)))
+        for _ in range(4):
+            await asyncio.sleep(0)
+        assert not consumer.done()
+        if fatal:
+            def fail():
+                raise RuntimeError('injected native uncertainty')
+            monkeypatch.setattr(tier, 'progress', fail)
+            session._consume()
+            with pytest.raises(RuntimeError, match='DDR cache progress failed'):
+                await asyncio.wait_for(consumer, .2)
+            assert not ctx.worker_release_done.is_set() and not core._running
+        else:
+            core._acknowledge_worker_frees(('r',))
+            assert (await asyncio.wait_for(consumer, .2)).finished
+        assert not session._failure.cancelled() and not core._request_contexts
+    asyncio.run(run())

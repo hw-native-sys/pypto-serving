@@ -837,3 +837,27 @@ def test_mixed_decode_does_not_overwrite_prepared_next_step():
         worker.input_queue.put(encode_command(ShutdownCommand()))
         thread.join(timeout=5)
     assert not thread.is_alive()
+
+
+@pytest.mark.parametrize('stage', ['setup', 'start', 'success'])
+def test_worker_start_notification_does_not_authorize_uncreated_owners(monkeypatch, stage):
+    from pypto_serving.serving.server import serving_worker
+    events = []
+    def queue():
+        if stage == 'setup':
+            raise ValueError('before process creation')
+        return object()
+    def start():
+        events.append('start')
+        if stage == 'start':
+            raise ValueError('start attempted, outcome unknown')
+    process = SimpleNamespace(start=start)
+    context = SimpleNamespace(Queue=queue, Event=object, Array=lambda *args: [0], Process=lambda **kwargs: process)
+    monkeypatch.setattr(serving_worker.mp, 'get_context', lambda _: context)
+    config = SimpleNamespace(resolve_runtime_config=lambda: SimpleNamespace(kv_cache_groups=()))
+    if stage == 'success':
+        serving_worker.spawn_worker(config, on_starting=lambda: events.append('starting'))
+    else:
+        with pytest.raises(ValueError):
+            serving_worker.spawn_worker(config, on_starting=lambda: events.append('starting'))
+    assert events == ([] if stage == 'setup' else ['starting', 'start'])

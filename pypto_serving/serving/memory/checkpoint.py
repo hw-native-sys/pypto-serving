@@ -52,9 +52,17 @@ class GroupCheckpointWriter:
         partition = manager._group_request_partitions[request]
         original = {name: list(tables[name]) for name in states}
         publications = {name: {} for name in states}
+        rolling = {name: (pool.spec.spec.token_capacity, pool.spec.sliding_window,
+                          max(0, (end + pool.spec.spec.token_capacity - 1)
+                              // pool.spec.spec.token_capacity - len(tables[name])))
+                   for name, pool in pools.items() if pool.spec.sliding_window is not None and name not in states}
         records, fresh = {}, []
         try:
             for boundary in targets:
+                # Retention is optional; never stage an incomplete recovery set.
+                if any(max(0, boundary - window) // page < resident
+                       for page, window, resident in rolling.values()):
+                    continue
                 members, needs = {}, {}
                 for name, pool in states.items():
                     page = pool.spec.spec.token_capacity
@@ -64,7 +72,9 @@ class GroupCheckpointWriter:
                     members[name] = {}
                     needs[name] = []
                     for logical in range(begin, stop):
-                        if logical * page < start:
+                        if logical in publications[name]:
+                            members[name][logical] = publications[name][logical]
+                        elif logical * page < start:
                             block = read_tables.get(name, {}).get(logical)
                             if block is None and logical >= resident:
                                 block = original[name][logical % len(original[name])]
@@ -85,14 +95,9 @@ class GroupCheckpointWriter:
                         fresh.append((pool, block))
                         members[name][logical] = pool.local_block_id(block)
                     publications[name].update(members[name])
-                for name, pool in pools.items():
-                    if pool.spec.sliding_window is None or name in states:
-                        continue
-                    page = pool.spec.spec.token_capacity
-                    begin = max(0, boundary - pool.spec.sliding_window) // page
+                for name, (page, window, _) in rolling.items():
+                    begin = max(0, boundary - window) // page
                     stop = boundary // page
-                    if begin < max(0, (end + page - 1) // page - len(tables[name])):
-                        raise RuntimeError("Checkpoint rolling window is outside the execution snapshot")
                     members[name] = {q: tables[name][q % len(tables[name])] for q in range(begin, stop)}
                 records[boundary] = members
             if not records:

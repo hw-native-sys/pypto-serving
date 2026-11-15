@@ -14,6 +14,7 @@ import socket
 import threading
 from concurrent.futures import Future
 from types import SimpleNamespace
+from dataclasses import replace
 
 import msgspec
 import pytest
@@ -24,7 +25,7 @@ from pypto_serving.pd.adapter import CACHE_COMPONENTS, COMPONENTS, DeepSeekDSpar
 from pypto_serving.pd.config import Config, Endpoint
 from pypto_serving.pd.integration import Chunk
 from pypto_serving.pd.planner import Geometry, plan_chunk, rank_mapping
-from pypto_serving.pd.protocol import Binding, Component, Completion, Continuation, Contract, Copy, Node, Placement, Plan, Topology, digest
+from pypto_serving.pd.protocol import Binding, CapacityExhausted, Component, Completion, Continuation, Contract, Copy, Node, Placement, Plan, Topology, digest
 from pypto_serving.pd.service import Service
 from pypto_serving.pd.transfer import Mooncake, Region, TransferError
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
@@ -178,6 +179,15 @@ def service():
     result = Service(config, config.endpoint("decode"), "decode", None, core, None)
     result.node = d
     return result, p, d
+
+
+def test_active_handoff_capacity_uses_the_retryable_error():
+    s, p, d = service()
+    s.config = replace(s.config, capacity=1)
+    s.entry(Binding.create(p, d, {}), create=True)
+    with pytest.raises(CapacityExhausted):
+        s.entry(Binding.create(p, d, {}), create=True)
+    assert len(s.requests) == 1
 
 
 def test_status_reads_current_lease_without_changing_cache():
