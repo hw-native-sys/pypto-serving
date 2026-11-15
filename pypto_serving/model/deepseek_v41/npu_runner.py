@@ -2629,6 +2629,15 @@ class ResidentDSparkBuffers:
 
 
 # resident_resources
+_DSPARK_RESIDENT_DECODE_SCRATCH = (
+    "x_hc", "pre_mix", "position_ids", "request_ids", "window_slots", "window_indices",
+    "c2a_slots", "c1a_slots", "query_starts", "target_hidden_padded", "target_hidden",
+    "context_valid", "context_positions", "num_sampled", "anchor_ids", "first_query_positions",
+    "context_slots", "context_rope_cos", "context_rope_sin", "query_rope_cos", "query_rope_sin",
+    "draft_head_hidden", "committed",
+)
+
+
 class _DSparkOrchestratorRunner:
     """Adapt the lib's callable stage runner to resident serving resources."""
 
@@ -3194,6 +3203,13 @@ class V41ResidentResources:
                 f"missing={sorted(required - supplied)} extra={sorted(supplied - required)}"
             )
         bound = arguments
+        if stage == "decode" and self.dspark_buffers is not None:
+            # The composite produces and consumes these intermediates on device.
+            # Retain their existing allocations across calls and return only the
+            # small sampling outputs through the host-backed arguments.
+            bound = dict(arguments)
+            for name in _DSPARK_RESIDENT_DECODE_SCRATCH:
+                bound[name] = self.dspark_buffers.decode_workspace[name]
         reset_windows = False
         if stage in ("dspark_drafter", "decode"):
             module = importlib.import_module("models.deepseek_v4_1_flash.dspark_drafter")
@@ -3213,7 +3229,7 @@ class V41ResidentResources:
             # These windows persist across both bootstrap and decode. Allocate
             # epochs at dispatch, so repeated lowering cannot consume them and
             # replaying an already lowered payload cannot reuse old signals.
-            bound = dict(arguments, moe_epoch=epoch)
+            bound = dict(bound, moe_epoch=epoch)
         if reset_windows:
             previous_reset = self.worker._reset_persistent_windows
             self.worker._reset_persistent_windows = True
@@ -3281,6 +3297,10 @@ class V41ResidentResources:
     def _read_dspark_output(self, lowered, name):
         """Return an owned CPU copy of one device-produced DSpark output."""
         value = lowered.outputs.get(name, lowered.workspace.get(name))
+        if (name not in lowered.outputs and name in _DSPARK_RESIDENT_DECODE_SCRATCH
+                and self.dspark_buffers is not None
+                and lowered.workspace is self.dspark_host_resources.decode_workspace):
+            value = self.dspark_buffers.decode_workspace[name]
         if value is None:
             raise MissingCompositeInterface(
                 f"V4.1 DSpark output lowering is missing {name!r}"
