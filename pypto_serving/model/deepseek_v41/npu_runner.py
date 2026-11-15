@@ -1741,8 +1741,8 @@ class HostEngramResources:
                     raise ValueError("Engram rows must fit the current-token capacity")
                 if row_stride is not None and count > row_stride:
                     raise ValueError("Engram active rows exceed the request stride")
-                values = self.host.lookup(request.token_ids, max(1, count),
-                                          request.start, request_id=request.request_id)
+                values = self.host.lookup(request.token_ids, start_pos=request.start,
+                                          request_id=request.request_id)
                 for tp_rank in range(topology.tp):
                     rank = request.partition * topology.tp + tp_rank
                     target[rank, :, start:start + count].copy_(values[:, :count])
@@ -2668,6 +2668,15 @@ class ResidentDSparkBuffers:
 
 
 # resident_resources
+_DSPARK_RESIDENT_DECODE_SCRATCH = frozenset((
+    "x_hc", "pre_mix", "position_ids", "request_ids", "window_slots", "window_indices",
+    "c2a_slots", "c1a_slots", "query_starts", "target_hidden_padded", "target_hidden",
+    "context_valid", "context_positions", "num_sampled", "anchor_ids", "first_query_positions",
+    "context_slots", "context_rope_cos", "context_rope_sin", "query_rope_cos", "query_rope_sin",
+    "draft_head_hidden", "committed",
+))
+
+
 class _DSparkOrchestratorRunner:
     """Adapt the lib's callable stage runner to resident serving resources."""
 
@@ -2760,6 +2769,7 @@ class V41ResidentResources:
         self._prefill_binding = (prefill_program, prefill_param_names, run_config, prefill_host.topology)
         self.dspark_programs = dict(dspark_programs or {})
         self.dspark_param_names = dict(dspark_param_names or {})
+        self._validate_resident_decode_contract()
         if self.dspark_programs:
             if type(max_seq_len) is not int or max_seq_len <= 0:
                 raise ValueError("DSpark resources require a positive max_seq_len")
@@ -3209,6 +3219,37 @@ class V41ResidentResources:
             self._activate_decode()
         return self._decode_fwd
 
+    def _validate_resident_decode_contract(self):
+        """Validate resident scratch names against the current serving ABI."""
+        if not self.dspark_programs or self.dspark_host_resources is None:
+            return
+        from .dspark_runtime import _DECODE_WORKSPACE_KEYS
+
+        layout = self.dspark_host_resources.layout
+        missing_layout = _DSPARK_RESIDENT_DECODE_SCRATCH - set(layout.decode_shapes)
+        missing_runtime = _DSPARK_RESIDENT_DECODE_SCRATCH - set(_DECODE_WORKSPACE_KEYS)
+        if missing_layout or missing_runtime:
+            raise MissingCompositeInterface(
+                "V4.1 resident decode scratch is outside the current workspace ABI: "
+                f"layout={sorted(missing_layout)} runtime={sorted(missing_runtime)}"
+            )
+        missing_params = (_DSPARK_RESIDENT_DECODE_SCRATCH
+                          - set(self.dspark_param_names.get("decode", ())))
+        if missing_params:
+            raise MissingCompositeInterface(
+                "V4.1 decode program does not expose resident scratch parameters: "
+                + ", ".join(sorted(missing_params))
+            )
+        for name in _DSPARK_RESIDENT_DECODE_SCRATCH:
+            value = self.dspark_host_resources.decode_workspace.get(name)
+            expected = (tuple(layout.decode_shapes[name]), layout.decode_dtypes[name])
+            actual = None if value is None else (tuple(value.shape), value.dtype)
+            if actual != expected:
+                raise MissingCompositeInterface(
+                    f"V4.1 resident decode scratch {name!r} has invalid layout: "
+                    f"expected={expected}, actual={actual}"
+                )
+
     def run_decode_fwd(self, state, step):
         if (self.closed or step is not self._step or step.phase != "decode"
                 or self._decode_fwd is None):
@@ -3239,6 +3280,13 @@ class V41ResidentResources:
                     f"missing={sorted(required - supplied)} extra={sorted(supplied - required)}"
                 )
             bound = arguments
+            if stage == "decode" and self.dspark_buffers is not None:
+                # The composite produces and consumes these intermediates on device.
+                # Retain their existing allocations across calls and return only the
+                # small sampling outputs through the host-backed arguments.
+                bound = dict(arguments)
+                for name in _DSPARK_RESIDENT_DECODE_SCRATCH:
+                    bound[name] = self.dspark_buffers.decode_workspace[name]
             reset_windows = False
             if stage in ("dspark_drafter", "decode"):
                 module = importlib.import_module("models.deepseek_v4_1_flash.dspark_drafter")
@@ -3258,7 +3306,7 @@ class V41ResidentResources:
                 # These windows persist across both bootstrap and decode. Allocate
                 # epochs at dispatch, so repeated lowering cannot consume them and
                 # replaying an already lowered payload cannot reuse old signals.
-                bound = dict(arguments, moe_epoch=epoch)
+                bound = dict(bound, moe_epoch=epoch)
             if reset_windows:
                 previous_reset = self.worker._reset_persistent_windows
                 self.worker._reset_persistent_windows = True
@@ -3328,7 +3376,15 @@ class V41ResidentResources:
     def _read_dspark_output(self, lowered, name):
         """Return an owned CPU copy of one device-produced DSpark output."""
         with profile_span('v41.V41ResidentResources._read_dspark_output', cat='v41.host', level='verbose'):
-            value = lowered.outputs.get(name, lowered.workspace.get(name))
+            if name in _DSPARK_RESIDENT_DECODE_SCRATCH:
+                if (self.dspark_buffers is None
+                        or lowered.workspace is not self.dspark_host_resources.decode_workspace):
+                    raise MissingCompositeInterface(
+                        f"V4.1 resident decode output {name!r} has an invalid workspace binding"
+                    )
+                value = self.dspark_buffers.decode_workspace[name]
+            else:
+                value = lowered.outputs.get(name, lowered.workspace.get(name))
             if value is None:
                 raise MissingCompositeInterface(
                     f"V4.1 DSpark output lowering is missing {name!r}"

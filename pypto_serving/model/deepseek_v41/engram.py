@@ -198,8 +198,10 @@ class HostEngram:
             self.history[request_id] = compressed
             return torch.cat(hashes, dim=-1) + self.offsets.unsqueeze(1)
 
-    def lookup(self, token_ids, capacity: int, start_pos: int = 0, *, request_id=0) -> torch.Tensor:
+    def lookup(self, token_ids, capacity: int | None = None, start_pos: int = 0, *, request_id=0) -> torch.Tensor:
         with profile_span("v41.HostEngram.lookup", cat="v41.engram", level="verbose"):
+            if capacity is None:
+                capacity = len(token_ids)
             if len(token_ids) > capacity or capacity <= 0:
                 raise ValueError("Engram rows must fit the current-token capacity")
             hashes = self.hash_ids(token_ids, start_pos, request_id=request_id)

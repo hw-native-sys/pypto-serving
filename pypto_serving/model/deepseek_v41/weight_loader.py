@@ -288,7 +288,9 @@ class V41WeightLoader:
                 with self.store._safe_open_fn(path, self.store.device) as reader:
                     source = reader.get_tensor(name)
                 if source.ndim != 2:
-                    raise ValueError(f"row indices exceed tensor {name} shape {tuple(source.shape)}")
+                    raise ValueError(
+                        f"Engram tensor {name} must be 2-D, got shape {tuple(source.shape)}"
+                    )
                 self._row_tensors[name] = source
         shape = tuple(source.shape)
         if rows.numel() and int(rows.max()) >= shape[0]:
