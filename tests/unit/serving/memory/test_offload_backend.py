@@ -150,8 +150,61 @@ def test_copy_owner_finishing_initialization_after_timeout_stops(monkeypatch):
     service = simpler.CopyService.__new__(simpler.CopyService)
     try:
         with pytest.raises(RuntimeError, match='initialization failed'):
-            service.__init__(None, SimpleNamespace(close=lambda: None), {})
+            service.__init__(None, SimpleNamespace(close=lambda: None), {}, SimpleNamespace(value=False))
     finally:
         release.set()
         service.thread.join(2)
     assert not service.thread.is_alive() and closed == [True]
+
+
+@pytest.mark.parametrize('stage,rollback_fails', [
+    ('context', False), ('attach', False), ('stream', False), ('import', False),
+    ('prefault', False), ('register', False),
+    ('helper', False), ('helper', True)])
+def test_copy_owner_initialization_rolls_back_only_acquired_stages(monkeypatch, stage, rollback_fails):
+    from simpler import buffer
+    from pypto_serving.serving.memory.tiering import simpler
+    events, retired = [], SimpleNamespace(value=False)
+    def call(name, *args):
+        events.append(name)
+        if name in ('aclrtGetCurrentContext', 'aclrtCreateStream'):
+            ctypes.cast(args[0], ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(1)
+        return int((stage == 'context' and name == 'aclrtGetCurrentContext')
+                   or (stage == 'attach' and name == 'aclrtSetCurrentContext')
+                   or (stage == 'stream' and name == 'aclrtCreateStream')
+                   or (stage == 'register' and name == 'aclrtHostRegisterV2')
+                   or (rollback_fails and name == 'aclrtHostUnregister'))
+    acl = SimpleNamespace(**{name: (lambda *args, n=name: call(n, *args)) for name in (
+        'aclrtGetCurrentContext', 'aclrtSetCurrentContext', 'aclrtCreateStream', 'aclrtDestroyStream',
+        'aclrtSynchronizeStream', 'aclrtHostRegisterV2', 'aclrtHostUnregister')})
+    def acquire(name):
+        events.append(name)
+        if stage == name:
+            raise ValueError('injected ' + name)
+        return SimpleNamespace(base=1, nbytes=4096, identity='pool')
+    helper = SimpleNamespace(prefault_read=lambda *args: acquire('prefault'))
+    if stage != 'helper':
+        helper.copy_cache_batch = lambda *args: events.append('copy')
+    monkeypatch.setattr(simpler.ctypes, 'CDLL', lambda name: acl if name == 'libascendcl.so' else helper)
+    monkeypatch.setattr(simpler, '_descriptor', lambda wire: wire)
+    monkeypatch.setattr(simpler, 'advise', lambda *args: None)
+    monkeypatch.setattr(buffer, 'ImportRegistry', lambda _: SimpleNamespace(
+        materialize=lambda _: acquire('import'), unregister=lambda _: events.append('unmap')))
+    service = simpler.CopyService.__new__(simpler.CopyService)
+    with pytest.raises(RuntimeError, match='ACL context' if stage == 'context' else 'initialization failed'):
+        service.__init__(None, SimpleNamespace(close=lambda: None), {'copy_library': 'helper'}, retired)
+    if stage == 'context':
+        assert retired.value and not hasattr(service, 'thread')
+        return
+    service.thread.join(2)
+    assert not service.thread.is_alive() and 'copy' not in events
+    assert ('aclrtHostUnregister' in events) == (stage == 'helper')
+    assert ('unmap' in events) == (stage not in ('attach', 'stream', 'import') and not rollback_fails)
+    assert ('aclrtDestroyStream' in events) == (stage not in ('attach', 'stream') and not rollback_fails)
+    if rollback_fails:
+        assert not retired.value and isinstance(service.error, AttributeError)
+        with pytest.raises(RuntimeError, match='not been safely retired'):
+            service.close()
+    else:
+        assert retired.value
+        service.close()

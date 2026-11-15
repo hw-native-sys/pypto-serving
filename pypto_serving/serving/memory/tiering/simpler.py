@@ -11,11 +11,14 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import threading
 import time
 
 from .pool import advise
 from .backend import BATCH_BYTES, BATCH_SPANS
+
+logger = logging.getLogger(__name__)
 
 
 def descriptor_wire(descriptor):
@@ -56,12 +59,14 @@ class NativeCopy:
         for name, args in signatures.items():
             function = getattr(self.acl, name)
             function.argtypes, function.restype = args, ctypes.c_int
-        self.stream = pointer()
-        self._call("aclrtCreateStream", ctypes.byref(self.stream))
         self.regions = {}
         self.commands = (Span * BATCH_SPANS)()
         self.pool = None
+        self.host_registered = False
         self.poisoned = self.closed = False
+        stream = pointer()
+        self._call("aclrtCreateStream", ctypes.byref(stream))
+        self.stream = stream
 
     def _call(self, name, *args):
         code = getattr(self.acl, name)(*args)
@@ -92,6 +97,7 @@ class NativeCopy:
         self.native.prefault_read.restype = ctypes.c_uint64
         self.native.prefault_read(self.pool.base, self.pool.nbytes)
         self._call("aclrtHostRegisterV2", self.pool.base, self.pool.nbytes, 0x10000000)
+        self.host_registered = True
         self.native.copy_cache_batch.argtypes = [ctypes.POINTER(Span), ctypes.c_size_t, ctypes.c_int,
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_size_t)]
         self.native.copy_cache_batch.restype = ctypes.c_int
@@ -154,14 +160,18 @@ class NativeCopy:
                     native_commands=planned.value)
 
     def close(self):
+        if self.closed:
+            return
         self._check()
-        if self.pool is not None:
+        if self.host_registered:
             self._call("aclrtHostUnregister", self.pool.base)
+            self.host_registered = False
+        if self.pool is not None:
             self.registry.unregister(self.pool.identity)
             self.pool = None
-        for token, _, _, _ in self.regions.values():
+        for name, (token, _, _, _) in tuple(self.regions.items()):
             self.context.unpin(token)
-        self.regions.clear()
+            del self.regions[name]
         self._call("aclrtDestroyStream", self.stream)
         self.closed = True
 
@@ -169,13 +179,19 @@ class NativeCopy:
 class CopyService:
     """Independent child-owner endpoint. All Buffer and native work stays in its thread."""
 
-    def __init__(self, context, channel, pool):
+    def __init__(self, context, channel, pool, retired):
         self.context, self.channel, self.pool = context, channel, pool
-        acl = ctypes.CDLL("libascendcl.so")
-        self.acl_context = ctypes.c_void_p()
-        acl.aclrtGetCurrentContext.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
-        if acl.aclrtGetCurrentContext(ctypes.byref(self.acl_context)) or not self.acl_context.value:
-            raise RuntimeError("cache service requires the allocation owner's ACL context")
+        self.retired = retired
+        try:
+            acl = ctypes.CDLL("libascendcl.so")
+            self.acl_context = ctypes.c_void_p()
+            acl.aclrtGetCurrentContext.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+            if acl.aclrtGetCurrentContext(ctypes.byref(self.acl_context)) or not self.acl_context.value:
+                raise RuntimeError("cache service requires the allocation owner's ACL context")
+        except BaseException:
+            self.retired.value = True  # No thread, mapping, registration or DMA exists yet.
+            self.channel.close()
+            raise
         self.started = threading.Event()
         self.close_requested = threading.Event()
         self.error = None
@@ -188,6 +204,8 @@ class CopyService:
             raise RuntimeError("cache copy owner initialization failed") from self.error
 
     def _run(self):
+        provider = None
+        initialized = False
         try:
             acl = ctypes.CDLL("libascendcl.so")
             acl.aclrtSetCurrentContext.argtypes = [ctypes.c_void_p]
@@ -196,20 +214,19 @@ class CopyService:
             provider = NativeCopy(self.context)
             self.provider = provider
             provider.initialize_pool(self.pool)
+            initialized = True
             self.started.set()
             expected = 0
             while not self.stopped:
                 if self.close_requested.is_set():
-                    provider.close()  # Rejects uncertain DMA.
-                    self.stopped = True
+                    self._retire(provider)
                     break
                 if not self.channel.poll(.1):
                     continue
                 try:
                     sequence, operation, payload = self.channel.recv()
                 except EOFError:
-                    provider.close()
-                    self.stopped = True
+                    self._retire(provider)
                     break
                 expected += 1
                 if sequence != expected:
@@ -221,8 +238,7 @@ class CopyService:
                     elif operation == "copy_batch":
                         result = provider.copy_batch(*payload)
                     elif operation == "stop":
-                        result = provider.close()
-                        self.stopped = True
+                        result = self._retire(provider)
                     else:
                         raise ValueError("unknown cache-copy operation")
                     self.channel.send((sequence, True, result))
@@ -230,9 +246,22 @@ class CopyService:
                     self.channel.send((sequence, False, (str(error), provider.poisoned)))
         except BaseException as error:
             self.error = error
+            if not initialized:
+                # No copy command was accepted. Undo only acquired stages;
+                # failed rollback retains the original error and ownership.
+                try:
+                    self._retire(provider)
+                except BaseException:
+                    logger.exception("cache copy initialization rollback failed; owner retained")
             self.started.set()
         finally:
             self.channel.close()
+
+    def _retire(self, provider):
+        if provider is not None:
+            provider.close()  # Rejects uncertain DMA; never unmaps a registered pool on error.
+        self.stopped = True
+        self.retired.value = True
 
     def close(self):
         self.close_requested.set()

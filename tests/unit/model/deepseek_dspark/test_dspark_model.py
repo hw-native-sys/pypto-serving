@@ -143,6 +143,15 @@ def test_empty_cache_geometry_uses_execution_role_even_with_k7_decode_kernel(rol
     assert specs == expected
 
 
+def test_pd_and_ddr_use_the_same_group_components_and_tensor_names():
+    from pypto_serving.model.deepseek_dspark.cache_offload import COMPONENTS
+    from pypto_serving.pd.adapter import CACHE_COMPONENTS, TENSORS
+    specs = build_dspark_cache_group_specs(43, (0, 0) + (4,) * 21 + (128,) * 20)
+    assert {g.name for g in specs} == set(COMPONENTS)
+    assert {g: tuple(TENSORS[c.name] for c in CACHE_COMPONENTS if c.group == g)
+            for g in COMPONENTS} == COMPONENTS
+
+
 def _runner(*, speculative: bool = False, max_position: int = 512, extension_factory=None,
             tp_size: int = 4) -> DSparkModelRunner:
     rows = torch.arange(max_position * 64, dtype=torch.float32).reshape(max_position, 64)

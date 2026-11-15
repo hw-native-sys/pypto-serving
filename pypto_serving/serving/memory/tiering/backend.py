@@ -21,6 +21,8 @@ from typing import Protocol
 
 from .pool import Extents
 
+# Software batching bounds, not CANN/device limits. See the offload guide's
+# batching rationale: a tested large-payload default and a 1.5 MiB compact table.
 BATCH_BYTES = 256 << 20
 BATCH_SPANS = 32768
 logger = logging.getLogger(__name__)

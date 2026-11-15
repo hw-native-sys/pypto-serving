@@ -9,9 +9,12 @@
 """DSpark cache byte geometry and composition with optional existing owner services."""
 
 from functools import partial
+import logging
 from math import prod
 
 from pypto_serving.serving.memory.tiering.simpler import CopyService, descriptor_wire
+
+logger = logging.getLogger(__name__)
 
 
 COMPONENTS = {
@@ -38,7 +41,15 @@ def owner_factory(endpoints, rank, previous, pool, context):
     services = []
     if previous is not None:
         services.append(previous(context))
-    services.append(CopyService(context, endpoints[rank].child, pool))
+    try:
+        services.append(CopyService(context, endpoints[rank].child, pool, endpoints[rank].stopped))
+    except BaseException:
+        for service in reversed(services):
+            try:
+                service.close()
+            except BaseException:
+                logger.exception("previous owner service rollback failed; preserving copy initialization error")
+        raise
     return OwnerServices(services)
 
 

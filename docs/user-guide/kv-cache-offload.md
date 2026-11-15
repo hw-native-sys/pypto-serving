@@ -16,6 +16,12 @@ For PD, configure each P/D process independently; the Router has no DDR pool.
 alignment and TP replicas, rounded down to a system page. It is not a per-rank
 budget. The current backend is `--kv-offload-backend simpler`.
 
+The example requests **200 decimal GB (186.26 GiB)**, not a model requirement or
+a safe default for every host. The pool is allocated/prefaulted up front. Leave
+separate host-memory headroom for weights and staging, runtime heaps, Python and
+checkpoint metadata, concurrent processes and the operating system; do not set
+the pool from `MemAvailable` alone or assume a container has a dedicated host.
+
 The backend requires Linux, the matching PyPTO/Simpler owner-service and retained
 tensor interfaces, CANN's Ascend asynchronous copy APIs and `aclrtHostRegisterV2`, and enough host memory
 for the configured pool. On a host with multiple NUMA nodes, `libnuma.so.1` and permission
@@ -27,6 +33,55 @@ configuration. Registration and physical allocation happen during startup.
 A C++17 compiler (`CXX`, default `g++`) and CANN headers under `ASCEND_HOME_PATH`
 are required when offload is enabled. A small temporary copy helper is built
 before owners start and removed after they retire; disabled offload does not build it.
+
+## Sizing a retention target
+
+For each **unique** page in the union of the desired recovery sets, charge
+`TP * ceil(component_bytes_per_owner / system_page_size) * system_page_size`.
+Sum every component in the group before rounding: `idx` includes KV and scale.
+Within one partition, overlapping checkpoints and shared prefixes count their
+common pages once; TP replicas and copies in different partitions count separately.
+Full-history KV is a union, not one full-history copy per checkpoint. Rolling KV
+and state require the union of each retained checkpoint's complete windows.
+
+For example, use 43 layers (20 C128, 21 C4), 4 KiB host pages, P DP4/TP4, and
+eight independent 65536-token prefixes in each of four partitions. Retain the
+eight 8192-token periodic checkpoints of each prefix. Per prefix/per owner:
+
+| Group | Unique pages | Useful bytes/page | Charged bytes/page |
+| --- | ---: | ---: | ---: |
+| `cmp_c128` | 512 | 20480 | 20480 |
+| `cmp_c4` | 512 | 688128 | 688128 |
+| `idx` (KV + scale) | 512 | 88704 | 90112 |
+| `ori` (eight 128-token windows) | 32 | 1409024 | 1409024 |
+| `hca_state` | 128 | 655360 | 655360 |
+| `csa_state` | 32 | 344064 | 344064 |
+| `csa_inner_state` | 32 | 86016 | 86016 |
+
+This recovery-set union costs **551682048 bytes/owner (526.125 MiB)**,
+**2.055 GiB with TP4**, or **65.766 GiB for 32 independent prefixes**.
+It assumes these checkpoints were complete and eligible for publication.
+Extra tail/output pages, additional prefixes and in-flight work need allowance;
+capacity pressure may retain fewer checkpoints. A shared 32768-token prefix
+reduces the charge only where its pages are actually shared in the same partition.
+Decode-only PD keeps shareable history, not P's rolling/state checkpoint set:
+the same 65536-token history is 390 MiB with TP1, before new Decode pages.
+Request-local final state and bootstrap still need HBM and arrive from P.
+
+The startup largest-page check is only a necessary allocation check. It does
+not guarantee that a complete checkpoint fits or that a restore has enough
+destination HBM pages, COW replacements and snapshot working space. Restore uses
+the existing cache-manager allocator and can wait/fail under HBM pressure.
+Reduce the retention target or leave more HBM headroom when needed; the configured
+context/sequence ceilings do not reserve all possible full-length requests.
+
+Tune using completed STORE/LOAD bytes, queue/source-pin age and bytes, actual
+HBM-hit versus DDR-restored tokens, allocation waits/preemption and latency tails.
+For host memory use instance/cgroup `memory.current`, `memory.peak`, `memory.stat`
+and process PSS/Private, plus host `MemAvailable` and swap pressure. A shared HOST
+mapping appears in every owner's RSS: summing those RSS values overcounts backing.
+Budget for metadata outside the pool, including page keys, checkpoint tuples and
+their memberships; short intervals and long contexts increase that overhead.
 
 ## Execution and ownership
 
@@ -48,6 +103,60 @@ The native planner compares layer rows within a page with regular runs across pa
 using the plan with fewer two-dimensional copies. Contiguous ranges use asynchronous memcpy. This changes command
 grouping without changing page layout or copying gaps between authorized pages.
 There is no HBM staging buffer, data packing, or selectable legacy copy path.
+
+### Batch limits and native execution
+
+The **256 MiB** payload cap is a software default per owner/batch, not a hardware
+or SDK limit. It was selected from exploratory 1/4/16/64/256 MiB Ascend A3 DSpark
+page-layout sweeps as a useful large batch that amortizes RPC/submission work.
+It is the largest tested default in that sweep, not a global optimum. Owners
+submit currently available work immediately; they do not wait to fill 256 MiB.
+Validate again for different CANN versions, hardware, geometry and workloads.
+
+The **32768 compact spans** cap independently bounds command metadata. On the
+tested 64-bit platform its preallocated six-`size_t` table is 1.5 MiB per owner.
+It counts compact component spans before layer expansion, not ACL commands or
+pages; it is a storage/work bound rather than an empirically optimal span count.
+Either cap can end a batch. Actual useful payload and native command counts
+must be measured instead of assuming every batch is one contiguous DMA.
+
+C++ is used for the small owner-local planning/submission loop, not to replace
+Buffer ownership with a new runtime. In exploratory A3 same-layout strided
+microbenchmarks, Python per-command 2D submission was about 1.1 GB/s, versus
+about 18 GB/s for a C++ loop on registered THP backing; the batch API was about
+2.8 GB/s on that layout. These are submission-path diagnostics, not model
+throughput or guaranteed bandwidth. Keeping expansion and ACL calls in one
+ctypes call also releases the GIL. This does not claim Python lacks async copy
+APIs. Simpler continues to own allocation/context lifetime; Serving validates
+model spans and copy proofs. Moving generic strided batch execution into a shared
+runtime is separate follow-up work, not an SDK modification in this feature.
+
+### Ownership boundaries and pressure
+
+`KvCacheManager` owns HBM identities, allocation, snapshots/COW, prefix matching
+and publication. `TieredCache` bridges those existing operations to DDR: it
+reserves restore destinations, coalesces readers and returns cache-manager pins
+only after confirmed completion. `CacheTier` owns DDR page keys, checkpoint
+membership, storage references and eviction. The backend owns physical DDR
+extents/transport jobs; the owner executes copies and never owns the tensor's
+allocation. DDR readiness alone does not authorize physical HBM reuse.
+
+The STORE queue has no independent byte or entry admission limit. Unique source
+pages remain pinned in the existing finite HBM pools, so queue data cannot grow
+past those pools, but pinning can exhaust their allocatable pages. The DDR budget
+does not bound HBM pin pressure or guarantee progress/latency for new requests.
+Background native completion and reader release allow pins/eviction to progress;
+UNKNOWN preserves isolation instead of pretending that space was returned.
+Report normal pending pins separately from quarantine. There is no optional-save
+dropping or automatic admission policy in this revision.
+
+The adapter currently uses cache-manager internals for grouped tables and
+checkpoint publication. Follow-up interface work should expose those operations
+through a small cache-manager API and derive inference/PD/DDR byte views from
+one model storage description. Transport registration, final/bootstrap handoff
+and DDR checkpoint eligibility should remain adapter responsibilities. Naming
+and generic copy-runtime placement can be tightened in that work without
+introducing a second allocator or resource state machine.
 
 Completed batches notify the existing engine event loop to publish pages and
 return copy references without waiting for a model step to return. Restore
