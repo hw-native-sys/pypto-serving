@@ -43,6 +43,11 @@ Explicit `--ring-heap` values apply to all DSpark profiles and worker prewarm,
 including speculative bootstrap; available capacity still requires validation
 at the intended context and batch sizes.
 
+AgentInfer admission supports both K=0 and K=7 in a single replica. Replace
+`--no-enable-prefix-caching` in the example with `--enable-prefix-caching` and
+add `--agentinfer-mode enforce`. See [AgentInfer Admission](../../user-guide/online-serving.md#agentinfer-admission)
+for session identity and lifecycle reporting.
+
 ## Verify
 
 ```bash
