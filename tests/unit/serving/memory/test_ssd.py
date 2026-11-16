@@ -29,7 +29,9 @@ from pypto_serving.serving.memory.tiering.simpler import NativeCopy, Span
 from pypto_serving.serving.memory.tiering.ssd import FileStore
 from pypto_serving.serving.memory.tiering.trace import OffloadTrace
 from pypto_serving.serving.memory.kv_cache import KVCacheRestoreError
-from tests.unit.serving.memory._copy_stub import helper as helper  # Actual C++ planner, CPU ACL stubs.
+from tests.unit.serving.memory import _copy_stub
+
+helper = _copy_stub.helper  # Actual C++ planner, CPU ACL stubs.
 
 
 def eventually(check, progress=lambda: None):
