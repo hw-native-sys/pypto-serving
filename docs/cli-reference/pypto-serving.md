@@ -119,6 +119,8 @@ The HTTP completion path always ignores EOS. Chat requests can set `max_completi
 | --- | --- | --- |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | enabled | Enable or disable prefix caching for supported paths. |
 | `--enable-chunked-prefill` / `--no-enable-chunked-prefill` | enabled | Enable or disable chunked prefill. |
+| `--agentinfer-mode disabled\|enforce` | `disabled` | Enable AgentInfer admission for a supported single-replica model with prefix caching. |
+| `--agentinfer-config JSON` | `{}` | Optional AgentInfer policy bounds; requires `--agentinfer-mode enforce`. |
 | `--speculative-config JSON` | unset | Model-specific speculative decoding configuration; currently supported by DeepSeek V4. |
 | `--num-speculative-tokens K` | unset | Deprecated alias for the DeepSeek V4 MTP draft-token count. |
 
@@ -127,6 +129,8 @@ The HTTP completion path always ignores EOS. Chat requests can set `max_completi
 Chunked prefill breaks long prompts into scheduler-visible chunks when a prompt exceeds `--long-prefill-token-threshold`. `--no-enable-chunked-prefill` disables that scheduler path.
 
 Prefix caching reuses KV cache state for repeated prompt prefixes when the model executor supports it. The flag is enabled by default, but model-specific decoding modes may disable caching or require an explicit choice; consult the model guide.
+
+AgentInfer supports Qwen, standard DeepSeek V4 MTP K=1, and DeepSeek V4 DSpark K=0/K=7. See [AgentInfer Admission](../user-guide/online-serving.md#agentinfer-admission) for session identity and lifecycle reporting.
 
 `--speculative-config` selects a model-supported decoding method and its parameters. Currently only DeepSeek V4 accepts this option; see its [MTP](../models/deepseek-v4/mtp.md#8-device-dpep-serving) and [DSpark](../models/deepseek-v4/dspark.md) guides for supported values and constraints. The deprecated `--num-speculative-tokens` flag remains a DeepSeek V4 MTP compatibility alias.
 
