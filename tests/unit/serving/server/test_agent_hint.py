@@ -460,3 +460,23 @@ def test_lifecycle_endpoint_reaches_real_engine_and_admission(stream, monkeypatc
             assert notification.json() == {"released": lifecycle == "terminal"}
             assert admission.policy.registry.has_programs is (lifecycle == "continue")
     assert engine._request_to_replica == {}
+
+
+@pytest.mark.parametrize("completion_order", [(0, 1), (1, 0)])
+def test_automatic_chat_terminal_releases_after_all_overlapping_responses(completion_order):
+    engine = AsyncLLMEngine(EngineConfig(agentinfer_mode="enforce"), tokenizer=_Tokenizer())
+    manager = KvCacheManager(num_blocks=64, block_size=16)
+    admission = AgentInferAdmission(0, Scheduler(SchedulerConfig(), manager), manager)
+    engine.single_core()._agentinfer_admission = admission
+    server = ServingServer(engine, "test-model", GenerateConfig())
+    requests = [Request(f"request-{index}", [1, 2], max_new_tokens=1) for index in range(2)]
+    for request in requests:
+        assert admission.arrive(request, "session-a")
+    output = TokenOutput(text="OK", finished=True, finish_reason="FINISHED_EOS")
+
+    for position, index in enumerate(completion_order):
+        request = requests[index]
+        admission.complete(request)
+        server._observe_chat_lifecycle("session-a", request.request_id, "chat", output)
+        assert admission.policy.registry.has_programs is (position == 0)
+    assert admission._sessions == {}

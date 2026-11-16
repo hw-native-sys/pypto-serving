@@ -123,6 +123,32 @@ def test_medium_kv_pool_reserves_one_context_and_schedules_promptly() -> None:
     assert admission.policy.strategy.config.shared_prefix_freshness_warmup_seconds == 0.0
 
 
+@pytest.mark.parametrize("max_new_tokens", [1, 128])
+def test_decode_buffer_respects_context_limit_in_idle_two_context_pool(max_new_tokens) -> None:
+    manager = KvCacheManager(num_blocks=64, block_size=128)
+    native = Scheduler(SchedulerConfig(max_num_running_reqs=16, max_seq_len=4096), manager)
+    admission = AgentInferAdmission(0, native, manager)
+    request = Request("long", list(range(4095)), max_new_tokens=max_new_tokens)
+    native.validate_request(request)
+
+    assert request.max_new_tokens == 1
+    assert admission.arrive(request, "session-a")
+    assert admission.retained_request_ids == ()
+    native.add_request(request)
+    for _ in range(2):
+        step = native.schedule()
+        assert len(step.scheduled_requests) == 1
+        admission.native_scheduled(step.scheduled_requests[0])
+        outputs = native.update_from_output(step, {request.request_id: 42})
+
+    assert len(outputs) == 1 and outputs[0].finished
+    assert len(request.output_token_ids) == 1
+    admission.complete(request)
+    assert not native.has_work()
+    assert not admission._sessions
+    assert manager.num_free_blocks == manager.num_blocks
+
+
 def test_optional_wait_capacity_relax_reaches_policy() -> None:
     manager = KvCacheManager(num_blocks=128, block_size=128)
     native = Scheduler(SchedulerConfig(max_num_running_reqs=16, max_seq_len=4096), manager)
@@ -305,6 +331,106 @@ def test_retained_prefix_refresh_releases_request_without_acquiring_blocks(
     assert admission.policy.prefix_cache_candidates() == ()
 
 
+def test_plain_completion_refreshes_retained_agent_prefix_without_binding_or_acquiring_blocks(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    manager = KvCacheManager(num_blocks=64, block_size=128)
+    native = Scheduler(SchedulerConfig(max_num_running_reqs=16, max_seq_len=4096), manager)
+    admission = AgentInferAdmission(0, native, manager, AgentInferOptions(resume_capacity_ratio=0.4))
+    tokens = list(range(3500))
+    donor = Request("plain", tokens, max_new_tokens=1)
+    native.add_request(donor)
+    held = Request("held", tokens, max_new_tokens=1)
+    assert not admission.arrive(held, "session-a")
+    assert admission.poll() == []
+
+    for _ in range(2):
+        step = native.schedule()
+        assert len(step.scheduled_requests) == 1
+        admission.native_scheduled(step.scheduled_requests[0])
+        outputs = native.update_from_output(step, {donor.request_id: 42})
+    assert len(outputs) == 1 and outputs[0].finished
+    admission.complete(donor)
+    assert manager.observe_prefix(tokens).cached_tokens == 3456
+
+    refs = [block.ref_cnt for block in manager.blocks]
+    free = manager.num_free_blocks
+    now[0] += 0.05
+    assert admission.poll() == [held]
+    assert admission.poll() == []
+    assert [block.ref_cnt for block in manager.blocks] == refs
+    assert manager.num_free_blocks == free
+    programs = admission.policy.registry.views()
+    assert len(programs) == 1 and programs[0].ref.program_id == "session-a"
+    assert programs[0].tokens.shared_prefix_tokens == 3456
+
+    native.add_request(held)
+    step = native.schedule()
+    assert len(step.scheduled_requests) == 1
+    assert step.scheduled_requests[0].num_computed_tokens == 3456
+    admission.native_scheduled(step.scheduled_requests[0])
+    outputs = native.update_from_output(step, {held.request_id: 43})
+    assert len(outputs) == 1 and outputs[0].finished
+    admission.complete(held)
+    assert not native.has_work()
+    assert not admission._sessions
+    assert manager.num_free_blocks == manager.num_blocks
+
+
+@pytest.mark.parametrize("arrival_offsets", [(0.0,), (0.0, 50.0)])
+def test_completion_refresh_waits_for_each_retained_prefix_freshness_deadline(monkeypatch, arrival_offsets):
+    now = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    manager = KvCacheManager(num_blocks=16, block_size=128)
+    native = Scheduler(SchedulerConfig(max_num_running_reqs=16, max_seq_len=4096), manager)
+    admission = AgentInferAdmission(0, native, manager, AgentInferOptions(resume_capacity_ratio=0.85))
+    tokens = list(range(1800))
+    donor = Request("plain", tokens, max_new_tokens=1)
+    native.add_request(donor)
+    held = []
+    for index, offset in enumerate(arrival_offsets):
+        now[0] = 100.0 + offset
+        request = Request(f"held-{index}", tokens, max_new_tokens=1)
+        assert not admission.arrive(request, f"session-{index}")
+        held.append(request)
+        assert admission.poll() == []
+
+    step = native.schedule()
+    outputs = native.update_from_output(step, {donor.request_id: 42})
+    assert len(outputs) == 1 and outputs[0].finished
+    admission.complete(donor)
+    assert manager.observe_prefix(tokens).cached_tokens == 1792
+    refs = [block.ref_cnt for block in manager.blocks]
+    free = manager.num_free_blocks
+    observations = []
+    observe_prefix = manager.observe_prefix
+
+    def record_observation(prompt_token_ids):
+        observations.append(now[0])
+        return observe_prefix(prompt_token_ids)
+
+    monkeypatch.setattr(manager, "observe_prefix", record_observation)
+    now[0] += 0.1
+    assert admission.poll() == []
+    assert admission._prefix_refresh_pending
+    for index, offset in enumerate(arrival_offsets):
+        now[0] = 199.9 + offset
+        assert admission.poll() == []
+        assert len(observations) == index
+        now[0] = 201.0 + offset
+        assert admission.poll() == [held[index]]
+        assert len(observations) == index + 1
+        view = next(view for view in admission.policy.registry.views()
+                    if view.ref.program_id == f"session-{index}")
+        assert view.tokens.shared_prefix_tokens == 1792
+        assert admission._prefix_refresh_pending is (index + 1 < len(held))
+        assert admission.poll() == []
+    assert manager.num_free_blocks == free
+    assert [block.ref_cnt for block in manager.blocks] == refs
+    for request in held:
+        admission.cancel(request.request_id)
+
+
 @pytest.mark.parametrize("values", [
     {"resume_capacity_ratio": 0}, {"resume_capacity_ratio": float("nan")},
     {"resume_capacity_ratio": True}, {"force_resume_timeout_min_seconds": 4,
@@ -376,6 +502,45 @@ def test_terminal_lifecycle_releases_only_idle_program_and_preserves_live_reques
     assert not admission.observe_lifecycle("session-a", "first", "terminal")
     assert admission._sessions == {"next": "session-a"}
     assert admission.policy.registry.current_ref("session-a") is not None
+
+
+@pytest.mark.parametrize("finish_earlier", ["complete", "cancel"])
+def test_latest_terminal_is_deferred_until_overlapping_request_finishes(finish_earlier):
+    admission = _admission()
+    earlier = Request("earlier", [1, 2], max_new_tokens=1)
+    latest = Request("latest", [1, 2], max_new_tokens=1)
+    assert admission.arrive(earlier, "session-a")
+    assert admission.arrive(latest, "session-a")
+    admission.complete(latest)
+    assert not admission.observe_lifecycle("session-a", latest.request_id, "terminal")
+    assert admission.policy.registry.has_programs
+
+    if finish_earlier == "complete":
+        admission.complete(earlier)
+    else:
+        admission.cancel(earlier.request_id)
+    assert not admission.policy.registry.has_programs
+    assert not admission._sessions
+    assert not admission.observe_lifecycle("session-a", latest.request_id, "terminal")
+
+
+def test_new_arrival_invalidates_terminal_deferred_by_overlapping_request():
+    admission = _admission()
+    earlier = Request("earlier", [1, 2], max_new_tokens=1)
+    latest = Request("latest", [1, 2], max_new_tokens=1)
+    new = Request("new", [1, 2], max_new_tokens=1)
+    assert admission.arrive(earlier, "session-a")
+    assert admission.arrive(latest, "session-a")
+    ref = admission.policy.registry.current_ref("session-a")
+    admission.complete(latest)
+    assert not admission.observe_lifecycle("session-a", latest.request_id, "terminal")
+    assert admission.arrive(new, "session-a")
+    admission.complete(earlier)
+    assert admission.policy.registry.current_ref("session-a") == ref
+    admission.complete(new)
+    assert admission.policy.registry.current_ref("session-a") == ref
+    assert not admission.observe_lifecycle("session-a", latest.request_id, "terminal")
+    assert admission.observe_lifecycle("session-a", new.request_id, "terminal")
 
 
 def test_late_terminal_from_previous_round_cannot_release_completed_new_round():
