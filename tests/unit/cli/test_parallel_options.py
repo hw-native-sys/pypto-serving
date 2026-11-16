@@ -192,3 +192,18 @@ def test_worker_only_exports_explicit_build_directory(monkeypatch, requested):
     directory = worker._configure_pypto_build_dir((3, 4))
     assert directory == (Path(requested) / "serving_dp2_d3_4" if requested else None)
     assert os.environ.get("PYPTO_PROG_BUILD_DIR") == (str(directory) if requested else requested)
+
+
+@pytest.mark.parametrize(
+    "flag,expected", [(None, None), ("--enable-dplb", True), ("--no-enable-dplb", False)]
+)
+def test_dplb_cli_reaches_engine_config(tmp_path, flag, expected):
+    model = tmp_path / "model"
+    model.mkdir()
+    argv = ["--model", str(model)] + ([flag] if flag else [])
+    config = cli.build_serving_engine_config(_parse_cli_args(argv))
+    assert config.enable_dplb is expected
+    assert config.resolve_dplb() is (expected if expected is not None else False)
+    from dataclasses import replace
+    dspark = replace(config, executor_cls="PyptoDeepSeekV4DSparkExecutor")
+    assert dspark.resolve_dplb() is (expected if expected is not None else True)

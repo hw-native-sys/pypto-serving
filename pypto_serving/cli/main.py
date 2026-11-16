@@ -212,6 +212,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--enable-dplb", action=argparse.BooleanOptionalAction, default=None,
+        help="Balance grouped DP admission by request count and KV length (default: on for DSpark).",
+    )
+    parser.add_argument(
         "--enable-prefix-caching",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -333,6 +337,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         max_num_scheduled_tokens=args.max_num_batched_tokens,
         long_prefill_token_threshold=args.long_prefill_token_threshold,
         enable_prefix_cache=enable_prefix_cache,
+        enable_dplb=args.enable_dplb,
         enable_chunk_prefill=args.enable_chunked_prefill,
     )
 

@@ -459,6 +459,7 @@ class Scheduler:
                             request.num_prompt_tokens
                             - max(1, self.config.speculative_prefix_cache_replay_tokens),
                         ),
+                        load_tokens=request.num_prompt_tokens,
                     )
                     request.num_group_blocks_cached = (
                         self.kv_cache_manager.published_group_block_counts(
@@ -1012,6 +1013,7 @@ class Scheduler:
                     request.request_id,
                     total_tokens,
                     partition=request.cache_partition,
+                    load_tokens=request.num_prompt_tokens,
                 )
                 request.cache_partition = self.kv_cache_manager.group_request_partition(
                     request.request_id

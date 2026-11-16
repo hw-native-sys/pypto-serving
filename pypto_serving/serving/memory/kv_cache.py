@@ -164,6 +164,7 @@ class KvCacheManager:
         num_blocks: int | None = None,
         block_size: int = 64,
         enable_prefix_cache: bool = True,
+        enable_dplb: bool = False,
     ) -> None:
         """Create an empty registry of model-specific KV pools."""
         self._pools: dict[str, _CachePool] = {}
@@ -175,6 +176,8 @@ class KvCacheManager:
         self.request_blocks: dict[str, list[KVCacheBlock]] = {}
         self._group_pools: dict[str, _GroupBlockPool] = {}
         self._group_request_partitions: dict[str, int] = {}
+        self.enable_dplb = enable_dplb
+        self._group_request_tokens: dict[str, int] = {}
         self._next_group_partition = 0
         if num_blocks is not None:
             self._init_blocks(num_blocks, block_size)
@@ -749,6 +752,7 @@ class KvCacheManager:
         block_hashes: dict[str, list[int]],
         *,
         max_cache_hit_tokens: int,
+        load_tokens: int | None = None,
     ) -> tuple[dict[str, list[int]], int, int | None]:
         """Attach the longest strict zero-copy grouped prefix to a request.
 
@@ -789,7 +793,12 @@ class KvCacheManager:
         best_partition: int | None = None
         best_hit_tokens = 0
         best_blocks: dict[str, list[KVCacheBlock | None]] = {}
-        for partition in range(self.group_partition_count):
+        candidate_partitions = list(range(self.group_partition_count))
+        if self.enable_dplb:
+            candidate_partitions = self._rank_group_partitions(
+                candidate_partitions, load_tokens or max_hit_tokens
+            )
+        for partition in candidate_partitions:
             candidate = max_candidate
             for name, pool in self._group_pools.items():
                 if pool.spec.sliding_window is not None:
@@ -862,6 +871,9 @@ class KvCacheManager:
             return {}, 0, None
 
         self._group_request_partitions[request_id] = best_partition
+        if self.enable_dplb:
+            self._next_group_partition = (best_partition + 1) % self.group_partition_count
+        self._group_request_tokens[request_id] = max(best_hit_tokens, load_tokens or 0)
         for name, pool in self._group_pools.items():
             owned = best_blocks[name]
             pool.request_blocks[request_id] = list(owned)
@@ -1186,7 +1198,37 @@ class KvCacheManager:
             )
         ]
 
-    def _select_group_partition(self, request_id: str, token_count: int) -> int | None:
+    def _rank_group_partitions(self, candidates: list[int], token_count: int) -> list[int]:
+        """Rank admission targets using DeepInfer's two-dimensional heuristic.
+
+        Short sequences fill concurrency gaps, breaking ties toward larger KV
+        loads. Long sequences fill KV gaps. Exact ties rotate to avoid rank bias.
+        KV ownership never moves after admission. Logical lengths include the
+        full prompt even while chunked prefill has allocated only its first chunk.
+        """
+        counts = [0] * self.group_partition_count
+        tokens = [0] * self.group_partition_count
+        for request_id, partition in self._group_request_partitions.items():
+            counts[partition] += 1
+            tokens[partition] += self._group_request_tokens.get(request_id, 0)
+        short = token_count * sum(counts) <= sum(tokens)
+
+        def score(partition):
+            rotation = (partition - self._next_group_partition) % self.group_partition_count
+            if self.enable_dplb:
+                load = (
+                    (counts[partition], -tokens[partition]) if short
+                    else (tokens[partition], counts[partition])
+                )
+            else:
+                load = (counts[partition], 0)
+            return (*load, rotation)
+
+        return sorted(candidates, key=score)
+
+    def _select_group_partition(
+        self, request_id: str, token_count: int, load_tokens: int | None = None
+    ) -> int | None:
         candidates = self._candidate_group_partitions(request_id, token_count)
         if not candidates:
             return None
@@ -1194,22 +1236,9 @@ class KvCacheManager:
         if assigned is not None:
             return assigned
 
-        first_pool = next(iter(self._group_pools.values()))
-        owned_counts = {
-            partition: sum(
-                request_partition == partition
-                for request_partition in first_pool.request_partitions.values()
-            )
-            for partition in candidates
-        }
-        minimum = min(owned_counts.values())
-        least_loaded = {partition for partition, count in owned_counts.items() if count == minimum}
-        for offset in range(self.group_partition_count):
-            partition = (self._next_group_partition + offset) % self.group_partition_count
-            if partition in least_loaded:
-                self._next_group_partition = (partition + 1) % self.group_partition_count
-                return partition
-        raise RuntimeError("group partition selection became inconsistent")
+        partition = self._rank_group_partitions(candidates, max(token_count, load_tokens or 0))[0]
+        self._next_group_partition = (partition + 1) % self.group_partition_count
+        return partition
 
     def can_ensure_group_blocks(
         self,
@@ -1236,6 +1265,7 @@ class KvCacheManager:
         token_count: int,
         *,
         partition: int | None = None,
+        load_tokens: int | None = None,
     ) -> dict[str, list[int]]:
         """Atomically grow all cache groups for a request and return block IDs."""
         if not self._group_pools:
@@ -1264,7 +1294,7 @@ class KvCacheManager:
         selected = (
             partition
             if partition is not None
-            else self._select_group_partition(request_id, token_count)
+            else self._select_group_partition(request_id, token_count, load_tokens)
         )
         if selected is None or not self.can_ensure_group_blocks(
             request_id,
@@ -1293,6 +1323,7 @@ class KvCacheManager:
             )
 
         self._group_request_partitions.setdefault(request_id, selected)
+        self._group_request_tokens[request_id] = max(token_count, load_tokens or 0)
         for name, pool in self._group_pools.items():
             owned = pool.request_blocks.setdefault(request_id, [])
             pool.request_partitions.setdefault(request_id, selected)
@@ -1373,6 +1404,7 @@ class KvCacheManager:
                 if block.ref_cnt == 0:
                     pool.free_queues[partition].append(block)
         self._group_request_partitions.pop(request_id, None)
+        self._group_request_tokens.pop(request_id, None)
 
     def group_num_blocks(self, group_name: str) -> int:
         """Return the rank-local physical block capacity of one cache group."""

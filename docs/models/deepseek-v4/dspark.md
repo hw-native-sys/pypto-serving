@@ -35,3 +35,27 @@ curl --noproxy '*' http://127.0.0.1:8000/v1/completions \
 ```
 
 For the cache layout, kernel dispatch, and drafter state behind these options, see [DSpark Internals](dspark-internals.md).
+
+## Data-parallel load balancing
+
+DSpark enables DPLB by default for grouped KV-cache admission, at both K=0
+and K=7. Use `--no-enable-dplb` to restore request-count balancing with rotating
+ties; `--enable-dplb` explicitly enables the new policy.
+
+The policy follows the published [DeepInfer DPLB design](https://github.com/deepseek-ai/DeepInfer/blob/main/doc/inference_deployment_qa.md#data-parallel-load-balancing):
+it tracks active request count and logical KV length per TP group. A prompt
+longer than the average active sequence goes to the feasible group with the
+smallest total KV length. Shorter prompts go to the group with the fewest
+requests, breaking ties toward larger KV length. Exact ties rotate. An empty
+system starts with balanced request counts.
+
+Admission counts the complete prompt even during chunked prefill. Decode
+updates the length as the cache grows, and completion, cancellation or
+preemption removes the request's load. Requests keep their assigned group
+throughout execution, including DSpark's speculative state. Physical page
+capacity always constrains admission.
+
+Prefix cache remains local to each group: the longest reusable prefix wins,
+with DPLB resolving equally long hits. This preserves zero-copy cache reuse;
+it does not implement DeepInfer's shared external KV storage, cross-group
+migration, prefill quota model or production multi-instance routing.
