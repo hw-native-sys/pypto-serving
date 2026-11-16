@@ -258,6 +258,13 @@ class ReplicaEngineCore:
             block_size=block_size,
             enable_prefix_cache=self.config.enable_prefix_cache,
         )
+        self._cache_tiering = None
+        if runtime.kv_offload_bytes < 0:
+            raise ValueError("DDR offload capacity must not be negative")
+        if runtime.kv_offload_bytes:
+            from pypto_serving.serving.memory.tiering.integration import Session
+            self._cache_tiering = Session(self)
+            self.config = self._cache_tiering.configure(self.config)
         self._async_scheduling = self.config.resolve_async_scheduling()
         scheduler_config = SchedulerConfig(
             max_num_running_reqs=self.config.max_num_running_reqs,
@@ -358,6 +365,8 @@ class ReplicaEngineCore:
     async def start(self) -> None:
         """Start worker process and engine loop."""
         with profile_span("AsyncLLMEngine.start", cat="serving"):
+            worker_options = ({"on_starting": self._cache_tiering.worker_starting}
+                              if self._cache_tiering is not None else {})
             (
                 process,
                 input_q,
@@ -365,7 +374,7 @@ class ReplicaEngineCore:
                 profile_output_q,
                 ready_event,
                 cache_capacity,
-            ) = self._worker_factory(self.config)
+            ) = self._worker_factory(self.config, **worker_options)
             self._worker_process = process
             self._input_queue = input_q
             self._output_queue = output_q
@@ -410,6 +419,8 @@ class ReplicaEngineCore:
                     self._runtime.page_size,
                 )
 
+        if self._cache_tiering is not None:
+            await self._cache_tiering.start()
         # The KV-cache block pool, scheduler tables and tokenizer are now
         # resident. Freeze the engine-process heap so the GC won't rescan them
         # during serving (see gc_utils). Per-process: the worker freezes its
@@ -445,6 +456,15 @@ class ReplicaEngineCore:
         """
         self._running = False
         await self._drain_loop_task()
+        try:
+            if self._cache_tiering is not None:
+                await self._cache_tiering.close()
+        except BaseException:
+            try:
+                await asyncio.to_thread(self._shutdown_worker, timeout=30)
+            except Exception:
+                logger.exception("Worker shutdown failed after DDR close failed; mappings remain retained")
+            raise
         reaped = await asyncio.to_thread(self._shutdown_worker, timeout=30)
         if reaped:
             logger.info("ReplicaEngineCore stopped")
@@ -639,8 +659,10 @@ class ReplicaEngineCore:
                 output: TokenOutput = queued
                 if output.finished:
                     try:
+                        tiering = getattr(self, "_cache_tiering", None)
                         await asyncio.wait_for(
-                            ctx.worker_release_done.wait(),
+                            tiering.wait_worker_release(ctx.worker_release_done) if tiering is not None
+                            else ctx.worker_release_done.wait(),
                             timeout=self._step_timeout,
                         )
                     except TimeoutError as exc:

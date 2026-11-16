@@ -424,6 +424,8 @@ class Scheduler:
         request = self.requests.get(request_id)
         if request is None:
             return
+        if self.kv_cache_manager.tiering is not None:
+            self.kv_cache_manager.tiering.cancel(request_id)
         request.status = RequestStatus.FINISHED_ABORTED
         self._free_request_blocks(request)
         self.running = [r for r in self.running if r.request_id != request_id]
@@ -447,6 +449,14 @@ class Scheduler:
 
     def schedule(self, *, allow_reject_stalled: bool = True) -> SchedulerOutput:
         output = SchedulerOutput()
+        try:
+            return self._schedule(output, allow_reject_stalled=allow_reject_stalled)
+        except BaseException:
+            for scheduled in output.scheduled_requests:
+                self._release_scheduled_group_blocks(scheduled)
+            raise
+
+    def _schedule(self, output: SchedulerOutput, *, allow_reject_stalled: bool) -> SchedulerOutput:
         token_budget = self.config.max_num_scheduled_tokens
         grouped_phase = self._grouped_cache_phase()
 
@@ -518,6 +528,8 @@ class Scheduler:
                     running_to_keep.append(request)
                     continue
 
+            if is_prefill and not self._prepare_checkpoint(scheduled, num_new, output):
+                continue
             all_block_ids = request.cached_block_ids + request.allocated_block_ids
             scheduled.block_ids = list(all_block_ids)
             scheduled.block_ids_by_group = {
@@ -586,6 +598,13 @@ class Scheduler:
             # Prefix cache lookup
             if self.config.enable_prefix_cache:
                 if self.kv_cache_manager.has_groups:
+                    tiering = self.kv_cache_manager.tiering
+                    if tiering is not None and not tiering.prepare(
+                        request.request_id, request.group_block_hashes, request.num_prompt_tokens,
+                        maximum=request.group_checkpoint_boundary,
+                    ):
+                        remaining_waiting.append(request)
+                        continue
                     (
                         request.allocated_group_block_ids,
                         request.num_computed_tokens,
@@ -683,6 +702,8 @@ class Scheduler:
                 remaining_waiting.append(request)
                 break
 
+            if not self._prepare_checkpoint(scheduled, num_new, output):
+                continue
             if self.config.enable_prefix_cache and not request.prefix_cache_metrics_recorded:
                 cacheable_tokens = (
                     request.num_prompt_tokens // self.kv_cache_manager.block_size
@@ -922,6 +943,16 @@ class Scheduler:
         new_token_ids: dict[str, int | list[int]],
     ) -> list[RequestOutput]:
         """Update request states after model execution. Returns outputs for finished/streaming."""
+        try:
+            return self._apply_output(scheduler_output, new_token_ids)
+        except BaseException:
+            # The release helper clears each snapshot/plan after releasing it,
+            # so entries already reconciled remain safe to visit again.
+            for scheduled in scheduler_output.scheduled_requests:
+                self.discard_scheduled_request(scheduled)
+            raise
+
+    def _apply_output(self, scheduler_output, new_token_ids) -> list[RequestOutput]:
         outputs: list[RequestOutput] = []
 
         for scheduled in scheduler_output.scheduled_requests:
@@ -1146,6 +1177,26 @@ class Scheduler:
         """Drop one failed/stale async step without publishing its KV hashes."""
         self._release_scheduled_group_blocks(scheduled)
 
+    def _prepare_checkpoint(self, scheduled, num_new, output) -> bool:
+        request = scheduled.request
+        if not self.kv_cache_manager.has_groups or request.group_checkpoint_boundary is None:
+            return True
+        try:
+            scheduled.checkpoint_plan = self.kv_cache_manager.checkpoint_writer.prepare(
+                request.request_id, request.num_computed_tokens, request.num_computed_tokens + num_new,
+                request.num_prompt_tokens, request.group_checkpoint_boundary,
+                request.group_shared_prefix_boundary, self.config.prefix_cache_retention_interval,
+                request.allocated_group_block_ids, scheduled.read_block_ids_by_group,
+            )
+        except Exception as error:
+            self._release_scheduled_group_blocks(scheduled)
+            self._release_waiting_prefix_blocks(request)
+            request.status = RequestStatus.FINISHED_ABORTED
+            self.requests.pop(request.request_id, None)
+            output.rejected_requests[request.request_id] = f"Checkpoint preparation failed: {error}"
+            return False
+        return True
+
     def _check_finish(self, request: Request) -> RequestStatus | None:
         if not request.output_token_ids:
             return None
@@ -1203,17 +1254,6 @@ class Scheduler:
             if scheduled is not None:
                 scheduled.read_block_ids_by_group = read_blocks
                 scheduled.group_read_snapshot = read_snapshot
-                if scheduled.is_prefill and request.group_checkpoint_boundary is not None:
-                    try:
-                        scheduled.checkpoint_plan = self.kv_cache_manager.checkpoint_writer.prepare(
-                            request.request_id, request.num_computed_tokens, total_tokens, request.num_prompt_tokens,
-                            request.group_checkpoint_boundary, request.group_shared_prefix_boundary,
-                            self.config.prefix_cache_retention_interval,
-                            request.allocated_group_block_ids, read_blocks,
-                        )
-                    except Exception:
-                        self._release_scheduled_group_blocks(scheduled)
-                        raise
             return True
         return self._try_allocate_blocks(request, self._blocks_needed(request, num_new_tokens))
 

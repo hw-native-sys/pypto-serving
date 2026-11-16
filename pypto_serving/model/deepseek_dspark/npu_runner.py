@@ -1483,9 +1483,11 @@ def _accept_dspark_tokens(
 class DSparkModelRunner(L3DispatchMixin, ModelRunner):
     """Runner boundary for the DSpark target kernels."""
 
-    def __init__(self, *, compiled: DSparkCompiledKernels, extension_factory=None) -> None:
+    def __init__(self, *, compiled: DSparkCompiledKernels, extension_factory=None,
+                 execution_role: str = "mixed") -> None:
         super().__init__()
         self._compiled = compiled
+        self._execution_role = execution_role
         self.cache_metadata = DSparkCacheMetadataBuilder(layout=compiled.layout)
         self._init_l3_dispatch(stacked=True)
         self._decode_run_config: Any = None
@@ -1640,8 +1642,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 runtime.max_num_batched_tokens,
             ),
             partitions=self._compiled.layout.partitions,
-            decode_only=self._compiled.prefill is None,
-            prefill_only=self._compiled.prefill is not None and self._compiled.decode is None,
+            decode_only=self._execution_role == "decode",
+            prefill_only=self._execution_role == "prefill",
         )
         names = tuple(spec.name for spec in specs)
         if names != DSPARK_CACHE_GROUP_NAMES:

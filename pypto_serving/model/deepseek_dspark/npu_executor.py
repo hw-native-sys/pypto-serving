@@ -338,7 +338,8 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         """Create the DSpark runtime runner."""
         if not isinstance(compiled, DSparkCompiledKernels):
             raise TypeError("DeepSeekV4DSparkPyptoExecutor requires DSpark compiled metadata.")
-        return DSparkModelRunner(compiled=compiled, extension_factory=self._runner_extension_factory)
+        return DSparkModelRunner(compiled=compiled, extension_factory=self._runner_extension_factory,
+                                 execution_role=self._execution_role)
 
     def runtime_extensions(self):
         """Return explicitly configured runner services after model registration."""

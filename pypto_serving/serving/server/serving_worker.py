@@ -237,6 +237,9 @@ class WorkerProcess:
             else:
                 raise RuntimeError("Executor has no register_model method")
 
+            if self.config.resolve_runtime_config().kv_offload_bytes:
+                from pypto_serving.serving.memory.tiering.integration import initialize_loaded
+                initialize_loaded(self.executor)
             if self._services_factory is not None:
                 self._services = self._services_factory(
                     self.executor.runtime_extensions(), self._req_cache.__getitem__,
@@ -1615,7 +1618,7 @@ def _worker_entry(
         get_profiler(initially_active=False).stop()
 
 
-def spawn_worker(config: EngineConfig, *, services_factory=None):
+def spawn_worker(config: EngineConfig, *, services_factory=None, on_starting=None):
     """Spawn a worker process and return its process, queues, and ready state.
 
     ``cache_capacity`` reports primary and optional per-group physical counts
@@ -1643,6 +1646,10 @@ def spawn_worker(config: EngineConfig, *, services_factory=None):
         ),
         daemon=False,
     )
+    # Setup failures above prove that no process borrowed owner resources.
+    # Once start() is attempted, failure remains on the acknowledgement path.
+    if on_starting is not None:
+        on_starting()
     process.start()
     return (
         process,

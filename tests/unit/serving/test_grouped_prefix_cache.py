@@ -11,6 +11,7 @@
 import pytest
 from dataclasses import replace
 
+from pypto_serving.serving.sched.scheduler import ScheduledRequest, SchedulerOutput, RequestStatus
 from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.sched.scheduler import Request, Scheduler, SchedulerConfig
@@ -279,3 +280,101 @@ def test_paged_receive_failure_keeps_healthy_shared_prefix(uncertain, compact_st
     cache.release_group_cache("failed", confirmed_stopped=uncertain)
     assert query(cache, tokens, TARGET) == 8192
     assert all(block.ref_cnt == 0 for pool in cache._group_pools.values() for block in pool.blocks)
+
+
+
+def test_schedule_failure_releases_snapshot_not_running_allocation(monkeypatch):
+    cache = manager(slots=2, checkpoint_state=True)
+    scheduler = _prefill_scheduler(cache)
+    tables = cache.ensure_group_blocks("running", 128)
+    snapshot = cache.retain_group_block_snapshot(tables, 0)
+    scheduled = ScheduledRequest(Request("running", prompt(0, 513), max_new_tokens=16), 128, True,
+                                 group_read_snapshot=snapshot)
+    def fail(output, **kwargs):
+        output.scheduled_requests.append(scheduled)
+        raise RuntimeError("next checkpoint failed")
+    monkeypatch.setattr(scheduler, "_schedule", fail)
+    with pytest.raises(RuntimeError, match="next checkpoint failed"):
+        scheduler.schedule()
+    assert snapshot._owner is None
+    assert all(b.ref_cnt == 1 for pool in cache._group_pools.values()
+               for b in pool.request_blocks['running'] if b is not None)
+    cache.release_all_group_requests("running")
+
+
+def test_overlapping_checkpoint_windows_share_worker_written_pages():
+    cache = KvCacheManager(enable_prefix_cache=True)
+    cache.init_groups((KVCacheGroupSpec('kv', (0,), KVCacheSpec(128, 128), 8),
+        KVCacheGroupSpec('state', (0,), KVCacheSpec(128, 128), 2,
+                         sliding_window=256, is_checkpoint_state=True)), max_batch_size=4)
+    tables = cache.ensure_group_blocks('r', 512)
+    plan = cache.checkpoint_writer.prepare('r', 0, 512, 640, 512, None, 128, tables, {})
+    written = {local: logical for logical, local in plan.publication_blocks['state'].items()}
+    assert len(written) == 4
+    for members in plan.records.values():
+        assert all(written[local] == logical for logical, local in members['state'].items())
+    hashes = cache.compute_group_block_hashes(prompt(0, 640))
+    cache.cache_group_blocks('r', hashes, 512, {})
+    cache.checkpoint_writer.complete('r', hashes, 512, plan)
+    for logical, value in enumerate(hashes['state'][:4]):
+        block = cache._group_pools['state'].hash_to_block[0, value]
+        assert written[cache._group_pools['state'].local_block_id(block)] == logical
+    cache.release_group_block_snapshot(plan.snapshot)
+    cache.release_all_group_requests('r')
+    assert all(b.ref_cnt == 0 for p in cache._group_pools.values() for b in p.blocks)
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_unavailable_optional_checkpoints_do_not_block_a_long_chunk(enabled):
+    cache = manager(enabled=enabled, slots=4, partitions=1, checkpoint_state=True)
+    tables = cache.ensure_group_blocks('r', 512)
+    plan = cache.checkpoint_writer.prepare('r', 0, 512, 640, 384, None, 128, tables, {})
+    if enabled:
+        assert plan.boundaries == (384, 512)
+        cache.release_group_block_snapshot(plan.snapshot)
+    else:
+        assert plan is None
+    cache.release_all_group_requests('r')
+    assert all(b.ref_cnt == 0 for p in cache._group_pools.values() for b in p.blocks)
+
+
+def test_checkpoint_prepare_rejects_one_request_and_preserves_the_queue(monkeypatch):
+    cache = manager(slots=4, partitions=1, checkpoint_state=True)
+    scheduler = _prefill_scheduler(cache)
+    requests = [Request(name, prompt(i, 513), max_new_tokens=16)
+                for i, name in enumerate(('deferred', 'bad', 'good'))]
+    for request in requests:
+        scheduler.add_request(request)
+    limit, prepare = scheduler._limit_scheduled_tokens, cache.checkpoint_writer.prepare
+    monkeypatch.setattr(scheduler, '_limit_scheduled_tokens', lambda r, b: 0 if r.request_id == 'deferred' else limit(r, b))
+    def fail(request, *args):
+        if request == 'bad':
+            raise RuntimeError('injected checkpoint failure')
+        return prepare(request, *args)
+    monkeypatch.setattr(cache.checkpoint_writer, 'prepare', fail)
+    output = scheduler.schedule()
+    assert list(output.rejected_requests) == ['bad'] and requests[1].status is RequestStatus.FINISHED_ABORTED
+    assert [s.request.request_id for s in output.scheduled_requests] == ['good']
+    assert [r.request_id for r in scheduler.waiting] == ['deferred'] and 'bad' not in scheduler.requests
+    assert all('bad' not in p.request_blocks for p in cache._group_pools.values())
+    scheduler.abort_request('good')
+
+
+def test_failed_output_releases_the_entire_batch_without_freeing_owned_pages():
+    cache = manager(slots=4, partitions=1, checkpoint_state=True)
+    scheduler = _prefill_scheduler(cache)
+    output, snapshots = SchedulerOutput(), []
+    for i, name in enumerate(('stale', 'bad', 'later')):
+        tables = cache.ensure_group_blocks(name, 128)
+        snapshot = cache.retain_group_block_snapshot(tables, 0)
+        snapshots.append(snapshot)
+        request = Request(name, prompt(i, 513), max_new_tokens=16)
+        if i == 0:
+            request.status = RequestStatus.FINISHED_ABORTED
+        output.scheduled_requests.append(ScheduledRequest(request, 1, False, group_read_snapshot=snapshot))
+    with pytest.raises(TypeError):
+        scheduler.update_from_output(output, {'bad': [object()]})
+    assert all(s._owner is None for s in snapshots)
+    assert all(b.ref_cnt == 1 for p in cache._group_pools.values() for blocks in p.request_blocks.values() for b in blocks)
+    for name in ('stale', 'bad', 'later'):
+        cache.release_all_group_requests(name)

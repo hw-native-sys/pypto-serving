@@ -38,7 +38,7 @@ pypto-serving \
 
 Use `--pd-role decode` on D; both launchers specify K7, while P internally runs target-only prefill. D can use `--max-num-batched-tokens 2048` while P keeps 8192. D plans rolling KV from the smaller of its token budget and 8192, and ignores `--long-prefill-token-threshold`; continuation-state rings are budgeted separately. D still validates eight positions per request and does not run a local Prefill. The global scheduling budget does not force a batch to fill it.
 
-P and D rings may differ in length. Handoff selects the model's required logical tail and checkpoint state, then maps each page through the two local tables; D receives directly into its reservation without copying or shrinking a ring at takeover. Full-history compressed KV and index suffixes retain their normal coverage, and final request-local state/bootstrap still transfers on a full KV hit. A model-contract fingerprint checks byte layouts and the matching/state policy. Host and real-weight validation cover TP4-to-TP4 and TP4-to-TP1 handoff.
+P and D rings may differ in length. Handoff selects the model's required logical tail and checkpoint state, then maps each page through the two local tables; D receives directly into its reservation without copying or shrinking a ring at takeover. Full-history compressed KV and index suffixes retain their normal coverage, and final request-local state/bootstrap still transfers on a full KV hit. A model-contract fingerprint checks byte layouts and the matching/state policy. Revision-specific Host and device qualification is recorded in the [DDR offload PR validation](https://github.com/hw-native-sys/pypto-serving/pull/319). The historical topology and context checks below do not qualify every later revision.
 
 The context limit covers **prompt plus output**: 655360 allows a 524288-token prompt plus 131072 generated tokens, subject to actual device memory. Configuring this limit is not a full-length validation.
 
@@ -56,21 +56,28 @@ For example, keep P at `--dp 4 --tp 4 --ep 16` and set D to
 `--dp 16 --tp 1 --ep 16 --lm-head-tp 4`; no PD JSON mode changes are needed.
 Without PD, Prefill and Decode share the same local topology.
 Smaller attention TP does not multiply batch capacity: every rank still owns
-16 decode request slots, distinct from the padded 64-request group ABI.
+16 decode request slots. The Lib group ABI is `16 * attention TP`: 16 requests
+at TP1 and 64 at TP4. Padding to that shape does not create extra owner slots.
 
-Real-weight K7 validation covers ordinary DP4TP4, homogeneous PD DP4TP4,
+Historical real-weight K7 validation covers ordinary DP4TP4, homogeneous PD DP4TP4,
 and asymmetric P DP4TP4 to D DP16TP1 with head TP4 and prefix caching enabled.
 It includes cache/state replay, rolling boundaries, cancellation, streaming
 and non-streaming APIs, and inputs through 1048320 tokens. Legal input/output
 boundaries of 1048575+1 and 1048560+16 are also covered. Other layouts and
-capacity/concurrency combinations require their own validation. Repeat
+capacity/concurrency combinations require their own validation. These historical
+checks apply to their tested snapshots; consult the linked PR for candidate-specific
+topologies, revisions and limits. Repeat
 compilation and hardware validation after SDK or model-kernel changes.
 
 Each node independently accepts `--no-enable-prefix-caching`; all four P/D combinations are supported. No prefix mode belongs in JSON. P cache hits reduce computation; D hits reduce network traffic, independently.
 
 P restores only complete history KV, ori and recurrent-state checkpoints.
-It retains evictable periodic boundaries based on the effective Prefill chunk,
-the request replay boundary and discovered shared boundaries. An unseen branch
+The periodic cadence comes from `--prefix-cache-retention-interval` (default
+8192 tokens), independently of the effective Prefill chunk. Positive intervals
+must align to 128 tokens; zero retains replay/shared boundaries only. Chunk size
+determines which boundaries a dispatch crosses, while available KV/state pages
+limit which complete checkpoints can be retained. Request replay and discovered
+shared boundaries are also candidates. An unseen branch
 may replay from an earlier checkpoint before materializing its shared boundary
 for later requests. These pages use the existing cache pools and snapshot/COW
 lifetime rules; retention remains bounded by available capacity.

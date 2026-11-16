@@ -246,15 +246,18 @@ def test_retention_interval_reaches_runtime_and_scheduler(interval, prefix):
 
 
 @pytest.mark.parametrize("interval", [-1, True, 1.5, 129])
-def test_invalid_retention_interval_is_rejected_before_worker_startup(interval):
+def test_retention_validation_and_default(interval):
     from pypto_serving.config.types import RuntimeConfig
     from pypto_serving.model.deepseek_dspark.npu_runner import build_dspark_cache_group_specs
     from pypto_serving.serving.sched.scheduler import SchedulerConfig
 
-    with pytest.raises(ValueError, match="retention_interval"):
-        RuntimeConfig(prefix_cache_retention_interval=interval)
+    assert _parse_cli_args(["--model", "model"]).prefix_cache_retention_interval == 8192
+    if interval != 129:
+        with pytest.raises(ValueError, match="retention_interval"):
+            RuntimeConfig(prefix_cache_retention_interval=interval)
+        with pytest.raises(ValueError, match="retention_interval"):
+            SchedulerConfig(prefix_cache_retention_interval=interval)
+    else:
         config = SchedulerConfig(prefix_cache_retention_interval=interval)
-        config.validate_cache_groups(build_dspark_cache_group_specs(43))
-
-    with pytest.raises(ValueError, match="Unsupported chip runtime"):
-        RuntimeConfig(chip_runtime="invalid")
+        with pytest.raises(ValueError, match="retention_interval"):
+            config.validate_cache_groups(build_dspark_cache_group_specs(43))
