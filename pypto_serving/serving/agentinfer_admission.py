@@ -133,6 +133,7 @@ class AgentInferAdmission:
         self._retained: dict[str, _Retained] = {}
         self._prefix_observed: set[str] = set()
         self._prefix_refresh_pending = False
+        self._next_prefix_refresh_at: float | None = None
         # Keep the Qwen NPU calibration separate from the grouped-cache path.
         # DeepSeek uses the upstream defaults until device timing is available.
         qwen_cost = dict(
@@ -171,7 +172,7 @@ class AgentInferAdmission:
         if self.options.resume_capacity_ratio is not None:
             config = replace(config, resume_capacity_ratio=self.options.resume_capacity_ratio)
         components = build_progress_ttl_strategy(
-            config, capacity_cost=self._capacity_cost if self.grouped else None,
+            config, capacity_cost=self._capacity_cost,
         )
         schedule_interval = (
             FAST_ADMISSION_SCHEDULE_INTERVAL_SECONDS
@@ -195,10 +196,13 @@ class AgentInferAdmission:
         return tuple(self._retained)
 
     def _capacity_cost(self, tokens: int) -> int:
+        # Native validation caps prompt plus generation at the model limit, so
+        # the policy's decode buffer must not reserve beyond that limit either.
+        tokens = min(tokens, self._max_seq_len)
         if not self.grouped:
             return tokens
         return self.kv_cache_manager.group_capacity_cost_tokens(
-            min(tokens, self._max_seq_len), self._max_seq_len,
+            tokens, self._max_seq_len,
         )
 
     def _observe_capacity(self) -> KVCacheCapacityObservation:
@@ -275,9 +279,14 @@ class AgentInferAdmission:
         """Advance TTL checks even when the native scheduler is idle."""
         now = time.monotonic()
         self.policy.run_due_lightweight_checks(now)
-        if self._prefix_refresh_pending:
+        if self._prefix_refresh_pending and (
+            self._next_prefix_refresh_at is None or now >= self._next_prefix_refresh_at
+        ):
+            # Capture cooling requests before observing due requests, whose new
+            # freshness deadlines must not create another completion notification.
+            self._next_prefix_refresh_at = self.policy.next_prefix_cache_refresh_at()
             self._refresh_retained_prefix_cache()
-            self._prefix_refresh_pending = False
+            self._prefix_refresh_pending = self._next_prefix_refresh_at is not None
         if self.policy.needs_schedule_cycle(now):
             self.policy.schedule_cycle(self._backend_pool())
         admitted = []
@@ -358,6 +367,10 @@ class AgentInferAdmission:
             self.policy.on_stream_output(request.request_id, len(request.output_token_ids))
 
     def complete(self, request: Request) -> None:
+        # Plain native requests also publish prefixes that retained agents can
+        # reuse, even though those requests have no AgentInfer binding.
+        self._prefix_refresh_pending = True
+        self._next_prefix_refresh_at = None
         session_id = self._sessions.pop(request.request_id, None)
         if session_id is None:
             return
@@ -368,7 +381,6 @@ class AgentInferAdmission:
             request.request_id, request.num_prompt_tokens + len(request.output_token_ids),
         )
         self.policy.on_response_completion(session_id, request.request_id, self._unknown_lifecycle)
-        self._prefix_refresh_pending = True
 
     def cancel(self, request_id: str) -> bool:
         """Return True when the request was retained and never reached native scheduling."""

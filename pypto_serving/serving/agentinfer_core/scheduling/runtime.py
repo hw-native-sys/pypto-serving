@@ -16,7 +16,7 @@ import math
 import time
 import uuid
 from dataclasses import dataclass, replace
-from typing import Generic
+from typing import Generic, Iterator
 
 from pypto_serving.serving.agentinfer_core.scheduling.admission_outcome import AdmissionDisposition
 from pypto_serving.serving.agentinfer_core.scheduling.backend import BackendInfo, BackendPoolInfo, DispatchTarget, DpRankInfo
@@ -71,6 +71,7 @@ class _RequestBinding:
 class _LatestResponse:
     request_id: str
     completed: bool = False
+    terminal: bool = False
 
 
 class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, StrategyProgramFactorsT]):
@@ -119,8 +120,27 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
 
     def prefix_cache_candidates(self) -> tuple[tuple[str, RetainedRequestT], ...]:
         """Return retained paused reasoning requests whose reusable prefix observation should be refreshed."""
-        candidates: list[tuple[str, RetainedRequestT]] = []
         now = time.monotonic()
+        return tuple(
+            (entry.request_id, entry.retained_request)
+            for entry, program in self._retained_prefix_programs()
+            if self._shared_prefix_observation_due(program, now)
+        )
+
+    def next_prefix_cache_refresh_at(self) -> float | None:
+        """Return the earliest deferred observation deadline, excluding requests already due."""
+        now = time.monotonic()
+        return min(
+            (
+                deadline
+                for _, program in self._retained_prefix_programs()
+                if not self._shared_prefix_observation_due(program, now)
+                and (deadline := program.tokens.shared_prefix_fresh_until_monotonic_s) is not None
+            ),
+            default=None,
+        )
+
+    def _retained_prefix_programs(self) -> Iterator[tuple[RequestPoolEntry[RetainedRequestT], RuntimeProgram]]:
         for entry in self.request_pool.entries:
             binding = self._request_bindings.get(entry.request_id)
             program = self.registry.get(binding.program) if binding is not None else None
@@ -130,10 +150,8 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                 and program is not None
                 and program.state is ProgramState.PAUSED
                 and program.status is ProgramStatus.REASONING
-                and self._shared_prefix_observation_due(program, now)
             ):
-                candidates.append((entry.request_id, entry.retained_request))
-        return tuple(candidates)
+                yield entry, program
 
     def needs_schedule_cycle(self, now_monotonic_s: float) -> bool:
         """Return whether a host poll must enter the strategy instead of staying on its hot path."""
@@ -427,6 +445,8 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                 ),
             )
         )
+        if self._release_terminal_program(binding.program):
+            return
         if program.marked_for_pause and current_status is ProgramStatus.ACTING:
             self._apply_transition(TransitionRequest(TransitionKind.PAUSE, program.ref, "marked_pause_completion"))
         else:
@@ -440,9 +460,9 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
     def on_response_completion(self, program_id: str, request_id: str, lifecycle: ProgramLifecycle) -> bool:
         """Apply an optional API-layer lifecycle fact after response semantic parsing.
 
-        Terminal facts release only the idle generation whose latest request has completed. A late signal from an
-        earlier round cannot release a newer round for the same stable Program id. Continue and unknown facts leave
-        TTL ownership to the scheduling strategy.
+        Terminal facts for the latest completed request are retained until overlapping requests finish. A new
+        arrival invalidates the old fact, so a late signal cannot release a newer round for the same stable Program
+        id. Continue and unknown facts leave TTL ownership to the scheduling strategy.
 
         Args:
             program_id: Stable Program identity retained by the API Adapter.
@@ -455,10 +475,17 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         if lifecycle is not ProgramLifecycle.TERMINAL:
             return False
         ref = self.registry.current_ref(program_id)
-        if ref is None or self._program_requests.get(ref):
+        if ref is None:
             return False
         latest = self._latest_response.get(ref)
         if latest is None or latest.request_id != request_id or not latest.completed:
+            return False
+        latest.terminal = True
+        return self._release_terminal_program(ref)
+
+    def _release_terminal_program(self, ref: ProgramRef) -> bool:
+        latest = self._latest_response.get(ref)
+        if latest is None or not latest.completed or not latest.terminal or self._program_requests.get(ref):
             return False
         program = self.registry.get(ref)
         if program is None or program.status is not ProgramStatus.ACTING:
