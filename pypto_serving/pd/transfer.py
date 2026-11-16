@@ -23,6 +23,7 @@ from typing import Protocol
 
 import msgspec
 
+from pypto_serving.tools.profile import request as request_trace
 from pypto_serving.tools.observe import span
 from pypto_serving.tools.profile import configure_profiler, get_profiler
 from .config import PROVIDERS
@@ -223,6 +224,7 @@ class Owner:
         self.parent.close()
         return OwnerService(context, self.child, self)
 
+    @request_trace.traced("pd.owner.roundtrip")
     def call(self, operation, **payload):
         fields = dict(operation=operation, owner_rank=self.rank, **payload.get("observation", {}))
         with span(logger, "pd.owner.call", log=False, **fields), self.lock:
@@ -231,7 +233,8 @@ class Owner:
             self.sequence += 1
             try:
                 with span(logger, "pd.owner.rpc", log=False, **fields):
-                    _send(self.parent, dict(sequence=self.sequence, boot=self.boot, operation=operation, **payload))
+                    _send(self.parent, dict(sequence=self.sequence, boot=self.boot, operation=operation,
+                                            request_profile=request_trace.current.get(), **payload))
                     reply = _receive(self.parent)
                 if reply["sequence"] != self.sequence or reply["boot"] != self.boot:
                     raise ValueError("stale owner reply")
@@ -239,7 +242,8 @@ class Owner:
                     raise TransferError(reply["error"], uncertain=reply["uncertain"])
                 return reply.get("result")
             except BaseException as exc:
-                self.uncertain = not isinstance(exc, TransferError) or exc.uncertain
+                if operation != "request_profile":
+                    self.uncertain = not isinstance(exc, TransferError) or exc.uncertain
                 if self.uncertain:
                     raise TransferError(f"owner completion unknown: {exc}", uncertain=True) from exc
                 raise
@@ -333,50 +337,57 @@ class OwnerService:
                 if request["boot"] != self.owner.boot or request["sequence"] != sequence:
                     raise ValueError("stale owner command")
                 reply = dict(boot=self.owner.boot, sequence=sequence)
-                try:
-                    op = request["operation"]
-                    if op == "probe":
-                        reply["result"] = os.getpid()
-                    elif op == "register":
-                        token = request["token"]
-                        address, extent = self.context.pin(token, _descriptor(request["descriptor"]))
-                        self.tokens.append(token)
-                        if extent != request["extent"]:
-                            raise ValueError("registered extent differs from allocation")
-                        reply["result"] = provider.register(self.owner.boot, self.owner.rank,
-                                                           request["name"], address, extent)
-                    elif op == "install":
-                        provider.install(tuple(decode(r, Region) for r in request["regions"]))
-                    elif op == "write":
-                        with span(logger, "pd.owner.decode", log=False, thread_cpu=True,
-                                  **request["observation"]):
-                            copies = tuple(decode(c, Copy) for c in request["copies"])
-                        with span(logger, "pd.native.write", cat="native-transfer",
-                                  **request["observation"], bytes=sum(c.length for c in copies),
-                                  segments=len(copies)):
-                            provider.write(request["peer"], copies)
-                    elif op == "release":
-                        provider.release()
-                        for token in self.tokens:
-                            self.context.unpin(token)
-                        self.tokens.clear()
-                    elif op == "profile":
-                        profiler = get_profiler(initially_active=False)
-                        if request["active"]:
-                            profiler.stop()
-                            profiler.start()
+                with request_trace.scope(request.get("request_profile"), "pd.owner.execute",
+                                         sequence=sequence, operation=request["operation"]):
+                    try:
+                        op = request["operation"]
+                        if op == "probe":
+                            reply["result"] = os.getpid()
+                        elif op == "register":
+                            token = request["token"]
+                            address, extent = self.context.pin(token, _descriptor(request["descriptor"]))
+                            self.tokens.append(token)
+                            if extent != request["extent"]:
+                                raise ValueError("registered extent differs from allocation")
+                            reply["result"] = provider.register(self.owner.boot, self.owner.rank,
+                                                               request["name"], address, extent)
+                        elif op == "install":
+                            provider.install(tuple(decode(r, Region) for r in request["regions"]))
+                        elif op == "write":
+                            with span(logger, "pd.owner.decode", log=False, thread_cpu=True,
+                                      **request["observation"]):
+                                copies = tuple(decode(c, Copy) for c in request["copies"])
+                            with span(logger, "pd.native.write", cat="native-transfer",
+                                      **request["observation"], bytes=sum(c.length for c in copies),
+                                      segments=len(copies)):
+                                provider.write(request["peer"], copies)
+                        elif op == "release":
+                            provider.release()
+                            for token in self.tokens:
+                                self.context.unpin(token)
+                            self.tokens.clear()
+                        elif op == "request_profile":
+                            if request["active"]:
+                                reply["result"] = request_trace.ensure(request["capture"]).key
+                            else:
+                                reply["result"] = request_trace.close(request["capture"]["capture"])
+                        elif op == "profile":
+                            profiler = get_profiler(initially_active=False)
+                            if request["active"]:
+                                profiler.stop()
+                                profiler.start()
+                            else:
+                                profiler.stop()
+                        elif op == "stop":
+                            if self.tokens:
+                                raise RuntimeError("registered owner cannot stop")
+                            self.stopped = True
                         else:
-                            profiler.stop()
-                    elif op == "stop":
-                        if self.tokens:
-                            raise RuntimeError("registered owner cannot stop")
-                        self.stopped = True
-                    else:
-                        raise ValueError("unknown owner operation")
-                except Exception as exc:
-                    reply.update(error=str(exc), uncertain=not isinstance(exc, ValueError)
-                                 and (not isinstance(exc, TransferError) or exc.uncertain))
-                _send(self.channel, reply)
+                            raise ValueError("unknown owner operation")
+                    except Exception as exc:
+                        reply.update(error=str(exc), uncertain=not isinstance(exc, ValueError)
+                                     and (not isinstance(exc, TransferError) or exc.uncertain))
+                    _send(self.channel, reply)
         except Exception as exc:
             # Never unregister/unpin on a lost reply or uncertain native write.
             self.start_error = exc

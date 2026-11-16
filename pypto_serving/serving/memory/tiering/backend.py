@@ -21,6 +21,8 @@ from typing import Protocol
 
 from .pool import Extents
 
+from pypto_serving.tools.profile import request as request_trace
+
 # Software batching bounds, not CANN/device limits. See the offload guide's
 # batching rationale: a tested large-payload default and a 1.5 MiB compact table.
 BATCH_BYTES = 256 << 20
@@ -49,6 +51,7 @@ class Endpoint:
     stopped: object
     failed: object
 
+    @request_trace.traced("ddr.owner.roundtrip")
     def call(self, operation, payload=None):
         with self.lock:
             if self.stopped.value:
@@ -58,7 +61,7 @@ class Endpoint:
             try:
                 self.sequence.value += 1
                 sequence = self.sequence.value
-                self.parent.send((sequence, operation, payload))
+                self.parent.send((sequence, operation, payload, request_trace.current.get()))
                 if not self.parent.poll(60):
                     raise RuntimeError("cache owner completion unknown: response timeout")
                 received, success, result = self.parent.recv()
@@ -67,7 +70,8 @@ class Endpoint:
                 if not success:
                     raise RuntimeError(f"cache owner failed: {result}")
             except Exception:
-                self.failed.value = True
+                if operation != "request_profile":
+                    self.failed.value = True
                 raise
             if operation == "stop":
                 self.stopped.value = True
@@ -103,6 +107,7 @@ class Job:
     enqueued: int
     group: str
     request: str | None
+    profile: dict | None = None
 
 
 class SimplerBackend:
@@ -181,7 +186,12 @@ class SimplerBackend:
                     or (operation == "store" and (storage.complete or storage.active))):
                 raise ValueError("cache storage layout or generation mismatch")
             future = Future()
-            job = Job(future, operation, handle, spans, storage, time.monotonic_ns(), source[0], request)
+            profile = request_trace.context((request,)) if request else request_trace.current.get()
+            job = Job(future, operation, handle, spans, storage, time.monotonic_ns(), source[0], request, profile)
+            request_trace.track("ddr." + operation, id(future), profile, record=False)
+            future.add_done_callback(lambda done: request_trace.finish(
+                "ddr." + operation, id(done), error="cancelled" if done.cancelled() else
+                type(done.exception()).__name__ if done.exception() is not None else None))
             storage.active += 1
             self.queue.put_nowait(job)
             self.wake.set()
@@ -311,7 +321,8 @@ class SimplerBackend:
                     calls = []
                     for copy_index, rank in enumerate(jobs[0].storage.ranks):
                         payload = tuple((job.handle, *job.storage.extents[copy_index], job.spans) for job in jobs)
-                        call = executor.submit(self.owners[rank].call, "copy_batch", (direction, payload))
+                        call = executor.submit(request_trace.invoke, request_trace.combine(j.profile for j in jobs),
+                            "ddr.batch.rpc", self.owners[rank].call, "copy_batch", (direction, payload))
                         call.add_done_callback(lambda _: self.wake.set())
                         calls.append(call)
                     active[partition] = jobs, calls, dispatched, next(self.batch_ids)

@@ -82,6 +82,59 @@ The endpoints follow the vLLM profiling API. `start_profile` starts recording in
 
 A graceful server shutdown also attempts to stop active recorders and merge available fragments, so it remains a fallback when profiling was left active.
 
+## Profile Selected Requests
+
+Request profiling selects requests by arrival rather than recording every event
+inside a time window. It is available on the Serving API and unified Router
+without `--profile`. Recording is off until explicitly started:
+
+```bash
+curl -X POST http://localhost:8899/start_request_profile
+# Send a small completion/chat workload to this same ingress.
+curl -X POST http://localhost:8899/stop_request_profile
+```
+
+`start_request_profile` selects new requests at HTTP ingress, before reading
+their bodies. Requests already running are not selected. With a Router, the
+controller prepares its registered peers over HTTP and propagates the selected
+request markers; no shared filesystem or SSH collection is required.
+
+`stop_request_profile` stops selecting new requests immediately. Selected
+requests and their associated asynchronous work continue to be observed until
+they drain. A draining capture returns HTTP 202; repeat the stop call to poll.
+When `result` is present, inspect `result.complete` and the manifest before
+using the trace. The server keeps running, and a new capture can start after
+the previous one finishes. Active time profiling and request profiling are
+mutually exclusive.
+
+The default output directory is
+`serving_log/request_profile/<capture>/<node>/<role>/`. Set
+`PYPTO_REQUEST_PROFILE_ROOT` in each participating process environment to change
+its local root. The ingress collects peer fragments and writes:
+
+| File | Contents |
+| --- | --- |
+| `trace.json` | Merged Chrome Trace JSON for Perfetto |
+| `requests.json` | Per-root stages and explicit lifecycle milestones |
+| `manifest.json` | Participating processes, loss/errors and clock samples |
+| `trace.*.jsonl`, `*.status.json` | Original process fragments and status |
+
+Explicit semantic hooks cover preparation, queuing, batch dispatch/reclaim,
+Host L3 envelopes, PD control/native transfer and DDR copy completion. A bounded
+queue passes observations to a process-local writer thread; no automatic
+Python/C call hook or device synchronization is installed. Request markers are
+carried explicitly across HTTP, IPC and asynchronous jobs. Recording failures
+mark the capture incomplete without granting execution or resource-release
+authority. Request bodies and KV payloads are not recorded.
+
+Use small workloads: selected long requests and late STORE work can still
+produce large traces. `http.end`, `generation.finished` and
+`request.resources_retired` are different milestones. Shared batch spans are
+physical work associated with multiple roots, not independent per-request
+kernel durations. Starts use Unix wall time and durations use a monotonic
+clock; clock estimates are retained without shifting peer timestamps. Host
+spans include waits and are not a device-internal timeline.
+
 ## Merge Profile Fragments Manually
 
 Use `scripts/merge_profile.sh` when automatic merging did not run, for example after an interrupted serving process. Pass the same path used for `--profile-output`:

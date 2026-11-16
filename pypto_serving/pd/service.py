@@ -16,6 +16,7 @@ import logging
 
 import msgspec
 
+from pypto_serving.tools.profile import request as request_trace
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.reasoning import OutputParserSpec
@@ -176,6 +177,7 @@ class Service:
             entry = self.requests[binding.request] = Request(binding)
         if entry.binding != binding:
             raise ValueError("request binding changed")
+        request_trace.bind(binding.request, owner="pd")
         return entry
 
     def register_http(self, binding, payload):
@@ -198,6 +200,8 @@ class Service:
         while len(self.terminal) > self.config.capacity * 8:
             self.terminal.popitem(last=False)
 
+    @request_trace.traced("pd.cancel_binding", resolve=lambda self, binding, *args, **kwargs:
+                          request_trace.context((binding.request,)))
     async def cancel_binding(self, binding):
         binding.check(self.node, self.role)
         entry = self.requests.get(binding.request)
@@ -210,10 +214,13 @@ class Service:
                 raise ValueError("abort binding mismatch")
             await self.abort(entry)
 
+    @request_trace.traced("pd.finish", resolve=lambda self, entry, *args, **kwargs:
+                          request_trace.context((entry.binding.request,)))
     def finish(self, entry):
         if self.requests.pop(entry.binding.request, None) is None:
             return
         self.chunks.pop(entry.binding.request, None)
+        request_trace.release(entry.binding.request, owner="pd")
         self.remember_terminal(entry.binding)
         self.observe("finished", entry, cancelled=entry.cancelled, error=entry.error,
                      p_hit=entry.p_hit, d_hit=entry.reservation.prefix_hit_tokens
@@ -255,16 +262,18 @@ class Service:
                 raise ValueError("peer registry fingerprint mismatch")
             await send(writer, dict(node=self.node, registry=self.registry))
             async def dispatch(message):
-                try:
-                    async with slots:
-                        value = await self.control(peer, geometry, message["op"], message["payload"])
-                    reply = dict(id=message["id"], result=value)
-                except Exception as exc:
-                    reply = dict(id=message["id"], error=str(exc))
-                    if isinstance(exc, CapacityExhausted):
-                        reply["code"] = "capacity_exhausted"
-                async with write_lock:
-                    await send(writer, reply)
+                with request_trace.scope(request_trace.incoming(message.get("request_profile")),
+                                         "pd.control.receive", operation=message["op"], sequence=message["id"]):
+                    try:
+                        async with slots:
+                            value = await self.control(peer, geometry, message["op"], message["payload"])
+                        reply = dict(id=message["id"], result=value)
+                    except Exception as exc:
+                        reply = dict(id=message["id"], error=str(exc))
+                        if isinstance(exc, CapacityExhausted):
+                            reply["code"] = "capacity_exhausted"
+                    async with write_lock:
+                        await send(writer, reply)
             while True:
                 message = await receive(reader)
                 if len(tasks) >= self.config.capacity * 2:
@@ -516,11 +525,14 @@ class Service:
                 if actual != required[component.name]:
                     raise ValueError("copy plan does not cover the required destination pages")
 
+    @request_trace.traced("pd.fail", resolve=lambda self, entry, *args, **kwargs:
+                          request_trace.context((entry.binding.request,)))
     def fail(self, entry, error):
         entry.error = error
         entry.prepared.set()
         entry.transferred.set()
         if isinstance(error, TransferError) and error.uncertain:
+            request_trace.incomplete("pd_completion_unknown", request_trace.context((entry.binding.request,)))
             self.gated = True
             if self.cache.tiering is not None:
                 self.cache.tiering.wake()
@@ -529,6 +541,8 @@ class Service:
         self.observe("request.error", entry, error=type(error).__name__,
                      uncertain=isinstance(error, TransferError) and error.uncertain)
 
+    @request_trace.traced("pd.abort", resolve=lambda self, entry, *args, **kwargs:
+                          request_trace.context((entry.binding.request,)))
     async def abort(self, entry, stopped=False):
         entry.cancelled = True
         if self.cache.tiering is not None:
@@ -707,7 +721,8 @@ class Service:
         terminal = False
         try:
             try:
-                await asyncio.wait_for(entry.transferred.wait(), self.config.request_timeout)
+                with span(logger, "pd.wait_transfer", log=False, request=request):
+                    await asyncio.wait_for(entry.transferred.wait(), self.config.request_timeout)
             except asyncio.TimeoutError as exc:
                 raise TimeoutError("Prefill data did not arrive within request_timeout") from exc
             if entry.error is not None:

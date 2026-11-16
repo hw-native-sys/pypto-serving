@@ -14,7 +14,10 @@ import time
 from .profile import profile_duration
 
 
-def record(logger, name, **fields):
+def record(logger, name, *, _trace=True, **fields):
+    from .profile import request
+    if _trace:
+        request.event(name, **fields)
     try:
         logger.info("%s %s", name, " ".join(f"{key}={value}" for key, value in fields.items()))
     except Exception:
@@ -43,7 +46,7 @@ def span(logger, name, *, cat="pd", thread_cpu=False, log=True, **fields):
         cpu = {} if cpu_started is None else {"thread_cpu_ms": (time.thread_time_ns() - cpu_started) / 1e6}
         timing.update(cpu)
         if log:
-            record(logger, name, **fields, **timing, outcome=outcome)
+            record(logger, name, _trace=False, **fields, **timing, outcome=outcome)
         try:
             profile_duration(name, cat=cat, dur_us=duration, ts_us=started / 1000,
                              args={**fields, **cpu, "outcome": outcome})

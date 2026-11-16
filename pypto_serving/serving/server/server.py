@@ -19,6 +19,7 @@ import time
 import uuid
 from typing import Literal
 
+from pypto_serving.tools.profile import request as request_trace
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.model.model_family import read_model_config
 from pypto_serving.serving.constraints import ConstraintSpec
@@ -211,6 +212,10 @@ class ServingServer:
         self._constraint_preflight_provider: XGrammarProvider | None = None
         self._register_exception_handlers()
         self._register_routes()
+        from pypto_serving.tools.profile.http import engine_controller
+        self.request_profiler = engine_controller(
+            getattr(self, "real_engine", self.engine), getattr(getattr(self, "service", None), "role", "replica"))
+        self.request_profiler.install(self.app)
 
     def _register_exception_handlers(self) -> None:
         # Surface scheduler/engine rejections (e.g. a prompt longer than
@@ -349,6 +354,7 @@ class ServingServer:
             validate(config)
         return config
 
+    @request_trace.traced("serving.prepare_completion")
     def prepare_completion(self, request):
         config = dataclasses.replace(self._resolve_generate_config(request), ignore_eos=True)
         return request.prompt, config
@@ -393,6 +399,7 @@ class ServingServer:
             )
             return JSONResponse(response.model_dump())
 
+    @request_trace.traced("serving.prepare_chat")
     async def prepare_chat(self, request):
         output_parser_spec = self._output_parser_spec(request)
         constraint_spec = self._constraint_spec(request, output_parser_spec)
@@ -640,6 +647,7 @@ class ServingServer:
             return "tool_calls"
         return cls._map_finish_reason(output.finish_reason)
 
+    @request_trace.traced("serving.apply_chat_template")
     def _apply_chat_template(
         self,
         messages: list[ChatMessage],
@@ -741,6 +749,7 @@ class ServingServer:
             parallel_tool_calls=request.parallel_tool_calls,
         )
 
+    @request_trace.traced("serving.preflight_constraint")
     async def _preflight_constraint(self, spec: ConstraintSpec, initial_tokens=()) -> None:
         """Reject unsupported schemas before an SSE response or worker batch starts."""
         async with self._constraint_preflight_lock:

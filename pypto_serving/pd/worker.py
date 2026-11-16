@@ -20,6 +20,7 @@ import time
 
 import msgspec
 
+from pypto_serving.tools.profile import request as request_trace
 from pypto_serving.tools.observe import record, span
 from .protocol import Completion, MAX_FRAME, Plan, Topology, decode, digest
 from .transfer import Owner, Region, TransferError, owner_factories
@@ -174,9 +175,11 @@ class WorkerRuntime:
                 peer, batches, job, observation = self._lower(plan)
             if len(self.jobs) >= self.settings.capacity or job in self.jobs:
                 raise ValueError("transfer capacity exceeded or duplicate submission")
+            profile = request_trace.track("pd.transfer", job)
             # Every rank was validated before the first native task is enqueued.
             try:
-                futures = tuple(self.pool.submit(self.owners[rank].call, "write", peer=peer,
+                futures = tuple(self.pool.submit(request_trace.invoke, profile, "pd.rank.write",
+                    self.owners[rank].call, "write", peer=peer,
                     copies=tuple(copies), observation={**observation, "source_rank": rank,
                                                      "destination_rank": destination})
                     for (rank, destination), copies in batches.items())
@@ -213,6 +216,7 @@ class WorkerRuntime:
                     result.append(dict(error="rank transfer failed", uncertain=uncertain))
                 else:
                     result.append(dict(completion=Completion(job, plan.units)))
+                request_trace.finish("pd.transfer", job, error="rank_failed" if errors else None)
                 del self.jobs[job]
             return result
 
@@ -304,6 +308,13 @@ class Services:
     def handle_command(self, operation, payload):
         return self.extension.transfer.handle(operation, payload)
 
+    def request_profile(self, active, capture):
+        results = [owner.call("request_profile", active=active, capture=capture)
+                   for owner in self.extension.transfer.owners]
+        if not active and not all(results):
+            raise BlockingIOError("request profile owners are still draining")
+        return results
+
     def set_profile_active(self, active):
         # Owner transfer spans use the same on-demand profile lifecycle.
         self.extension.set_profile_active(active)
@@ -321,9 +332,9 @@ class ProgressServer:
             while not self.stop.is_set():
                 if select.select((self.channel,), (), (), .02)[0]:
                     deadline = time.monotonic() + self.timeout
-                    sequence, operation, payload = msgspec.msgpack.decode(
-                        _receive_frame(self.channel, deadline), type=tuple[int, str, bytes])
-                    with span(logger, "pd.progress.handle", log=False,
+                    sequence, operation, payload, profile = msgspec.msgpack.decode(
+                        _receive_frame(self.channel, deadline), type=tuple[int, str, bytes, dict | None])
+                    with request_trace.scope(profile, "pd.progress.pickup"), span(logger, "pd.progress.handle", log=False,
                               command_id=sequence, operation=operation):
                         result = self.handle(operation, payload)
                     _send_frame(self.channel, msgspec.msgpack.encode((sequence, result)), deadline)
@@ -382,7 +393,7 @@ class Progress:
                     raise self.error
                 if self.closed or (not self.accepting and operation != "poll"):
                     raise TransferError("transfer observer is closing", uncertain=False)
-                packet = msgspec.msgpack.encode((sequence, operation, payload))
+                packet = msgspec.msgpack.encode((sequence, operation, payload, request_trace.current.get()))
                 if len(packet) > MAX_FRAME:
                     raise TransferError("transfer command exceeds frame limit", uncertain=False)
                 _remaining(deadline)  # Expiry before starting I/O is a known rejection.
@@ -425,13 +436,17 @@ class Progress:
             raise TransferError("completion observer closed, full or duplicate waiter", uncertain=True)
         future = asyncio.get_running_loop().create_future()
         self.pending[job] = future
+        request_trace.track("pd.observer", job)
         def consume(done):
+            request_trace.finish("pd.observer", job, error="cancelled" if done.cancelled() else
+                                 type(done.exception()).__name__ if done.exception() is not None else None)
             self.pending.pop(job, None)
             if not done.cancelled():
                 done.exception()
         future.add_done_callback(consume)
         if self.task is None or self.task.done():
-            self.task = asyncio.create_task(self._observe())
+            with request_trace.scope(None):
+                self.task = asyncio.create_task(self._observe())
         return future
 
     async def wait(self, job):
@@ -445,7 +460,9 @@ class Progress:
         try:
             while self.pending:
                 jobs = tuple(self.pending)
-                values = msgspec.msgpack.decode(await self.call("poll", msgspec.msgpack.encode(jobs)))
+                with request_trace.scope(request_trace.combine(
+                        request_trace.job_context("pd.observer", job) for job in jobs), "pd.poll"):
+                    values = msgspec.msgpack.decode(await self.call("poll", msgspec.msgpack.encode(jobs)))
                 if isinstance(values, dict) or len(values) != len(jobs):
                     raise TransferError("completion reply correlation mismatch", uncertain=True)
                 for job, value in zip(jobs, values):

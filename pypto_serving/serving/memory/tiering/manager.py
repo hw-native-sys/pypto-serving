@@ -15,6 +15,8 @@ import time
 
 from .policy import LRU
 
+from pypto_serving.tools.profile import request as request_trace
+
 
 @dataclass
 class PendingUnit:
@@ -76,6 +78,7 @@ class CacheTier:
         self.pages[key] = page
         self.by_handle[page.handle] = page
         self.queued.append(page)
+        request_trace.track("ddr.publication", id(page), record=False)
         if self.notify is not None:
             self.notify()
 
@@ -208,6 +211,7 @@ class CacheTier:
                 del self.inflight[page.handle]
                 page.ready = True
                 self.release_pin(page.lease)
+                request_trace.finish("ddr.publication", id(page))
                 page.lease = page.source = None
                 self.counters["stored_bytes"] += page.size
                 self.counters["stores"] += 1
@@ -241,7 +245,8 @@ class CacheTier:
                     break
                 self.queued.popleft()
                 self.used += page.charge
-                page.future = self.backend.store(page.handle, page.source)
+                with request_trace.scope(request_trace.job_context("ddr.publication", id(page))):
+                    page.future = self.backend.store(page.handle, page.source)
                 self.inflight[page.handle] = page
         except BaseException as error:
             self.error = error
@@ -261,11 +266,13 @@ class CacheTier:
         while self.queued:
             page = self.queued.popleft()
             self.release_pin(page.lease)
+            request_trace.finish("ddr.publication", id(page))
             del self.pages[page.key]
             del self.by_handle[page.handle]
         for handle, page in tuple(self.inflight.items()):
             if page.future.cancel():
                 self.release_pin(page.lease)
+                request_trace.finish("ddr.publication", id(page), error="cancelled")
                 self.used -= page.charge
                 del self.inflight[handle]
                 del self.pages[page.key]

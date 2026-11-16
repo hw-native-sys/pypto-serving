@@ -16,6 +16,8 @@ import time
 from ..kv_cache import KVCacheCapacityError
 from .manager import CacheTier, Page
 
+from pypto_serving.tools.profile import request as request_trace
+
 logger = logging.getLogger(__name__)
 
 
@@ -149,6 +151,7 @@ class TieredCache:
             self.tier.counters["loaded_bytes"] += load.page.size
             self.tier.release((load.page,))
             load.ready = True
+            request_trace.finish("ddr.restore", id(load))
             if self.trace is not None:
                 reaped_pages += 1
                 reaped_bytes += load.page.size
@@ -170,6 +173,7 @@ class TieredCache:
         resident = pool.hash_to_block.get((partition, value))
         return resident if resident is not None else self.tier.lookup((partition, pool.spec.name, value))
 
+    @request_trace.traced("cache.restore_prepare", resolve=lambda self, request, *args, **kwargs: request_trace.context((request,)))
     def prepare(self, request, hashes, tokens, *, maximum, groups=None, partition=None):
         started_ns = time.monotonic_ns() if self.trace is not None else 0
         if self.tier.error:
@@ -219,7 +223,19 @@ class TieredCache:
                     self.loads[key] = Load(page, block, selected, pins,
                         self.tier.load(page, destination, request=request), request=request)
             for key in missing:
-                self.loads[key].waiters.add(request)
+                load = self.loads[key]
+                request_trace.event("ddr.load.attach", tag=request_trace.context((request,)),
+                                    job=str(id(load.future)), started_before_observed=key not in fresh)
+                tag = request_trace.context((request,))
+                if tag:
+                    identity = str(id(load.future)) + ":" + request
+                    request_trace.track("ddr.waiter", identity, tag)
+                    request_trace.track("ddr.restore", id(load), tag)
+                    load.future.add_done_callback(lambda done, identity=identity:
+                        request_trace.finish("ddr.waiter", identity,
+                            error="cancelled" if done.cancelled() else
+                            type(done.exception()).__name__ if done.exception() is not None else None))
+                load.waiters.add(request)
             self.pending[request] = PendingPrefix(hashes, tokens, boundary, selected, source_pin,
                 tuple(missing), started_ns=started_ns,
                 remaining=sum(not self.loads[key].ready for key in missing))

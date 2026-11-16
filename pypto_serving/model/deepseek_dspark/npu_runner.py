@@ -64,6 +64,7 @@ from pypto_serving.model.deepseek_dspark.weight_loader import (
 )
 from pypto_serving.serving.sampling.stop_rules import blocked_token_ids
 from pypto_serving.tools.profile import profile_span
+from pypto_serving.tools.profile import request as request_trace
 
 logger = logging.getLogger(__name__)
 
@@ -6622,6 +6623,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             state.device_draft_count = DSPARK_DRAFTER_QUERY_WIDTH if descriptor.bootstrap_valid else 0
             state.proposed_tokens += state.device_draft_count
 
+    @request_trace.traced("dspark.bootstrap", resolve=lambda self, request_ids, *args, **kwargs:
+                          request_trace.subset(request_ids))
     def _seed_prefill_wave(
         self, request_ids: Sequence[str], sampled_token_ids: Sequence[int]
     ) -> None:

@@ -282,6 +282,9 @@ def profile_span(
     level: str = "e2e",
     args: dict[str, Any] | None = None,
 ):
+    from . import request
+    if request.current.get():
+        return request.scope(request.current.get(), name, cat=cat, **(args or {}))
     profiler = get_profiler()
     if not profiler.includes(level):
         return nullcontext()
@@ -295,6 +298,10 @@ def profile_instant(
     level: str = "e2e",
     args: dict[str, Any] | None = None,
 ) -> None:
+    from . import request
+    if request.current.get():
+        request.event(name, **(args or {}))
+        return
     get_profiler().instant(name, cat=cat, level=level, args=args)
 
 
@@ -307,11 +314,17 @@ def profile_duration(
     args: dict[str, Any] | None = None,
     ts_us: float | None = None,
 ) -> None:
+    from . import request
+    if request.duration(name, dur_us, cat=cat, args=args, ts_us=ts_us):
+        return
     get_profiler().duration(name, dur_us=dur_us, cat=cat, level=level, args=args, ts_us=ts_us)
 
 
 def start_profile() -> bool:
     """Start a fresh profile session in the current process."""
+    from . import request
+    if request.enabled():
+        raise ValueError("request profiling is active")
     profiler = get_profiler(initially_active=False)
     if not profiler.enabled or profiler.active:
         return False

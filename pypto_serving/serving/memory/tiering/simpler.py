@@ -18,6 +18,8 @@ import time
 from .pool import advise
 from .backend import BATCH_BYTES, BATCH_SPANS
 
+from pypto_serving.tools.profile import request as request_trace
+
 logger = logging.getLogger(__name__)
 
 
@@ -224,26 +226,38 @@ class CopyService:
                 if not self.channel.poll(.1):
                     continue
                 try:
-                    sequence, operation, payload = self.channel.recv()
+                    sequence, operation, payload, profile = self.channel.recv()
                 except EOFError:
                     self._retire(provider)
                     break
                 expected += 1
                 if sequence != expected:
                     raise RuntimeError("stale cache-copy command")
-                try:
-                    if operation == "register":
-                        name, token, descriptor = payload
-                        result = provider.register(name, token, _descriptor(descriptor))
-                    elif operation == "copy_batch":
-                        result = provider.copy_batch(*payload)
-                    elif operation == "stop":
-                        result = self._retire(provider)
-                    else:
-                        raise ValueError("unknown cache-copy operation")
-                    self.channel.send((sequence, True, result))
-                except Exception as error:
-                    self.channel.send((sequence, False, (str(error), provider.poisoned)))
+                with request_trace.scope(profile, "ddr.owner.execute", operation=operation, sequence=sequence):
+                    try:
+                        if operation == "register":
+                            name, token, descriptor = payload
+                            result = provider.register(name, token, _descriptor(descriptor))
+                        elif operation == "copy_batch":
+                            result = provider.copy_batch(*payload)
+                            if request_trace.current.get():
+                                request_trace.native_interval("ddr.native.copy", result["started_ns"],
+                                    result["completed_ns"], direction=payload[0],
+                                    handles=[p["handle"] for p in result["pages"]],
+                                    pages=len(result["pages"]), bytes=sum(p["bytes"] for p in result["pages"]))
+                        elif operation == "request_profile":
+                            active, capture = payload
+                            if active:
+                                result = request_trace.ensure(capture).key
+                            else:
+                                result = request_trace.close(capture["capture"])
+                        elif operation == "stop":
+                            result = self._retire(provider)
+                        else:
+                            raise ValueError("unknown cache-copy operation")
+                        self.channel.send((sequence, True, result))
+                    except Exception as error:
+                        self.channel.send((sequence, False, (str(error), provider.poisoned)))
         except BaseException as error:
             self.error = error
             if not initialized:
