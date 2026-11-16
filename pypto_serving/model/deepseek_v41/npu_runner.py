@@ -208,16 +208,16 @@ def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
                 len(layers), kv_sources, c2a_sources, index_sources, 128):
         raise ValueError("decode cache source axes disagree with the layer schedule")
     kv_layers = tuple(layer for layer in layers if layer.kv_source == layer.layer_id)
-    index_layers = tuple(layer for layer in layers if layer.index_source == layer.layer_id)
+    # Reindex layers own query weights and selections, but read their KV producer's keys.
     group_sources = {
         resolved.window: {"window": tuple(range(len(layers)))},
         resolved.c2a: {
             "compressed": tuple(i for i, layer in enumerate(kv_layers) if layer.mode.startswith("c2a_")),
-            "index": tuple(i for i, layer in enumerate(index_layers) if layer.mode.startswith("c2a_")),
+            "index": tuple(i for i, layer in enumerate(kv_layers) if layer.mode.startswith("c2a_")),
         },
         resolved.c1a: {
             "compressed": tuple(i for i, layer in enumerate(kv_layers) if layer.mode.startswith("c1a_")),
-            "index": tuple(i for i, layer in enumerate(index_layers) if layer.mode.startswith("c1a_")),
+            "index": tuple(i for i, layer in enumerate(kv_layers) if layer.mode.startswith("c1a_")),
         },
     }
     head, index, world = abi.HEAD_DIM, abi.INDEX_DIM, abi.EP_SIZE
@@ -237,9 +237,9 @@ def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
         CacheBufferSpec("compressed_cache_pool", (
             world, kv_sources * compressed_pages, block, 1, abi.COMPRESSED_CACHE_BYTES), torch.uint8),
         CacheBufferSpec("index_cache_pool", (
-            world, index_sources * compressed_pages, block, 1, index // 2), torch.uint8),
+            world, kv_sources * compressed_pages, block, 1, index // 2), torch.uint8),
         CacheBufferSpec("index_cache_scale_pool", (
-            world, index_sources * compressed_pages, block, 1, index // abi.INDEX_CACHE_GROUP),
+            world, kv_sources * compressed_pages, block, 1, index // abi.INDEX_CACHE_GROUP),
                         torch.float8_e8m0fnu),
         CacheBufferSpec("state_cache_pool", (
             world, c2a_sources * (request_slots + 1), abi.STATE_CAPACITY, abi.STATE_WIDTH), torch.float32),
@@ -348,10 +348,10 @@ class DecodeCachePools:
         if layer.mode == "swa":
             return result
         kv_slot = kv_sources.index(layer.kv_source)
-        index_slot = index_sources.index(layer.index_source)
+        if layer.index_source not in index_sources:
+            raise ValueError("layer index query source is missing")
         for name in ("compressed_cache", "index_cache", "index_cache_scale"):
-            slot = kv_slot if name.startswith("compressed_") else index_slot
-            result[name] = self.view(name + "_pool", slot)
+            result[name] = self.view(name + "_pool", kv_slot)
         if layer.mode == "c2a_full":
             result["state_cache"] = self.view("state_cache_pool", c2a_sources.index(layer.layer_id))
         return result
@@ -2064,7 +2064,10 @@ class PrefillMetadataResources:
             shared(name, (world, tokens, width), torch.float32)
         for name in ("c2a_compressed_rope_cos", "c2a_compressed_rope_sin"):
             shared(name, (world, tokens, width), torch.float32)
-        for prefix, pages in self.compressed_pages.items():
+        for prefix in self.compressed_pages:
+            block_tokens = 256 if prefix == "c2a" else 128
+            # Columns cover one request's history; entries address the whole physical pool.
+            table_pages = (max_seq_len + block_tokens - 1) // block_tokens
             for name, shape, dtype, fill in (
                 ("position_ids", (world, tokens), torch.int32, 0),
                 ("request_ids", (world, tokens), torch.int32, -1),
@@ -2072,7 +2075,7 @@ class PrefillMetadataResources:
                 ("compressed_lens", (world, tokens), torch.int32, 0),
                 ("compressed_slots", (world, tokens), torch.int64, -1),
                 ("compressed_rope_positions", (world, tokens), torch.int32, -1),
-                ("index_block_table", (world, max_requests, pages), torch.int32, -1),
+                ("index_block_table", (world, max_requests, table_pages), torch.int32, -1),
                 ("state_block_table", (world, max_requests, 1), torch.int32, -1),
             ):
                 shared(prefix + "_" + name, shape, dtype, fill)
@@ -3706,8 +3709,8 @@ def make_production_bindings(
             ring_heap=(runtime.ring_heap if runtime.ring_heap is not None
                        else prefill_ring_heap(prefill_topology.capacity)),
             # DP4's 8K prefill can exhaust ring 2's default dependency pool.
-            ring_dep_pool=((16384, 16384, 32764, 16384)
-                           if topology.dp == 4 else None),
+            ring_dep_pool=(runtime.ring_dep_pool if runtime.ring_dep_pool is not None else
+                           ((16384, 16384, 32764, 16384) if topology.dp == 4 else None)),
         )
         compiler = KernelCompiler(run_config=run_config)
         decode, decode_names, decode_counts_are_tensor = compile_decode_fwd(
