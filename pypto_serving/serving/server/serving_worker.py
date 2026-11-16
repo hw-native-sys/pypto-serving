@@ -28,6 +28,7 @@ from pypto_serving.config.types import (
     SamplingParams,
     StopTokenMask,
 )
+from pypto_serving.observability.dplb_dfx import DplbDfxRecorder, command_load
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.constraints.provider import ConstraintState, XGrammarProvider
 from pypto_serving.serving.sampling.capabilities import SamplingCapabilities
@@ -140,6 +141,13 @@ class WorkerProcess:
         self.output_queue = output_queue
         self.profile_output_queue = profile_output_queue
 
+        self._dplb_dfx = None
+        dfx_config = getattr(config, "dplb_dfx_config", None)
+        if dfx_config is not None and dfx_config.level != "off":
+            self._dplb_dfx = DplbDfxRecorder(
+                dfx_config, config.profile_config.trace_file.parent, "worker", config.dp_rank)
+        self._dfx_pending = {}
+        self._dfx_slot_generations = {}
         self.executor = None
         self.sampler = None
         self.model_record = None
@@ -261,6 +269,8 @@ class WorkerProcess:
             self._pipelined_busy_loop()
         else:
             self._serial_busy_loop()
+        if getattr(self, "_dplb_dfx", None) is not None:
+            self._dplb_dfx.close()
         logger.info("Worker exiting")
 
     def _serial_busy_loop(self) -> None:
@@ -337,6 +347,10 @@ class WorkerProcess:
                         )
                     )
                     continue
+                if isinstance(cmd, ProfileCommand) and cmd.active:
+                    # The prepare lane can run ahead of the device profile
+                    # barrier. Start its sink before preparing tagged commands.
+                    self._dfx_start_capture(cmd, boundary="input_control_received")
                 release_cache_entries: dict[str, object] = {}
                 if isinstance(cmd, StepCommand):
                     # Snapshot the entries this command intends to release before
@@ -377,6 +391,8 @@ class WorkerProcess:
                         batch=None,
                         error=str(exc),
                     )
+                if isinstance(cmd, StepCommand):
+                    self._dfx_prepare(cmd, owned_slot)
                 work_queue.put((cmd, prepared, release_cache_entries))
                 if isinstance(cmd, ShutdownCommand):
                     break
@@ -406,6 +422,7 @@ class WorkerProcess:
                 barrier.completed.wait()
                 continue
             assert isinstance(cmd, StepCommand)
+            self._dfx_phase(cmd.step_id, "worker_command_begin")
             try:
                 self._wait_for_pending_decode_reclaims(cmd.finished_request_ids)
                 accepted_lengths = getattr(self, "_accepted_output_lengths", {})
@@ -551,6 +568,7 @@ class WorkerProcess:
                 raise TypeError(f"unexpected output work item: {type(work).__name__}")
             if buffer_slot is not None:
                 slot_ownership[buffer_slot].release()
+            self._dfx_complete(result)
             self.output_queue.put(encode_result(result))
 
     def _track_pending_decode_requests(self, requests: list[DecodeRequest]) -> None:
@@ -717,7 +735,13 @@ class WorkerProcess:
         try:
             if cmd.active:
                 profiler.start()
+                self._dfx_start_capture(cmd, boundary="control_applied")
+                if getattr(self, "_dplb_dfx", None) is not None:
+                    self._dplb_dfx.emit("worker_control_applied")
             else:
+                if getattr(self, "_dplb_dfx", None) is not None:
+                    self._dplb_dfx.stop(worker_pending_steps=list(self._dfx_pending))
+                    self._dplb_dfx.close()
                 profiler.stop()
             if profiler.active != cmd.active:
                 error = "SA profiling is not configured in the worker process"
@@ -738,7 +762,41 @@ class WorkerProcess:
         busy loop and crash the worker. Any failure is reported back to the
         engine as an error result so the loop keeps serving.
         """
-        self.output_queue.put(encode_result(self._run_step_command(cmd, None)))
+        self._dfx_prepare(cmd, None)
+        self._dfx_phase(cmd.step_id, "worker_command_begin")
+        result = self._run_step_command(cmd, None)
+        self._dfx_complete(result)
+        self.output_queue.put(encode_result(result))
+
+    def _dfx_start_capture(self, cmd: ProfileCommand, *, boundary: str) -> None:
+        dfx = getattr(self, "_dplb_dfx", None)
+        if dfx is not None and not dfx.active:
+            dfx.start(cmd.capture_id, devices=list(self.config.worker_device_ids()), boundary=boundary)
+
+    def _dfx_prepare(self, cmd: StepCommand, slot: int | None) -> None:
+        dfx = getattr(self, "_dplb_dfx", None)
+        if dfx is None:
+            return
+        generation = self._dfx_slot_generations.get(slot, 0) + 1
+        self._dfx_slot_generations[slot] = generation
+        if cmd.dplb_dfx is None:
+            return
+        token = cmd.dplb_dfx
+        context = dict(token=token, buffer_slot=slot, slot_generation=generation)
+        self._dfx_pending[cmd.step_id] = context
+        dfx.emit("worker_prepared", token=token, step_id=cmd.step_id,
+                 buffer_slot=slot, slot_generation=generation, view="worker_command_mirror",
+                 groups=command_load(cmd, token["group_count"], token.get("epochs")),
+                 device_confirmed=False)
+
+    def _dfx_phase(self, step_id: int, kind: str) -> None:
+        context = getattr(self, "_dfx_pending", {}).get(step_id)
+        if context is not None:
+            self._dplb_dfx.emit(kind, step_id=step_id, **context)
+
+    def _dfx_complete(self, result: StepResult) -> None:
+        self._dfx_phase(result.step_id, "worker_command_reclaimed")
+        getattr(self, "_dfx_pending", {}).pop(result.step_id, None)
 
     def _run_step_command(
         self,

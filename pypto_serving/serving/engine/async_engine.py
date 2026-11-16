@@ -14,6 +14,7 @@ import contextlib
 import logging
 import queue
 import time
+import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, field, replace
@@ -22,6 +23,7 @@ from typing import Callable
 from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
 from pypto_serving.observability import InMemoryStatLogger, IterationStats, SchedulerStats
+from pypto_serving.observability.dplb_dfx import DplbDfxConfig, DplbDfxRecorder, command_load
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.reasoning import (
@@ -83,6 +85,8 @@ class EngineConfig:
     profile_config: ProfileConfig = field(
         default_factory=lambda: create_profile_config(enabled=False)
     )
+
+    dplb_dfx_config: DplbDfxConfig = field(default_factory=DplbDfxConfig)
 
     # Scheduler / serving
     max_num_running_reqs: int = 32
@@ -224,6 +228,14 @@ class ReplicaEngineCore:
             enable_prefix_cache=self.config.enable_prefix_cache,
             enable_dplb=self.config.resolve_dplb(),
         )
+        self._dplb_dfx = None
+        if config.dplb_dfx_config.level != "off" and not config.profile_config.enabled:
+            raise ValueError("DPLB DFX requires profiling to be enabled")
+        if config.dplb_dfx_config.level != "off":
+            self._dplb_dfx = DplbDfxRecorder(
+                config.dplb_dfx_config, config.profile_config.trace_file.parent, "engine", config.dp_rank
+            )
+            self.kv_cache_manager.dplb_dfx = getattr(self, "_dplb_dfx", None)
         self._async_scheduling = self.config.resolve_async_scheduling()
         scheduler_config = SchedulerConfig(
             max_num_running_reqs=self.config.max_num_running_reqs,
@@ -395,17 +407,22 @@ class ReplicaEngineCore:
             self._loop_task = None
 
         await asyncio.to_thread(self._shutdown_worker, timeout=30)
+        if getattr(self, "_dplb_dfx", None) is not None:
+            self._dplb_dfx.close()
         logger.info("ReplicaEngineCore stopped")
 
-    async def start_profile(self) -> None:
+    async def start_profile(self, capture_id: str | None = None) -> None:
         """Start SA profiling in this replica's worker."""
-        await self._set_profile_active(True)
+        await self._set_profile_active(
+            True, capture_id=(capture_id or uuid.uuid4().hex)
+            if getattr(self, "_dplb_dfx", None) is not None else None
+        )
 
     async def stop_profile(self) -> None:
         """Flush and stop SA profiling in this replica's worker."""
         await self._set_profile_active(False)
 
-    async def _set_profile_active(self, active: bool) -> None:
+    async def _set_profile_active(self, active: bool, *, capture_id: str | None = None) -> None:
         """Send an ordered worker profile command and wait for its acknowledgement."""
         async with self._profile_lock:
             input_queue = self._input_queue
@@ -413,7 +430,24 @@ class ReplicaEngineCore:
             if input_queue is None or output_queue is None:
                 raise RuntimeError("Serving worker is not running")
 
-            input_queue.put(encode_command(ProfileCommand(active=active)))
+            dfx = getattr(self, "_dplb_dfx", None)
+            if dfx is not None:
+                if active and not dfx.active:
+                    dfx.start(capture_id, topology=self._dfx_topology(),
+                              policy_enabled=self.config.resolve_dplb(),
+                              counters=self._dfx_counters(),
+                              settings=dict(model=self.config.model_id, executor=self.config.executor_cls,
+                                            max_num_seqs=self.config.max_num_running_reqs,
+                                            max_model_len=self.config.runtime_config.max_seq_len,
+                                            speculative_tokens=self.config.runtime_config.num_speculative_tokens,
+                                            prefix_cache=self.config.enable_prefix_cache,
+                                            ring_heap=self.config.runtime_config.ring_heap),
+                              sampling=dict(every=dfx.config.sample_every, max_steps=dfx.config.max_steps,
+                                            max_seconds=dfx.config.max_seconds))
+                    self.kv_cache_manager.dfx_baseline()
+                elif not active:
+                    dfx.stop(counters=self._dfx_counters())
+            input_queue.put(encode_command(ProfileCommand(active=active, capture_id=capture_id)))
             try:
                 raw_result = await asyncio.to_thread(
                     output_queue.get,
@@ -433,6 +467,26 @@ class ReplicaEngineCore:
                     f"Worker profile state mismatch: requested active={active}, "
                     f"received active={result.active}"
                 )
+
+            if not active and dfx is not None:
+                # Worker acknowledgement follows its output-lane barrier. Allow
+                # the independent engine loop to apply these queued results.
+                deadline = time.monotonic() + 2
+                while dfx.step_tokens and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                dfx.emit("capture_drain", token=dict(capture_id=dfx.capture_id),
+                         pending_steps=list(dfx.step_tokens))
+                await asyncio.to_thread(dfx.close)
+
+    def _dfx_counters(self) -> dict | None:
+        return self._stat_logger.snapshot() if self._stat_logger is not None else None
+
+    def _dfx_topology(self) -> list[dict]:
+        devices = self.config.worker_device_ids()
+        count = self.kv_cache_manager.group_partition_count
+        width = len(devices) // count
+        return [dict(group=g, tp_ranks=list(range(g * width, (g + 1) * width)),
+                     devices=list(devices[g * width:(g + 1) * width])) for g in range(count)]
 
     def generate_request_id(self) -> str:
         self._request_counter += 1
@@ -651,6 +705,17 @@ class ReplicaEngineCore:
             step_cmd = self._build_step_command(
                 scheduler_output, finished_ids, step_id=self._step_counter
             )
+            dfx = getattr(self, "_dplb_dfx", None)
+            if dfx is not None:
+                token = dfx.sample(step_cmd.step_id)
+                if token is not None:
+                    token["group_count"] = self.kv_cache_manager.group_partition_count
+                    token["epochs"] = {item.request.request_id: dfx.epochs.get(item.request.request_id, 1)
+                                       for item in scheduler_output.scheduled_requests}
+                    step_cmd.dplb_dfx = token
+                    dfx.emit("scheduled_step", token=token, step_id=step_cmd.step_id,
+                             view="scheduler_planned", groups=command_load(
+                                 step_cmd, token["group_count"], token["epochs"]))
             self._input_queue.put(encode_command(step_cmd))
 
         stat_logger = getattr(self, "_stat_logger", None)
@@ -715,6 +780,9 @@ class ReplicaEngineCore:
             args={"new_tokens": len(new_tokens)},
         ):
             self._process_step_output(scheduler_output, new_tokens, step_result.num_draft_tokens)
+        if getattr(self, "_dplb_dfx", None) is not None:
+            self._dplb_dfx.outcome(step_id, status="applied", token_counts={
+                request_id: len(tokens) for request_id, tokens in step_result.new_tokens.items()})
         return True
 
     async def _get_live_result(self) -> bytes:
@@ -898,6 +966,8 @@ class ReplicaEngineCore:
         (worker returned an error / step_id desync); True on timeout, where the
         failed step's result is still coming.
         """
+        if getattr(self, "_dplb_dfx", None) is not None:
+            self._dplb_dfx.outcome(failed_step_id, status="failed", result_pending=result_pending)
         failed_batches = [scheduler_output]
         if result_pending:
             self._discard_result_step_ids.add(failed_step_id)
@@ -906,6 +976,8 @@ class ReplicaEngineCore:
         while self._batch_queue:
             sid, batch = self._batch_queue.popleft()
             self._discard_result_step_ids.add(sid)
+            if getattr(self, "_dplb_dfx", None) is not None:
+                self._dplb_dfx.outcome(sid, status="discarded", result_pending=True)
             failed_batches.append(batch)
 
         seen: set[str] = set()
@@ -1368,8 +1440,9 @@ class AsyncLLMEngine:
 
     async def start_profile(self) -> None:
         """Start SA profiling in every replica worker."""
+        capture_id = uuid.uuid4().hex
         results = await asyncio.gather(
-            *(core.start_profile() for core in self._cores),
+            *(core.start_profile(capture_id) for core in self._cores),
             return_exceptions=True,
         )
         errors = [result for result in results if isinstance(result, BaseException)]

@@ -99,7 +99,7 @@ class DecodeRequest(msgspec.Struct):
 # Step-level commands (engine → worker)
 # ---------------------------------------------------------------------------
 
-class StepCommand(msgspec.Struct, tag="step"):
+class StepCommand(msgspec.Struct, tag="step", omit_defaults=True):
     """One scheduling step: admits new requests and runs prefill + decode.
 
     ``new_requests`` is non-empty only when freshly admitted requests enter the
@@ -115,6 +115,7 @@ class StepCommand(msgspec.Struct, tag="step"):
     # Monotonic step counter, echoed back on StepResult. Cheap ordering guard for
     # the pipelined loop (the worker is FIFO, so results must return in order).
     step_id: int = 0
+    dplb_dfx: dict[str, Any] | None = None
 
 
 class ShutdownCommand(msgspec.Struct, tag="shutdown"):
@@ -125,6 +126,7 @@ class ProfileCommand(msgspec.Struct, tag="profile"):
     """Starts or stops the process-local SA profiler."""
 
     active: bool
+    capture_id: str | None = None
 
 
 # Union used for the decoder — tag field ("type") discriminates.

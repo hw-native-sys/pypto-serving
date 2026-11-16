@@ -178,6 +178,7 @@ class KvCacheManager:
         self._group_request_partitions: dict[str, int] = {}
         self.enable_dplb = enable_dplb
         self._group_request_tokens: dict[str, int] = {}
+        self.dplb_dfx = None
         self._next_group_partition = 0
         if num_blocks is not None:
             self._init_blocks(num_blocks, block_size)
@@ -793,10 +794,11 @@ class KvCacheManager:
         best_partition: int | None = None
         best_hit_tokens = 0
         best_blocks: dict[str, list[KVCacheBlock | None]] = {}
+        prefix_hits = {} if self._dfx_active() else None
         candidate_partitions = list(range(self.group_partition_count))
         if self.enable_dplb:
             candidate_partitions = self._rank_group_partitions(
-                candidate_partitions, load_tokens or max_hit_tokens
+                candidate_partitions, load_tokens or max_hit_tokens, request_id=request_id
             )
         for partition in candidate_partitions:
             candidate = max_candidate
@@ -862,11 +864,16 @@ class KvCacheManager:
                     break
                 candidate -= alignment
 
+            if prefix_hits is not None:
+                prefix_hits[partition] = candidate
             if candidate > best_hit_tokens:
                 best_partition = partition
                 best_hit_tokens = candidate
                 best_blocks = candidate_blocks
 
+        if prefix_hits is not None:
+            self.dplb_dfx.emit("prefix_lookup", request_id=request_id, hits=prefix_hits,
+                               selected=best_partition, hit_tokens=best_hit_tokens)
         if best_partition is None or best_hit_tokens == 0:
             return {}, 0, None
 
@@ -888,6 +895,7 @@ class KvCacheManager:
                     pool.free_queues[best_partition].remove(block)
                 block.ref_cnt += 1
 
+        self._dfx_owner(request_id, "prefix_admit", best_partition)
         return (
             {
                 name: [
@@ -1198,7 +1206,9 @@ class KvCacheManager:
             )
         ]
 
-    def _rank_group_partitions(self, candidates: list[int], token_count: int) -> list[int]:
+    def _rank_group_partitions(
+        self, candidates: list[int], token_count: int, *, request_id: str | None = None
+    ) -> list[int]:
         """Rank admission targets using DeepInfer's two-dimensional heuristic.
 
         Short sequences fill concurrency gaps, breaking ties toward larger KV
@@ -1224,19 +1234,34 @@ class KvCacheManager:
                 load = (counts[partition], 0)
             return (*load, rotation)
 
-        return sorted(candidates, key=score)
+        ranked = sorted(candidates, key=score)
+        if self._dfx_active():
+            decision = self.dplb_dfx.begin_decision(request_id)
+            self.dplb_dfx.emit("placement_rank", request_id=request_id, decision_id=decision,
+                               admission_epoch=self.dplb_dfx.epochs.get(request_id, 0) + 1,
+                               view="policy_logical",
+                               token_count=token_count, short=short, candidates=candidates,
+                               ranked=ranked, scores={p: score(p) for p in candidates},
+                               counts=counts, tokens=tokens, rotation=self._next_group_partition)
+        return ranked
 
     def _select_group_partition(
         self, request_id: str, token_count: int, load_tokens: int | None = None
     ) -> int | None:
         candidates = self._candidate_group_partitions(request_id, token_count)
         if not candidates:
+            if self._dfx_active():
+                decision = self.dplb_dfx.begin_decision(request_id)
+                self.dplb_dfx.emit("placement_failed", request_id=request_id, decision_id=decision,
+                                   token_count=token_count, reason="no_feasible_cache_partition")
             return None
         assigned = self._group_request_partitions.get(request_id)
         if assigned is not None:
             return assigned
 
-        partition = self._rank_group_partitions(candidates, max(token_count, load_tokens or 0))[0]
+        partition = self._rank_group_partitions(
+            candidates, max(token_count, load_tokens or 0), request_id=request_id
+        )[0]
         self._next_group_partition = (partition + 1) % self.group_partition_count
         return partition
 
@@ -1368,6 +1393,7 @@ class KvCacheManager:
                         owned[slot] = self._take_group_block(pool, selected)
             pool.request_logical_blocks[request_id] = max(previous, target)
 
+        self._dfx_owner(request_id, "admit" if assigned is None else "grow", selected)
         result = {}
         for name, pool in self._group_pools.items():
             block_ids = []
@@ -1403,8 +1429,38 @@ class KvCacheManager:
                 block.ref_cnt -= 1
                 if block.ref_cnt == 0:
                     pool.free_queues[partition].append(block)
+        if request_id in self._group_request_partitions:
+            self._dfx_owner(request_id, "release", self._group_request_partitions[request_id])
         self._group_request_partitions.pop(request_id, None)
         self._group_request_tokens.pop(request_id, None)
+
+    def _dfx_active(self) -> bool:
+        return self.dplb_dfx is not None and self.dplb_dfx.capturing
+
+    def dfx_baseline(self) -> None:
+        if self._dfx_active():
+            for request_id, partition in self._group_request_partitions.items():
+                self._dfx_owner(request_id, "baseline", partition)
+            self.dplb_dfx.emit("cache_capacity", groups={
+                name: [pool.num_free_blocks_in(p) for p in range(self.group_partition_count)]
+                for name, pool in self._group_pools.items()})
+
+    def _dfx_owner(self, request_id: str, action: str, partition: int) -> None:
+        if not self._dfx_active():
+            return
+        dfx = self.dplb_dfx
+        if action in {"admit", "prefix_admit"}:
+            dfx.epochs[request_id] = dfx.epochs.get(request_id, 0) + 1
+        else:
+            dfx.epochs.setdefault(request_id, 1)
+        if action in {"admit", "prefix_admit"} and request_id not in dfx.decisions:
+            dfx.begin_decision(request_id)
+        dfx.emit("ownership", request_id=request_id, action=action, group=partition,
+                 decision_id=dfx.decisions.get(request_id),
+                 admission_epoch=dfx.epochs[request_id],
+                 logical_tokens=self._group_request_tokens.get(request_id, 0))
+        if action == "release":
+            dfx.decisions.pop(request_id, None)
 
     def group_num_blocks(self, group_name: str) -> int:
         """Return the rank-local physical block capacity of one cache group."""

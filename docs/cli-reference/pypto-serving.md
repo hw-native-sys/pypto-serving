@@ -137,6 +137,13 @@ Prefix caching reuses KV cache state for repeated prompt prefixes when the model
 | `--profile` | off | Enable `/start_profile` and `/stop_profile`, or profile the offline generation window. |
 | `--profile-output PATH` | `./profile_out` | Profile output directory or JSON path. |
 | `--profile-level LEVELS` | `e2e,kernel` | Comma-separated profile levels. |
+| `--dplb-dfx-level LEVEL` | `off` | Group placement and sampled host command diagnostics: `off` or `load`. `timing` is currently unsupported. Requires `--profile`. |
+| `--dplb-dfx-sample-every N` | `32` | Sample one complete scheduler command every N commands. |
+| `--dplb-dfx-max-steps N` | `256` | Maximum sampled commands per capture. |
+| `--dplb-dfx-max-seconds S` | `60` | Maximum duration for new DFX records and samples. |
+
+See [DPLB diagnostics](../developer-guide/dplb-dfx.md) for capture boundaries, analysis,
+resource limits, and the distinction between host command load and device timing.
 
 ## Help Output
 

@@ -116,6 +116,10 @@ nav:
   - Developer Guide:
       - Architecture: developer-guide/architecture.md
       - Profiling: developer-guide/profile.md
+      - DPLB Diagnostics: developer-guide/dplb-dfx.md
+      - DPLB Design: developer-guide/dplb-dfx-design.md
+      - DPLB Progress and Handoff: developer-guide/dplb-dfx-handoff.md
+      - DPLB Cost Proposal: developer-guide/dplb-cost-policy-proposal.md
       - Model Integration: developer-guide/model-integration.md
       - Weight Staging: developer-guide/weight-staging.md
       - JIT Cache: developer-guide/jit-cache.md
