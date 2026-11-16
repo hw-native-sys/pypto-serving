@@ -157,6 +157,54 @@ def test_partial_startup_releases_pool_only_after_owner_ack(started, failed):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize('outcome', ['ready', 'cancel', 'cancel_failed_constructor'])
+def test_ssd_startup_remains_owned_until_archive_retirement(monkeypatch, outcome):
+    from pypto_serving.serving.memory.tiering import archive, integration
+    async def run():
+        cache, tier, backend = fixture()
+        session, events = attach(tier), []
+        entered, release = threading.Event(), threading.Event()
+        session.owners = [SimpleNamespace(child=SimpleNamespace(close=lambda: None))]
+        session.metadata = SimpleNamespace(get=lambda **kw: dict(ranks=1, tp=1, groups=cache.group_names))
+        session.core.config = SimpleNamespace(runtime_config=SimpleNamespace(kv_ssd_bytes=4096, kv_ssd_path='ssd'))
+        session.pool.nbytes = 200_000
+        session.pool.close = lambda: events.append('pool')
+        session.copy_library.cleanup = lambda: events.append('helper')
+        def construct(*args):
+            entered.set()
+            assert release.wait(2)
+            assert not events  # Construction must never outlive the backing.
+            if outcome == 'cancel_failed_constructor':
+                raise OSError('injected SSD initialization failure')
+            return SimpleNamespace(name='ssd', work_bytes=0, window_bytes=0,
+                begin_close=lambda: None, pump=lambda: None, pop_loaded=lambda: (),
+                idle=lambda: True, close=lambda: events.append('archive'))
+        monkeypatch.setattr(integration, 'SimplerBackend', lambda *args, **kw: backend)
+        monkeypatch.setattr(integration, 'TieredCache', lambda *args, **kw: tier)
+        monkeypatch.setattr(integration.OffloadTrace, 'from_env', lambda: None)
+        monkeypatch.setattr(archive, 'SSDArchive', construct)
+        starting = asyncio.create_task(session.start())
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            if outcome != 'ready':
+                starting.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await starting
+                closing = asyncio.create_task(session.close())
+                await asyncio.sleep(.01)
+                assert not closing.done() and not events
+            else:
+                release.set()
+                await starting
+                closing = asyncio.create_task(session.close())
+        finally:
+            release.set()
+        await asyncio.wait_for(closing, 2)
+        assert events == ([] if outcome == 'cancel_failed_constructor' else ['archive']) + ['pool', 'helper']
+        assert cache.tiering is None and session._archive_start.done()
+    asyncio.run(run())
+
+
 def test_drain_failure_stops_progress_thread_and_retains_pool():
     async def run():
         owner = Owner(failed=True)

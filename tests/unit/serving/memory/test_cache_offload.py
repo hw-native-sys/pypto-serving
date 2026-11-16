@@ -107,6 +107,7 @@ def evict(cache, names=None):
 def attach(cache):
     session = Session.__new__(Session)
     session.__dict__.update(cache=cache, trace=None, _loop=asyncio.get_running_loop(),
+        _archive_start=None,
         _failure=asyncio.get_running_loop().create_future(),
         _notify_lock=threading.Lock(), _notified=False,
         core=SimpleNamespace(_running=True, _request_contexts={}, kv_cache_manager=cache.cache),
