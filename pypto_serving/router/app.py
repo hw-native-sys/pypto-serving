@@ -145,6 +145,10 @@ class ServingRouter:
         self.fleet = FleetManager(config, self.registry, **fleet_kwargs)
         self.app = FastAPI(title="PyPTO Serving Router", lifespan=self._lifespan)
         self.app.state.router = self
+        from pypto_serving.tools.profile.http import Controller
+        self.request_profiler = Controller(role="router", peers=lambda: (
+            state.spec.base_url for state in self.registry.states))
+        self.request_profiler.install(self.app)
 
         self.app.add_api_route("/health", self._health, methods=["GET"])
         self.app.add_api_route("/v1/models", self._list_models, methods=["GET"])

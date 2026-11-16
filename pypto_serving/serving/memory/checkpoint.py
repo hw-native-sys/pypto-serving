@@ -14,6 +14,8 @@ prefix lookup still validates every required group, including full-history KV.
 
 from dataclasses import dataclass
 
+from pypto_serving.tools.profile import request as request_trace
+
 
 @dataclass
 class CheckpointWritePlan:
@@ -137,6 +139,7 @@ class GroupCheckpointWriter:
                 if block.ref_cnt == 0:
                     pool.free_queues[partition].append(block)
 
+    @request_trace.traced("cache.checkpoint_complete", resolve=lambda self, request, *args, **kwargs: request_trace.context((request,)))
     def complete(self, request, hashes, tokens, plan):
         if plan is None:
             return

@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, replace
 
 import torch
 
+from pypto_serving.tools.profile import request as request_trace
 from pypto_serving.config.types import KVCacheGroupSpec, KvAllocation, ModelConfig, RuntimeConfig
 from pypto_serving.tools.profile import profile_span
 from .checkpoint import GroupCheckpointWriter, GroupPrefixCheckpoints
@@ -1031,6 +1032,7 @@ class KvCacheManager:
                 )
         return updated
 
+    @request_trace.traced("cache.cache_group_blocks", resolve=lambda self, request_id, *args, **kwargs: request_trace.context((request_id,)))
     def cache_group_blocks(
         self,
         request_id: str,
@@ -1181,6 +1183,7 @@ class KvCacheManager:
             snapshot._groups = ()
             snapshot._owner = None
 
+    @request_trace.traced("cache.cache_group_blocks_from_snapshot", resolve=lambda self, *args, request_id, **kwargs: request_trace.context((request_id,)))
     def cache_group_blocks_from_snapshot(
         self,
         block_hashes: dict[str, list[bytes]],

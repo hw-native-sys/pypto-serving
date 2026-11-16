@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 
+from pypto_serving.tools.profile import request as request_trace
 from pypto_serving.config.types import (
     DecodeBatch,
     DecodeResult,
@@ -322,7 +323,9 @@ class WorkerProcess:
                 self._handle_control_command(cmd)
                 continue
 
-            self._handle_step_command(cmd)
+            request_trace.batch_pickup(cmd)
+            with request_trace.scope(request_trace.command_context(cmd), "worker.serial", step_id=cmd.step_id):
+                self._handle_step_command(cmd)
 
     def _pipelined_busy_loop(self) -> None:
         """Run prepare, device dispatch, and host reclaim as three FIFO stages.
@@ -385,35 +388,39 @@ class WorkerProcess:
                     }
                     for new_request in cmd.new_requests:
                         self._req_cache[new_request.request_id] = new_request
-                owned_slot = None
-                if (
-                    isinstance(cmd, StepCommand)
-                    and (cmd.decode_requests or (cmd.prefill_requests and
-                         getattr(self.executor, "supports_async_prefill_reclaim", False)))
-                    and self.executor.supports_device_decode_embedding
-                ):
-                    # Every writer must own its slot, including the decode
-                    # half of a mixed command that stages later on the device
-                    # lane while this thread prepares the following command.
-                    owned_slot = cmd.step_id % _DECODE_PIPELINE_SLOTS
-                    slot_ownership[owned_slot].acquire()
-                try:
-                    prepared = (
-                        self._prepare_step_command(cmd, buffer_slot=owned_slot)
-                        if isinstance(cmd, StepCommand)
-                        else None
-                    )
-                    if prepared is None and owned_slot is not None:
-                        prepared = _PreparedDecodeWork(prepared=None, buffer_slot=owned_slot)
-                except Exception as exc:
-                    logger.error("Worker decode preparation failed: %s", exc, exc_info=True)
-                    prepared = _PreparedDecodeWork(
-                        prepared=None,
-                        buffer_slot=owned_slot if owned_slot is not None else 0,
-                        batch=None,
-                        error=str(exc),
-                    )
-                work_queue.put((cmd, prepared, release_cache_entries))
+                request_trace.batch_pickup(cmd)
+                with request_trace.scope(request_trace.command_context(cmd), "worker.prepare_queue", step_id=getattr(cmd, "step_id", None)):
+                    owned_slot = None
+                    if (
+                        isinstance(cmd, StepCommand)
+                        and (cmd.decode_requests or (cmd.prefill_requests and
+                             getattr(self.executor, "supports_async_prefill_reclaim", False)))
+                        and self.executor.supports_device_decode_embedding
+                    ):
+                        # Every writer must own its slot, including the decode
+                        # half of a mixed command that stages later on the device
+                        # lane while this thread prepares the following command.
+                        owned_slot = cmd.step_id % _DECODE_PIPELINE_SLOTS
+                        with profile_span("worker.slot_wait", cat="worker",
+                                          args=dict(step_id=cmd.step_id, buffer_slot=owned_slot)):
+                            slot_ownership[owned_slot].acquire()
+                    try:
+                        prepared = (
+                            self._prepare_step_command(cmd, buffer_slot=owned_slot)
+                            if isinstance(cmd, StepCommand)
+                            else None
+                        )
+                        if prepared is None and owned_slot is not None:
+                            prepared = _PreparedDecodeWork(prepared=None, buffer_slot=owned_slot)
+                    except Exception as exc:
+                        logger.error("Worker decode preparation failed: %s", exc, exc_info=True)
+                        prepared = _PreparedDecodeWork(
+                            prepared=None,
+                            buffer_slot=owned_slot if owned_slot is not None else 0,
+                            batch=None,
+                            error=str(exc),
+                        )
+                    work_queue.put((cmd, prepared, release_cache_entries))
                 if isinstance(cmd, ShutdownCommand):
                     break
         finally:
@@ -446,118 +453,123 @@ class WorkerProcess:
                 output_work_queue.put(barrier)
                 barrier.completed.wait()
                 continue
-            assert isinstance(cmd, StepCommand)
-            try:
-                self._wait_for_pending_decode_reclaims(cmd.finished_request_ids)
-                accepted_lengths = getattr(self, "_accepted_output_lengths", {})
-                # Both grammar and stop-token masks depend on committed output.
-                self._wait_for_pending_decode_reclaims(
-                    [
-                        request.request_id
-                        for request in cmd.decode_requests
-                        if (cached := self._req_cache.get(request.request_id)) is not None
-                        and (cached.constraint_spec is not None
-                             or self._min_tokens_mask_active(
-                                 cached,
-                                 accepted_lengths.get(request.request_id, 0),
-                             ))
-                    ]
-                )
-                self._wait_for_pending_prefill_reclaims(cmd.finished_request_ids)
-                self._apply_command_lifecycle(cmd, release_cache_entries)
-            except Exception as exc:
-                logger.error("Worker command lifecycle failed: %s", exc, exc_info=True)
-                output_work_queue.put(
-                    _CompletedStepOutput(
-                        StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id),
-                        buffer_slot=prepared.buffer_slot if prepared is not None else None,
-                    )
-                )
-                continue
-            if cmd.prefill_requests and not self._can_split_prefill_output(cmd, prepared):
-                with self._pending_decode_condition:
-                    prior_requests = tuple(self._pending_prefill_request_counts)
-                self._wait_for_pending_prefill_reclaims(prior_requests)
-            elif cmd.prefill_requests and getattr(
-                self.executor, "prefill_tail_requires_reclaim_before_dispatch", False
-            ):
-                # The device ring capture reads the forward's shared hidden
-                # scratch; the next forward must wait until capture completes.
-                with self._pending_decode_condition:
-                    prior_requests = tuple(self._pending_prefill_request_counts)
-                self._wait_for_pending_prefill_reclaims(
-                    prior_requests
-                )
-            if self._can_split_prefill_output(cmd, prepared):
-                assert prepared is not None and prepared.prefill_batch is not None
+            if request_trace.command_context(cmd):
+                if not hasattr(self, "_request_profile_steps"):
+                    self._request_profile_steps = {}
+                self._request_profile_steps[cmd.step_id] = request_trace.command_context(cmd)
+            with request_trace.scope(request_trace.command_context(cmd), "worker.dispatch", step_id=cmd.step_id):
+                assert isinstance(cmd, StepCommand)
                 try:
-                    with profile_span("WorkerProcess.dispatch_prefill", cat="worker",
-                                      args={"step_id": cmd.step_id, "buffer_slot": prepared.buffer_slot}):
-                        pending = self.executor.dispatch_prepared_prefill(
-                            self.model_record.runtime_model, prepared.prefill_batch,
-                            prepared.prefill_prepared,
-                        )
-                    self._track_pending_prefill_requests(cmd.prefill_requests)
-                    output_work_queue.put(_PendingPrefillOutput(
-                        cmd=cmd, scheduled=tuple(cmd.prefill_requests),
-                        pending=pending, buffer_slot=prepared.buffer_slot,
-                    ))
-                except Exception as exc:
-                    logger.error("Worker prefill dispatch failed: %s", exc, exc_info=True)
-                    output_work_queue.put(_CompletedStepOutput(
-                        StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id),
-                        buffer_slot=prepared.buffer_slot,
-                    ))
-                continue
-            if self._can_split_decode_output(cmd, prepared):
-                assert prepared is not None and prepared.batch is not None
-                try:
-                    with profile_span(
-                        "WorkerProcess.dispatch_decode",
-                        cat="worker",
-                        args={"step_id": cmd.step_id, "buffer_slot": prepared.buffer_slot},
-                    ):
-                        dispatch_batch = self._late_bind_prepared_decode_batch(
-                            prepared,
-                            tuple(cmd.decode_requests),
-                        )
-                        started_ns = self._decode_metrics.start() if self._decode_metrics else 0
-                        pending = self.executor.dispatch_prepared_decode(
-                            self.model_record.runtime_model,
-                            dispatch_batch,
-                            prepared.prepared,
-                        )
-                    self._track_pending_decode_requests(cmd.decode_requests)
-                    output_work_queue.put(
-                        _PendingDecodeOutput(
-                            cmd=cmd,
-                            scheduled=tuple(cmd.decode_requests),
-                            pending=pending,
-                            buffer_slot=prepared.buffer_slot,
-                            batch=dispatch_batch,
-                            started_ns=started_ns,
-                        )
+                    self._wait_for_pending_decode_reclaims(cmd.finished_request_ids)
+                    accepted_lengths = getattr(self, "_accepted_output_lengths", {})
+                    # Both grammar and stop-token masks depend on committed output.
+                    self._wait_for_pending_decode_reclaims(
+                        [
+                            request.request_id
+                            for request in cmd.decode_requests
+                            if (cached := self._req_cache.get(request.request_id)) is not None
+                            and (cached.constraint_spec is not None
+                                 or self._min_tokens_mask_active(
+                                     cached,
+                                     accepted_lengths.get(request.request_id, 0),
+                                 ))
+                        ]
                     )
+                    self._wait_for_pending_prefill_reclaims(cmd.finished_request_ids)
+                    self._apply_command_lifecycle(cmd, release_cache_entries)
                 except Exception as exc:
-                    logger.error("Worker decode dispatch failed: %s", exc, exc_info=True)
+                    logger.error("Worker command lifecycle failed: %s", exc, exc_info=True)
                     output_work_queue.put(
                         _CompletedStepOutput(
                             StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id),
-                            buffer_slot=prepared.buffer_slot,
+                            buffer_slot=prepared.buffer_slot if prepared is not None else None,
                         )
                     )
-                continue
-            try:
-                result = self._execute_step(cmd, prepared_decode=prepared)
-            except Exception as exc:
-                logger.error("Worker step failed: %s", exc, exc_info=True)
-                result = StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id)
-            output_work_queue.put(
-                _CompletedStepOutput(
-                    result,
-                    buffer_slot=prepared.buffer_slot if prepared is not None else None,
+                    continue
+                if cmd.prefill_requests and not self._can_split_prefill_output(cmd, prepared):
+                    with self._pending_decode_condition:
+                        prior_requests = tuple(self._pending_prefill_request_counts)
+                    self._wait_for_pending_prefill_reclaims(prior_requests)
+                elif cmd.prefill_requests and getattr(
+                    self.executor, "prefill_tail_requires_reclaim_before_dispatch", False
+                ):
+                    # The device ring capture reads the forward's shared hidden
+                    # scratch; the next forward must wait until capture completes.
+                    with self._pending_decode_condition:
+                        prior_requests = tuple(self._pending_prefill_request_counts)
+                    self._wait_for_pending_prefill_reclaims(
+                        prior_requests
+                    )
+                if self._can_split_prefill_output(cmd, prepared):
+                    assert prepared is not None and prepared.prefill_batch is not None
+                    try:
+                        with profile_span("WorkerProcess.dispatch_prefill", cat="worker",
+                                          args={"step_id": cmd.step_id, "buffer_slot": prepared.buffer_slot}):
+                            pending = self.executor.dispatch_prepared_prefill(
+                                self.model_record.runtime_model, prepared.prefill_batch,
+                                prepared.prefill_prepared,
+                            )
+                        self._track_pending_prefill_requests(cmd.prefill_requests)
+                        output_work_queue.put(_PendingPrefillOutput(
+                            cmd=cmd, scheduled=tuple(cmd.prefill_requests),
+                            pending=pending, buffer_slot=prepared.buffer_slot,
+                        ))
+                    except Exception as exc:
+                        logger.error("Worker prefill dispatch failed: %s", exc, exc_info=True)
+                        output_work_queue.put(_CompletedStepOutput(
+                            StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id),
+                            buffer_slot=prepared.buffer_slot,
+                        ))
+                    continue
+                if self._can_split_decode_output(cmd, prepared):
+                    assert prepared is not None and prepared.batch is not None
+                    try:
+                        with profile_span(
+                            "WorkerProcess.dispatch_decode",
+                            cat="worker",
+                            args={"step_id": cmd.step_id, "buffer_slot": prepared.buffer_slot},
+                        ):
+                            dispatch_batch = self._late_bind_prepared_decode_batch(
+                                prepared,
+                                tuple(cmd.decode_requests),
+                            )
+                            started_ns = self._decode_metrics.start() if self._decode_metrics else 0
+                            pending = self.executor.dispatch_prepared_decode(
+                                self.model_record.runtime_model,
+                                dispatch_batch,
+                                prepared.prepared,
+                            )
+                        self._track_pending_decode_requests(cmd.decode_requests)
+                        output_work_queue.put(
+                            _PendingDecodeOutput(
+                                cmd=cmd,
+                                scheduled=tuple(cmd.decode_requests),
+                                pending=pending,
+                                buffer_slot=prepared.buffer_slot,
+                                batch=dispatch_batch,
+                                started_ns=started_ns,
+                            )
+                        )
+                    except Exception as exc:
+                        logger.error("Worker decode dispatch failed: %s", exc, exc_info=True)
+                        output_work_queue.put(
+                            _CompletedStepOutput(
+                                StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id),
+                                buffer_slot=prepared.buffer_slot,
+                            )
+                        )
+                    continue
+                try:
+                    result = self._execute_step(cmd, prepared_decode=prepared)
+                except Exception as exc:
+                    logger.error("Worker step failed: %s", exc, exc_info=True)
+                    result = StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id)
+                output_work_queue.put(
+                    _CompletedStepOutput(
+                        result,
+                        buffer_slot=prepared.buffer_slot if prepared is not None else None,
+                    )
                 )
-            )
 
     def _output_reclaim_loop(
         self,
@@ -581,26 +593,29 @@ class WorkerProcess:
                 finally:
                     work.completed.set()
                 continue
-            if isinstance(work, _CompletedStepOutput):
-                result = work.result
-                buffer_slot = work.buffer_slot
-            elif isinstance(work, _PendingDecodeOutput):
-                try:
-                    result = self._reclaim_pending_decode(work)
-                finally:
-                    self._finish_pending_decode_reclaims(work.scheduled)
-                buffer_slot = work.buffer_slot
-            elif isinstance(work, _PendingPrefillOutput):
-                try:
-                    result = self._reclaim_pending_prefill(work)
-                finally:
-                    self._finish_pending_prefill_reclaims(work.scheduled)
-                buffer_slot = work.buffer_slot
-            else:
-                raise TypeError(f"unexpected output work item: {type(work).__name__}")
-            if buffer_slot is not None:
-                slot_ownership[buffer_slot].release()
-            self.output_queue.put(encode_result(result))
+            with request_trace.scope(getattr(self, "_request_profile_steps", {}).pop(
+                    work.result.step_id if isinstance(work, _CompletedStepOutput) else work.cmd.step_id, None),
+                    "worker.reclaim_result"):
+                if isinstance(work, _CompletedStepOutput):
+                    result = work.result
+                    buffer_slot = work.buffer_slot
+                elif isinstance(work, _PendingDecodeOutput):
+                    try:
+                        result = self._reclaim_pending_decode(work)
+                    finally:
+                        self._finish_pending_decode_reclaims(work.scheduled)
+                    buffer_slot = work.buffer_slot
+                elif isinstance(work, _PendingPrefillOutput):
+                    try:
+                        result = self._reclaim_pending_prefill(work)
+                    finally:
+                        self._finish_pending_prefill_reclaims(work.scheduled)
+                    buffer_slot = work.buffer_slot
+                else:
+                    raise TypeError(f"unexpected output work item: {type(work).__name__}")
+                if buffer_slot is not None:
+                    slot_ownership[buffer_slot].release()
+                self.output_queue.put(encode_result(result))
 
     def _track_pending_decode_requests(self, requests: list[DecodeRequest]) -> None:
         """Retain request lifecycle state until this decode is reclaimed."""
@@ -767,6 +782,29 @@ class WorkerProcess:
 
     def _handle_profile_command(self, cmd: ProfileCommand) -> None:
         """Apply a profile command and acknowledge it after the file is flushed."""
+        if cmd.request_capture is not None:
+            error = None
+            processes = []
+            pending = False
+            try:
+                if cmd.active:
+                    processes.append(request_trace.ensure(cmd.request_capture).key)
+                if self._services is not None:
+                    prepare = getattr(self._services, "request_profile", None)
+                    if prepare is not None:
+                        owners = prepare(cmd.active, cmd.request_capture)
+                        if cmd.active:
+                            processes.extend(owners or ())
+                if not cmd.active and not request_trace.close(cmd.request_capture["capture"]):
+                    raise BlockingIOError("request profile worker is still draining")
+            except BlockingIOError:
+                pending = True
+            except Exception as exc:
+                error = str(exc)
+            if self.profile_output_queue is not None:
+                self.profile_output_queue.put(encode_profile_result(ProfileResult(
+                    active=cmd.active, error=error, command_id=cmd.command_id, request_processes=processes, request_pending=pending)))
+            return
         profiler = get_profiler(initially_active=False)
         error = None
         transfer_profile = self._services.set_profile_active if self._services is not None else None
@@ -794,6 +832,7 @@ class WorkerProcess:
                 encode_profile_result(ProfileResult(active=profiler.active, error=error, command_id=cmd.command_id))
             )
 
+    @request_trace.traced("worker.control", resolve=lambda self, cmd: cmd.request_profile)
     def _handle_control_command(self, cmd: ControlCommand) -> None:
         """Run a worker-owned PD operation after all older device work settles."""
         error = None
@@ -841,6 +880,7 @@ class WorkerProcess:
             logger.error(f"Worker step failed: {e}", exc_info=True)
             return StepResult(new_tokens={}, error=str(e), step_id=cmd.step_id)
 
+    @request_trace.traced("worker.lifecycle", resolve=lambda self, cmd, *args, **kwargs: cmd.request_profile)
     def _apply_command_lifecycle(
         self,
         cmd: StepCommand,
@@ -1078,6 +1118,8 @@ class WorkerProcess:
                 "ordinary target-only dispatch is not a valid fallback"
             )
 
+    @request_trace.traced("worker.prefill", resolve=lambda self, scheduled, *args, **kwargs:
+                          request_trace.subset(item.request_id for item in scheduled))
     def _batch_prefill(
         self,
         scheduled: list[PrefillRequest],
@@ -1306,6 +1348,8 @@ class WorkerProcess:
             } if bind_policy else {},
         )
 
+    @request_trace.traced("worker.decode", resolve=lambda self, scheduled, *args, **kwargs:
+                          request_trace.subset(item.request_id for item in scheduled))
     def _batch_decode(
         self,
         scheduled: list[DecodeRequest],

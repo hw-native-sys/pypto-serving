@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 from .protocol import CapacityExhausted, receive, send
 
+from pypto_serving.tools.profile import request as request_trace
+
 
 class Session:
     def __init__(self, reader, writer, capacity=32):
@@ -22,7 +24,8 @@ class Session:
         self.sequence = 0
         self.lock = asyncio.Lock()
         self.slots = asyncio.Semaphore(capacity)
-        self.task = asyncio.create_task(self._read())
+        with request_trace.scope(None):
+            self.task = asyncio.create_task(self._read())
 
     @property
     def closed(self):
@@ -36,6 +39,8 @@ class Session:
                 future = self.pending.get(reply["id"])
                 if future is None or future.done():
                     raise ValueError("unexpected control reply")
+                request_trace.event("pd.control.reply", tag=getattr(future, "_request_profile", None),
+                                    sequence=reply["id"], error="error" in reply)
                 if "error" in reply:
                     error_type = CapacityExhausted if reply.get("code") == "capacity_exhausted" else RuntimeError
                     future.set_exception(error_type(reply["error"]))
@@ -49,6 +54,7 @@ class Session:
                 if not future.done():
                     future.set_exception(error)
 
+    @request_trace.traced("pd.control.roundtrip")
     async def call(self, operation, payload):
         await self.slots.acquire()
         future = None
@@ -59,9 +65,14 @@ class Session:
                 self.sequence += 1
                 sequence = self.sequence
                 future = asyncio.get_running_loop().create_future()
+                if request_trace.current.get():
+                    future._request_profile = request_trace.current.get()
+                    request_trace.track("pd.rpc", id(future))
                 self.pending[sequence] = future
                 try:
-                    await send(self.writer, {"id": sequence, "op": operation, "payload": payload})
+                    request_trace.event("pd.control.send", sequence=sequence, operation=operation)
+                    await send(self.writer, {"id": sequence, "op": operation, "payload": payload,
+                                             "request_profile": request_trace.marker()})
                 except BaseException:
                     self.pending.pop(sequence, None)
                     future.cancel()
@@ -73,6 +84,8 @@ class Session:
                 self.slots.release()
             else:
                 def consume(done):
+                    request_trace.finish("pd.rpc", id(done), error="cancelled" if done.cancelled() else
+                                         type(done.exception()).__name__ if done.exception() is not None else None)
                     self.pending.pop(sequence, None)
                     self.slots.release()
                     if not done.cancelled():

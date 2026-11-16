@@ -13,6 +13,8 @@ import json
 import logging
 import re
 
+from pypto_serving.tools.profile import request as request_trace
+
 logger = logging.getLogger(__name__)
 SESSION_HEADER = "x-session-id"
 ERROR_SOURCE_HEADER = "x-pypto-error-source"
@@ -44,8 +46,12 @@ def filter_headers(headers, drop):
 
 
 def request_headers(headers, *, drop=(), extra=None):
-    return {**filter_headers(headers, {"host", "content-length", ERROR_SOURCE_HEADER, *drop}),
-            **(extra or {})}
+    result = {**filter_headers(headers, {"host", "content-length", ERROR_SOURCE_HEADER,
+                                        request_trace.HEADER, *drop}), **(extra or {})}
+    marker = request_trace.marker()
+    if marker:
+        result[request_trace.HEADER] = json.dumps(marker, separators=(",", ":"))
+    return result
 
 
 def response_headers(response, session_id, *, decoded=False, source=None):
@@ -112,8 +118,12 @@ async def send(client, registry, replica, path, *, headers, stream=True, timeout
     if timeout is not None:
         options["timeout"] = timeout
     try:
+        if request_trace.current.get():
+            request_trace.event("http.upstream.send", node=replica.name, role=replica.role, path=path)
         request = client.build_request("POST", replica.base_url + path, **options)
-        return await client.send(request, stream=stream)
+        response = await client.send(request, stream=stream)
+        request_trace.event("http.upstream.headers", node=replica.name, status=response.status_code)
+        return response
     except Exception as exc:
         if isinstance(exc, (OSError, httpx.TransportError)) and not is_router_side_failure(exc):
             registry.set_ready(replica.name, False)
@@ -127,6 +137,7 @@ class Retirement:
         self.active, self.owner, self.release = active, owner, release
         self.before_close = before_close
         self.response = self.task = self.timer = None
+        request_trace.track("http.retire", id(self))
         active[owner] = self.retire
 
     def arm(self, timeout):
@@ -153,6 +164,7 @@ class Retirement:
             await asyncio.shield(task)
             raise
 
+    @request_trace.traced("http.retire")
     async def _close(self):
         try:
             if self.before_close is not None:
@@ -168,6 +180,7 @@ class Retirement:
             finally:
                 self.release()
                 self.active.pop(self.owner, None)
+                request_trace.finish("http.retire", id(self))
 
 
 async def close_requests(active, timeout):

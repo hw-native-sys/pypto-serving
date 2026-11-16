@@ -126,6 +126,7 @@ class StepCommand(msgspec.Struct, tag="step"):
     # Monotonic step counter, echoed back on StepResult. Cheap ordering guard for
     # the pipelined loop (the worker is FIFO, so results must return in order).
     step_id: int = 0
+    request_profile: dict | None = None
 
 
 class ShutdownCommand(msgspec.Struct, tag="shutdown"):
@@ -137,6 +138,7 @@ class ProfileCommand(msgspec.Struct, tag="profile"):
 
     active: bool
     command_id: int = 0
+    request_capture: dict | None = None
 
 
 class ControlCommand(msgspec.Struct, tag="control"):
@@ -145,6 +147,7 @@ class ControlCommand(msgspec.Struct, tag="control"):
     command_id: int
     operation: str
     payload: bytes = b""
+    request_profile: dict | None = None
 
 
 # Union used for the decoder — tag field ("type") discriminates.
@@ -179,6 +182,8 @@ class ProfileResult(msgspec.Struct, tag="profile"):
     active: bool
     error: str | None = None
     command_id: int = 0
+    request_processes: list[str] = msgspec.field(default_factory=list)
+    request_pending: bool = False
 
 
 class ControlResult(msgspec.Struct, tag="control"):
