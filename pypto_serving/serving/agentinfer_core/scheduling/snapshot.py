@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
-# Modified by PyPTO Serving: internal imports use the bundled scheduling package.
+# Modified by PyPTO Serving: adapt imports and expose uncached KV headroom.
 """Immutable scheduling snapshots passed to stateful strategy Hooks.
 
 ``SchedulingSnapshot`` is the complete read model used for one admission, resume, or capacity-repair decision. It

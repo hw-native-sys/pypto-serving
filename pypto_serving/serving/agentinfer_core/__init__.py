@@ -6,9 +6,11 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Bundled AgentInfer scheduling implementation.
+"""Agent session scheduling adapted from AgentInfer.
 
-The scheduling sources are vendored from AgentInfer revision
-``9b8e3c473c83dba1a73aefd33ba081c83c3c3bdd`` so PyPTO serving does not need
-to import or install the external AgentInfer package at runtime.
+Upstream: https://github.com/openJiuwen-ai/agent-infer
+
+PyPTO Serving integrates the scheduling core with native admission, KV cache
+capacity observations, and request lifecycle handling. The scheduling sources
+retain their Apache-2.0 license; see LICENSE-APACHE-2.0.
 """

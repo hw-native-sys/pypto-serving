@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
-# Modified by PyPTO Serving: internal imports use the bundled scheduling package.
+# Modified by PyPTO Serving: adapt imports and document registry-wide generations.
 """Environment-neutral program facts for AgentInfer scheduling strategies.
 
 This module defines the stable vocabulary shared by Router Runtime and every scheduling policy: generation-safe
