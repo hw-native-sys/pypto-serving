@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
-# Modified by PyPTO Serving: internal imports use the bundled scheduling package.
+# Modified by PyPTO Serving: adapt imports and bound generation bookkeeping.
 """Generation-safe Program identity, task membership, and blocking-edge registry.
 
 ``ProgramRegistry`` owns live ``RuntimeProgram`` records and the indexes required to materialize immutable scheduling

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
-# Modified by PyPTO Serving: internal imports use the bundled scheduling package.
+# Modified by PyPTO Serving: adapt imports and expose uncached KV headroom.
 """Backend, DP-rank capacity, and dispatch types shared by host adapters.
 
 Capacities are expressed as logical KV-token slots and belong to the concrete DP rank that owns the corresponding

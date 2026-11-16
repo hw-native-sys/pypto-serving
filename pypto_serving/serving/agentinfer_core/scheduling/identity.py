@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
-# Modified by PyPTO Serving: internal imports use the bundled scheduling package.
+# Modified by PyPTO Serving: adapt imports and extend framework session headers.
 """Normalize supported request metadata into one host-neutral Agent identity.
 
 The module is the shared metadata boundary for AgentCache and AgentRouter. It parses explicit AgentInfer fields and

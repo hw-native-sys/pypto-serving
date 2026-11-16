@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
-# Modified by PyPTO Serving: internal imports use the bundled scheduling package.
+# Modified by PyPTO Serving: adapt imports, account for native KV capacity, and bound victim selection.
 """Progress-TTL strategy over the shared AgentInfer scheduling contracts.
 
 The strategy guarantees short consecutive service segments, retains acting Programs only while avoided cold-prefill

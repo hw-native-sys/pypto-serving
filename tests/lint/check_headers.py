@@ -26,8 +26,8 @@ PY_HEADER = """\
 
 AGENTINFER_HEADER = """\
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
-# Modified by PyPTO Serving: internal imports use the bundled scheduling package."""
+# SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project"""
+AGENTINFER_MODIFICATION_PREFIX = "# Modified by PyPTO Serving: "
 AGENTINFER_SOURCE = Path(__file__).resolve().parents[2] / "pypto_serving/serving/agentinfer_core/scheduling"
 
 
@@ -48,7 +48,7 @@ def get_git_tracked_files(root: Path) -> list[Path]:
 
 
 def check_header(path: Path) -> tuple[bool, str]:
-    """Check project sources and the explicitly vendored AgentInfer sources."""
+    """Check project headers and attribution for the adapted AgentInfer sources."""
     header = AGENTINFER_HEADER if path.is_relative_to(AGENTINFER_SOURCE) else PY_HEADER
     expected_lines = header.split("\n")
     try:
@@ -66,6 +66,13 @@ def check_header(path: Path) -> tuple[bool, str]:
                 f"Line {index + 1}: expected: {expected!r}, "
                 f"got: {actual_lines[index]!r}"
             )
+    if path.is_relative_to(AGENTINFER_SOURCE):
+        index = len(expected_lines)
+        modification = actual_lines[index] if len(actual_lines) > index else ""
+        if not modification.startswith(AGENTINFER_MODIFICATION_PREFIX) or not modification.removeprefix(
+            AGENTINFER_MODIFICATION_PREFIX
+        ).strip():
+            return False, f"Line {index + 1}: expected a non-empty PyPTO Serving modification notice"
     return True, ""
 
 

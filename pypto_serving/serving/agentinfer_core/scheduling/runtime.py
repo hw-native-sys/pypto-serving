@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
-# Modified by PyPTO Serving: internal imports use the bundled scheduling package.
+# Modified by PyPTO Serving: adapt imports and integrate native KV observations and response lifecycle handling.
 """Environment-neutral AgentInfer Scheduler with an embedded RequestPool.
 
 ``ProgramScheduler`` owns request retention, request-to-Program bindings, mutable Program records, strategy

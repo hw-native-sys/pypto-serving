@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
-# Modified by PyPTO Serving: internal imports use the bundled scheduling package.
+# Modified by PyPTO Serving: adapt imports and add native admission wait bounds.
 """Validated configuration for the Progress-TTL scheduling policy.
 
 The policy combines workload-derived continuous-growth protection, capacity-aware pause/resume, and an acting TTL
