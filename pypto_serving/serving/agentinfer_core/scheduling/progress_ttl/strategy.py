@@ -29,6 +29,9 @@ from pypto_serving.serving.agentinfer_core.scheduling.transitions import Transit
 ProgressTTLFactors = StrategyFactors[ProgressTTLGlobalFactors, ProgressTTLProgramFactors]
 logger = logging.getLogger(__name__)
 
+# Bound synchronous subset search work on the engine's event loop.
+_CAPACITY_FIT_SEARCH_STEPS = 4096
+
 
 @dataclass(frozen=True)
 class _ForceResumeTimeoutEstimate:
@@ -1771,12 +1774,24 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
         *,
         per_program_relief_tokens: int = 0,
     ) -> tuple[ProgramView, ...] | None:
+        """Minimize excess relief within a fixed search budget, then use a greedy cover."""
         if deficit <= 0:
             return ()
+        candidates = [
+            (program, tokens)
+            for program in sorted(programs, key=lambda item: item.ref)
+            if (tokens := self._capacity_tokens(program) + per_program_relief_tokens) > 0
+        ]
+        total = sum(tokens for _, tokens in candidates)
+        if total < deficit:
+            return None
         reachable: dict[int, tuple[ProgramView, ...]] = {0: ()}
         best: tuple[int, tuple[ProgramView, ...]] | None = None
-        for program in sorted(programs, key=lambda item: (item.ref.program_id, item.ref.generation)):
-            tokens = self._capacity_tokens(program) + per_program_relief_tokens
+        remaining_steps = _CAPACITY_FIT_SEARCH_STEPS
+        for program, tokens in candidates:
+            if len(reachable) > remaining_steps:
+                break
+            remaining_steps -= len(reachable)
             additions: dict[int, tuple[ProgramView, ...]] = {}
             for freed, selected in tuple(reachable.items()):
                 new_freed = freed + tokens
@@ -1791,7 +1806,23 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
                     if existing is None or candidate_key < (len(existing), tuple(item.ref for item in existing)):
                         additions[new_freed] = candidate
             reachable.update(additions)
-        return best[1] if best is not None else None
+        else:
+            return best[1] if best is not None else None
+
+        # Remove the largest unnecessary victims first. This always covers the
+        # deficit in O(n log n) work, without a token-sized subset state space.
+        selected: list[ProgramView] = []
+        for program, tokens in sorted(candidates, key=lambda item: (-item[1], item[0].ref)):
+            if total - tokens >= deficit:
+                total -= tokens
+            else:
+                selected.append(program)
+        greedy = tuple(sorted(selected, key=lambda item: item.ref))
+        if best is not None and (best[0], len(best[1]), tuple(item.ref for item in best[1])) <= (
+            total, len(greedy), tuple(item.ref for item in greedy)
+        ):
+            return best[1]
+        return greedy
 
     def _select_layered_capacity_fit(
         self,
