@@ -43,6 +43,32 @@ Explicit `--ring-heap` values apply to all DSpark profiles and worker prewarm,
 including speculative bootstrap; available capacity still requires validation
 at the intended context and batch sizes.
 
+## Expert Load Balancing
+
+Add these options to a non-PD DSpark server using TP4/EP8 or TP4/EP16:
+
+```bash
+--enable-eplb \
+--eplb-config '{"num_redundant_experts":16,"max_migration_bytes":17179869184}'
+```
+
+EPLB preserves logical expert routing and places expert replicas in fixed physical
+slots. The logical expert count plus `num_redundant_experts` must divide evenly
+across EP ranks. Redundant slots consume additional device memory. Set
+`max_migration_bytes` to an explicit positive per-rebalance transfer budget;
+the example permits up to 16 GiB and is not a recommended memory sizing value.
+
+By default, EPLB collects decode loads over a 128-step window and considers
+rebalancing every 1024 collected steps, with at most one layer per rebalance
+and a minimum relative gain of 0.05. Optional JSON fields include `window_size`,
+`step_interval`, `load_collection_phase` (`prefill` or `decode`), `policy`
+(`temporal_greedy` or `cumulative_greedy`), `max_layers_per_rebalance`, and
+`min_relative_gain`. P/D deployments and drafter balancing are unsupported.
+
+Serving and pypto-lib must both include the matching EPLB ABI. Maintenance drains
+in-flight outputs before migrating expert weights and scales, then publishes the
+new placement. A failed installation stops subsequent compute on that executor.
+
 ## Verify
 
 ```bash

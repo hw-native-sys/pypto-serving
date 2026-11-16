@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Literal
 
 import torch
@@ -18,6 +19,77 @@ from pypto_serving.model.tokenizer import TokenizerAdapter
 
 
 PREFILL_CHUNK_SIZE_CHOICES = (1024, 2048, 4096, 8192)
+
+
+@dataclass(frozen=True)
+class EplbConfig:
+    """Engine-wide DSpark expert placement and maintenance limits."""
+
+    enabled: bool = False
+    num_redundant_experts: int = 0
+    window_size: int = 128
+    step_interval: int = 1024
+    # None preserves the distinction between an omitted phase and an explicit one.
+    load_collection_phase: str | None = None
+    policy: str = "temporal_greedy"
+    min_relative_gain: float = 0.05
+    max_layers_per_rebalance: int = 1
+    max_migration_bytes: int = 0
+    transfer_backend: str = "device_maintenance"
+    balance_drafter: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("enabled", "balance_drafter"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"EPLB {name} must be a boolean")
+        for name, minimum in (
+            ("num_redundant_experts", 0), ("window_size", 1), ("step_interval", 1),
+            ("max_layers_per_rebalance", 1), ("max_migration_bytes", 0),
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(f"EPLB {name} must be an integer >= {minimum}")
+        if self.step_interval < self.window_size:
+            raise ValueError("EPLB step_interval must be >= window_size")
+        if self.load_collection_phase not in (None, "prefill", "decode"):
+            raise ValueError("EPLB load_collection_phase must be prefill or decode")
+        if self.policy not in ("temporal_greedy", "cumulative_greedy"):
+            raise ValueError("Unsupported EPLB policy")
+        if (
+            isinstance(self.min_relative_gain, bool)
+            or not isinstance(self.min_relative_gain, (int, float))
+            or not math.isfinite(self.min_relative_gain)
+            or not 0 <= self.min_relative_gain < 1
+        ):
+            raise ValueError("EPLB min_relative_gain must be finite and in [0, 1)")
+        if self.transfer_backend != "device_maintenance":
+            raise ValueError("EPLB only implements the device_maintenance backend")
+        if self.balance_drafter:
+            raise ValueError("EPLB drafter balancing is not supported")
+        if self.enabled and self.max_migration_bytes == 0:
+            raise ValueError("Enabled EPLB requires an explicit positive max_migration_bytes")
+
+    def phase_for_role(self, execution_role: str) -> str:
+        """Resolve a collection phase without sharing P/D controller state."""
+        if execution_role not in ("mixed", "prefill", "decode"):
+            raise ValueError("Unsupported EPLB execution role")
+        expected = None if execution_role == "mixed" else execution_role
+        phase = self.load_collection_phase or expected or "decode"
+        if expected is not None and phase != expected:
+            raise ValueError("EPLB collection phase conflicts with the execution role")
+        return phase
+
+    def validate_topology(self, *, logical_experts: int, ranks: int, tp_size: int,
+                          execution_role: str) -> int:
+        """Freeze physical capacity before compilation or device allocation."""
+        if execution_role != "mixed":
+            raise ValueError("EPLB P/D integration is not yet supported")
+        if tp_size != 4 or ranks not in (8, 16):
+            raise ValueError("EPLB requires TP4/DP2/EP8 or TP4/DP4/EP16")
+        physical = logical_experts + self.num_redundant_experts
+        if logical_experts <= 0 or physical % ranks or physical // ranks > logical_experts:
+            raise ValueError("Invalid EPLB physical expert capacity")
+        return physical // ranks
 
 
 @dataclass(frozen=True)

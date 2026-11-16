@@ -10,6 +10,8 @@
 
 import ast
 import ctypes
+import weakref
+from collections import Counter
 from dataclasses import make_dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,7 +20,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from pypto_serving.config.types import DecodeBatch, PrefillBatch, RuntimeConfig
+from pypto_serving.config.types import DecodeBatch, EplbConfig, PrefillBatch, RuntimeConfig
 from pypto_serving.model.deepseek_dspark import task_args as task_args_module
 from pypto_serving.model.deepseek_dspark import npu_executor as executor_module
 from pypto_serving.model.deepseek_dspark import npu_runner as runner_module
@@ -154,7 +156,9 @@ def test_pd_and_ddr_use_the_same_group_components_and_tensor_names():
 
 
 def _runner(*, speculative: bool = False, max_position: int = 512, extension_factory=None,
-            tp_size: int = 4) -> DSparkModelRunner:
+            tp_size: int = 4, eplb: bool = False) -> DSparkModelRunner:
+    from pypto_serving.model.deepseek_dspark.eplb.state import Placement
+
     rows = torch.arange(max_position * 64, dtype=torch.float32).reshape(max_position, 64)
     rope = DSparkRopeTables(
         max_position=max_position,
@@ -186,6 +190,11 @@ def _runner(*, speculative: bool = False, max_position: int = 512, extension_fac
             kernel_dir="unused",
             rope=rope,
             num_speculative_tokens=7 if speculative else 0,
+            decode_full_fused=eplb and speculative,
+            eplb_config=EplbConfig(enabled=eplb, num_redundant_experts=16 if eplb else 0,
+                                   max_migration_bytes=(1 << 34) if eplb else 0),
+            eplb_placement=(Placement.initial(layers=43, logical_experts=256, ranks=16,
+                                               redundant_experts=16) if eplb else None),
         ),
         extension_factory=extension_factory,
     )
@@ -285,6 +294,51 @@ def test_packed_prefill_executor_limits_follow_runtime(monkeypatch, max_batch_si
     assert executor.max_prefill_requests_per_partition == per_group
     assert executor.max_prefill_batch_size == max_batch_size
     assert executor.max_prefill_tokens_per_partition == 8192
+
+
+@pytest.mark.parametrize("pd,failure", [(False, None), (True, None), (True, "owner"), (True, "compute")])
+def test_pd_communication_initializes_after_owners_before_worker_is_returned(monkeypatch, pd, failure):
+    from pypto_serving.pd.adapter import DSparkExtension
+
+    events = []
+    def owner_ready():
+        events.append("owners-ready")
+        if failure == "owner":
+            raise RuntimeError("owner failed")
+    def compute_ready():
+        events.append("compute-init")
+        if failure == "compute":
+            raise RuntimeError("compute failed")
+        events.append("compute-ready")
+    class FakeWorker:
+        def __init__(self, compiled, **kwargs):
+            events.append("worker-created")
+            if pd:
+                self._w = SimpleNamespace(_ensure_comm_base=compute_ready)
+    monkeypatch.setattr("pypto.runtime.DistributedWorker", FakeWorker)
+    runner = DSparkModelRunner.__new__(DSparkModelRunner)
+    runner._eplb = None
+    runner._l3_worker = None
+    runner._l3_run_config = None
+    runner._compiled = SimpleNamespace(l3_callables=lambda: [SimpleNamespace(compiled=object())])
+    runner._inherited_host_weights = lambda: ()
+    runner.runtime_extension = None
+    if pd:
+        extension = DSparkExtension.__new__(DSparkExtension)
+        extension.worker = runner._shared_l3_worker
+        extension.transfer = SimpleNamespace(worker_ready=owner_ready, worker_options=lambda: {})
+        runner.runtime_extension = extension
+    if failure:
+        with pytest.raises(RuntimeError, match=failure + " failed"):
+            runner._shared_l3_worker()
+        assert events == (["worker-created", "owners-ready"] if failure == "owner" else
+                          ["worker-created", "owners-ready", "compute-init"])
+    else:
+        worker = runner._shared_l3_worker()
+        events.append("worker-returned")
+        assert runner._shared_l3_worker() is worker  # No per-request initialization.
+        assert events == (["worker-created", "owners-ready", "compute-init", "compute-ready",
+                           "worker-returned"] if pd else ["worker-created", "worker-returned"])
 
 
 @pytest.mark.parametrize("length", [1, 127, 128, 129, 512, 8064, 8192, 8193, 655359])
@@ -715,6 +769,34 @@ def test_dspark_task_arg_orders_match_pypto_lib_abis() -> None:
     assert len(task_args_module._DECODE_TENSOR_ORDER) == 110
 
 
+@pytest.mark.parametrize("module,name", [
+    ("prefill_fwd", "l3_prefill_fwd"), ("decode_fwd", "l3_decode_fwd"),
+    ("decode_fwd_dspark", "l3_decode_fwd_dspark"),
+])
+def test_disabled_host_driver_preserves_output_contract(module, name):
+    host = _pypto_lib_function(module, name)
+    if module != "decode_fwd_dspark":
+        returns = [node for node in ast.walk(host) if isinstance(node, ast.Return)]
+        assert len(returns) == 1
+        assert isinstance(returns[0].value, ast.Tuple)
+        assert tuple(item.id for item in returns[0].value.elts) == (
+            "x_out", "logits", "sampled_ids", "dspark_target_hidden",
+        )
+    writable = {arg.arg for arg in host.args.args
+                if any(tag in ast.unparse(arg.annotation) for tag in ("pl.Out[", "pl.InOut["))}
+    dispatched = [node for node in ast.walk(host) if isinstance(node, ast.Call)
+                  and any(keyword.arg == "device" for keyword in node.keywords)]
+    assert dispatched
+    for call in dispatched:
+        copies = Counter(ast.unparse(arg) for arg in call.args)
+        for arg in call.args:
+            if isinstance(arg, ast.Subscript) and isinstance(arg.value, ast.Name):
+                if arg.value.id in writable:
+                    assert copies[ast.unparse(arg)] == 1, (
+                        f"{name} aliases writable {ast.unparse(arg)}; unused placeholders must be read-only"
+                    )
+
+
 def test_fused_dspark_target_args_match_pypto_lib_abi() -> None:
     """The K7 target prefix includes the mask and capped draft counts."""
     fused = _pypto_lib_function("decode_fwd_dspark", "l3_decode_fwd_dspark")
@@ -722,6 +804,62 @@ def test_fused_dspark_target_args_match_pypto_lib_abi() -> None:
         name for name in task_args_module._FUSED_DECODE_TENSOR_ORDER
         if name not in runner_module._DSPARK_FUSED_INTERNAL_PREPARE_NAMES
     )
+    assert tuple(arg.arg for arg in fused.args.args[:len(target)]) == target
+
+
+@pytest.mark.parametrize("speculative", [False, True], ids=["k0", "k7"])
+def test_eplb_abi_appends_controls_and_owns_padded_host_outputs(speculative):
+    runner = _runner(speculative=speculative, eplb=True)
+    extra = ("eplb_mapping", "eplb_replicas", "eplb_load", "eplb_control")
+    programs = (("prefill_fwd", "l3_prefill_fwd", runner._prefill_task_args),
+                ("decode_fwd", "l3_decode_fwd", runner._decode_task_args[0]))
+    for module, name, task_args in programs:
+        if speculative and module == "decode_fwd":
+            # The fused target list also contains device-prepare-only metadata.
+            assert tuple(task_args.names[-4:]) == extra
+        else:
+            enabled = _pypto_lib_function(module, name + "_eplb")
+            assert tuple(task_args.names) == tuple(arg.arg for arg in enabled.args.args)
+        load = task_args.tensors["eplb_load"]
+        control = task_args.tensors["eplb_control"]
+        assert load.shape == (16, 43, 32)  # Real capacity 17; each metadata row owns whole cache lines.
+        assert control.shape == (16, 2)
+        assert load.dtype == control.dtype == torch.int32
+        assert load.is_contiguous() and control.is_contiguous()
+    assert runner._prefill_task_args.tensors["eplb_load"].data_ptr() != (
+        runner._decode_task_args[0].tensors["eplb_load"].data_ptr()
+    )
+    for module, name in (("prefill_fwd", "l3_prefill_fwd"), ("decode_fwd", "l3_decode_fwd"),
+                         ("decode_fwd_dspark", "l3_decode_fwd_dspark")):
+        base = _pypto_lib_function(module, name)
+        enabled = _pypto_lib_function(module, name + "_eplb")
+        assert tuple(arg.arg for arg in enabled.args.args) == (
+            *(arg.arg for arg in base.args.args), *extra,
+        )
+        assert "pl.Out" in ast.unparse(enabled.args.args[-2].annotation)
+
+
+def test_eplb_fused_binding_keeps_controls_after_state_prepare_and_drafter(monkeypatch):
+    runner = _runner(speculative=True, eplb=True)
+    task_args = runner._decode_task_args[0]
+    monkeypatch.setattr(task_args, "build", lambda: tuple(task_args.names))
+    runner._device_scratch[("decode_pages_0", "input_ids")] = "resident_input_ids"
+    for method, values in (
+        ("_fused_decode_device_state_args", ("device_state",)),
+        ("_fused_decode_prepare_args", ("device_prepare",)),
+        ("_fused_decode_drafter_args", ("draft_weights",)),
+    ):
+        monkeypatch.setattr(runner, method, lambda slot, result=values: result)
+    args = runner._bind_fused_decode_args(SimpleNamespace(buffer_slot=0))
+    target = tuple(name for name in task_args.names
+                   if name not in runner_module._DSPARK_FUSED_INTERNAL_PREPARE_NAMES
+                   and not name.startswith("eplb_"))
+    assert args == (
+        *("resident_input_ids" if name == "input_ids" else name for name in target),
+        "device_state", "device_prepare", "draft_weights",
+        "eplb_mapping", "eplb_replicas", "eplb_load", "eplb_control",
+    )
+    fused = _pypto_lib_function("decode_fwd_dspark", "l3_decode_fwd_dspark_eplb")
     assert tuple(arg.arg for arg in fused.args.args[:len(target)]) == target
 
 
