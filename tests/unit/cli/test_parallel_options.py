@@ -234,6 +234,7 @@ def test_retention_interval_reaches_runtime_and_scheduler(interval, prefix):
     from pypto_serving.serving.sched.scheduler import SchedulerConfig
 
     argv = ["--model", "model", "--prefix-cache-retention-interval", str(interval),
+            "--max-num-batched-tokens", "4096",
             "--speculative-config", '{"method":"dspark","num_speculative_tokens":7}']
     runtime = cli._build_runtime_config(_parse_cli_args(argv), model_family="deepseek_v4")
     config = EngineConfig(runtime_config=runtime, enable_prefix_cache=prefix)

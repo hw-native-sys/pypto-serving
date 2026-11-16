@@ -21,6 +21,8 @@ import math
 import numpy as np
 import torch
 
+from pypto_serving.tools.profile import profile_span
+
 
 def _is_prime(value: int) -> bool:
     if value < 2:
@@ -173,42 +175,55 @@ class HostEngram:
         self.history.pop(request_id, None)
 
     def hash_ids(self, token_ids, start_pos: int = 0, *, request_id=0) -> torch.Tensor:
-        ids = torch.as_tensor(token_ids, dtype=torch.int64, device="cpu")
-        if ids.ndim != 1 or bool(((ids < 0) | (ids >= self.token_map.numel())).any()):
-            raise ValueError("Engram requires a one-dimensional sequence of valid token IDs")
-        history = self.history.get(request_id, torch.empty(0, dtype=torch.int64))
-        if isinstance(start_pos, bool) or not isinstance(start_pos, int) or not 0 <= start_pos <= history.numel():
-            raise ValueError("Engram continuation requires all preceding token history")
-        compressed = torch.cat((history[:start_pos], self.token_map[ids]))
-        positions = torch.arange(start_pos, compressed.numel(), dtype=torch.int64)
-        lookback = []
-        for shift in range(self.layout.max_ngram_size):
-            source = (positions - shift).clamp_min(0)
-            values = compressed[source]
-            lookback.append(torch.where(positions >= shift, values, self.pad_id))
-        tokens = torch.stack(lookback, dim=-1)
-        products = tokens.unsqueeze(0) * self.multipliers.unsqueeze(1)
-        rolling, hashes = products[..., 0], []
-        for shift in range(1, self.layout.max_ngram_size):
-            rolling = torch.bitwise_xor(rolling, products[..., shift])
-            hashes.append(rolling.unsqueeze(-1) % self.primes[:, shift - 1].unsqueeze(1))
-        self.history[request_id] = compressed
-        return torch.cat(hashes, dim=-1) + self.offsets.unsqueeze(1)
+        with profile_span("v41.HostEngram.hash_ids", cat="v41.engram", level="verbose"):
+            ids = torch.as_tensor(token_ids, dtype=torch.int64, device="cpu")
+            if ids.ndim != 1 or bool(((ids < 0) | (ids >= self.token_map.numel())).any()):
+                raise ValueError("Engram requires a one-dimensional sequence of valid token IDs")
+            history = self.history.get(request_id, torch.empty(0, dtype=torch.int64))
+            if isinstance(start_pos, bool) or not isinstance(start_pos, int) or not 0 <= start_pos <= history.numel():
+                raise ValueError("Engram continuation requires all preceding token history")
+            compressed = torch.cat((history[:start_pos], self.token_map[ids]))
+            positions = torch.arange(start_pos, compressed.numel(), dtype=torch.int64)
+            lookback = []
+            for shift in range(self.layout.max_ngram_size):
+                source = (positions - shift).clamp_min(0)
+                values = compressed[source]
+                lookback.append(torch.where(positions >= shift, values, self.pad_id))
+            tokens = torch.stack(lookback, dim=-1)
+            products = tokens.unsqueeze(0) * self.multipliers.unsqueeze(1)
+            rolling, hashes = products[..., 0], []
+            for shift in range(1, self.layout.max_ngram_size):
+                rolling = torch.bitwise_xor(rolling, products[..., shift])
+                hashes.append(rolling.unsqueeze(-1) % self.primes[:, shift - 1].unsqueeze(1))
+            self.history[request_id] = compressed
+            return torch.cat(hashes, dim=-1) + self.offsets.unsqueeze(1)
 
     def lookup(self, token_ids, capacity: int, start_pos: int = 0, *, request_id=0) -> torch.Tensor:
-        if len(token_ids) > capacity or capacity <= 0:
-            raise ValueError("Engram rows must fit the current-token capacity")
-        hashes = self.hash_ids(token_ids, start_pos, request_id=request_id)
-        result = torch.zeros((len(self.layout.layer_ids), capacity, self.layout.lookup_width), dtype=torch.bfloat16)
-        for slot, layer in enumerate(self.layout.layer_ids):
-            prefix = f"layers.{layer}.engram.embed."
-            rows = self.checkpoint.tensor_rows(prefix + "weight", hashes[slot])
-            scales = self.checkpoint.tensor_rows(prefix + "scale", hashes[slot])
-            if rows.dtype != torch.float8_e4m3fn or rows.shape[-1] != self.layout.head_dim:
-                raise ValueError(f"unsupported native Engram table layout: {prefix}weight")
-            if scales.dtype != torch.float8_e8m0fnu or scales.shape[-1] != self.layout.head_dim // 32:
-                raise ValueError(f"unsupported native Engram table scales: {prefix}scale")
-            scale_values = torch.exp2(scales.view(torch.uint8).float() - 127.0)
-            values = rows.float() * scale_values.repeat_interleave(32, dim=-1)
-            result[slot, :len(token_ids)] = values.flatten(1).to(torch.bfloat16)
-        return result
+        with profile_span("v41.HostEngram.lookup", cat="v41.engram", level="verbose"):
+            if len(token_ids) > capacity or capacity <= 0:
+                raise ValueError("Engram rows must fit the current-token capacity")
+            hashes = self.hash_ids(token_ids, start_pos, request_id=request_id)
+            with profile_span("v41.allocate_lookup", cat="v41.engram", level="verbose"):
+                result = torch.zeros((len(self.layout.layer_ids), capacity, self.layout.lookup_width), dtype=torch.bfloat16)
+            for slot, layer in enumerate(self.layout.layer_ids):
+                prefix = f"layers.{layer}.engram.embed."
+                with profile_span("v41.table_read.weight", cat="v41.engram", level="verbose",
+                                  args={"layer": layer, "tokens": len(token_ids)}):
+                    rows = self.checkpoint.tensor_rows(prefix + "weight", hashes[slot])
+                with profile_span("v41.table_read.scale", cat="v41.engram", level="verbose",
+                                  args={"layer": layer, "tokens": len(token_ids)}):
+                    scales = self.checkpoint.tensor_rows(prefix + "scale", hashes[slot])
+                if rows.dtype != torch.float8_e4m3fn or rows.shape[-1] != self.layout.head_dim:
+                    raise ValueError(f"unsupported native Engram table layout: {prefix}weight")
+                if scales.dtype != torch.float8_e8m0fnu or scales.shape[-1] != self.layout.head_dim // 32:
+                    raise ValueError(f"unsupported native Engram table scales: {prefix}scale")
+                with profile_span("v41.decode_scales", cat="v41.engram", level="verbose",
+                                  args={"layer": layer, "tokens": len(token_ids)}):
+                    scale_values = torch.exp2(scales.view(torch.uint8).float() - 127.0)
+                with profile_span("v41.dequantize", cat="v41.engram", level="verbose",
+                                  args={"layer": layer, "tokens": len(token_ids)}):
+                    values = rows.float() * scale_values.repeat_interleave(32, dim=-1)
+                with profile_span("v41.pack_lookup", cat="v41.engram", level="verbose",
+                                  args={"layer": layer, "tokens": len(token_ids)}):
+                    result[slot, :len(token_ids)] = values.flatten(1).to(torch.bfloat16)
+            return result
