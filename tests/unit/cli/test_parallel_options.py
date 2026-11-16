@@ -227,6 +227,24 @@ def test_role_specific_state_rings_do_not_change_the_chunk_contract(role, budget
     assert tuple(g.max_blocks_per_seq for g in runtime.kv_cache_groups if g.name.endswith("state")) == pages
 
 
+@pytest.mark.parametrize("interval", [0, 128, 2048, 8192, 16384])
+@pytest.mark.parametrize("prefix", [False, True])
+def test_retention_interval_reaches_runtime_and_scheduler(interval, prefix):
+    from pypto_serving.serving.engine.async_engine import EngineConfig
+    from pypto_serving.serving.sched.scheduler import SchedulerConfig
+
+    argv = ["--model", "model", "--prefix-cache-retention-interval", str(interval),
+            "--max-num-batched-tokens", "4096",
+            "--speculative-config", '{"method":"dspark","num_speculative_tokens":7}']
+    runtime = cli._build_runtime_config(_parse_cli_args(argv), model_family="deepseek_v4")
+    config = EngineConfig(runtime_config=runtime, enable_prefix_cache=prefix)
+    runtime = config.resolve_runtime_config()
+    assert runtime.prefix_cache_retention_interval == (interval if prefix else 0)
+    scheduler = SchedulerConfig(prefix_cache_retention_interval=runtime.prefix_cache_retention_interval)
+    scheduler.validate_cache_groups(runtime.kv_cache_groups)
+    assert _parse_cli_args(["--model", "model"]).prefix_cache_retention_interval == 8192
+
+
 @pytest.mark.parametrize("interval", [-1, True, 1.5, 129])
 def test_retention_validation_and_default(interval):
     from pypto_serving.config.types import RuntimeConfig
