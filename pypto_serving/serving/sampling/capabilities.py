@@ -37,6 +37,6 @@ def sampling_capabilities(executor_cls: str, num_speculative_tokens: int) -> Sam
             honor_min_tokens=num_speculative_tokens == 0,
             greedy_only=num_speculative_tokens == 5,
         )
-    if executor_cls == "PyptoQwen14BExecutor":
+    if executor_cls in ("PyptoQwen14BExecutor", "PyptoGlm53Executor"):
         return SamplingCapabilities()
     raise ValueError(f"sampling capabilities are not declared for {executor_cls!r}")
