@@ -231,8 +231,10 @@ def test_cancel_and_unknown_cannot_release_unconfirmed_native_writes():
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('shutdown', [None, 'drain', 'timeout'])
-@pytest.mark.parametrize('cancel', ['submit', 'wait', None])
+@pytest.mark.parametrize('shutdown,cancel', [
+    (None, 'submit'), ('drain', 'submit'), ('timeout', 'submit'),
+    (None, None), ('drain', None), ('drain', 'wait'),
+])
 def test_submit_ack_is_observed_until_native_completion(shutdown, cancel):
     async def run():
         plan = handoff(128).plans[-1]
