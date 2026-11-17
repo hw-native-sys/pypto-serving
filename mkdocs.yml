@@ -118,6 +118,7 @@ nav:
   - Developer Guide:
       - Architecture: developer-guide/architecture.md
       - Profiling: developer-guide/profile.md
+      - Accuracy Debugging: developer-guide/accuracy-debugging.md
       - Model Integration: developer-guide/model-integration.md
       - Weight Staging: developer-guide/weight-staging.md
       - JIT Cache: developer-guide/jit-cache.md
