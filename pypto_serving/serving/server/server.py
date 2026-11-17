@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import importlib.util
 import json
 import logging
 import time
@@ -19,6 +20,9 @@ import uuid
 from typing import Literal
 
 from pypto_serving.config.types import GenerateConfig
+from pypto_serving.model.model_family import read_model_config
+from pypto_serving.serving.constraints import ConstraintSpec
+from pypto_serving.serving.constraints.provider import XGrammarProvider
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput
 from pypto_serving.serving.reasoning import OutputParserSpec, ToolCallDelta, supports_tool_calls
 from pypto_serving.tools.profile import (
@@ -37,7 +41,7 @@ ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "
 try:
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse, Response, StreamingResponse
-    from pydantic import BaseModel, Field, model_serializer
+    from pydantic import BaseModel, Field, model_serializer, model_validator
 except ImportError as e:
     raise ImportError(
         "Serving requires fastapi and pydantic. Install with: pip install fastapi uvicorn sse-starlette pydantic"
@@ -125,6 +129,9 @@ class ChatCompletionRequest(BaseModel):
     model: str = ""
     messages: list[ChatMessage]
     max_tokens: int | None = None
+    max_completion_tokens: int | None = None
+    min_tokens: int | None = Field(default=None, ge=0)
+    ignore_eos: bool | None = None
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
@@ -137,6 +144,14 @@ class ChatCompletionRequest(BaseModel):
     tools: list[ChatTool] | None = None
     tool_choice: str | dict | None = None
     parallel_tool_calls: bool = True
+
+    @model_validator(mode="after")
+    def _validate_selected_token_limit(self) -> ChatCompletionRequest:
+        field = "max_completion_tokens" if self.max_completion_tokens is not None else "max_tokens"
+        limit = self.max_completion_tokens if self.max_completion_tokens is not None else self.max_tokens
+        if limit is not None and limit <= 0:
+            raise ValueError(f"{field} must be a positive integer")
+        return self
 
 
 class CompletionChoice(BaseModel):
@@ -192,6 +207,8 @@ class ServingServer:
         self.generate_config = generate_config
         self.app = FastAPI(title="PyPTO Serving")
         self._profile_lock = asyncio.Lock()
+        self._constraint_preflight_lock = asyncio.Lock()
+        self._constraint_preflight_provider: XGrammarProvider | None = None
         self._register_exception_handlers()
         self._register_routes()
 
@@ -218,6 +235,14 @@ class ServingServer:
             self.app.add_api_route("/stop_profile", self._stop_profile, methods=["POST"])
 
     async def _health(self) -> JSONResponse:
+        """Report serving readiness, not just route liveness.
+
+        A router in front of several replicas needs to stop routing to a replica
+        whose worker died or whose engine loop stopped scheduling; both look
+        identical to a healthy idle server from the outside.
+        """
+        if not self.engine.is_ready():
+            return JSONResponse({"status": "not_ready"}, status_code=503)
         return JSONResponse({"status": "ok"})
 
     async def _list_models(self) -> JSONResponse:
@@ -274,10 +299,11 @@ class ServingServer:
     def _resolve_generate_config(self, request: CompletionRequest | ChatCompletionRequest) -> GenerateConfig:
         """Build the per-request config from the server-wide defaults.
 
-        A field the request explicitly sets always wins — including "empty"
-        values that clear a server default (``stop: []`` clears the server
-        stop strings, ``top_k: null`` disables the server top-k). Fields the
-        request omits fall back to ``self.generate_config``.
+        A field the request explicitly sets wins, including "empty" values
+        that clear a server default (``stop: []`` clears the server stop
+        strings, ``top_k: null`` disables the server top-k). Token limits
+        instead use the first non-null value. Omitted fields fall back to
+        ``self.generate_config``.
         """
         defaults = self.generate_config
         provided = request.model_fields_set
@@ -287,10 +313,23 @@ class ServingServer:
         else:
             stop = defaults.stop
 
-        return GenerateConfig(
-            max_new_tokens=request.max_tokens
-            if "max_tokens" in provided
-            else defaults.max_new_tokens,
+        if isinstance(request, ChatCompletionRequest) and request.max_completion_tokens is not None:
+            max_new_tokens = request.max_completion_tokens
+        elif isinstance(request, ChatCompletionRequest) and request.max_tokens is not None:
+            max_new_tokens = request.max_tokens
+        elif isinstance(request, CompletionRequest) and request.max_tokens is not None:
+            max_new_tokens = request.max_tokens
+        else:
+            max_new_tokens = defaults.max_new_tokens
+
+        min_tokens = (
+            request.min_tokens
+            if isinstance(request, ChatCompletionRequest) and request.min_tokens is not None
+            else defaults.min_tokens
+        )
+        config = GenerateConfig(
+            max_new_tokens=max_new_tokens,
+            min_tokens=min_tokens,
             temperature=request.temperature
             if "temperature" in provided
             else defaults.temperature,
@@ -299,12 +338,27 @@ class ServingServer:
             seed=request.seed if "seed" in provided else defaults.seed,
             stop=stop,
             stream=request.stream if "stream" in provided else defaults.stream,
+            ignore_eos=(
+                request.ignore_eos
+                if isinstance(request, ChatCompletionRequest) and request.ignore_eos is not None
+                else defaults.ignore_eos
+            ),
         )
+        validate = getattr(self.engine, "validate_generate_config", None)
+        if callable(validate):
+            validate(config)
+        return config
+
+    def prepare_completion(self, request):
+        config = dataclasses.replace(self._resolve_generate_config(request), ignore_eos=True)
+        return request.prompt, config
 
     async def _completions(self, request: CompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"cmpl-{uuid.uuid4().hex[:8]}"
-        config = dataclasses.replace(self._resolve_generate_config(request), ignore_eos=True)
+        _, config = self.prepare_completion(request)
+        return await self.completion_response(request_id, request, config)
 
+    async def completion_response(self, request_id, request, config):
         with profile_span(
             "http.completions",
             cat="request",
@@ -339,23 +393,27 @@ class ServingServer:
             )
             return JSONResponse(response.model_dump())
 
-    async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
-        request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    async def prepare_chat(self, request):
         output_parser_spec = self._output_parser_spec(request)
+        constraint_spec = self._constraint_spec(request, output_parser_spec)
+        if constraint_spec is not None:
+            await self._preflight_constraint(constraint_spec)
         prompt = self._apply_chat_template(
             request.messages,
             request.chat_template_kwargs,
             reasoning_effort=request.reasoning_effort,
             tools=request.tools,
         )
-        # The OpenAI chat schema has no ignore_eos field, so the server-wide
-        # config decides it (the completions endpoint keeps its historic
-        # always-ignore-EOS override).
-        config = dataclasses.replace(
-            self._resolve_generate_config(request),
-            ignore_eos=self.generate_config.ignore_eos,
-        )
+        config = self._resolve_generate_config(request)
 
+        return prompt, config, output_parser_spec, constraint_spec
+
+    async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
+        request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        prompt, config, output_parser_spec, constraint_spec = await self.prepare_chat(request)
+        return await self.chat_response(request_id, request, prompt, config, output_parser_spec, constraint_spec)
+
+    async def chat_response(self, request_id, request, prompt, config, output_parser_spec, constraint_spec):
         with profile_span(
             "http.chat_completions",
             cat="request",
@@ -369,6 +427,7 @@ class ServingServer:
                         config,
                         request.model or self.model_id,
                         output_parser_spec=output_parser_spec,
+                        constraint_spec=constraint_spec,
                         parallel_tool_calls=request.parallel_tool_calls,
                     ),
                     media_type="text/event-stream",
@@ -384,6 +443,7 @@ class ServingServer:
                 prompt,
                 config,
                 output_parser_spec=output_parser_spec,
+                **({"constraint_spec": constraint_spec} if constraint_spec else {}),
             ):
                 if output.text:
                     full_text = output.text
@@ -469,12 +529,14 @@ class ServingServer:
         model: str,
         *,
         output_parser_spec: OutputParserSpec | None = None,
+        constraint_spec: ConstraintSpec | None = None,
         parallel_tool_calls: bool = True,
     ):
         # Once SSE headers have been sent, request-local parser failures must be
         # reported in the stream. Cancellation still propagates to engine cleanup.
         chunks = self._stream_chat_chunks(
             request_id, prompt, config, model, output_parser_spec=output_parser_spec,
+            constraint_spec=constraint_spec,
             parallel_tool_calls=parallel_tool_calls,
         )
         try:
@@ -494,6 +556,7 @@ class ServingServer:
         model: str,
         *,
         output_parser_spec: OutputParserSpec | None,
+        constraint_spec: ConstraintSpec | None,
         parallel_tool_calls: bool,
     ):
         with profile_span("http.stream_chat_completion", cat="request", args={"request_id": request_id}):
@@ -504,6 +567,7 @@ class ServingServer:
                 prompt,
                 config,
                 output_parser_spec=output_parser_spec,
+                **({"constraint_spec": constraint_spec} if constraint_spec else {}),
             )
             async with contextlib.aclosing(outputs):
                 async for output in outputs:
@@ -614,21 +678,27 @@ class ServingServer:
         return kwargs
 
     @staticmethod
-    def _validate_chat_request(request: ChatCompletionRequest) -> str:
+    def _validate_chat_request(request: ChatCompletionRequest) -> str | dict:
         if "tools" in (request.chat_template_kwargs or {}):
             raise ValueError("tools must be supplied as a top-level request field")
         choice = request.tool_choice
         if choice is None:
             choice = "auto" if request.tools else "none"
-        if choice not in ("none", "auto"):
-            raise ValueError("only tool_choice 'auto' and 'none' are supported; constrained tool choice is unavailable")
-        if choice == "auto" and not request.tools:
-            raise ValueError("tool_choice 'auto' requires non-empty tools")
-        names = []
-        for tool in request.tools or ():
-            if tool.function.strict:
-                raise ValueError("strict tool schemas require constrained decoding, which is not supported")
-            names.append(tool.function.name)
+        names = [tool.function.name for tool in request.tools or ()]
+        if isinstance(choice, dict):
+            function = choice.get("function")
+            if (
+                set(choice) != {"type", "function"}
+                or choice.get("type") != "function"
+                or not isinstance(function, dict)
+                or set(function) != {"name"}
+                or function.get("name") not in names
+            ):
+                raise ValueError("named tool_choice must select a declared function")
+        elif choice not in ("none", "auto", "required"):
+            raise ValueError("tool_choice must be none, auto, required, or a declared function")
+        if choice != "none" and not request.tools:
+            raise ValueError("enabled tool_choice requires non-empty tools")
         if len(set(names)) != len(names):
             raise ValueError("tool function names must be unique")
         for message in request.messages:
@@ -646,6 +716,52 @@ class ServingServer:
                     raise ValueError("tool call arguments must encode an object")
         return choice
 
+    def _constraint_spec(
+        self, request: ChatCompletionRequest, parser_spec: OutputParserSpec | None,
+    ) -> ConstraintSpec | None:
+        """Enable structural generation only for vLLM-compatible tool-choice cases."""
+        choice = self._validate_chat_request(request)
+        if choice == "none" or (
+            choice == "auto" and not any(tool.function.strict for tool in request.tools or ())
+        ):
+            return None
+        if parser_spec is None or parser_spec.parser_id != "deepseek_v4":
+            raise ValueError("the model has no DeepSeek V4 structural-tool format")
+        engine_config = getattr(self.engine, "config", None)
+        if getattr(engine_config, "executor_cls", None) != "PyptoDeepSeekV4DSparkExecutor":
+            raise ValueError("constrained tool generation currently requires DeepSeek V4 DSpark")
+        if importlib.util.find_spec("xgrammar") is None:
+            raise ValueError("xgrammar is required for constrained tool generation")
+        return ConstraintSpec(
+            provider_id="xgrammar",
+            format_id="deepseek_v4",
+            tools=tuple(tool.model_dump(mode="json", exclude_none=True) for tool in request.tools or ()),
+            tool_choice=choice,
+            reasoning=parser_spec.initial_state == "reasoning",
+            parallel_tool_calls=request.parallel_tool_calls,
+        )
+
+    async def _preflight_constraint(self, spec: ConstraintSpec, initial_tokens=()) -> None:
+        """Reject unsupported schemas before an SSE response or worker batch starts."""
+        async with self._constraint_preflight_lock:
+            try:
+                await asyncio.to_thread(self._compile_constraint_for_preflight, spec, initial_tokens)
+            except (RuntimeError, ValueError) as exc:
+                raise ValueError(f"invalid tool constraint: {exc}") from exc
+
+    def _compile_constraint_for_preflight(self, spec: ConstraintSpec, initial_tokens=()) -> None:
+        if self._constraint_preflight_provider is None:
+            model_vocab_size = int(read_model_config(self.engine.config.model_dir)["vocab_size"])
+            self._constraint_preflight_provider = XGrammarProvider(
+                self.engine.tokenizer, model_vocab_size
+            )
+        with profile_span("ServingServer.constraint_preflight", cat="constraints"):
+            state = self._constraint_preflight_provider.compile(spec)
+        try:
+            state.accept(initial_tokens)
+        finally:
+            state.close()
+
     def _output_parser_spec(
         self,
         request: ChatCompletionRequest,
@@ -656,17 +772,23 @@ class ServingServer:
         has_tool_history = any(m.tool_calls or m.role == "tool" for m in request.messages)
         if (request.tools or has_tool_history) and not supports_tool_calls(parser_id):
             raise ValueError("the model has no tool-call parser")
+        if (
+            getattr(self.engine.tokenizer, "output_parser_requires_tool_context", False)
+            and not (request.tools or has_tool_history)
+        ):
+            return None
         if not parser_id:
             return None
         kwargs = self._chat_kwargs(request.chat_template_kwargs, request.reasoning_effort)
         thinking = bool(
             kwargs.get("thinking", False) or kwargs.get("enable_thinking", False)
+            or kwargs.get("thinking_mode") == "thinking"
         ) and kwargs.get("reasoning_effort") != "none"
         return OutputParserSpec(
             parser_id=str(parser_id),
             initial_state="reasoning" if thinking else "content",
             include_reasoning=request.include_reasoning,
-            tool_choice=tool_choice,
+            tool_choice="required" if tool_choice == "required" or isinstance(tool_choice, dict) else tool_choice,
             tool_names=tuple(tool.function.name for tool in request.tools or ()),
         )
 

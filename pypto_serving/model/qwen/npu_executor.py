@@ -127,30 +127,35 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         *,
         platform: str = "a2a3sim",
         device_ids: Sequence[int] = (0,),
-        pypto_build_dir: str = "build_output",
-        use_compile_cache: bool = False,
+        pypto_build_dir: str | None = None,
     ) -> None:
-        # ``pypto_build_dir`` is the per-worker build dir (set by the serving
-        # worker). When ``use_compile_cache`` is set, the compiler writes each
-        # kernel straight to ``<pypto_build_dir>/<name>`` and reloads it on a
-        # later launch, so it doubles as the on-disk kernel cache. No
-        # fingerprinting -- the caller must keep this dir config/kernel-source
-        # appropriate. When off, pypto uses its default per-kernel build dirs.
+        # ``pypto_build_dir`` is an explicit diagnostic/output request (set by
+        # the serving worker only when the user asks for build output); it
+        # bypasses PyPTO's JIT cache. The persistent cache policy reaches pypto
+        # through the run config instead.
         super().__init__(
             kv_cache_manager,
             platform=platform,
             device_ids=device_ids,
             pypto_build_dir=pypto_build_dir,
-            use_compile_cache=use_compile_cache,
         )
+        self._configure_compiler("tensormap_and_ringbuffer")
+
+    def _configure_compiler(self, runtime: str) -> None:
+        self._chip_runtime = runtime
         self._compiler = KernelCompiler(
             run_config=build_pypto_run_config(
+                runtime=runtime,
                 platform=self._platform,
                 device_ids=self._device_ids,
                 pypto_build_dir=self._pypto_build_dir,
             ),
-            cache_dir=self._pypto_build_dir,
         )
+
+    @property
+    def max_prefill_batch_size(self) -> int | None:
+        """Bound HBG graph scratch to one active prefill row."""
+        return 1 if self._chip_runtime == "host_build_graph" else None
 
     @property
     def supports_device_sampling(self) -> bool:
@@ -174,12 +179,23 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         return Qwen314BModelRunner(
             compiled=compiled,
             device_id=self._device_ids[0],
+            hbg_prefill=self._chip_runtime == "host_build_graph",
         )
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
         """Compile Qwen3-14B PyPTO kernels and pack runtime artifacts."""
+        self._configure_compiler(model.runtime.chip_runtime)
         kernel_dir = _find_pypto_lib_qwen14b_dir()
         qwen3_prefill_fwd = _load_pypto_lib_qwen14b_module("prefill_fwd", kernel_dir)
+        if self._chip_runtime == "host_build_graph":
+            prefill_host = getattr(qwen3_prefill_fwd, "qwen3_prefill_hbg_host", None)
+            if prefill_host is None:
+                raise RuntimeError(
+                    "Qwen3-14B HBG requires a pypto-lib checkout with qwen3_prefill_hbg_host. "
+                    "Set PYPTO_LIB_ROOT to a compatible checkout."
+                )
+        else:
+            prefill_host = qwen3_prefill_fwd.qwen3_prefill_host
         # The fused all-layer decode lives in decode_fwd.decode_fwd. It is
         # PAGED: it consumes block_table + slot_mapping and reads/writes the SAME
         # device-resident paged KV pool prefill writes (self._kv_caches), so no
@@ -268,7 +284,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         sampled_ids_width = int(getattr(qwen3_decode_fwd, "SAMPLED_IDS_PAD", 1))
         page_size = model.runtime.page_size
         max_blocks_per_seq = (model.runtime.max_seq_len + page_size - 1) // page_size
-        prefill = self._compile_jit_fwd_callable("prefill_fwd", qwen3_prefill_fwd.qwen3_prefill_host)
+        prefill = self._compile_jit_fwd_callable("prefill_fwd", prefill_host)
         decode = self._compile_jit_fwd_callable("decode_fwd", qwen3_decode_fwd.qwen3_decode_host)
         topk_select = self._compile_jit_fwd_callable(
             "topk_select_fwd", qwen3_topk_select.qwen3_topk_select_host
@@ -338,7 +354,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         cache fast-path and the JIT compile are both handled by the shared
         :class:`KernelCompiler`.
         """
-        return self._compiler.compile(name, jit_fn, use_cache=self._use_compile_cache)
+        return self._compiler.compile(name, jit_fn)
 
     @classmethod
     def _stage_stacked_decode_weights(cls, model: RuntimeModel) -> dict[str, torch.Tensor]:

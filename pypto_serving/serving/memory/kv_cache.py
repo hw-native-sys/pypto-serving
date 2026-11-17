@@ -9,24 +9,39 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
-from dataclasses import dataclass, field
+import struct
+from collections.abc import Sequence
+from dataclasses import dataclass, field, replace
 
 import torch
 
 from pypto_serving.config.types import KVCacheGroupSpec, KvAllocation, ModelConfig, RuntimeConfig
+from pypto_serving.tools.profile import profile_span
+from .checkpoint import GroupCheckpointWriter, GroupPrefixCheckpoints
+from .reservation import GroupCacheReservation, GroupedCacheReservations
 
 
-NONE_HASH = hash(("__none__",))
+NONE_HASH = hashlib.sha256(b"pypto-serving-prefix-root/v1").digest()
+
+
+def aligned_prefix_cache_boundary(token_count: int, alignment: int, *, replay_tokens: int = 0) -> int:
+    """Return the common page boundary before the required local replay."""
+    return max(0, token_count - max(1, replay_tokens)) // alignment * alignment
 
 
 class KVCacheCapacityError(RuntimeError):
     """Raised when a cache allocation cannot fit in the physical pools."""
 
 
-def hash_block_tokens(parent_hash: int, token_ids: tuple[int, ...]) -> int:
-    """Return a chained prefix-cache hash for one full token block."""
-    return hash((parent_hash, token_ids))
+def hash_block_tokens(parent_hash: bytes, token_ids: tuple[int, ...]) -> bytes:
+    """Return a stable chained digest suitable for cross-process identity."""
+    digest = hashlib.sha256()
+    digest.update(parent_hash)
+    digest.update(struct.pack(">I", len(token_ids)))
+    digest.update(struct.pack(f">{len(token_ids)}q", *map(int, token_ids)))
+    return digest.digest()
 
 
 @dataclass(slots=True)
@@ -35,7 +50,7 @@ class KVCacheBlock:
 
     block_id: int
     ref_cnt: int = 0
-    block_hash: int | None = None
+    block_hash: bytes | None = None
     prev_free: "KVCacheBlock | None" = field(default=None, repr=False)
     next_free: "KVCacheBlock | None" = field(default=None, repr=False)
 
@@ -137,7 +152,7 @@ class _GroupBlockPool:
     request_blocks: dict[str, list[KVCacheBlock | None]] = field(default_factory=dict)
     request_partitions: dict[str, int] = field(default_factory=dict)
     request_logical_blocks: dict[str, int] = field(default_factory=dict)
-    hash_to_block: dict[tuple[int, int], KVCacheBlock] = field(default_factory=dict)
+    hash_to_block: dict[tuple[int, bytes], KVCacheBlock] = field(default_factory=dict)
 
     def num_free_blocks_in(self, partition: int) -> int:
         return len(self.free_queues[partition])
@@ -153,6 +168,14 @@ class _GroupBlockPool:
                 f"Invalid local block ID {block_id} for cache group {self.spec.name!r}"
             )
         return self.blocks[partition * self.blocks_per_partition + block_id]
+
+
+@dataclass(slots=True, eq=False)
+class GroupBlockSnapshot:
+    """Host-only pin returned by the cache manager; release through that manager."""
+
+    _owner: KvCacheManager | None = field(repr=False)
+    _groups: tuple[tuple[FreeKVCacheBlockQueue, tuple[KVCacheBlock, ...]], ...] = field(repr=False)
 
 
 class KvCacheManager:
@@ -171,11 +194,15 @@ class KvCacheManager:
         self.enable_prefix_cache = enable_prefix_cache
         self.blocks: list[KVCacheBlock] = []
         self.free_queue = FreeKVCacheBlockQueue()
-        self.hash_to_block: dict[int, KVCacheBlock] = {}
+        self.hash_to_block: dict[bytes, KVCacheBlock] = {}
         self.request_blocks: dict[str, list[KVCacheBlock]] = {}
         self._group_pools: dict[str, _GroupBlockPool] = {}
         self._group_request_partitions: dict[str, int] = {}
         self._next_group_partition = 0
+        self._group_checkpoints: GroupPrefixCheckpoints | None = None
+        self.checkpoint_writer = GroupCheckpointWriter(self)
+        self._reservations: GroupedCacheReservations | None = None
+        self.tiering = None
         if num_blocks is not None:
             self._init_blocks(num_blocks, block_size)
 
@@ -207,11 +234,13 @@ class KvCacheManager:
         runtime: RuntimeConfig,
         *,
         num_blocks: int,
+        group_num_blocks: dict[str, int] | None = None,
     ) -> None:
         """Initialize scheduler-visible pools from the runtime cache topology.
 
         ``num_blocks`` is the device-reported capacity of the primary cache
         group, or the complete capacity for a generic single cache pool.
+        ``group_num_blocks`` supplies independently planned per-group sizes.
         """
         num_blocks = int(num_blocks)
         if num_blocks <= 0:
@@ -219,10 +248,17 @@ class KvCacheManager:
                 f"Worker reported invalid KV cache block count: {num_blocks}"
             )
         if runtime.kv_cache_groups:
+            groups = runtime.kv_cache_groups
+            if group_num_blocks is not None:
+                if set(group_num_blocks) != {group.name for group in groups}:
+                    raise ValueError("worker must report capacity for every cache group")
+                if group_num_blocks[groups[0].name] != num_blocks:
+                    raise ValueError("primary cache capacity disagrees with group report")
+                groups = tuple(replace(group, num_blocks=group_num_blocks[group.name]) for group in groups)
             self.init_groups(
-                runtime.kv_cache_groups,
+                groups,
                 max_batch_size=runtime.max_batch_size,
-                primary_num_blocks=num_blocks,
+                primary_num_blocks=None if group_num_blocks is not None else num_blocks,
             )
             return
         self._init_blocks(num_blocks, runtime.page_size)
@@ -333,7 +369,7 @@ class KvCacheManager:
         for block in blocks:
             self.release(block)
 
-    def get_cached_block(self, block_hash: int) -> KVCacheBlock | None:
+    def get_cached_block(self, block_hash: bytes) -> KVCacheBlock | None:
         """Return and reference a cached block for one block hash."""
         if not self.enable_prefix_cache:
             return None
@@ -345,7 +381,7 @@ class KvCacheManager:
         block.ref_cnt += 1
         return block
 
-    def cache_block(self, block: KVCacheBlock, block_hash: int) -> None:
+    def cache_block(self, block: KVCacheBlock, block_hash: bytes) -> None:
         """Publish a full block to the prefix cache."""
         if not self.enable_prefix_cache:
             return
@@ -354,7 +390,13 @@ class KvCacheManager:
         block.block_hash = block_hash
         self.hash_to_block[block_hash] = block
 
-    def cache_block_ids(self, block_ids: list[int], block_hashes: list[int], start: int, end: int) -> None:
+    def cache_block_ids(
+        self,
+        block_ids: list[int],
+        block_hashes: list[bytes],
+        start: int,
+        end: int,
+    ) -> None:
         """Publish a range of full blocks to the prefix cache."""
         if not self.enable_prefix_cache:
             return
@@ -427,7 +469,7 @@ class KvCacheManager:
             hit_blocks.append(block)
         return hit_blocks
 
-    def compute_block_hashes(self, token_ids: list[int]) -> list[int]:
+    def compute_block_hashes(self, token_ids: list[int]) -> list[bytes]:
         """Compute chained hashes for all full blocks in the token sequence."""
         return [block_hash for _, block_hash in self._iter_block_hashes(token_ids)]
 
@@ -564,7 +606,7 @@ class KvCacheManager:
 
     @property
     def group_specs(self) -> tuple[KVCacheGroupSpec, ...]:
-        """Return the immutable contracts for the configured cache groups."""
+        """Return the immutable scheduler/runner cache geometry in group order."""
         return tuple(pool.spec for pool in self._group_pools.values())
 
     def init_groups(
@@ -593,6 +635,9 @@ class KvCacheManager:
         partition_counts = {group.num_partitions for group in group_specs}
         if len(partition_counts) != 1:
             raise ValueError("KV cache groups must use the same num_partitions")
+        request_limits = {group.max_requests_per_partition for group in group_specs}
+        if len(request_limits) != 1:
+            raise ValueError("KV cache groups must use the same per-partition request limit")
 
         capacity_slots = None
         if primary_num_blocks is not None:
@@ -720,15 +765,29 @@ class KvCacheManager:
             alignment = math.lcm(alignment, pool.spec.spec.token_capacity)
         return alignment
 
+    def group_prefix_cache_boundary(self, token_count: int, *, replay_tokens: int = 0) -> int:
+        """Align a complete prompt's reuse limit after its required local replay."""
+        alignment = self.group_prefix_cache_alignment
+        return aligned_prefix_cache_boundary(token_count, alignment, replay_tokens=replay_tokens)
+
     @property
     def has_eagle_groups(self) -> bool:
         """Return whether grouped lookup uses shifted EAGLE/MTP page hashes."""
         return any(pool.spec.is_eagle_group for pool in self._group_pools.values())
 
-    def compute_group_block_hashes(self, token_ids: list[int]) -> dict[str, list[int]]:
+    def compute_group_block_hashes(
+        self,
+        token_ids: list[int],
+        *,
+        group_names: tuple[str, ...] | None = None,
+    ) -> dict[str, list[bytes]]:
         """Compute full-page prefix hashes independently for every cache group."""
+        selected = tuple(self._group_pools) if group_names is None else group_names
+        if len(selected) != len(set(selected)) or set(selected) - set(self._group_pools):
+            raise ValueError("prefix hash groups must be unique configured cache groups")
         hashes = {}
-        for name, pool in self._group_pools.items():
+        for name in selected:
+            pool = self._group_pools[name]
             iterator = (
                 self._iter_eagle_token_block_hashes
                 if pool.spec.is_eagle_group
@@ -743,14 +802,63 @@ class KvCacheManager:
             ]
         return hashes
 
+    def group_history_prefix_hit(self, block_hashes, max_tokens):
+        """Find a shared full-history boundary for sparse state publication."""
+        if not self.enable_prefix_cache:
+            return 0
+        history = [pool for pool in self._group_pools.values() if pool.spec.sliding_window is None]
+        best = 0
+        for partition in range(self.group_partition_count):
+            candidate = max_tokens
+            for pool in history:
+                page = pool.spec.spec.token_capacity
+                count = 0
+                for value in block_hashes[pool.spec.name][:candidate // page]:
+                    if (partition, value) not in pool.hash_to_block:
+                        break
+                    count += 1
+                candidate = min(candidate, count * page)
+            best = max(best, candidate)
+        return best // self.group_prefix_cache_alignment * self.group_prefix_cache_alignment
+
     def acquire_group_prefix_blocks(
         self,
         request_id: str,
-        block_hashes: dict[str, list[int]],
+        block_hashes: dict[str, list[bytes]],
         *,
         max_cache_hit_tokens: int,
+        shareable_group_names: tuple[str, ...] | None = None,
+        partition: int | None = None,
     ) -> tuple[dict[str, list[int]], int, int | None]:
-        """Attach the longest strict zero-copy grouped prefix to a request.
+        if not self.enable_prefix_cache or not self._group_pools:
+            return {}, 0, None
+        if request_id in self._group_request_partitions:
+            raise ValueError(f"Request {request_id!r} already owns grouped KV cache blocks")
+        best_blocks, best_hit_tokens, best_partition = self.select_group_prefix_blocks(
+            block_hashes, max_cache_hit_tokens=max_cache_hit_tokens,
+            shareable_group_names=shareable_group_names, partition=partition)
+        if best_partition is None or not best_hit_tokens:
+            return {}, 0, None
+        self._group_request_partitions[request_id] = best_partition
+        for name, pool in self._group_pools.items():
+            owned = best_blocks[name]
+            pool.request_blocks[request_id] = list(owned)
+            pool.request_partitions[request_id] = best_partition
+            pool.request_logical_blocks[request_id] = best_hit_tokens // pool.spec.spec.token_capacity
+            for block in owned:
+                if block is None:
+                    continue
+                if block.ref_cnt == 0:
+                    pool.free_queues[best_partition].remove(block)
+                block.ref_cnt += 1
+        return ({name: [pool.local_block_id(block) for block in best_blocks[name] if block is not None]
+                 for name, pool in self._group_pools.items()}, best_hit_tokens, best_partition)
+
+    def select_group_prefix_blocks(
+        self, block_hashes, *, max_cache_hit_tokens, shareable_group_names=None, partition=None,
+        lookup=None, checkpoint_keys=None,
+    ):
+        """Select the longest complete grouped prefix without mutating ownership.
 
         Cache namespaces are rank-local, so every partition is evaluated and
         the partition with the longest hit is selected. Full-history groups
@@ -763,9 +871,23 @@ class KvCacheManager:
         """
         if not self.enable_prefix_cache or not self._group_pools:
             return {}, 0, None
-        if request_id in self._group_request_partitions:
-            raise ValueError(f"Request {request_id!r} already owns grouped KV cache blocks")
-        expected_names = set(self._group_pools)
+        if lookup is None:
+            lookup = lambda pool, owner, value: pool.hash_to_block.get((owner, value))
+        selected_names = (
+            tuple(self._group_pools)
+            if shareable_group_names is None
+            else shareable_group_names
+        )
+        if len(selected_names) != len(set(selected_names)):
+            raise ValueError("shareable cache groups must be unique")
+        if not selected_names:
+            raise ValueError("shareable cache groups must not be empty")
+        expected_names = set(selected_names)
+        unknown = expected_names - set(self._group_pools)
+        if unknown:
+            raise ValueError(
+                "unknown shareable cache groups: " + ", ".join(sorted(unknown))
+            )
         if set(block_hashes) != expected_names:
             missing = sorted(expected_names - set(block_hashes))
             extra = sorted(set(block_hashes) - expected_names)
@@ -789,9 +911,21 @@ class KvCacheManager:
         best_partition: int | None = None
         best_hit_tokens = 0
         best_blocks: dict[str, list[KVCacheBlock | None]] = {}
-        for partition in range(self.group_partition_count):
+        candidate_partitions = (
+            range(self.group_partition_count)
+            if partition is None
+            else (partition,)
+        )
+        if partition is not None and not 0 <= partition < self.group_partition_count:
+            raise ValueError(f"Invalid cache partition {partition}")
+        request_limit = next(iter(self._group_pools.values())).spec.max_requests_per_partition
+        for candidate_partition in candidate_partitions:
+            if (request_limit is not None and
+                    sum(owner == candidate_partition for owner in self._group_request_partitions.values()) >= request_limit):
+                continue
             candidate = max_candidate
-            for name, pool in self._group_pools.items():
+            for name in selected_names:
+                pool = self._group_pools[name]
                 if pool.spec.sliding_window is not None:
                     continue
                 token_capacity = pool.spec.spec.token_capacity
@@ -802,7 +936,7 @@ class KvCacheManager:
                 )
                 num_hit_blocks = 0
                 for block_hash in block_hashes[name][:max_blocks]:
-                    block = pool.hash_to_block.get((partition, block_hash))
+                    block = lookup(pool, candidate_partition, block_hash)
                     if block is None:
                         break
                     num_hit_blocks += 1
@@ -810,10 +944,24 @@ class KvCacheManager:
 
             candidate -= candidate % alignment
             candidate_blocks: dict[str, list[KVCacheBlock | None]] = {}
-            while candidate > 0:
+            if any(self._group_pools[name].spec.is_checkpoint_state for name in selected_names):
+                # State is materialized at sparse publication boundaries, not at
+                # every computed token. Validate only resident joint candidates.
+                keys = checkpoint_keys if checkpoint_keys is not None else (
+                    self._group_checkpoints.checkpoints if self._group_checkpoints is not None else ())
+                candidates = sorted({key[1] for key in keys
+                                     if key[0] == candidate_partition and key[1] <= candidate}, reverse=True)
+            else:
+                candidates = range(candidate, 0, -alignment)
+            candidate = 0
+            for boundary in candidates:
+                candidate = boundary
                 candidate_blocks = {}
                 valid = True
                 for name, pool in self._group_pools.items():
+                    if name not in expected_names:
+                        candidate_blocks[name] = []
+                        continue
                     token_capacity = pool.spec.spec.token_capacity
                     end_block = candidate // token_capacity
                     if end_block > len(block_hashes[name]):
@@ -837,7 +985,7 @@ class KvCacheManager:
 
                     for block_index in lookup_indices:
                         block_hash = block_hashes[name][block_index]
-                        block = pool.hash_to_block.get((partition, block_hash))
+                        block = lookup(pool, candidate_partition, block_hash)
                         if block is None:
                             valid = False
                             break
@@ -851,43 +999,17 @@ class KvCacheManager:
 
                 if valid:
                     break
-                candidate -= alignment
+                candidate = 0
 
             if candidate > best_hit_tokens:
-                best_partition = partition
+                best_partition = candidate_partition
                 best_hit_tokens = candidate
                 best_blocks = candidate_blocks
 
         if best_partition is None or best_hit_tokens == 0:
             return {}, 0, None
 
-        self._group_request_partitions[request_id] = best_partition
-        for name, pool in self._group_pools.items():
-            owned = best_blocks[name]
-            pool.request_blocks[request_id] = list(owned)
-            pool.request_partitions[request_id] = best_partition
-            pool.request_logical_blocks[request_id] = (
-                best_hit_tokens // pool.spec.spec.token_capacity
-            )
-            for block in owned:
-                if block is None:
-                    continue
-                if block.ref_cnt == 0:
-                    pool.free_queues[best_partition].remove(block)
-                block.ref_cnt += 1
-
-        return (
-            {
-                name: [
-                    pool.local_block_id(block)
-                    for block in best_blocks[name]
-                    if block is not None
-                ]
-                for name, pool in self._group_pools.items()
-            },
-            best_hit_tokens,
-            best_partition,
-        )
+        return best_blocks, best_hit_tokens, best_partition
 
     def group_cache_valid_from_after_prefill(
         self,
@@ -912,11 +1034,12 @@ class KvCacheManager:
     def cache_group_blocks(
         self,
         request_id: str,
-        block_hashes: dict[str, list[int]],
+        block_hashes: dict[str, list[bytes]],
         num_computed_tokens: int,
         already_cached: dict[str, int],
         *,
         valid_from: dict[str, int] | None = None,
+        checkpoint_boundary: int | None = None,
     ) -> dict[str, int]:
         """Publish newly completed grouped pages and return cached counts."""
         if not self.enable_prefix_cache:
@@ -939,7 +1062,14 @@ class KvCacheManager:
                 safe_computed_tokens // pool.spec.spec.token_capacity,
                 len(hashes),
             )
+            if pool.spec.is_checkpoint_state:
+                if checkpoint_boundary is None:
+                    continue
+                completed = min(completed, checkpoint_boundary // pool.spec.spec.token_capacity)
             start = min(cached_counts.get(name, 0), completed)
+            if pool.spec.is_checkpoint_state:
+                start = max(start, max(0, checkpoint_boundary - pool.spec.sliding_window)
+                            // pool.spec.spec.token_capacity)
             if valid_from is not None:
                 token_capacity = pool.spec.spec.token_capacity
                 start = max(start, (valid_from.get(name, 0) + token_capacity - 1) // token_capacity)
@@ -955,13 +1085,46 @@ class KvCacheManager:
                     )
                 self._cache_group_block(pool, partition, block, hashes[index])
             cached_counts[name] = completed
+        # Decode without newly publishable prompt pages must not replace the
+        # prompt's replay checkpoint with a later, non-reusable boundary.
+        if cached_counts != already_cached:
+            self._protect_group_checkpoint(request_id, block_hashes, num_computed_tokens, partition,
+                                           valid_from, checkpoint_boundary)
         return cached_counts
+
+    def retain_group_prefill_history(
+        self, request_id: str, token_count: int,
+    ) -> tuple[dict[str, dict[int, int]], GroupBlockSnapshot | None]:
+        """Retain entry state before an entire Prefill chunk rebinds its ring."""
+        if token_count <= 0:
+            return {}, None
+        read_blocks = {}
+        pin_blocks = {name: [] for name in self._group_pools}
+        for name, pool in self._group_pools.items():
+            if not pool.spec.preserve_prefill_history:
+                continue
+            page = pool.spec.spec.token_capacity
+            owned = pool.request_blocks.get(request_id, ())
+            pages = {}
+            for logical in range(max(0, token_count - pool.spec.sliding_window) // page,
+                                 (token_count + page - 1) // page):
+                slot = logical % pool.spec.max_blocks_per_seq
+                block = owned[slot] if slot < len(owned) else None
+                if block is None:
+                    raise RuntimeError(f"Missing Prefill history for {name}:{logical}")
+                pages[logical] = pool.local_block_id(block)
+            read_blocks[name] = pages
+            pin_blocks[name] = list(dict.fromkeys(pages.values()))
+        if not read_blocks:
+            return {}, None
+        partition = self._group_request_partitions[request_id]
+        return read_blocks, self.retain_group_block_snapshot(pin_blocks, partition)
 
     def retain_group_block_snapshot(
         self,
-        block_ids_by_group: dict[str, list[int]],
+        block_ids_by_group: dict[str, Sequence[int]],
         partition: int,
-    ) -> None:
+    ) -> GroupBlockSnapshot:
         """Pin one scheduled grouped block-table snapshot until its step settles.
 
         Async scheduling may advance a rolling request table before an older
@@ -969,55 +1132,66 @@ class KvCacheManager:
         until that step is confirmed or discarded, matching vLLM's in-flight
         block lifetime fence.
         """
-        if not block_ids_by_group:
-            return
-        if set(block_ids_by_group) != set(self._group_pools):
-            raise ValueError("Grouped block snapshot does not match configured cache groups")
+        with profile_span("cache.snapshot.retain", cat="cache"):
+            if block_ids_by_group and set(block_ids_by_group) != set(self._group_pools):
+                raise ValueError("Grouped block snapshot does not match configured cache groups")
 
-        blocks = []
-        for name, block_ids in block_ids_by_group.items():
-            pool = self._group_pools[name]
-            if len(block_ids) != len(set(block_ids)):
-                raise ValueError(f"Cache group {name!r} snapshot contains duplicate block IDs")
-            for block_id in block_ids:
-                block = pool.block_from_local_id(partition, block_id)
-                if block.ref_cnt <= 0:
-                    raise RuntimeError(
-                        f"Cannot retain unowned grouped KV block {name}:{block_id}"
-                    )
-                blocks.append(block)
+            groups = []
+            for name, block_ids in block_ids_by_group.items():
+                pool = self._group_pools[name]
+                if not 0 <= partition < len(pool.free_queues):
+                    raise ValueError(f"Invalid cache partition {partition}")
+                if len(block_ids) != len(set(block_ids)):
+                    raise ValueError(f"Cache group {name!r} snapshot contains duplicate block IDs")
+                blocks = []
+                for block_id in block_ids:
+                    block = pool.block_from_local_id(partition, block_id)
+                    if block.ref_cnt <= 0:
+                        raise RuntimeError(
+                            f"Cannot retain unowned grouped KV block {name}:{block_id}"
+                        )
+                    blocks.append(block)
+                groups.append((pool.free_queues[partition], tuple(blocks)))
 
-        for block in blocks:
-            block.ref_cnt += 1
+            # Resolve and validate everything before acquiring any references.
+            snapshot = GroupBlockSnapshot(self, tuple(groups))
+            for _, blocks in snapshot._groups:
+                for block in blocks:
+                    block.ref_cnt += 1
+            return snapshot
 
     def release_group_block_snapshot(
         self,
-        block_ids_by_group: dict[str, list[int]],
-        partition: int,
+        snapshot: GroupBlockSnapshot,
     ) -> None:
         """Release pins acquired by :meth:`retain_group_block_snapshot`."""
-        for name, block_ids in block_ids_by_group.items():
-            pool = self._group_pools[name]
-            for block_id in block_ids:
-                block = pool.block_from_local_id(partition, block_id)
-                if block.ref_cnt <= 0:
-                    raise RuntimeError(
-                        f"Grouped KV snapshot block {name}:{block_id} has "
-                        f"invalid ref_cnt={block.ref_cnt}"
-                    )
-                block.ref_cnt -= 1
-                if block.ref_cnt == 0:
-                    pool.free_queues[partition].append(block)
+        with profile_span("cache.snapshot.release", cat="cache"):
+            if snapshot._owner is not self:
+                raise RuntimeError("Grouped KV snapshot belongs to another manager or was already released")
+            for queue, blocks in snapshot._groups:
+                for block in blocks:
+                    if block.ref_cnt <= 0:
+                        raise RuntimeError(
+                            f"Grouped KV snapshot block {block.block_id} has invalid ref_cnt={block.ref_cnt}"
+                        )
+                    block.ref_cnt -= 1
+                    if block.ref_cnt == 0:
+                        queue.append(block)
+            # A retired handle must not keep the manager or its pages alive.
+            snapshot._groups = ()
+            snapshot._owner = None
 
     def cache_group_blocks_from_snapshot(
         self,
-        block_hashes: dict[str, list[int]],
+        block_hashes: dict[str, list[bytes]],
         num_computed_tokens: int,
         already_cached: dict[str, int],
         block_ids_by_group: dict[str, list[int]],
         partition: int,
         *,
+        request_id: str,
         valid_from: dict[str, int] | None = None,
+        checkpoint_boundary: int | None = None,
     ) -> dict[str, int]:
         """Publish confirmed pages using the exact table used by one step.
 
@@ -1043,7 +1217,17 @@ class KvCacheManager:
                 safe_computed_tokens // pool.spec.spec.token_capacity,
                 len(hashes),
             )
+            if pool.spec.is_checkpoint_state:
+                if checkpoint_boundary is None:
+                    continue
+                completed = min(completed, checkpoint_boundary // pool.spec.spec.token_capacity)
             start = min(cached_counts.get(name, 0), completed)
+            if pool.spec.is_checkpoint_state:
+                start = max(start, max(0, checkpoint_boundary - pool.spec.sliding_window)
+                            // pool.spec.spec.token_capacity)
+                # A snapshot may already have wrapped beyond the checkpoint.
+                capacity = pool.spec.spec.token_capacity
+                start = max(start, (num_computed_tokens + capacity - 1) // capacity - len(block_ids))
             if valid_from is not None:
                 token_capacity = pool.spec.spec.token_capacity
                 start = max(start, (valid_from.get(name, 0) + token_capacity - 1) // token_capacity)
@@ -1061,33 +1245,90 @@ class KvCacheManager:
                 block = pool.block_from_local_id(partition, block_ids[slot])
                 self._cache_group_block(pool, partition, block, hashes[index])
             cached_counts[name] = completed
+        if cached_counts != already_cached:
+            self._protect_group_checkpoint(request_id, block_hashes, num_computed_tokens, partition,
+                                           valid_from, checkpoint_boundary)
         return cached_counts
 
-    @staticmethod
+    def _protect_group_checkpoint(self, request_id, hashes, tokens, partition, valid_from, boundary, *, preferred=True):
+        if boundary is None:
+            # Publishers without a local replay target (e.g. an external fill)
+            # retain the allocator's latest checkpoint for future requests.
+            boundary = self.group_prefix_cache_boundary(tokens)
+            if not boundary:
+                boundary = tokens // self.group_prefix_cache_alignment * self.group_prefix_cache_alignment
+        if not 0 < boundary <= tokens:
+            return
+        if self._group_checkpoints is None:
+            if not any(pool.spec.sliding_window is not None for pool in self._group_pools.values()):
+                return
+            self._group_checkpoints = GroupPrefixCheckpoints()
+        owner = request_id if request_id in self._group_request_partitions else None
+        self._group_checkpoints.prune(self._group_pools)
+        self._group_checkpoints.publish(owner, self._group_pools, hashes, tokens, partition,
+                                        boundary, valid_from, preferred=preferred)
+        if self.tiering is not None:
+            self.tiering.publish_checkpoint(hashes, tokens, partition, boundary)
+
     def _cache_group_block(
+        self,
         pool: _GroupBlockPool,
         partition: int,
         block: KVCacheBlock,
-        block_hash: int,
+        block_hash: bytes,
     ) -> None:
         """Publish one immutable full page without replacing a live duplicate."""
         key = (partition, block_hash)
         existing = pool.hash_to_block.get(key)
         if existing is block:
             return
+        self._invalidate_group_block(pool, partition, block)
         if existing is not None:
-            if block.block_hash is not None:
-                old_key = (partition, block.block_hash)
-                if pool.hash_to_block.get(old_key) is block:
-                    del pool.hash_to_block[old_key]
-                block.block_hash = None
             return
-        if block.block_hash is not None:
-            old_key = (partition, block.block_hash)
-            if pool.hash_to_block.get(old_key) is block:
-                del pool.hash_to_block[old_key]
         block.block_hash = block_hash
         pool.hash_to_block[key] = block
+        if self.tiering is not None:
+            self.tiering.capture(pool.spec.name, partition, block)
+
+    def pin_cached_group_blocks(self, members, partition):
+        """Retain exact immutable cache pages, including currently evictable pages."""
+        groups = []
+        for name, blocks in members.items():
+            pool = self._group_pools[name]
+            blocks = tuple({block.block_id: block for block in blocks}.values())
+            if any(pool.hash_to_block.get((partition, block.block_hash)) is not block for block in blocks):
+                raise RuntimeError("cached snapshot content changed before pin")
+            groups.append((pool.free_queues[partition], blocks))
+        for queue, blocks in groups:
+            for block in blocks:
+                if block.ref_cnt == 0:
+                    queue.remove(block)
+                block.ref_cnt += 1
+        return GroupBlockSnapshot(self, tuple(groups))
+
+    def reserve_group_restore_pages(self, keys, partition):
+        """Reserve externally restored pages through the normal grouped allocator."""
+        counts = {}
+        for name, _ in keys:
+            counts[name] = counts.get(name, 0) + 1
+        if any(self._group_pools[name].num_free_blocks_in(partition) < amount + 1
+               for name, amount in counts.items()):
+            raise KVCacheCapacityError("not enough cache pages for restore and suffix headroom")
+        members, pages = {}, {}
+        try:
+            for name, value in keys:
+                pool = self._group_pools[name]
+                block = self._take_group_block(pool, partition)
+                members.setdefault(name, []).append(block)
+                pages[name, value] = block
+        except BaseException:
+            self.release_group_block_snapshot(GroupBlockSnapshot(
+                self, tuple((self._group_pools[name].free_queues[partition], tuple(blocks))
+                            for name, blocks in members.items())))
+            raise
+        pin = GroupBlockSnapshot(self, tuple((self._group_pools[name].free_queues[partition], tuple(blocks))
+                                             for name, blocks in members.items()))
+        return pages, pin
 
     @property
     def group_partition_count(self) -> int:
@@ -1100,13 +1341,15 @@ class KvCacheManager:
         """Return the stable cache partition assigned to a request."""
         return self._group_request_partitions.get(request_id)
 
-    @staticmethod
     def _invalidate_group_block(
+        self,
         pool: _GroupBlockPool,
         partition: int,
         block: KVCacheBlock,
     ) -> None:
         """Remove one block's old contents from its partition hash index."""
+        if self._group_checkpoints is not None:
+            self._group_checkpoints.discard_page(pool, block)
         if block.block_hash is None:
             return
         key = (partition, block.block_hash)
@@ -1120,7 +1363,10 @@ class KvCacheManager:
         partition: int,
     ) -> KVCacheBlock:
         """Take and initialize one evictable block from a group partition."""
-        block = pool.free_queues[partition].popleft()
+        queue = pool.free_queues[partition]
+        block = (self._group_checkpoints.victim(pool, queue)
+                 if self._group_checkpoints is not None and pool.spec.sliding_window is not None
+                 else queue.head)
         if block is None:
             raise RuntimeError(
                 f"KV cache group {pool.spec.name!r} free queue became inconsistent"
@@ -1129,6 +1375,7 @@ class KvCacheManager:
             raise RuntimeError(
                 f"Free grouped KV block {block.block_id} has ref_cnt={block.ref_cnt}"
             )
+        queue.remove(block)
         self._invalidate_group_block(pool, partition, block)
         block.ref_cnt = 1
         return block
@@ -1176,10 +1423,13 @@ class KvCacheManager:
     ) -> list[int]:
         assigned = self._group_request_partitions.get(request_id)
         candidates = [assigned] if assigned is not None else list(range(self.group_partition_count))
+        limit = next(iter(self._group_pools.values())).spec.max_requests_per_partition
         return [
             partition
             for partition in candidates
-            if all(
+            if (assigned is not None or limit is None or
+                sum(owner == partition for owner in self._group_request_partitions.values()) < limit)
+            and all(
                 self._additional_group_blocks(pool, request_id, token_count)
                 <= pool.num_free_blocks_in(partition)
                 for pool in self._group_pools.values()
@@ -1303,18 +1553,24 @@ class KvCacheManager:
                 else target
             )
             owned.extend([None] * (table_size - len(owned)))
+            initialized = set()
             # Prefix lookup leaves irrelevant rolling slots empty. Materialize
             # them without copying any cached KV before exposing the table.
             for slot in range(table_size):
                 if owned[slot] is None:
                     owned[slot] = self._take_group_block(pool, selected)
+                    initialized.add(slot)
 
             previous = pool.request_logical_blocks.get(request_id, 0)
             if pool.spec.sliding_window is not None:
-                for logical_block in range(previous, target):
-                    if logical_block < pool.spec.max_blocks_per_seq:
-                        continue
+                # A cold external fill needs one final ring mapping, not a
+                # replay of every historical wrap. Fresh/sparse slots already
+                # have empty pages; rotate each existing destination at most once.
+                for logical_block in range(max(previous, target - table_size,
+                                               pool.spec.max_blocks_per_seq), target):
                     slot = logical_block % pool.spec.max_blocks_per_seq
+                    if slot in initialized:
+                        continue
                     block = owned[slot]
                     if block is None:
                         raise RuntimeError(
@@ -1337,6 +1593,8 @@ class KvCacheManager:
                         owned[slot] = self._take_group_block(pool, selected)
             pool.request_logical_blocks[request_id] = max(previous, target)
 
+        if self._group_checkpoints is not None:
+            self._group_checkpoints.prune(self._group_pools)
         result = {}
         for name, pool in self._group_pools.items():
             block_ids = []
@@ -1351,6 +1609,8 @@ class KvCacheManager:
 
     def release_all_group_requests(self, request_id: str) -> None:
         """Release every grouped block owned by a request."""
+        if self._group_checkpoints is not None:
+            self._group_checkpoints.release(request_id)
         for pool in self._group_pools.values():
             partition = pool.request_partitions.get(request_id)
             blocks = pool.request_blocks.get(request_id, [])
@@ -1374,9 +1634,58 @@ class KvCacheManager:
                     pool.free_queues[partition].append(block)
         self._group_request_partitions.pop(request_id, None)
 
+    @property
+    def reservations(self) -> GroupedCacheReservations:
+        """Create external-fill leases only when a caller requests them."""
+        if self._reservations is None:
+            self._reservations = GroupedCacheReservations(self)
+        return self._reservations
+
+    def reserve_group_cache(
+        self, reservation_id: str, request_id: str, token_capacity: int, *,
+        partition: int | None = None, prompt_token_count: int | None = None,
+        prefix_block_hashes: dict[str, list[bytes]] | None = None,
+        shareable_group_names: tuple[str, ...] = (),
+    ) -> GroupCacheReservation:
+        return self.reservations.reserve_group_cache(
+            reservation_id, request_id, token_capacity, partition=partition,
+            prompt_token_count=prompt_token_count, prefix_block_hashes=prefix_block_hashes,
+            shareable_group_names=shareable_group_names,
+        )
+
+    def group_cache_reservation(self, reservation_id: str) -> GroupCacheReservation | None:
+        if self._reservations is None:
+            return None
+        return self._reservations.group_cache_reservation(reservation_id)
+
+    def commit_group_cache(self, reservation_id: str, *, valid_from=None) -> GroupCacheReservation:
+        return self.reservations.commit_group_cache(reservation_id, valid_from=valid_from)
+
+    def release_group_cache(self, reservation_id: str, *, confirmed_stopped=False) -> GroupCacheReservation:
+        return self.reservations.release_group_cache(reservation_id, confirmed_stopped=confirmed_stopped)
+
+    def authorize_group_cache_write(self, reservation_id: str):
+        return self.reservations.authorize_group_cache_write(reservation_id)
+
+    def adopt_group_cache(self, reservation_id: str):
+        return self.reservations.adopt_group_cache(reservation_id)
+
+    def quarantine_group_cache(self, reservation_id: str):
+        return self.reservations.quarantine_group_cache(reservation_id)
+
+    def retire_group_cache_reservation(self, reservation_id: str):
+        return self.reservations.retire_group_cache_reservation(reservation_id)
+
     def group_num_blocks(self, group_name: str) -> int:
         """Return the rank-local physical block capacity of one cache group."""
         return self._group_pool(group_name).blocks_per_partition
+
+    def group_num_free_blocks(self, group_name: str, partition: int) -> int:
+        """Return allocatable blocks in one scheduler-visible cache namespace."""
+        pool = self._group_pool(group_name)
+        if not 0 <= partition < len(pool.free_queues):
+            raise ValueError(f"Invalid cache partition {partition}")
+        return pool.num_free_blocks_in(partition)
 
     def _group_pool(self, group_name: str) -> _GroupBlockPool:
         try:

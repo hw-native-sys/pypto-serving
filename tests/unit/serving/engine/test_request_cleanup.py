@@ -11,6 +11,8 @@ import asyncio
 from collections import deque
 from types import SimpleNamespace
 
+import pytest
+
 from pypto_serving.serving.engine.async_engine import (
     ReplicaEngineCore,
     TokenOutput,
@@ -20,12 +22,47 @@ from pypto_serving.serving.server.ipc import (
     decode_command,
     encode_result,
 )
+from pypto_serving.serving.sched.scheduler import Request, RequestOutput
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("reason", ["stop", "length", "eos"])
+def test_prefilled_initial_terminal_token_needs_no_worker_release(stream, reason):
+    async def run():
+        core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+        core.config = SimpleNamespace(resolve_min_tokens=lambda value: value)
+        core._step_timeout = .05
+        core._request_contexts = {}
+        core._pending_free_ids = []
+        request = Request("initial", [1], max_new_tokens=1 if reason == "length" else 32,
+            output_token_ids=[2], stop_strings=("Paris",) if reason == "stop" else ())
+        output = RequestOutput("initial", new_token_id=2, num_output_tokens=1,
+            finished=reason != "stop",
+            finish_reason={"length": "FINISHED_LENGTH", "eos": "FINISHED_EOS"}.get(reason, ""))
+        finished = []
+        core.scheduler = SimpleNamespace(admit_prefilled=lambda **kwargs: (request, output),
+            finish_request=lambda rid, status: finished.append(rid))
+        core._record_scheduler_stats = lambda *args: None
+        core.tokenizer = SimpleNamespace(decode=lambda ids, **kwargs: "Paris" if ids else "")
+        receipt = asyncio.Event()
+        results = [token async for token in core.add_prefilled_request(reservation_id="initial",
+            request_id="initial", prompt_token_ids=[1], first_token=2,
+            max_new_tokens=request.max_new_tokens, stop_strings=request.stop_strings, stream=stream,
+            worker_release_ack=receipt)]
+        assert len(results) == 1 and results[0].finished
+        assert results[0].completion_tokens == 1
+        assert results[0].finish_reason == "FINISHED_" + reason.upper()
+        assert finished == (["initial"] if reason == "stop" else [])
+        assert not core._pending_free_ids and not core._request_contexts
+        assert not receipt.is_set()  # Logical first-token completion is not a worker ACK.
+    asyncio.run(run())
 
 
 def test_worker_step_error_queues_finished_ids_for_executor_release():
     aborted: list[str] = []
     discarded: list[SimpleNamespace] = []
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._request_contexts = {}
     core.scheduler = SimpleNamespace(
         abort_request=aborted.append,
         discard_scheduled_request=discarded.append,
@@ -34,8 +71,8 @@ def test_worker_step_error_queues_finished_ids_for_executor_release():
     core._batch_queue = deque()
     core._discard_result_step_ids = set()
     contexts = {
-        "req-a": SimpleNamespace(queue=asyncio.Queue()),
-        "req-b": SimpleNamespace(queue=asyncio.Queue()),
+        name: SimpleNamespace(queue=asyncio.Queue(), worker_release_done=asyncio.Event())
+        for name in ("req-a", "req-b")
     }
     core._request_contexts = dict(contexts)
     scheduler_output = SimpleNamespace(
@@ -52,12 +89,15 @@ def test_worker_step_error_queues_finished_ids_for_executor_release():
     assert aborted == ["req-a", "req-b"]
     assert discarded == scheduler_output.scheduled_requests
     assert core._pending_free_ids == ["req-a", "req-b"]
-    assert not core._request_contexts
+    assert core._request_contexts == contexts
     for request_id in ("req-a", "req-b"):
         token = contexts[request_id].queue.get_nowait()
         assert isinstance(token, TokenOutput)
         assert token.finished is True
         assert token.finish_reason == "error"
+        assert contexts[request_id].terminal_output_queued
+    core._acknowledge_worker_frees(("req-a", "req-b"))
+    assert all(ctx.worker_release_done.is_set() for ctx in contexts.values())
 
 
 def test_abort_request_schedules_worker_cleanup():
@@ -65,15 +105,19 @@ def test_abort_request_schedules_worker_cleanup():
     otherwise its worker-side _req_cache entry and device slots leak."""
     aborted: list[str] = []
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._request_contexts = {}
     core.scheduler = SimpleNamespace(abort_request=aborted.append)
     core._pending_free_ids = []
-    core._request_contexts = {"req-x": SimpleNamespace(queue=asyncio.Queue())}
+    core._request_contexts = {"req-x": SimpleNamespace(
+        queue=asyncio.Queue(), worker_release_done=asyncio.Event())}
 
     asyncio.run(core.abort_request("req-x"))
 
-    # Scheduler aborted, context removed.
+    # The terminal consumer still needs its context to receive the release ACK.
     assert aborted == ["req-x"]
-    assert "req-x" not in core._request_contexts
+    context = core._request_contexts["req-x"]
+    core._acknowledge_worker_frees(("req-x",))
+    assert context.worker_release_done.is_set()
     # The id is queued for worker release exactly once.
     assert core._pending_free_ids == ["req-x"]
 
@@ -86,6 +130,7 @@ def test_abort_request_schedules_worker_cleanup():
 def test_abort_request_emits_abort_token_before_scheduling_free():
     """The client-facing queue receives a FINISHED_ABORTED token on abort."""
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._request_contexts = {}
     core.scheduler = SimpleNamespace(abort_request=lambda _req_id: None)
     core._pending_free_ids = []
     queue: asyncio.Queue = asyncio.Queue()
@@ -110,6 +155,7 @@ def test_flush_pending_frees_sends_cleanup_only_step_command(monkeypatch):
 
     monkeypatch.setattr(asyncio, "to_thread", run_inline)
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._request_contexts = {}
     core.config = SimpleNamespace(executor_cls="PyptoQwen14BExecutor")
     core._worker_known_req_ids = {"aborted"}
     core._pending_free_ids = ["aborted"]
@@ -121,7 +167,7 @@ def test_flush_pending_frees_sends_cleanup_only_step_command(monkeypatch):
     sent: list[bytes] = []
     core._input_queue = SimpleNamespace(put=sent.append)
     # Worker replies with an empty StepResult for the cleanup-only step.
-    core._output_queue = SimpleNamespace(get=lambda timeout=None: encode_result(StepResult(new_tokens={})))
+    core._output_queue = SimpleNamespace(get=lambda timeout=None: encode_result(StepResult(new_tokens={}, step_id=1)))
 
     asyncio.run(core._flush_pending_frees())
 

@@ -755,7 +755,6 @@ def test_cli_selects_deepseek_executor_and_configures_mtp_depth(tmp_path):
             '{"method":"mtp","num_speculative_tokens":4}',
             "--max-num-seqs",
             "16",
-            "--use-compile-cache",
         ]
     )
 
@@ -775,7 +774,6 @@ def test_cli_selects_deepseek_executor_and_configures_mtp_depth(tmp_path):
     assert config.runtime_config.requires_homogeneous_prefill_decode is True
     assert config.max_num_running_reqs == 16
     assert config.long_prefill_token_threshold == 2048
-    assert config.executor_kwargs["use_compile_cache"] is True
 
 
 @pytest.mark.parametrize(
@@ -919,9 +917,8 @@ def test_deepseek_compile_attaches_lazy_weight_store_without_opening_shards(
     assert compiled.layer_plan[3].include_gate_bias is True
 
 
-@pytest.mark.parametrize("use_compile_cache", [False, True])
-def test_deepseek_compiler_only_sets_cache_dir_when_enabled(tmp_path, monkeypatch, use_compile_cache):
-    """Disabled caching keeps PyPTO's fresh per-kernel build directories."""
+def test_deepseek_explicit_output_is_diagnostic(tmp_path, monkeypatch):
+    """Explicit output remains a diagnostic request, not a cache control."""
     kernel_dir = _write_deepseek_kernel_dir(tmp_path, lm_head_tp_size=8)
     captured: dict[str, object] = {}
 
@@ -936,12 +933,11 @@ def test_deepseek_compiler_only_sets_cache_dir_when_enabled(tmp_path, monkeypatc
         platform="a2a3sim",
         device_ids=tuple(range(8)),
         pypto_build_dir=str(tmp_path / "build"),
-        use_compile_cache=use_compile_cache,
     )
 
-    expected = executor._pypto_build_dir if use_compile_cache else None
-    assert captured["cache_dir"] == expected
-    assert getattr(captured["run_config"], "save_kernels_dir") == expected
+    assert "cache_dir" not in captured
+    assert getattr(captured["run_config"], "save_kernels_dir") == str(tmp_path / "build")
+    assert getattr(captured["run_config"], "save_kernels")
 
 
 @pytest.mark.parametrize("num_speculative_tokens", [1, 3])
@@ -1044,7 +1040,7 @@ def test_deepseek_l3_compile_passes_runtime_scalars_unspecialized():
     captured: dict[str, object] = {}
 
     class _FakeCompiler:
-        def compile(self, name, jit_fn, *, use_cache=False, **compile_kwargs):
+        def compile(self, name, jit_fn, **compile_kwargs):
             captured["name"] = name
             captured["compile_kwargs"] = compile_kwargs
             return "compiled"
@@ -1058,7 +1054,6 @@ def test_deepseek_l3_compile_passes_runtime_scalars_unspecialized():
 
     executor = npu_executor.DeepSeekV4PyptoExecutor.__new__(npu_executor.DeepSeekV4PyptoExecutor)
     executor._compiler = _FakeCompiler()
-    executor._use_compile_cache = False
 
     compiled = executor._compile_l3_callable(
         "deepseek_v4_mtp_prefill",
@@ -1070,35 +1065,6 @@ def test_deepseek_l3_compile_passes_runtime_scalars_unspecialized():
     assert compiled == "compiled"
     assert captured["name"] == "deepseek_v4_mtp_prefill"
     assert captured["compile_kwargs"] == {"num_tokens": RUNTIME}
-
-
-def test_deepseek_compile_l3_callable_threads_use_cache_to_compiler():
-    """_compile_l3_callable forwards use_compile_cache to the shared compiler."""
-    captured: dict[str, object] = {}
-
-    class _FakeCompiler:
-        def compile(self, name, jit_fn, *, use_cache=False, **compile_kwargs):
-            captured["name"] = name
-            captured["use_cache"] = use_cache
-            return "compiled"
-
-    def _kernel(x: tuple[int, int]):
-        pass
-
-    class _JitFunction:
-        _func = _kernel
-
-    executor = npu_executor.DeepSeekV4PyptoExecutor.__new__(npu_executor.DeepSeekV4PyptoExecutor)
-    executor._compiler = _FakeCompiler()
-    executor._use_compile_cache = True
-
-    compiled = executor._compile_l3_callable(
-        "deepseek_v4_decode", _JitFunction(), layout=DeepSeekV4CacheLayout()
-    )
-
-    assert compiled == "compiled"
-    assert captured["name"] == "deepseek_v4_decode"
-    assert captured["use_cache"] is True
 
 
 def test_deepseek_weight_store_reads_real_safetensors_by_name(tmp_path):
@@ -3114,8 +3080,8 @@ def test_deepseek_mtp_prefill_reads_only_selected_owner_outputs():
         def free_tensor(_tensor, *, worker_id=0):
             pass
 
-        def copy_from(self, dst, src, nbytes, *, src_offset=0, worker_id=0):
-            self.copies.append((dst, src + src_offset, nbytes, worker_id))
+        def copy_from(self, dst, src, nbytes, *, worker_id=0, src_offset=0):
+            self.copies.append((dst, src, nbytes, worker_id, src_offset))
 
     worker = FakeWorker()
     runner._l3_worker = worker
@@ -3147,12 +3113,14 @@ def test_deepseek_mtp_prefill_reads_only_selected_owner_outputs():
             ta.tensors["logits"].shards[1].data_ptr,
             129280 * torch.float32.itemsize,
             1,
+            0,
         ),
         (
             runner._mtp_buffers.prefill_pre_hc_mirror[1, 0].data_ptr(),
             ta.tensors["pre_hc_hidden_out"].shards[1].data_ptr,
             4 * 5 * torch.float32.itemsize,
             1,
+            0,
         ),
     ]
 

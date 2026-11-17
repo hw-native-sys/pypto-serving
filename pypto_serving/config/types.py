@@ -25,6 +25,7 @@ class GenerateConfig:
     """User-facing options that control text generation."""
 
     max_new_tokens: int = 256
+    min_tokens: int = 0
     temperature: float = 0.0
     top_p: float = 1.0
     top_k: int | None = None
@@ -32,6 +33,22 @@ class GenerateConfig:
     stop: tuple[str, ...] = ()
     stream: bool = False
     ignore_eos: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.max_new_tokens, int)
+            or isinstance(self.max_new_tokens, bool)
+            or self.max_new_tokens <= 0
+        ):
+            raise ValueError("max_new_tokens must be a positive integer")
+        if (
+            not isinstance(self.min_tokens, int)
+            or isinstance(self.min_tokens, bool)
+            or self.min_tokens < 0
+        ):
+            raise ValueError("min_tokens must be a non-negative integer")
+        if self.min_tokens > self.max_new_tokens:
+            raise ValueError(f"min_tokens {self.min_tokens} exceeds max_tokens {self.max_new_tokens}")
 
 
 @dataclass(frozen=True)
@@ -114,6 +131,15 @@ class KVCacheGroupSpec:
     # states, including the final pending row. Earlier rows in a large chunk
     # must not be published as complete prefix-cache pages.
     prefill_tail_tokens: int | None = None
+    # Some kernels have request state for fewer sequences than their KV pages
+    # could fit. Limit active owners per partition before assigning pages.
+    max_requests_per_partition: int | None = None
+    # Recurrent state is immutable only at an explicitly materialized Prefill
+    # checkpoint, not at every position covered by the scheduled token count.
+    is_checkpoint_state: bool = False
+    # Prefill reads entry history through a retained view while a compact ring
+    # is rebound for the current chunk's writes.
+    preserve_prefill_history: bool = False
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -124,6 +150,12 @@ class KVCacheGroupSpec:
             raise ValueError("KV cache num_blocks must be positive when specified")
         if self.num_partitions <= 0:
             raise ValueError("KV cache num_partitions must be positive")
+        if self.max_requests_per_partition is not None and self.max_requests_per_partition <= 0:
+            raise ValueError("KV cache max_requests_per_partition must be positive")
+        if self.is_checkpoint_state and self.sliding_window is None:
+            raise ValueError("Checkpoint state requires a rolling history window")
+        if self.preserve_prefill_history and not self.is_checkpoint_state:
+            raise ValueError("Preserved Prefill history requires checkpoint state")
         if self.prefill_tail_tokens is not None:
             if self.prefill_tail_tokens <= 0 or not self.is_eagle_group:
                 raise ValueError("KV cache prefill_tail_tokens requires a positive EAGLE tail extent")
@@ -155,12 +187,17 @@ class RuntimeConfig:
     total_kv_pages: int | None = None
     # Fraction of total NPU HBM the server is allowed to use (weights + activations + KV).
     npu_memory_utilization: float = 0.90
+    kv_offload_bytes: int = 0
+    kv_offload_backend: str = "simpler"
     # Max tokens processed per scheduling step (chunked-prefill granularity).
     max_num_batched_tokens: int = 4096
     # Optional model/kernel limit for one request's active prefill tokens in a
     # single dispatch. ``None`` means the model has no stricter per-request
     # limit than ``max_num_batched_tokens``.
     max_prefill_tokens_per_request: int | None = None
+    # Unfinished prompt chunks preserve this kernel recurrence boundary. The
+    # final prompt tail can have any length. Other models use token granularity.
+    prefill_chunk_alignment: int = 1
     # User-selectable scheduler chunk sizes supported by this model. Empty
     # means that the shared scheduler imposes no model-specific allowlist.
     prefill_chunk_size_choices: tuple[int, ...] = ()
@@ -173,6 +210,9 @@ class RuntimeConfig:
     # A nonzero window opts into grouped prefix caching with private draft
     # caches rebuilt from this many freshly prefilled suffix tokens.
     speculative_prefix_cache_replay_tokens: int = 0
+    # Source-token cadence for sparse grouped state checkpoints; zero keeps
+    # only replay/shared boundaries. Independent of the Prefill chunk size.
+    prefix_cache_retention_interval: int = 8192
     # Whether the kernel requires each scheduler step to contain prefill or
     # decode work, never both.
     requires_homogeneous_prefill_decode: bool = False
@@ -192,6 +232,14 @@ class RuntimeConfig:
     ring_dep_pool: int | list[int] | None = None
     ring_task_window: int | list[int] | None = None
     ring_heap: int | list[int] | None = None
+    # Chip scheduler policy, independent of backend and onboard/simulation mode.
+    chip_runtime: Literal["tensormap_and_ringbuffer", "host_build_graph"] = "tensormap_and_ringbuffer"
+
+    def __post_init__(self) -> None:
+        if self.chip_runtime not in ("tensormap_and_ringbuffer", "host_build_graph"):
+            raise ValueError(f"Unsupported chip runtime: {self.chip_runtime}")
+        if type(self.prefix_cache_retention_interval) is not int or self.prefix_cache_retention_interval < 0:
+            raise ValueError("prefix_cache_retention_interval must be a nonnegative integer")
 
 
 @dataclass(frozen=True)
@@ -249,6 +297,7 @@ class SamplingParams:
     top_p: float
     top_k: int | None = None
     seed: int | None = None
+    forbidden_token_ids: tuple[int, ...] = ()
 
 
 @dataclass
@@ -290,6 +339,14 @@ class KvAllocation:
     tokens_used: int = 0
 
 
+@dataclass(frozen=True)
+class StopTokenMask:
+    """Immutable dispatch-time stop constraint for device sampling."""
+
+    stop_token_ids: tuple[int, ...]
+    remaining_tokens: int
+
+
 @dataclass
 class PrefillBatch:
     """Packed inputs for a batched prompt prefill call."""
@@ -301,12 +358,25 @@ class PrefillBatch:
     chunk_lens: list[int]
     chunk_offsets: list[int]
     chunk_starts: list[int]
+    # Stable full prompt lengths. Unlike seq_lens, these do not change between
+    # chunked-prefill steps and let device prepare identify the terminal chunk.
+    prompt_lens: list[int] = field(default_factory=list)
     allow_device_greedy_sampling: bool = False
     allow_device_topk_sampling: bool = False
     kv_allocations: list[KvAllocation] = field(default_factory=list)
     block_ids: list[list[int]] = field(default_factory=list)
     block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
+    read_block_ids_by_group: list[dict[str, dict[int, int]]] = field(default_factory=list)
+    checkpoint_ends: list[tuple[int, ...]] = field(default_factory=list)
+    state_write_block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
+    checkpoint_block_ids_by_group: list[dict[str, dict[int, int]]] = field(default_factory=list)
     cache_partitions: list[int | None] = field(default_factory=list)
+    # Opaque request-local generation constraints, interpreted only by capable runners.
+    constraint_states: dict[str, object] = field(default_factory=dict)
+    stop_token_masks: dict[str, StopTokenMask] = field(default_factory=dict)
+    # Optional serving-owned DSpark stage arguments.  The V4.1 adapter accepts
+    # only already-bound lib composite arguments; it never rebuilds operators.
+    dspark_stages: object | None = None
 
 
 @dataclass
@@ -338,12 +408,20 @@ class DecodeBatch:
     block_ids: list[list[int]] = field(default_factory=list)
     block_ids_by_group: list[dict[str, list[int]]] = field(default_factory=list)
     cache_partitions: list[int | None] = field(default_factory=list)
+    constraint_states: dict[str, object] = field(default_factory=dict)
+    stop_token_masks: dict[str, StopTokenMask] = field(default_factory=dict)
+    # Requests with preinitialized target cache that still require local model
+    # state initialization. Ordinary batches carry no additional request list.
+    initial_request_ids: tuple[str, ...] = ()
     # Optional MTP context for models (e.g. DeepSeek V4) that decode two real
     # trailing tokens per step. ``prev_token_ids`` holds the token id at absolute
     # position ``seq_len-2`` per request (shape ``[B]``) and ``prev_hidden_states``
     # its embedding (shape ``[B, hidden]``). Left ``None`` for single-token decoders.
     prev_token_ids: torch.Tensor | None = None
     prev_hidden_states: torch.Tensor | None = None
+    # Optional serving-owned DSpark stage arguments for one complete target ->
+    # accept -> drafter -> Markov -> commit round.
+    dspark_stages: object | None = None
 
 
 @dataclass

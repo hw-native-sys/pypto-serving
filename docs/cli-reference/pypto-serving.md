@@ -40,14 +40,18 @@ pypto-serving \
 | `--devices LIST` | unset | Comma-separated device IDs for multi-device placement. |
 | `--dtype DTYPE` | `bfloat16` | Weight data type. |
 | `--kv-cache-dtype DTYPE` | `bfloat16` | KV cache data type. `auto` follows `--dtype`. |
-| `--use-compile-cache` | off | Reuse compiled kernels from `PYPTO_PROG_BUILD_DIR`. |
 | `--show-startup-logs` | off | Show model loading and kernel compilation logs. |
 
 ### Startup and Build Cache
 
-The first NPU run may compile kernels and assemble device binaries. Set `PYPTO_PROG_BUILD_DIR` to choose a persistent build directory, then pass `--use-compile-cache` to reuse compiled programs on later launches.
+The first NPU run may compile kernels. Serving inherits PyPTO's cache settings; there is no serving cache CLI flag. `PYPTO_CACHE=1` enables reuse, `PYPTO_CACHE=0` disables it, `PYPTO_CACHE_DIR` selects the artifact directory, and `PYPTO_CACHE_READONLY=1` enables read-only lookup. `PYPTO_CACHE_DIR` alone does not enable caching.
 
-The compile cache does not perform fingerprint validation. Reuse it only with the same model configuration, platform, assigned devices, and kernel sources. Clear the build directory after any of those inputs changes. Use `--show-startup-logs` when startup progress or cache behavior needs to be visible in the server logs.
+```bash
+PYPTO_CACHE=1 PYPTO_CACHE_DIR=/path/to/shared-jit-cache pypto-serving \
+  --model /path/to/Qwen3-14B --platform a2a3
+```
+
+Leave `PYPTO_PROG_BUILD_DIR` unset for reuse; setting it requests explicit build output and bypasses the cache. See [JIT Cache](../developer-guide/jit-cache.md) for precedence, startup behavior, and inspection commands. Use `--show-startup-logs` to see compilation progress.
 
 ## Parallelism Arguments
 
@@ -55,10 +59,10 @@ The compile cache does not perform fingerprint validation. Reuse it only with th
 | --- | --- | --- |
 | `--data-parallel-size`, `--dp` | `1` | Data-parallel size. |
 | `--tensor-parallel-size`, `--tp` | `1` | Tensor-parallel group size. |
-| `--expert-parallel-size`, `--ep` | `1` | Expert-parallel size for supported overlapped placement. |
+| `--expert-parallel-size`, `--ep` | `1` | Expert-parallel size where supported by the model. |
 | `--data-parallel-routing` | `least_pending_tokens` | DP request routing policy. |
 
-For Qwen-style replica placement, the number of device IDs must equal `dp * tp`. DeepSeek V4 uses overlapped placement and requires exactly eight devices with `--dp 8 --ep 8 --tp 1`.
+Device count and the meaning of each parallel axis depend on the model's placement mode. Replica placement uses `dp * tp` devices; overlapped placement can reuse ranks across parallel axes. See [Parallelism and Scaling](../user-guide/parallel.md) and the model guide for supported topologies.
 
 ## Runtime Capacity Arguments
 
@@ -67,9 +71,10 @@ For Qwen-style replica placement, the number of device IDs must equal `dp * tp`.
 | `--max-model-len` | `1024` | Maximum prompt plus generated token length. |
 | `--block-size` | `128` | KV cache block size. |
 | `--npu-memory-utilization` | `0.90` | Fraction of NPU memory available to the server. |
-| `--max-num-seqs` | `16` | Maximum concurrent requests in serving mode. |
+| `--max-num-seqs` | `16`; PD decode: `72` | Maximum concurrent requests and cache-planning capacity. PD prefill defaults to `16`; explicit values override the default. |
 | `--max-num-batched-tokens` | `4096` | Maximum scheduled tokens per iteration. |
 | `--long-prefill-token-threshold` | `2048` | Chunked-prefill threshold in serving mode. |
+| `--prefix-cache-retention-interval` | `8192` | DSpark sparse checkpoint cadence in source tokens, independent of chunk size. Must align to the common cache-page boundary (128 tokens); `0` retains only replay/shared boundaries. |
 | `--ring-dep-pool` | runtime default | Simpler ring dependency-edge pool capacity. A single integer broadcasts to all scope-depth rings; a comma-separated four-integer list sizes rings 0..3, with `0` leaving that ring at its default. |
 | `--ring-task-window` | runtime default | Simpler ring task-slot window capacity. Accepts the same single integer or four-entry list form as `--ring-dep-pool`. |
 | `--ring-heap` | runtime default | Simpler per-ring output-heap size in bytes. Accepts the same single integer or four-entry list form as `--ring-dep-pool`. |
@@ -78,9 +83,9 @@ For Qwen-style replica placement, the number of device IDs must equal `dp * tp`.
 
 Continuous batching keeps multiple requests active across engine iterations. Requests move through waiting, prefill, decode, and finished states while the scheduler allocates KV cache pages and dispatches work that fits the configured request and token limits.
 
-`--max-num-seqs` bounds the number of active requests. `--max-num-batched-tokens` bounds the scheduled tokens in one engine iteration. Paged KV cache capacity is determined by `--max-model-len`, `--block-size`, active request count, cache dtype, and available NPU memory.
+`--max-num-seqs` bounds the number of active requests. `--max-num-batched-tokens` bounds the scheduled tokens in one engine iteration. For the generic paged KV cache, capacity depends on `--max-model-len`, `--block-size`, active request count, cache dtype, and available NPU memory.
 
-Standard models use the generic paged KV cache layout. DeepSeek V4 uses model-specific grouped cache pools that match its decode layout and compressed-state requirements; see [DeepSeek V4](../user-guide/deepseek-v4.md) for the topology-specific command lines.
+Cache layout and capacity constraints depend on the model executor. Some models use the generic paged KV cache; others allocate model-specific cache pools. Check the model guide when sizing `--max-model-len`, `--block-size`, and concurrent requests.
 
 The ring options size Simpler runtime queues and output heap capacity. A single integer applies to every scope-depth ring; a four-entry list controls rings 0 through 3, with `0` preserving that ring's runtime default.
 
@@ -98,14 +103,15 @@ Server defaults and offline generate mode use `--generate-config`. HTTP request 
 | Field or option | Meaning |
 | --- | --- |
 | `max_tokens` / `max_new_tokens` | Maximum generated tokens. |
+| `min_tokens` | Minimum generated tokens before EOS can be sampled on supported model paths. |
 | `temperature` | Sampling temperature. |
 | `top_p` | Nucleus sampling cutoff. |
 | `top_k` | Top-k sampling cutoff. |
 | `stop` | Stop strings. |
 | `stream` | Stream text deltas. |
-| `ignore_eos` | Generate-mode EOS handling. |
+| `ignore_eos` | EOS handling; chat requests can override the server default. |
 
-The HTTP completion path ignores EOS for completion requests and uses standard generation behavior for chat requests.
+The HTTP completion path always ignores EOS. Chat requests can set `max_completion_tokens`, `min_tokens`, and `ignore_eos` as described in the [HTTP API Reference](../api-reference/http.md#chat-fields).
 
 ## Feature Flags
 
@@ -113,16 +119,16 @@ The HTTP completion path ignores EOS for completion requests and uses standard g
 | --- | --- | --- |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | enabled | Enable or disable prefix caching for supported paths. |
 | `--enable-chunked-prefill` / `--no-enable-chunked-prefill` | enabled | Enable or disable chunked prefill. |
-| `--speculative-config JSON` | unset | DeepSeek V4 MTP config. |
-| `--num-speculative-tokens K` | unset | Deprecated DeepSeek V4 MTP alias. |
+| `--speculative-config JSON` | unset | Model-specific speculative decoding configuration; currently supported by DeepSeek V4. |
+| `--num-speculative-tokens K` | unset | Deprecated alias for the DeepSeek V4 MTP draft-token count. |
 
 ### Feature Flag Semantics
 
 Chunked prefill breaks long prompts into scheduler-visible chunks when a prompt exceeds `--long-prefill-token-threshold`. `--no-enable-chunked-prefill` disables that scheduler path.
 
-Prefix caching reuses KV cache state for repeated prompt prefixes when the model path supports it. It is enabled by default for Qwen serving. DeepSeek V4 command examples disable it unless prefix-cache behavior is being validated.
+Prefix caching reuses KV cache state for repeated prompt prefixes when the model executor supports it. The flag is enabled by default, but model-specific decoding modes may disable caching or require an explicit choice; consult the model guide.
 
-`--speculative-config '{"method":"mtp","num_speculative_tokens":K}'` enables DeepSeek V4 MTP speculative decoding. The deprecated `--num-speculative-tokens` flag remains as a compatibility alias. Model-specific MTP layout and batch-size constraints are documented in [DeepSeek V4](../user-guide/deepseek-v4.md#8-device-dpep-serving).
+`--speculative-config` selects a model-supported decoding method and its parameters. Currently only DeepSeek V4 accepts this option; see its [MTP](../models/deepseek-v4/mtp.md#8-device-dpep-serving) and [DSpark](../models/deepseek-v4/dspark.md) guides for supported values and constraints. The deprecated `--num-speculative-tokens` flag remains a DeepSeek V4 MTP compatibility alias.
 
 ## Profiling Arguments
 

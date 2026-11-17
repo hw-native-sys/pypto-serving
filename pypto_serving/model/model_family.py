@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 
-ModelFamily = Literal["deepseek_v4", "qwen3_8_27b", "qwen"]
+ModelFamily = Literal["deepseek_v41", "deepseek_v4", "glm53", "qwen3_8_27b", "qwen"]
 
 
 def read_model_config(model_dir: str | Path) -> dict[str, object]:
@@ -67,8 +67,30 @@ def is_qwen38_config(config_data: dict[str, object]) -> bool:
     return named or (hybrid and identified_dimensions)
 
 
+def is_deepseek_v41_config(config_data: dict[str, object]) -> bool:
+    """Identify V4.1 before the V4 and generic Hugging Face paths."""
+    architectures = config_data.get("architectures", ())
+    return str(config_data.get("model_type", "")).lower() == "deepseek_v41" or (
+        isinstance(architectures, (list, tuple))
+        and any(str(name).lower() == "deepseekv41forcausallm" for name in architectures)
+    )
+
+
+def is_glm53_config(config_data: dict[str, object]) -> bool:
+    """Identify GLM-5.3's conditional-generation checkpoint metadata."""
+    architectures = config_data.get("architectures") or ()
+    return str(config_data.get("model_type", "")).lower() == "glm5_next" or (
+        isinstance(architectures, (list, tuple))
+        and "glm5nextforconditionalgeneration" in {str(item).lower() for item in architectures}
+    )
+
+
 def detect_model_family(config_data: dict[str, object]) -> ModelFamily:
     """Return the serving model family inferred from config metadata."""
+    if is_deepseek_v41_config(config_data):
+        return "deepseek_v41"
+    if is_glm53_config(config_data):
+        return "glm53"
     if is_deepseek_v4_config(config_data):
         return "deepseek_v4"
     if is_qwen38_config(config_data):

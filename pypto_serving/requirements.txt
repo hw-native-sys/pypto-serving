@@ -1,4 +1,6 @@
-pypto>=0.1.0
-simpler>=0.1.0
+# PyPTO and its simpler runtime are NOT published on PyPI: the "pypto" and
+# "simpler" names there are unrelated packages without the persistent JIT
+# cache API. Provide both from a current source build (see
+# docs/get-started/installation.md) -- do not pip-resolve them from PyPI.
 torch>=2.6.0
 -r requirements-runtime.txt

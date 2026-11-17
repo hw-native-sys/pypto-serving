@@ -34,6 +34,7 @@ def build_pypto_run_config(
     pypto_build_dir: str | None = None,
     aicpu_thread_num: int = 4,
     num_sub_workers: int = 0,
+    runtime: str = "tensormap_and_ringbuffer",
 ) -> RunConfig:
     """Build a PyPTO ``RunConfig`` (with ``DistributedConfig``) for compile/run.
 
@@ -42,22 +43,28 @@ def build_pypto_run_config(
     :class:`KernelCompiler` (which only layers on per-model knobs via
     ``dataclasses.replace``). ``device_id`` is the first of ``device_ids``.
 
-    ``pypto_build_dir`` is the per-worker build/cache directory: when set it
-    becomes the pypto ``RunConfig.save_kernels_dir`` (artifacts retained there)
-    and the :class:`KernelCompiler` slots each kernel under ``<dir>/<name>``.
+    ``pypto_build_dir`` is an explicit diagnostic/output request and bypasses
+    PyPTO's JIT cache. Ordinary serving leaves it unset; private builds then use
+    PyPTO's unique directories. KernelCompiler adds the kernel name to an
+    explicitly requested base directory.
     """
     from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
-    from pypto.runtime import RunConfig  # noqa: PLC0415
+    from pypto.runtime import ExecutionMode, RunConfig  # noqa: PLC0415
 
+    if platform not in ("a2a3", "a2a3sim", "a5", "a5sim"):
+        raise ValueError(f"Unsupported PyPTO platform: {platform}")
+    if runtime not in ("tensormap_and_ringbuffer", "host_build_graph"):
+        raise ValueError(f"Unsupported chip runtime: {runtime}")
     device_ids = list(device_ids)
     return RunConfig(
-        platform=platform,
         device_id=device_ids[0],
         backend_type=backend_type_for_platform(platform),
+        execution_mode=ExecutionMode.SIM if platform.endswith("sim") else ExecutionMode.ONBOARD,
         codegen_only=True,
         save_kernels=pypto_build_dir is not None,
         save_kernels_dir=pypto_build_dir,
         distributed_config=DistributedConfig(
+            runtime=runtime,
             device_ids=device_ids,
             num_sub_workers=num_sub_workers,
             aicpu_thread_num=aicpu_thread_num,

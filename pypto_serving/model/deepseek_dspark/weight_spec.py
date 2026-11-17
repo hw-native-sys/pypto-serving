@@ -143,7 +143,7 @@ class DSParkShardPolicy:
     """Pack one layer tensor under the DSpark rank layout.
 
     A rule-name dispatch rather than one flat policy: most weights replicate
-    across all 16 ranks, the output projection shards across the 4 TP ranks,
+    across the world, the output projection shards across attention TP ranks,
     and the two HC function matrices pad to the decode bank's storage rows.
     Keeping the dispatch here lets the shared generic packer stay unaware of
     per-name layouts.
@@ -276,9 +276,9 @@ class DSParkShardPolicy:
         return packed.contiguous()
 
 
-def dspark_shard_policy(ranks: int) -> DSParkShardPolicy:
+def dspark_shard_policy(ranks: int, *, tp_size: int = DSPARK_TP_SIZE) -> DSParkShardPolicy:
     """The DSpark rank policy, carrying the diagnostics its users recognise."""
-    return DSParkShardPolicy(ranks=ranks)
+    return DSParkShardPolicy(ranks=ranks, tp_size=tp_size)
 
 
 def dspark_expert_parallel(ranks: int, n_routed_experts: int):

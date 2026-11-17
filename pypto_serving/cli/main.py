@@ -27,7 +27,10 @@ from pypto_serving.config.types import (
 )
 from pypto_serving.model.model_family import detect_model_family, read_model_config
 from pypto_serving.observability.access_log import create_uvicorn_log_config
-from pypto_serving.serving.utils.env import configure_runtime_logging
+from pypto_serving.serving.utils.env import (
+    configure_runtime_logging,
+    graceful_shutdown_timeout_seconds,
+)
 from pypto_serving.tools.profile import (
     ProfileConfig,
     configure_profiler,
@@ -63,18 +66,6 @@ def build_parser() -> argparse.ArgumentParser:
     # Backend and device
     parser.add_argument("--backend", default="npu", choices=sorted(_VALID_BACKENDS), help="Inference backend (default: npu).")
     parser.add_argument("--platform", default="a2a3", help="NPU platform (default: a2a3).")
-    parser.add_argument(
-        "--use-compile-cache",
-        action="store_true",
-        default=False,
-        help=(
-            "Reuse compiled kernels across launches. Each kernel is written to "
-            "<pypto_build_dir>/<name> and reloaded on the next launch, skipping the JIT "
-            "and the device-binary assembly. Off by default. NOTE: there is no "
-            "fingerprinting, so reuse the same build dir only for the same config and "
-            "kernel sources; clear it on a config/kernel change to avoid stale binaries."
-        ),
-    )
     parser.add_argument("--device", type=int, default=0, help="NPU device ID (default: 0).")
     parser.add_argument(
         "--devices",
@@ -108,11 +99,19 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["least_pending_tokens"],
         help="Data-parallel request routing policy.",
     )
+    parser.add_argument(
+        "--lm-head-tp", type=int, default=4,
+        help="DSpark vocabulary head TP, independent of attention TP (default: 4).",
+    )
     # Dtype
     parser.add_argument("--dtype", default="bfloat16", help="Weight data type (default: bfloat16).")
     parser.add_argument("--kv-cache-dtype", default="bfloat16", help="KV cache data type. 'auto' follows --dtype (default: bfloat16).")
 
     # Runtime
+    parser.add_argument("--kv-offload-bytes", type=int, default=0,
+                        help="Instance-wide DDR prefix-cache capacity in bytes; zero disables offload.")
+    parser.add_argument("--kv-offload-backend", choices=("simpler",), default="simpler",
+                        help="DDR cache storage/transfer backend (default: simpler).")
     parser.add_argument("--max-model-len", type=int, default=1024, help="Maximum sequence length (prompt + generated; default: 1024).")
     parser.add_argument("--block-size", type=int, default=128, help="KV cache block size (default: 128).")
     parser.add_argument(
@@ -180,7 +179,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="JSON",
         help=(
-            "GenerateConfig fields as a JSON object: max_new_tokens, "
+            "GenerateConfig fields as a JSON object: max_new_tokens, min_tokens, "
             "temperature, top_p, top_k, stop, stream, ignore_eos. Generate "
             "mode: the run's sampling config. Serve mode: server-wide defaults "
             "for request fields that are omitted (default: GenerateConfig "
@@ -204,15 +203,29 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Speculative decoding configuration as JSON. DeepSeek V4 supports "
             "method='mtp' with a positive num_speculative_tokens, and "
-            "method='dspark' with num_speculative_tokens 0 (target-only serving)."
+            "method='dspark' with its model-specific fixed draft width."
         ),
     )
+
+    # Prefill/decode disaggregated serving
+    parser.add_argument("--pd-role", choices=("prefill", "decode"), default=None)
+    parser.add_argument("--pd-config", default=None, help="Shared PD deployment JSON.")
+    parser.add_argument("--pd-node-id", default=None, help="Select a node when its role has multiple endpoints.")
 
     # Serving
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind the serving server (default: 0.0.0.0).")
     parser.add_argument("--port", type=int, default=8000, help="Port for the serving server (default: 8000).")
-    parser.add_argument("--max-num-seqs", type=int, default=16, help="Max concurrent requests in serving mode (default: 16).")
-    parser.add_argument("--max-num-batched-tokens", type=int, default=4096, help="Max tokens scheduled per iteration (default: 4096).")
+    parser.add_argument(
+        "--max-num-seqs", type=int, default=None,
+        help="Max concurrent requests (default: 16; PD decode: 72).",
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens", type=int, default=None,
+        help=(
+            "Max tokens scheduled per iteration (default: V4.1 1024, other models 4096). "
+            "V4.1 uses at most 4096 tokens per prefill iteration."
+        ),
+    )
     parser.add_argument(
         "--long-prefill-token-threshold",
         type=int,
@@ -220,7 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Maximum tokens per request in one chunked-prefill scheduling step. "
             "DeepSeek V4 accepts 1024, 2048, 4096, or 8192; the final prompt "
-            "chunk may be smaller (default: 2048)."
+            "chunk may be smaller (default: 2048). Ignored by PD decode nodes."
         ),
     )
     parser.add_argument(
@@ -228,6 +241,10 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable prefix caching (default: True). Use --no-enable-prefix-caching to disable.",
+    )
+    parser.add_argument(
+        "--prefix-cache-retention-interval", type=int, default=8192,
+        help="DSpark sparse checkpoint interval in source tokens (default: 8192; 0 disables periodic points).",
     )
     parser.add_argument(
         "--enable-chunked-prefill",
@@ -269,6 +286,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     _validate_backend(args.backend)
+    if args.max_num_seqs is None:
+        if args.pd_role:
+            from pypto_serving.pd.config import default_max_num_seqs
+
+            args.max_num_seqs = default_max_num_seqs(args.pd_role)
+        else:
+            args.max_num_seqs = 16
 
     from pypto_serving.serving.engine.async_engine import EngineConfig
 
@@ -277,6 +301,10 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
+    if args.max_num_batched_tokens is None:
+        args.max_num_batched_tokens = 1024 if model_family == "deepseek_v41" else 4096
+    if model_family == "deepseek_v41":
+        return _build_v41_engine_config(args, model_dir, model_config_data, devices)
     model_variant = _resolve_model_variant(args)
     _validate_prefill_chunk_size(
         model_family,
@@ -291,17 +319,16 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         raise ValueError(
             "--speculative-config/--num-speculative-tokens is only supported for DeepSeek V4"
         )
-    executor_kwargs["use_compile_cache"] = args.use_compile_cache
-    # The DSpark TP4/DP4 axes are internal to the kernels (TP groups hold
-    # replicated caches; DP groups are the four scheduler cache partitions).
-    # The serving contract is one overlapped worker group of 16 ranks with
-    # expert parallelism spanning it, so the config collapses dp/tp to one.
+    # DSpark's attention DP/TP are model-local; the executor owns one EP-wide
+    # worker group, with a replicated cache partition per attention group.
     dspark_variant = model_family == "deepseek_v4" and model_variant == "dspark"
     if dspark_variant:
         # The dspark world size is flag-driven: --ep is the rank count and the
         # executor freezes the kernel layout (import arguments, cache
         # partitions, packed-prefill capacity) from it.
         executor_kwargs["cache_ranks"] = args.expert_parallel_size
+        executor_kwargs["tp_size"] = args.tensor_parallel_size
+        executor_kwargs["lm_head_tp_size"] = args.lm_head_tp
     parallel_config = ParallelConfig(
         data_parallel_size=1 if dspark_variant else args.data_parallel_size,
         tensor_parallel_size=1 if dspark_variant else args.tensor_parallel_size,
@@ -309,7 +336,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         enable_expert_parallel=args.expert_parallel_size > 1,
         devices=devices,
         data_parallel_routing=args.data_parallel_routing,
-        placement_mode="overlapped" if model_family == "deepseek_v4" else "replica",
+        placement_mode="overlapped" if model_family in ("deepseek_v4", "glm53") else "replica",
     )
     _validate_model_topology(
         model_family,
@@ -350,13 +377,111 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     )
 
 
+def _build_v41_engine_config(args, model_dir, raw, devices):
+    """Resolve the V4.1 worker boundary before starting any device resources.
+
+    Like DSpark placement, TP/DP are internal to one overlapped EP worker.
+    The scheduler uses one cache partition per configured DP/EP rank instead of creating DP replicas.
+    """
+    from pypto_serving.config.types import KVCacheGroupSpec
+    from pypto_serving.model.deepseek_v41.npu_runner import (
+        MAX_PREFILL_TOKENS_PER_DP, MissingCompositeInterface, SegmentTopology, load_composite_bindings,
+    )
+    from pypto_serving.model.deepseek_v41.encoding import V41TextConfig
+    from pypto_serving.model.deepseek_v41.weight_loader import RankPlacement, plan_layers
+    from pypto_serving.serving.engine.async_engine import EngineConfig
+
+    text = V41TextConfig.from_dict(raw)
+    speculative = getattr(args, "speculative_config", None)
+    legacy_speculative = getattr(args, "num_speculative_tokens", None)
+    if legacy_speculative not in (None, 0):
+        raise ValueError("V4.1 requires --speculative-config with method='dspark'")
+    if speculative is None:
+        dspark_tokens = 0
+    else:
+        if speculative.get("method") != "dspark":
+            raise ValueError("V4.1 --speculative-config requires method='dspark'")
+        dspark_tokens = speculative.get("num_speculative_tokens")
+        if type(dspark_tokens) is not int or dspark_tokens != 5:
+            raise ValueError("V4.1 DSpark requires num_speculative_tokens=5")
+    if args.platform != "a5":
+        raise ValueError("V4.1 M0 serving requires --platform a5")
+    topology = (args.tensor_parallel_size, args.data_parallel_size, args.expert_parallel_size)
+    if (args.tensor_parallel_size != 1 or args.data_parallel_size != args.expert_parallel_size
+            or args.data_parallel_size not in (4, 8)
+            or len(devices) != args.data_parallel_size):
+        raise ValueError("V4.1 serving requires TP1 with matching DP/EP size 4 or 8")
+    dp_size = args.data_parallel_size
+    if args.block_size != 128:
+        raise ValueError("V4.1 serving requires --block-size 128")
+    if not 0 < args.max_model_len <= text.max_position_embeddings:
+        raise ValueError("V4.1 --max-model-len must fit the checkpoint position capacity")
+    if args.max_num_seqs <= 0 or args.max_num_batched_tokens <= 0:
+        raise ValueError("V4.1 batch and token capacities must be positive")
+
+    parallel = ParallelConfig(
+        data_parallel_size=1, tensor_parallel_size=1, expert_parallel_size=dp_size,
+        enable_expert_parallel=True, placement_mode="overlapped", devices=devices,
+        data_parallel_routing=args.data_parallel_routing,
+    )
+    # This resolver intentionally raises while the lib adapter is missing.
+    # No default generic KV layout may be substituted for the V4.1 pools.
+    if args.max_num_seqs > 12 * dp_size:
+        raise ValueError("V4.1 supports at most 12 requests per DP partition")
+    request_slots = (args.max_num_seqs + dp_size - 1) // dp_size
+    bindings = load_composite_bindings(
+        model_dir, args.max_model_len, dp_size=dp_size, request_slots=request_slots)
+    bindings.require(plan_layers(raw), RankPlacement(0, tp_size=1, dp_size=dp_size, ep_size=dp_size))
+    if bindings.segment_topology is None:
+        raise MissingCompositeInterface("V4.1 bindings must declare the selected lib decode capacity")
+    prefill_topology = SegmentTopology.for_prefill(
+        dp=topology[1], max_tokens=min(args.max_num_batched_tokens, MAX_PREFILL_TOKENS_PER_DP))
+    step_tokens = min(args.max_num_batched_tokens, prefill_topology.capacity)
+    groups = tuple(bindings.cache_groups)
+    if not groups or any(not isinstance(group, KVCacheGroupSpec) for group in groups):
+        raise MissingCompositeInterface("V4.1 bindings must provide concrete grouped cache specifications")
+    if any(group.num_partitions != dp_size for group in groups):
+        raise ValueError(f"V4.1 cache groups must use {dp_size} logical DP partitions")
+    if len({group.name for group in groups}) != len(groups):
+        raise ValueError("V4.1 cache group names must be unique")
+    runtime = dataclasses.replace(
+        _build_runtime_config(args, model_family="deepseek_v41", num_speculative_tokens=dspark_tokens),
+        kv_cache_groups=groups,
+        max_num_batched_tokens=step_tokens,
+        max_prefill_tokens_per_request=step_tokens,
+        requires_homogeneous_prefill_decode=True,
+        supports_chunked_prefill_with_speculation=True,
+    )
+    return EngineConfig(
+        model_id=args.served_model_name or Path(model_dir).name,
+        model_dir=model_dir,
+        platform=args.platform,
+        device_id=devices[0],
+        device_ids=devices,
+        parallel_config=parallel,
+        executor_cls=_executor_cls_for_model_family("deepseek_v41"),
+        runtime_config=runtime,
+        profile_config=_build_profile_config(args),
+        max_num_running_reqs=args.max_num_seqs,
+        max_num_scheduled_tokens=step_tokens,
+        long_prefill_token_threshold=args.long_prefill_token_threshold,
+        # Prefix restore needs both KV pages and matching compressor state.
+        # Pipelining needs independently owned mutable snapshots and tickets.
+        enable_prefix_cache=False,
+        async_scheduling=False,
+        enable_chunk_prefill=args.enable_chunked_prefill,
+    )
+
+
 def _build_runtime_config(
     args: argparse.Namespace,
     *,
     model_family: str = "qwen",
     config_data: dict[str, object] | None = None,
+    num_speculative_tokens: int | None = None,
 ):
-    num_speculative_tokens = _resolve_num_speculative_tokens(args)
+    if num_speculative_tokens is None:
+        num_speculative_tokens = _resolve_num_speculative_tokens(args)
     kv_dtype = args.kv_cache_dtype
     if kv_dtype == "auto":
         kv_dtype = args.dtype
@@ -372,7 +497,6 @@ def _build_runtime_config(
         from pypto_serving.model.deepseek_dspark.npu_runner import (
             DSPARK_PREFILL_MAX_TOKENS,
             DSPARK_SLIDING_WINDOW,
-            DSPARK_TP_SIZE,
             build_dspark_cache_group_specs,
         )
 
@@ -382,7 +506,8 @@ def _build_runtime_config(
             compress_ratios = None
         num_hidden_layers = int(config_data.get("num_hidden_layers", 43))
         max_prefill_tokens_per_request = min(DSPARK_PREFILL_MAX_TOKENS, args.max_num_batched_tokens)
-        if args.enable_chunked_prefill and args.long_prefill_token_threshold > 0:
+        if (args.pd_role != "decode" and args.enable_chunked_prefill
+                and args.long_prefill_token_threshold > 0):
             max_prefill_tokens_per_request = min(
                 max_prefill_tokens_per_request, args.long_prefill_token_threshold,
             )
@@ -391,7 +516,9 @@ def _build_runtime_config(
             compress_ratios,
             max_seq_len=args.max_model_len,
             max_prefill_tokens=max_prefill_tokens_per_request,
-            partitions=args.expert_parallel_size // DSPARK_TP_SIZE,
+            partitions=args.expert_parallel_size // args.tensor_parallel_size,
+            decode_only=args.pd_role == "decode",
+            prefill_only=args.pd_role == "prefill",
         )
         if num_speculative_tokens:
             speculative_prefix_cache_replay_tokens = DSPARK_SLIDING_WINDOW
@@ -440,7 +567,7 @@ def _build_runtime_config(
             kernel_contract.requires_homogeneous_prefill_decode
         )
 
-    return RuntimeConfig(
+    runtime = RuntimeConfig(
         page_size=args.block_size,
         max_batch_size=args.max_num_seqs,
         max_seq_len=args.max_model_len,
@@ -448,12 +575,15 @@ def _build_runtime_config(
         kv_dtype=kv_dtype,
         weight_dtype=args.dtype,
         npu_memory_utilization=args.npu_memory_utilization,
+        kv_offload_bytes=args.kv_offload_bytes,
+        kv_offload_backend=args.kv_offload_backend,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_prefill_tokens_per_request=max_prefill_tokens_per_request,
         prefill_chunk_size_choices=prefill_chunk_size_choices,
         preserve_prefill_chunks=preserve_prefill_chunks,
         supports_chunked_prefill_with_speculation=supports_chunked_prefill_with_speculation,
         speculative_prefix_cache_replay_tokens=speculative_prefix_cache_replay_tokens,
+        prefix_cache_retention_interval=args.prefix_cache_retention_interval,
         requires_homogeneous_prefill_decode=requires_homogeneous_prefill_decode,
         num_speculative_tokens=num_speculative_tokens,
         kv_cache_groups=kv_cache_groups,
@@ -461,6 +591,17 @@ def _build_runtime_config(
         ring_task_window=args.ring_task_window,
         ring_heap=args.ring_heap,
     )
+    if model_family == "glm53":
+        from pypto_serving.model.glm53.kernel_api import build_glm53_runtime_config
+
+        return build_glm53_runtime_config(
+            runtime, tp_size=args.tensor_parallel_size,
+            max_num_running_reqs=args.max_num_seqs,
+            max_num_scheduled_tokens=args.max_num_batched_tokens,
+            enable_chunk_prefill=args.enable_chunked_prefill,
+            long_prefill_token_threshold=args.long_prefill_token_threshold,
+        )
+    return runtime
 
 
 def _resolve_model_variant(args: argparse.Namespace) -> str:
@@ -604,6 +745,7 @@ def _validate_generate_config_options(options: dict[str, object]) -> None:
 
     checks: dict[str, tuple[str, object]] = {
         "max_new_tokens": ("a positive int", is_positive_int),
+        "min_tokens": ("a non-negative int", lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0),
         "temperature": ("a non-negative number", lambda v: is_number(v) and v >= 0),
         "top_p": ("a number in (0, 1]", lambda v: is_number(v) and 0 < v <= 1),
         "top_k": ("a positive int or null", lambda v: v is None or is_positive_int(v)),
@@ -653,6 +795,10 @@ def _warn_deprecated_serving_profile_env(args: argparse.Namespace) -> None:
 
 def _executor_cls_for_model_family(model_family: str, *, variant: str = "") -> str:
     """Map model family metadata to the worker executor class id."""
+    if model_family == "deepseek_v41":
+        return "PyptoDeepSeekV41Executor"
+    if model_family == "glm53":
+        return "PyptoGlm53Executor"
     if model_family == "deepseek_v4":
         if variant == "dspark":
             return "PyptoDeepSeekV4DSparkExecutor"
@@ -711,6 +857,14 @@ def _validate_model_topology(
         if parallel_config.tensor_parallel_size != 1 or parallel_config.expert_parallel_size != 1:
             raise ValueError("Qwen3.8 kernels currently require --tp 1 and --ep 1")
         return
+    if model_family == "glm53":
+        from pypto_serving.model.glm53.kernel_api import validate_topology
+
+        validate_topology(
+            parallel_config.tensor_parallel_size, parallel_config.expert_parallel_size,
+            parallel_config.data_parallel_size, parallel_config.devices,
+        )
+        return
     if model_family != "deepseek_v4":
         return
     if variant == "dspark":
@@ -754,33 +908,28 @@ def _validate_model_topology(
 
 
 def _validate_dspark_topology(args: argparse.Namespace) -> None:
-    """Validate the configured TP4 DSpark serving topology from the flags."""
+    """Validate one local topology shared by the node's execution stages."""
     from pypto_serving.model.deepseek_dspark.npu_runner import (
-        DSPARK_DECODE_BATCH,
+        DSparkCacheLayout,
         DSPARK_MAX_SEQ_LEN,
-        DSPARK_TP_SIZE,
     )
 
-    # The deployment is TP4 with expert parallelism spanning the whole world:
-    # --ep is the rank count (16 in production, 8 on a half node) and --dp is
-    # the scheduler cache-partition count derived from it.
     ranks = args.expert_parallel_size
-    partitions = ranks // DSPARK_TP_SIZE
-    if args.tensor_parallel_size != DSPARK_TP_SIZE:
-        raise ValueError(f"DSpark serving requires --tp {DSPARK_TP_SIZE}")
-    if ranks not in (2 * DSPARK_TP_SIZE, 4 * DSPARK_TP_SIZE):
-        raise ValueError("DSpark serving requires --ep 8 or --ep 16 (TP4, EP=ranks)")
+    layout = DSparkCacheLayout.for_ranks(
+        ranks, tp_size=args.tensor_parallel_size, lm_head_tp_size=args.lm_head_tp,
+    )
+    partitions = layout.partitions
     if args.data_parallel_size != partitions:
         raise ValueError(f"DSpark serving requires --dp {partitions} with --ep {ranks}")
     if len(parse_device_ids(args.devices, default_device=args.device)) != ranks:
         raise ValueError(f"DSpark serving requires exactly {ranks} NPU device ids")
     if args.block_size != 32:
         raise ValueError("DSpark kernels require --block-size 32")
-    max_global_batch = partitions * DSPARK_DECODE_BATCH
+    max_global_batch = partitions * layout.decode_capacity
     if args.max_num_seqs > max_global_batch:
         raise ValueError(
             "DSpark decode kernels support at most "
-            f"--max-num-seqs {max_global_batch} ({DSPARK_DECODE_BATCH} per TP group)"
+            f"--max-num-seqs {max_global_batch} ({layout.decode_capacity} per attention group)"
         )
     if args.max_model_len > DSPARK_MAX_SEQ_LEN:
         raise ValueError(
@@ -869,7 +1018,14 @@ def run_serve(
     print(f"  Endpoints: {endpoints}")
 
     log_config = create_uvicorn_log_config(["/metrics", "/metrics/json"])
-    uvicorn.run(app, host=host, port=port, log_level="info", log_config=log_config)
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        log_config=log_config,
+        timeout_graceful_shutdown=max(1, round(graceful_shutdown_timeout_seconds())),
+    )
 
 
 def run_generate(
@@ -1026,7 +1182,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = build_serving_engine_config(args)
         generate_config = _build_generate_config(args.generate_config)
 
-    if args.prompt:
+    if args.pd_role:
+        from pypto_serving.pd.integration import run
+
+        run(args, config, generate_config)
+    elif args.pd_config or args.pd_node_id:
+        raise ValueError("PD options require --pd-role")
+    elif args.prompt:
         run_generate(config, prompts=args.prompt, generate_config=generate_config)
     else:
         run_serve(

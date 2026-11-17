@@ -13,16 +13,21 @@ from types import SimpleNamespace
 
 import pytest
 
+from pypto_serving.config.types import GenerateConfig, RuntimeConfig
 from pypto_serving.observability import InMemoryStatLogger
+from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.engine.async_engine import (
+    EngineConfig,
     ReplicaEngineCore,
 )
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.sched.scheduler import (
     Request,
     RequestStatus,
+    ScheduledRequest,
     Scheduler,
     SchedulerConfig,
+    SchedulerOutput,
 )
 from pypto_serving.serving.server.ipc import (
     PLACEHOLDER_TOKEN,
@@ -33,6 +38,8 @@ from pypto_serving.serving.server.ipc import (
 
 
 class _Tokenizer:
+    eos_token_id: int | None = None
+
     def encode(self, text: str) -> list[int]:
         return [max(1, len(text))]
 
@@ -50,6 +57,14 @@ def _running_decode_request(req_id="r", prompt=(1, 2), first_output=99):
         num_computed_tokens=len(prompt),
         output_token_ids=[first_output],
         status=RequestStatus.RUNNING,
+    )
+
+
+def _tool_constraint():
+    return ConstraintSpec(
+        provider_id="xgrammar", format_id="deepseek_v4",
+        tools=({"type": "function", "function": {"name": "shell"}},),
+        tool_choice="required", reasoning=False,
     )
 
 
@@ -71,7 +86,10 @@ def _async_pipeline_core(*, num_speculative_tokens: int = 0):
     core.scheduler = scheduler
     core.kv_cache_manager = manager
     core.tokenizer = _Tokenizer()
-    core.config = SimpleNamespace(executor_cls="PyptoQwen14BExecutor")
+    core.config = EngineConfig(
+        executor_cls="PyptoQwen14BExecutor",
+        runtime_config=RuntimeConfig(num_speculative_tokens=num_speculative_tokens),
+    )
     core._async_scheduling = True
     core._pending_free_ids = []
     core._worker_known_req_ids = set()
@@ -163,6 +181,158 @@ def test_speculation_metrics_ignore_results_for_already_aborted_requests():
     counters = metrics.snapshot()["replicas"][0]["counters"]
     assert counters["draft_tokens"] == 0
     assert counters["accepted_tokens"] == 0
+
+
+def test_constrained_abort_drops_inflight_output_and_frees_worker_before_reuse():
+    core, dispatched = _async_pipeline_core(num_speculative_tokens=7)
+    request = _running_decode_request(first_output=50)
+    request.constraint_spec = _tool_constraint()
+    core.scheduler.running.append(request)
+    core.scheduler.requests[request.request_id] = request
+    ctx = SimpleNamespace(queue=asyncio.Queue(), request=request, stream=True,
+                          worker_release_done=asyncio.Event())
+    core._request_contexts[request.request_id] = ctx
+
+    assert core._try_dispatch_step()
+    asyncio.run(core.abort_request(request.request_id))
+    assert request.status is RequestStatus.FINISHED_ABORTED
+    assert asyncio.run(core._await_and_apply_oldest())
+    assert request.output_token_ids == [50]
+    asyncio.run(core._flush_pending_frees())
+    assert dispatched[-1].finished_request_ids == [request.request_id]
+    assert request.request_id not in core._worker_known_req_ids
+    output = asyncio.run(anext(core._iterate_request_output(ctx)))
+    assert output.finish_reason == "FINISHED_ABORTED"
+    assert not core._pending_free_ids and not core._request_contexts
+
+    next_request = Request("next", [3], max_new_tokens=1)
+    core.scheduler.add_request(next_request)
+    assert core._try_dispatch_step()
+    assert [item.request_id for item in dispatched[-1].new_requests] == ["next"]
+
+
+def test_constrained_step_error_cleans_up_before_next_request():
+    core, dispatched = _async_pipeline_core(num_speculative_tokens=7)
+    request = _running_decode_request(first_output=50)
+    request.constraint_spec = _tool_constraint()
+    core.scheduler.running.append(request)
+    core.scheduler.requests[request.request_id] = request
+    ctx = SimpleNamespace(queue=asyncio.Queue(), request=request, stream=True,
+                          worker_release_done=asyncio.Event())
+    core._request_contexts[request.request_id] = ctx
+    assert core._try_dispatch_step()
+
+    results = deque([encode_result(StepResult(
+        new_tokens={}, error="invalid grammar mask", step_id=dispatched[0].step_id,
+    ))])
+    core._output_queue = SimpleNamespace(get=lambda timeout=None: results.popleft())
+    assert asyncio.run(core._await_and_apply_oldest()) is False
+    assert ctx.queue.get_nowait().finish_reason == "error"
+    assert request.status is RequestStatus.FINISHED_ABORTED
+
+    def put(raw):
+        command = decode_command(raw)
+        dispatched.append(command)
+        results.append(encode_result(StepResult(new_tokens={}, step_id=command.step_id)))
+
+    core._input_queue = SimpleNamespace(put=put)
+    asyncio.run(core._flush_pending_frees())
+    assert ctx.worker_release_done.is_set()
+    assert dispatched[-1].finished_request_ids == [request.request_id]
+    assert not core._pending_free_ids and not core._worker_known_req_ids
+
+    next_request = Request("next", [3], max_new_tokens=1)
+    core.scheduler.add_request(next_request)
+    assert core._try_dispatch_step()
+    assert [item.request_id for item in dispatched[-1].new_requests] == ["next"]
+
+
+def test_rejected_request_does_not_leave_an_engine_context():
+    core, _ = _async_pipeline_core()
+    config = SimpleNamespace(
+        max_new_tokens=1, stop=None, ignore_eos=True, temperature=0,
+        top_p=1, top_k=None, seed=None, stream=True,
+    )
+
+    async def consume():
+        async for _ in core.add_request(
+            "too-long", "ignored", config, prompt_token_ids=list(range(4096)),
+            constraint_spec=_tool_constraint(),
+        ):
+            pass
+
+    with pytest.raises(ValueError, match="leaves no room for generation"):
+        asyncio.run(consume())
+    assert not core._request_contexts and not core.scheduler.requests
+    assert not core._pending_free_ids
+
+
+@pytest.mark.parametrize("executor_cls,speculative_tokens,expected_min_tokens", [
+    ("PyptoQwen14BExecutor", 0, 2),
+    ("PyptoDeepSeekV4Executor", 1, 0),
+    ("PyptoDeepSeekV4DSparkExecutor", 7, 2),
+])
+def test_min_tokens_reaches_worker_registration(executor_cls, speculative_tokens, expected_min_tokens):
+    core, dispatched = _async_pipeline_core(num_speculative_tokens=speculative_tokens)
+    core.config.executor_cls = executor_cls
+    core.tokenizer.eos_token_id = 9
+
+    class Queued(Exception):
+        pass
+
+    async def enqueue():
+        async for _ in core.add_request(
+            "eos-policy", "prompt", GenerateConfig(max_new_tokens=4, min_tokens=2,
+                                                     ignore_eos=True),
+            prompt_token_ids=[1], on_queued=lambda: (_ for _ in ()).throw(Queued()),
+        ):
+            pass
+
+    with pytest.raises(Queued):
+        asyncio.run(enqueue())
+    request = core.scheduler.requests["eos-policy"]
+    assert request.eos_token_id == 9
+    assert request.ignore_eos is True
+    assert request.min_tokens == expected_min_tokens
+    assert core._try_dispatch_step()
+    assert len(dispatched[0].new_requests) == 1
+    registration = dispatched[0].new_requests[0]
+    assert registration.min_tokens == expected_min_tokens
+    assert registration.eos_token_id == 9
+    assert registration.initial_output_tokens == 0
+
+
+def test_restarted_request_registers_committed_output_length(monkeypatch):
+    core, _ = _async_pipeline_core()
+    request = Request(
+        request_id="restarted", prompt_token_ids=[1, 2], max_new_tokens=6,
+        min_tokens=3, eos_token_id=9, output_token_ids=[7, 8],
+        status=RequestStatus.PREEMPTED,
+    )
+    core._worker_known_req_ids.add(request.request_id)
+    context = SimpleNamespace(worker_release_done=asyncio.Event(), worker_release_ack=asyncio.Event())
+    context.worker_release_done.set()
+    context.worker_release_ack.set()
+    core._request_contexts[request.request_id] = context
+    scheduled = SchedulerOutput(scheduled_requests=[
+        ScheduledRequest(request=request, num_new_tokens=1, is_prefill=True),
+    ])
+
+    command = core._build_step_command(scheduled, [request.request_id])
+
+    assert command.finished_request_ids == [request.request_id]
+    assert len(command.new_requests) == 1
+    assert command.new_requests[0].initial_output_tokens == 2
+    assert command.new_requests[0].min_tokens == 3
+    assert not context.worker_release_done.is_set() and not context.worker_release_ack.is_set()
+    # A release followed by re-registration in one FIFO command only retires
+    # the old incarnation; its reply must not acknowledge the new live state.
+    monkeypatch.setattr(core.scheduler, "schedule", lambda **kwargs: scheduled)
+    core._pending_free_ids = [request.request_id]
+    assert core._try_dispatch_step()
+    assert not getattr(core, "_worker_free_ids_by_step", {})
+    assert asyncio.run(core._await_and_apply_oldest())
+    assert not context.worker_release_done.is_set() and not context.worker_release_ack.is_set()
 
 
 def test_async_pipeline_dispatches_two_steps_before_applying_first(monkeypatch):
@@ -331,7 +501,8 @@ def test_async_pipeline_drains_stale_result_after_error(monkeypatch):
     req = _running_decode_request(prompt=(1, 2), first_output=50)
     core.scheduler.running.append(req)
     core.scheduler.requests[req.request_id] = req
-    ctx = SimpleNamespace(queue=asyncio.Queue(), request=req, stream=True)
+    ctx = SimpleNamespace(queue=asyncio.Queue(), request=req, stream=True,
+                          worker_release_done=asyncio.Event())
     core._request_contexts = {"r": ctx}
 
     # Two steps dispatched: both commands reached the FIFO worker, so both
@@ -358,7 +529,8 @@ def test_async_pipeline_drains_stale_result_after_error(monkeypatch):
     assert not core._batch_queue
     assert second_step_id in core._discard_result_step_ids
     tok = ctx.queue.get_nowait()
-    assert not core._request_contexts
+    assert core._request_contexts == {"r": ctx}
+    assert not ctx.worker_release_done.is_set()
     assert tok.finished is True and tok.finish_reason == "error"
 
     # Next live fetch must SKIP the stale second-step result and return step 99,

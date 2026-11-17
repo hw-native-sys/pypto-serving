@@ -14,6 +14,9 @@ authors = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+pd = ["fastapi", "httpx", "msgspec>=0.19", "uvicorn"]
+
 [project.urls]
 Repository = "https://github.com/hw-native-sys/pypto-serving"
 Issues = "https://github.com/hw-native-sys/pypto-serving/issues"
@@ -21,8 +24,12 @@ Issues = "https://github.com/hw-native-sys/pypto-serving/issues"
 [project.scripts]
 pypto-serving = "pypto_serving.cli.main:main"
 pypto-prepack-deepseek-v4 = "pypto_serving.tools.prepack_deepseek_v4:main"
+pypto-serving-router = "pypto_serving.router.app:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["pypto_serving*"]
 namespaces = false
+
+[tool.setuptools.package-data]
+"pypto_serving.serving.memory.tiering" = ["*.cpp"]

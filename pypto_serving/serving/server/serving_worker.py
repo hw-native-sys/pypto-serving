@@ -17,21 +17,30 @@ import sys
 import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
 from pypto_serving.config.types import (
     DecodeBatch,
     DecodeResult,
+    PrefillBatch,
     SamplingParams,
+    StopTokenMask,
 )
+from pypto_serving.serving.constraints import ConstraintSpec
+from pypto_serving.serving.constraints.provider import ConstraintState, XGrammarProvider
+from pypto_serving.serving.sampling.capabilities import SamplingCapabilities
+from pypto_serving.serving.sampling.stop_rules import blocked_token_ids
+from pypto_serving.observability.decode_metrics import DecodeStepRecorder
 from pypto_serving.serving.utils.gc_utils import freeze_gc_heap
 from pypto_serving.serving.utils.env import configure_runtime_logging
 from pypto_serving.serving.server.ipc import (
     PLACEHOLDER_TOKEN,
     DecodeRequest,
     NewRequestData,
+    ControlCommand,
+    ControlResult,
     PrefillRequest,
     ProfileCommand,
     ProfileResult,
@@ -39,6 +48,7 @@ from pypto_serving.serving.server.ipc import (
     StepCommand,
     StepResult,
     decode_command,
+    encode_control_result,
     encode_profile_result,
     encode_result,
 )
@@ -52,6 +62,7 @@ logger = logging.getLogger(__name__)
 
 _DECODE_PIPELINE_SLOTS = 2
 _MISSING_REQUEST = object()
+_DEFAULT_SAMPLING_CAPABILITIES = SamplingCapabilities()
 
 
 @dataclass(frozen=True)
@@ -66,6 +77,9 @@ class _PreparedDecodeWork:
     buffer_slot: int
     batch: DecodeBatch | None = None
     error: str | None = None
+    prefill_request_ids: tuple[str, ...] = ()
+    prefill_prepared: object | None = None
+    prefill_batch: PrefillBatch | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +88,16 @@ class _PendingDecodeOutput:
 
     cmd: StepCommand
     scheduled: tuple[DecodeRequest, ...]
+    pending: object
+    buffer_slot: int
+    batch: DecodeBatch
+    started_ns: int = 0
+
+
+@dataclass(frozen=True)
+class _PendingPrefillOutput:
+    cmd: StepCommand
+    scheduled: tuple[PrefillRequest, ...]
     pending: object
     buffer_slot: int
 
@@ -101,6 +125,14 @@ class _ProfileBarrier:
     completed: threading.Event
 
 
+@dataclass(frozen=True)
+class _ControlBarrier:
+    """FIFO barrier for owner/cache control relative to device dispatch."""
+
+    command: ControlCommand
+    completed: threading.Event
+
+
 class WorkerProcess:
     """Dedicated process that owns a single NPU device and executes model inference.
 
@@ -108,18 +140,26 @@ class WorkerProcess:
       Main Process  --[input_queue]--> WorkerProcess --[output_queue]--> Main Process
     """
 
+    _decode_metrics: DecodeStepRecorder | None = None
+
     def __init__(
         self,
         config: EngineConfig,
         input_queue: mp.Queue,
         output_queue: mp.Queue,
         profile_output_queue: mp.Queue | None = None,
+        services_factory=None,
     ):
         self.config = config
+        self._sampling_capabilities = config.sampling_capabilities()
         self.input_queue = input_queue
         self.output_queue = output_queue
         self.profile_output_queue = profile_output_queue
+        self._decode_metrics = DecodeStepRecorder.from_env()
 
+        self._services_factory = services_factory
+        self._services = None
+        self._batch_builder = self._make_decode_batch
         self.executor = None
         self.sampler = None
         self.model_record = None
@@ -131,6 +171,9 @@ class WorkerProcess:
         # PLACEHOLDER_TOKEN for a decode input it hasn't sampled yet; the worker
         # substitutes from here. Entries cleared when a request is released.
         self._last_tokens: dict[str, list[int]] = {}
+        self._constraint_states: dict[str, ConstraintState] = {}
+        self._accepted_output_lengths: dict[str, int] = {}
+        self._xgrammar_provider: XGrammarProvider | None = None
 
     def init_device_and_model(self) -> int:
         from pypto_serving.config.types import ModelRecord
@@ -168,7 +211,7 @@ class WorkerProcess:
             self.executor = executor_cls(
                 platform=self.config.platform,
                 device_ids=device_ids,
-                pypto_build_dir=str(pypto_build_dir),
+                pypto_build_dir=str(pypto_build_dir) if pypto_build_dir is not None else None,
                 **self.config.executor_kwargs,
             )
 
@@ -194,10 +237,22 @@ class WorkerProcess:
             else:
                 raise RuntimeError("Executor has no register_model method")
 
+            if self.config.resolve_runtime_config().kv_offload_bytes:
+                from pypto_serving.serving.memory.tiering.integration import initialize_loaded
+                initialize_loaded(self.executor)
+            if self._services_factory is not None:
+                self._services = self._services_factory(
+                    self.executor.runtime_extensions(), self._req_cache.__getitem__,
+                )
+                self._batch_builder = self._services.wrap_batch(self._make_decode_batch)
             logger.info("Worker model loaded and ready")
             return num_pages
 
     def _resolve_executor_cls(self):
+        if self.config.executor_cls == "PyptoDeepSeekV41Executor":
+            from pypto_serving.model.deepseek_v41.npu_executor import DeepSeekV41PyptoExecutor
+
+            return DeepSeekV41PyptoExecutor
         if self.config.executor_cls == "PyptoQwen14BExecutor":
             from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor
 
@@ -216,15 +271,24 @@ class WorkerProcess:
             )
 
             return DeepSeekV4DSparkPyptoExecutor
+        if self.config.executor_cls == "PyptoGlm53Executor":
+            from pypto_serving.model.glm53.npu_executor import Glm53PyptoExecutor
+
+            return Glm53PyptoExecutor
         from pypto_serving.model.common.executor.executor import ModelExecutor
 
         return ModelExecutor
 
-    def _configure_pypto_build_dir(self, device_ids: tuple[int, ...]) -> Path:
-        """Give each worker process an isolated PyPTO build base."""
-        base = Path(os.environ.get("PYPTO_PROG_BUILD_DIR") or "build_output")
+    def _configure_pypto_build_dir(self, device_ids: tuple[int, ...]) -> Path | None:
+        """Namespace explicitly requested output without disabling JIT reuse by default."""
+        requested = os.environ.get("PYPTO_PROG_BUILD_DIR")
+        if not requested:
+            return None
+        base = Path(requested)
         device_label = "_".join(str(device_id) for device_id in device_ids)
         worker_dir = base / f"serving_dp{self.config.dp_rank}_d{device_label}"
+        # PyPTO treats this variable as an explicit output/rebuild request.
+        # Injecting a default would silently bypass both JIT cache levels.
         os.environ["PYPTO_PROG_BUILD_DIR"] = str(worker_dir)
         return worker_dir
 
@@ -262,6 +326,10 @@ class WorkerProcess:
                 self._handle_profile_command(cmd)
                 continue
 
+            if isinstance(cmd, ControlCommand):
+                self._handle_control_command(cmd)
+                continue
+
             self._handle_step_command(cmd)
 
     def _pipelined_busy_loop(self) -> None:
@@ -279,6 +347,7 @@ class WorkerProcess:
         slot_ownership = [threading.Semaphore(1) for _ in range(_DECODE_PIPELINE_SLOTS)]
         self._pending_decode_condition = threading.Condition()
         self._pending_decode_request_counts: dict[str, int] = {}
+        self._pending_prefill_request_counts: dict[str, int] = {}
         output_thread = threading.Thread(
             target=self._output_reclaim_loop,
             args=(output_work_queue, slot_ownership),
@@ -327,7 +396,8 @@ class WorkerProcess:
                 owned_slot = None
                 if (
                     isinstance(cmd, StepCommand)
-                    and cmd.decode_requests
+                    and (cmd.decode_requests or (cmd.prefill_requests and
+                         getattr(self.executor, "supports_async_prefill_reclaim", False)))
                     and self.executor.supports_device_decode_embedding
                 ):
                     # Every writer must own its slot, including the decode
@@ -379,9 +449,29 @@ class WorkerProcess:
                 output_work_queue.put(barrier)
                 barrier.completed.wait()
                 continue
+            if isinstance(cmd, ControlCommand):
+                barrier = _ControlBarrier(command=cmd, completed=threading.Event())
+                output_work_queue.put(barrier)
+                barrier.completed.wait()
+                continue
             assert isinstance(cmd, StepCommand)
             try:
                 self._wait_for_pending_decode_reclaims(cmd.finished_request_ids)
+                accepted_lengths = getattr(self, "_accepted_output_lengths", {})
+                # Both grammar and stop-token masks depend on committed output.
+                self._wait_for_pending_decode_reclaims(
+                    [
+                        request.request_id
+                        for request in cmd.decode_requests
+                        if (cached := self._req_cache.get(request.request_id)) is not None
+                        and (cached.constraint_spec is not None
+                             or self._min_tokens_mask_active(
+                                 cached,
+                                 accepted_lengths.get(request.request_id, 0),
+                             ))
+                    ]
+                )
+                self._wait_for_pending_prefill_reclaims(cmd.finished_request_ids)
                 self._apply_command_lifecycle(cmd, release_cache_entries)
             except Exception as exc:
                 logger.error("Worker command lifecycle failed: %s", exc, exc_info=True)
@@ -392,9 +482,48 @@ class WorkerProcess:
                     )
                 )
                 continue
+            if cmd.prefill_requests and not self._can_split_prefill_output(cmd, prepared):
+                with self._pending_decode_condition:
+                    prior_requests = tuple(self._pending_prefill_request_counts)
+                self._wait_for_pending_prefill_reclaims(prior_requests)
+            elif cmd.prefill_requests and getattr(
+                self.executor, "prefill_tail_requires_reclaim_before_dispatch", False
+            ):
+                # The device ring capture reads the forward's shared hidden
+                # scratch; the next forward must wait until capture completes.
+                with self._pending_decode_condition:
+                    prior_requests = tuple(self._pending_prefill_request_counts)
+                self._wait_for_pending_prefill_reclaims(
+                    prior_requests
+                )
+            if self._can_split_prefill_output(cmd, prepared):
+                assert prepared is not None and prepared.prefill_batch is not None
+                try:
+                    with profile_span("WorkerProcess.dispatch_prefill", cat="worker",
+                                      args={"step_id": cmd.step_id, "buffer_slot": prepared.buffer_slot}):
+                        pending = self.executor.dispatch_prepared_prefill(
+                            self.model_record.runtime_model, prepared.prefill_batch,
+                            prepared.prefill_prepared,
+                        )
+                    self._track_pending_prefill_requests(cmd.prefill_requests)
+                    output_work_queue.put(_PendingPrefillOutput(
+                        cmd=cmd, scheduled=tuple(cmd.prefill_requests),
+                        pending=pending, buffer_slot=prepared.buffer_slot,
+                    ))
+                except Exception as exc:
+                    logger.error("Worker prefill dispatch failed: %s", exc, exc_info=True)
+                    output_work_queue.put(_CompletedStepOutput(
+                        StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id),
+                        buffer_slot=prepared.buffer_slot,
+                    ))
+                continue
             if self._can_split_decode_output(cmd, prepared):
                 assert prepared is not None and prepared.batch is not None
                 try:
+                    if self.executor.prepared_decode_requires_token(prepared.prepared):
+                        self._wait_for_pending_decode_reclaims(
+                            [request.request_id for request in cmd.decode_requests]
+                        )
                     with profile_span(
                         "WorkerProcess.dispatch_decode",
                         cat="worker",
@@ -404,6 +533,7 @@ class WorkerProcess:
                             prepared,
                             tuple(cmd.decode_requests),
                         )
+                        started_ns = self._decode_metrics.start() if self._decode_metrics else 0
                         pending = self.executor.dispatch_prepared_decode(
                             self.model_record.runtime_model,
                             dispatch_batch,
@@ -416,6 +546,8 @@ class WorkerProcess:
                             scheduled=tuple(cmd.decode_requests),
                             pending=pending,
                             buffer_slot=prepared.buffer_slot,
+                            batch=dispatch_batch,
+                            started_ns=started_ns,
                         )
                     )
                 except Exception as exc:
@@ -455,6 +587,12 @@ class WorkerProcess:
                 finally:
                     work.completed.set()
                 continue
+            if isinstance(work, _ControlBarrier):
+                try:
+                    self._handle_control_command(work.command)
+                finally:
+                    work.completed.set()
+                continue
             if isinstance(work, _CompletedStepOutput):
                 result = work.result
                 buffer_slot = work.buffer_slot
@@ -463,6 +601,12 @@ class WorkerProcess:
                     result = self._reclaim_pending_decode(work)
                 finally:
                     self._finish_pending_decode_reclaims(work.scheduled)
+                buffer_slot = work.buffer_slot
+            elif isinstance(work, _PendingPrefillOutput):
+                try:
+                    result = self._reclaim_pending_prefill(work)
+                finally:
+                    self._finish_pending_prefill_reclaims(work.scheduled)
                 buffer_slot = work.buffer_slot
             else:
                 raise TypeError(f"unexpected output work item: {type(work).__name__}")
@@ -506,6 +650,50 @@ class WorkerProcess:
                 )
             )
 
+    def _track_pending_prefill_requests(self, requests: list[PrefillRequest]) -> None:
+        with self._pending_decode_condition:
+            for request_id in {request.request_id for request in requests}:
+                self._pending_prefill_request_counts[request_id] = (
+                    self._pending_prefill_request_counts.get(request_id, 0) + 1
+                )
+
+    def _finish_pending_prefill_reclaims(self, requests: tuple[PrefillRequest, ...]) -> None:
+        with self._pending_decode_condition:
+            for request_id in {request.request_id for request in requests}:
+                count = self._pending_prefill_request_counts[request_id]
+                if count == 1:
+                    del self._pending_prefill_request_counts[request_id]
+                else:
+                    self._pending_prefill_request_counts[request_id] = count - 1
+            self._pending_decode_condition.notify_all()
+
+    def _wait_for_pending_prefill_reclaims(self, request_ids: list[str] | tuple[str, ...]) -> None:
+        if not request_ids:
+            return
+        with self._pending_decode_condition:
+            self._pending_decode_condition.wait_for(
+                lambda: not any(request_id in self._pending_prefill_request_counts
+                                for request_id in request_ids)
+            )
+
+    def _can_split_prefill_output(self, cmd: StepCommand, prepared: _PreparedDecodeWork | None) -> bool:
+        return bool(
+            prepared is not None and prepared.error is None
+            and prepared.prefill_prepared is not None and prepared.prefill_batch is not None
+            and cmd.prefill_requests and not cmd.decode_requests
+            and bool(getattr(self.executor, "supports_async_prefill_reclaim", False))
+        )
+
+    def _reclaim_pending_prefill(self, work: _PendingPrefillOutput) -> StepResult:
+        try:
+            with profile_span("WorkerProcess.reclaim_prefill", cat="worker",
+                              args={"step_id": work.cmd.step_id}):
+                self.executor.reclaim_prepared_prefill(work.pending)
+            return StepResult(new_tokens={}, step_id=work.cmd.step_id)
+        except Exception as exc:
+            logger.error("Worker prefill reclaim failed: %s", exc, exc_info=True)
+            return StepResult(new_tokens={}, error=str(exc), step_id=work.cmd.step_id)
+
     def _can_split_decode_output(
         self,
         cmd: StepCommand,
@@ -533,10 +721,18 @@ class WorkerProcess:
             ):
                 decode_result = self.executor.reclaim_prepared_decode(work.pending)
                 new_tokens: dict[str, list[int]] = {}
-                num_draft_tokens = self._consume_decode_result(work.scheduled, decode_result, new_tokens)
+                num_draft_tokens = self._consume_decode_result(
+                    work.scheduled, decode_result, new_tokens, batch=work.batch
+                )
                 for req_id, tokens in new_tokens.items():
                     if tokens:
                         self._record_last_tokens(req_id, tokens)
+            if self._decode_metrics:
+                self._decode_metrics.record(
+                    step_id=work.cmd.step_id, started_ns=work.started_ns,
+                    request_ids=[r.request_id for r in work.scheduled], new_tokens=new_tokens,
+                    num_draft_tokens=num_draft_tokens, mode="async",
+                )
             return StepResult(
                 new_tokens=new_tokens, step_id=work.cmd.step_id, num_draft_tokens=num_draft_tokens
             )
@@ -549,40 +745,89 @@ class WorkerProcess:
         prepared: _PreparedDecodeWork,
         scheduled: tuple[DecodeRequest, ...],
     ) -> DecodeBatch:
-        """Patch a prior token only when the active executor requests it.
+        """Bind live constraints and patch a token only when the executor needs it.
 
         DeepSeek fused MTP finalizes persistent state during prefill, so both
         cold and steady descriptors return the early-prepared batch unchanged.
         """
         assert prepared.batch is not None
+        batch = prepared.batch
+        # Early prepare may precede registration on the command lane. Bind the
+        # live policy states only after the command has registered the request.
+        constraints = {}
+        stop_masks = {}
+        for request in scheduled:
+            cached = self._req_cache[request.request_id]
+            if cached.constraint_spec is not None:
+                state = self._constraint_states.get(request.request_id)
+                if state is None:
+                    raise RuntimeError(f"constraint state is not registered for {request.request_id!r}")
+                constraints[request.request_id] = state
+            if mask := self._stop_token_mask(request.request_id):
+                stop_masks[request.request_id] = mask
+        if constraints or stop_masks or batch.constraint_states or batch.stop_token_masks:
+            batch = replace(batch, constraint_states=constraints, stop_token_masks=stop_masks)
         if not self.executor.prepared_decode_requires_token(prepared.prepared):
-            return prepared.batch
+            return batch
         tokens = [self._resolve_decode_token(request) for request in scheduled]
         token_ids = torch.tensor(
             tokens,
             dtype=torch.long,
             device=self.model_record.runtime_model.runtime.device,
         ).unsqueeze(1)
-        return replace(prepared.batch, token_ids=token_ids)
+        return replace(batch, token_ids=token_ids)
 
     def _handle_profile_command(self, cmd: ProfileCommand) -> None:
         """Apply a profile command and acknowledge it after the file is flushed."""
         profiler = get_profiler(initially_active=False)
         error = None
+        transfer_profile = self._services.set_profile_active if self._services is not None else None
         try:
             if cmd.active:
                 profiler.start()
+                if callable(transfer_profile):
+                    transfer_profile(True)
             else:
-                profiler.stop()
+                try:
+                    if callable(transfer_profile):
+                        transfer_profile(False)
+                finally:
+                    profiler.stop()
             if profiler.active != cmd.active:
                 error = "SA profiling is not configured in the worker process"
         except Exception as exc:
+            if cmd.active:
+                profiler.stop()
             error = str(exc)
             logger.error("Worker profile command failed: %s", exc, exc_info=True)
 
         if self.profile_output_queue is not None:
             self.profile_output_queue.put(
-                encode_profile_result(ProfileResult(active=profiler.active, error=error))
+                encode_profile_result(ProfileResult(active=profiler.active, error=error, command_id=cmd.command_id))
+            )
+
+    def _handle_control_command(self, cmd: ControlCommand) -> None:
+        """Run a worker-owned PD operation after all older device work settles."""
+        error = None
+        payload = b""
+        try:
+            if self._services is None:
+                raise RuntimeError("worker extension control is not configured")
+            payload = self._services.handle_command(cmd.operation, cmd.payload)
+            if not isinstance(payload, bytes):
+                raise TypeError("worker control handler must return bytes")
+        except Exception as exc:
+            error = str(exc)
+            logger.error("Worker control failed: %s", exc, exc_info=True)
+        if self.profile_output_queue is not None:
+            self.profile_output_queue.put(
+                encode_control_result(
+                    ControlResult(
+                        command_id=cmd.command_id,
+                        payload=payload,
+                        error=error,
+                    )
+                )
             )
 
     def _handle_step_command(self, cmd: StepCommand) -> None:
@@ -614,11 +859,36 @@ class WorkerProcess:
         expected_cache_entries: dict[str, object] | None = None,
     ) -> None:
         """Apply request release and registration on the FIFO device lane."""
+        if not hasattr(self, "_constraint_states"):
+            self._constraint_states = {}
+        if not hasattr(self, "_accepted_output_lengths"):
+            self._accepted_output_lengths = {}
         self._release_finished_request_state(
             cmd.finished_request_ids,
             expected_cache_entries=expected_cache_entries,
         )
         for new_request in cmd.new_requests:
+            previous_state = self._constraint_states.pop(new_request.request_id, None)
+            if previous_state is not None:
+                previous_state.close()
+            self._accepted_output_lengths[new_request.request_id] = new_request.initial_output_tokens
+            if new_request.constraint_spec is not None:
+                spec = ConstraintSpec.from_wire(new_request.constraint_spec)
+                if spec.provider_id != "xgrammar":
+                    raise ValueError(f"unsupported constraint provider {spec.provider_id!r}")
+                if self._xgrammar_provider is None:
+                    self._xgrammar_provider = XGrammarProvider(
+                        self.model_record.tokenizer, self.model_record.config.vocab_size
+                    )
+                with profile_span("WorkerProcess.constraint_compile", cat="constraints"):
+                    state = self._xgrammar_provider.compile(spec)
+                try:
+                    if new_request.initial_output_token_ids:
+                        state.accept(new_request.initial_output_token_ids)
+                except BaseException:
+                    state.close()
+                    raise
+                self._constraint_states[new_request.request_id] = state
             self._req_cache[new_request.request_id] = new_request
 
     def _release_finished_request_state(
@@ -641,7 +911,15 @@ class WorkerProcess:
                     continue
             self._req_cache.pop(req_id, None)
             self._last_tokens.pop(req_id, None)
-            release_sampler = getattr(self.sampler, "release_requests", None)
+            constraint_state = getattr(self, "_constraint_states", {}).pop(req_id, None)
+            if constraint_state is not None:
+                constraint_state.close()
+            getattr(self, "_accepted_output_lengths", {}).pop(req_id, None)
+            release_sampler = getattr(
+                getattr(self, "sampler", None),
+                "release_requests",
+                None,
+            )
             if callable(release_sampler):
                 release_sampler([req_id])
 
@@ -663,7 +941,11 @@ class WorkerProcess:
             if cmd.prefill_requests:
                 max_prefill_batch = self.executor.max_prefill_batch_size
                 if max_prefill_batch is None:
-                    self._batch_prefill(cmd.prefill_requests, runtime_model, new_tokens)
+                    if prepared_decode is not None and getattr(self.executor, "supports_async_prefill_reclaim", False):
+                        self._batch_prefill(cmd.prefill_requests, runtime_model, new_tokens,
+                                            prefill_slot=prepared_decode.buffer_slot)
+                    else:
+                        self._batch_prefill(cmd.prefill_requests, runtime_model, new_tokens)
                 else:
                     if max_prefill_batch <= 0:
                         raise ValueError("executor max_prefill_batch_size must be positive")
@@ -677,13 +959,19 @@ class WorkerProcess:
                             self.executor, "max_prefill_tokens_per_partition", None
                         ),
                     ):
-                        self._batch_prefill(chunk, runtime_model, new_tokens)
+                        if prepared_decode is not None and getattr(self.executor, "supports_async_prefill_reclaim", False):
+                            self._batch_prefill(chunk, runtime_model, new_tokens,
+                                                prefill_slot=prepared_decode.buffer_slot)
+                        else:
+                            self._batch_prefill(chunk, runtime_model, new_tokens)
             if cmd.decode_requests:
                 num_draft_tokens = self._batch_decode(
                     cmd.decode_requests,
                     runtime_model,
                     new_tokens,
                     prepared_decode=prepared_decode,
+                    step_id=cmd.step_id,
+                    prefill_requests=len(cmd.prefill_requests),
                 )
 
         # Retain the tokens just sampled so a following pipelined decode step can
@@ -750,46 +1038,79 @@ class WorkerProcess:
             pending = deferred
         return chunks
 
+    def _make_prefill_batch(self, scheduled: list[PrefillRequest], runtime_model) -> PrefillBatch:
+        device = runtime_model.runtime.device
+        terminal = [
+            pr for pr in scheduled
+            if pr.num_computed_tokens + len(pr.chunk_tokens)
+            >= len(self._req_cache[pr.request_id].prompt_token_ids)
+        ]
+        embedding_lookup = None
+        if not self.executor.supports_device_embedding:
+            embedding_lookup = lambda token_ids: self.executor.lookup_embeddings(runtime_model, token_ids)
+        batch = pack_prefill_batch(
+            request_ids=[pr.request_id for pr in scheduled],
+            token_chunks=[pr.chunk_tokens for pr in scheduled],
+            seq_lens=[pr.num_computed_tokens + len(pr.chunk_tokens) for pr in scheduled],
+            prompt_lens=[len(self._req_cache[pr.request_id].prompt_token_ids) for pr in scheduled],
+            chunk_starts=[pr.num_computed_tokens for pr in scheduled],
+            device=device, embedding_lookup=embedding_lookup,
+            allow_device_greedy_sampling=self._allow_device_sampled_ids(terminal, phase="prefill"),
+            allow_device_topk_sampling=self._allow_device_topk_sampling(terminal, phase="prefill"),
+            block_ids=[pr.block_ids for pr in scheduled],
+            block_ids_by_group=[pr.block_ids_by_group for pr in scheduled],
+            read_block_ids_by_group=[pr.read_block_ids_by_group for pr in scheduled],
+            checkpoint_ends=[pr.checkpoint_ends for pr in scheduled],
+            state_write_block_ids_by_group=[pr.state_write_block_ids_by_group for pr in scheduled],
+            checkpoint_block_ids_by_group=[pr.checkpoint_block_ids_by_group for pr in scheduled],
+            cache_partitions=[pr.cache_partition for pr in scheduled],
+        )
+        batch.constraint_states = {
+            pr.request_id: state
+            for pr in terminal
+            if (state := getattr(self, "_constraint_states", {}).get(pr.request_id)) is not None
+        }
+        batch.stop_token_masks = {
+            pr.request_id: mask
+            for pr in terminal
+            if (mask := self._stop_token_mask(pr.request_id)) is not None
+        }
+        return batch
+
+    @staticmethod
+    def _require_v41_dspark_stages(runtime_model, batch, *, phase: str) -> None:
+        """Reject V4.1 speculative work before it falls back to target-only dispatch."""
+        extra = getattr(runtime_model, "extra", {})
+        runtime = getattr(runtime_model, "runtime", None)
+        if (isinstance(extra, dict) and extra.get("family") == "deepseek_v41"
+                and getattr(runtime, "num_speculative_tokens", 0) == 5
+                and batch.dspark_stages is None):
+            raise RuntimeError(
+                f"V4.1 DSpark {phase} requires lowered dspark_stages; "
+                "ordinary target-only dispatch is not a valid fallback"
+            )
+
     def _batch_prefill(
         self,
         scheduled: list[PrefillRequest],
         runtime_model,
         new_tokens: dict[str, list[int]],
+        prefill_slot: int | None = None,
     ) -> None:
         with profile_span(
             "WorkerProcess.batch_prefill",
             cat="worker",
             args={"batch_size": len(scheduled), "request_ids": [pr.request_id for pr in scheduled]},
         ):
-            device = runtime_model.runtime.device
-            chunk_tokens_list = [pr.chunk_tokens for pr in scheduled]
-            seq_lens = [pr.num_computed_tokens + len(pr.chunk_tokens) for pr in scheduled]
-            chunk_starts = [pr.num_computed_tokens for pr in scheduled]
-            block_ids_list = [pr.block_ids for pr in scheduled]
-            allow_device_greedy_sampling = self._allow_device_sampled_ids(scheduled)
-            allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled)
-            embedding_lookup = None
-            if not self.executor.supports_device_embedding:
-                embedding_lookup = lambda token_ids: self.executor.lookup_embeddings(
-                    runtime_model, token_ids
+            batch = self._make_prefill_batch(scheduled, runtime_model)
+            allow_device_greedy_sampling = batch.allow_device_greedy_sampling
+            allow_device_topk_sampling = batch.allow_device_topk_sampling
+            if prefill_slot is not None and getattr(self.executor, "supports_async_prefill_reclaim", False):
+                prefill_result = self.executor.run_prefill_in_slot(
+                    runtime_model, batch, buffer_slot=prefill_slot,
                 )
-
-            prefill_result = self.executor.run_prefill(
-                runtime_model,
-                pack_prefill_batch(
-                    request_ids=[pr.request_id for pr in scheduled],
-                    token_chunks=chunk_tokens_list,
-                    seq_lens=seq_lens,
-                    chunk_starts=chunk_starts,
-                    device=device,
-                    embedding_lookup=embedding_lookup,
-                    allow_device_greedy_sampling=allow_device_greedy_sampling,
-                    allow_device_topk_sampling=allow_device_topk_sampling,
-                    block_ids=block_ids_list,
-                    block_ids_by_group=[pr.block_ids_by_group for pr in scheduled],
-                    cache_partitions=[pr.cache_partition for pr in scheduled],
-                ),
-            )
+            else:
+                prefill_result = self.executor.run_prefill(runtime_model, batch)
 
             # Sample only for requests whose prefill chunk completes the prompt.
             completed_request_ids: list[str] = []
@@ -805,12 +1126,7 @@ class WorkerProcess:
                         if prefill_result.logits.dim() > 1
                         else prefill_result.logits
                     )
-                    params = SamplingParams(
-                        temperature=cached.temperature,
-                        top_p=cached.top_p,
-                        top_k=cached.top_k,
-                        seed=cached.seed,
-                    )
+                    params = self._sampling_params(pr.request_id)
                     token_id = self._sample_result_row(
                         prefill_result,
                         logits,
@@ -821,6 +1137,10 @@ class WorkerProcess:
                         allow_device_topk_sampling=allow_device_topk_sampling,
                     )
                     new_tokens[pr.request_id] = [token_id]
+                    constraint_state = getattr(self, "_constraint_states", {}).get(pr.request_id)
+                    if constraint_state is not None:
+                        constraint_state.accept((token_id,))
+                    self._accept_output_tokens(pr.request_id, 1)
                     completed_request_ids.append(pr.request_id)
                     completed_token_ids.append(token_id)
                     completed_sampling_params.append(params)
@@ -835,6 +1155,24 @@ class WorkerProcess:
                     completed_token_ids,
                     completed_sampling_params,
                 )
+                if (isinstance(getattr(runtime_model, "extra", None), dict)
+                        and runtime_model.extra.get("family") == "deepseek_v41"
+                        and getattr(runtime_model.runtime, "num_speculative_tokens", 0) == 5):
+                    lower = getattr(self.executor, "lower_dspark_prefill_batch", None)
+                    if not callable(lower):
+                        self._require_v41_dspark_stages(runtime_model, batch, phase="prefill")
+                    for request_id, token_id in zip(
+                        completed_request_ids, completed_token_ids, strict=True
+                    ):
+                        dispatch = lower(
+                            runtime_model,
+                            batch,
+                            request_ids=(request_id,),
+                            sampled_token_ids=(token_id,),
+                        )
+                        self.executor.run_dspark_prefill_batch(
+                            replace(batch, dspark_stages=dispatch)
+                        )
 
     def _resolve_decode_token(self, dr: DecodeRequest) -> int:
         """Return the decode input token, substituting from cache on placeholder.
@@ -858,27 +1196,60 @@ class WorkerProcess:
         *,
         buffer_slot: int | None = None,
     ) -> _PreparedDecodeWork | None:
-        """Prepare decode-only metadata without touching request output state."""
-        if cmd.prefill_requests or not cmd.decode_requests:
+        """Prepare prefill or decode metadata before FIFO dispatch."""
+        if cmd.prefill_requests:
+            if getattr(getattr(self, "executor", None), "supports_async_prefill_reclaim", False):
+                if buffer_slot is None:
+                    buffer_slot = cmd.step_id % _DECODE_PIPELINE_SLOTS
+                scheduled = cmd.prefill_requests
+                max_batch = self.executor.max_prefill_batch_size
+                if max_batch is not None:
+                    chunks = self._partitioned_prefill_chunks(
+                        scheduled, max_batch,
+                        max_requests_per_partition=getattr(self.executor, "max_prefill_requests_per_partition", 1),
+                        max_tokens_per_partition=getattr(self.executor, "max_prefill_tokens_per_partition", None),
+                    )
+                    if len(chunks) != 1:
+                        return _PreparedDecodeWork(prepared=None, buffer_slot=buffer_slot)
+                if (cmd.decode_requests or any(item.request_id in cmd.finished_request_ids for item in scheduled)
+                        or any(item.num_computed_tokens + len(item.chunk_tokens) >=
+                               len(self._req_cache[item.request_id].prompt_token_ids) for item in scheduled)):
+                    return _PreparedDecodeWork(prepared=None, buffer_slot=buffer_slot)
+                model = self.model_record.runtime_model
+                batch = self._make_prefill_batch(scheduled, model)
+                with profile_span("WorkerProcess.prepare_prefill", cat="worker",
+                                  args={"step_id": cmd.step_id, "buffer_slot": buffer_slot}):
+                    plan = self.executor.prepare_prefill(model, batch, buffer_slot=buffer_slot)
+                return _PreparedDecodeWork(prepared=None, buffer_slot=buffer_slot,
+                                           prefill_prepared=plan, prefill_batch=batch,
+                                           prefill_request_ids=tuple(item.request_id for item in scheduled))
+            return None
+        if not cmd.decode_requests:
             return None
         if not self.executor.supports_device_decode_embedding:
             # Placeholder tokens cannot be embedded correctly until the prior
             # device result is available. Keep this executor on the serial path.
             return None
+        if self._needs_host_stop_token_mask(cmd.decode_requests, "decode"):
+            return None
+        # Constraints do not prevent acceptance-independent metadata preparation.
+        # The device lane still waits for these requests' prior output reclaim
+        # before touching matchers or drafts and staging the next mask.
         runtime_model = self.model_record.runtime_model
         if buffer_slot is None:
             buffer_slot = cmd.step_id % _DECODE_PIPELINE_SLOTS
-        allow_device_greedy_sampling = self._allow_device_sampled_ids(cmd.decode_requests)
-        allow_device_topk_sampling = self._allow_device_topk_sampling(cmd.decode_requests)
+        allow_device_greedy_sampling = self._allow_device_sampled_ids(cmd.decode_requests, phase="decode")
+        allow_device_topk_sampling = self._allow_device_topk_sampling(cmd.decode_requests, phase="decode")
         # Tokens remain placeholders during early preparation. Executors with a
         # host-token dependency may patch them on the device lane; fused MTP
         # consumes persistent state finalized by the terminal-prefill command.
-        batch = self._make_decode_batch(
+        batch = self._batch_builder(
             cmd.decode_requests,
             runtime_model,
             resolve_tokens=False,
             allow_device_greedy_sampling=allow_device_greedy_sampling,
             allow_device_topk_sampling=allow_device_topk_sampling,
+            bind_policy=False,
         )
         with profile_span(
             "WorkerProcess.prepare_decode",
@@ -900,6 +1271,7 @@ class WorkerProcess:
         resolve_tokens: bool,
         allow_device_greedy_sampling: bool,
         allow_device_topk_sampling: bool,
+        bind_policy: bool = True,
     ) -> DecodeBatch:
         """Build a decode batch snapshot, optionally resolving prior output tokens."""
         device = runtime_model.runtime.device
@@ -934,6 +1306,16 @@ class WorkerProcess:
             block_ids=[dr.block_ids for dr in scheduled],
             block_ids_by_group=[dr.block_ids_by_group for dr in scheduled],
             cache_partitions=[dr.cache_partition for dr in scheduled],
+            constraint_states={
+                dr.request_id: state
+                for dr in scheduled
+                if (state := getattr(self, "_constraint_states", {}).get(dr.request_id)) is not None
+            } if bind_policy else {},
+            stop_token_masks={
+                dr.request_id: mask
+                for dr in scheduled
+                if (mask := self._stop_token_mask(dr.request_id)) is not None
+            } if bind_policy else {},
         )
 
     def _batch_decode(
@@ -942,24 +1324,38 @@ class WorkerProcess:
         runtime_model,
         new_tokens: dict[str, list[int]],
         prepared_decode: _PreparedDecodeWork | None = None,
+        step_id: int = 0,
+        prefill_requests: int = 0,
     ) -> dict[str, int]:
         with profile_span(
             "WorkerProcess.batch_decode",
             cat="worker",
             args={"batch_size": len(scheduled), "request_ids": [dr.request_id for dr in scheduled]},
         ):
-            allow_device_greedy_sampling = self._allow_device_sampled_ids(scheduled)
-            allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled)
+            allow_device_greedy_sampling = self._allow_device_sampled_ids(scheduled, phase="decode")
+            allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled, phase="decode")
 
-            batch = self._make_decode_batch(
+            batch = self._batch_builder(
                 scheduled,
                 runtime_model,
                 resolve_tokens=True,
                 allow_device_greedy_sampling=allow_device_greedy_sampling,
                 allow_device_topk_sampling=allow_device_topk_sampling,
             )
+            if (isinstance(getattr(runtime_model, "extra", None), dict)
+                    and runtime_model.extra.get("family") == "deepseek_v41"
+                    and getattr(runtime_model.runtime, "num_speculative_tokens", 0) == 5):
+                lower = getattr(self.executor, "lower_dspark_decode_batch", None)
+                if not callable(lower):
+                    self._require_v41_dspark_stages(runtime_model, batch, phase="decode")
+                batch.dspark_stages = lower(runtime_model, batch)
+            self._require_v41_dspark_stages(runtime_model, batch, phase="decode")
             if prepared_decode is None:
-                decode_result = self.executor.run_decode(runtime_model, batch)
+                started_ns = self._decode_metrics.start() if self._decode_metrics else 0
+                if batch.dspark_stages is None:
+                    decode_result = self.executor.run_decode(runtime_model, batch)
+                else:
+                    decode_result = self.executor.run_dspark_decode_batch(batch)
             else:
                 if prepared_decode.error is not None:
                     raise RuntimeError(prepared_decode.error)
@@ -973,33 +1369,57 @@ class WorkerProcess:
                         batch,
                         buffer_slot=prepared_decode.buffer_slot,
                     )
-                decode_result = self.executor.run_prepared_decode(
-                    runtime_model,
-                    batch,
-                    prepared,
+                started_ns = self._decode_metrics.start() if self._decode_metrics else 0
+                if batch.dspark_stages is None:
+                    decode_result = self.executor.run_prepared_decode(
+                        runtime_model,
+                        batch,
+                        prepared,
+                    )
+                else:
+                    raise RuntimeError(
+                        "DSpark decode batches cannot use the generic prepared-decode lane; "
+                        "provide a DSpark-specific prepared/reclaim contract"
+                    )
+            num_draft_tokens = self._consume_decode_result(scheduled, decode_result, new_tokens, batch=batch)
+            if self._decode_metrics:
+                self._decode_metrics.record(
+                    step_id=step_id, started_ns=started_ns,
+                    request_ids=[r.request_id for r in scheduled], new_tokens=new_tokens,
+                    num_draft_tokens=num_draft_tokens,
+                    mode="sync_prepared" if prepared_decode is not None else "sync_unprepared",
+                    prefill_requests=prefill_requests,
                 )
-            return self._consume_decode_result(scheduled, decode_result, new_tokens)
+            return num_draft_tokens
 
     def _consume_decode_result(
         self,
         scheduled: tuple[DecodeRequest, ...] | list[DecodeRequest],
         decode_result: DecodeResult,
         new_tokens: dict[str, list[int]],
+        *,
+        batch: DecodeBatch | None = None,
     ) -> dict[str, int]:
         """Convert a runner result to tokens on either serial or reclaim lane."""
         if decode_result.accepted_token_ids is not None:
             for i, dr in enumerate(scheduled):
-                new_tokens[dr.request_id] = list(decode_result.accepted_token_ids[i])
+                tokens = list(decode_result.accepted_token_ids[i])
+                constraint_state = getattr(self, "_constraint_states", {}).get(dr.request_id)
+                if constraint_state is not None:
+                    constraint_state.accept(tokens)
+                self._accept_output_tokens(dr.request_id, len(tokens))
+                new_tokens[dr.request_id] = tokens
             if decode_result.num_draft_tokens is None:
                 return {}
             return {
                 dr.request_id: count
                 for dr, count in zip(scheduled, decode_result.num_draft_tokens, strict=True)
             }
-        allow_device_greedy_sampling = self._allow_device_sampled_ids(list(scheduled))
-        allow_device_topk_sampling = self._allow_device_topk_sampling(list(scheduled))
+        if batch is None:
+            raise RuntimeError("decode sampling requires the dispatched batch")
+        allow_device_greedy_sampling = batch.allow_device_greedy_sampling
+        allow_device_topk_sampling = batch.allow_device_topk_sampling
         for i, dr in enumerate(scheduled):
-            cached = self._req_cache[dr.request_id]
             logits = None
             if decode_result.logits is not None:
                 logits = (
@@ -1007,12 +1427,7 @@ class WorkerProcess:
                     if decode_result.logits.dim() > 1
                     else decode_result.logits
                 )
-            params = SamplingParams(
-                temperature=cached.temperature,
-                top_p=cached.top_p,
-                top_k=cached.top_k,
-                seed=cached.seed,
-            )
+            params = self._sampling_params(dr.request_id)
             token_id = self._sample_result_row(
                 decode_result,
                 logits,
@@ -1023,10 +1438,20 @@ class WorkerProcess:
                 allow_device_topk_sampling=allow_device_topk_sampling,
             )
             new_tokens[dr.request_id] = [token_id]
+            constraint_state = getattr(self, "_constraint_states", {}).get(dr.request_id)
+            if constraint_state is not None:
+                constraint_state.accept((token_id,))
+            self._accept_output_tokens(dr.request_id, 1)
         return {}
 
     def close(self) -> None:
         """Release executor-owned runtime and device resources."""
+        for constraint_state in getattr(self, "_constraint_states", {}).values():
+            constraint_state.close()
+        if hasattr(self, "_constraint_states"):
+            self._constraint_states.clear()
+        if hasattr(self, "_accepted_output_lengths"):
+            self._accepted_output_lengths.clear()
         executor = self.executor
         self.executor = None
         if executor is None:
@@ -1063,11 +1488,69 @@ class WorkerProcess:
                 params,
                 request_id,
             )
+        if logits is None or logits.numel() == 0:
+            raise ValueError("host sampling requires logits when device sampling is unavailable")
         return self.sampler.sample(logits, params, request_id)
 
-    def _allow_device_topk_sampling(self, scheduled: list) -> bool:
+    def _accept_output_tokens(self, request_id: str, count: int) -> None:
+        lengths = getattr(self, "_accepted_output_lengths", {})
+        if request_id in lengths:
+            lengths[request_id] += count
+
+    @staticmethod
+    def _min_tokens_mask_active(cached: NewRequestData, accepted_count: int) -> bool:
+        has_eos = cached.eos_token_id is not None or bool(cached.eos_token_ids)
+        return has_eos and accepted_count < cached.min_tokens
+
+    def _stop_token_mask(self, request_id: str) -> StopTokenMask | None:
+        cached = self._req_cache[request_id]
+        if cached.min_tokens <= 0 or (cached.eos_token_id is None and not cached.eos_token_ids):
+            return None
+        lengths = getattr(self, "_accepted_output_lengths", {})
+        if request_id not in lengths:
+            raise RuntimeError(f"accepted output length is not registered for {request_id!r}")
+        if not self._min_tokens_mask_active(cached, lengths[request_id]):
+            return None
+        remaining = cached.min_tokens - lengths[request_id]
+        primary = () if cached.eos_token_id is None else (cached.eos_token_id,)
+        all_eos = tuple(dict.fromkeys(primary + (cached.eos_token_ids or ())))
+        stop_ids = blocked_token_ids(all_eos, remaining)
+        return StopTokenMask(stop_ids, remaining) if stop_ids else None
+
+    def _sampling_params(self, request_id: str) -> SamplingParams:
+        cached = self._req_cache[request_id]
+        mask = self._stop_token_mask(request_id)
+        forbidden = mask.stop_token_ids if mask is not None else ()
+        return SamplingParams(
+            temperature=cached.temperature, top_p=cached.top_p,
+            top_k=cached.top_k, seed=cached.seed,
+            forbidden_token_ids=forbidden,
+        )
+
+    def _needs_host_stop_token_mask(
+        self, scheduled: list, phase: Literal["prefill", "decode"]
+    ) -> bool:
+        capabilities = getattr(self, "_sampling_capabilities", _DEFAULT_SAMPLING_CAPABILITIES)
+        if capabilities.stop_mask_on_device(phase):
+            return False
+        # Early preparation can precede FIFO registration; assume zero output until then.
+        lengths = getattr(self, "_accepted_output_lengths", {})
+        return any(
+            self._min_tokens_mask_active(
+                self._req_cache[item.request_id], lengths.get(item.request_id, 0)
+            )
+            for item in scheduled
+        )
+
+    def _allow_device_topk_sampling(
+        self, scheduled: list, *, phase: Literal["prefill", "decode"]
+    ) -> bool:
         """Return whether a scheduled batch can use executor top-k candidates."""
+        if not scheduled:
+            return False
         max_device_topk = self.executor.device_topk_sampling_k
+        if self._needs_host_stop_token_mask(scheduled, phase):
+            return False
         cached_requests = [self._req_cache[item.request_id] for item in scheduled]
         return (
             max_device_topk > 0
@@ -1077,9 +1560,15 @@ class WorkerProcess:
             and all(request.top_k <= max_device_topk for request in cached_requests)
         )
 
-    def _allow_device_sampled_ids(self, scheduled: list) -> bool:
+    def _allow_device_sampled_ids(
+        self, scheduled: list, *, phase: Literal["prefill", "decode"]
+    ) -> bool:
         """Return whether the executor can perform every request's sampling policy."""
+        if not scheduled:
+            return False
         if not self.executor.supports_device_sampling:
+            return False
+        if self._needs_host_stop_token_mask(scheduled, phase):
             return False
         requests = [self._req_cache[item.request_id] for item in scheduled]
         return all(
@@ -1097,8 +1586,9 @@ def _worker_entry(
     input_queue: mp.Queue,
     output_queue: mp.Queue,
     ready_event,
-    num_pages_value,
+    cache_capacity,
     profile_output_queue: mp.Queue | None = None,
+    services_factory=None,
 ):
     """Entry point for the worker subprocess."""
     import signal
@@ -1116,10 +1606,19 @@ def _worker_entry(
     )
     configure_runtime_logging()
 
-    worker = WorkerProcess(config, input_queue, output_queue, profile_output_queue)
+    worker = WorkerProcess(config, input_queue, output_queue, profile_output_queue, services_factory)
     try:
         num_pages = worker.init_device_and_model()
-        num_pages_value.value = num_pages
+        sizes = worker.executor.cache_group_sizes(config.model_id)
+        groups = config.resolve_runtime_config().kv_cache_groups
+        if sizes and set(sizes) != {group.name for group in groups}:
+            raise ValueError("executor must report capacity for every cache group")
+        if sizes and (any(type(size) is not int or size <= 0 for size in sizes.values())
+                      or sizes[groups[0].name] != num_pages):
+            raise ValueError("invalid executor cache group capacities")
+        for index, group in enumerate(groups, 1):
+            cache_capacity[index] = sizes.get(group.name, 0)
+        cache_capacity[0] = num_pages
         # Model weights, compiled kernels and KV-cache objects are now resident.
         # Freeze them so the GC won't rescan them during decode (avoids
         # multi-ms gen2 pauses landing mid-step). Must happen in this process:
@@ -1138,13 +1637,12 @@ def _worker_entry(
         get_profiler(initially_active=False).stop()
 
 
-def spawn_worker(config: EngineConfig):
+def spawn_worker(config: EngineConfig, *, services_factory=None, on_starting=None):
     """Spawn a worker process and return its process, queues, and ready state.
 
-    ``num_pages_value`` is a shared ``multiprocessing.Value('i')`` that the
-    worker writes after ``init_device_and_model()`` completes.  The main
-    process reads it to synchronise the ``KvCacheManager`` block metadata with
-    the actual device-side KV cache size. Profile acknowledgements use a
+    ``cache_capacity`` reports primary and optional per-group physical counts
+    through one shared array after model initialization. The main process
+    initializes allocator metadata from these exact sizes. Profile replies use a
     dedicated output queue so they cannot be mistaken for inference results.
     """
     ctx = mp.get_context("spawn")
@@ -1152,7 +1650,7 @@ def spawn_worker(config: EngineConfig):
     output_queue = ctx.Queue()
     profile_output_queue = ctx.Queue()
     ready_event = ctx.Event()
-    num_pages_value = ctx.Value("i", 0)
+    cache_capacity = ctx.Array("q", 1 + len(config.resolve_runtime_config().kv_cache_groups))
 
     process = ctx.Process(
         target=_worker_entry,
@@ -1161,11 +1659,16 @@ def spawn_worker(config: EngineConfig):
             input_queue,
             output_queue,
             ready_event,
-            num_pages_value,
+            cache_capacity,
             profile_output_queue,
+            services_factory,
         ),
         daemon=False,
     )
+    # Setup failures above prove that no process borrowed owner resources.
+    # Once start() is attempted, failure remains on the acknowledgement path.
+    if on_starting is not None:
+        on_starting()
     process.start()
     return (
         process,
@@ -1173,5 +1676,5 @@ def spawn_worker(config: EngineConfig):
         output_queue,
         profile_output_queue,
         ready_event,
-        num_pages_value,
+        cache_capacity,
     )

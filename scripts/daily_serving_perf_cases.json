@@ -1,0 +1,9 @@
+{
+  "seed": 42,
+  "rounds": 2,
+  "cases": [
+    {"id": "16b-8kin-1024out", "requests": 16, "input_tokens": 8192, "output_tokens": 1024},
+    {"id": "1b-128kin-1024out", "requests": 1, "input_tokens": 131072, "output_tokens": 1024},
+    {"id": "4b-128kin-1024out", "requests": 4, "input_tokens": 131072, "output_tokens": 1024}
+  ]
+}

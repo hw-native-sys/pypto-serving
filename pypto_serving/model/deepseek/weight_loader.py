@@ -111,6 +111,7 @@ _PREPACKED_MIN_CACHE_RESIDENCY = 0.95
 _PACKED_NP_DTYPE = {
     "F32": np.float32,
     "I32": np.int32,
+    "I16": np.int16,
     "I8": np.int8,
     "U8": np.uint8,
     # No numpy dtype matches these, so they are read as same-width integers and

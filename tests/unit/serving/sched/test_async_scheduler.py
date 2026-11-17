@@ -7,14 +7,17 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+
 import pytest
 
 from pypto_serving.config.types import (
     KVCacheGroupSpec,
     KVCacheSpec,
     PREFILL_CHUNK_SIZE_CHOICES,
+    RuntimeConfig,
 )
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.sched.scheduler import (
     Request,
     RequestStatus,
@@ -28,6 +31,90 @@ from pypto_serving.serving.sched.scheduler import (
 def test_scheduler_rejects_speculative_depth_larger_than_token_budget():
     with pytest.raises(ValueError, match="one decode token"):
         SchedulerConfig(max_num_scheduled_tokens=4, num_speculative_tokens=4)
+
+
+@pytest.mark.parametrize("options", [
+    {"prefill_chunk_alignment": 0}, {"prefill_chunk_alignment": True},
+    {"prefill_chunk_alignment": 1.5},
+])
+def test_scheduler_rejects_invalid_prefill_chunk_alignment(options):
+    with pytest.raises(ValueError, match="prefill.*alignment"):
+        SchedulerConfig(max_seq_len=512, **options)
+
+
+@pytest.mark.parametrize("context", [8, 15, 16])
+def test_aligned_prefill_accepts_a_smaller_complete_context(context):
+    runtime = RuntimeConfig(max_seq_len=context, max_num_batched_tokens=context,
+                            max_prefill_tokens_per_request=context, prefill_chunk_alignment=16)
+    scheduler = _prefill_scheduler(max_seq_len=runtime.max_seq_len, max_num_scheduled_tokens=context,
+                                   long_prefill_token_threshold=context, prefill_chunk_alignment=16)
+    scheduler.add_request(Request("small", list(range(context - 1)), max_new_tokens=1))
+    output = scheduler.schedule()
+    assert [(item.num_computed_tokens, item.num_new_tokens) for item in output.scheduled_requests] == [(0, context - 1)]
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_aligned_prefill_defers_ongoing_work_but_uses_arbitrary_terminal_tails(async_mode):
+    scheduler = _prefill_scheduler(
+        num_blocks=64, max_num_scheduled_tokens=128, long_prefill_token_threshold=32,
+        prefill_chunk_alignment=16, max_seq_len=512, async_scheduling=async_mode,
+    )
+    lengths = {"short": 17, "a": 401, "b": 402, "c": 415, "deferred": 339, "tail": 7}
+    for name, length in lengths.items():
+        scheduler.add_request(Request(name, list(range(length)), max_new_tokens=1))
+    chunks = {name: [] for name in lengths}
+    for step in range(100):
+        if not scheduler.has_work():
+            break
+        # Stable per-request recurrence boundaries must survive batch reordering.
+        scheduler.running.reverse()
+        output = scheduler.schedule()
+        assert output.scheduled_requests
+        assert output.num_prefill_tokens <= 128
+        if step == 0:
+            assert [(item.request.request_id, item.num_new_tokens) for item in output.scheduled_requests] == [
+                ("short", 17), ("a", 32), ("b", 32), ("c", 32), ("tail", 7),
+            ]
+            assert [request.request_id for request in scheduler.waiting] == ["deferred"]
+        sampled = {}
+        for item in output.scheduled_requests:
+            start, length = item.num_computed_tokens, item.num_new_tokens
+            chunks[item.request.request_id].append((start, length))
+            assert start % 16 == 0
+            if start + length < item.request.num_prompt_tokens:
+                assert length % 16 == 0
+            else:
+                sampled[item.request.request_id] = [9]
+        if async_mode:
+            scheduler.advance_after_schedule(output)
+        scheduler.update_from_output(output, sampled)
+    else:
+        pytest.fail("aligned prefill stalled")
+    assert not scheduler.has_work()
+    assert chunks["a"][-1][1] % 16 == 1
+    assert chunks["b"][-1][1] % 16 == 2
+    assert chunks["c"][-1][1] % 16 == 15
+    assert all(sum(length for _, length in rows) == lengths[name] for name, rows in chunks.items())
+
+
+@pytest.mark.parametrize("alignment,expected", [(1, [(0, 31), (31, 18)]),
+                                               (16, [(0, 16), (16, 16), (32, 17)])])
+def test_prefill_alignment_preserves_final_tail_and_single_token_decode(alignment, expected):
+    scheduler = _prefill_scheduler(max_num_scheduled_tokens=128, long_prefill_token_threshold=31,
+                                   prefill_chunk_alignment=alignment)
+    request = Request("request", list(range(49)), max_new_tokens=2)
+    scheduler.add_request(request)
+    chunks = []
+    while request.is_prefill:
+        output = scheduler.schedule()
+        item, = output.scheduled_requests
+        chunks.append((item.num_computed_tokens, item.num_new_tokens))
+        terminal = item.num_computed_tokens + item.num_new_tokens == request.num_prompt_tokens
+        scheduler.update_from_output(output, {"request": [9]} if terminal else {})
+    assert chunks == expected
+    decode = scheduler.schedule()
+    item, = decode.scheduled_requests
+    assert not item.is_prefill and item.num_new_tokens == 1
 
 
 @pytest.mark.parametrize("chunk_size", PREFILL_CHUNK_SIZE_CHOICES)
@@ -1143,6 +1230,225 @@ def test_grouped_cache_preemption_removes_victim_from_running_queue():
     assert [request.request_id for request in scheduler.waiting] == ["newer"]
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_preempted_request_replays_emitted_tokens_before_sampling_again(async_scheduling):
+    from pypto_serving.serving.engine.async_engine import ReplicaEngineCore
+
+    scheduler = _prefill_scheduler(
+        num_blocks=8,
+        block_size=1,
+        max_num_running_reqs=1,
+        max_num_scheduled_tokens=2,
+        long_prefill_token_threshold=2,
+        max_seq_len=16,
+        async_scheduling=async_scheduling,
+    )
+    request = Request(
+        "replay", [1, 2], max_new_tokens=3, status=RequestStatus.RUNNING,
+        num_computed_tokens=3, output_token_ids=[7, 8],
+    )
+    scheduler.running = [request]
+    scheduler.requests = {request.request_id: request}
+    assert scheduler._preempt_lowest_priority(Request("other", [1], 1), set(), {}, SchedulerOutput())
+
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._request_contexts = {}
+    core._worker_known_req_ids = {request.request_id}
+    first = scheduler.schedule()
+    first_cmd = core._build_step_command(first, finished_ids=[request.request_id])
+    assert first_cmd.new_requests[0].prompt_token_ids == [1, 2, 7, 8]
+    assert first_cmd.new_requests[0].initial_output_tokens == 2
+    assert first_cmd.prefill_requests[0].chunk_tokens == [1, 2]
+    assert request.num_prompt_tokens == 2
+
+    if async_scheduling:
+        scheduler.advance_after_schedule(first)
+        second = scheduler.schedule()
+        scheduler.advance_after_schedule(second)
+        assert scheduler.update_from_output(first, {}) == []
+        assert request.num_output_placeholders == 1
+    else:
+        assert scheduler.update_from_output(first, {}) == []
+        second = scheduler.schedule()
+    second_cmd = core._build_step_command(second, finished_ids=[])
+    assert not second_cmd.new_requests
+    assert second_cmd.prefill_requests[0].chunk_tokens == [7, 8]
+    assert second_cmd.prefill_requests[0].num_computed_tokens == 2
+
+    outputs = scheduler.update_from_output(second, {request.request_id: 9})
+    assert [(item.new_token_id, item.finished) for item in outputs] == [(9, True)]
+    assert request.output_token_ids == [7, 8, 9]
+    assert request.num_output_placeholders == 0
+
+
+@pytest.mark.parametrize(
+    "config_overrides",
+    [
+        {},
+        {"enable_chunk_prefill": False},
+        {"num_speculative_tokens": 1, "supports_chunked_prefill_with_speculation": False},
+    ],
+    ids=["chunked", "single-dispatch", "speculative-single-dispatch"],
+)
+@pytest.mark.parametrize("committed_count", [2, 3])
+def test_preemption_preserves_requests_that_cannot_replay(config_overrides, committed_count):
+    scheduler = _prefill_scheduler(
+        num_blocks=16, block_size=1, max_num_scheduled_tokens=4,
+        max_prefill_tokens_per_request=4, max_seq_len=16, **config_overrides,
+    )
+    request = Request("replay", [1, 2], max_new_tokens=8, temperature=0.0)
+    scheduler.add_request(request)
+    for token in range(7, 7 + committed_count):
+        step = scheduler.schedule()
+        assert step.scheduled_requests
+        scheduler.update_from_output(step, {request.request_id: [token]})
+
+    blocks = list(request.allocated_block_ids)
+    free_blocks = scheduler.kv_cache_manager.num_free_blocks
+    result = scheduler._preempt_lowest_priority(
+        Request("other", [3], 1), set(), {}, SchedulerOutput(),
+    )
+
+    if not config_overrides or len(request.all_token_ids) <= 4:
+        assert result is not None and result["request"] is request
+        assert request.status is RequestStatus.PREEMPTED
+    else:
+        assert result is None
+        assert request.status is RequestStatus.RUNNING
+        assert request.allocated_block_ids == blocks
+        assert scheduler.kv_cache_manager.num_free_blocks == free_blocks
+
+
+def test_preemption_eligibility_does_not_depend_on_evictable_prefix_cache():
+    scheduler = _prefill_scheduler(
+        num_blocks=8, block_size=2, prefix_cache=True,
+        max_num_scheduled_tokens=4, max_prefill_tokens_per_request=4,
+        max_seq_len=16, enable_chunk_prefill=False,
+    )
+    manager = scheduler.kv_cache_manager
+    cached = manager.allocate_blocks(1)[0]
+    manager.cache_block(cached, manager.compute_block_hashes([1, 2])[0])
+    manager.release(cached)
+    request = Request("replay", [1, 2, 3, 4, 5, 6], max_new_tokens=8)
+    scheduler.add_request(request)
+    step = scheduler.schedule()
+    assert step.scheduled_requests[0].num_computed_tokens == 2
+    scheduler.update_from_output(step, {request.request_id: [7]})
+    blocks = (list(request.cached_block_ids), list(request.allocated_block_ids))
+
+    result = scheduler._preempt_lowest_priority(
+        Request("other", [8], 1), set(), {}, SchedulerOutput(),
+    )
+
+    assert result is None
+    assert request.status is RequestStatus.RUNNING
+    assert (request.cached_block_ids, request.allocated_block_ids) == blocks
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize(
+    "config_overrides",
+    [
+        {"enable_chunk_prefill": False},
+        {"num_speculative_tokens": 1, "supports_chunked_prefill_with_speculation": False},
+    ],
+    ids=["single-dispatch", "speculative-single-dispatch"],
+)
+def test_unreplayable_request_waits_for_inflight_then_resolves_stall(config_overrides, async_scheduling):
+    scheduler = _prefill_scheduler(
+        num_blocks=4 + config_overrides.get("num_speculative_tokens", 0), block_size=1,
+        max_num_scheduled_tokens=4, max_prefill_tokens_per_request=4, max_seq_len=16,
+        async_scheduling=async_scheduling, **config_overrides,
+    )
+    request = Request("replay", [1, 2], max_new_tokens=8, temperature=0.0)
+    scheduler.add_request(request)
+    for token in (7, 8, 9):
+        step = scheduler.schedule()
+        assert step.scheduled_requests
+        if async_scheduling:
+            scheduler.advance_after_schedule(step)
+        scheduler.update_from_output(step, {request.request_id: [token]})
+    assert request.output_token_ids == [7, 8, 9]
+    assert scheduler.kv_cache_manager.num_free_blocks == 0
+    scheduler.add_request(Request("waiter", [3], max_new_tokens=1))
+
+    request.num_output_placeholders = 1
+    pending = scheduler.schedule()
+    assert pending.is_empty and not pending.rejected_requests
+    assert not pending.preempted_requests
+    request.num_output_placeholders = 0
+    deferred = scheduler.schedule(allow_reject_stalled=False)
+    assert deferred.is_empty and not deferred.rejected_requests
+
+    resolved = scheduler.schedule()
+    assert "replay" in resolved.rejected_requests
+    assert "single-dispatch" in resolved.rejected_requests["replay"]
+    assert request.status is RequestStatus.FINISHED_ABORTED
+    assert "replay" not in scheduler.requests
+    assert [item.request.request_id for item in resolved.scheduled_requests] == ["waiter"]
+
+
+def test_constrained_request_is_not_recomputed_without_grammar_replay():
+    manager = KvCacheManager(num_blocks=4, block_size=1, enable_prefix_cache=False)
+    scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=False), manager)
+    protected = Request(
+        "protected", [1], max_new_tokens=5, status=RequestStatus.RUNNING,
+        constraint_spec=ConstraintSpec(
+            provider_id="xgrammar", format_id="deepseek_v4",
+            tools=({"type": "function", "function": {"name": "shell"}},),
+            tool_choice="required", reasoning=False,
+        ),
+    )
+    unprotected = Request("plain", [2], max_new_tokens=5, status=RequestStatus.RUNNING)
+    exclude = Request("new", [3], max_new_tokens=5)
+    scheduler.running = [protected]
+    assert scheduler._preempt_lowest_priority(exclude, set(), {}, SchedulerOutput()) is None
+    assert protected.status is RequestStatus.RUNNING
+
+    scheduler.running.append(unprotected)
+    result = scheduler._preempt_lowest_priority(exclude, set(), {}, SchedulerOutput())
+    assert result is not None and result["request"] is unprotected
+    assert protected.status is RequestStatus.RUNNING
+
+
+def test_constrained_request_waits_for_inflight_work_then_rejects_if_no_progress():
+    manager = KvCacheManager(num_blocks=1, block_size=1, enable_prefix_cache=False)
+    scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=False), manager)
+    protected = Request(
+        "protected", [1], max_new_tokens=4,
+        constraint_spec=ConstraintSpec(
+            provider_id="xgrammar", format_id="deepseek_v4",
+            tools=({"type": "function", "function": {"name": "shell"}},),
+            tool_choice="required", reasoning=False,
+        ),
+    )
+    scheduler.add_request(protected)
+    first = scheduler.schedule()
+    scheduler.update_from_output(first, {"protected": [9]})
+    waiter = Request("waiter", [2], max_new_tokens=1)
+    scheduler.add_request(waiter)
+
+    protected.num_output_placeholders = 1
+    blocked = scheduler.schedule()
+    assert blocked.is_empty
+    assert not blocked.preempted_requests
+    assert not blocked.rejected_requests
+    assert protected.status is RequestStatus.RUNNING
+    assert [request.request_id for request in scheduler.waiting] == ["waiter"]
+
+    protected.num_output_placeholders = 0
+    in_flight = scheduler.schedule(allow_reject_stalled=False)
+    assert in_flight.is_empty
+    assert not in_flight.rejected_requests
+    assert protected.status is RequestStatus.RUNNING
+
+    admitted = scheduler.schedule()
+    assert "cannot allocate KV blocks" in admitted.rejected_requests["protected"]
+    assert protected.status is RequestStatus.FINISHED_ABORTED
+    assert "protected" not in scheduler.requests
+    assert [item.request.request_id for item in admitted.scheduled_requests] == ["waiter"]
+
+
 def test_grouped_cache_capacity_scales_from_device_reported_primary_pool():
     manager = KvCacheManager(block_size=1, enable_prefix_cache=False)
     manager.init_groups(
@@ -1273,3 +1579,20 @@ def test_grouped_prefix_metrics_count_reused_tokens():
     assert output.prefix_cache_queries == 4
     assert output.prefix_cache_hits == 4
     assert output.prefix_cache_query_tokens == 5
+
+
+@pytest.mark.parametrize("ignore_eos", [False, True])
+def test_scheduler_stops_on_secondary_model_eos(ignore_eos):
+    manager = KvCacheManager(num_blocks=4, block_size=2, enable_prefix_cache=False)
+    scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=False), manager)
+    request = Request(request_id="multi-eos", prompt_token_ids=[1], max_new_tokens=4,
+                      eos_token_id=7, eos_token_ids=(7, 9), num_computed_tokens=1,
+                      status=RequestStatus.RUNNING, ignore_eos=ignore_eos)
+    scheduler.running.append(request)
+    scheduler.requests[request.request_id] = request
+    scheduled = SchedulerOutput(
+        scheduled_requests=[ScheduledRequest(request=request, num_new_tokens=1, is_prefill=False)]
+    )
+    outputs = scheduler.update_from_output(scheduled, {request.request_id: 9})
+    assert request.status is (RequestStatus.RUNNING if ignore_eos else RequestStatus.FINISHED_EOS)
+    assert outputs[0].finished is (not ignore_eos)

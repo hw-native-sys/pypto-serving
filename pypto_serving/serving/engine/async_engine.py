@@ -19,13 +19,17 @@ from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Callable
 
+import msgspec
+
 from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
 from pypto_serving.observability import InMemoryStatLogger, IterationStats, SchedulerStats
+from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.reasoning import (
     OutputParserSpec, ParsedToolCall, ToolCallDelta, create_output_parser,
 )
+from pypto_serving.serving.sampling.capabilities import SamplingCapabilities, sampling_capabilities
 from pypto_serving.serving.utils.env import (
     worker_init_timeout_seconds,
     worker_step_timeout_seconds,
@@ -42,11 +46,14 @@ from pypto_serving.serving.server.ipc import (
     PLACEHOLDER_TOKEN,
     DecodeRequest,
     NewRequestData,
+    ControlCommand,
+    MAX_CONTROL_PAYLOAD_BYTES,
     PrefillRequest,
     ProfileCommand,
     ShutdownCommand,
     StepCommand,
     decode_profile_result,
+    decode_control_result,
     decode_result,
     encode_command,
 )
@@ -59,6 +66,19 @@ from pypto_serving.tools.profile import (
 )
 
 logger = logging.getLogger(__name__)
+
+# How long to wait at each stage of reaping a worker, after the cooperative
+# shutdown command has had its turn. A worker inside a device call cannot be
+# interrupted, so each stage escalates once instead of repeating a signal that
+# has already been delivered.
+WORKER_TERM_GRACE_SECONDS = 10.0
+WORKER_KILL_GRACE_SECONDS = 5.0
+# How long to give the engine loop to notice it is stopping before the worker is
+# reaped without it. Clearing _running does not interrupt a pending read, and the
+# loop usually sits in a worker read governed by SERVING_WORKER_STEP_TIMEOUT --
+# twenty minutes by default -- so waiting it out would put the whole bounded
+# sequence behind an unbounded wait. Stopping the worker is what ends that read.
+LOOP_DRAIN_GRACE_SECONDS = 5.0
 
 
 @dataclass
@@ -102,22 +122,40 @@ class EngineConfig:
             return self.async_scheduling
         return True
 
+    def resolve_min_tokens(self, min_tokens: int) -> int:
+        """Return the minimum length supported by the selected decode path."""
+        return min_tokens if self.sampling_capabilities().honor_min_tokens else 0
+
+    def sampling_capabilities(self) -> SamplingCapabilities:
+        return sampling_capabilities(
+            self.executor_cls, self.resolve_runtime_config().num_speculative_tokens
+        )
+
+    def validate_generate_config(self, config) -> None:
+        if self.sampling_capabilities().greedy_only and not config.temperature <= 0:
+            raise ValueError("V4.1 K5 DSpark supports greedy sampling only; set temperature=0 or use K0")
+
     def resolve_runtime_config(self) -> RuntimeConfig:
         """Return runtime settings with executor requirements resolved."""
         runtime = self.runtime_config or RuntimeConfig()
+        if runtime.chip_runtime != "tensormap_and_ringbuffer" and self.executor_cls != "PyptoQwen14BExecutor":
+            raise ValueError("host_build_graph serving currently requires PyptoQwen14BExecutor")
         # Qwen3.8 needs the full token budget to fill its fused prefill extent.
         separate_phases = self.executor_cls in ("PyptoDeepSeekV4Executor", "PyptoQwen38Executor")
         homogeneous_prefill_decode = (
             runtime.requires_homogeneous_prefill_decode or separate_phases
         )
         preserve_prefill_chunks = runtime.preserve_prefill_chunks or self.executor_cls == "PyptoQwen38Executor"
+        retention_interval = runtime.prefix_cache_retention_interval if self.enable_prefix_cache else 0
         if (runtime.requires_homogeneous_prefill_decode == homogeneous_prefill_decode
-                and runtime.preserve_prefill_chunks == preserve_prefill_chunks):
+                and runtime.preserve_prefill_chunks == preserve_prefill_chunks
+                and runtime.prefix_cache_retention_interval == retention_interval):
             return runtime
         return replace(
             runtime,
             requires_homogeneous_prefill_decode=homogeneous_prefill_decode,
             preserve_prefill_chunks=preserve_prefill_chunks,
+            prefix_cache_retention_interval=retention_interval,
         )
 
     def worker_device_ids(self) -> tuple[int, ...]:
@@ -141,6 +179,17 @@ class EngineConfig:
 class _RequestContext:
     request: Request
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    # The public terminal output is held until the worker has acknowledged the
+    # FIFO release command.  In async mode a speculative step may already be in
+    # flight when the request reaches its token limit; publishing completion
+    # before that step drains leaves request-local K7 state visible to metrics.
+    worker_release_done: asyncio.Event = field(default_factory=asyncio.Event)
+    # Optional receipt for externally reserved state. Unlike release_done,
+    # only an actual worker ACK sets it, never an initial terminal token.
+    worker_release_ack: asyncio.Event | None = None
+    # The terminal output is queued, but its worker release may still be in
+    # flight. Cancellation must not schedule a second release in that window.
+    terminal_output_queued: bool = False
     # When False (non-streaming), intermediate TokenOutputs are suppressed and
     # only the final one is enqueued — one queue push / one HTTP wake-up per
     # request instead of one per token. Stop-string detection still runs every
@@ -194,8 +243,12 @@ class ReplicaEngineCore:
     def __init__(
         self,
         config: EngineConfig,
-        tokenizer
+        tokenizer,
+        *,
+        scheduler_factory=Scheduler,
+        worker_factory=spawn_worker,
     ) -> None:
+        self._worker_factory = worker_factory
         runtime = config.resolve_runtime_config()
         self.config = replace(config, runtime_config=runtime)
         self.tokenizer = tokenizer
@@ -209,12 +262,20 @@ class ReplicaEngineCore:
             block_size=block_size,
             enable_prefix_cache=self.config.enable_prefix_cache,
         )
+        self._cache_tiering = None
+        if runtime.kv_offload_bytes < 0:
+            raise ValueError("DDR offload capacity must not be negative")
+        if runtime.kv_offload_bytes:
+            from pypto_serving.serving.memory.tiering.integration import Session
+            self._cache_tiering = Session(self)
+            self.config = self._cache_tiering.configure(self.config)
         self._async_scheduling = self.config.resolve_async_scheduling()
         scheduler_config = SchedulerConfig(
             max_num_running_reqs=self.config.max_num_running_reqs,
             max_num_scheduled_tokens=self.config.max_num_scheduled_tokens,
             long_prefill_token_threshold=self.config.long_prefill_token_threshold,
             max_prefill_tokens_per_request=runtime.max_prefill_tokens_per_request,
+            prefill_chunk_alignment=runtime.prefill_chunk_alignment,
             prefill_chunk_size_choices=runtime.prefill_chunk_size_choices,
             preserve_prefill_chunks=runtime.preserve_prefill_chunks,
             max_seq_len=runtime.max_seq_len,
@@ -225,6 +286,7 @@ class ReplicaEngineCore:
                 runtime.supports_chunked_prefill_with_speculation
             ),
             speculative_prefix_cache_replay_tokens=runtime.speculative_prefix_cache_replay_tokens,
+            prefix_cache_retention_interval=runtime.prefix_cache_retention_interval,
             requires_homogeneous_prefill_decode=(
                 runtime.requires_homogeneous_prefill_decode
             ),
@@ -232,7 +294,7 @@ class ReplicaEngineCore:
         )
         # Validate before worker startup, while the manager's pools are still lazy.
         scheduler_config.validate_cache_groups(runtime.kv_cache_groups)
-        self.scheduler = Scheduler(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)
+        self.scheduler = scheduler_factory(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)
 
         self._request_contexts: dict[str, _RequestContext] = {}
         self._running = False
@@ -244,7 +306,12 @@ class ReplicaEngineCore:
         self._input_queue = None
         self._output_queue = None
         self._profile_output_queue = None
+        # Sticky: set once a worker has outlived every signal. The handle is
+        # dropped at that point, so without it the next stop sees no process and
+        # reports a clean one.
+        self._worker_stranded = False
         self._profile_lock = asyncio.Lock()
+        self._control_counter = 0
         # Tracks which request_ids the worker has already received via
         # NewRequestData — prompt tokens are sent exactly once per request.
         self._worker_known_req_ids: set[str] = set()
@@ -253,6 +320,13 @@ class ReplicaEngineCore:
         # executing on the device while the next is scheduled. Each entry is the
         # SchedulerOutput awaiting its StepResult. Sync mode leaves this empty.
         self._batch_queue: deque[tuple[int, SchedulerOutput]] = deque()
+        # Request ids released by each queued worker step.  A successful reply
+        # is the acknowledgement that the FIFO worker applied the release
+        # before executing that step.
+        self._worker_free_ids_by_step: dict[int, tuple[str, ...]] = {}
+        # Requests admitted with an existing cache may need one step to seed
+        # model-local recurrent state. Apply that result before pipelining.
+        self._initialization_steps: set[int] = set()
         self._max_in_flight = 2 if self._async_scheduling else 1
         self._step_counter = 0
         # step_ids of dispatched steps whose worker StepResult has NOT yet been
@@ -297,14 +371,16 @@ class ReplicaEngineCore:
     async def start(self) -> None:
         """Start worker process and engine loop."""
         with profile_span("AsyncLLMEngine.start", cat="serving"):
+            worker_options = ({"on_starting": self._cache_tiering.worker_starting}
+                              if self._cache_tiering is not None else {})
             (
                 process,
                 input_q,
                 output_q,
                 profile_output_q,
                 ready_event,
-                num_pages_value,
-            ) = spawn_worker(self.config)
+                cache_capacity,
+            ) = self._worker_factory(self.config, **worker_options)
             self._worker_process = process
             self._input_queue = input_q
             self._output_queue = output_q
@@ -326,10 +402,13 @@ class ReplicaEngineCore:
             # Synchronise block metadata with the actual device-side KV cache
             # size. Grouped runners report the first group's rank-local block
             # count; generic runners report their single-pool page count.
-            reported_num_blocks = num_pages_value.value
+            reported_num_blocks = cache_capacity[0]
+            group_sizes = {group.name: cache_capacity[index]
+                           for index, group in enumerate(self._runtime.kv_cache_groups, 1)}
             self.kv_cache_manager.initialize(
                 self._runtime,
                 num_blocks=reported_num_blocks,
+                group_num_blocks=group_sizes if any(group_sizes.values()) else None,
             )
             if self.kv_cache_manager.has_groups:
                 logger.info(
@@ -346,6 +425,8 @@ class ReplicaEngineCore:
                     self._runtime.page_size,
                 )
 
+        if self._cache_tiering is not None:
+            await self._cache_tiering.start()
         # The KV-cache block pool, scheduler tables and tokenizer are now
         # resident. Freeze the engine-process heap so the GC won't rescan them
         # during serving (see gc_utils). Per-process: the worker freezes its
@@ -356,15 +437,44 @@ class ReplicaEngineCore:
         self._loop_task = asyncio.create_task(self._engine_loop())
         logger.info("ReplicaEngineCore started")
 
-    async def stop(self) -> None:
-        """Stop engine loop and worker process."""
-        self._running = False
-        if self._loop_task is not None:
-            await self._loop_task
-            self._loop_task = None
+    def is_ready(self) -> bool:
+        """Report whether this replica can still serve requests.
 
-        await asyncio.to_thread(self._shutdown_worker, timeout=30)
-        logger.info("ReplicaEngineCore stopped")
+        Covers the two silent deaths a route-liveness check misses: a worker
+        process that exited (the engine would keep blocking on its output queue
+        until SERVING_WORKER_STEP_TIMEOUT, 1200s by default), and an engine loop
+        that raised with its exception never retrieved — which leaves _running
+        True while nothing is ever scheduled again.
+        """
+        return (
+            self._running
+            and self._loop_task is not None
+            and not self._loop_task.done()
+            and self._worker_process is not None
+            and self._worker_process.is_alive()
+        )
+
+    async def stop(self) -> bool:
+        """Stop engine loop and worker process.
+
+        False means the worker outlived every signal, so its devices are still
+        held and the caller must not report a clean stop.
+        """
+        self._running = False
+        await self._drain_loop_task()
+        try:
+            if self._cache_tiering is not None:
+                await self._cache_tiering.close()
+        except BaseException:
+            try:
+                await asyncio.to_thread(self._shutdown_worker, timeout=30)
+            except Exception:
+                logger.exception("Worker shutdown failed after DDR close failed; mappings remain retained")
+            raise
+        reaped = await asyncio.to_thread(self._shutdown_worker, timeout=30)
+        if reaped:
+            logger.info("ReplicaEngineCore stopped")
+        return reaped
 
     async def start_profile(self) -> None:
         """Start SA profiling in this replica's worker."""
@@ -376,32 +486,89 @@ class ReplicaEngineCore:
 
     async def _set_profile_active(self, active: bool) -> None:
         """Send an ordered worker profile command and wait for its acknowledgement."""
+        result = await self._call_worker_command(ProfileCommand(active=active), decode_profile_result)
+        if result.error:
+            raise RuntimeError(result.error)
+        if result.active != active:
+            raise RuntimeError(
+                f"Worker profile state mismatch: requested active={active}, "
+                f"received active={result.active}"
+            )
+
+    async def call_worker(self, operation: str, payload: bytes = b"") -> bytes:
+        """Run an ordered owner/cache operation in the spawned worker process."""
+        if not isinstance(operation, str) or not operation or len(operation) > 128:
+            raise ValueError("worker operation must be a nonempty bounded string")
+        if (
+            not isinstance(payload, bytes)
+            or len(payload) > MAX_CONTROL_PAYLOAD_BYTES
+        ):
+            raise ValueError(
+                "worker payload must be bytes no larger than "
+                f"{MAX_CONTROL_PAYLOAD_BYTES >> 20} MiB"
+            )
+        result = await self._call_worker_command(
+            ControlCommand(command_id=0, operation=operation, payload=payload), decode_control_result,
+        )
+        if result.error:
+            raise RuntimeError(result.error)
+        return result.payload
+
+    async def _call_worker_command(self, command, decode_reply):
+        """Correlate the shared control/profile queue, including late replies."""
         async with self._profile_lock:
             input_queue = self._input_queue
             output_queue = self._profile_output_queue
             if input_queue is None or output_queue is None:
                 raise RuntimeError("Serving worker is not running")
+            self._control_counter += 1
+            command_id = self._control_counter
+            command.command_id = command_id
+            input_queue.put(encode_command(command))
 
-            input_queue.put(encode_command(ProfileCommand(active=active)))
+            def receive_reply():
+                deadline = time.monotonic() + self._step_timeout
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise queue.Empty
+                    raw = output_queue.get(timeout=remaining)
+                    reply_id = msgspec.msgpack.decode(raw)["command_id"]
+                    if type(reply_id) is not int:
+                        raise RuntimeError("Worker control response has an invalid command ID")
+                    if reply_id < command_id:
+                        continue
+                    if reply_id != command_id:
+                        raise RuntimeError("Worker control response ordering mismatch")
+                    return decode_reply(raw)
+
+            response = asyncio.create_task(asyncio.to_thread(receive_reply))
             try:
-                raw_result = await asyncio.to_thread(
-                    output_queue.get,
-                    timeout=self._step_timeout,
-                )
+                return await asyncio.shield(response)
+            except asyncio.CancelledError:
+                # A cancelled to_thread waiter cannot stop queue.get(). Keep
+                # ownership of the queue until it drains or reaches its deadline.
+                while not response.done():
+                    try:
+                        await asyncio.shield(response)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not response.cancelled():
+                    response.exception()
+                raise
             except queue.Empty as exc:
-                action = "start" if active else "stop"
                 raise RuntimeError(
-                    f"Worker profile {action} timed out ({self._step_timeout:g}s)"
+                    f"Worker {type(command).__name__} timed out ({self._step_timeout:g}s)"
                 ) from exc
 
-            result = decode_profile_result(raw_result)
-            if result.error:
-                raise RuntimeError(result.error)
-            if result.active != active:
-                raise RuntimeError(
-                    f"Worker profile state mismatch: requested active={active}, "
-                    f"received active={result.active}"
-                )
+    def finish_prefilled_request(self, request_id):
+        self.scheduler.finish_prefilled_request(request_id)
+        self._schedule_worker_free(request_id)
+        context = self._request_contexts.get(request_id)
+        if context is not None:
+            context.queue.put_nowait(TokenOutput(finished=True, finish_reason="FINISHED_PREFILL"))
 
     def generate_request_id(self) -> str:
         self._request_counter += 1
@@ -413,7 +580,7 @@ class ReplicaEngineCore:
         for request in self.scheduler.requests.values():
             if request.status.is_finished:
                 continue
-            prompt_remaining = max(0, request.num_prompt_tokens - request.num_computed_tokens)
+            prompt_remaining = max(0, request.num_prefill_tokens - request.num_computed_tokens)
             generation_remaining = max(0, request.max_new_tokens - len(request.output_token_ids))
             load += prompt_remaining + generation_remaining
         return load
@@ -427,8 +594,10 @@ class ReplicaEngineCore:
         on_queued: Callable[[], None] | None = None,
         prompt_token_ids: Sequence[int] | None = None,
         output_parser_spec: OutputParserSpec | None = None,
+        constraint_spec: ConstraintSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
+        self.config.validate_generate_config(config)
         with profile_span(
             "ReplicaEngineCore.add_request",
             cat="serving",
@@ -438,22 +607,32 @@ class ReplicaEngineCore:
                 request_id=request_id,
                 prompt_token_ids=prompt_token_ids,
                 max_new_tokens=config.max_new_tokens,
+                min_tokens=self.config.resolve_min_tokens(getattr(config, "min_tokens", 0)),
                 arrival_time=time.time(),
                 stop_strings=tuple(config.stop) if config.stop else (),
-                eos_token_id=None if config.ignore_eos else self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                eos_token_ids=getattr(self.tokenizer, "eos_token_ids", ()),
+                ignore_eos=config.ignore_eos,
                 temperature=config.temperature,
                 top_p=config.top_p,
                 top_k=config.top_k,
                 seed=config.seed,
+                constraint_spec=constraint_spec,
             )
 
+            if request_id in self._request_contexts:
+                raise ValueError(f"request {request_id!r} is already active")
             ctx = _RequestContext(
                 request=request,
                 stream=getattr(config, "stream", True),
                 output_parser=create_output_parser(output_parser_spec, self.tokenizer),
             )
             self._request_contexts[request_id] = ctx
-            self.scheduler.add_request(request)
+            try:
+                self.scheduler.add_request(request)
+            except BaseException:
+                self._request_contexts.pop(request_id, None)
+                raise
             stat_logger = getattr(self, "_stat_logger", None)
             if stat_logger is not None:
                 stat_logger.record_queued(getattr(self, "_engine_index", 0), request_id)
@@ -469,6 +648,14 @@ class ReplicaEngineCore:
                 args={"request_id": request_id, "prompt_tokens": len(prompt_token_ids)},
             )
 
+        async with contextlib.aclosing(self._iterate_request_output(ctx)) as outputs:
+            async for output in outputs:
+                yield output
+
+    async def _iterate_request_output(self, ctx):
+        request = ctx.request
+        request_id = request.request_id
+        prompt_token_ids = request.prompt_token_ids
         finished_normally = False
         try:
             while True:
@@ -477,9 +664,20 @@ class ReplicaEngineCore:
                     self._request_contexts.pop(request_id, None)
                     raise queued
                 output: TokenOutput = queued
-                yield output
                 if output.finished:
+                    try:
+                        tiering = getattr(self, "_cache_tiering", None)
+                        await asyncio.wait_for(
+                            tiering.wait_worker_release(ctx.worker_release_done) if tiering is not None
+                            else ctx.worker_release_done.wait(),
+                            timeout=self._step_timeout,
+                        )
+                    except TimeoutError as exc:
+                        raise RuntimeError(
+                            f"worker request release timed out ({self._step_timeout:g}s)"
+                        ) from exc
                     finished_normally = True
+                    self._request_contexts.pop(request_id, None)
                     e2e = time.time() - request.arrival_time
                     n_out = len(request.output_token_ids)
                     logger.info(
@@ -487,7 +685,9 @@ class ReplicaEngineCore:
                         request_id, len(prompt_token_ids), n_out, output.finish_reason,
                         e2e, (n_out / e2e) if e2e > 0 else 0.0,
                     )
+                    yield output
                     break
+                yield output
         finally:
             # Only cancellation/disconnect needs cleanup here. On normal
             # completion the request already finished in the scheduler and
@@ -497,25 +697,32 @@ class ReplicaEngineCore:
             # membership check and freeing the same request on the worker twice.
             if not finished_normally and request_id in self._request_contexts:
                 self._request_contexts.pop(request_id, None)
-                self.scheduler.abort_request(request_id)
-                stat_logger = getattr(self, "_stat_logger", None)
-                if stat_logger is not None:
-                    stat_logger.finish_request(
-                        getattr(self, "_engine_index", 0),
-                        request_id,
-                        "FINISHED_ABORTED",
-                    )
-                # Aborted/cancelled ids must ride the next StepCommand's
-                # finished_request_ids, otherwise they leak in _req_cache /
-                # _worker_known_req_ids and pin device resources.
-                self._schedule_worker_free(request_id)
+                if not ctx.terminal_output_queued:
+                    self.scheduler.abort_request(request_id)
+                    stat_logger = getattr(self, "_stat_logger", None)
+                    if stat_logger is not None:
+                        stat_logger.finish_request(
+                            getattr(self, "_engine_index", 0),
+                            request_id,
+                            "FINISHED_ABORTED",
+                        )
+                    # Aborted/cancelled ids must ride the next StepCommand's
+                    # finished_request_ids, otherwise they leak in _req_cache /
+                    # _worker_known_req_ids and pin device resources.
+                    self._schedule_worker_free(request_id)
 
     async def abort_request(self, request_id: str) -> None:
-        ctx = self._request_contexts.pop(request_id, None)
+        ctx = self._request_contexts.get(request_id)
         if ctx is None:
             # Already finished/cleaned up: nothing pinned to release, and the
             # scheduler no longer tracks it. Avoid scheduling a duplicate free.
             return
+        if getattr(ctx, "terminal_output_queued", False):
+            # The terminal consumer still needs the context to observe the
+            # release acknowledgement. Its finally block handles disconnects.
+            return
+        # Keep the consumer's ACK binding until it observes the terminal output.
+        ctx.terminal_output_queued = True
         self.scheduler.abort_request(request_id)
         self._record_scheduler_stats()
         stat_logger = getattr(self, "_stat_logger", None)
@@ -531,6 +738,62 @@ class ReplicaEngineCore:
         # See note in add_request's finally block: schedule worker-side cleanup.
         self._schedule_worker_free(request_id)
 
+    async def add_prefilled_request(
+        self,
+        *,
+        reservation_id: str,
+        request_id: str,
+        prompt_token_ids: Sequence[int],
+        first_token: int,
+        max_new_tokens: int,
+        min_tokens: int = 0,
+        ignore_eos: bool = False,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int | None = None,
+        seed: int | None = None,
+        stop_strings: tuple[str, ...] = (),
+        eos_token_id: int | None = None,
+        stream: bool = True,
+        output_parser_spec: OutputParserSpec | None = None,
+        constraint_spec: ConstraintSpec | None = None,
+        worker_release_ack: asyncio.Event | None = None,
+    ) -> AsyncGenerator[TokenOutput, None]:
+        """Continue from an initialized cache lease using normal output delivery."""
+        parser = create_output_parser(output_parser_spec, self.tokenizer)
+        request, first_output = self.scheduler.admit_prefilled(
+            reservation_id=reservation_id,
+            request_id=request_id,
+            prompt_token_ids=list(prompt_token_ids),
+            first_token=first_token,
+            max_new_tokens=max_new_tokens,
+            min_tokens=self.config.resolve_min_tokens(min_tokens),
+            ignore_eos=ignore_eos,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+            stop_strings=stop_strings,
+            eos_token_id=eos_token_id,
+            constraint_spec=constraint_spec,
+        )
+        ctx = _RequestContext(
+            request=request,
+            stream=stream,
+            output_parser=parser,
+            worker_release_ack=worker_release_ack,
+        )
+        self._request_contexts[request_id] = ctx
+        self._publish_outputs([first_output], release_worker=False)
+        if first_output.finished:
+            # Publication can also finish the first token through a stop
+            # string. No Decode execution was scheduled; externally reserved
+            # state still needs its owner's explicit release, not a fake ACK.
+            ctx.worker_release_done.set()
+        async with contextlib.aclosing(self._iterate_request_output(ctx)) as outputs:
+            async for output in outputs:
+                yield output
+
     def _schedule_worker_free(self, request_id: str) -> None:
         """Queue a request id for worker-side release on the next StepCommand.
 
@@ -540,6 +803,16 @@ class ReplicaEngineCore:
         """
         if request_id not in self._pending_free_ids:
             self._pending_free_ids.append(request_id)
+
+    def _acknowledge_worker_frees(self, request_ids: Sequence[str]) -> None:
+        """Publish worker FIFO release acknowledgements to request producers."""
+        for request_id in request_ids:
+            context = self._request_contexts.get(request_id)
+            if context is not None:
+                context.worker_release_done.set()
+                receipt = getattr(context, "worker_release_ack", None)
+                if receipt is not None:
+                    receipt.set()
 
     async def _engine_loop(self) -> None:
         """Pipelined schedule/execute loop.
@@ -565,8 +838,15 @@ class ReplicaEngineCore:
 
             if self._batch_queue:
                 # Block on the oldest in-flight step when the queue is full, or
-                # when we could not dispatch anything new this iteration.
-                if len(self._batch_queue) >= self._max_in_flight or not dispatched:
+                # when we could not dispatch anything new this iteration.  A
+                # request's initialization step must also complete before
+                # steady-state pipelining begins.
+                oldest_step_id = self._batch_queue[0][0]
+                if (
+                    len(self._batch_queue) >= self._max_in_flight
+                    or not dispatched
+                    or oldest_step_id in self._initialization_steps
+                ):
                     applied = await self._await_and_apply_oldest()
                     if not applied:
                         continue
@@ -585,7 +865,9 @@ class ReplicaEngineCore:
         in-flight), False if the scheduler produced nothing.
         """
         with profile_span("scheduler.schedule", cat="scheduler"):
-            scheduler_output = self.scheduler.schedule()
+            scheduler_output = self.scheduler.schedule(
+                allow_reject_stalled=not self._batch_queue
+            )
         for request_id, reason in scheduler_output.rejected_requests.items():
             logger.warning("request %s rejected during scheduling: %s", request_id, reason)
             ctx = self._request_contexts.get(request_id)
@@ -603,16 +885,38 @@ class ReplicaEngineCore:
 
         finished_ids = self._pending_free_ids.copy()
         self._pending_free_ids.clear()
+        requires_initial_step = any(
+            scheduled.request.requires_initial_step
+            and scheduled.request.request_id not in self._worker_known_req_ids
+            for scheduled in scheduler_output.scheduled_requests
+        )
         self._step_counter += 1
         with profile_span(
             "scheduler.queue_worker_step",
             cat="scheduler",
             args={"scheduled": len(scheduler_output.scheduled_requests)},
         ):
-            step_cmd = self._build_step_command(
-                scheduler_output, finished_ids, step_id=self._step_counter
-            )
-            self._input_queue.put(encode_command(step_cmd))
+            try:
+                step_cmd = self._build_step_command(
+                    scheduler_output, finished_ids, step_id=self._step_counter
+                )
+                encoded = encode_command(step_cmd)
+            except Exception:
+                # Nothing reached the worker: release pre-dispatch read pins.
+                for scheduled in scheduler_output.scheduled_requests:
+                    self.scheduler.discard_scheduled_request(scheduled)
+                raise
+            self._input_queue.put(encoded)
+        reregistered_ids = {
+            request.request_id for request in step_cmd.new_requests
+        }
+        release_only_ids = tuple(
+            request_id
+            for request_id in finished_ids
+            if request_id not in reregistered_ids
+        )
+        if release_only_ids:
+            self._worker_free_ids_by_step[self._step_counter] = release_only_ids
 
         stat_logger = getattr(self, "_stat_logger", None)
         if stat_logger is not None:
@@ -628,6 +932,10 @@ class ReplicaEngineCore:
         self.scheduler.advance_after_schedule(scheduler_output)
 
         self._batch_queue.append((self._step_counter, scheduler_output))
+        if requires_initial_step:
+            if not hasattr(self, "_initialization_steps"):
+                self._initialization_steps = set()
+            self._initialization_steps.add(self._step_counter)
         return True
 
     async def _await_and_apply_oldest(self) -> bool:
@@ -639,13 +947,17 @@ class ReplicaEngineCore:
         oldest dispatched step is the next result off the output queue.
         """
         step_id, scheduler_output = self._batch_queue.popleft()
+        getattr(self, "_initialization_steps", set()).discard(step_id)
+        finished_ids = getattr(self, "_worker_free_ids_by_step", {}).pop(
+            step_id, ()
+        )
         try:
             with profile_span("scheduler.wait_worker_output", cat="scheduler"):
                 raw_output = await self._get_live_result()
         except queue.Empty:
             logger.error(f"Worker response timed out ({self._step_timeout:g}s)")
             # Timeout: the failed step's own result is still in transit.
-            self._handle_step_error(step_id, scheduler_output, result_pending=True)
+            self._handle_step_error(step_id, scheduler_output, result_pending=True, finished_ids=finished_ids)
             return False
 
         step_result = decode_result(raw_output)
@@ -657,13 +969,15 @@ class ReplicaEngineCore:
                 "Pipeline desync: expected step_id=%d, got %d; aborting batch",
                 step_id, step_result.step_id,
             )
-            self._handle_step_error(step_id, scheduler_output, result_pending=False)
+            self._handle_step_error(step_id, scheduler_output, result_pending=False, finished_ids=finished_ids)
             return False
         if step_result.error:
             logger.error(f"Worker returned error: {step_result.error}")
             # This step's result was just consumed; only in-flight steps pend.
-            self._handle_step_error(step_id, scheduler_output, result_pending=False)
+            self._handle_step_error(step_id, scheduler_output, result_pending=False, finished_ids=finished_ids)
             return False
+
+        self._acknowledge_worker_frees(finished_ids)
 
         # Unwrap list[int] values back to int | list[int] for update_from_output.
         new_tokens: dict[str, int | list[int]] = {
@@ -704,8 +1018,8 @@ class ReplicaEngineCore:
     ) -> StepCommand:
         """Build a lightweight StepCommand from the scheduler output.
 
-        Prompt tokens for requests that the worker has not yet seen are shipped
-        as ``NewRequestData`` entries exactly once; subsequent steps carry only
+        Prefill tokens for each worker registration, including committed tokens
+        after preemption, are shipped once as ``NewRequestData``. Later steps carry only
         per-request deltas (~1 KB total at batch 16).
 
         In async mode a decode input token for step N+1 may not be sampled yet
@@ -728,20 +1042,39 @@ class ReplicaEngineCore:
 
             # Register with worker the first time this request is scheduled.
             if req_id not in self._worker_known_req_ids:
+                context = self._request_contexts.get(req_id)
+                release_done = getattr(context, "worker_release_done", None)
+                if release_done is not None:
+                    # A preempted request may release and re-register in this
+                    # same FIFO command.  Its old-incarnation acknowledgement
+                    # must not satisfy the eventual terminal release barrier.
+                    release_done.clear()
+                receipt = getattr(context, "worker_release_ack", None)
+                if receipt is not None:
+                    receipt.clear()
                 new_requests.append(NewRequestData(
                     request_id=req_id,
-                    prompt_token_ids=list(req.prompt_token_ids),
+                    prompt_token_ids=list(req.prefill_token_ids),
                     temperature=req.temperature,
                     top_p=req.top_p,
                     top_k=req.top_k,
                     seed=req.seed,
+                    min_tokens=req.min_tokens,
+                    eos_token_id=req.eos_token_id,
+                    eos_token_ids=req.eos_token_ids,
+                    initial_output_tokens=len(req.output_token_ids),
+                    constraint_spec=req.constraint_spec.to_wire() if req.constraint_spec else None,
+                    initialize_from_cache=req.requires_initial_step,
+                    initial_output_token_ids=(
+                        (int(req.output_token_ids[0]),) if req.requires_initial_step else ()
+                    ),
                 ))
                 self._worker_known_req_ids.add(req_id)
 
             if sr.is_prefill:
                 num_computed = sr.num_computed_tokens
                 num_new = sr.num_new_tokens
-                chunk_tokens = req.prompt_token_ids[num_computed: num_computed + num_new]
+                chunk_tokens = req.prefill_token_ids[num_computed: num_computed + num_new]
                 prefill_requests.append(PrefillRequest(
                     request_id=req_id,
                     chunk_tokens=list(chunk_tokens),
@@ -752,6 +1085,10 @@ class ReplicaEngineCore:
                         for name, block_ids in sr.block_ids_by_group.items()
                     },
                     cache_partition=sr.cache_partition,
+                    read_block_ids_by_group=sr.read_block_ids_by_group,
+                    checkpoint_ends=sr.checkpoint_plan.boundaries if sr.checkpoint_plan else (),
+                    state_write_block_ids_by_group=sr.checkpoint_plan.write_blocks if sr.checkpoint_plan else {},
+                    checkpoint_block_ids_by_group=sr.checkpoint_plan.publication_blocks if sr.checkpoint_plan else {},
                 ))
             else:
                 output_ids = req.output_token_ids
@@ -821,17 +1158,28 @@ class ReplicaEngineCore:
             finished_request_ids=finished_ids,
             step_id=self._step_counter,
         )
-        self._input_queue.put(encode_command(cleanup_cmd))
         try:
+            self._input_queue.put(encode_command(cleanup_cmd))
             # Drains any stale results from previously-discarded steps first, so
             # the cleanup reply is not confused with a leftover in-transit result.
             raw_output = await self._get_live_result()
+            step_result = decode_result(raw_output)
+            if step_result.step_id != cleanup_cmd.step_id:
+                raise RuntimeError("Worker cleanup response ordering mismatch")
+            if step_result.error:
+                raise RuntimeError(step_result.error)
         except queue.Empty:
-            logger.error(f"Worker cleanup-step timed out ({self._step_timeout:g}s)")
+            self._discard_result_step_ids.add(cleanup_cmd.step_id)
+            logger.error("Worker cleanup-step timed out (%gs)", self._step_timeout)
+        except Exception:
+            logger.exception("Worker cleanup-step failed")
+        else:
+            self._acknowledge_worker_frees(finished_ids)
             return
-        step_result = decode_result(raw_output)
-        if step_result.error:
-            logger.error(f"Worker cleanup-step returned error: {step_result.error}")
+        # Release is idempotent. Preserve IDs until a positive ACK; a late
+        # timeout reply is drained before the next attempt is acknowledged.
+        for request_id in finished_ids:
+            self._schedule_worker_free(request_id)
 
     def _handle_step_error(
         self,
@@ -839,6 +1187,7 @@ class ReplicaEngineCore:
         scheduler_output: SchedulerOutput,
         *,
         result_pending: bool = True,
+        finished_ids: Sequence[str] = (),
     ) -> None:
         """On worker error/timeout, abort all requests in the failed batch.
 
@@ -856,12 +1205,17 @@ class ReplicaEngineCore:
         failed step's result is still coming.
         """
         failed_batches = [scheduler_output]
+        for request_id in finished_ids:
+            self._schedule_worker_free(request_id)
         if result_pending:
             self._discard_result_step_ids.add(failed_step_id)
         # Any remaining in-flight batches depend on the failed step; drop them.
         # Their results are still in transit and must be drained.
         while self._batch_queue:
             sid, batch = self._batch_queue.popleft()
+            getattr(self, "_initialization_steps", set()).discard(sid)
+            for request_id in getattr(self, "_worker_free_ids_by_step", {}).pop(sid, ()):
+                self._schedule_worker_free(request_id)
             self._discard_result_step_ids.add(sid)
             failed_batches.append(batch)
 
@@ -873,8 +1227,9 @@ class ReplicaEngineCore:
                 if request_id in seen:
                     continue
                 seen.add(request_id)
-                ctx = self._request_contexts.pop(request_id, None)
-                if ctx is not None:
+                ctx = self._request_contexts.get(request_id)
+                if ctx is not None and not getattr(ctx, "terminal_output_queued", False):
+                    ctx.terminal_output_queued = True
                     ctx.queue.put_nowait(
                         TokenOutput(finished=True, finish_reason="error")
                     )
@@ -929,22 +1284,38 @@ class ReplicaEngineCore:
             )
             stat_logger.record_iteration(engine_index, iteration)
         self._record_scheduler_stats()
+
+        self._publish_outputs(request_outputs)
+
+    def _publish_outputs(self, request_outputs, *, release_worker=True):
+        stat_logger = getattr(self, "_stat_logger", None)
+        engine_index = getattr(self, "_engine_index", 0)
         for req_output in request_outputs:
+            if req_output.prefill_finished:
+                continue
             ctx = self._request_contexts.get(req_output.request_id)
             if ctx is None:
                 continue
 
+            if req_output.num_output_tokens is not None:
+                output_count = req_output.num_output_tokens
+            else:
+                output_count = len(ctx.request.output_token_ids)
             previous_text = ctx.detok_text
-            text = self._detokenize_incrementally(ctx)
+            text = self._detokenize_incrementally(ctx, end_offset=output_count)
             text_delta = (
                 text[len(previous_text) :]
                 if text.startswith(previous_text)
                 else ""
             )
 
-            if not req_output.finished and ctx.request.stop_strings:
+            if (req_output.new_token_id is not None
+                    and (not req_output.finished or req_output.finish_reason == "FINISHED_LENGTH")
+                    and ctx.request.stop_strings
+                    and output_count > ctx.request.min_tokens):
                 for stop in ctx.request.stop_strings:
                     if stop and text.endswith(stop):
+                        del ctx.request.output_token_ids[output_count:]
                         req_output.finished = True
                         req_output.finish_reason = "FINISHED_STOP"
                         self.scheduler.finish_request(
@@ -957,7 +1328,7 @@ class ReplicaEngineCore:
                 stat_logger.record_output(
                     engine_index,
                     req_output.request_id,
-                    completion_tokens=len(ctx.request.output_token_ids),
+                    completion_tokens=output_count,
                 )
 
             if req_output.finished:
@@ -967,7 +1338,8 @@ class ReplicaEngineCore:
                 # forever. A one-shot full decode at finish guarantees the final
                 # text matches the offline baseline instead of being truncated.
                 text = self._finalize_detokenization(ctx)
-                self._schedule_worker_free(req_output.request_id)
+                if release_worker:
+                    self._schedule_worker_free(req_output.request_id)
 
             # Stop detection above operates on the original generated text.
             # Semantic parsing only changes the public presentation channels.
@@ -979,10 +1351,10 @@ class ReplicaEngineCore:
                 try:
                     truncated = req_output.finish_reason in ("FINISHED_LENGTH", "FINISHED_ABORTED")
                     if ctx.stream:
-                        parser_text_delta = self._detokenize_parser_incrementally(ctx)
+                        parser_text_delta = self._detokenize_parser_incrementally(ctx, end_offset=output_count)
                         token_ids = ctx.request.output_token_ids
-                        delta_token_ids = token_ids[ctx.parser_token_offset :]
-                        ctx.parser_token_offset = len(token_ids)
+                        delta_token_ids = token_ids[ctx.parser_token_offset : output_count]
+                        ctx.parser_token_offset = output_count
                         parsed = ctx.output_parser.feed(
                             parser_text_delta,
                             delta_token_ids,
@@ -1037,7 +1409,8 @@ class ReplicaEngineCore:
                     self._request_contexts.pop(req_output.request_id, None)
                     ctx.queue.put_nowait(exc)
                     self.scheduler.abort_request(req_output.request_id)
-                    self._schedule_worker_free(req_output.request_id)
+                    if release_worker:
+                        self._schedule_worker_free(req_output.request_id)
                     if stat_logger is not None:
                         stat_logger.finish_request(engine_index, req_output.request_id, "error")
                     self._record_scheduler_stats()
@@ -1070,7 +1443,7 @@ class ReplicaEngineCore:
                 finished=req_output.finished,
                 finish_reason=req_output.finish_reason,
                 prompt_tokens=ctx.request.num_prompt_tokens,
-                completion_tokens=len(ctx.request.output_token_ids),
+                completion_tokens=output_count,
                 token_ids=(
                     tuple(ctx.request.output_token_ids)
                     if req_output.finished
@@ -1078,12 +1451,14 @@ class ReplicaEngineCore:
                 ),
             )
             if req_output.finished:
-                # Final output owns the already-scheduled worker release. Drop
-                # the context before waking a consumer that may close at once.
-                self._request_contexts.pop(req_output.request_id, None)
+                # Keep the context until the worker acknowledges its release;
+                # otherwise the terminal consumer cannot observe the barrier.
+                ctx.terminal_output_queued = True
             ctx.queue.put_nowait(token_output)
 
-    def _detokenize_incrementally(self, ctx: _RequestContext) -> str:
+    def _detokenize_incrementally(
+        self, ctx: _RequestContext, *, end_offset: int | None = None
+    ) -> str:
         """Decode only the newly-completed text and append it to the running text.
 
         O(1) amortized per step (bounded decode window) instead of re-decoding
@@ -1101,10 +1476,13 @@ class ReplicaEngineCore:
             prefix_offset=ctx.detok_prefix_offset,
             read_offset=ctx.detok_read_offset,
             skip_special_tokens=True,
+            end_offset=end_offset,
         )
         return ctx.detok_text
 
-    def _detokenize_parser_incrementally(self, ctx: _RequestContext) -> str:
+    def _detokenize_parser_incrementally(
+        self, ctx: _RequestContext, *, end_offset: int | None = None
+    ) -> str:
         """Return newly released raw text for one stateful output parser."""
         (
             _,
@@ -1117,6 +1495,7 @@ class ReplicaEngineCore:
             prefix_offset=ctx.parser_detok_prefix_offset,
             read_offset=ctx.parser_detok_read_offset,
             skip_special_tokens=False,
+            end_offset=end_offset,
         )
         if delta:
             ctx.parser_detok_parts.append(delta)
@@ -1130,13 +1509,16 @@ class ReplicaEngineCore:
         prefix_offset: int,
         read_offset: int,
         skip_special_tokens: bool,
+        end_offset: int | None = None,
     ) -> tuple[str, int, int, str]:
         """Advance one bounded-context detokenizer and return its text delta."""
         if not output_ids:
             return text, prefix_offset, read_offset, ""
 
+        if end_offset is None:
+            end_offset = len(output_ids)
         prefix_ids = output_ids[prefix_offset:read_offset]
-        new_ids = output_ids[prefix_offset:]
+        new_ids = output_ids[prefix_offset:end_offset]
 
         def decode(token_ids: Sequence[int]) -> str:
             if skip_special_tokens:
@@ -1153,7 +1535,7 @@ class ReplicaEngineCore:
 
         delta = new_text[len(prefix_text) :]
         text += delta
-        read_offset = len(output_ids)
+        read_offset = end_offset
         prefix_offset = max(0, read_offset - 3)
         return text, prefix_offset, read_offset, delta
 
@@ -1198,27 +1580,109 @@ class ReplicaEngineCore:
         )
         return delta
 
-    def _shutdown_worker(self, *, timeout: float) -> None:
+    def _shutdown_worker(self, *, timeout: float) -> bool:
+        """Stop the worker and reap it. Returns whether it is really gone.
+
+        Three stages, each escalating once rather than repeating itself: ask the
+        worker to stop, SIGTERM, SIGKILL. Re-sending a signal buys nothing --
+        one already pending is not queued twice, and a worker blocked in an
+        uninterruptible device call is no more reachable by the second than by
+        the first -- so what is repeated is the waiting, not the signal.
+
+        Returning before the worker is reaped is what strands device memory: the
+        HTTP endpoint closes with this process, so from the outside the replica
+        looks stopped while its cards are still held, and whatever is launched
+        onto them next fails for want of memory. If even SIGKILL leaves it
+        alive, that is reported rather than passed off as a clean stop.
+        """
         input_q = self._input_queue
         process = self._worker_process
-
-        if input_q is not None:
-            with contextlib.suppress(Exception):
-                # New protocol: send encoded ShutdownCommand bytes.
-                input_q.put(encode_command(ShutdownCommand()))
-
-        if process is not None:
-            with contextlib.suppress(Exception):
-                process.join(timeout=timeout)
-            with contextlib.suppress(Exception):
-                if process.is_alive():
-                    process.terminate()
-                    process.join(timeout=1)
-
         self._worker_process = None
         self._input_queue = None
         self._output_queue = None
         self._profile_output_queue = None
+
+        if process is None:
+            # Not necessarily "nothing to do": a worker that survived an earlier
+            # stop left its handle cleared behind it. start() shuts the worker
+            # down when initialization fails and the caller then calls stop(),
+            # so the second call must not call devices reclaimed that the first
+            # one could not reclaim.
+            return not self._worker_stranded
+
+        if input_q is not None:
+            with contextlib.suppress(Exception):
+                # Cooperative first: the worker closes its own device context.
+                input_q.put(encode_command(ShutdownCommand()))
+            if self._reap(process, timeout):
+                return True
+
+        with contextlib.suppress(Exception):
+            process.terminate()
+        if self._reap(process, WORKER_TERM_GRACE_SECONDS):
+            return True
+
+        with contextlib.suppress(Exception):
+            process.kill()
+        if self._reap(process, WORKER_KILL_GRACE_SECONDS):
+            return True
+
+        self._worker_stranded = True
+        logger.error(
+            "Worker process %s survived SIGKILL; device(s) %s may still be held. It is most "
+            "likely stuck in an uninterruptible device call, which no further signal can "
+            "reach -- the cards do not come back until it does",
+            getattr(process, "pid", "?"),
+            ",".join(str(device) for device in self.config.device_ids) or self.config.device_id,
+        )
+        return False
+
+    async def _drain_loop_task(self) -> None:
+        """Let the engine loop finish, but never wait on it to stop the worker.
+
+        Two ways this used to skip the stop entirely. A loop that raised -- and
+        nothing retrieves that exception, as is_ready() already notes -- made
+        `await self._loop_task` re-raise here, so the worker was never sent a
+        command, never signalled, and kept its devices while the parent exited.
+        And a loop still parked in a worker read does not come back for as long
+        as that read is allowed to take, which is not the shutdown's budget.
+
+        Neither is worth waiting for, and the stop no longer depends on it.
+
+        What this does not fix is the process exit. A read already dispatched
+        to the default executor keeps that thread parked -- mp.Queue.get() does
+        not wake because its writer died -- and asyncio.run() joins the default
+        executor on the way out, so the process can linger for the rest of
+        SERVING_WORKER_STEP_TIMEOUT after a stop whose stages are all bounded.
+        Its worker is reaped by then, so no device memory is held, but a
+        broker-managed launch keeps its allocation until the process is gone.
+        Closing that needs the worker read off the default executor, which is
+        the hot path and belongs in its own change.
+        """
+        task, self._loop_task = self._loop_task, None
+        if task is None:
+            return
+        done, _pending = await asyncio.wait({task}, timeout=LOOP_DRAIN_GRACE_SECONDS)
+        if task not in done:
+            logger.warning(
+                "Engine loop still running %.0fs into shutdown; stopping the worker anyway",
+                LOOP_DRAIN_GRACE_SECONDS,
+            )
+            # Best effort. A read already dispatched to a thread cannot be
+            # cancelled, so this only stops the loop from starting another one.
+            task.cancel()
+            return
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("Engine loop failed before shutdown: %s", task.exception())
+
+    @staticmethod
+    def _reap(process, timeout: float) -> bool:
+        """Wait out one stage, and say whether the worker is gone."""
+        with contextlib.suppress(Exception):
+            process.join(timeout=timeout)
+        with contextlib.suppress(Exception):
+            return not process.is_alive()
+        return False
 
 
 class AsyncLLMEngine:
@@ -1298,9 +1762,31 @@ class AsyncLLMEngine:
             await self.stop()
             raise
 
-    async def stop(self) -> None:
-        """Stop all DP engine cores."""
-        await asyncio.gather(*(core.stop() for core in reversed(self._cores)))
+    async def stop(self) -> bool:
+        """Stop all DP engine cores. False if a worker could not be reaped."""
+        # return_exceptions: without it one core's failure propagates before its
+        # siblings have finished, leaving their workers unsignalled on their
+        # devices -- the opposite of what stopping is for.
+        results = await asyncio.gather(
+            *(core.stop() for core in reversed(self._cores)), return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        for failure in failures:
+            logger.error("Stopping a replica core failed: %s", failure)
+        # ``is False`` rather than falsy: a core that reports nothing is not a
+        # core that reported a failure. A core that raised is counted too -- what
+        # became of its worker is exactly what it could not tell us.
+        stranded = sum(1 for result in results if result is False) + len(failures)
+        if stranded:
+            logger.error(
+                "%d of %d worker(s) could not be reaped; their device(s) are still held",
+                stranded, len(results),
+            )
+        return not stranded
+
+    def is_ready(self) -> bool:
+        """Report whether every replica core can still serve requests."""
+        return bool(self._cores) and all(core.is_ready() for core in self._cores)
 
     async def start_profile(self) -> None:
         """Start SA profiling in every replica worker."""
@@ -1390,11 +1876,15 @@ class AsyncLLMEngine:
 
     @property
     def scheduler(self) -> Scheduler:
-        return self._single_core().scheduler
+        return self.single_core().scheduler
 
     @property
     def kv_cache_manager(self) -> KvCacheManager:
-        return self._single_core().kv_cache_manager
+        return self.single_core().kv_cache_manager
+
+    def validate_generate_config(self, config) -> None:
+        """Validate sampling before admission or HTTP streaming headers."""
+        self.config.validate_generate_config(config)
 
     async def add_request(
         self,
@@ -1403,7 +1893,9 @@ class AsyncLLMEngine:
         config,
         *,
         output_parser_spec: OutputParserSpec | None = None,
+        constraint_spec: ConstraintSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
+        self.validate_generate_config(config)
         arrival_monotonic = time.monotonic()
         replica_idx = self._select_replica()
         prompt_token_ids = self._tokenize_prompt(prompt)
@@ -1432,23 +1924,19 @@ class AsyncLLMEngine:
         terminal_output_seen = False
         try:
             core = self._cores[replica_idx]
-            if output_parser_spec is None:
-                outputs = core.add_request(
-                    request_id,
-                    prompt,
-                    config,
-                    on_queued=clear_route_extra_load,
-                    prompt_token_ids=prompt_token_ids,
-                )
-            else:
-                outputs = core.add_request(
-                    request_id,
-                    prompt,
-                    config,
-                    on_queued=clear_route_extra_load,
-                    prompt_token_ids=prompt_token_ids,
-                    output_parser_spec=output_parser_spec,
-                )
+            request_options = {}
+            if output_parser_spec is not None:
+                request_options["output_parser_spec"] = output_parser_spec
+            if constraint_spec is not None:
+                request_options["constraint_spec"] = constraint_spec
+            outputs = core.add_request(
+                request_id,
+                prompt,
+                config,
+                on_queued=clear_route_extra_load,
+                prompt_token_ids=prompt_token_ids,
+                **request_options,
+            )
             async with contextlib.aclosing(outputs):
                 async for output in outputs:
                     if not self._core_records_metrics[replica_idx]:
@@ -1498,7 +1986,7 @@ class AsyncLLMEngine:
         self._route_counter = (replica_idx + 1) % replica_count
         return replica_idx
 
-    def _single_core(self):
+    def single_core(self):
         if len(self._cores) != 1:
             raise AttributeError("scheduler and kv_cache_manager are only exposed for single-replica engines")
         return self._cores[0]

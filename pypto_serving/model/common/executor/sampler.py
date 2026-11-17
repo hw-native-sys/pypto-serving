@@ -30,6 +30,9 @@ class Sampler:
     ) -> int:
         """Sample one token ID from logits using the supplied sampling params."""
         logits = self._sanitize_logits(logits)
+        if params.forbidden_token_ids:
+            logits = logits.clone()
+            logits[list(params.forbidden_token_ids)] = float("-inf")
         if params.temperature <= 0.0:
             return self._greedy_token(logits)
 
@@ -95,6 +98,12 @@ class Sampler:
             width = min(width, params.top_k)
         values = self._sanitize_logits(values[:width])
         token_ids = token_ids[:width]
+        if params.forbidden_token_ids:
+            allowed = ~torch.isin(token_ids, torch.tensor(params.forbidden_token_ids, device=token_ids.device))
+            if not allowed.any():
+                raise ValueError("sampling candidates contain no allowed tokens")
+            values = values[allowed]
+            token_ids = token_ids[allowed]
         if params.temperature <= 0.0:
             return int(token_ids[self._greedy_token(values)].item())
 

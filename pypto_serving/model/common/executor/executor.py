@@ -35,6 +35,10 @@ class ModelExecutor(ABC):
         """Store the KV cache manager shared with the engine (optional for serving path)."""
         self._kv_cache_manager = kv_cache_manager
 
+    def cache_group_sizes(self, model_id: str) -> dict[str, int]:
+        """Report independently planned pools, or use primary-pool scaling."""
+        return {}
+
     @property
     def supports_device_sampling(self) -> bool:
         """Return whether executor results may include already-sampled token IDs."""
@@ -137,6 +141,54 @@ class ModelExecutor(ABC):
         """Return whether dispatch still needs the prior host-sampled token."""
         return True
 
+    @property
+    def supports_async_prefill_reclaim(self) -> bool:
+        return False
+
+    @property
+    def prefill_tail_requires_reclaim_before_dispatch(self) -> bool:
+        return False
+
+    def prepare_prefill(self, model: RuntimeModel, batch: PrefillBatch, *, buffer_slot: int) -> object:
+        raise NotImplementedError(f"{type(self).__name__} does not support async prefill preparation")
+
+    def dispatch_prepared_prefill(self, model: RuntimeModel, batch: PrefillBatch, prepared: object) -> object:
+        raise NotImplementedError(f"{type(self).__name__} does not support split prefill dispatch")
+
+    def reclaim_prepared_prefill(self, pending: object) -> PrefillResult:
+        raise NotImplementedError(f"{type(self).__name__} does not support split prefill reclaim")
+
+    def run_prefill_in_slot(
+        self, model: RuntimeModel, batch: PrefillBatch, *, buffer_slot: int,
+    ) -> PrefillResult:
+        raise NotImplementedError(f"{type(self).__name__} does not support owned prefill slots")
+
+    def run_dspark_prefill_batch(self, batch: PrefillBatch) -> object:
+        """Run a pre-lowered DSpark bootstrap batch.
+
+        Model-specific serving integrations may expose this hook when a batch
+        carries the complete lib composite ABI in ``dspark_stages``.  The
+        default keeps ordinary executors from accidentally accepting a DSpark
+        payload without implementing its state ownership.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support DSpark prefill")
+
+    def lower_dspark_prefill_batch(
+        self,
+        model: RuntimeModel,
+        batch: PrefillBatch,
+        *,
+        request_ids,
+        sampled_token_ids,
+    ) -> object:
+        """Return a complete DSpark prefill payload for a terminal batch.
+
+        Only model-specific executors with a serving-owned lowering provider
+        implement this hook.  The worker must never synthesize an empty stage
+        list as a fallback.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support DSpark lowering")
+
     def lookup_embeddings(self, model: RuntimeModel, token_ids: torch.Tensor) -> torch.Tensor:
         """Return embedding rows for ``token_ids`` on the model runtime device."""
         token_ids = token_ids.to(device=model.runtime.device, dtype=torch.long)
@@ -197,3 +249,13 @@ class ModelExecutor(ABC):
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
         """Run one decode step for active requests and return next-token logits."""
         raise NotImplementedError
+
+    def run_dspark_decode_batch(self, batch: DecodeBatch) -> DecodeResult:
+        """Run a pre-lowered DSpark target/accept/draft/Markov round."""
+        raise NotImplementedError(f"{type(self).__name__} does not support DSpark decode")
+
+    def lower_dspark_decode_batch(
+        self, model: RuntimeModel, batch: DecodeBatch,
+    ) -> object:
+        """Return a complete DSpark decode payload for one serving batch."""
+        raise NotImplementedError(f"{type(self).__name__} does not support DSpark lowering")

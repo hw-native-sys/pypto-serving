@@ -14,15 +14,19 @@ from queue import Queue
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from pypto_serving.serving.engine.async_engine import (
     ReplicaEngineCore,
 )
+from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.sched.scheduler import (
     Request,
     RequestStatus,
     ScheduledRequest,
+    Scheduler,
+    SchedulerConfig,
     SchedulerOutput,
 )
 from pypto_serving.serving.server import serving_worker
@@ -45,11 +49,14 @@ from ..device_sampling_fakes import _FixedSampler, _ImmediateEosExecutor, _model
 
 def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._request_contexts = {}
     core._worker_known_req_ids = {"req"}
     request = Request(
         request_id="req",
         prompt_token_ids=[1, 2],
-        max_new_tokens=1,
+        max_new_tokens=4,
+        output_token_ids=[7, 8],
+        num_replay_tokens=2,
         status=RequestStatus.RUNNING,
     )
     scheduled = ScheduledRequest(
@@ -58,6 +65,7 @@ def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
         is_prefill=True,
         block_ids_by_group={"ori": [3, 4], "state": [5]},
         cache_partition=2,
+        read_block_ids_by_group={"state": {1023: 19, 1024: 7}},
     )
     output = SchedulerOutput(scheduled_requests=[scheduled])
 
@@ -66,11 +74,106 @@ def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
 
     assert [item.request_id for item in decoded.new_requests] == ["req"]
     assert decoded.finished_request_ids == ["req"]
+    assert decoded.new_requests[0].prompt_token_ids == [1, 2, 7, 8]
+    assert decoded.new_requests[0].initial_output_tokens == 2
     assert decoded.prefill_requests[0].block_ids_by_group == {
         "ori": [3, 4],
         "state": [5],
     }
     assert decoded.prefill_requests[0].cache_partition == 2
+    assert decoded.prefill_requests[0].read_block_ids_by_group == {"state": {1023: 19, 1024: 7}}
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_worker_replays_committed_context_without_resampling_intermediate_chunks(async_scheduling):
+    manager = KvCacheManager(num_blocks=8, block_size=1, enable_prefix_cache=False)
+    scheduler = Scheduler(SchedulerConfig(
+        enable_prefix_cache=False, max_num_running_reqs=1,
+        max_num_scheduled_tokens=2, max_prefill_tokens_per_request=2,
+        long_prefill_token_threshold=2, max_seq_len=16,
+        async_scheduling=async_scheduling,
+    ), manager)
+    released = []
+
+    class ReplayExecutor(_ImmediateEosExecutor):
+        def release_finished_requests(self, request_ids):
+            released.extend(request_ids)
+
+    model = _model(max_batch_size=1, page_size=1, eos_token_id=0)
+    executor = ReplayExecutor(manager)
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
+    worker.executor = executor
+    worker.sampler = _FixedSampler(token_id=7)
+    worker.model_record = SimpleNamespace(config=model.config, runtime_model=model)
+    worker._req_cache = {}
+    worker._last_tokens = {}
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core._request_contexts = {}
+    core._worker_known_req_ids = set()
+    request = Request("replay", [1, 2], max_new_tokens=2, min_tokens=2, eos_token_id=0)
+    scheduler.add_request(request)
+
+    initial = scheduler.schedule()
+    initial_cmd = core._build_step_command(initial, finished_ids=[])
+    if async_scheduling:
+        scheduler.advance_after_schedule(initial)
+    initial_result = worker._run_step_command(decode_command(encode_command(initial_cmd)), None)
+    assert initial_result.error is None
+    scheduler.update_from_output(initial, initial_result.new_tokens)
+    assert request.output_token_ids == [7]
+
+    if async_scheduling:
+        stale = scheduler.schedule()
+        stale_cmd = core._build_step_command(stale, finished_ids=[])
+        scheduler.advance_after_schedule(stale)
+        worker.sampler.token_id = 8
+        stale_result = worker._run_step_command(stale_cmd, None)
+        assert stale_result.error is None and stale_result.new_tokens == {"replay": [8]}
+        assert worker._stop_token_mask("replay") is None
+    victim = scheduler._preempt_lowest_priority(Request("other", [3], 1), set(), {}, SchedulerOutput())
+    assert victim is not None and victim["request"] is request
+    if async_scheduling:
+        assert scheduler.update_from_output(stale, stale_result.new_tokens) == []
+    assert request.output_token_ids == [7]
+
+    first = scheduler.schedule()
+    first_cmd = core._build_step_command(first, finished_ids=["replay"])
+    if async_scheduling:
+        scheduler.advance_after_schedule(first)
+        terminal = scheduler.schedule()
+        scheduler.advance_after_schedule(terminal)
+    first_result = worker._run_step_command(decode_command(encode_command(first_cmd)), None)
+    assert first_result.error is None and first_result.new_tokens == {}
+    assert released == ["replay"]
+    assert worker._req_cache["replay"].prompt_token_ids == [1, 2, 7]
+    assert worker._accepted_output_lengths["replay"] == 1
+    assert worker._last_tokens == {}
+    assert worker._sampling_params("replay").forbidden_token_ids == (0,)
+    assert worker.sampler.sample_calls == (2 if async_scheduling else 1)
+    assert executor.finalized_prefills == [(["replay"], [7])]
+    assert scheduler.update_from_output(first, first_result.new_tokens) == []
+
+    if not async_scheduling:
+        terminal = scheduler.schedule()
+    terminal_cmd = core._build_step_command(terminal, finished_ids=[])
+    assert not terminal_cmd.new_requests
+    assert terminal_cmd.prefill_requests[0].chunk_tokens == [7]
+    if async_scheduling:
+        assert request.num_output_placeholders == 1
+    worker.sampler.token_id = 9
+    terminal_result = worker._run_step_command(decode_command(encode_command(terminal_cmd)), None)
+    assert terminal_result.error is None and terminal_result.new_tokens == {"replay": [9]}
+    resumed = scheduler.update_from_output(terminal, terminal_result.new_tokens)
+
+    assert [(item.new_token_id, item.finished) for item in resumed] == [(9, True)]
+    assert request.output_token_ids == [7, 9]
+    assert request.num_output_placeholders == 0
+    assert worker._accepted_output_lengths["replay"] == 2
+    assert worker._stop_token_mask("replay") is None
+    assert executor.prefill_batches[-1].stop_token_masks["replay"].remaining_tokens == 1
+    assert executor.finalized_prefills == [(["replay"], [7]), (["replay"], [9])]
 
 
 def test_partitioned_prefill_chunks_keep_cache_partitions_unique():
@@ -122,6 +225,8 @@ def test_partitioned_prefill_chunks_reject_oversized_request():
 
 def test_worker_uses_executor_packed_prefill_limits():
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
     worker.model_record = SimpleNamespace(runtime_model=object())
     worker.executor = SimpleNamespace(
         max_prefill_batch_size=8,
@@ -144,6 +249,8 @@ def test_worker_releases_preempted_state_before_same_command_reregistration():
     released: list[str] = []
     results: list[bytes] = []
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
     worker.executor = SimpleNamespace(release_finished_requests=released.extend)
     # __new__ bypasses __init__, which is what normally provides sampler.
     worker.sampler = None
@@ -171,6 +278,8 @@ def test_worker_releases_preempted_state_before_same_command_reregistration():
 def test_worker_release_does_not_remove_a_later_same_id_registration():
     released: list[str] = []
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
     worker.executor = SimpleNamespace(release_finished_requests=released.extend)
     old = NewRequestData("req", [0], 0.0, 1.0, None)
     replacement = NewRequestData("req", [1], 0.0, 1.0, None)
@@ -187,11 +296,75 @@ def test_worker_release_does_not_remove_a_later_same_id_registration():
     assert worker._last_tokens["req"] == [7]
 
 
+def test_constrained_worker_error_releases_matcher_and_next_request_is_healthy(monkeypatch):
+    states = []
+    released = []
+
+    class State:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class Provider:
+        def __init__(self, tokenizer, model_vocab_size):
+            assert model_vocab_size == 129280
+
+        def compile(self, spec):
+            state = State()
+            states.append(state)
+            return state
+
+    monkeypatch.setattr(serving_worker, "XGrammarProvider", Provider)
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
+    worker.executor = SimpleNamespace(release_finished_requests=released.extend)
+    worker.sampler = SimpleNamespace(release_requests=lambda ids: None)
+    worker.model_record = SimpleNamespace(tokenizer=object(), config=SimpleNamespace(vocab_size=129280))
+    worker._req_cache = {}
+    worker._last_tokens = {}
+    worker._constraint_states = {}
+    worker._xgrammar_provider = None
+    spec = ConstraintSpec(
+        provider_id="xgrammar", format_id="deepseek_v4",
+        tools=({"type": "function", "function": {"name": "shell"}},),
+        tool_choice="required", reasoning=False,
+    )
+
+    def command(request_id, *, finished=()):
+        return StepCommand(
+            new_requests=[NewRequestData(request_id, [1], 0.0, 1.0, None,
+                                         constraint_spec=spec.to_wire())] if request_id else [],
+            prefill_requests=[], decode_requests=[], finished_request_ids=list(finished),
+        )
+
+    def fail(_cmd, prepared_decode=None):
+        raise ValueError("invalid generated token")
+
+    worker._execute_step = fail
+    assert worker._run_step_command(command("failed"), None).error == "invalid generated token"
+    assert "failed" in worker._constraint_states
+    worker._execute_step = lambda cmd, prepared_decode=None: StepResult(new_tokens={})
+    assert worker._run_step_command(command(None, finished=("failed",)), None).error is None
+    assert states[0].closed
+    assert "failed" not in worker._constraint_states
+    assert "failed" not in worker._req_cache
+    assert released == ["failed"]
+
+    assert worker._run_step_command(command("next"), None).error is None
+    assert "next" in worker._constraint_states
+    assert not states[1].closed
+
+
 def test_serving_worker_packs_variable_length_prefill_chunks():
     model = _model(max_batch_size=2, eos_token_id=0)
     manager = KvCacheManager()
     executor = _ImmediateEosExecutor(manager)
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
     worker.executor = executor
     worker.sampler = _FixedSampler(token_id=0)
     worker.model_record = SimpleNamespace(config=model.config)
@@ -253,6 +426,8 @@ def test_worker_close_releases_executor_once():
 
     executor.close = close
     worker = serving_worker.WorkerProcess.__new__(serving_worker.WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
     worker.executor = executor
 
     worker.close()
@@ -262,7 +437,8 @@ def test_worker_close_releases_executor_once():
     assert worker.executor is None
 
 
-def test_worker_prepares_next_decode_while_prior_device_step_runs():
+@pytest.mark.parametrize("constrained,persistent_device_token", [(False, True), (True, True), (False, False)])
+def test_worker_prepares_next_decode_while_prior_device_step_runs(constrained, persistent_device_token):
     """MRV2 cadence: prepare and reclaim overlap the FIFO device lane."""
     model = _model(max_batch_size=1, eos_token_id=0)
     first_running = threading.Event()
@@ -274,6 +450,7 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
     allow_first_reclaim = threading.Event()
     calls: list[tuple[str, int]] = []
     released: list[str] = []
+    committed = []
 
     class Executor:
         supports_async_decode_prepare = True
@@ -285,7 +462,7 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
 
         @staticmethod
         def prepared_decode_requires_token(_prepared):
-            return False
+            return not persistent_device_token
 
         @staticmethod
         def prepare_decode(_model, batch, *, buffer_slot):
@@ -302,6 +479,12 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
         @classmethod
         def dispatch_prepared_decode(cls, _model, _batch, prepared):
             calls.append(("execute", prepared.slot))
+            if not persistent_device_token:
+                assert _batch.token_ids.tolist() == [[cls.device_token]]
+            if constrained:
+                # Planning the next mask can only see actually committed output.
+                assert committed == list(range(11, cls.device_token + 1))
+                assert "req" in _batch.constraint_states
             if len([call for call in calls if call[0] == "execute"]) == 1:
                 first_running.set()
                 assert allow_first_finish.wait(timeout=5)
@@ -329,6 +512,8 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
     input_queue: Queue = Queue()
     output_queue: Queue = Queue()
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
     worker.config = SimpleNamespace(resolve_async_scheduling=lambda: True)
     worker.input_queue = input_queue
     worker.output_queue = output_queue
@@ -341,6 +526,9 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
         "old": NewRequestData("old", [2], 0.0, 1.0, None),
     }
     worker._last_tokens = {"req": [10]}
+    if constrained:
+        worker._req_cache["req"].constraint_spec = {"provider_id": "xgrammar"}
+        worker._constraint_states = {"req": SimpleNamespace(accept=committed.extend)}
 
     first = StepCommand(
         new_requests=[],
@@ -376,10 +564,13 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
     assert released == []
     allow_first_finish.set()
 
-    # N+1 is fully bound by prepare, so its device dispatch is not held behind
-    # N's host-side output processing.
+    # Persistent-token dispatch can overlap reclaim. Host-token dispatch waits
+    # until reclaim publishes the token that late binding needs.
     assert first_reclaim_running.wait(timeout=5)
-    assert second_dispatched.wait(timeout=5)
+    if constrained or not persistent_device_token:
+        assert not second_dispatched.wait(timeout=0.1)
+    else:
+        assert second_dispatched.wait(timeout=5)
     input_queue.put(encode_command(third))
     # Step N+2 maps back to N's slot and must not prepare until reclaim has
     # finished reading that slot's captured outputs.
@@ -387,6 +578,7 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
     assert output_queue.empty()
     allow_first_reclaim.set()
     assert third_prepared.wait(timeout=5)
+    assert second_dispatched.wait(timeout=5)
 
     first_result = decode_result(output_queue.get(timeout=5))
     second_result = decode_result(output_queue.get(timeout=5))
@@ -401,12 +593,16 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs():
     assert second_result.new_tokens == {"req": [12]}
     assert third_result.new_tokens == {"req": [13]}
     assert released == ["old"]
+    if constrained:
+        assert committed == [11, 12, 13]
     assert calls.index(("prepare", 0)) < calls.index(("execute", 0))
     assert calls.index(("execute", 0)) < calls.index(("reclaim", 0))
 
 
 def test_worker_does_not_prepare_prefill_asynchronously():
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
     command = StepCommand(
         new_requests=[],
         prefill_requests=[PrefillRequest("req", [1], 0, [])],
@@ -418,8 +614,36 @@ def test_worker_does_not_prepare_prefill_asynchronously():
     assert worker._prepare_step_command(command) is None
 
 
+def test_constrained_dispatch_binds_live_state_after_early_prepare():
+    from pypto_serving.config.types import DecodeBatch
+
+    worker = WorkerProcess.__new__(WorkerProcess)
+
+    worker._services = None
+
+    worker._batch_builder = worker._make_decode_batch
+    worker.executor = SimpleNamespace(prepared_decode_requires_token=lambda _: False)
+    worker._req_cache = {"req": NewRequestData("req", [1], 0.0, 1.0, None, constraint_spec={"active": True})}
+    live_state = object()
+    worker._constraint_states = {"req": live_state}
+    batch = DecodeBatch(
+        request_ids=["req"], token_ids=torch.tensor([[0]]), hidden_states=None,
+        seq_lens=torch.tensor([2]), constraint_states={},
+    )
+    prepared = SimpleNamespace(batch=batch, prepared=object())
+    scheduled = (DecodeRequest("req", -1, 2, []),)
+    bound = worker._late_bind_prepared_decode_batch(prepared, scheduled)
+    assert bound.constraint_states == {"req": live_state}
+    assert batch.constraint_states == {}
+    worker._constraint_states.clear()
+    with pytest.raises(RuntimeError, match="not registered"):
+        worker._late_bind_prepared_decode_batch(prepared, scheduled)
+
+
 def test_worker_does_not_prepare_host_embedding_decode_asynchronously():
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
     worker.executor = SimpleNamespace(supports_device_decode_embedding=False)
     command = StepCommand(
         new_requests=[],
@@ -432,8 +656,95 @@ def test_worker_does_not_prepare_host_embedding_decode_asynchronously():
     assert worker._prepare_step_command(command) is None
 
 
+def test_worker_prepares_device_embedding_metadata_then_resolves_real_token():
+    class MetadataExecutor(_ImmediateEosExecutor):
+        supports_async_decode_prepare = True
+        supports_device_decode_embedding = True
+
+        def prepare_decode(self, model, batch, *, buffer_slot):
+            assert batch.hidden_states is None
+            assert not self.embedding_lookup_shapes
+            return SimpleNamespace(buffer_slot=buffer_slot)
+
+    model = _model(max_batch_size=1)
+    model.embed_tokens.copy_(torch.arange(model.embed_tokens.numel()).reshape_as(model.embed_tokens))
+    executor = MetadataExecutor(KvCacheManager())
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
+    worker.executor = executor
+    worker.model_record = SimpleNamespace(runtime_model=model)
+    worker._req_cache = {"req": NewRequestData("req", [1], 0.0, 1.0, None)}
+    worker._last_tokens = {}
+    command = StepCommand(
+        new_requests=[], prefill_requests=[],
+        decode_requests=[DecodeRequest("req", -1, 2, [0])],
+        finished_request_ids=[], step_id=1,
+    )
+
+    assert executor.supports_device_decode_embedding
+    prepared = worker._prepare_step_command(command, buffer_slot=1)
+    assert prepared.prepared.buffer_slot == 1
+    assert prepared.batch.token_ids.tolist() == [[0]]
+    assert prepared.batch.hidden_states is None and not executor.embedding_lookup_shapes
+
+    worker._last_tokens["req"] = [11]
+    bound = worker._late_bind_prepared_decode_batch(prepared, tuple(command.decode_requests))
+    assert bound.token_ids.tolist() == [[11]]
+    assert prepared.batch.token_ids.tolist() == [[0]]
+    assert bound.hidden_states is None and not executor.embedding_lookup_shapes
+
+    resolved = worker._make_decode_batch(
+        command.decode_requests, model, resolve_tokens=True,
+        allow_device_greedy_sampling=False, allow_device_topk_sampling=False,
+    )
+    assert resolved.token_ids.tolist() == [[11]]
+    assert resolved.hidden_states is None
+    assert not executor.embedding_lookup_shapes
+
+
+def test_decode_prepare_defers_stop_policy_until_fifo_registration():
+    class MetadataExecutor(_ImmediateEosExecutor):
+        supports_async_decode_prepare = True
+        supports_device_decode_embedding = True
+
+        def prepare_decode(self, model, batch, *, buffer_slot):
+            return SimpleNamespace(buffer_slot=buffer_slot)
+
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
+    worker.executor = MetadataExecutor(KvCacheManager())
+    worker.model_record = SimpleNamespace(runtime_model=_model(max_batch_size=1))
+    registration = NewRequestData("req", [1], 0.0, 1.0, None, eos_token_id=0, min_tokens=2)
+    # The receive lane publishes metadata before the device lane applies lifecycle.
+    worker._req_cache = {"req": registration}
+    worker._accepted_output_lengths = {}
+    command = StepCommand(
+        new_requests=[], prefill_requests=[],
+        decode_requests=[DecodeRequest("req", -1, 2, [0])],
+        finished_request_ids=[], step_id=2,
+    )
+    assert worker._prepare_step_command(command) is None
+    with pytest.raises(RuntimeError, match="accepted output length is not registered"):
+        worker._sampling_params("req")
+
+    worker._apply_command_lifecycle(StepCommand(
+        new_requests=[registration], prefill_requests=[], decode_requests=[],
+        finished_request_ids=[], step_id=1,
+    ))
+    assert worker._sampling_params("req").forbidden_token_ids == (0,)
+    assert worker._prepare_step_command(command) is None
+    worker._accept_output_tokens("req", 2)
+    prepared = worker._prepare_step_command(command)
+    assert prepared is not None and prepared.prepared.buffer_slot == 0
+    assert worker._sampling_params("req").forbidden_token_ids == ()
+
+
 def test_worker_routes_decode_failures_through_device_fifo():
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
     worker._apply_command_lifecycle = lambda _cmd, _entries: None
     worker._can_split_decode_output = lambda _cmd, _prepared: False
     worker._execute_step = lambda cmd, prepared_decode=None: StepResult(step_id=cmd.step_id)
@@ -472,6 +783,8 @@ def test_worker_routes_decode_failures_through_device_fifo():
 def test_worker_reclaims_device_accepted_tokens_after_request_cache_release():
     """A stale fused result is self-contained and must not reread request config."""
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
     worker.executor = SimpleNamespace()
     worker._req_cache = {}
     new_tokens = {}
@@ -497,8 +810,8 @@ def test_worker_entry_always_closes_worker(monkeypatch, caplog, busy_loop_fails,
         monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
 
     class FakeWorker:
-        def __init__(self, config, input_queue, output_queue, profile_output_queue=None):
-            pass
+        def __init__(self, config, input_queue, output_queue, profile_output_queue=None, services_factory=None):
+            self.executor = SimpleNamespace(cache_group_sizes=lambda _model: {})
 
         def init_device_and_model(self):
             assert logging.getLogger("simpler").level == expected_level
@@ -514,17 +827,17 @@ def test_worker_entry_always_closes_worker(monkeypatch, caplog, busy_loop_fails,
     monkeypatch.setattr(serving_worker, "WorkerProcess", FakeWorker)
     monkeypatch.setattr(signal, "signal", lambda *_args: None)
     ready_event = SimpleNamespace(set=lambda: setattr(calls, "ready", calls.ready + 1))
-    num_pages_value = SimpleNamespace(value=0)
+    cache_capacity = [0]
 
     serving_worker._worker_entry(
-        SimpleNamespace(),
+        SimpleNamespace(model_id="model", resolve_runtime_config=lambda: SimpleNamespace(kv_cache_groups=())),
         SimpleNamespace(),
         SimpleNamespace(),
         ready_event,
-        num_pages_value,
+        cache_capacity,
     )
 
-    assert num_pages_value.value == 7
+    assert cache_capacity == [7]
     assert calls.ready >= 1
     assert calls.close == 1
     if log_level == "invalid":
@@ -570,6 +883,10 @@ def test_mixed_decode_does_not_overwrite_prepared_next_step():
         assert next_prepared.wait(timeout=5)
 
     worker = WorkerProcess.__new__(WorkerProcess)
+
+    worker._services = None
+
+    worker._batch_builder = worker._make_decode_batch
     worker.config = SimpleNamespace(resolve_async_scheduling=lambda: True)
     worker.input_queue, worker.output_queue = Queue(), Queue()
     worker.profile_output_queue = None
@@ -607,3 +924,27 @@ def test_mixed_decode_does_not_overwrite_prepared_next_step():
         worker.input_queue.put(encode_command(ShutdownCommand()))
         thread.join(timeout=5)
     assert not thread.is_alive()
+
+
+@pytest.mark.parametrize('stage', ['setup', 'start', 'success'])
+def test_worker_start_notification_does_not_authorize_uncreated_owners(monkeypatch, stage):
+    from pypto_serving.serving.server import serving_worker
+    events = []
+    def queue():
+        if stage == 'setup':
+            raise ValueError('before process creation')
+        return object()
+    def start():
+        events.append('start')
+        if stage == 'start':
+            raise ValueError('start attempted, outcome unknown')
+    process = SimpleNamespace(start=start)
+    context = SimpleNamespace(Queue=queue, Event=object, Array=lambda *args: [0], Process=lambda **kwargs: process)
+    monkeypatch.setattr(serving_worker.mp, 'get_context', lambda _: context)
+    config = SimpleNamespace(resolve_runtime_config=lambda: SimpleNamespace(kv_cache_groups=()))
+    if stage == 'success':
+        serving_worker.spawn_worker(config, on_starting=lambda: events.append('starting'))
+    else:
+        with pytest.raises(ValueError):
+            serving_worker.spawn_worker(config, on_starting=lambda: events.append('starting'))
+    assert events == ([] if stage == 'setup' else ['starting', 'start'])

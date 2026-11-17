@@ -507,3 +507,29 @@ class _MemoryInfoFakeWorker:
     def device_memory_info(self, worker_id=0):
         self.queried_worker_ids.append(worker_id)
         return self._info
+
+
+class _DirtyKvWorker:
+    """Model recycled device memory containing NaNs before initialization."""
+
+    def alloc_tensor(self, shape, dtype, init=None):
+        self.storage = torch.full(shape, float("nan"), dtype=dtype)
+        if init is not None:
+            assert init.shape == self.storage.shape
+            assert init.dtype == dtype
+            self.storage.copy_(init)
+        return self.storage
+
+
+@pytest.mark.parametrize("shape", [(3, 5), (128, 128)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_kv_cache_allocation_clears_recycled_nan_pages(monkeypatch, shape, dtype):
+    runner = ModelRunner(compiled=None, device_id=0)
+    worker = _DirtyKvWorker()
+    monkeypatch.setattr(runner, "_shared_l3_worker", lambda: worker)
+
+    tensor = runner._alloc_kv_cache_tensor(shape, dtype)
+
+    assert tensor is worker.storage
+    assert torch.isfinite(tensor).all()
+    assert torch.count_nonzero(tensor) == 0

@@ -94,21 +94,34 @@ nav:
       - Inference and Serving:
           - Offline Inference: user-guide/offline-inference.md
           - Online Serving: user-guide/online-serving.md
+          - Tool Calling: user-guide/tool-calling.md
+          - PD Disaggregation: user-guide/pd-disaggregation.md
+          - DDR Prefix Cache: user-guide/kv-cache-offload.md
           - Parallelism and Scaling: user-guide/parallel.md
-          - Benchmarking: user-guide/benchmarking.md
-          - Profiling: user-guide/profile.md
-      - Models:
-          - Qwen3-14B: user-guide/qwen.md
-          - Qwen3.8-27B W8A8: user-guide/qwen38.md
-          - DeepSeek V4: user-guide/deepseek-v4.md
-  - CLI Reference:
-      - Overview: cli-reference/index.md
-      - pypto-serving: cli-reference/pypto-serving.md
-      - DeepSeek V4 Conversion: cli-reference/deepseek-v4-conversion.md
-      - pypto-prepack-deepseek-v4: cli-reference/pypto-prepack-deepseek-v4.md
+          - Multi-Node Routing: user-guide/multi-node-routing.md
+          - Troubleshooting: user-guide/troubleshooting.md
+  - Models:
+      - Overview: models/index.md
+      - Qwen3-14B: models/qwen3-14b.md
+      - Qwen3.8-27B W8A8: models/qwen3-8-27b.md
+      - GLM-5.3-Flash: models/glm53.md
+      - GLM-5.3-Flash Optimization: models/glm53-optimization.md
+      - DeepSeek V4:
+          - Overview: models/deepseek-v4/index.md
+          - MTP Deployment: models/deepseek-v4/mtp.md
+          - DSpark Deployment: models/deepseek-v4/dspark.md
+          - DSpark Tool Constraints: models/deepseek-v4/tool-constraints.md
+          - Internals:
+              - MTP: models/deepseek-v4/mtp-internals.md
+              - DSpark: models/deepseek-v4/dspark-internals.md
+  - Reference:
+      - HTTP API: api-reference/http.md
+      - CLI: cli-reference/pypto-serving.md
+      - Router CLI: cli-reference/pypto-serving-router.md
   - Developer Guide:
       - Architecture: developer-guide/architecture.md
+      - Profiling: developer-guide/profile.md
+      - Accuracy Debugging: developer-guide/accuracy-debugging.md
       - Model Integration: developer-guide/model-integration.md
       - Weight Staging: developer-guide/weight-staging.md
-      - DeepSeek V4 Runtime: developer-guide/deepseek-v4-runtime.md
-      - DeepSeek V4 DSpark: developer-guide/deepseek-v4-dspark.md
+      - JIT Cache: developer-guide/jit-cache.md

@@ -1,0 +1,6 @@
+{
+  "replicas": [
+    {"host": "192.0.2.10", "port": 8000, "role": "prefill"},
+    {"host": "192.0.2.20", "port": 8000, "role": "decode"}
+  ]
+}

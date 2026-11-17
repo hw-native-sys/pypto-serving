@@ -58,8 +58,9 @@ The completion response includes one choice and usage counts when the request fi
 
 ## Next Steps
 
-- [Offline Inference](../user-guide/offline-inference.md): run larger offline validation workloads.
+- [Offline Inference](../user-guide/offline-inference.md): run multiple prompts and inspect output.
 - [Online Serving](../user-guide/online-serving.md): configure the HTTP server.
-- [CLI Reference](../cli-reference/index.md): understand CLI arguments and runtime environment variables.
+- [CLI Reference](../cli-reference/pypto-serving.md): understand CLI arguments and defaults.
+- [HTTP API](../api-reference/http.md): check request and response fields.
 - [Parallelism and Scaling](../user-guide/parallel.md): configure DP, TP, and DeepSeek V4 overlapped DP/EP.
-- [Profiling](../user-guide/profile.md): capture Chrome trace profiles.
+- [Profiling](../developer-guide/profile.md): capture Chrome trace profiles.

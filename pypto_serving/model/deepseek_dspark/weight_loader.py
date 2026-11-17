@@ -151,6 +151,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         *,
         ranks: int,
         n_routed_experts: int,
+        tp_size: int = 4,
         compress_ratio: int = 0,
         include_tid2eid: bool = False,
         include_gate_bias: bool = False,
@@ -199,7 +200,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
             (*DSPARK_LAYER_RULES, *DSPARK_PREFILL_LAYER_RULES),
             raw,
             context,
-            policy=dspark_shard_policy(int(ranks)),
+            policy=dspark_shard_policy(int(ranks), tp_size=tp_size),
             expert_policy=dspark_expert_parallel(int(ranks), int(n_routed_experts)),
             factories=dspark_factories(),
             destinations=destinations,
@@ -216,6 +217,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         n_routed_experts: int,
         compress_ratios: Sequence[int],
         num_hash_layers: int,
+        tp_size: int = 4,
         use_prepacked: bool = True,
     ) -> DSparkStackedLayerWeights:
         """Load every hidden layer once and stack the DSpark weight banks.
@@ -248,6 +250,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         first = self.load_packed_layer_weights(
             0,
             ranks=ranks,
+            tp_size=tp_size,
             n_routed_experts=n_routed_experts,
             compress_ratio=int(compress_ratios[0]),
             include_tid2eid=num_hash_layers > 0,
@@ -258,6 +261,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
             self.load_packed_layer_weights(
                 layer_id,
                 ranks=ranks,
+                tp_size=tp_size,
                 n_routed_experts=n_routed_experts,
                 compress_ratio=int(compress_ratios[layer_id]),
                 include_tid2eid=layer_id < num_hash_layers,
@@ -319,6 +323,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
         *,
         ranks: int,
         n_routed_experts: int,
+        tp_size: int = 4,
     ) -> DSparkDrafterWeights:
         """Pack the ``mtp.0/1/2`` drafter into the kernel's stacked banks.
 
@@ -337,12 +342,11 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
             DSPARK_DRAFT_LAYERS,
             DSPARK_DRAFTER_HASH_LAYERS,
             DSPARK_DRAFTER_LAYERS,
-            DSPARK_TP_SIZE,
         )
 
-        if ranks <= 0 or ranks % DSPARK_TP_SIZE:
+        if tp_size not in (1, 2, 4) or ranks <= 0 or ranks % tp_size:
             raise ValueError(
-                f"DSpark drafter packing needs a rank count divisible by TP={DSPARK_TP_SIZE}, got {ranks}"
+                f"DSpark drafter packing needs a rank count divisible by TP={tp_size}, got {ranks}"
             )
         if n_routed_experts % ranks:
             raise ValueError(
@@ -471,9 +475,9 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
                 f"DSpark wo_b must be [D, O_GROUPS*O_LORA]={(hidden, o_groups * o_lora)}, "
                 f"got {tuple(wo_b0.shape)}"
             )
-        if o_groups % DSPARK_TP_SIZE:
-            raise ValueError(f"DSpark o-groups {o_groups} must divide by TP={DSPARK_TP_SIZE}")
-        local_o_groups = o_groups // DSPARK_TP_SIZE
+        if o_groups % tp_size:
+            raise ValueError(f"DSpark o-groups {o_groups} must divide by TP={tp_size}")
+        local_o_groups = o_groups // tp_size
         if int(gate0.shape[0]) != n_routed_experts or gate0.shape[1] != hidden:
             raise ValueError(f"DSpark gate must be [{n_routed_experts}, {hidden}], got {tuple(gate0.shape)}")
         moe_inter = int(shared_w1_0.shape[0])
@@ -650,7 +654,7 @@ class DSparkWeightStore(DeepSeekV4WeightStore):
             for layer in DSPARK_DRAFTER_LAYERS
         ]
         for rank in range(ranks):
-            tp_rank = rank % DSPARK_TP_SIZE
+            tp_rank = rank % tp_size
             for layer in range(DSPARK_DRAFT_LAYERS):
                 wo_a[rank, layer * local_o_groups : (layer + 1) * local_o_groups].copy_(
                     wo_a_sources[layer][tp_rank * local_o_groups : (tp_rank + 1) * local_o_groups]

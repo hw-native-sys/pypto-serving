@@ -1,0 +1,4 @@
+interface:
+  display_name: "Serving + Simpler Swimlane"
+  short_description: "Capture and combine serving and Simpler host timelines"
+  default_prompt: "Use $profile-serving-simpler-swimlane to capture or merge serving and Simpler traces into one Perfetto swimlane."

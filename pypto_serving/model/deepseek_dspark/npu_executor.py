@@ -8,10 +8,9 @@
 # -----------------------------------------------------------------------------------------------------------
 """PyPTO executor for the DSpark DeepSeek-V4-Flash target kernels.
 
-Compiles ``l3_prefill_fwd`` and ``l3_decode_fwd`` from
-``pypto-lib/models/deepseek_v4_flash_dspark`` with the canonical 16-card
-import contract (``--tp 4 --ep 16 --weight-bank-size 43``) and hands the
-compiled programs to :class:`DSparkModelRunner`.  The DSpark kernels freeze
+Compiles the role's programs from ``pypto-lib/models/deepseek_v4_flash_dspark``
+with local attention TP, independent head TP and an EP-wide world, then hands
+them to :class:`DSparkModelRunner`. The DSpark kernels freeze
 their shapes from ``sys.argv`` at import, so every import runs inside
 ``_dspark_import_context``; the module names collide with the MTP variant's
 (``config``, ``moe``, ``lm_head`` ...), so the context evicts any same-named
@@ -26,6 +25,7 @@ import importlib
 import os
 import sys
 from collections.abc import Iterable, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -96,6 +96,10 @@ _DSPARK_IMPORT_MODULES = (
     "prefill_indexer_compressor",
     "prefill_layer",
     "prefill_o_proj",
+    "prefill_state",
+    "prefill_bootstrap",
+    "prefill_bootstrap_metadata",
+    "prefill_bootstrap_one_l2",
     "prefill_sparse_attn",
     "prefill_swa",
     "qkv_proj_rope",
@@ -141,12 +145,10 @@ def _dspark_import_context(
     kernel_dir: Path,
     *,
     pypto_lib_root: Path,
-    tp: int,
-    ep: int,
+    layout: DSparkCacheLayout,
     weight_bank_size: int,
-    dp: int = 1,
 ):
-    """Import DSpark kernels with the canonical 16-card shape arguments."""
+    """Import kernels with one node's independent attention and head shapes."""
     old_argv = list(sys.argv)
     old_path = list(sys.path)
     missing = object()
@@ -161,18 +163,36 @@ def _dspark_import_context(
             sys.modules.pop(module_name, None)
     sys.argv = [
         "pypto-serving-dspark",
-        "--tp", str(int(tp)),
-        "--ep", str(int(ep)),
-        # lm_head.WORLD_SIZE = TP * DP scopes the markov sampler's stacked
-        # tensors; only lm_head/dspark_markov parse --dp (the target programs
-        # ignore it), so passing the DP group count makes the markov program
-        # cover the full 16-rank world in one dispatch.
-        "--dp", str(int(dp)),
+        "--tp", str(layout.tp_size),
+        "--lm-head-tp", str(layout.lm_head_tp_size),
+        "--ep", str(layout.ranks),
+        # EP fixes the composed world; attention DP is not head DP.
+        "--dp", str(layout.partitions),
         "--weight-bank-size", str(int(weight_bank_size)),
     ]
     sys.path.insert(0, str(kernel_dir))
     sys.path.insert(0, str(pypto_lib_root))
     try:
+        # Small standalone programs must not depend on importing MoE first to
+        # replace config's default EP=8 with the requested topology.
+        sys.modules.pop("config", None)
+        config = importlib.import_module("config")
+        config.EP = layout.ranks
+        config.TP = layout.tp_size
+        config.DP = layout.partitions
+        if config.DECODE_SEQ != layout.decode_seq:
+            raise ValueError("DSpark Lib verification width does not match the Serving layout")
+        # Lib derives owner, drafter and head extents from B/S at import.
+        # Configure the existing 16-request owner tile instead of inheriting
+        # B=64 at TP1 and quadrupling padded workspaces and filler execution.
+        config.DECODE_BATCH = layout.decode_batch
+        config.DECODE_TOKENS = layout.decode_tokens
+        config.MOE_TOKENS = layout.moe_tokens
+        config.DECODE_RECV_MAX = layout.ranks * layout.moe_tokens
+        config.RECV_MAX = config.DECODE_RECV_MAX
+        for state in ("HCA", "CSA", "CSA_INNER"):
+            setattr(config, f"{state}_STATE_PHYSICAL_BLOCKS",
+                    layout.decode_batch * getattr(config, f"{state}_STATE_BLOCKS_PER_REQUEST"))
         yield
     finally:
         sys.argv = old_argv
@@ -194,11 +214,15 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         platform: str = "a2a3sim",
         device_id: int = 0,
         device_ids: Sequence[int] | None = None,
-        pypto_build_dir: str = "build_output",
-        use_compile_cache: bool = False,
+        pypto_build_dir: str | None = None,
         cache_ranks: int = DSPARK_RANKS,
+        tp_size: int = 4,
+        lm_head_tp_size: int = 4,
+        execution_role: str = "mixed",
         compile_kernels: bool = False,
         num_speculative_tokens: int = 0,
+        capture_prefill_tail: bool = False,
+        runner_extension_factory=None,
     ) -> None:
         worker_device_ids = tuple(device_ids) if device_ids is not None else (int(device_id),)
         super().__init__(
@@ -206,15 +230,21 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             platform=platform,
             device_ids=worker_device_ids,
             pypto_build_dir=pypto_build_dir,
-            use_compile_cache=use_compile_cache,
         )
         self._kernel_dir = _find_pypto_lib_dspark_dir()
         self._compile_kernels = bool(compile_kernels)
         self._num_speculative_tokens = int(num_speculative_tokens)
+        self._capture_prefill_tail = bool(capture_prefill_tail)
         # The serving topology is flag-driven: --ep is the rank count and this
         # layout freezes every rank-derived axis (kernel import arguments,
         # scheduler cache partitions, packed-prefill capacity) from it.
-        self._topology_layout = DSparkCacheLayout.for_ranks(cache_ranks)
+        self._topology_layout = DSparkCacheLayout.for_ranks(
+            cache_ranks, tp_size=tp_size, lm_head_tp_size=lm_head_tp_size,
+        )
+        if execution_role not in ("mixed", "prefill", "decode"):
+            raise ValueError("invalid DSpark execution role")
+        self._execution_role = execution_role
+        self._runner_extension_factory = runner_extension_factory
         if self._num_speculative_tokens not in (0, DSPARK_SPECULATIVE_TOKENS):
             raise ValueError(
                 "DSpark speculation is fixed at K="
@@ -223,14 +253,14 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                 "model without speculation."
             )
         self._embedding_cache: dict[str, torch.Tensor] = {}
-        compile_cache_dir = self._pypto_build_dir if self._use_compile_cache else None
+        # The persistent JIT cache is resolved by PyPTO through the run config
+        # policy; an explicit build dir stays a diagnostic/output request.
         self._compiler = KernelCompiler(
             run_config=build_pypto_run_config(
                 platform=self._platform,
                 device_ids=self._device_ids,
-                pypto_build_dir=compile_cache_dir,
+                pypto_build_dir=self._pypto_build_dir,
             ),
-            cache_dir=compile_cache_dir,
         )
 
     @property
@@ -240,6 +270,9 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             (compiled.layout.prefill_batch for compiled in self._compiled.values()),
             default=self._topology_layout.prefill_batch,
         )
+
+    def cache_group_sizes(self, model_id: str) -> dict[str, int]:
+        return dict(self._runners[model_id]._cache_group_num_blocks)
 
     @property
     def max_prefill_requests_per_partition(self) -> int:
@@ -305,10 +338,16 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         """Create the DSpark runtime runner."""
         if not isinstance(compiled, DSparkCompiledKernels):
             raise TypeError("DeepSeekV4DSparkPyptoExecutor requires DSpark compiled metadata.")
-        return DSparkModelRunner(compiled=compiled)
+        return DSparkModelRunner(compiled=compiled, extension_factory=self._runner_extension_factory,
+                                 execution_role=self._execution_role)
+
+    def runtime_extensions(self):
+        """Return explicitly configured runner services after model registration."""
+        return tuple(runner.runtime_extension for runner in self._runners.values()
+                     if runner.runtime_extension is not None)
 
     def _compile_model(self, model: RuntimeModel) -> DSparkCompiledKernels:
-        """Validate DSpark metadata, compile the two L3 programs, and package."""
+        """Validate DSpark metadata and compile the role's L3 programs."""
         metadata = model.extra
         if metadata.get("family") != "deepseek_v4":
             raise ValueError("DeepSeekV4DSparkPyptoExecutor received a non-DeepSeekV4 model")
@@ -316,9 +355,8 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             raise ValueError(
                 "DeepSeekV4DSparkPyptoExecutor requires the W8A8 compressed-tensors checkpoint"
             )
-        layout = DSparkCacheLayout(
-            ranks=self._topology_layout.ranks,
-            partitions=self._topology_layout.partitions,
+        layout = replace(
+            self._topology_layout,
             prefill_batch=min(
                 model.runtime.max_batch_size, self._topology_layout.prefill_batch
             ),
@@ -369,20 +407,78 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             )
 
         prefill = None
+        prefill_capture = None
+        prefill_extract = None
+        prefill_extract_batched = None
+        prefill_publish = None
+        bootstrap_tokens = None
+        bootstrap_metadata = None
+        bootstrap_one_l2 = None
+        normal_k7 = speculative and os.environ.get("PYPTO_DSPARK_BOOTSTRAP_METADATA_DEVICE") != "0"
+        prefill_async_flag = os.environ.get("PYPTO_DSPARK_PREFILL_ASYNC")
+        prefill_async = (prefill_async_flag == "1" or (prefill_async_flag is None and normal_k7))
+        device_bootstrap_metadata = speculative and (
+            os.environ.get("PYPTO_DSPARK_BOOTSTRAP_METADATA_DEVICE") == "1" or (normal_k7 and prefill_async)
+        )
+        bootstrap_one_l2_flag = os.environ.get("PYPTO_DSPARK_BOOTSTRAP_ONE_L2")
+        bootstrap_one_l2_enabled = (
+            bootstrap_one_l2_flag == "1" or (bootstrap_one_l2_flag is None and normal_k7 and prefill_async)
+        )
+        if bootstrap_one_l2_enabled and not device_bootstrap_metadata:
+            raise ValueError("One-L2 DSpark bootstrap requires device bootstrap metadata")
+        device_bootstrap = device_bootstrap_metadata or (
+            speculative and os.environ.get("PYPTO_DSPARK_BOOTSTRAP_DEVICE") == "1"
+        )
+        prefill_device_tail = self._capture_prefill_tail or (speculative and (
+            device_bootstrap or os.environ.get("PYPTO_DSPARK_PREFILL_TAIL_DEVICE") == "1"
+        ))
+        if prefill_async and (not speculative or (device_bootstrap and not device_bootstrap_metadata)):
+            raise ValueError("Async DSpark prefill requires K=7 and Host metadata; device bootstrap needs metadata")
         decode = None
         rope: DSparkRopeTables | None = None
         if self._compile_kernels:
             modules = self._load_kernel_modules(layout, speculative=speculative)
-            prefill = self._compile_l3_callable("dspark_prefill", modules["prefill_fwd"].l3_prefill_fwd)
+            if self._execution_role != "decode":
+                prefill = self._compile_l3_callable(
+                    "dspark_prefill", modules["prefill_fwd"].l3_prefill_fwd,
+                )
+            if prefill_device_tail:
+                prefill_capture = self._compile_l3_callable(
+                    "dspark_prefill_capture", modules["prefill_state"].l3_capture_prefill_tail
+                )
+                if speculative:
+                    prefill_extract = self._compile_l3_callable(
+                        "dspark_prefill_extract", modules["prefill_state"].l3_extract_prefill_tail
+                    )
+                if device_bootstrap_metadata:
+                    prefill_extract_batched = self._compile_l3_callable(
+                        "dspark_prefill_extract_batched", modules["prefill_state"].l3_extract_prefill_tails
+                    )
             if speculative:
                 decode = self._compile_l3_callable(
                     "dspark_decode_one_l2",
                     modules["decode_fwd_dspark"].l3_decode_fwd_dspark,
                 )
-            else:
+            elif self._execution_role != "prefill":
                 decode = self._compile_l3_callable(
                     "dspark_decode", modules["decode_fwd"].l3_decode_fwd
                 )
+            if device_bootstrap:
+                bootstrap_tokens = self._compile_l3_callable(
+                    "dspark_bootstrap_tokens", modules["prefill_bootstrap"].l3_prepare_bootstrap_tokens
+                )
+                prefill_publish = self._compile_l3_callable(
+                    "dspark_bootstrap_publish", modules["prefill_bootstrap"].l3_publish_bootstrap
+                )
+                if device_bootstrap_metadata:
+                    bootstrap_metadata = self._compile_l3_callable(
+                        "dspark_bootstrap_metadata", modules["prefill_bootstrap_metadata"].l3_prepare_bootstrap_metadata
+                    )
+                    if bootstrap_one_l2_enabled:
+                        bootstrap_one_l2 = self._compile_l3_callable(
+                            "dspark_bootstrap_one_l2_batched",
+                            modules["prefill_bootstrap_one_l2"].l3_bootstrap_one_l2,
+                        )
             if speculative:
                 # The fused decode program owns every recurrent decode stage,
                 # but prefill still needs one standalone draft step to seed
@@ -415,6 +511,15 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             kernel_dir=str(self._kernel_dir),
             runtime_model=model,
             prefill=prefill,
+            prefill_async=prefill_async,
+            bootstrap_one_l2_enabled=bootstrap_one_l2_enabled,
+            prefill_capture=prefill_capture,
+            prefill_extract=prefill_extract,
+            prefill_extract_batched=prefill_extract_batched,
+            prefill_publish=prefill_publish,
+            bootstrap_tokens=bootstrap_tokens,
+            bootstrap_metadata=bootstrap_metadata,
+            bootstrap_one_l2=bootstrap_one_l2,
             decode=decode,
             drafter=drafter,
             markov=markov,
@@ -465,10 +570,8 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         with _dspark_import_context(
             self._kernel_dir,
             pypto_lib_root=pypto_lib_root,
-            tp=layout.tp_size,
-            ep=layout.ranks,
+            layout=layout,
             weight_bank_size=DSPARK_FWD_NUM_LAYERS,
-            dp=layout.partitions,
         ):
             config = importlib.import_module("config")
             utils = importlib.import_module("utils")
@@ -479,19 +582,42 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                 "utils": utils,
                 "decode_fwd": decode_fwd,
                 "prefill_fwd": prefill_fwd,
+                "prefill_state": importlib.import_module("prefill_state"),
+                "prefill_bootstrap": importlib.import_module("prefill_bootstrap"),
+                "prefill_bootstrap_metadata": importlib.import_module("prefill_bootstrap_metadata"),
             }
             if speculative:
+                modules["prefill_bootstrap_one_l2"] = importlib.import_module("prefill_bootstrap_one_l2")
                 modules["dspark_drafter"] = importlib.import_module("dspark_drafter")
                 modules["dspark_markov"] = importlib.import_module("dspark_markov")
                 modules["decode_fwd_dspark"] = importlib.import_module(
                     "decode_fwd_dspark"
                 )
+            shapes = [
+                ("Decode owner rows", decode_fwd.MOE_TOKENS, layout.moe_tokens),
+                ("LM-head rows", decode_fwd.MAX_LOGIT_ROWS, layout.max_logit_rows),
+                ("LM-head TP", decode_fwd.LM_HEAD_TP_SIZE, layout.lm_head_tp_size),
+            ]
+            if speculative:
+                fused = modules["decode_fwd_dspark"]
+                shapes.extend((
+                    ("Decode group batch", fused.DECODE_BATCH, layout.decode_batch),
+                    ("Decode local batch", fused.LOCAL_DECODE_BATCH, layout.decode_local_batch),
+                    ("drafter rows", modules["dspark_drafter"].T, layout.moe_tokens),
+                    ("drafter batch", modules["dspark_drafter"].DSPARK_MAX_BATCH, layout.decode_local_batch),
+                    ("Markov rows", modules["dspark_markov"].DSPARK_MOE_TOKENS, layout.moe_tokens),
+                    ("bootstrap batch", modules["prefill_bootstrap_one_l2"].DRAFTER_DSPARK_MAX_BATCH,
+                     layout.decode_local_batch),
+                ))
+            for name, actual, expected in shapes:
+                if actual != expected:
+                    raise ValueError(f"DSpark Lib {name}={actual} does not match Serving capacity={expected}")
         return modules
 
     def _compile_l3_callable(self, name: str, jit_fn: object):
         """Compile one fully annotated DSpark HOST wrapper."""
         with profile_span(f"DeepSeekV4DSparkPyptoExecutor.compile.{name}", cat="executor"):
-            return self._compiler.compile(name, jit_fn, use_cache=self._use_compile_cache)
+            return self._compiler.compile(name, jit_fn)
 
     def _build_rope_tables(
         self,

@@ -8,13 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """DSpark (deepseek_v4_flash_dspark) target-model serving package."""
 
-from pypto_serving.model.deepseek_dspark.npu_executor import DeepSeekV4DSparkPyptoExecutor
-from pypto_serving.model.deepseek_dspark.npu_runner import (
-    DSparkCacheLayout,
-    DSparkModelRunner,
-    build_dspark_cache_group_specs,
-)
-from pypto_serving.model.deepseek_dspark.weight_loader import DSparkWeightStore
+from importlib import import_module
 
 __all__ = [
     "DSparkCacheLayout",
@@ -23,3 +17,15 @@ __all__ = [
     "DeepSeekV4DSparkPyptoExecutor",
     "build_dspark_cache_group_specs",
 ]
+
+
+def __getattr__(name):
+    if name not in __all__:
+        raise AttributeError(name)
+    if name == "DeepSeekV4DSparkPyptoExecutor":
+        module = "npu_executor"
+    elif name == "DSparkWeightStore":
+        module = "weight_loader"
+    else:
+        module = "npu_runner"
+    return getattr(import_module(f"{__name__}.{module}"), name)

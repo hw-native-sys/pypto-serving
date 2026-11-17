@@ -9,8 +9,9 @@
 """DSpark per-dispatch-class :class:`TaskArgs` builders.
 
 The ``_PREFILL_TENSOR_ORDER`` / ``_DECODE_TENSOR_ORDER`` tuples below ARE the
-positional contracts of ``l3_prefill_fwd`` (101 args) and ``l3_decode_fwd``
-(109 args) -- register them in exactly this order.  Every argument declares its
+positional contracts of ``l3_prefill_fwd`` (103 args) and ``l3_decode_fwd``
+(110 args). Fused decode also binds K=7 draft counts and resident state.
+Every argument declares its
 kind at registration: host-shared slots (per-step metadata), static weights
 (upload-once), worker-resident cache pools and scratch (runner materializers),
 and the stacked layer-weight banks.
@@ -30,22 +31,25 @@ import torch
 from pypto_serving.model.common.runner.buffer_set import Placement, Slot
 from pypto_serving.model.common.runner.task_args import TaskArgs
 from pypto_serving.model.deepseek_dspark.npu_runner import (
-    DSPARK_DECODE_BATCH,
     DSPARK_DECODE_CMP_C4_TABLE_BLOCKS,
     DSPARK_DECODE_HCA_CMP_TABLE_BLOCKS,
     DSPARK_DECODE_HCA_STATE_TABLE_BLOCKS,
     DSPARK_DECODE_IDX_TABLE_BLOCKS,
-    DSPARK_DECODE_LOCAL_BATCH,
     DSPARK_DECODE_LOCAL_TOKENS,
     DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS,
-    DSPARK_DECODE_TOKENS,
     DSPARK_BLOCK_SIZE,
+    DSPARK_CHECKPOINT_TILE_TOKENS,
+    DSPARK_CHECKPOINTS_PER_TILE,
     DSPARK_DRAFTER_CONTEXT_ROWS,
+    DSPARK_DRAFTER_BATCHES,
+    DSPARK_DRAFTER_TABLE_BLOCKS,
     DSPARK_DRAFTER_KV_BLOCKS,
     DSPARK_DRAFTER_MAX_BATCH,
     DSPARK_DRAFTER_QUERY_WIDTH,
     DSPARK_DRAFT_LAYERS,
     DSPARK_HEAD_DIM,
+    DSPARK_GRAMMAR_SEGMENTS,
+    DSPARK_GRAMMAR_SEGMENT_WORDS,
     DSPARK_HC_MULT,
     DSPARK_HIDDEN_SIZE,
     DSPARK_MAIN_HIDDEN_DIM,
@@ -81,6 +85,7 @@ __all__ = [
     "prefill_task_args",
 ]
 
+
 # ---- shared source name sets ----
 # Stacked layer-weight bank names shared by prefill and decode.
 _PREFILL_STATIC_WEIGHT_NAMES = ("hc_head_fn", "hc_head_scale", "hc_head_base",
@@ -97,12 +102,13 @@ _CACHE_POOL_NAMES = (
 )
 
 
-def _prefill_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
+def _prefill_slots(layout, *, host_hidden: bool = False) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
     """Host-shared prefill slot name -> (dtype, full shape)."""
     ranks = layout.ranks
     tokens = layout.prefill_tokens
     local_tokens = layout.prefill_local_tokens
     requests = layout.prefill_requests
+    checkpoint_tiles = (tokens + DSPARK_CHECKPOINT_TILE_TOKENS - 1) // DSPARK_CHECKPOINT_TILE_TOKENS
     group_rope = (tokens, DSPARK_ROPE_HEAD_DIM)
     slot_specs = {
         "x_hc": (torch.float32, (ranks, tokens, DSPARK_HC_MULT, layout.hidden_size)),
@@ -110,6 +116,9 @@ def _prefill_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
         # the terminal logical length.
         "query_start_loc": (
             torch.int32, (ranks, requests + 1),
+        ),
+        "state_checkpoint_ends": (
+            torch.int32, (ranks, requests, checkpoint_tiles, DSPARK_CHECKPOINTS_PER_TILE),
         ),
         "hca_compress_state_block_table": (
             torch.int32,
@@ -160,10 +169,17 @@ def _prefill_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
         "csa_state_slot_mapping_full": (torch.int64, (ranks, tokens)),
         "csa_inner_state_slot_mapping_full": (torch.int64, (ranks, tokens)),
         "logit_row_indices": (torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS)),
+        "grammar_mask": (
+            torch.int16, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS),
+        ),
         "sampled_ids": (
             torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_SAMPLED_IDS_PAD),
         ),
     }
+    if host_hidden:
+        slot_specs["dspark_target_hidden"] = (
+            torch.bfloat16, (ranks, local_tokens, DSPARK_MAIN_HIDDEN_DIM),
+        )
     return slot_specs
 
 
@@ -213,7 +229,9 @@ def _prefill_scratch_sources(runner: DSparkModelRunner) -> dict[str, Any]:
 def prefill_task_args(runner: DSparkModelRunner) -> TaskArgs:
     """Build the ``TaskArgs`` for the packed ``l3_prefill_fwd`` dispatch."""
     layout = runner._compiled.layout
-    slot_specs = _prefill_slots(layout)
+    slot_specs = _prefill_slots(
+        layout, host_hidden=runner._compiled.prefill_async and runner._compiled.prefill_capture is None,
+    )
     static_weights = set(_PREFILL_STATIC_WEIGHT_NAMES)
     cache_pools = set(_CACHE_POOL_NAMES)
     scratch = _prefill_scratch_sources(runner)
@@ -242,10 +260,10 @@ def prefill_task_args(runner: DSparkModelRunner) -> TaskArgs:
 def _decode_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
     """Host-shared decode slot name -> (dtype, full shape)."""
     ranks = layout.ranks
-    local_batch = DSPARK_DECODE_LOCAL_BATCH
-    group_batch = DSPARK_DECODE_BATCH
-    local_tokens = DSPARK_DECODE_LOCAL_TOKENS
-    group_tokens = DSPARK_DECODE_TOKENS
+    local_batch = layout.decode_local_batch
+    group_batch = layout.decode_batch
+    local_tokens = layout.decode_local_tokens
+    group_tokens = layout.decode_tokens
     rope = (DSPARK_ROPE_HEAD_DIM,)
     window = (DSPARK_SLIDING_WINDOW,)
     slot_specs = {
@@ -304,6 +322,10 @@ def _decode_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
         "input_ids": (torch.int64, (ranks, local_tokens)),
         "num_tokens_per_owner": (torch.int32, (ranks,)),
         "logit_row_indices": (torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS)),
+        "grammar_mask": (
+            torch.int16, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS),
+        ),
+        "valid_draft_counts": (torch.int32, (ranks, group_batch)),
         "sampled_ids": (
             torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_SAMPLED_IDS_PAD),
         ),
@@ -365,7 +387,12 @@ def decode_task_args(runner: DSparkModelRunner) -> TaskArgs:
     scratch = decode_scratch_specs(ranks)
 
     ta = TaskArgs(stacked=True)
-    for name in _DECODE_TENSOR_ORDER:
+    tensor_order = (
+        _FUSED_DECODE_TENSOR_ORDER
+        if runner._compiled.decode_full_fused
+        else _DECODE_TENSOR_ORDER
+    )
+    for name in tensor_order:
         if (
             runner._compiled.decode_full_fused
             and name in _DSPARK_FUSED_INTERNAL_PREPARE_NAMES
@@ -405,6 +432,7 @@ def decode_task_args(runner: DSparkModelRunner) -> TaskArgs:
 _PREFILL_TENSOR_ORDER = (
     "x_hc",
     "query_start_loc",
+    "state_checkpoint_ends",
     "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
     "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
     "kv_cache", "attn_sink", "wo_a", "wo_b", "wo_b_scale",
@@ -437,7 +465,7 @@ _PREFILL_TENSOR_ORDER = (
     "attn_stage", "x_mixed", "post_ffn", "comb_ffn", "ffn_out",
     "hc_head_fn", "hc_head_scale", "hc_head_base",
     "final_norm_w", "lm_head_weight", "logit_row_indices",
-    "dspark_target_hidden", "x_out", "logits", "sampled_ids",
+    "dspark_target_hidden", "x_out", "logits", "grammar_mask", "sampled_ids",
 )
 
 # Argument order for the packed ``l3_decode_fwd`` kernel (pypto-lib
@@ -484,7 +512,12 @@ _DECODE_TENSOR_ORDER = (
     "shared_w2", "shared_w2_scale",
     "hidden_workspace", "x_ping", "x_pong",
     "x_attn_active", "x_moe_next",
-    "pre_hc_hidden_out", "dspark_target_hidden", "x_out", "logits", "sampled_ids",
+    "pre_hc_hidden_out", "dspark_target_hidden", "x_out", "logits",
+    "grammar_mask", "sampled_ids",
+)
+
+_FUSED_DECODE_TENSOR_ORDER = (
+    *_DECODE_TENSOR_ORDER[:-1], "valid_draft_counts", _DECODE_TENSOR_ORDER[-1],
 )
 
 # Argument order for the speculative drafter (pypto-lib dspark_drafter.py,
@@ -549,7 +582,7 @@ def _drafter_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
     batch = DSPARK_DRAFTER_MAX_BATCH
     context = DSPARK_DRAFTER_CONTEXT_ROWS
     query = batch * DSPARK_DRAFTER_QUERY_WIDTH
-    group_query = 4 * query
+    group_query = layout.tp_size * query
     rope = (DSPARK_ROPE_HEAD_DIM,)
     return {
         "target_hidden": (
@@ -567,6 +600,30 @@ def _drafter_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
         "query_freqs_sin": (torch.bfloat16, (ranks, query, *rope)),
         "query_group_freqs_cos": (torch.bfloat16, (ranks, group_query, *rope)),
         "query_group_freqs_sin": (torch.bfloat16, (ranks, group_query, *rope)),
+    }
+
+
+def bootstrap_metadata_specs(layout) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    """Ordered output ABI for the descriptor-driven bootstrap metadata program."""
+    ranks, tp = layout.ranks, layout.tp_size
+    query = DSPARK_DRAFTER_MAX_BATCH * DSPARK_DRAFTER_QUERY_WIDTH
+    return {
+        "tail_selectors": ((ranks, DSPARK_DRAFTER_BATCHES[0], 4), torch.int32),
+        "num_sampled": ((ranks, DSPARK_DRAFTER_BATCHES[0]), torch.int32),
+        "last_sampled": ((ranks, DSPARK_DRAFTER_BATCHES[0]), torch.int64),
+        "anchor_positions": ((ranks, DSPARK_DRAFTER_BATCHES[0]), torch.int32),
+        "block_tables": ((ranks, 3, DSPARK_DRAFTER_BATCHES[0], DSPARK_DRAFTER_TABLE_BLOCKS), torch.int32),
+        "context_group_position_ids": ((ranks, 4 * DSPARK_SLIDING_WINDOW), torch.int32),
+        "context_group_slot_mapping": ((ranks, 3, 4 * DSPARK_SLIDING_WINDOW), torch.int64),
+        "context_group_freqs_cos": ((ranks, 4 * DSPARK_SLIDING_WINDOW, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
+        "context_group_freqs_sin": ((ranks, 4 * DSPARK_SLIDING_WINDOW, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
+        "query_group_position_ids": ((ranks, tp * query), torch.int32),
+        "query_group_slot_mapping": ((ranks, 3, tp * query), torch.int64),
+        "query_freqs_cos": ((ranks, query, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
+        "query_freqs_sin": ((ranks, query, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
+        "query_group_freqs_cos": ((ranks, tp * query, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
+        "query_group_freqs_sin": ((ranks, tp * query, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
+        "logit_row_indices": ((ranks, 128), torch.int32),
     }
 
 

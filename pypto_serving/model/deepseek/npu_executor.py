@@ -230,8 +230,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         platform: str = "a2a3sim",
         device_id: int = 0,
         device_ids: Sequence[int] | None = None,
-        pypto_build_dir: str = "build_output",
-        use_compile_cache: bool = False,
+        pypto_build_dir: str | None = None,
         compile_kernels: bool = False,
         num_speculative_tokens: int = 0,
     ) -> None:
@@ -241,7 +240,6 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             platform=platform,
             device_ids=worker_device_ids,
             pypto_build_dir=pypto_build_dir,
-            use_compile_cache=use_compile_cache,
         )
         self._kernel_dir = _find_pypto_lib_deepseek_v4_dir()
         self._kernel_contract = load_deepseek_v4_serving_contract()
@@ -251,17 +249,15 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             raise ValueError("num_speculative_tokens must be non-negative")
         self._embedding_cache: dict[str, torch.Tensor] = {}
         # Shared JIT-compile core; DeepSeek wraps each compile in a per-kernel
-        # profile span (see _compile_l3_callable). With ``use_compile_cache`` the
-        # build dir doubles as the on-disk kernel cache (load-or-compile, slotted
-        # by kernel name); otherwise pypto uses its default per-kernel build dirs.
-        compile_cache_dir = self._pypto_build_dir if self._use_compile_cache else None
+        # profile span (see _compile_l3_callable). The persistent JIT cache is
+        # resolved by PyPTO through the run config policy; an explicit build dir
+        # stays a diagnostic/output request and bypasses reuse.
         self._compiler = KernelCompiler(
             run_config=build_pypto_run_config(
                 platform=self._platform,
                 device_ids=self._device_ids,
-                pypto_build_dir=compile_cache_dir,
+                pypto_build_dir=self._pypto_build_dir,
             ),
-            cache_dir=compile_cache_dir,
         )
 
     @property
@@ -555,9 +551,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             else {}
         )
         with profile_span(f"DeepSeekV4PyptoExecutor.compile.{name}", cat="executor"):
-            return self._compiler.compile(
-                name, jit_fn, use_cache=self._use_compile_cache, **runtime_scalars
-            )
+            return self._compiler.compile(name, jit_fn, **runtime_scalars)
 
     def _build_rope_tables(
         self,

@@ -15,6 +15,10 @@ import os
 
 _DEFAULT_WORKER_INIT_TIMEOUT_SECONDS = 1800.0
 _DEFAULT_WORKER_STEP_TIMEOUT_SECONDS = 1200.0
+# How long a shutting-down server waits for the requests it has already accepted
+# before cancelling them. Matched to the router's drain timeout, which is the
+# same bound one layer up: that long for in-flight work, then stop regardless.
+_DEFAULT_GRACEFUL_SHUTDOWN_SECONDS = 300.0
 
 
 def configure_runtime_logging() -> None:
@@ -51,3 +55,16 @@ def worker_init_timeout_seconds() -> float:
 
 def worker_step_timeout_seconds() -> float:
     return _positive_env_timeout_seconds("SERVING_WORKER_STEP_TIMEOUT", _DEFAULT_WORKER_STEP_TIMEOUT_SECONDS)
+
+
+def graceful_shutdown_timeout_seconds() -> float:
+    """How long uvicorn waits for in-flight requests before it cancels them.
+
+    Unbounded by default, and the wait sits in front of everything that stops
+    the worker: a request that never finishes means the worker is never asked
+    to stop, never signalled, and keeps its devices for as long as the process
+    lives.
+    """
+    return _positive_env_timeout_seconds(
+        "PYPTO_GRACEFUL_SHUTDOWN_TIMEOUT", _DEFAULT_GRACEFUL_SHUTDOWN_SECONDS
+    )

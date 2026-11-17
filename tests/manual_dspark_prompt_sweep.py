@@ -94,13 +94,14 @@ def main() -> None:
         "--ring-heap": "2147483648,2147483648,4294967296,8589934592",
     }.items():
         command[command.index(option) + 1] = value
-    command += ["--generate-config", '{"ignore_eos": false}', "--use-compile-cache"]
+    command += ["--generate-config", '{"ignore_eos": false}']
     args.output_dir.mkdir(parents=True, exist_ok=False)
     (args.output_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
     log_path = args.output_dir / "server.log"
     with log_path.open("w", encoding="utf-8") as server_log:
         process = subprocess.Popen(
-            command, cwd=ROOT, env={**os.environ, "PYPTO_DSPARK_TRACE_PREFILL": "1"},
+            command, cwd=ROOT,
+            env={**os.environ, "PYPTO_DSPARK_TRACE_PREFILL": "1", "PYPTO_CACHE": "1"},
             stdout=server_log, stderr=subprocess.STDOUT, start_new_session=True, text=True,
         )
         try:

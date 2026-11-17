@@ -1,0 +1,36 @@
+name: Upload results with one retry
+description: Retry transient artifact upload failures on self-hosted runners.
+
+inputs:
+  name:
+    description: Artifact name.
+    required: true
+  path:
+    description: Directory or file to upload.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Upload ${{ inputs.name }}
+      id: first
+      continue-on-error: true
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        if-no-files-found: error
+
+    - name: Wait before retry
+      if: steps.first.outputs.artifact-id == ''
+      shell: bash
+      run: sleep 15
+
+    - name: Retry ${{ inputs.name }}
+      if: steps.first.outputs.artifact-id == ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        if-no-files-found: error
+        overwrite: true

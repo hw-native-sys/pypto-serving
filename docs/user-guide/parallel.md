@@ -1,10 +1,10 @@
 # Parallelism and Scaling
 
-PyPTO Serving supports two placement modes: replica placement for standard models and overlapped placement for DeepSeek V4. Single-device serving remains the default.
+PyPTO Serving supports replica and overlapped placement. The model executor selects its supported mode and validates the requested topology. Single-device serving remains the default where the model supports it.
 
 ## Replica Placement
 
-Replica placement is used by Qwen. Data parallelism creates independent serving replicas. Tensor parallelism passes one device group to the PyPTO L3 distributed worker for each replica.
+In replica placement, data parallelism creates independent serving replicas. Each replica owns one tensor-parallel device group, so `dp * tp` device IDs are needed. Qwen uses this mode:
 
 ```bash
 pypto-serving \
@@ -35,27 +35,8 @@ pypto-serving \
   --generate-config '{"max_new_tokens": 16}'
 ```
 
-Repeat `--prompt` to schedule multiple prompts. `--devices`, `--tp`, and `--dp` behave exactly as in serving: prompts are routed across replicas with the same least-pending-tokens policy.
+Repeat `--prompt` to schedule multiple prompts. In replica placement, `--devices`, `--tp`, and `--dp` behave as they do in serving: prompts are routed across replicas with the same least-pending-tokens policy.
 
-## DeepSeek V4 Overlapped Placement
+## Overlapped Placement
 
-DeepSeek V4 uses a model-local overlapped placement. Its attention DP ranks and MoE EP ranks reuse the same eight physical devices.
-
-```bash
-pypto-serving \
-  --model /path/to/dsv4-flash-w8a8 \
-  --served-model-name dsv4-flash-w8a8 \
-  --backend npu \
-  --platform a2a3 \
-  --devices 0,1,2,3,4,5,6,7 \
-  --dp 8 \
-  --ep 8 \
-  --tp 1 \
-  --block-size 128 \
-  --max-model-len 512 \
-  --max-num-seqs 32 \
-  --max-num-batched-tokens 512 \
-  --long-prefill-token-threshold 2048 \
-  --no-enable-prefix-caching \
-  --port 8225
-```
+In overlapped placement, parallel axes can share physical ranks within one model worker group. The required device count and supported `--dp`, `--ep`, and `--tp` values are model-specific. For example, DeepSeek V4 MTP reuses eight ranks for attention DP and MoE EP. See its [model guide](../models/deepseek-v4/mtp.md#8-device-dpep-serving) for the complete command and constraints.

@@ -24,7 +24,7 @@ call sites.
 
 from __future__ import annotations
 
-from typing import Union
+from typing import Any, Union
 
 import msgspec
 
@@ -33,6 +33,7 @@ import msgspec
 # sampled token is known, so it sends this placeholder and the worker substitutes
 # the token it last sampled for that request.
 PLACEHOLDER_TOKEN: int = -1
+MAX_CONTROL_PAYLOAD_BYTES: int = 16 << 20
 
 
 # ---------------------------------------------------------------------------
@@ -40,10 +41,10 @@ PLACEHOLDER_TOKEN: int = -1
 # ---------------------------------------------------------------------------
 
 class NewRequestData(msgspec.Struct):
-    """Full request data sent exactly once when a request is first scheduled.
+    """Full request data sent when a request is scheduled or restarted.
 
     The worker caches this and references it by ``request_id`` for the lifetime
-    of the request.  ``prompt_token_ids`` are never re-sent after this message.
+    of the registration. ``prompt_token_ids`` includes committed tokens on a recompute restart.
     """
 
     request_id: str
@@ -52,6 +53,16 @@ class NewRequestData(msgspec.Struct):
     top_p: float
     top_k: int | None
     seed: int | None = None
+    min_tokens: int = 0
+    eos_token_id: int | None = None
+    eos_token_ids: tuple[int, ...] | None = None
+    initial_output_tokens: int = 0
+    constraint_spec: dict[str, Any] | None = None
+    # The target cache was adopted from a preinitialized cache lease.  This is
+    # request metadata only; no device address or provider envelope crosses IPC.
+    initialize_from_cache: bool = False
+    # Tokens committed before this worker request was registered (PD adoption).
+    initial_output_token_ids: tuple[int, ...] = ()
 
 
 class PrefillRequest(msgspec.Struct):
@@ -67,6 +78,11 @@ class PrefillRequest(msgspec.Struct):
     # Model-specific grouped cache tables and their stable rank partition.
     block_ids_by_group: dict[str, list[int]] = msgspec.field(default_factory=dict)
     cache_partition: int | None = None
+    # Absolute logical page -> retained physical page, only for entry history.
+    read_block_ids_by_group: dict[str, dict[int, int]] = msgspec.field(default_factory=dict)
+    checkpoint_ends: tuple[int, ...] = ()
+    state_write_block_ids_by_group: dict[str, list[int]] = msgspec.field(default_factory=dict)
+    checkpoint_block_ids_by_group: dict[str, dict[int, int]] = msgspec.field(default_factory=dict)
 
 
 class DecodeRequest(msgspec.Struct):
@@ -121,10 +137,19 @@ class ProfileCommand(msgspec.Struct, tag="profile"):
     """Starts or stops the process-local SA profiler."""
 
     active: bool
+    command_id: int = 0
+
+
+class ControlCommand(msgspec.Struct, tag="control"):
+    """Address-free control request to the worker that owns cache/device state."""
+
+    command_id: int
+    operation: str
+    payload: bytes = b""
 
 
 # Union used for the decoder — tag field ("type") discriminates.
-Command = Union[StepCommand, ShutdownCommand, ProfileCommand]
+Command = Union[StepCommand, ShutdownCommand, ProfileCommand, ControlCommand]
 
 
 # ---------------------------------------------------------------------------
@@ -149,10 +174,19 @@ class StepResult(msgspec.Struct):
     num_draft_tokens: dict[str, int] = msgspec.field(default_factory=dict)
 
 
-class ProfileResult(msgspec.Struct):
+class ProfileResult(msgspec.Struct, tag="profile"):
     """Acknowledges a profile command after the worker has applied it."""
 
     active: bool
+    error: str | None = None
+    command_id: int = 0
+
+
+class ControlResult(msgspec.Struct, tag="control"):
+    """Ordered result for one :class:`ControlCommand`."""
+
+    command_id: int
+    payload: bytes = b""
     error: str | None = None
 
 
@@ -166,6 +200,8 @@ _result_encoder: msgspec.msgpack.Encoder = msgspec.msgpack.Encoder()
 _result_decoder: msgspec.msgpack.Decoder = msgspec.msgpack.Decoder(StepResult)
 _profile_result_encoder: msgspec.msgpack.Encoder = msgspec.msgpack.Encoder()
 _profile_result_decoder: msgspec.msgpack.Decoder = msgspec.msgpack.Decoder(ProfileResult)
+_control_result_encoder: msgspec.msgpack.Encoder = msgspec.msgpack.Encoder()
+_control_result_decoder: msgspec.msgpack.Decoder = msgspec.msgpack.Decoder(ControlResult)
 
 
 def encode_command(cmd: Command) -> bytes:
@@ -196,3 +232,13 @@ def encode_profile_result(result: ProfileResult) -> bytes:
 def decode_profile_result(data: bytes) -> ProfileResult:
     """Decode a profile-control acknowledgement."""
     return _profile_result_decoder.decode(data)
+
+
+def encode_control_result(result: ControlResult) -> bytes:
+    """Encode one worker-local extension control result."""
+    return _control_result_encoder.encode(result)
+
+
+def decode_control_result(data: bytes) -> ControlResult:
+    """Decode one worker-local PD control result."""
+    return _control_result_decoder.decode(data)

@@ -40,6 +40,12 @@ class _PendingRunnerDecode:
     pending: object
 
 
+@dataclass(frozen=True)
+class _PendingRunnerPrefill:
+    model_id: str
+    pending: object
+
+
 class PyptoExecutor(ModelExecutor, ABC):
     """Base executor for PyPTO backends that compile once and delegate runtime."""
 
@@ -49,8 +55,7 @@ class PyptoExecutor(ModelExecutor, ABC):
         *,
         platform: str = "a2a3sim",
         device_ids: Sequence[int] = (0,),
-        pypto_build_dir: str = "build_output",
-        use_compile_cache: bool = False,
+        pypto_build_dir: str | None = None,
     ) -> None:
         """Initialize common PyPTO runtime options and model registries."""
         super().__init__(kv_cache_manager)
@@ -59,7 +64,6 @@ class PyptoExecutor(ModelExecutor, ABC):
         if not self._device_ids:
             raise ValueError("device_ids must contain at least one device id")
         self._pypto_build_dir = pypto_build_dir
-        self._use_compile_cache = use_compile_cache
         self._runners: dict[str, ModelRunner] = {}
         self._compiled: dict[str, object] = {}
 
@@ -74,14 +78,14 @@ class PyptoExecutor(ModelExecutor, ABC):
 
             try:
                 num_pages = runner.init_kv_cache(model_id, record.config, record.runtime)
+                with profile_span("PyptoExecutor.preflight", cat="executor", args={"model_id": model_id}):
+                    runner.preflight(record)
             except Exception:
                 close = getattr(runner, "close", None)
                 if callable(close):
                     close()
                 raise
 
-            with profile_span("PyptoExecutor.preflight", cat="executor", args={"model_id": model_id}):
-                runner.preflight(record)
             logger.info(
                 "PyptoExecutor %s: model loaded (%.1fs total)",
                 model_id,
@@ -99,6 +103,43 @@ class PyptoExecutor(ModelExecutor, ABC):
             args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)},
         ):
             return self._runners[model.config.model_id].run_prefill(model, batch)
+
+    @property
+    def supports_async_prefill_reclaim(self) -> bool:
+        return bool(self._runners) and all(
+            bool(getattr(runner, "supports_async_prefill_reclaim", False))
+            for runner in self._runners.values()
+        )
+
+    @property
+    def prefill_tail_requires_reclaim_before_dispatch(self) -> bool:
+        return any(bool(getattr(runner, "prefill_tail_requires_reclaim_before_dispatch", False))
+                   for runner in self._runners.values())
+
+    def prepare_prefill(self, model: RuntimeModel, batch: PrefillBatch, *, buffer_slot: int) -> object:
+        runner = self._runners[model.config.model_id]
+        with profile_span("PyptoExecutor.prepare_prefill", cat="executor"):
+            return runner.prepare_prefill(model, batch, buffer_slot=buffer_slot)
+
+    def dispatch_prepared_prefill(self, model: RuntimeModel, batch: PrefillBatch, prepared: object) -> object:
+        runner = self._runners[model.config.model_id]
+        with profile_span("PyptoExecutor.dispatch_prepared_prefill", cat="executor"):
+            return _PendingRunnerPrefill(model.config.model_id, runner.dispatch_prepared_prefill(model, batch, prepared))
+
+    def reclaim_prepared_prefill(self, pending: object) -> PrefillResult:
+        if not isinstance(pending, _PendingRunnerPrefill):
+            return super().reclaim_prepared_prefill(pending)
+        runner = self._runners[pending.model_id]
+        with profile_span("PyptoExecutor.reclaim_prepared_prefill", cat="executor"):
+            return runner.reclaim_prepared_prefill(pending.pending)
+
+    def run_prefill_in_slot(
+        self, model: RuntimeModel, batch: PrefillBatch, *, buffer_slot: int,
+    ) -> PrefillResult:
+        runner = self._runners[model.config.model_id]
+        with profile_span("PyptoExecutor.run_prefill", cat="executor",
+                          args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)}):
+            return runner.run_prefill_in_slot(model, batch, buffer_slot=buffer_slot)
 
     def finalize_prefill(
         self,

@@ -50,6 +50,11 @@ class TokenizerAdapter:
         """Return the Serving output parser registered for this tokenizer."""
         return None
 
+    @property
+    def output_parser_requires_tool_context(self) -> bool:
+        """Whether parsing is needed only for requests with tool context."""
+        return False
+
     def apply_chat_template(self, messages: list[dict[str, object]], **kwargs) -> str:
         """Encode chat messages into the model's generation prompt."""
         raise NotImplementedError
@@ -63,6 +68,11 @@ class TokenizerAdapter:
     def eos_token_id(self) -> int | None:
         """Return the end-of-sequence token ID, if available."""
         return None
+
+    @property
+    def eos_token_ids(self) -> tuple[int, ...]:
+        """Return all model termination tokens, including the primary EOS."""
+        return () if self.eos_token_id is None else (int(self.eos_token_id),)
 
     @property
     def pad_token_id(self) -> int | None:
@@ -197,20 +207,49 @@ class DeepSeekV4TokenizerAdapter(TransformersTokenizerAdapter):
         return "deepseek_v4"
 
 
+@dataclass
+class Glm53TokenizerAdapter(TransformersTokenizerAdapter):
+    """GLM tokenizer with the published generation termination tokens."""
+
+    termination_ids: tuple[int, ...] = ()
+
+    @property
+    def eos_token_ids(self) -> tuple[int, ...]:
+        return self.termination_ids or super().eos_token_ids
+
+
 def load_tokenizer(model_dir: str | Path, *, trust_remote_code: bool = False) -> TokenizerAdapter:
     """Load a local tokenizer and select any model-specific chat encoding."""
     model_path = Path(model_dir)
-    adapter_cls = (
-        DeepSeekV4TokenizerAdapter
-        if detect_model_family(read_model_config(model_path)) == "deepseek_v4"
-        else TransformersTokenizerAdapter
-    )
+    model_config = read_model_config(model_path)
+    family = detect_model_family(model_config)
+    if family == "deepseek_v41":
+        from .deepseek_v41.encoding import DeepSeekV41TokenizerAdapter
+
+        adapter_cls = DeepSeekV41TokenizerAdapter
+    elif family == "deepseek_v4":
+        adapter_cls = DeepSeekV4TokenizerAdapter
+    elif model_config.get("model_type") == "qwen3":
+        from .qwen.encoding import Qwen3TokenizerAdapter
+
+        adapter_cls = Qwen3TokenizerAdapter
+    elif family == "glm53":
+        adapter_cls = Glm53TokenizerAdapter
+    else:
+        adapter_cls = TransformersTokenizerAdapter
     if (model_path / "tokenizer.json").exists():
-        return adapter_cls.from_tokenizer_file(str(model_path))
-    return adapter_cls.from_pretrained(
-        str(model_path),
-        trust_remote_code=trust_remote_code,
-    )
+        adapter = adapter_cls.from_tokenizer_file(str(model_path))
+    else:
+        adapter = adapter_cls.from_pretrained(
+            str(model_path),
+            trust_remote_code=trust_remote_code,
+        )
+    generation_path = model_path / "generation_config.json"
+    if isinstance(adapter, Glm53TokenizerAdapter) and generation_path.exists():
+        eos = json.loads(generation_path.read_text()).get("eos_token_id")
+        values = eos if isinstance(eos, list) else [] if eos is None else [eos]
+        adapter.termination_ids = tuple(int(value) for value in values)
+    return adapter
 
 def _token_content(value: object) -> str | None:
     """Extract a special token string from tokenizer_config JSON."""
@@ -248,6 +287,8 @@ def _load_fast_tokenizer_from_file(model_path: Path, tokenizer_cls: type) -> obj
     if additional_special_tokens:
         special_tokens["additional_special_tokens"] = additional_special_tokens
     chat_template = tokenizer_config.get("chat_template")
+    if not chat_template and (model_path / "chat_template.jinja").is_file():
+        chat_template = (model_path / "chat_template.jinja").read_text()
     if isinstance(chat_template, (str, dict)):
         special_tokens["chat_template"] = chat_template
     return tokenizer_cls(tokenizer_file=str(tokenizer_file), **special_tokens)

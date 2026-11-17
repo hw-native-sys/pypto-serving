@@ -127,10 +127,12 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         *,
         compiled: _CompiledKernels,
         device_id: int = 0,
+        hbg_prefill: bool = False,
     ) -> None:
         super().__init__()
         self._compiled = compiled
         self._device_id = device_id
+        self._hbg_prefill = hbg_prefill
         self._init_l3_dispatch(stacked=False)
         # Device-resident decode output scratch (greedy path): allocated directly on
         # the worker (no host copy) so the per-step memset + D2H copy-back of the
@@ -170,7 +172,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
             prefill_task_args,
             topk_select_task_args,
         )
-        self._prefill_task_args = prefill_task_args(self)
+        self._prefill_task_args = prefill_task_args(self, hbg=self._hbg_prefill)
         self._decode_task_args = decode_task_args(self)
         self._topk_select_task_args = topk_select_task_args(self)
         for task_args in (
@@ -221,9 +223,8 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         logger.info("[init_kv_cache] creating L3 worker …")
         with profile_span("Qwen314BModelRunner.prepare_l3_worker", cat="executor"):
             self._shared_l3_worker()
-        # The L3 worker assembles the device binaries into each program's
-        # output_dir, which (via the compiler's save_kernels_dir) already is the
-        # kernel-cache slot -- so the cache is populated directly, no store step.
+        # PyPTO prepares every chip binary here and publishes READY artifacts
+        # when caching is enabled. Serving owns no artifact load/store step.
 
         logger.info("[init_kv_cache] uploading static tensors …")
         with profile_span("Qwen314BModelRunner.upload_static_tensors", cat="executor"):
@@ -458,8 +459,8 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
     def _warmup_dispatch(self, runtime: RuntimeConfig) -> None:
         """Production-scale prefill + decode warm-up with slot_mapping=-1.
 
-        Sizes the prefill to one serving scheduling step — total tokens =
-        ``max_num_batched_tokens`` spread across ``max_batch`` requests.
+        Sizes the prefill to one serving scheduling step across the runtime's
+        active prefill rows.
         This deliberately exercises the kernel at the configured capacity so
         that a too-large ``max_num_batched_tokens`` (which would hit the
         single-die attention heap ceiling around seq≈415 in the 40-layer
@@ -469,12 +470,13 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         batch = runtime.max_batch_size
         max_seq = runtime.max_seq_len
         mnb = getattr(runtime, "max_num_batched_tokens", 4096)
-        step_tokens = min(mnb, batch * max_seq)
-        per_req = max(step_tokens // batch, 1)
-        total_tokens = per_req * batch
+        prefill_rows = 1 if self._hbg_prefill else batch
+        step_tokens = min(mnb, prefill_rows * max_seq)
+        per_req = max(step_tokens // prefill_rows, 1)
+        total_tokens = per_req * prefill_rows
 
         logger.info(
-            f"[warmup] starting (batch={batch}, max_num_batched_tokens={mnb}, "
+            f"[warmup] starting (batch={batch}, prefill_rows={prefill_rows}, max_num_batched_tokens={mnb}, "
             f"max_seq={max_seq}, per_req={per_req}, total_tokens={total_tokens}, slot=-1)",
         )
         compiled = self._compiled
@@ -491,19 +493,19 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         prefill["slot_mapping"].fill_(-1)  # all writes to page 0
 
         token_offset = 0
-        for b in range(batch):
+        for b in range(prefill_rows):
             prefill["seq_lens"][b] = per_req
             prefill["chunk_lens"][b] = per_req
             prefill["chunk_offsets"][b] = token_offset
             token_offset += per_req
 
         prefill_inputs = _PrefillInputs(
-            actual_batch=batch,
+            actual_batch=prefill_rows,
             token_ids=prefill["input_ids"][:total_tokens],
             slot_mapping=prefill["slot_mapping"][:total_tokens],
         )
 
-        logger.info(f"[warmup] prefill dispatch … (batch={batch}, tokens={total_tokens})")
+        logger.info(f"[warmup] prefill dispatch … (active_rows={prefill_rows}, tokens={total_tokens})")
         t0 = time.perf_counter()
         self._run_l3(compiled.prefill, *self._prefill_kernel_args(prefill_inputs))
         logger.info(f"[warmup] prefill done ({time.perf_counter() - t0:.2f} s)")
@@ -532,7 +534,9 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
 
     def _alloc_kv_cache_tensor(self, shape: tuple[int, ...], dtype: torch.dtype) -> DeviceTensor:
         """Allocate one worker-resident KV cache tensor shared by prefill/decode."""
-        return self._shared_l3_worker().alloc_tensor(shape, dtype)
+        # Attention reads full KV pages: zero weights cannot suppress NaNs
+        # left in the unused value-page tail (0 * NaN is NaN).
+        return self._shared_l3_worker().alloc_tensor(shape, dtype, init=torch.zeros(shape, dtype=dtype))
 
     def _free_kv_cache_tensor(self, tensor: DeviceTensor) -> None:
         """Release one worker-resident KV cache tensor."""
@@ -784,13 +788,16 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         )
 
     def _prefill_kernel_args(self, inputs: _PrefillInputs) -> tuple[Any, ...]:
-        """Return arguments in ``qwen3_prefill_host`` signature order.
+        """Return arguments in the selected prefill host entry's signature order.
 
         Fixed-shape buffers and weights come from the prefill TaskArgs
         (``build()``); the per-call ``input_ids`` / ``slot_mapping`` are
         length-``total_tokens`` slices over the full slots, spliced in.
         """
         task_args = self._prefill_task_args
+        if self._hbg_prefill:
+            task_args.tensors["host_chunk_lens"].copy_(task_args.tensors["chunk_lens"])
+            task_args.tensors["host_chunk_offsets"].copy_(task_args.tensors["chunk_offsets"])
         args = list(task_args.build())
         args[task_args.names.index("input_ids")] = inputs.token_ids
         args[task_args.names.index("slot_mapping")] = inputs.slot_mapping

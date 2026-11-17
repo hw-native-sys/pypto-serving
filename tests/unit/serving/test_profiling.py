@@ -106,6 +106,10 @@ def test_worker_profile_commands_ack_after_state_change(monkeypatch):
     monkeypatch.setattr(serving_worker, "get_profiler", lambda **_kwargs: profiler)
 
     worker = serving_worker.WorkerProcess.__new__(serving_worker.WorkerProcess)
+
+    worker._services = None
+
+    worker._batch_builder = worker._make_decode_batch
     worker.input_queue = _Queue(
         [
             encode_command(ProfileCommand(active=True)),
@@ -131,8 +135,8 @@ def test_replica_core_waits_for_profile_ack(monkeypatch):
     sent = _Queue()
     acknowledgements = _Queue(
         [
-            encode_profile_result(ProfileResult(active=True)),
-            encode_profile_result(ProfileResult(active=False)),
+            encode_profile_result(ProfileResult(active=True, command_id=1)),
+            encode_profile_result(ProfileResult(active=False, command_id=2)),
         ]
     )
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
@@ -140,6 +144,7 @@ def test_replica_core_waits_for_profile_ack(monkeypatch):
     core._input_queue = sent
     core._profile_output_queue = acknowledgements
     core._step_timeout = 1.0
+    core._control_counter = 0
 
     async def control_profile():
         await core.start_profile()
@@ -149,8 +154,8 @@ def test_replica_core_waits_for_profile_ack(monkeypatch):
 
     commands = [decode_command(raw) for raw in sent.values]
     assert commands == [
-        ProfileCommand(active=True),
-        ProfileCommand(active=False),
+        ProfileCommand(active=True, command_id=1),
+        ProfileCommand(active=False, command_id=2),
     ]
 
 
