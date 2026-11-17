@@ -236,12 +236,40 @@ def stack(tmp_path, helper, tp=1, *, cache=None, capacity=2 << 20, trace=None):
     else:
         cache.tiering = TieredCache(cache, backend, capacity, trace=trace)
         tier = cache.tiering.tier
-    archive = SSDArchive(tier, pool, tmp_path, min(16 << 20, 1_000_000_000))
+    try:
+        archive = SSDArchive(tier, pool, tmp_path, min(16 << 20, 1_000_000_000))
+    except BaseException:
+        backend.close()
+        pool.close()
+        if cache is not None:
+            cache.tiering = None
+        raise
     if cache is not None:
         cache.tiering.add_store(archive)
     else:
         tier.on_store, tier.on_remove = archive.stored, archive.removed
     return pool, backend, tier, archive, owners, regions, pins, buffers
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_failed_stack_initialization_retires_backend_and_pool(tmp_path, monkeypatch, grouped):
+    from tests.unit.serving.test_grouped_prefix_cache import manager
+    created, backend_factory = [], SimplerBackend
+    def backend(*args, **kwargs):
+        value = backend_factory(*args, **kwargs)
+        created.append(value)
+        return value
+    def fail_probe(self):
+        raise OSError(22, "injected unsupported direct I/O")
+    monkeypatch.setitem(globals(), "SimplerBackend", backend)
+    monkeypatch.setattr(FileStore, "_probe", fail_probe)
+    cache = manager(slots=5, checkpoint_state=True) if grouped else None
+    with pytest.raises(OSError, match="unsupported direct I/O"):
+        stack(tmp_path, SimpleNamespace(inject=lambda *args: None), cache=cache)
+    assert len(created) == 1 and not created[0].thread.is_alive()
+    assert created[0].pool.buffer.closed and not list(tmp_path.iterdir())
+    if grouped:
+        assert cache.tiering is None
 
 
 def drain(tier, archive):
