@@ -48,9 +48,32 @@ def test_eplb_rejects_invalid_json_and_unknown_fields(value):
 
 
 @pytest.mark.parametrize("family,flags", [("qwen", []), ("deepseek_v41", []),
-                                         ("deepseek_v4", ["--pd-role", "prefill"]),
                                          ("deepseek_v4", ["--tp", "1"])])
 def test_eplb_rejects_unsupported_model_role_or_topology(family, flags):
     args = arguments("--enable-eplb", "--eplb-config", '{"max_migration_bytes": 1024}', *flags)
     with pytest.raises(ValueError):
         _resolve_eplb_config(args, family, {})
+
+
+@pytest.mark.parametrize("role,phase", [("prefill", "prefill"), ("decode", "decode")])
+def test_pd_eplb_resolves_role_and_rejects_a_conflicting_phase(role, phase):
+    args = arguments("--enable-eplb", "--pd-role", role, "--eplb-config",
+                     '{"max_migration_bytes":1024}')
+    config = _resolve_eplb_config(args, "deepseek_v4", {})
+    assert config.load_collection_phase is None
+    assert config.phase_for_role(role) == phase
+    args.eplb_config = json.dumps({"max_migration_bytes": 1024,
+                                  "load_collection_phase": "decode" if role == "prefill" else "prefill"})
+    with pytest.raises(ValueError, match="conflicts"):
+        _resolve_eplb_config(args, "deepseek_v4", {})
+
+
+def test_pd_decode_tp1_preserves_independent_head_and_expert_capacity():
+    args = arguments("--enable-eplb", "--pd-role", "decode", "--tp", "1", "--dp", "16",
+                     "--lm-head-tp", "4", "--eplb-config",
+                     '{"num_redundant_experts":16,"max_migration_bytes":1024}')
+    config = _resolve_eplb_config(args, "deepseek_v4", {})
+    assert config.validate_topology(logical_experts=256, ranks=16, tp_size=1, execution_role="decode") == 17
+    args.pd_role = "prefill"
+    with pytest.raises(ValueError, match="TP4"):
+        _resolve_eplb_config(args, "deepseek_v4", {})

@@ -45,7 +45,7 @@ at the intended context and batch sizes.
 
 ## Expert Load Balancing
 
-Add these options to a non-PD DSpark server using TP4/EP8 or TP4/EP16:
+Add these options to a DSpark server using TP4/EP8 or TP4/EP16:
 
 ```bash
 --enable-eplb \
@@ -63,7 +63,17 @@ rebalancing every 1024 collected steps, with at most one layer per rebalance
 and a minimum relative gain of 0.05. Optional JSON fields include `window_size`,
 `step_interval`, `load_collection_phase` (`prefill` or `decode`), `policy`
 (`temporal_greedy` or `cumulative_greedy`), `max_layers_per_rebalance`, and
-`min_relative_gain`. P/D deployments and drafter balancing are unsupported.
+`min_relative_gain`. Drafter balancing is unsupported. PD roles independently select
+prefill or decode loads; D also supports TP1 with independent head TP4; see [PD EPLB](../../user-guide/pd-disaggregation.md#expert-load-balancing).
+
+Maintenance waits at most `maintenance_timeout_seconds` (default 1 second) for
+compute outputs and conflicting DMA to settle before postponing a candidate.
+`cooldown_seconds` defaults to 30; `max_sample_age_seconds` defaults to 60.
+A measured pause-cost estimate is compared with predicted savings over
+`amortization_steps` (default 1024), with `maintenance_cost_margin` (default 1.25).
+The estimate uses dispatch wall time and load-balance gain as proxies, not a
+guarantee of kernel or end-to-end acceleration. Set `max_rebalances` to a positive
+count to learn that many placements and then freeze; zero (default) is unlimited.
 
 Serving and pypto-lib must both include the matching EPLB ABI. Maintenance drains
 in-flight outputs before migrating expert weights and scales, then publishes the

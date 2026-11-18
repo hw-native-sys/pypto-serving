@@ -52,8 +52,7 @@ def test_role_and_topology_contract():
     assert config.phase_for_role("mixed") == "decode"
     assert config.phase_for_role("prefill") == "prefill"
     assert config.validate_topology(logical_experts=256, ranks=16, tp_size=4, execution_role="mixed") == 17
-    with pytest.raises(ValueError, match="P/D"):
-        config.validate_topology(logical_experts=256, ranks=16, tp_size=4, execution_role="decode")
+    assert config.validate_topology(logical_experts=256, ranks=16, tp_size=4, execution_role="decode") == 17
     with pytest.raises(ValueError, match="TP4"):
         config.validate_topology(logical_experts=256, ranks=16, tp_size=1, execution_role="mixed")
     with pytest.raises(ValueError, match="conflicts"):

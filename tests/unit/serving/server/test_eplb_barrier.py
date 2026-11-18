@@ -114,6 +114,7 @@ def test_failed_maintenance_rejects_every_later_compute_command():
     assert not execution.is_alive() and not output.is_alive()
     assert not computed
     assert worker.output_queue.qsize() == 2
+    assert all(decode_result(worker.output_queue.get_nowait()).executor_fatal for _ in range(2))
     assert "partial weight installation" in worker._executor_fatal_error
 
 
@@ -151,3 +152,23 @@ def test_serial_worker_commits_between_reclaimed_steps_and_keeps_failure_fatal(m
         assert events == ["compute-1", "install"]
         assert results[0].error is None
         assert all(maintenance_error in result.error for result in results[1:])
+
+
+def test_fatal_worker_acknowledges_release_without_running_compute():
+    worker = module.WorkerProcess.__new__(module.WorkerProcess)
+    worker.model_record = SimpleNamespace(runtime_model=object())
+    worker.input_queue, worker.output_queue = Queue(), Queue()
+    worker._executor_fatal_error = "EPLB partial installation"
+    worker.executor = SimpleNamespace()
+    released = []
+    worker._wait_for_pending_decode_reclaims = lambda ids: None
+    worker._wait_for_pending_prefill_reclaims = lambda ids: None
+    worker._release_finished_request_state = lambda ids, **_: released.extend(ids)
+    worker._handle_step_command = lambda _: pytest.fail("compute after fatal maintenance")
+    cleanup = step(1)
+    cleanup.finished_request_ids = ["retired"]
+    worker.input_queue.put(encode_command(cleanup))
+    worker.input_queue.put(encode_command(ShutdownCommand()))
+    worker._serial_busy_loop()
+    result = decode_result(worker.output_queue.get_nowait())
+    assert released == ["retired"] and result.error is None and not result.executor_fatal

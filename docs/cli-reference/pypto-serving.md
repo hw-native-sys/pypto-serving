@@ -60,7 +60,7 @@ Leave `PYPTO_PROG_BUILD_DIR` unset for reuse; setting it requests explicit build
 | `--data-parallel-size`, `--dp` | `1` | Data-parallel size. |
 | `--tensor-parallel-size`, `--tp` | `1` | Tensor-parallel group size. |
 | `--expert-parallel-size`, `--ep` | `1` | Expert-parallel size where supported by the model. |
-| `--enable-eplb` | disabled | Enable DSpark expert load balancing on non-PD TP4/EP8 or TP4/EP16 deployments. |
+| `--enable-eplb` | disabled | Enable DSpark expert load balancing on TP4/EP8 or TP4/EP16 deployments, including PD nodes; PD Decode also accepts TP1 with independent head TP4. |
 | `--eplb-config` | unset | JSON configuration for EPLB; requires `--enable-eplb` and a positive `max_migration_bytes`. See [DSpark EPLB](../models/deepseek-v4/dspark.md#expert-load-balancing). |
 | `--data-parallel-routing` | `least_pending_tokens` | DP request routing policy. |
 

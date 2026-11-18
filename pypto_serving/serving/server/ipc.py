@@ -173,6 +173,7 @@ class StepResult(msgspec.Struct, tag="step"):
     # Echoes the originating StepCommand.step_id (pipeline ordering guard).
     step_id: int = 0
     num_draft_tokens: dict[str, int] = msgspec.field(default_factory=dict)
+    executor_fatal: bool = False
 
 
 class ReleaseResult(msgspec.Struct, tag="release"):

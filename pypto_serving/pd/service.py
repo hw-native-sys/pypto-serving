@@ -73,6 +73,7 @@ class Request:
     admitted: bool = False
     worker_release_ack: asyncio.Event = field(default_factory=asyncio.Event)
     completion_source: str | None = None
+    transfer_permit: str | None = None
 
 
 class Service:
@@ -98,11 +99,12 @@ class Service:
             payload = msgspec.msgpack.encode(value) if value is not None else b""
         with span(logger, "pd.worker." + operation, encode_ms=timing["duration_ms"],
                   encode_thread_cpu_ms=timing["thread_cpu_ms"]):
-            response = (await self.progress.call(operation, payload) if operation in ("submit", "source_state")
+            independent = operation in ("submit", "source_state", "reserve_write", "release_write")
+            response = (await self.progress.call(operation, payload) if independent
                         else await self.core.call_worker(operation, payload))
             result = msgspec.msgpack.decode(response)
-        if operation in ("submit", "source_state"):
-            if "error" in result:
+        if independent:
+            if isinstance(result, dict) and "error" in result:
                 raise TransferError(result["error"], uncertain=result["uncertain"])
         if operation == "submit":
             return result["job"]
@@ -385,6 +387,16 @@ class Service:
                     self.validate_plan(entry, plan, geometry, p_hit, peer.topology)
                 with span(logger, "pd.plan.digest", log=False, thread_cpu=True, role="decode") as digest_timing:
                     plan_digest = digest(plan)
+            if plan.copies:
+                key = "in:" + plan_digest
+                decision = await self.worker("reserve_write", dict(key=key))
+                if not decision["admitted"]:
+                    return dict(retry=True)
+                if (entry.cancelled or not self.is_ready() or entry.pending is not None
+                        or entry.transfer_permit is not None):
+                    await self.worker("release_write", dict(key=key))
+                    raise NodeUnavailable("PD request stopped before write authorization")
+                entry.transfer_permit = key
             if plan.copies or plan.final:
                 self.cache.authorize_group_cache_write(request)
             entry.pending = plan
@@ -405,6 +417,7 @@ class Service:
                 raise ValueError("no authorized chunk")
             completion = decode(payload["completion"], Completion)
             completion.check(entry.pending_digest, plan.units)
+            await self.release_transfer_permit(entry)
             entry.pending = None
             entry.pending_digest = None
             entry.chunk += 1
@@ -441,6 +454,11 @@ class Service:
             await self.abort(entry, stopped=stopped)
             return {}
         raise ValueError("unknown handoff operation")
+
+    async def release_transfer_permit(self, entry):
+        if entry.transfer_permit is not None:
+            await self.worker("release_write", dict(key=entry.transfer_permit))
+            entry.transfer_permit = None
 
     def validate_plan(self, entry, plan, geometry, p_hit, source_topology):
         if (entry.reservation is None or entry.pending is not None or plan.binding != entry.binding
@@ -561,6 +579,8 @@ class Service:
         if reservation is None or not reservation.write_authorized:
             stopped = True
             entry.source_done.set()
+        if stopped:
+            await self.release_transfer_permit(entry)
         if reservation is not None:
             if (reservation.write_authorized and not stopped
                     and (entry.pending is not None or entry.end < reservation.prompt_token_count)):
@@ -588,6 +608,26 @@ class Service:
                 entry.worker_release_ack.set()
             entry.state_task = None
 
+    async def authorize_plan(self, entry, call, plan, p_hit, plan_digest):
+        """Reserve P before asking D; return both permits on a busy receiver."""
+        deadline = asyncio.get_running_loop().time() + self.config.handoff_timeout
+        key = "out:" + plan_digest
+        while True:
+            if entry.cancelled:
+                raise ValueError("request cancelled while waiting for transfer admission")
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("PD transfer admission deadline")
+            admitted = not plan.copies or (await self.worker("reserve_write", dict(key=key)))["admitted"]
+            if admitted:
+                result = await call("plan", plan=plan, p_hit=p_hit)
+                if result == plan_digest:
+                    return
+                if plan.copies:
+                    await self.worker("release_write", dict(key=key))
+                if result != {"retry": True}:
+                    raise ValueError("destination acknowledged a different plan")
+            await asyncio.sleep(.01)
+
     async def prefill(self, entry, continuation, peer):
         entry.normalized_digest = digest(continuation)
         request = entry.binding.request
@@ -604,6 +644,7 @@ class Service:
         drain = None
         inflight = None
         submitted = False
+        source_permit = None
         async with self.peers.use(peer.key, lambda: self.connect(peer)) as session:
             entry.continuation = continuation
 
@@ -658,8 +699,8 @@ class Service:
                     entry.pending = plan
                     entry.pending_digest = plan_digest
                     submitted = False
-                    if await call("plan", plan=plan, p_hit=p_hit) != plan_digest:
-                        raise ValueError("destination acknowledged a different plan")
+                    source_permit = "out:" + plan_digest if plan.copies else None
+                    await self.authorize_plan(entry, call, plan, p_hit, plan_digest)
                     job = None
                     if plan.copies:
                         submitted = True  # A lost independent-submit reply is still uncertain.
@@ -720,6 +761,8 @@ class Service:
                     self.fail(entry, exc if isinstance(exc, Exception) else ValueError("request cancelled"))
                     if request in self.pins.active:
                         self.pins.release(request)
+                    if source_permit is not None:
+                        await self.worker("release_write", dict(key=source_permit))
                     await self.core.abort_request(request)
                     if drain is not None:
                         # The task may already carry the Prefill error we are

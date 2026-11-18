@@ -227,6 +227,64 @@ def test_role_specific_state_rings_do_not_change_the_chunk_contract(role, budget
     assert tuple(g.max_blocks_per_seq for g in runtime.kv_cache_groups if g.name.endswith("state")) == pages
 
 
+@pytest.mark.parametrize("ep,tp", [(8, 1), (8, 4), (16, 1), (16, 4)])
+def test_dspark_pd_prefix_hits_preserve_partition_request_capacity(ep, tp):
+    from dataclasses import replace
+    from pypto_serving.serving.memory.kv_cache import KVCacheCapacityError, KvCacheManager
+
+    partitions = ep // tp
+    limit = (16 + partitions - 1) // partitions
+    args = _parse_cli_args([
+        "--model", "model", "--pd-role", "decode", "--ep", str(ep), "--tp", str(tp),
+        "--dp", str(partitions), "--max-num-seqs", "16", "--max-model-len", "2048",
+        "--max-num-batched-tokens", "1024",
+        "--speculative-config", '{"method":"dspark","num_speculative_tokens":7}',
+    ])
+    runtime = cli._build_runtime_config(args, model_family="deepseek_v4",
+        config_data={"num_hidden_layers": 3, "compress_ratios": [0, 4, 128]})
+    assert {g.max_requests_per_partition for g in runtime.kv_cache_groups} == {limit}
+    # The physical rings fit the configured local concurrency, while history
+    # pages alone could admit more owners to one hot prefix partition.
+    counts = {"ori": 42 * limit, "hca_state": 53 * limit,
+              "csa_state": 86 * limit, "csa_inner_state": 86 * limit,
+              "cmp_c128": 64, "cmp_c4": 64, "idx": 64}
+    groups = tuple(replace(g, num_blocks=counts[g.name]) for g in runtime.kv_cache_groups)
+    cache = KvCacheManager(enable_prefix_cache=True)
+    cache.initialize(replace(runtime, kv_cache_groups=groups), num_blocks=counts["ori"],
+                     group_num_blocks=counts)
+    tokens = list(range(132))
+    history = tuple(g.name for g in groups if g.sliding_window is None)
+    hashes = cache.compute_group_block_hashes(tokens, group_names=history)
+
+    def reserve(name, partition=None):
+        return cache.reserve_group_cache(name, name, 260, partition=partition,
+            prompt_token_count=132, prefix_block_hashes=hashes, shareable_group_names=history)
+
+    reserve("warm", 0)
+    cache.authorize_group_cache_write("warm")
+    cache.commit_group_cache("warm")
+    cache.release_group_cache("warm", confirmed_stopped=True)
+    leases = [reserve(str(i)) for i in range(16)]
+    assert sum(r.partition == 0 for r in leases) == limit
+    assert sum(r.prefix_hit_tokens == 128 for r in leases) == limit
+    assert {p: sum(r.partition == p for r in leases) for p in range(partitions)} == {
+        p: limit for p in range(partitions)}
+    with pytest.raises(KVCacheCapacityError):
+        reserve("overflow")
+    for i in range(16):
+        cache.authorize_group_cache_write(str(i))
+        cache.commit_group_cache(str(i))
+        cache.adopt_group_cache(str(i))
+    # Every admitted request can grow through K7 lookahead without exhausting
+    # the hot partition while other partitions sit empty.
+    for end in range(140, 261, 8):
+        for i in range(16):
+            cache.ensure_group_blocks(str(i), end)
+    for i in range(16):
+        cache.release_group_cache(str(i), confirmed_stopped=True)
+    assert not cache._group_request_partitions
+
+
 @pytest.mark.parametrize("interval", [0, 128, 2048, 8192, 16384])
 @pytest.mark.parametrize("prefix", [False, True])
 def test_retention_interval_reaches_runtime_and_scheduler(interval, prefix):

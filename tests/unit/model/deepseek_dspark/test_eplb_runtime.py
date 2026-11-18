@@ -190,7 +190,9 @@ def test_async_planner_failure_stops_future_submissions(monkeypatch):
 
 @pytest.mark.parametrize("failure", [None, "transfer", "upload"])
 def test_maintenance_publishes_only_after_all_rank_table_uploads(failure):
+    from dataclasses import replace
     runtime, layout = runtime_fixture()
+    runtime.config = replace(runtime.config, max_rebalances=1)
     history = np.full((2, 1, 8), 10)
     history[:, :, 0] = 100
     history[:, :, 1] = 80
@@ -219,6 +221,10 @@ def test_maintenance_publishes_only_after_all_rank_table_uploads(failure):
         assert runtime.placement is plan.target
         assert events == ["install"] + ["upload"] * 8
         assert runtime.controller.current().generation == 1
+        control = torch.ones((4, 2), dtype=torch.int32)
+        context = runtime.begin("decode", torch.zeros((4, 1, 16), dtype=torch.int32), control)
+        runtime.complete(context)
+        assert not control[:, 1].any() and runtime.take_ready_plan() is None
     else:
         with pytest.raises(RuntimeError):
             runtime.apply(Worker(), {}, SimpleNamespace(compiled=object()), plan)
@@ -227,3 +233,57 @@ def test_maintenance_publishes_only_after_all_rank_table_uploads(failure):
             runtime.take_ready_plan()
         with pytest.raises(RuntimeError, match="fatal"):
             runtime.controller.current()
+
+
+@pytest.mark.parametrize("role,phase", [("prefill", "prefill"), ("decode", "decode")])
+def test_runtime_preflight_preserves_role_and_only_collects_the_selected_phase(monkeypatch, role, phase):
+    base = Placement.initial(layers=1, logical_experts=8, ranks=4, redundant_experts=4)
+    config = EplbConfig(enabled=True, num_redundant_experts=4, window_size=1, step_interval=1,
+                        max_migration_bytes=100_000)
+    runtime = EplbRuntime(base, config, execution_role=role)
+    layout = SimpleNamespace(expert_bytes=100, receive_bytes_per_rank=100, layer_views=lambda *_: ())
+    monkeypatch.setattr(ExpertBankLayout, "inspect", lambda *_: layout)
+    worker = SimpleNamespace(alloc_stacked_tensor=lambda value: value, run=lambda *_args, **_kwargs: None)
+    runtime.prepare(worker, {}, SimpleNamespace(compiled=object()))
+    assert runtime.controller.phase == phase
+    output = torch.zeros((4, 1, 16), dtype=torch.int32)
+    control = torch.zeros((4, 2), dtype=torch.int32)
+    other = "decode" if phase == "prefill" else "prefill"
+    output.fill_(-1)  # Unselected phases need not write statistics.
+    runtime.complete(runtime.begin(other, output, control))
+    assert not runtime.controller.has_ready_history() and not control[:, 1].any()
+    output.zero_()
+    runtime.complete(runtime.begin(phase, output, control))
+    assert runtime.controller.has_ready_history() and control[:, 1].all()
+    runtime.close()
+
+
+def test_plan_age_cooldown_and_measured_pause_gate_a_deferred_candidate(monkeypatch):
+    from dataclasses import replace
+    from pypto_serving.model.deepseek_dspark.eplb import runtime as runtime_module
+
+    runtime, _ = runtime_fixture()
+    ready_window(runtime)
+    plan = runtime.controller.take_ready_plan()
+    assert plan is not None
+    now = plan.sampled_at + 1
+    monkeypatch.setattr(runtime_module, "monotonic", lambda: now)
+    runtime.defer(plan)
+    assert runtime.take_ready_plan() is None
+    now += .2
+    assert runtime.take_ready_plan() is plan
+    runtime.defer(replace(plan, sampled_at=now - runtime.config.max_sample_age_seconds - 1))
+    now += .2
+    assert runtime.take_ready_plan() is None
+    runtime._last_commit = now
+    runtime.defer(plan)
+    now += .2
+    assert runtime.take_ready_plan() is None
+    now += runtime.config.cooldown_seconds
+    runtime._dispatch_seconds = .001
+    runtime.record_pause(plan, 100)
+    assert runtime.take_ready_plan() is None
+    runtime._dispatch_seconds = 100
+    runtime.defer(plan)
+    now += .2
+    assert runtime.take_ready_plan() is plan

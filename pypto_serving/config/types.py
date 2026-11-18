@@ -37,6 +37,12 @@ class EplbConfig:
     max_migration_bytes: int = 0
     transfer_backend: str = "device_maintenance"
     balance_drafter: bool = False
+    maintenance_timeout_seconds: float = 1.0
+    cooldown_seconds: float = 30.0
+    max_sample_age_seconds: float = 60.0
+    amortization_steps: int = 1024
+    maintenance_cost_margin: float = 1.25
+    max_rebalances: int = 0
 
     def __post_init__(self) -> None:
         for name in ("enabled", "balance_drafter"):
@@ -45,12 +51,22 @@ class EplbConfig:
         for name, minimum in (
             ("num_redundant_experts", 0), ("window_size", 1), ("step_interval", 1),
             ("max_layers_per_rebalance", 1), ("max_migration_bytes", 0),
+            ("amortization_steps", 1),
+            ("max_rebalances", 0),
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
                 raise ValueError(f"EPLB {name} must be an integer >= {minimum}")
         if self.step_interval < self.window_size:
             raise ValueError("EPLB step_interval must be >= window_size")
+        for name, minimum in (("maintenance_timeout_seconds", 0), ("cooldown_seconds", 0),
+                              ("max_sample_age_seconds", 0), ("maintenance_cost_margin", 1)):
+            value = getattr(self, name)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < minimum):
+                raise ValueError(f"EPLB {name} must be finite and >= {minimum}")
+        if self.max_sample_age_seconds == 0:
+            raise ValueError("EPLB max_sample_age_seconds must be positive")
         if self.load_collection_phase not in (None, "prefill", "decode"):
             raise ValueError("EPLB load_collection_phase must be prefill or decode")
         if self.policy not in ("temporal_greedy", "cumulative_greedy"):
@@ -82,10 +98,10 @@ class EplbConfig:
     def validate_topology(self, *, logical_experts: int, ranks: int, tp_size: int,
                           execution_role: str) -> int:
         """Freeze physical capacity before compilation or device allocation."""
-        if execution_role != "mixed":
-            raise ValueError("EPLB P/D integration is not yet supported")
-        if tp_size != 4 or ranks not in (8, 16):
-            raise ValueError("EPLB requires TP4/DP2/EP8 or TP4/DP4/EP16")
+        self.phase_for_role(execution_role)
+        supported_tp = (1, 4) if execution_role == "decode" else (4,)
+        if tp_size not in supported_tp or ranks not in (8, 16):
+            raise ValueError("EPLB requires EP8/EP16 with TP4, or TP1 on a PD Decode node")
         physical = logical_experts + self.num_redundant_experts
         if logical_experts <= 0 or physical % ranks or physical // ranks > logical_experts:
             raise ValueError("Invalid EPLB physical expert capacity")

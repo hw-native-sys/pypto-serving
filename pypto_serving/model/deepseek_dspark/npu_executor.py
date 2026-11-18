@@ -275,6 +275,10 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
     def eplb_enabled(self) -> bool:
         return self._eplb_config.enabled
 
+    @property
+    def eplb_config(self) -> EplbConfig:
+        return self._eplb_config
+
     def take_ready_eplb_plan(self, model: RuntimeModel):
         return self._runners[model.config.model_id].take_ready_eplb_plan()
 
@@ -283,6 +287,17 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
 
     def apply_eplb_plan(self, model: RuntimeModel, plan) -> None:
         self._runners[model.config.model_id].apply_eplb_plan(plan)
+
+    def defer_eplb_plan(self, model: RuntimeModel, plan) -> None:
+        self._runners[model.config.model_id]._eplb.defer(plan)
+
+    def eplb_plan_is_current(self, model: RuntimeModel, plan) -> bool:
+        from time import monotonic
+
+        return self._runners[model.config.model_id]._eplb._admit(plan, monotonic())
+
+    def record_eplb_pause(self, model: RuntimeModel, plan, seconds: float) -> None:
+        self._runners[model.config.model_id]._eplb.record_pause(plan, seconds)
 
     @property
     def max_prefill_batch_size(self) -> int:
@@ -561,6 +576,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             eplb_config=self._eplb_config,
             eplb_placement=eplb_placement,
             eplb_transfer=eplb_transfer,
+            execution_role=self._execution_role,
             prefill=prefill,
             prefill_async=prefill_async,
             bootstrap_one_l2_enabled=bootstrap_one_l2_enabled,

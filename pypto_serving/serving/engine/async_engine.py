@@ -293,6 +293,7 @@ class ReplicaEngineCore:
 
         self._request_contexts: dict[str, _RequestContext] = {}
         self._running = False
+        self._executor_fatal_error: str | None = None
         self._loop_task: asyncio.Task | None = None
         self._request_counter = 0
         self._pending_free_ids: list[str] = []
@@ -443,6 +444,7 @@ class ReplicaEngineCore:
         """
         return (
             self._running
+            and getattr(self, "_executor_fatal_error", None) is None
             and self._loop_task is not None
             and not self._loop_task.done()
             and self._worker_process is not None
@@ -592,6 +594,8 @@ class ReplicaEngineCore:
         constraint_spec: ConstraintSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
+        if getattr(self, "_executor_fatal_error", None) is not None:
+            raise RuntimeError(self._executor_fatal_error)
         with profile_span(
             "ReplicaEngineCore.add_request",
             cat="serving",
@@ -754,6 +758,8 @@ class ReplicaEngineCore:
         worker_release_ack: asyncio.Event | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Continue from an initialized cache lease using normal output delivery."""
+        if getattr(self, "_executor_fatal_error", None) is not None:
+            raise RuntimeError(self._executor_fatal_error)
         parser = create_output_parser(output_parser_spec, self.tokenizer)
         request, first_output = self.scheduler.admit_prefilled(
             reservation_id=reservation_id,
@@ -866,6 +872,8 @@ class ReplicaEngineCore:
         Returns True if a non-empty step was dispatched (and enqueued as
         in-flight), False if the scheduler produced nothing.
         """
+        if getattr(self, "_executor_fatal_error", None) is not None:
+            return False
         with profile_span("scheduler.schedule", cat="scheduler"):
             scheduler_output = self.scheduler.schedule(
                 allow_reject_stalled=not self._batch_queue
@@ -977,6 +985,15 @@ class ReplicaEngineCore:
             logger.error(f"Worker returned error: {step_result.error}")
             # This step's result was just consumed; only in-flight steps pend.
             self._handle_step_error(step_id, scheduler_output, result_pending=False, finished_ids=finished_ids)
+            if step_result.executor_fatal:
+                self._executor_fatal_error = step_result.error
+                for request_id in tuple(self.scheduler.requests):
+                    ctx = self._request_contexts.get(request_id)
+                    if ctx is not None and not getattr(ctx, "terminal_output_queued", False):
+                        ctx.terminal_output_queued = True
+                        ctx.queue.put_nowait(TokenOutput(finished=True, finish_reason="error"))
+                    self._schedule_worker_free(request_id)
+                    self.scheduler.abort_request(request_id)
             return False
 
         # Unwrap list[int] values back to int | list[int] for update_from_output.

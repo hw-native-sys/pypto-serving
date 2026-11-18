@@ -80,6 +80,14 @@ def handoff(length, p_hit=0, d_hit=0, p_tp=4, d_tp=1, ori_blocks=9, enabled=True
     core = SimpleNamespace(kv_cache_manager=d, is_ready=lambda: True)
     config = SimpleNamespace(prefill=(0,), decode=(0,), capacity=4)
     destination = Service(config, SimpleNamespace(node_id="d"), "decode", adapter, core, None)
+    from pypto_serving.pd.maintenance import TransferGate
+    gate = TransferGate(4)
+    async def permit(operation, payload):
+        value = msgspec.msgpack.decode(payload)
+        result = ({"admitted": gate.reserve(value["key"])} if operation == "reserve_write"
+                  else gate.release(value["key"]))
+        return msgspec.msgpack.encode(result)
+    destination.progress = SimpleNamespace(call=permit)
     destination.node, destination.geometry = nodes[1], dg
     entry = destination.register_http(binding, {})
     entry.continuation = Continuation(tokens, {"max_new_tokens": 512}, None, None)

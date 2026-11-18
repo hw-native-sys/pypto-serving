@@ -510,6 +510,7 @@ def build_dspark_cache_group_specs(
     max_seq_len: int = DSPARK_MAX_SEQ_LEN,
     max_prefill_tokens: int = DSPARK_PREFILL_MAX_TOKENS,
     partitions: int = DSPARK_CACHE_PARTITIONS,
+    max_requests_per_partition: int | None = None,
     decode_only: bool = False,
     prefill_only: bool = False,
     num_speculative_tokens: int = DSPARK_SPECULATIVE_TOKENS,
@@ -582,6 +583,7 @@ def build_dspark_cache_group_specs(
             ),
             max_blocks_per_seq=int(max_blocks_per_seq),
             num_partitions=partitions,
+            max_requests_per_partition=max_requests_per_partition,
             sliding_window=sliding_window,
             is_checkpoint_state=is_checkpoint_state,
             preserve_prefill_history=is_checkpoint_state and prefill_only,
@@ -1441,6 +1443,7 @@ class DSparkCompiledKernels:
     eplb_config: EplbConfig = field(default_factory=EplbConfig)
     eplb_placement: EplbPlacement | None = None
     eplb_transfer: Any | None = None
+    execution_role: str = "mixed"
     prefill: Any | None = None
     prefill_async: bool = False
     bootstrap_one_l2_enabled: bool = False
@@ -1616,7 +1619,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         if compiled.eplb_placement is not None:
             from pypto_serving.model.deepseek_dspark.eplb.runtime import EplbRuntime
 
-            self._eplb = EplbRuntime(compiled.eplb_placement, compiled.eplb_config)
+            self._eplb = EplbRuntime(compiled.eplb_placement, compiled.eplb_config,
+                                     execution_role=compiled.execution_role)
         self.runtime_extension = None
         self._needs_source_tail_capture = None
         self._plan_builder = self._prepare_decode_plan
@@ -1696,6 +1700,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 runtime.max_num_batched_tokens,
             ),
             partitions=self._compiled.layout.partitions,
+            max_requests_per_partition=math.ceil(runtime.max_batch_size / self._compiled.layout.partitions),
             decode_only=self._execution_role == "decode",
             prefill_only=self._execution_role == "prefill",
             num_speculative_tokens=self._compiled.num_speculative_tokens,
@@ -2894,6 +2899,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         return worker
 
     def _submit_l3(self, callable_spec, *args, config=None):
+        guard = getattr(self.runtime_extension, "before_compute", None)
+        if callable(guard):
+            guard()
         context = None
         if self._eplb is not None:
             self._eplb.check_healthy()
@@ -2922,6 +2930,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             self._eplb.complete(context, success=success)
 
     def _run_l3(self, callable_spec, *args, config=None):
+        guard = getattr(self.runtime_extension, "before_compute", None)
+        if callable(guard):
+            guard()
         if self._eplb is None:
             return super()._run_l3(callable_spec, *args, config=config)
         dispatch = self._submit_l3(callable_spec, *args, config=config)

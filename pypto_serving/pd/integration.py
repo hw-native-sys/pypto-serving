@@ -240,10 +240,8 @@ class Application:
         if engine_config.runtime_config.num_speculative_tokens <= 0:
             raise ValueError("PD deployment requires speculative decoding")
         self.config = config
-        progress = channel = None
-        if role == "prefill":
-            parent, channel = socket.socketpair()
-            progress = Progress(parent, config.handoff_timeout, config.capacity)
+        parent, channel = socket.socketpair()
+        progress = Progress(parent, config.handoff_timeout, config.capacity)
         self.channel, self.progress = channel, progress
         settings = WorkerSettings(self.boot, endpoint.transfer_hostname or endpoint.host,
                                   config.provider, config.capacity, len(config.prefill) + len(config.decode),

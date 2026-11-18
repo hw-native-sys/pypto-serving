@@ -12,7 +12,9 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace
 from threading import Lock
+from time import monotonic
 
 import numpy as np
 
@@ -38,6 +40,7 @@ class EplbController:
         self._selected_steps = 0
         self._last_dispatch_id = -1
         self._ready_history: np.ndarray | None = None
+        self._ready_at = 0.0
         self._failure: BaseException | None = None
 
     def _check_healthy(self) -> None:
@@ -66,12 +69,14 @@ class EplbController:
             self._selected_steps += 1
             if self._selected_steps % self.config.step_interval == 0:
                 self._ready_history = np.stack(self._window)
+                self._ready_at = monotonic()
             return True
 
     def take_ready_plan(self) -> RebalancePlan | None:
         with self._lock:
             self._check_healthy()
             history = self._ready_history
+            sampled_at = self._ready_at
             self._ready_history = None
             base = self._placement
         if history is None:
@@ -81,7 +86,7 @@ class EplbController:
             self._check_healthy()
             if self._placement is not base:
                 return None
-        return plan
+        return replace(plan, sampled_at=sampled_at) if plan is not None else None
 
     def has_ready_history(self) -> bool:
         """Inspect readiness without running the placement policy on the caller."""

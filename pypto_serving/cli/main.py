@@ -105,7 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="DSpark vocabulary head TP, independent of attention TP (default: 4).",
     )
     parser.add_argument("--enable-eplb", action="store_true",
-                        help="Enable non-PD DSpark expert load balancing on TP4/EP8 or TP4/EP16.")
+                        help="Enable DSpark expert load balancing on TP4/EP8 or TP4/EP16, including PD nodes.")
     parser.add_argument("--eplb-config", default=None,
                         help="EPLB JSON options; requires --enable-eplb and a positive max_migration_bytes.")
     # Dtype
@@ -550,12 +550,17 @@ def _build_runtime_config(
             max_prefill_tokens_per_request = min(
                 max_prefill_tokens_per_request, args.long_prefill_token_threshold,
             )
+        cache_partitions = args.expert_parallel_size // args.tensor_parallel_size
         kv_cache_groups = build_dspark_cache_group_specs(
             num_hidden_layers,
             compress_ratios,
             max_seq_len=args.max_model_len,
             max_prefill_tokens=max_prefill_tokens_per_request,
-            partitions=args.expert_parallel_size // args.tensor_parallel_size,
+            partitions=cache_partitions,
+            max_requests_per_partition=(
+                (args.max_num_seqs + cache_partitions - 1) // cache_partitions
+                if args.max_num_seqs is not None else None
+            ),
             decode_only=args.pd_role == "decode",
             prefill_only=args.pd_role == "prefill",
             num_speculative_tokens=num_speculative_tokens,

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from concurrent.futures import Future, ThreadPoolExecutor
 import logging
 from threading import Lock
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Any
 
 import numpy as np
@@ -38,14 +38,17 @@ class DispatchContext:
     placement: Placement
     output: torch.Tensor
     record_enabled: bool
+    submitted_at: float
 
 
 class EplbRuntime:
     """One executor's expert tables; maintenance is serialized by its execution lane."""
 
-    def __init__(self, placement: Placement, config: EplbConfig):
+    def __init__(self, placement: Placement, config: EplbConfig, *, execution_role: str = "mixed"):
         self.placement = placement
         self.config = config
+        self.execution_role = execution_role
+        config.phase_for_role(execution_role)
         self.controller: EplbController | None = None
         self.bank_layout: ExpertBankLayout | None = None
         self.tables: dict[str, Any] = {}
@@ -58,6 +61,13 @@ class EplbRuntime:
         self._failure: BaseException | None = None
         self._planner: ThreadPoolExecutor | None = None
         self._planning: Future | None = None
+        self._candidate: RebalancePlan | None = None
+        self._retry_at = 0.0
+        self._last_commit = -float("inf")
+        self._dispatch_seconds = 0.0
+        self._pause_seconds = 0.0
+        self._last_payload_bytes = 0
+        self._commits = 0
         ranks, slots = placement.ranks, placement.local_slots
         self._sources = shared_empty((ranks, ranks, slots, 2), torch.int32, name="eplb_sources")
         self._changed = shared_empty((ranks, ranks, slots), torch.int32, name="eplb_changed")
@@ -105,15 +115,18 @@ class EplbRuntime:
         worker.run(transfer.compiled, *views, self._sources, self._changed, 1, config=self.run_config)
         self._epoch = 1
         self.bank_layout = layout
-        self.controller = EplbController(self.placement, self.config, expert_bytes=layout.expert_bytes)
-        logger.info("[eplb] prepared generation=0 physical_experts=%d local_slots=%d receive_bytes_per_rank=%d",
-                    self.placement.physical_to_logical.shape[1], self.placement.local_slots,
+        self.controller = EplbController(self.placement, self.config, expert_bytes=layout.expert_bytes,
+                                         execution_role=self.execution_role)
+        logger.info("[eplb] prepared role=%s generation=0 physical_experts=%d local_slots=%d receive_bytes_per_rank=%d",
+                    self.execution_role, self.placement.physical_to_logical.shape[1], self.placement.local_slots,
                     layout.receive_bytes_per_rank)
 
     def begin(self, phase: str, output: torch.Tensor, control: torch.Tensor, *, record: bool = True):
         self.check_healthy()
         if self.controller is None:
             raise RuntimeError("EPLB dispatch before maintenance preflight")
+        record = (record and phase == self.controller.phase
+                  and (not self.config.max_rebalances or self._commits < self.config.max_rebalances))
         with self._lock:
             dispatch_id = self._next_dispatch
             if dispatch_id >= np.iinfo(np.int32).max:
@@ -123,7 +136,7 @@ class EplbRuntime:
             self._inflight.add(dispatch_id)
         control[:, 0].fill_(dispatch_id)
         control[:, 1].fill_(int(record and phase == self.controller.phase))
-        return DispatchContext(dispatch_id, phase, placement, output, record)
+        return DispatchContext(dispatch_id, phase, placement, output, record, monotonic())
 
     def complete(self, context: DispatchContext, *, success: bool = True):
         """Retire each context once, forwarding samples in submission order."""
@@ -137,6 +150,10 @@ class EplbRuntime:
                     slots = context.placement.local_slots
                     counts = context.output[:, :, :slots].numpy()
                     sample = LoadSample(context.dispatch_id, context.phase, context.placement, counts)
+                    if context.phase == self.controller.phase:
+                        elapsed = monotonic() - context.submitted_at
+                        self._dispatch_seconds = (elapsed if not self._dispatch_seconds
+                                                  else .9 * self._dispatch_seconds + .1 * elapsed)
                 self._inflight.remove(context.dispatch_id)
                 self._completed[context.dispatch_id] = sample
                 while self._next_reclaim in self._completed:
@@ -154,6 +171,14 @@ class EplbRuntime:
         self.check_healthy()
         if self.controller is None:
             return None
+        if self.config.max_rebalances and self._commits >= self.config.max_rebalances:
+            return None
+        now = monotonic()
+        if now < self._retry_at or now - self._last_commit < self.config.cooldown_seconds:
+            return None
+        if self._candidate is not None:
+            plan, self._candidate = self._candidate, None
+            return plan if self._admit(plan, now) else None
         if self._planning is None and self.controller.has_ready_history():
             if self._planner is None:
                 # The first sample arrives after all native workers have forked.
@@ -169,11 +194,33 @@ class EplbRuntime:
             self.controller.failed(error)
             raise
         if plan is not None:
-            if plan.base_generation != self.placement.generation:
+            if not self._admit(plan, monotonic()):
                 return None
             logger.info("[eplb] plan ready base_generation=%d planning_ms=%.3f",
                         plan.base_generation, elapsed_ms)
         return plan
+
+    def _admit(self, plan, now):
+        if (plan.base_generation != self.placement.generation
+                or now - plan.sampled_at > self.config.max_sample_age_seconds):
+            return False
+        # Dispatch wall time is a proxy, not a measured MoE kernel speedup.
+        savings = self._dispatch_seconds * plan.predicted_gain * self.config.amortization_steps
+        cost = self._pause_seconds * max(1.0, plan.payload_bytes / max(1, self._last_payload_bytes))
+        if cost and savings < cost * self.config.maintenance_cost_margin:
+            logger.info("[eplb] deferred role=%s reason=amortization predicted_savings_ms=%.3f cost_ms=%.3f",
+                        self.execution_role, savings * 1000, cost * 1000)
+            return False
+        return True
+
+    def defer(self, plan):
+        self.check_healthy()
+        self._candidate = plan
+        self._retry_at = monotonic() + .1
+
+    def record_pause(self, plan, seconds):
+        self._pause_seconds = seconds
+        self._last_payload_bytes = plan.payload_bytes
 
     def _plan(self):
         started = perf_counter()
@@ -230,9 +277,11 @@ class EplbRuntime:
                                    worker_id=rank)
             self.controller.committed(plan)
             self.placement = plan.target
-            logger.info("[eplb] committed generation=%d layers=%s payload_bytes=%d predicted_gain=%.6f "
+            self._last_commit = monotonic()
+            self._commits += 1
+            logger.info("[eplb] committed role=%s generation=%d layers=%s payload_bytes=%d predicted_gain=%.6f "
                         "changed_slots=%d replica_changes=%d remote_bytes=%d elapsed_ms=%.3f",
-                        plan.target.generation, [move.layer_id for move in plan.layers],
+                        self.execution_role, plan.target.generation, [move.layer_id for move in plan.layers],
                         plan.payload_bytes, plan.predicted_gain, changed_slots, replica_changes,
                         remote_slots * self.bank_layout.expert_bytes, (perf_counter() - started) * 1000)
         except BaseException as error:

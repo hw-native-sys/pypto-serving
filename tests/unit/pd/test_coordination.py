@@ -81,6 +81,42 @@ def assert_idle(router):
     assert all(s.outstanding == 0 for s in router.registry.states)
 
 
+def test_default_pd_client_reaches_nodes_despite_ambient_proxy(monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+    from pypto_serving.router.app import default_client_factory
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            body = b'{"direct":true}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.setenv(name, "http://127.0.0.1:1")
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.setenv(name, "")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever)
+    thread.start()
+    async def run():
+        async with default_client_factory(config()) as client:
+            response = await client.post(f"http://127.0.0.1:{server.server_port}/v1/completions", json={})
+            assert response.status_code == 200 and response.json() == {"direct": True}
+    try:
+        asyncio.run(run())
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_json_and_sse_generation(stream):
     async def run():

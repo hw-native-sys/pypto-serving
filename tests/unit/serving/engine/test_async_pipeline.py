@@ -632,3 +632,32 @@ def test_async_pipeline_drains_stale_result_after_error(monkeypatch):
     got = decode_result(asyncio.run(core._get_live_result()))
     assert got.step_id == 99
     assert core._discard_result_step_ids == set()
+
+
+def test_fatal_executor_stops_new_admission_but_preserves_cleanup_ack():
+    core, dispatched = _async_pipeline_core()
+    core._running = True
+    request = _running_decode_request()
+    core.scheduler.running.append(request)
+    core.scheduler.requests[request.request_id] = request
+    ctx = SimpleNamespace(queue=asyncio.Queue(), request=request, stream=True,
+                          worker_release_done=asyncio.Event())
+    core._request_contexts[request.request_id] = ctx
+    assert core._try_dispatch_step()
+    results = deque([encode_result(StepResult(new_tokens={}, error="EPLB installation failed",
+        executor_fatal=True, step_id=dispatched[0].step_id))])
+    core._output_queue = SimpleNamespace(get=lambda timeout=None: results.popleft())
+    assert asyncio.run(core._await_and_apply_oldest()) is False
+    assert ctx.queue.get_nowait().finish_reason == "error"
+    assert not core.is_ready() and not core._try_dispatch_step()
+    def put(raw):
+        command = decode_command(raw)
+        dispatched.append(command)
+        results.append(encode_result(StepResult(new_tokens={}, step_id=command.step_id)))
+    core._input_queue = SimpleNamespace(put=put)
+    asyncio.run(core._flush_pending_frees())
+    assert ctx.worker_release_done.is_set() and not core._pending_free_ids
+    async def rejected():
+        with pytest.raises(RuntimeError, match="EPLB installation"):
+            await anext(core.add_request("later", "hello", GenerateConfig()))
+    asyncio.run(rejected())

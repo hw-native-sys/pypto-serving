@@ -373,6 +373,8 @@ def test_pd_bootstrap_reuses_normal_seed_with_local_generations(monkeypatch, len
     monkeypatch.setattr(runner, "_wait_for_pending_decode_dispatches", lambda: events.append("fence"))
     monkeypatch.setattr(runner, "_clear_drafter_lease", lambda *key: events.append(("clear", key)))
     extension = DSparkExtension.__new__(DSparkExtension)
+    from pypto_serving.pd.maintenance import TransferGate
+    extension.transfer = SimpleNamespace(gate=TransferGate(16))
     extension.runner, extension.compiled, extension.worker = runner, runner._compiled, lambda: worker
     extension.draft_states, extension.ranks, extension.tp = runner._drafter_states, 16, tp_size
     ids = ["first", "same-group", "other-partition"]

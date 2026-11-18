@@ -11,7 +11,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from time import monotonic
 import math
 
 import numpy as np
@@ -50,9 +51,12 @@ class RebalancePlan:
     target: Placement
     layers: tuple[LayerMovePlan, ...]
     predicted_gain: float
+    sampled_at: float = field(default_factory=monotonic)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "layers", tuple(self.layers))
+        if not isinstance(self.sampled_at, (int, float)) or not math.isfinite(self.sampled_at) or self.sampled_at < 0:
+            raise ValueError("Invalid EPLB sample timestamp")
         if (isinstance(self.base_generation, bool) or not isinstance(self.base_generation, int)
                 or self.base_generation < 0 or self.target.generation != self.base_generation + 1):
             raise ValueError("Migration must advance exactly one generation")

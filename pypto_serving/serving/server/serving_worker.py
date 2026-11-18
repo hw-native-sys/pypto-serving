@@ -344,8 +344,11 @@ class WorkerProcess:
                     logger.error("Worker EPLB maintenance failed; stopping model submissions", exc_info=True)
                     self._executor_fatal_error = f"EPLB maintenance failed: {exc}"
             if getattr(self, "_executor_fatal_error", None) is not None:
+                if self._release_after_fatal(cmd):
+                    self.output_queue.put(encode_result(StepResult(new_tokens={}, step_id=cmd.step_id)))
+                    continue
                 self.output_queue.put(encode_result(StepResult(
-                    new_tokens={}, error=self._executor_fatal_error, step_id=cmd.step_id,
+                    new_tokens={}, error=self._executor_fatal_error, step_id=cmd.step_id, executor_fatal=True,
                 )))
                 continue
             self._handle_step_command(cmd)
@@ -480,8 +483,12 @@ class WorkerProcess:
                     logger.error("Worker EPLB maintenance failed; stopping model submissions", exc_info=True)
                     self._executor_fatal_error = f"EPLB maintenance failed: {exc}"
             if getattr(self, "_executor_fatal_error", None) is not None:
+                if self._release_after_fatal(cmd, release_cache_entries):
+                    output_work_queue.put(_CompletedStepOutput(StepResult(new_tokens={}, step_id=cmd.step_id),
+                        buffer_slot=prepared.buffer_slot if prepared is not None else None))
+                    continue
                 output_work_queue.put(_CompletedStepOutput(
-                    StepResult(new_tokens={}, error=self._executor_fatal_error, step_id=cmd.step_id),
+                    StepResult(new_tokens={}, error=self._executor_fatal_error, step_id=cmd.step_id, executor_fatal=True),
                     buffer_slot=prepared.buffer_slot if prepared is not None else None,
                 ))
                 continue
@@ -653,6 +660,18 @@ class WorkerProcess:
                 slot_ownership[buffer_slot].release()
             self.output_queue.put(encode_result(result))
 
+    def _release_after_fatal(self, cmd, expected_cache_entries=None):
+        if cmd.new_requests or cmd.prefill_requests or cmd.decode_requests or not cmd.finished_request_ids:
+            return False
+        try:
+            self._wait_for_pending_decode_reclaims(cmd.finished_request_ids)
+            self._wait_for_pending_prefill_reclaims(cmd.finished_request_ids)
+            self._release_finished_request_state(cmd.finished_request_ids, expected_cache_entries=expected_cache_entries)
+        except Exception:
+            logger.exception("Worker cleanup after fatal maintenance failed")
+            return False
+        return True
+
     def _maintain_eplb(self, output_work_queue: queue.Queue[object] | None = None) -> None:
         if getattr(self.executor, "eplb_enabled", False) is not True:
             return
@@ -661,18 +680,54 @@ class WorkerProcess:
         if plan is None:
             return
         pause_started = perf_counter()
+        settings = getattr(self.executor, "eplb_config", None)
+        timeout = getattr(settings, "maintenance_timeout_seconds", 1.0)
+        deadline = pause_started + timeout
+        services = getattr(self, "_services", None)
+        acquired = False
+
+        def defer():
+            operation = getattr(self.executor, "defer_eplb_plan", None)
+            if callable(operation):
+                operation(model, plan)
+            logger.info("[eplb] maintenance deferred before installation")
+
         self.executor.validate_eplb_plan(model, plan)
         if output_work_queue is not None:
             barrier = _EplbDrainBarrier(threading.Event())
             output_work_queue.put(barrier)
-            barrier.completed.wait()
+            if not barrier.completed.wait(max(0, deadline - perf_counter())):
+                defer()
+                return
             if barrier.error is not None:
+                if services is not None:
+                    services.end_maintenance(RuntimeError(barrier.error))
                 raise RuntimeError(f"EPLB output drain failed: {barrier.error}")
-        # A serial step has already reclaimed all outputs before returning.
-        # Run on the execution lane, after output buffers and request refs retire.
-        maintenance_started = perf_counter()
-        self.executor.apply_eplb_plan(model, plan)
+        try:
+            # Progress and completion run independently while compute is paused.
+            if services is not None:
+                acquired = services.begin_maintenance(max(0, deadline - perf_counter()))
+                if not acquired:
+                    defer()
+                    return
+            current = getattr(self.executor, "eplb_plan_is_current", None)
+            if callable(current) and not current(model, plan):
+                return
+            self.executor.validate_eplb_plan(model, plan)
+            maintenance_started = perf_counter()
+            self.executor.apply_eplb_plan(model, plan)
+        except BaseException as error:
+            if services is not None:
+                services.end_maintenance(error)
+                acquired = False
+            raise
+        finally:
+            if acquired:
+                services.end_maintenance()
         resumed = perf_counter()
+        record_pause = getattr(self.executor, "record_eplb_pause", None)
+        if callable(record_pause):
+            record_pause(model, plan, resumed - pause_started)
         logger.info("[eplb] resumed submissions drain_ms=%.3f maintenance_ms=%.3f pause_ms=%.3f",
                     (maintenance_started - pause_started) * 1000,
                     (resumed - maintenance_started) * 1000, (resumed - pause_started) * 1000)
