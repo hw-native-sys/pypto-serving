@@ -123,4 +123,5 @@ nav:
       - Accuracy Debugging: developer-guide/accuracy-debugging.md
       - Model Integration: developer-guide/model-integration.md
       - Weight Staging: developer-guide/weight-staging.md
+      - V4.1 Engram and Decode Optimization: developer-guide/v41-engram-decode-optimization.md
       - JIT Cache: developer-guide/jit-cache.md
