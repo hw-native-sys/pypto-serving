@@ -19,7 +19,8 @@ from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
 from pypto_serving.observability import dplb_dfx
 from pypto_serving.observability.dplb_dfx import DplbDfxConfig, DplbDfxRecorder
 from pypto_serving.serving.memory.kv_cache import KVCacheCapacityError, KvCacheManager
-from pypto_serving.serving.sched.scheduler import Request, Scheduler, SchedulerConfig
+from pypto_serving.serving.sched.scheduler import Request, RequestStatus, Scheduler, SchedulerConfig
+from pypto_serving.serving.server.ipc import DecodeRequest, StepCommand
 
 
 def cache(enabled=True, *, blocks=256, request_limit=None):
@@ -119,6 +120,87 @@ def test_full_prompt_max_reduction_and_empty_group(capture):
     assert released["groups"][0]["max_logical_tokens"] == 128
     assert released["groups"][0]["request_count"] == 1
     assert released["groups"][1]["request_count"] == 0
+
+
+def test_step_snapshot_records_scheduled_load_and_worker_outcome(capture):
+    """M2 records the submitted command without claiming runner row extents."""
+    from pypto_serving.serving.engine.async_engine import EngineConfig, ReplicaEngineCore
+    from pypto_serving.serving.sched.scheduler import ScheduledRequest, SchedulerOutput
+
+    manager = cache()
+    manager.dplb_dfx = capture
+    block_ids = manager.ensure_group_blocks("decode", 32, partition=1, load_tokens=32)
+    request = Request(
+        request_id="decode",
+        prompt_token_ids=[1, 2],
+        max_new_tokens=8,
+        num_computed_tokens=32,
+        output_token_ids=[9],
+        status=RequestStatus.RUNNING,
+    )
+    scheduled = ScheduledRequest(
+        request=request,
+        num_new_tokens=1,
+        is_prefill=False,
+        num_computed_tokens=32,
+        num_speculative_tokens=2,
+        block_ids_by_group=block_ids,
+        cache_partition=1,
+    )
+    scheduler_output = SchedulerOutput(
+        scheduled_requests=[scheduled],
+        num_decode_tokens=3,
+    )
+
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.config = EngineConfig(device_ids=(0, 1, 2, 3))
+    core.kv_cache_manager = manager
+    core.scheduler = SimpleNamespace(running=[request])
+    core._dplb_dfx = capture
+    command = StepCommand(
+        new_requests=[],
+        prefill_requests=[],
+        decode_requests=[DecodeRequest(
+            request_id="decode",
+            last_token=9,
+            seq_len=33,
+            block_ids=[0],
+            block_ids_by_group=block_ids,
+            cache_partition=1,
+        )],
+        finished_request_ids=[],
+        step_id=7,
+    )
+
+    core._emit_dfx_step_plan(scheduler_output, command, dispatch_ordinal=3)
+    core._emit_dfx_step_outcome(
+        7,
+        scheduler_output,
+        {"decode": [10, 11]},
+        {"decode": 2},
+    )
+
+    events = records(capture)
+    plan = next(event for event in events if event["event"] == "step_plan")
+    row = plan["requests"][0]
+    assert plan["step_id"] == 7
+    assert plan["dispatch_ordinal"] == 3
+    assert plan["active_count"] == 1
+    assert plan["decode_tokens"] == 3
+    assert row["stage"] == "decode"
+    assert row["logical_length_after"] == 33
+    assert row["logical_length_status"] == "committed_snapshot"
+    assert row["speculative_proposed_tokens"] == 2
+    assert row["row_extent"]["valid_rows"] is None
+    assert row["row_extent"]["unavailable_reason"] == "runner_prepare_not_observed"
+    group = next(group for group in plan["groups"] if group["group_id"] == 1)
+    assert group["tp_ranks"] == [2, 3]
+    assert group["participating_request_ids"] == ["decode"]
+
+    outcome = next(event for event in events if event["event"] == "step_outcome")
+    assert outcome["status"] == "completed"
+    assert outcome["requests"][0]["returned_tokens"] == 2
+    assert outcome["requests"][0]["speculative_accepted_tokens"] == 1
 
 
 def test_filtered_candidates_explain_capacity_and_request_limit(capture):

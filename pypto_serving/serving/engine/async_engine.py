@@ -342,6 +342,8 @@ class ReplicaEngineCore:
         self._initialization_steps: set[int] = set()
         self._max_in_flight = 2 if self._async_scheduling else 1
         self._step_counter = 0
+        self._dfx_dispatch_ordinal = 0
+        self._dfx_dispatch_ordinals: dict[int, int] = {}
         # step_ids of dispatched steps whose worker StepResult has NOT yet been
         # consumed off _output_queue but whose batch was discarded (error/timeout
         # dropped the pipeline). The worker is FIFO and emits exactly one result
@@ -380,6 +382,210 @@ class ReplicaEngineCore:
                     num_preemptions=len(output.preempted_requests) if output else 0,
                 ),
             )
+
+    @staticmethod
+    def _dfx_length_distribution(values: list[int]) -> dict:
+        """Return a bounded summary while retaining the per-request lengths."""
+        return dict(
+            count=len(values),
+            sum=sum(values),
+            min=min(values) if values else 0,
+            max=max(values) if values else 0,
+            values=values,
+        )
+
+    def _dfx_group_snapshot(self, request_rows: list[dict]) -> list[dict]:
+        """Build the logical DP-group view for one submitted StepCommand.
+
+        The topology is known from the worker device layout.  The per-step
+        rows describe only requests participating in this command; the
+        ``policy_load`` field retains the allocator's complete logical owner
+        view when grouped DPLB is enabled.
+        """
+        topology = self._dfx_topology()
+        policy_groups = []
+        groups_fn = getattr(self.kv_cache_manager, "_dfx_groups", None)
+        if callable(groups_fn):
+            try:
+                policy_groups = groups_fn()
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                logger.debug("Unable to snapshot DPLB policy groups", exc_info=True)
+        policy_by_id = {row.get("group_id"): row for row in policy_groups}
+        known_partitions = {
+            row.get("cache_partition")
+            for row in request_rows
+            if row.get("cache_partition") is not None
+        }
+        if not topology and known_partitions:
+            topology = [
+                dict(
+                    group_id=partition,
+                    tp_ranks=None,
+                    devices=None,
+                    status="mapping_unavailable",
+                )
+                for partition in sorted(known_partitions)
+            ]
+
+        groups = []
+        for topology_row in topology:
+            group_id = topology_row.get("group_id")
+            members = [
+                row for row in request_rows
+                if row.get("cache_partition") == group_id
+            ]
+            groups.append(
+                dict(
+                    **topology_row,
+                    participating_request_ids=[row["request_id"] for row in members],
+                    participating_request_count=len(members),
+                    participating_logical_tokens=sum(
+                        row["logical_length_after"] for row in members
+                    ),
+                    participating_prefill_tokens=sum(
+                        row["prefill_tokens"] for row in members
+                    ),
+                    participating_decode_tokens=sum(
+                        row["decode_tokens"] for row in members
+                    ),
+                    policy_load=policy_by_id.get(group_id),
+                )
+            )
+        return groups
+
+    def _dfx_step_request_rows(self, scheduler_output: SchedulerOutput) -> list[dict]:
+        dfx = getattr(self, "_dplb_dfx", None)
+        if dfx is None:
+            return []
+        rows = []
+        for scheduled in scheduler_output.scheduled_requests:
+            request = scheduled.request
+            stage = "prefill" if scheduled.is_prefill else "decode"
+            planned_decode_tokens = (
+                scheduled.num_new_tokens + scheduled.num_speculative_tokens
+                if stage == "decode" else 0
+            )
+            identity = dfx.request_fields(request.request_id)
+            rows.append(
+                dict(
+                    **identity,
+                    stage=stage,
+                    is_prefill=scheduled.is_prefill,
+                    prompt_tokens=request.num_prompt_tokens,
+                    num_computed_tokens=scheduled.num_computed_tokens,
+                    num_new_tokens=scheduled.num_new_tokens,
+                    logical_length_before=scheduled.num_computed_tokens,
+                    logical_length_after=(
+                        scheduled.num_computed_tokens + scheduled.num_new_tokens
+                    ),
+                    optimistic_output_placeholders=request.num_output_placeholders,
+                    logical_length_status=(
+                        "includes_in_flight_placeholders"
+                        if request.num_output_placeholders
+                        else "committed_snapshot"
+                    ),
+                    prefill_tokens=scheduled.num_new_tokens if scheduled.is_prefill else 0,
+                    decode_tokens=planned_decode_tokens,
+                    speculative_proposed_tokens=scheduled.num_speculative_tokens,
+                    cache_partition=scheduled.cache_partition,
+                    block_table_extents={
+                        name: len(block_ids)
+                        for name, block_ids in scheduled.block_ids_by_group.items()
+                    },
+                    row_extent=dict(
+                        valid_rows=None,
+                        padded_rows=None,
+                        status="unavailable",
+                        unavailable_reason="runner_prepare_not_observed",
+                    ),
+                )
+            )
+        return rows
+
+    def _emit_dfx_step_plan(
+        self,
+        scheduler_output: SchedulerOutput,
+        step_command: StepCommand,
+        *,
+        dispatch_ordinal: int,
+    ) -> None:
+        """Record the exact Host command submitted for one scheduling step."""
+        dfx = getattr(self, "_dplb_dfx", None)
+        if dfx is None or not dfx.capturing:
+            return
+        request_rows = self._dfx_step_request_rows(scheduler_output)
+        stages = {row["stage"] for row in request_rows}
+        prefill_lengths = [row["num_new_tokens"] for row in request_rows if row["is_prefill"]]
+        decode_lengths = [row["decode_tokens"] for row in request_rows if not row["is_prefill"]]
+        dfx.emit(
+            "step_plan",
+            step_id=step_command.step_id,
+            dispatch_ordinal=dispatch_ordinal,
+            stage=next(iter(stages)) if len(stages) == 1 else "mixed",
+            active_count=len(request_rows),
+            running_count=len(self.scheduler.running),
+            prefill_tokens=scheduler_output.num_prefill_tokens,
+            decode_tokens=scheduler_output.num_decode_tokens,
+            speculative_proposed_tokens=sum(
+                row["speculative_proposed_tokens"] for row in request_rows
+            ),
+            length_distribution=dict(
+                prefill=self._dfx_length_distribution(prefill_lengths),
+                decode=self._dfx_length_distribution(decode_lengths),
+            ),
+            command_shape=dict(
+                new_requests=len(step_command.new_requests),
+                prefill_requests=len(step_command.prefill_requests),
+                decode_requests=len(step_command.decode_requests),
+                finished_requests=len(step_command.finished_request_ids),
+            ),
+            finished_request_ids=list(step_command.finished_request_ids),
+            execution_slots=[],
+            execution_slot_status="worker_prepare_not_observed",
+            topology=self._dfx_topology(),
+            groups=self._dfx_group_snapshot(request_rows),
+            requests=request_rows,
+            submission_status="submitted",
+        )
+
+    def _emit_dfx_step_outcome(
+        self,
+        step_id: int,
+        scheduler_output: SchedulerOutput,
+        new_tokens: dict[str, int | list[int]],
+        num_draft_tokens: dict[str, int] | None = None,
+        *,
+        status: str = "completed",
+        error: str | None = None,
+    ) -> None:
+        """Record worker completion without claiming device-level timing."""
+        dispatch_ordinal = getattr(self, "_dfx_dispatch_ordinals", {}).pop(step_id, step_id)
+        dfx = getattr(self, "_dplb_dfx", None)
+        if dfx is None or not dfx.capturing:
+            return
+        drafts = num_draft_tokens or {}
+        outcomes = []
+        for scheduled in scheduler_output.scheduled_requests:
+            request_id = scheduled.request.request_id
+            value = new_tokens.get(request_id, ())
+            returned = len(value) if isinstance(value, (list, tuple)) else int(value is not None)
+            proposed = int(drafts.get(request_id, 0))
+            outcomes.append(
+                dict(
+                    **dfx.request_fields(request_id),
+                    returned_tokens=returned,
+                    speculative_proposed_tokens=proposed,
+                    speculative_accepted_tokens=max(0, returned - 1) if proposed else 0,
+                )
+            )
+        dfx.emit(
+            "step_outcome",
+            step_id=step_id,
+            dispatch_ordinal=dispatch_ordinal,
+            status=status,
+            error=error,
+            requests=outcomes,
+        )
 
     async def start(self) -> None:
         """Start worker process and engine loop."""
@@ -979,6 +1185,15 @@ class ReplicaEngineCore:
                     self.scheduler.discard_scheduled_request(scheduled)
                 raise
             self._input_queue.put(encoded)
+        dfx = getattr(self, "_dplb_dfx", None)
+        if dfx is not None:
+            self._dfx_dispatch_ordinal = getattr(self, "_dfx_dispatch_ordinal", 0) + 1
+            self._dfx_dispatch_ordinals[self._step_counter] = self._dfx_dispatch_ordinal
+            self._emit_dfx_step_plan(
+                scheduler_output,
+                step_cmd,
+                dispatch_ordinal=self._dfx_dispatch_ordinal,
+            )
         reregistered_ids = {
             request.request_id for request in step_cmd.new_requests
         }
@@ -1056,6 +1271,12 @@ class ReplicaEngineCore:
             req_id: (tokens[0] if len(tokens) == 1 else tokens)
             for req_id, tokens in step_result.new_tokens.items()
         }
+        self._emit_dfx_step_outcome(
+            step_id,
+            scheduler_output,
+            new_tokens,
+            step_result.num_draft_tokens,
+        )
         with profile_span(
             "scheduler.process_step_output",
             cat="scheduler",
@@ -1277,6 +1498,13 @@ class ReplicaEngineCore:
         failed step's result is still coming.
         """
         failed_batches = [scheduler_output]
+        self._emit_dfx_step_outcome(
+            failed_step_id,
+            scheduler_output,
+            {},
+            status="error",
+            error="worker_timeout" if result_pending else "worker_step_error",
+        )
         for request_id in finished_ids:
             self._schedule_worker_free(request_id)
         if result_pending:
@@ -1286,6 +1514,13 @@ class ReplicaEngineCore:
         while self._batch_queue:
             sid, batch = self._batch_queue.popleft()
             getattr(self, "_initialization_steps", set()).discard(sid)
+            self._emit_dfx_step_outcome(
+                sid,
+                batch,
+                {},
+                status="discarded",
+                error="upstream_step_error",
+            )
             for request_id in getattr(self, "_worker_free_ids_by_step", {}).pop(sid, ()):
                 self._schedule_worker_free(request_id)
             self._discard_result_step_ids.add(sid)
