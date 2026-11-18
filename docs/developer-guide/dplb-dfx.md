@@ -1,8 +1,8 @@
 # DPLB Host Diagnostics
 
-This first increment of [issue #325](https://github.com/hw-native-sys/pypto-serving/issues/325)
-records grouped-cache placement and ownership in the serving process. It builds
-on the grouped DPLB policy and initial Host collector in
+This increment of [issue #325](https://github.com/hw-native-sys/pypto-serving/issues/325)
+records grouped-cache placement, ownership, and submitted Host step load in the
+serving process. It builds on the grouped DPLB policy and initial Host collector in
 [PR #336](https://github.com/hw-native-sys/pypto-serving/pull/336).
 Both the policy (`--enable-dplb`) and diagnostics are opt-in.
 
@@ -77,6 +77,8 @@ UIDs are not joins between independent captures.
 | `placement_failed` | Allocation raised before a placement commit; follow release/rollback events if ownership was partially allocated. |
 | `owner_change` | Acquisition, growth, baseline ownership, or release, with the resulting group load. |
 | `reservation_change` | Reserved, adopted, quarantined, or released reservation state. |
+| `step_plan` | The submitted `StepCommand`: participating requests, phase, token counts, speculative proposal budget, logical DP-group topology, and bounded request length snapshots. |
+| `step_outcome` | The ordered worker result: returned token counts and speculative proposed/accepted counts, or an error/discard status. |
 | `profile_control_ack` | Worker acknowledged the existing ordered start-profile command. |
 
 A placement decision has a replica-local `decision_id`, the actual policy
@@ -139,60 +141,133 @@ requests can still be open at the boundary. It does not certify full request
 execution, a complete model trace, or device timing. Use the manifest and
 sequence gaps before analyzing any subset of the JSONL.
 
-## Validation and scope
+## First-increment source baseline and validation
 
-This increment provides Host placement and ownership records for issue #325.
-Scheduled dispatch snapshots, runner/L3 and execution-slot identities, device
-attention timings, analysis reports, and formal overhead measurements are
-follow-up work. A complete Host manifest does not imply completion of the
-issue's end-to-end acceptance criteria.
+The implementation was integrated against these source snapshots on
+2026-11-16. This is a source baseline, not a validated NPU compatibility matrix.
 
-The grouped policy is an adapted prerequisite from PR #336. Its CLI is default
-off; the diagnostic level is independent of the policy switch. The current
-integration preserves main's shared, read-only grouped-prefix selector and
-DDR-offload shutdown order.
+| Component | Revision |
+| --- | --- |
+| Serving main | `e2d597d5b7e948053317878735ff843404c99c2f` |
+| PR #336 policy prerequisite | `7c952b7bbfcce9087ea566015db013d200c4f844` (adapted to main, default off) |
+| PR #336 Host reference | `dec9730473c7d5712129d990b1de7ddd87616a86` |
+| PyPTO source | `5ae2a2df58225fd58f5ae53192ec1a947b118e3b` |
+| Simpler source | `42e0d7b97bead99a5820a18142e3fb3e6414be4a` |
+| pypto-lib gitlink | `b67a5fd60ccbc1e7451e8b995293c7f1bc76426b` (not initialized) |
 
-Host regression checks cover unchanged allocation choices with capture enabled,
-full-prompt accounting, prefix fallback, reservations and rollback, cancellation,
-preemption, reused request IDs, bounds, writer failures, repeated captures,
-and ordered profile controls:
+`tests/unit/serving/test_dplb_dfx.py` checks decision equivalence, logical
+accounting, prefix fallback, reservations/rollback, request identities,
+cancellation, bounds, writer failures, repeated captures, and profile controls.
+The metadata-only example requires the normal Host dependencies but no PyPTO
+compiler or NPU execution:
 
 ```bash
-python -m pytest -q tests/unit/serving/test_dplb.py \
-  tests/unit/serving/test_dplb_dfx.py \
-  tests/unit/serving/test_dplb_smoke_validation.py \
-  tests/unit/serving/test_grouped_prefix_cache.py \
-  tests/unit/serving/engine tests/unit/cli
 python examples/dfx/capture_dplb_host.py --output /tmp/dplb-host-example
 ```
 
-The manual NPU smoke starts a K7 server, warms compilation, sends mixed prompt
-lengths and a repeated prefix, and validates two capture windows. It requires
-actual prefix hits, contiguous event sequences, matching manifest byte/record
-counts, terminal events for placed requests, and zero remaining logical load.
-Each run uses a private program build directory to avoid pairing a regenerated
-kernel table with a previous run's orchestration library.
+`step_plan` is emitted after the exact `StepCommand` is accepted by the engine
+input queue. Its `requests` rows distinguish prefill and decode work, record
+logical lengths before and after the planned tokens, and expose speculative
+proposal capacity separately from returned output. `row_extent.valid_rows` and
+`padded_rows` remain null because runner preparation has not been observed yet;
+the event records that limitation instead of treating table extent as executed
+attention work. `groups` includes logical DP-group topology and TP members when
+the serving layout can prove them. `step_outcome` is paired by `step_id` and
+`dispatch_ordinal`, and reports worker output without claiming device timing.
+Execution-slot fields remain explicitly unavailable until the worker-side
+prepare/submit hooks are added.
 
-Check the configuration without allocating devices:
+This increment still does not connect asynchronous L3 invocations, SWA/HCA/CSA
+task semantics, per-rank device cost, or a report generator. `--dplb-dfx-level
+timing` fails explicitly. NPU smoke tests and measured overhead remain required
+before making performance claims. The next device prototype must verify runtime
+invocation identity, semantic coverage and clock domains on a matched, built
+stack before enabling timing.
+
+The local Host checks used Python 3.10, pytest 9.0.3, msgspec 0.22.0,
+FastAPI 0.162.5, NumPy 1.26.4, and Torch 2.6.0+cpu. This environment is not an
+NPU runtime baseline. Verification passed 172 placement/collector/engine/
+scheduler checks, 85 grouped-prefix/cache-metrics checks, and three DPLB CLI
+flag checks. Ruff, copyright headers, and English-content checks passed.
+Twenty-one other CLI checks and four program-acceptance checks were blocked
+by the missing PyPTO package. A pre-existing external PyPTO installation also
+failed to import because its Python source expected a `CommEngine` binding
+absent from its native extension; it was not used as validation evidence.
+The documentation site was not built because the shared theme was not present.
+
+## Follow-up validation (2026-11-17)
+
+The existing `zm_pypto` Conda environment resolved the earlier PyPTO import
+blocker. All 91 CLI and program-acceptance checks passed. An expanded Host
+run initially passed 518 of 530 cases; 12 DSpark cases required the missing
+Lib sources. Git submodule cloning failed over the network, so the exact
+gitlink commit `b67a5fd60ccbc1e7451e8b995293c7f1bc76426b` was obtained from
+GitHub's commit archive. The archive SHA256 was
+`7d0db48483faf3e348b217eefa676ae5afa0a76a60bab72d3825d84db5c72ef1`.
+It supplies source files in `pypto-lib/`; it is not an initialized Git checkout.
+No native artifacts were copied and no dependency gitlink was changed.
+
+After adding those sources, all 182 DSpark Host cases passed. Seven new
+smoke-verdict checks also passed: the combined, deduplicated result is 537
+cases with no remaining failures. This was a staged validation, not one run
+of 537 tests. The environment used Python 3.10.22, Torch 2.8.0+cpu,
+torch_npu 2.8.0, NumPy 2.2.6, and pytest 9.1.1. Packages were not changed.
+PyPTO came from the installed baseline checkout at
+`1dedb26c329407360c5c5ce6ecb495565c2f154e`; its runtime was
+`355ce3015e3e344d1fc3a61c206ee01823ce292c`. These differ from the original
+workspace source snapshots above; NPU compatibility is still unverified.
+
+The manual smoke checks the actual `TASK_DEVICE` allocation, starts a K7
+server, warms compilation, runs mixed prompt lengths and a repeated prefix,
+and validates two captures with repeated profile-start controls. The verdict
+requires actual prefix hits, contiguous event sequences, matching byte/record
+counts, terminal events for placed requests, and zero remaining logical load.
+It stops only the server process it created. It does not measure overhead or
+cover every hardware cancellation, preemption, or in-flight capture scenario.
+
+Configuration can be checked without devices:
 
 ```bash
 python tests/manual_dplb_dfx_smoke.py --check-only \
-  --model /path/to/dspark-checkpoint --ep 16 \
+  --model /path/to/dspark-checkpoint --ep 8 \
   --output-dir /tmp/dplb-dfx-config-check
 ```
 
-Run with the matching compiler, Lib, and runtime environment through the task
-queue. The example reserves sixteen devices for DP4/EP16/TP4:
+Real execution must use the matching environment/toolchain and task queue:
 
 ```bash
-task-submit --device auto --device-num 16 --max-time 0 --timeout 0 --run \
+task-submit --device auto --device-num 16 --max-time 6000 --run \
   'PYPTO_WORKER_INIT_TIMEOUT=3600 PYPTO_DSV4_STARTUP_TIMEOUT_SECONDS=4200 \
     python tests/manual_dplb_dfx_smoke.py \
     --model /path/to/dspark-checkpoint --ep 16 --startup-seconds 4200 \
     --output-dir /tmp/dplb-dfx-npu-smoke'
 ```
 
-Use `--no-dplb` for count balancing and `--dfx-level off` for a generation control
-without DFX files. Use separate output directories per run. The smoke records
-functional evidence; it does not establish generation equivalence, observer
-overhead, or a DPLB performance improvement.
+The worker-init timeout is independent of the outer HTTP health deadline.
+Keep both within the task execution limit and allow time for the workload
+and shutdown. These bounds allow a diagnostic retry; they do not guarantee
+that initialization will complete on a given dependency stack.
+
+Use `--no-dplb` to exercise count balancing and `--dfx-level off` for a
+generation control without DFX files. Use separate output directories per run.
+The configuration-only check passed locally. The initial sandbox view showed
+only two devices and a stopped queue daemon. An outside-sandbox check corrected
+that observation: the host queue was running with sixteen devices. Real
+submissions must use that host queue. The smoke accepts task-submit's appended
+`--device` option and validates the actual allocation through `TASK_DEVICE`.
+
+The eight-device task allocated devices 0-7 and started model initialization,
+but failed before HTTP health and capture start: the post-resident KV budget
+was -5,695,729,664 bytes against a 570,425,344-byte minimum. The hardware has
+64 GiB per device. The task exited and released all eight locks; a subsequent
+device inspection found no remaining NPU processes from the run.
+
+The sixteen-device DP4/EP16/TP4 run loaded all 43 target layers and 42 drafter
+banks on the host, and all sixteen chip processes reported ready. It then
+reached the worker's independent 1800-second initialization timeout before
+HTTP health or capture start. A further run with the coordinated deadlines
+above was stopped by the user during resident initialization (exit 130).
+All recorded task processes exited and all sixteen device locks were released.
+Hardware validation is paused. No generation responses or DFX captures were
+produced; these results do not establish successful NPU generation, capture
+correctness, observer overhead or a DPLB performance improvement.
