@@ -680,6 +680,28 @@ def _mtp_scheduler(async_mode: bool, *, num_speculative_tokens: int = 1):
     )
 
 
+def test_async_max_tokens_counts_inflight_output_before_scheduling():
+    scheduler = _prefill_scheduler(async_scheduling=True)
+    request = _running_decode_request()
+    request.max_new_tokens = 2
+    scheduler.running.append(request)
+    scheduler.requests[request.request_id] = request
+
+    final_decode = scheduler.schedule()
+    assert len(final_decode.scheduled_requests) == 1
+    scheduler.advance_after_schedule(final_decode)
+    assert len(request.output_token_ids) == 1
+    assert request.num_output_placeholders == 1
+
+    # The in-flight decode will produce the second and final output token.
+    # Do not dispatch another decode while waiting for that result.
+    assert scheduler.schedule().is_empty
+
+    scheduler.update_from_output(final_decode, {request.request_id: 100})
+    assert request.output_token_ids == [99, 100]
+    assert request.status is RequestStatus.FINISHED_LENGTH
+
+
 def _mtp_request():
     """A greedy (temperature 0) decode-ready request — MTP only runs greedy."""
     request = _running_decode_request()
@@ -703,6 +725,48 @@ def test_async_mtp_reserves_max_tokens_per_step():
     assert request.num_output_placeholders == 2
     # computed advanced by num_new_tokens (1) + the extra speculative slot (1).
     assert request.num_computed_tokens == 4
+
+
+def test_async_mtp_max_tokens_keeps_lookahead_when_drafts_may_reject():
+    scheduler = _mtp_scheduler(async_mode=True, num_speculative_tokens=3)
+    request = _mtp_request()
+    request.max_new_tokens = 5
+    scheduler.running.append(request)
+    scheduler.requests[request.request_id] = request
+
+    first = scheduler.schedule()
+    scheduler.advance_after_schedule(first)
+    assert request.num_output_placeholders == 4
+
+    # Only the base token is guaranteed. Keep the pipeline full because all
+    # three speculative tokens may be rejected, leaving three tokens to go.
+    lookahead = scheduler.schedule()
+    assert len(lookahead.scheduled_requests) == 1
+
+
+def test_async_mtp_max_tokens_discards_accepted_lookahead_after_finish():
+    scheduler = _mtp_scheduler(async_mode=True, num_speculative_tokens=3)
+    request = _mtp_request()
+    request.max_new_tokens = 5
+    scheduler.running.append(request)
+    scheduler.requests[request.request_id] = request
+
+    first = scheduler.schedule()
+    scheduler.advance_after_schedule(first)
+    lookahead = scheduler.schedule()
+    assert len(lookahead.scheduled_requests) == 1
+    scheduler.advance_after_schedule(lookahead)
+
+    # All three drafts are accepted, so the first step reaches max_new_tokens.
+    scheduler.update_from_output(first, {request.request_id: [10, 11, 12, 13]})
+    assert request.output_token_ids == [99, 10, 11, 12, 13]
+    assert request.status is RequestStatus.FINISHED_LENGTH
+
+    # The throughput-oriented lookahead was already dispatched. Its output is
+    # stale and must not be delivered after the request has finished.
+    outputs = scheduler.update_from_output(lookahead, {request.request_id: [14]})
+    assert outputs == []
+    assert request.output_token_ids == [99, 10, 11, 12, 13]
 
 
 def test_async_mtp_matches_sync_when_all_tokens_accepted():

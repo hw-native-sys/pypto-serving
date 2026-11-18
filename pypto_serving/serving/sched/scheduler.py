@@ -485,6 +485,9 @@ class Scheduler:
             if request.scheduling_held:
                 running_to_keep.append(request)
                 continue
+            if self._is_tail_held(request):
+                running_to_keep.append(request)
+                continue
             if grouped_phase is not None and request.is_prefill != (grouped_phase == "prefill"):
                 running_to_keep.append(request)
                 continue
@@ -831,6 +834,22 @@ class Scheduler:
             scheduled -= scheduled % self.config.prefill_chunk_alignment
         return scheduled
 
+    def _is_tail_held(self, request: Request) -> bool:
+        """True when an in-flight base decode token already reaches max_new_tokens.
+
+        ``num_output_placeholders`` counts the guaranteed base output plus any
+        speculative slots that may all be rejected. Only the base token is
+        guaranteed, so a request is tail-held when the in-flight base output
+        alone reaches the limit; subtracting the speculative placeholders keeps
+        the pipeline full while drafts may still be rejected.
+        """
+        return (
+            not request.is_prefill
+            and request.num_output_placeholders > 0
+            and request.num_computed_tokens + 2 - request.num_output_placeholders
+            >= request.num_prompt_tokens + request.max_new_tokens
+        )
+
     def _grouped_cache_phase(self) -> str | None:
         """Choose one homogeneous kernel phase and rotate fairly."""
         if not self.config.requires_homogeneous_prefill_decode:
@@ -855,6 +874,7 @@ class Scheduler:
             and not request.scheduling_held
             and not request.is_prefill
             and request.num_new_tokens_needed > 0
+            and not self._is_tail_held(request)
             for request in self.running
         )
         if not has_prefill and not has_decode:
@@ -1292,6 +1312,7 @@ class Scheduler:
             for r in self.running
             if r.request_id != exclude.request_id and self._recompute_rejection(r) is None
             and not r.prefill_complete and not r.scheduling_held
+            and not self._is_tail_held(r)
         ]
         if self.kv_cache_manager.has_groups:
             # Grouped pools cannot borrow another partition's physical pages.
