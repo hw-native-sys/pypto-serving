@@ -121,6 +121,8 @@ nav:
       - Architecture: developer-guide/architecture.md
       - Profiling: developer-guide/profile.md
       - Accuracy Debugging: developer-guide/accuracy-debugging.md
+      - Feature Development: developer-guide/feature-development.md
+      - V4.1 Cache Migration: developer-guide/v41-cache-migration.md
       - Model Integration: developer-guide/model-integration.md
       - Weight Staging: developer-guide/weight-staging.md
       - V4.1 Engram and Decode Optimization: developer-guide/v41-engram-decode-optimization.md
