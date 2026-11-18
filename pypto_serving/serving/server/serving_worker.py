@@ -246,6 +246,10 @@ class WorkerProcess:
             return num_pages
 
     def _resolve_executor_cls(self):
+        if self.config.executor_cls == "PyptoDeepSeekV4LowlatExecutor":
+            from pypto_serving.model.deepseek_lowlat.npu_executor import DeepSeekV4LowlatPyptoExecutor
+
+            return DeepSeekV4LowlatPyptoExecutor
         if self.config.executor_cls == "PyptoDeepSeekV41Executor":
             from pypto_serving.model.deepseek_v41.npu_executor import DeepSeekV41PyptoExecutor
 
@@ -719,7 +723,9 @@ class WorkerProcess:
                     num_draft_tokens=num_draft_tokens, mode="async",
                 )
             return StepResult(
-                new_tokens=new_tokens, step_id=work.cmd.step_id, num_draft_tokens=num_draft_tokens
+                new_tokens=new_tokens, step_id=work.cmd.step_id, num_draft_tokens=num_draft_tokens,
+                retired_reservation_ids=decode_result.retired_reservation_ids,
+                execution_receipts=decode_result.execution_receipts
             )
         except Exception as exc:
             logger.error("Worker decode reclaim failed: %s", exc, exc_info=True)
@@ -852,6 +858,16 @@ class WorkerProcess:
             cmd.finished_request_ids,
             expected_cache_entries=expected_cache_entries,
         )
+        if getattr(self.executor, "uses_request_execution_context", False) is True:
+            from pypto_serving.config.types import RequestExecutionContext
+
+            contexts = [RequestExecutionContext(r.request_id, len(r.prompt_token_ids),
+                                                r.max_output_tokens, r.initial_output_tokens, r.execution_generation)
+                        for r in cmd.new_requests]
+            self.executor.prepare_request_contexts(self.model_record.runtime_model, contexts)
+            prepare_metadata=getattr(self.executor,"prepare_request_metadata",None)
+            if callable(prepare_metadata):
+                prepare_metadata(self.model_record.runtime_model,cmd.new_requests)
         for new_request in cmd.new_requests:
             previous_state = self._constraint_states.pop(new_request.request_id, None)
             if previous_state is not None:
@@ -917,6 +933,8 @@ class WorkerProcess:
         runtime_model = self.model_record.runtime_model
         new_tokens: dict[str, list[int]] = {}
         num_draft_tokens: dict[str, int] = {}
+        retirements = []
+        execution_receipts = []
 
         with profile_span(
             "WorkerProcess.execute_step",
@@ -957,6 +975,8 @@ class WorkerProcess:
                     prepared_decode=prepared_decode,
                     step_id=cmd.step_id,
                     prefill_requests=len(cmd.prefill_requests),
+                    **({"retirement_receipts": retirements, "execution_receipts": execution_receipts}
+                       if any(r.decode_reservation is not None for r in cmd.decode_requests) else {}),
                 )
 
         # Retain the tokens just sampled so a following pipelined decode step can
@@ -965,7 +985,11 @@ class WorkerProcess:
             if tokens:
                 self._record_last_tokens(req_id, tokens)
 
-        return StepResult(new_tokens=new_tokens, step_id=cmd.step_id, num_draft_tokens=num_draft_tokens)
+        return StepResult(new_tokens=new_tokens, step_id=cmd.step_id, num_draft_tokens=num_draft_tokens,
+                          retired_reservation_ids=tuple(retirements),
+                          execution_receipts=tuple(execution_receipts),
+                          cache_publications=(self.executor.take_cache_publications(runtime_model)
+                              if callable(getattr(self.executor,"take_cache_publications",None)) else ()))
 
     def _record_last_tokens(self, request_id: str, tokens: list[int]) -> None:
         """Remember the latest sampled token for async placeholder resolution."""
@@ -1046,6 +1070,7 @@ class WorkerProcess:
             block_ids_by_group=[pr.block_ids_by_group for pr in scheduled],
             cache_partitions=[pr.cache_partition for pr in scheduled],
         )
+        batch.execution_metadata={pr.request_id:pr.execution_metadata for pr in scheduled if pr.execution_metadata}
         batch.constraint_states = {
             pr.request_id: state
             for pr in terminal
@@ -1089,11 +1114,9 @@ class WorkerProcess:
                 # num_prompt_tokens is len(prompt_token_ids), which we have in cache.
                 will_be_computed = pr.num_computed_tokens + len(pr.chunk_tokens)
                 if will_be_computed >= len(cached.prompt_token_ids):
-                    logits = (
-                        prefill_result.logits[i]
-                        if prefill_result.logits.dim() > 1
-                        else prefill_result.logits
-                    )
+                    logits = prefill_result.logits
+                    if logits is not None and logits.dim() > 1:
+                        logits = logits[i]
                     params = self._sampling_params(pr.request_id)
                     token_id = self._sample_result_row(
                         prefill_result,
@@ -1224,6 +1247,8 @@ class WorkerProcess:
         bind_policy: bool = True,
     ) -> DecodeBatch:
         """Build a decode batch snapshot, optionally resolving prior output tokens."""
+        from pypto_serving.config.decoding import DecodeReservation
+
         device = runtime_model.runtime.device
         decode_tokens = (
             [self._resolve_decode_token(dr) for dr in scheduled]
@@ -1256,6 +1281,10 @@ class WorkerProcess:
             block_ids=[dr.block_ids for dr in scheduled],
             block_ids_by_group=[dr.block_ids_by_group for dr in scheduled],
             cache_partitions=[dr.cache_partition for dr in scheduled],
+            decode_reservations=tuple(
+                DecodeReservation(**{name: getattr(dr.decode_reservation, name)
+                                      for name in dr.decode_reservation.__struct_fields__})
+                if dr.decode_reservation is not None else None for dr in scheduled),
             constraint_states={
                 dr.request_id: state
                 for dr in scheduled
@@ -1276,6 +1305,8 @@ class WorkerProcess:
         prepared_decode: _PreparedDecodeWork | None = None,
         step_id: int = 0,
         prefill_requests: int = 0,
+        retirement_receipts: list[int] | None = None,
+        execution_receipts: list | None = None,
     ) -> dict[str, int]:
         with profile_span(
             "WorkerProcess.batch_decode",
@@ -1314,6 +1345,10 @@ class WorkerProcess:
                     batch,
                     prepared,
                 )
+            if retirement_receipts is not None:
+                retirement_receipts.extend(decode_result.retired_reservation_ids)
+            if execution_receipts is not None:
+                execution_receipts.extend(decode_result.execution_receipts)
             num_draft_tokens = self._consume_decode_result(scheduled, decode_result, new_tokens, batch=batch)
             if self._decode_metrics:
                 self._decode_metrics.record(

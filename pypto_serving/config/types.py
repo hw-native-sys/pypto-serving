@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+from .decoding import DecodeReservation
+
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -318,6 +320,25 @@ class StopTokenMask:
     remaining_tokens: int
 
 
+@dataclass(frozen=True)
+class RequestExecutionContext:
+    """Admission-resolved request limits passed before its first device step."""
+
+    request_id: str
+    prompt_tokens: int
+    max_output_tokens: int
+    initial_output_tokens: int = 0
+    execution_generation: int = 0
+
+    def __post_init__(self):
+        if (not isinstance(self.request_id, str) or not self.request_id
+                or any(type(v) is not int for v in
+                       (self.prompt_tokens, self.max_output_tokens, self.initial_output_tokens, self.execution_generation))
+                or self.execution_generation < 0 or self.prompt_tokens <= 0 or self.max_output_tokens <= 0
+                or not 0 <= self.initial_output_tokens <= self.max_output_tokens):
+            raise ValueError("invalid request execution context")
+
+
 @dataclass
 class PrefillBatch:
     """Packed inputs for a batched prompt prefill call."""
@@ -341,6 +362,7 @@ class PrefillBatch:
     # Opaque request-local generation constraints, interpreted only by capable runners.
     constraint_states: dict[str, object] = field(default_factory=dict)
     stop_token_masks: dict[str, StopTokenMask] = field(default_factory=dict)
+    execution_metadata: dict[str, bytes] = field(default_factory=dict)
 
 
 @dataclass
@@ -348,7 +370,7 @@ class PrefillResult:
     """Outputs from prompt prefill."""
 
     last_hidden: torch.Tensor | None
-    logits: torch.Tensor
+    logits: torch.Tensor | None
     sampled_token_ids: torch.Tensor | None = None
     sampling_candidates: SamplingCandidates | None = None
     next_hidden_states: torch.Tensor | None = None
@@ -383,6 +405,7 @@ class DecodeBatch:
     # its embedding (shape ``[B, hidden]``). Left ``None`` for single-token decoders.
     prev_token_ids: torch.Tensor | None = None
     prev_hidden_states: torch.Tensor | None = None
+    decode_reservations: tuple[DecodeReservation | None, ...] = ()
 
 
 @dataclass
@@ -400,6 +423,8 @@ class DecodeResult:
     # Actual verified drafts per request, before scheduler output truncation.
     # None disables speculation metrics; zero denotes a target-only fallback.
     num_draft_tokens: list[int] | None = None
+    retired_reservation_ids: tuple[int, ...] = ()
+    execution_receipts: tuple[bytes, ...] = ()
 
 
 @dataclass

@@ -347,11 +347,17 @@ class ServingServer:
 
     def prepare_completion(self, request):
         config = dataclasses.replace(self._resolve_generate_config(request), ignore_eos=True)
+        validate = getattr(self.engine, "validate_generate_config", None)
+        if callable(validate):
+            validate(config)
         return request.prompt, config
 
     async def _completions(self, request: CompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"cmpl-{uuid.uuid4().hex[:8]}"
         _, config = self.prepare_completion(request)
+        validate_budget = getattr(self.engine, "validate_request_budget", None)
+        if callable(validate_budget):
+            validate_budget(request.prompt, config)
         return await self.completion_response(request_id, request, config)
 
     async def completion_response(self, request_id, request, config):
@@ -390,8 +396,14 @@ class ServingServer:
             return JSONResponse(response.model_dump())
 
     async def prepare_chat(self, request):
+        config = self._resolve_generate_config(request)
+        validate = getattr(self.engine, "validate_generate_config", None)
+        if callable(validate):
+            validate(config)
         output_parser_spec = self._output_parser_spec(request)
         constraint_spec = self._constraint_spec(request, output_parser_spec)
+        if callable(validate):
+            validate(config, constraint_spec=constraint_spec)
         if constraint_spec is not None:
             await self._preflight_constraint(constraint_spec)
         prompt = self._apply_chat_template(
@@ -400,13 +412,14 @@ class ServingServer:
             reasoning_effort=request.reasoning_effort,
             tools=request.tools,
         )
-        config = self._resolve_generate_config(request)
-
         return prompt, config, output_parser_spec, constraint_spec
 
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         prompt, config, output_parser_spec, constraint_spec = await self.prepare_chat(request)
+        validate_budget = getattr(self.engine, "validate_request_budget", None)
+        if callable(validate_budget):
+            validate_budget(prompt, config)
         return await self.chat_response(request_id, request, prompt, config, output_parser_spec, constraint_spec)
 
     async def chat_response(self, request_id, request, prompt, config, output_parser_spec, constraint_spec):

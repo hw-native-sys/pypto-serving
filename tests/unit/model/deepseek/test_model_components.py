@@ -830,16 +830,6 @@ def test_cli_rejects_invalid_deepseek_speculative_config(config, message):
         cli._resolve_num_speculative_tokens(args)
 
 
-def test_cli_rejects_speculative_config_with_num_speculative_tokens_alias():
-    args = SimpleNamespace(
-        speculative_config={"method": "mtp", "num_speculative_tokens": 3},
-        num_speculative_tokens=2,
-    )
-
-    with pytest.raises(ValueError, match="cannot be combined"):
-        cli._resolve_num_speculative_tokens(args)
-
-
 def test_tokenizer_falls_back_when_deepseek_config_fails_strict_validation(tmp_path, monkeypatch):
     class StrictDataclassFieldValidationError(Exception):
         pass

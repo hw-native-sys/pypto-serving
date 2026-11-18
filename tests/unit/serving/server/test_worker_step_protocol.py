@@ -18,6 +18,7 @@ import torch
 
 from pypto_serving.serving.engine.async_engine import (
     ReplicaEngineCore,
+    EngineConfig,
 )
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
@@ -47,6 +48,8 @@ from ..device_sampling_fakes import _FixedSampler, _ImmediateEosExecutor, _model
 
 def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.config=EngineConfig()
+    core.kv_cache_manager=KvCacheManager()
     core._request_contexts = {}
     core._worker_known_req_ids = {"req"}
     request = Request(

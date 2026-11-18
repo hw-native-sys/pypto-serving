@@ -28,6 +28,8 @@ from typing import Any, Union
 
 import msgspec
 
+from pypto_serving.serving.memory.protocol import CachePublicationProof
+
 # Sentinel for a decode input token the worker must resolve from its own cache.
 # Under async (pipelined) scheduling the engine builds step N+1 before step N's
 # sampled token is known, so it sends this placeholder and the worker substitutes
@@ -62,6 +64,10 @@ class NewRequestData(msgspec.Struct):
     initialize_from_cache: bool = False
     # Tokens committed before this worker request was registered (PD adoption).
     initial_output_token_ids: tuple[int, ...] = ()
+    # Effective limit after scheduler admission/clamping. Optional for legacy senders.
+    max_output_tokens: int | None = None
+    execution_generation: int = 0
+    execution_metadata: bytes = b""
 
 
 class PrefillRequest(msgspec.Struct):
@@ -77,6 +83,18 @@ class PrefillRequest(msgspec.Struct):
     # Model-specific grouped cache tables and their stable rank partition.
     block_ids_by_group: dict[str, list[int]] = msgspec.field(default_factory=dict)
     cache_partition: int | None = None
+    execution_metadata: bytes = b""
+
+
+class DecodeReservationData(msgspec.Struct):
+    reservation_id: int
+    request_id: str
+    generation: int
+    cycles: int
+    max_output_tokens: int
+    physical_input_end: int
+    remaining_lower_bound: int
+    frame_id: int
 
 
 class DecodeRequest(msgspec.Struct):
@@ -99,6 +117,7 @@ class DecodeRequest(msgspec.Struct):
     # Model-specific grouped cache tables and their stable rank partition.
     block_ids_by_group: dict[str, list[int]] = msgspec.field(default_factory=dict)
     cache_partition: int | None = None
+    decode_reservation: DecodeReservationData | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +185,9 @@ class StepResult(msgspec.Struct):
     # Echoes the originating StepCommand.step_id (pipeline ordering guard).
     step_id: int = 0
     num_draft_tokens: dict[str, int] = msgspec.field(default_factory=dict)
+    retired_reservation_ids: tuple[int, ...] = ()
+    execution_receipts: tuple[bytes, ...] = ()
+    cache_publications: tuple[CachePublicationProof, ...] = ()
 
 
 class ProfileResult(msgspec.Struct, tag="profile"):
