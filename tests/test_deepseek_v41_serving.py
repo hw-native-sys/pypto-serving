@@ -91,6 +91,15 @@ def test_v41_dp4_http_answer(tmp_path, num_speculative_tokens):
         "--show-startup-logs",
     ]
     env = os.environ.copy()
+    probe_dir = tmp_path / "prefix-probe"
+    probe_dir.mkdir()
+    (probe_dir / "sitecustomize.py").write_text(
+        "from tests.v41_prefix_probe import install\n" + f"install({str(probe_dir)!r})\n",
+        encoding="utf-8",
+    )
+    env["PYTHONPATH"] = os.pathsep.join((
+        str(probe_dir), str(Path(__file__).resolve().parents[1]), env.get("PYTHONPATH", ""),
+    ))
     metrics_dir = tmp_path / "decode-metrics"
     if num_speculative_tokens:
         command.extend([
@@ -144,6 +153,32 @@ def test_v41_dp4_http_answer(tmp_path, num_speculative_tokens):
             assert result["usage"]["total_tokens"] == (
                 result["usage"]["prompt_tokens"] + result["usage"]["completion_tokens"]), result
 
+            cold_answer = answer
+            def repeated_answer(_):
+                repeated = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}, method="POST")
+                with OPENER.open(repeated, timeout=400) as response:
+                    warmed = json.load(response)
+                warmed_choice = warmed["choices"][0]
+                warmed_answer = warmed_choice["message"]["content"]
+                print("PREFIX_AB", json.dumps({
+                    "cold_answer": cold_answer, "warm_answer": warmed_answer,
+                    "identical": cold_answer == warmed_answer,
+                    "correct": bool(re.search(r"\b323\b", warmed_answer)),
+                    "usage": warmed["usage"], "finish_reason": warmed_choice["finish_reason"],
+                }, ensure_ascii=False), flush=True)
+                assert warmed_choice["finish_reason"] == "stop", warmed
+                assert re.search(r"\b323\b", warmed_answer), warmed
+                return warmed
+
+            repeated_answer(0)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(repeated_answer, range(2)))
+            hits = re.findall(r"prefix_cache_hit_tokens=(\d+)", log_path.read_text(encoding="utf-8"))
+            assert hits and max(map(int, hits)) >= 128, "repeated long prompts must reuse compressed prefix pages"
+
             def concurrent_answer(index):
                 number = 20 + index
                 body = {"model": MODEL_NAME, "messages": [{"role": "user", "content":
@@ -166,6 +201,25 @@ def test_v41_dp4_http_answer(tmp_path, num_speculative_tokens):
                 with ThreadPoolExecutor(max_workers=8) as pool:
                     results = list(pool.map(concurrent_answer, range(wave * 8, (wave + 1) * 8)))
                 print("CONCURRENT_WAVE", wave, json.dumps(results, ensure_ascii=False), flush=True)
+            records = [json.loads(line) for path in probe_dir.glob("pages.*.jsonl")
+                       for line in path.read_text(encoding="utf-8").splitlines()]
+            warm_prefills = [record for record in records if record["kind"] == "prefill"]
+            assert len(warm_prefills) >= 2, records
+            assert all(record["page_snapshots"] > 0 and record["unchanged"] for record in records), records
+            assert all(set(record["fields"]) == {
+                "compressed_cache_pool", "index_cache_pool", "index_cache_scale_pool"}
+                for record in records), records
+            crossings = [request for record in warm_prefills for request in record["requests"]
+                         if request["start"] < request["hit"] < request["end"]]
+            if prefill_tokens > 128:
+                assert crossings, records
+            else:
+                assert any(request["end"] == request["hit"] for record in warm_prefills
+                           for request in record["requests"])
+                assert any(request["start"] == request["hit"] for record in warm_prefills
+                           for request in record["requests"]), records
+            assert any(record["kind"] == "reset" for record in records), records
+            print("PREFIX_PAGE_GUARD", json.dumps(records), flush=True)
         finally:
             _stop_server(process)
             print("\n--- V4.1 server log (tail) ---", flush=True)

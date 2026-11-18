@@ -1049,6 +1049,7 @@ class WorkerProcess:
             token_chunks=[pr.chunk_tokens for pr in scheduled],
             seq_lens=[pr.num_computed_tokens + len(pr.chunk_tokens) for pr in scheduled],
             prompt_lens=[len(self._req_cache[pr.request_id].prompt_token_ids) for pr in scheduled],
+            prefix_cache_hit_tokens=[pr.prefix_cache_hit_tokens for pr in scheduled],
             chunk_starts=[pr.num_computed_tokens for pr in scheduled],
             device=device, embedding_lookup=embedding_lookup,
             allow_device_greedy_sampling=self._allow_device_sampled_ids(terminal, phase="prefill"),

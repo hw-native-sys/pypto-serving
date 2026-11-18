@@ -245,9 +245,8 @@ jobs:
           checkout-path: dist-checkout
           needs-device: 'true'
           runtime-platform: a5
-          # The K5 guard passed with this compiler and the bundled Lib. Revisit
-          # after the V4.1 dynamic-shape bindings compile on PyPTO main.
-          pypto-revision: 7302cd7ffeb552b3bec7c0e5bd92f164ba9fbd4b
+          # Keep V4.1 on the compiler validated before PyPTO PR #3411.
+          pypto-revision: 3db18db1286bdbb44266179e3aedae659174b711
           toolchain: bundle
           build-namespace: pypto-serving-v41-a5
           pip-cache-name: pip-pypto-serving-v41-a5

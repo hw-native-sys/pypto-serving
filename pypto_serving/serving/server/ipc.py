@@ -83,6 +83,7 @@ class PrefillRequest(msgspec.Struct):
     checkpoint_ends: tuple[int, ...] = ()
     state_write_block_ids_by_group: dict[str, list[int]] = msgspec.field(default_factory=dict)
     checkpoint_block_ids_by_group: dict[str, dict[int, int]] = msgspec.field(default_factory=dict)
+    prefix_cache_hit_tokens: int = 0
 
 
 class DecodeRequest(msgspec.Struct):

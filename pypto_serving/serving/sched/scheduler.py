@@ -60,6 +60,7 @@ class SchedulerConfig:
     num_speculative_tokens: int = 0
     supports_chunked_prefill_with_speculation: bool = True
     speculative_prefix_cache_replay_tokens: int = 0
+    prefix_cache_replay_before_hit: bool = False
     prefix_cache_retention_interval: int = 8192
     requires_homogeneous_prefill_decode: bool = False
     # Async (pipelined) scheduling: schedule step N+1 before step N's sampled
@@ -159,6 +160,7 @@ class Request:
     # Externally populated requests keep their allocator-owned checkpoint policy.
     group_checkpoint_boundary: int | None = None
     group_shared_prefix_boundary: int = 0
+    prefix_cache_hit_tokens: int = 0
     # Earliest valid KV position after a model skips the beginning of a
     # prefill chunk. Keep this across decode so partial pages stay unpublished.
     group_cache_valid_from: dict[str, int] = field(default_factory=dict)
@@ -635,6 +637,12 @@ class Scheduler:
                             request.request_id,
                             request.num_computed_tokens,
                         )
+                        request.prefix_cache_hit_tokens = request.num_computed_tokens
+                        if self.config.prefix_cache_replay_before_hit:
+                            request.num_computed_tokens = max(
+                                0, request.num_computed_tokens
+                                - self.config.speculative_prefix_cache_replay_tokens,
+                            )
                     cached_blocks = []
                 else:
                     cached_blocks = self.kv_cache_manager.get_computed_blocks(
@@ -651,7 +659,7 @@ class Scheduler:
                 cached_blocks = []
 
             grouped_prefix_hit = (
-                self.kv_cache_manager.has_groups and request.num_computed_tokens > 0
+                self.kv_cache_manager.has_groups and request.prefix_cache_hit_tokens > 0
             )
 
             rejection = self._single_prefill_rejection(request)
@@ -717,7 +725,8 @@ class Scheduler:
                 output.prefix_cache_query_tokens += request.num_prompt_tokens
                 output.prefix_cache_hits += min(
                     cacheable_tokens,
-                    request.num_computed_tokens,
+                    request.prefix_cache_hit_tokens if self.config.prefix_cache_replay_before_hit
+                    else request.num_computed_tokens,
                 )
                 request.prefix_cache_metrics_recorded = True
 
@@ -1333,6 +1342,7 @@ class Scheduler:
         victim.cache_partition = None
         victim.num_blocks_cached = 0
         victim.num_group_blocks_cached = {}
+        victim.prefix_cache_hit_tokens = 0
         # Async: drop any optimistic placeholder so the re-queued request restarts
         # from a clean prefill state (its in-flight step's result, if any, is
         # discarded engine-side since the request left `running`).
@@ -1359,6 +1369,7 @@ class Scheduler:
         request.cache_partition = None
         request.num_group_blocks_cached = {}
         request.group_cache_valid_from = {}
+        request.prefix_cache_hit_tokens = 0
 
     def _cache_completed_blocks(
         self,

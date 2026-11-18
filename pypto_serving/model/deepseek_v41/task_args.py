@@ -46,10 +46,12 @@ def build_cache_groups(layers: tuple[LayerPlan, ...], max_seq_len: int, *,
                      if layer.mode == "c1a_full" and layer.kv_source == layer.layer_id),
     }
     groups = tuple(KVCacheGroupSpec(
-        name, producers[name], KVCacheSpec(block_size, 16, ratio),
-        (max_seq_len + block_size - 1) // block_size, num_partitions=dp_size,
-        max_requests_per_partition=request_slots,
-    ) for name, block_size, ratio in (("window", 128, 1), ("c2a", 256, 2), ("c1a", 128, 1)))
+        name, producers[name], KVCacheSpec(128, 16, ratio),
+        min(3, (max_seq_len + 127) // 128) if name == "window" else (max_seq_len + 127) // 128,
+        num_partitions=dp_size, max_requests_per_partition=request_slots,
+        sliding_window=128 if name == "window" else None,
+        prefix_cacheable=name != "window",
+    ) for name, ratio in (("window", 1), ("c2a", 2), ("c1a", 1)))
     validate_cache_groups(layers, groups, max_seq_len, dp_size=dp_size)
     return groups
 
@@ -58,7 +60,7 @@ def validate_cache_groups(
     layers: tuple[LayerPlan, ...], groups: tuple[KVCacheGroupSpec, ...], max_seq_len: int,
     *, dp_size: int = 8,
 ) -> V41CacheGroups:
-    """Resolve the three full-history page families before device allocation."""
+    """Resolve private rolling window and cacheable full-history families."""
     if len(layers) != 40 or tuple(layer.layer_id for layer in layers) != tuple(range(40)):
         raise ValueError("V4.1 cache contract requires the complete ordered 40-layer backbone")
     if type(max_seq_len) is not int or max_seq_len <= 0:
@@ -72,7 +74,7 @@ def validate_cache_groups(
     expected = {
         "window": (tuple(range(40)), 128, 1),
         "c2a": (tuple(layer.layer_id for layer in layers
-                      if layer.mode == "c2a_full" and layer.kv_source == layer.layer_id), 256, 2),
+                      if layer.mode == "c2a_full" and layer.kv_source == layer.layer_id), 128, 2),
         "c1a": (tuple(layer.layer_id for layer in layers
                       if layer.mode == "c1a_full" and layer.kv_source == layer.layer_id), 128, 1),
     }
@@ -87,13 +89,16 @@ def validate_cache_groups(
         family = matches[0]
         _, block_size, ratio = expected[family]
         if (group.spec.block_size != block_size or group.spec.compress_ratio != ratio
-                or group.spec.storage_block_size != 128 or group.num_partitions != dp_size
-                or group.sliding_window is not None or group.is_eagle_group
+                or group.spec.storage_block_size != 128 // ratio or group.num_partitions != dp_size
+                or group.sliding_window != (128 if family == "window" else None)
+                or group.prefix_cacheable != (family != "window") or group.is_eagle_group
                 or type(group.max_requests_per_partition) is not int
                 or not 1 <= group.max_requests_per_partition <= 12
                 or group.max_requests_per_partition != groups[0].max_requests_per_partition):
             raise ValueError(f"V4.1 {family} cache page layout disagrees with the lib ABI")
         required = (max_seq_len + block_size - 1) // block_size
+        if family == "window":
+            required = min(3, required)
         if (group.max_blocks_per_seq < required
                 or (group.num_blocks is not None and group.num_blocks < required)):
             raise ValueError(f"V4.1 {family} cache cannot cover max_seq_len")
@@ -111,6 +116,8 @@ class RequestSlice:
     token_ids: tuple[int, ...]
     prompt_length: int
     pages: Mapping[str, tuple[int, ...]]
+    shared_prefix_tokens: int = 0
+    read_pages: Mapping[str, Mapping[int, int]] = field(default_factory=dict)
 
     @property
     def end(self):
@@ -147,11 +154,12 @@ class RequestProgress:
     prompt_length: int
     length: int = 0
     pages: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
+    shared_prefix_tokens: int = 0
 
 
 class RequestLedger:
     """One synchronous in-flight batch; slots survive omission and reordering."""
-    def __init__(self, *, max_requests, max_seq_len, partitions=8):
+    def __init__(self, *, max_requests, max_seq_len, partitions=8, sliding_groups=()):
         if any(type(v) is not int or v <= 0 for v in (max_requests, max_seq_len, partitions)):
             raise ValueError("request capacities must be positive integers")
         self.max_seq_len = max_seq_len
@@ -160,6 +168,7 @@ class RequestLedger:
         self.pending = None
         self.epoch = 1
         self.poisoned = False
+        self.sliding_groups = frozenset(sliding_groups)
 
     def _validate_page_ownership(self, slices):
         """Retain full-history pages even when their owner is absent this step.
@@ -171,29 +180,37 @@ class RequestLedger:
         occupied = {}
         for key, owner in self.owners.items():
             for group, pages in owner.pages.items():
-                for page in pages:
-                    occupied[owner.partition, group, page] = key
+                for index, page in enumerate(pages):
+                    immutable = group not in self.sliding_groups and (index + 1) * 128 <= max(owner.length, owner.shared_prefix_tokens)
+                    occupied.setdefault((owner.partition, group, page), []).append((key, immutable, index))
         for request in slices:
             owner = self.owners.get(request.request_id)
             if owner is not None:
                 for group, previous in owner.pages.items():
+                    if group in self.sliding_groups:
+                        continue
                     current = request.pages.get(group, ())
                     if tuple(current[:len(previous)]) != tuple(previous):
                         raise ValueError("continuation must preserve committed full-history pages")
             for group, pages in request.pages.items():
                 if len(set(pages)) != len(pages):
                     raise ValueError("request must not alias its own cache pages")
-                for page in pages:
+                for index, page in enumerate(pages):
                     address = (request.partition, group, page)
-                    key = occupied.get(address)
-                    if key is not None and key != request.request_id:
-                        raise ValueError("cache page belongs to another live request")
-                    occupied[address] = request.request_id
+                    immutable = (group not in self.sliding_groups
+                                 and (index + 1) * 128 <= max(request.shared_prefix_tokens, request.start))
+                    for key, previous_immutable, previous_index in occupied.get(address, ()):
+                        if key != request.request_id and not (
+                            immutable and previous_immutable and index == previous_index
+                        ):
+                            raise ValueError("cache page belongs to another live request")
+                    occupied.setdefault(address, []).append((request.request_id, immutable, index))
 
-    def begin_prefill(self, requests):
+    def begin_prefill(self, requests, *, prefix_cache_hits=None):
         """Validate the complete batch before taking ownership of any new slot.
 
-        Each item is (request_id, partition, start, token_ids, prompt_length, pages).
+        Each item is (request_id, partition, start, token_ids, prompt_length, pages,
+        optional pre-rebind read pages).
         Input order is retained for output mapping; it never determines state slots.
         """
         if self.poisoned:
@@ -203,8 +220,16 @@ class RequestLedger:
         if not requests or len({r[0] for r in requests}) != len(requests):
             raise ValueError("batch must contain distinct request IDs")
         available = [list(slots) for slots in self.free]
+        prefix_cache_hits = {} if prefix_cache_hits is None else prefix_cache_hits
         additions, slices = {}, []
-        for key, partition, start, tokens, prompt_length, pages in requests:
+        for item in requests:
+            if len(item) == 6:
+                key, partition, start, tokens, prompt_length, pages = item
+                read_pages = {}
+            elif len(item) == 7:
+                key, partition, start, tokens, prompt_length, pages, read_pages = item
+            else:
+                raise ValueError("prefill request tuple has an invalid arity")
             if not isinstance(key, str) or not key:
                 raise ValueError("request ID must be nonempty")
             if type(partition) is not int or not 0 <= partition < len(available):
@@ -214,20 +239,26 @@ class RequestLedger:
             if not tokens or not 0 <= start < start + len(tokens) <= prompt_length <= self.max_seq_len:
                 raise ValueError("invalid prefill extent")
             owner = self.owners.get(key)
+            shared = prefix_cache_hits.get(key, 0 if owner is None else owner.shared_prefix_tokens)
+            if type(shared) is not int or shared < 0 or shared % 128 or shared >= prompt_length:
+                raise ValueError("prefix hit must be a 128-token boundary strictly before the prompt end")
             if owner is None:
-                if start != 0:
-                    raise ValueError("cold requests require prefill from position zero; prefix restore is unavailable")
+                if start != max(0, shared - 128):
+                    raise ValueError("prefill must start at zero or one replay block before the prefix boundary")
                 if not available[partition]:
                     raise ValueError("compressor state slot capacity exhausted")
-                owner = RequestProgress(partition, available[partition].pop(), prompt_length)
+                owner = RequestProgress(partition, available[partition].pop(), prompt_length,
+                                        length=start, shared_prefix_tokens=shared)
                 additions[key] = owner
+            if owner.shared_prefix_tokens != shared:
+                raise ValueError("request prefix boundary changed")
             if owner.partition != partition or owner.length != start or owner.prompt_length != prompt_length:
                 raise ValueError("request partition, committed position or prompt length changed")
             if owner.length == owner.prompt_length:
                 raise ValueError("prefill already completed")
             immutable_pages = MappingProxyType({name: tuple(ids) for name, ids in pages.items()})
             slices.append(RequestSlice(key, partition, owner.slot, start, tuple(tokens),
-                                       prompt_length, immutable_pages))
+                                       prompt_length, immutable_pages, shared, read_pages))
         self._validate_page_ownership(slices)
         self.free = available
         self.owners.update(additions)
@@ -252,7 +283,8 @@ class RequestLedger:
             if start + len(tokens) > self.max_seq_len:
                 raise ValueError("decode exceeds sequence capacity")
             slices.append(RequestSlice(key, partition, owner.slot, start, tokens, owner.prompt_length,
-                                       MappingProxyType({name: tuple(ids) for name, ids in pages.items()})))
+                                       MappingProxyType({name: tuple(ids) for name, ids in pages.items()}),
+                                       owner.shared_prefix_tokens))
         self._validate_page_ownership(slices)
         self.pending = ForwardStep("decode", tuple(slices), self.epoch)
         return self.pending

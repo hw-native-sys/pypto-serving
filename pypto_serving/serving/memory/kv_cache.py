@@ -746,6 +746,9 @@ class KvCacheManager:
             raise ValueError("token_count must not be negative")
         counts = {}
         for name, pool in self._group_pools.items():
+            if not pool.spec.prefix_cacheable:
+                counts[name] = 0
+                continue
             safe_tokens = token_count
             if pool.spec.is_eagle_group:
                 safe_tokens = max(0, safe_tokens - 1)
@@ -762,6 +765,8 @@ class KvCacheManager:
         """
         alignment = 1
         for pool in self._group_pools.values():
+            if not pool.spec.prefix_cacheable:
+                continue
             alignment = math.lcm(alignment, pool.spec.spec.token_capacity)
         return alignment
 
@@ -782,7 +787,8 @@ class KvCacheManager:
         group_names: tuple[str, ...] | None = None,
     ) -> dict[str, list[bytes]]:
         """Compute full-page prefix hashes independently for every cache group."""
-        selected = tuple(self._group_pools) if group_names is None else group_names
+        selected = (tuple(name for name, pool in self._group_pools.items() if pool.spec.prefix_cacheable)
+                    if group_names is None else group_names)
         if len(selected) != len(set(selected)) or set(selected) - set(self._group_pools):
             raise ValueError("prefix hash groups must be unique configured cache groups")
         hashes = {}
@@ -806,7 +812,8 @@ class KvCacheManager:
         """Find a shared full-history boundary for sparse state publication."""
         if not self.enable_prefix_cache:
             return 0
-        history = [pool for pool in self._group_pools.values() if pool.spec.sliding_window is None]
+        history = [pool for pool in self._group_pools.values()
+                   if pool.spec.prefix_cacheable and pool.spec.sliding_window is None]
         best = 0
         for partition in range(self.group_partition_count):
             candidate = max_tokens
@@ -874,7 +881,7 @@ class KvCacheManager:
         if lookup is None:
             lookup = lambda pool, owner, value: pool.hash_to_block.get((owner, value))
         selected_names = (
-            tuple(self._group_pools)
+            tuple(name for name, pool in self._group_pools.items() if pool.spec.prefix_cacheable)
             if shareable_group_names is None
             else shareable_group_names
         )
@@ -1201,14 +1208,14 @@ class KvCacheManager:
         """
         if not self.enable_prefix_cache:
             return dict(already_cached)
-        if set(block_hashes) != set(self._group_pools):
-            raise ValueError("Grouped prefix hashes do not match configured cache groups")
+        if set(block_hashes) - set(self._group_pools):
+            raise ValueError("Grouped prefix hashes contain an unknown cache group")
         if set(block_ids_by_group) != set(self._group_pools):
             raise ValueError("Grouped block snapshot does not match configured cache groups")
 
         cached_counts = dict(already_cached)
         for name, pool in self._group_pools.items():
-            hashes = block_hashes[name]
+            hashes = block_hashes.get(name, ())
             block_ids = block_ids_by_group[name]
             safe_computed_tokens = int(num_computed_tokens)
             if pool.spec.is_eagle_group:
@@ -1260,7 +1267,8 @@ class KvCacheManager:
         if not 0 < boundary <= tokens:
             return
         if self._group_checkpoints is None:
-            if not any(pool.spec.sliding_window is not None for pool in self._group_pools.values()):
+            if not any(pool.spec.prefix_cacheable and pool.spec.sliding_window is not None
+                       for pool in self._group_pools.values()):
                 return
             self._group_checkpoints = GroupPrefixCheckpoints()
         owner = request_id if request_id in self._group_request_partitions else None

@@ -451,6 +451,9 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         max_prefill_tokens_per_request=step_tokens,
         requires_homogeneous_prefill_decode=True,
         supports_chunked_prefill_with_speculation=True,
+        speculative_prefix_cache_replay_tokens=128,
+        prefix_cache_replay_before_hit=True,
+        prefill_chunk_alignment=128,
     )
     return EngineConfig(
         model_id=args.served_model_name or Path(model_dir).name,
@@ -465,9 +468,8 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         max_num_running_reqs=args.max_num_seqs,
         max_num_scheduled_tokens=step_tokens,
         long_prefill_token_threshold=args.long_prefill_token_threshold,
-        # Prefix restore needs both KV pages and matching compressor state.
         # Pipelining needs independently owned mutable snapshots and tickets.
-        enable_prefix_cache=False,
+        enable_prefix_cache=args.enable_prefix_caching,
         async_scheduling=False,
         enable_chunk_prefill=args.enable_chunked_prefill,
     )
