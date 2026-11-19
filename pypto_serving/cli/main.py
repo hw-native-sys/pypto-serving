@@ -27,6 +27,7 @@ from pypto_serving.config.types import (
 )
 from pypto_serving.model.model_family import detect_model_family, read_model_config
 from pypto_serving.observability.access_log import create_uvicorn_log_config
+from pypto_serving.observability.dplb_dfx import DplbDfxConfig
 from pypto_serving.serving.utils.env import (
     configure_runtime_logging,
     graceful_shutdown_timeout_seconds,
@@ -279,6 +280,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated profile levels: e2e, kernel, or verbose (default: e2e,kernel).",
     )
 
+    parser.add_argument(
+        "--dplb-dfx-level", choices=("off", "load", "timing"), default="off",
+        help="DPLB placement diagnostics (default: off); load requires --profile; timing is unavailable.",
+    )
+    parser.add_argument(
+        "--dplb-dfx-max-seconds", type=float, default=60.0,
+        help="Maximum Host DPLB capture duration in seconds (default: 60).",
+    )
+
     # Misc
     parser.add_argument(
         "--show-startup-logs",
@@ -373,6 +383,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
             config_data=model_config_data,
         ),
         profile_config=_build_profile_config(args),
+        dplb_dfx_config=_build_dplb_dfx_config(args),
         max_num_running_reqs=args.max_num_seqs,
         max_num_scheduled_tokens=args.max_num_batched_tokens,
         long_prefill_token_threshold=args.long_prefill_token_threshold,
@@ -465,9 +476,10 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         device_ids=devices,
         parallel_config=parallel,
         executor_cls=_executor_cls_for_model_family("deepseek_v41"),
-        enable_dplb=args.enable_dplb,
         runtime_config=runtime,
         profile_config=_build_profile_config(args),
+        dplb_dfx_config=_build_dplb_dfx_config(args),
+        enable_dplb=args.enable_dplb,
         max_num_running_reqs=args.max_num_seqs,
         max_num_scheduled_tokens=step_tokens,
         long_prefill_token_threshold=args.long_prefill_token_threshold,
@@ -754,6 +766,13 @@ def _validate_generate_config_options(options: dict[str, object]) -> None:
                 f"--generate-config field {name!r} must be {expected}; "
                 f"got {options[name]!r}"
             )
+
+
+def _build_dplb_dfx_config(args: argparse.Namespace) -> DplbDfxConfig:
+    config = DplbDfxConfig(level=args.dplb_dfx_level, max_seconds=args.dplb_dfx_max_seconds)
+    if config.level != "off" and not args.profile:
+        raise ValueError("--dplb-dfx-level requires --profile")
+    return config
 
 
 def _build_profile_config(args: argparse.Namespace) -> ProfileConfig:

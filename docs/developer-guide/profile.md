@@ -14,6 +14,10 @@ In serve mode, recording begins only after `POST /start_profile`. In generate mo
 
 The `SA_PROFILE_OUTPUT` / `SA_PROFILE_LEVEL` environment variables configure the recorder for library users and are read by `scripts/merge_profile.sh`; the CLI entries replace them with explicit CLI configuration.
 
+Grouped-cache placement can also be recorded with `--dplb-dfx-level load`.
+It uses the same profile controls and writes separate bounded JSONL files.
+See [DPLB Host Diagnostics](dplb-dfx.md) for its schema and limitations.
+
 The event levels are:
 
 - `e2e`: request, scheduler, engine, executor, and worker spans.

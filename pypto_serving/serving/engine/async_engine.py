@@ -14,6 +14,7 @@ import contextlib
 import logging
 import queue
 import time
+import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, field, replace
@@ -24,6 +25,7 @@ import msgspec
 from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
 from pypto_serving.observability import InMemoryStatLogger, IterationStats, SchedulerStats
+from pypto_serving.observability.dplb_dfx import DplbDfxConfig, DplbDfxRecorder
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.reasoning import (
@@ -101,6 +103,7 @@ class EngineConfig:
     profile_config: ProfileConfig = field(
         default_factory=lambda: create_profile_config(enabled=False)
     )
+    dplb_dfx_config: DplbDfxConfig = field(default_factory=DplbDfxConfig)
 
     # Scheduler / serving
     max_num_running_reqs: int = 32
@@ -271,6 +274,15 @@ class ReplicaEngineCore:
             from pypto_serving.serving.memory.tiering.integration import Session
             self._cache_tiering = Session(self)
             self.config = self._cache_tiering.configure(self.config)
+        self._dplb_dfx = None
+        if config.dplb_dfx_config.level != "off":
+            if not config.profile_config.enabled:
+                raise ValueError("DPLB DFX requires --profile")
+            self._dplb_dfx = DplbDfxRecorder(
+                config.dplb_dfx_config, config.profile_config.trace_file.parent, config.dp_rank,
+            )
+            self.kv_cache_manager.dplb_dfx = self._dplb_dfx
+            self._dfx_profile_lock = asyncio.Lock()
         self._async_scheduling = self.config.resolve_async_scheduling()
         scheduler_config = SchedulerConfig(
             max_num_running_reqs=self.config.max_num_running_reqs,
@@ -464,28 +476,87 @@ class ReplicaEngineCore:
         self._running = False
         await self._drain_loop_task()
         try:
-            if self._cache_tiering is not None:
-                await self._cache_tiering.close()
-        except BaseException:
             try:
-                await asyncio.to_thread(self._shutdown_worker, timeout=30)
-            except Exception:
-                logger.exception("Worker shutdown failed after DDR close failed; mappings remain retained")
-            raise
-        reaped = await asyncio.to_thread(self._shutdown_worker, timeout=30)
+                if self._cache_tiering is not None:
+                    await self._cache_tiering.close()
+            except BaseException:
+                try:
+                    await asyncio.to_thread(self._shutdown_worker, timeout=30)
+                except Exception:
+                    logger.exception("Worker shutdown failed after DDR close failed; mappings remain retained")
+                raise
+            reaped = await asyncio.to_thread(self._shutdown_worker, timeout=30)
+        finally:
+            dfx = getattr(self, "_dplb_dfx", None)
+            if dfx is not None:
+                await asyncio.to_thread(dfx.close)
         if reaped:
             logger.info("ReplicaEngineCore stopped")
         return reaped
 
-    async def start_profile(self) -> None:
+    async def start_profile(self, capture_id: str | None = None) -> None:
         """Start SA profiling in this replica's worker."""
-        await self._set_profile_active(True)
+        await self._set_profile_active(True, capture_id=capture_id)
 
     async def stop_profile(self) -> None:
         """Flush and stop SA profiling in this replica's worker."""
         await self._set_profile_active(False)
 
-    async def _set_profile_active(self, active: bool) -> None:
+    async def _set_profile_active(self, active: bool, *, capture_id: str | None = None) -> None:
+        dfx = getattr(self, "_dplb_dfx", None)
+        if dfx is None:
+            await self._set_worker_profile_active(active)
+            return
+        async with self._dfx_profile_lock:
+            if active:
+                started = dfx.start(capture_id, topology=self._dfx_topology(),
+                                    policy=self.kv_cache_manager._dfx_policy(),
+                                    settings=dict(executor=self.config.executor_cls,
+                                                  max_model_len=self._runtime.max_seq_len,
+                                                  max_num_seqs=self.config.max_num_running_reqs,
+                                                  max_scheduled_tokens=self.config.max_num_scheduled_tokens,
+                                                  speculative_tokens=self._runtime.num_speculative_tokens,
+                                                  prefix_cache=self.config.enable_prefix_cache),
+                                    counters_start=self._dfx_counters())
+                if started:
+                    self.kv_cache_manager.dfx_baseline()
+                    for request in self.scheduler.requests.values():
+                        if not request.status.is_finished:
+                            dfx.emit("request_baseline",
+                                     **dfx.request_fields(request.request_id, preexisting=True),
+                                     status=request.status.name, prompt_tokens=request.num_prompt_tokens,
+                                     group_id=request.cache_partition)
+            else:
+                # Host observations end here, independently of the worker's FIFO
+                # acknowledgement. No diagnostic device work is submitted.
+                dfx.stop(counters_end=self._dfx_counters())
+            try:
+                await self._set_worker_profile_active(active)
+            except BaseException:
+                await asyncio.to_thread(dfx.close, reason="profile_control_failed")
+                raise
+            if active:
+                dfx.emit("profile_control_ack", active=True)
+            else:
+                await asyncio.to_thread(dfx.close)
+
+    def _dfx_counters(self) -> dict | None:
+        stat_logger = getattr(self, "_stat_logger", None)
+        return stat_logger.snapshot() if stat_logger is not None else None
+
+    def _dfx_topology(self) -> list[dict]:
+        devices = self.config.worker_device_ids()
+        count = self.kv_cache_manager.group_partition_count
+        if not self.kv_cache_manager.has_groups:
+            return []
+        if len(devices) % count:
+            return [dict(group_id=p, tp_ranks=None, devices=None, status="mapping_unavailable")
+                    for p in range(count)]
+        width = len(devices) // count
+        return [dict(group_id=p, tp_ranks=list(range(p * width, (p + 1) * width)),
+                     devices=list(devices[p * width:(p + 1) * width])) for p in range(count)]
+
+    async def _set_worker_profile_active(self, active: bool) -> None:
         """Send an ordered worker profile command and wait for its acknowledgement."""
         result = await self._call_worker_command(ProfileCommand(active=active), decode_profile_result)
         if result.error:
@@ -1732,13 +1803,22 @@ class AsyncLLMEngine:
             num_speculative_tokens=config.runtime_config.num_speculative_tokens,
         )
 
+        if (config.dplb_dfx_config.level != "off"
+                and config.dplb_dfx_config.max_bytes < len(parallel.replica_device_groups)):
+            raise ValueError("DPLB DFX output budget must allow at least one byte per replica")
         for dp_rank, device_group in enumerate(parallel.replica_device_groups):
             replica_parallel = parallel.for_replica(device_group)
+            dfx_config = config.dplb_dfx_config
+            if dfx_config.level != "off":
+                dfx_config = replace(
+                    dfx_config, max_bytes=dfx_config.max_bytes // len(parallel.replica_device_groups),
+                )
             replica_config = replace(
                 config,
                 device_id=device_group[0],
                 parallel_config=replica_parallel,
                 dp_rank=dp_rank,
+                dplb_dfx_config=dfx_config,
             )
             core = core_factory(
                 config=replica_config,
@@ -1791,8 +1871,11 @@ class AsyncLLMEngine:
 
     async def start_profile(self) -> None:
         """Start SA profiling in every replica worker."""
+        dfx_enabled = any(getattr(core, "_dplb_dfx", None) for core in self._cores)
+        capture_id = uuid.uuid4().hex if dfx_enabled else None
         results = await asyncio.gather(
-            *(core.start_profile() for core in self._cores),
+            *(core.start_profile(capture_id) if getattr(core, "_dplb_dfx", None) is not None
+              else core.start_profile() for core in self._cores),
             return_exceptions=True,
         )
         errors = [result for result in results if isinstance(result, BaseException)]
