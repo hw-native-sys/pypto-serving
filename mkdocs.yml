@@ -121,6 +121,7 @@ nav:
       - Architecture: developer-guide/architecture.md
       - Profiling: developer-guide/profile.md
       - Accuracy Debugging: developer-guide/accuracy-debugging.md
+      - DPLB Host Diagnostics: developer-guide/dplb-dfx.md
       - Model Integration: developer-guide/model-integration.md
       - Weight Staging: developer-guide/weight-staging.md
       - V4.1 Engram and Decode Optimization: developer-guide/v41-engram-decode-optimization.md

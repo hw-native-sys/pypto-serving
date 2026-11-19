@@ -261,3 +261,18 @@ def test_retention_validation_and_default(interval):
         config = SchedulerConfig(prefix_cache_retention_interval=interval)
         with pytest.raises(ValueError, match="retention_interval"):
             config.validate_cache_groups(build_dspark_cache_group_specs(43))
+
+
+@pytest.mark.parametrize(
+    "flag,expected", [(None, False), ("--enable-dplb", True), ("--no-enable-dplb", False)]
+)
+def test_dplb_cli_reaches_engine_config(tmp_path, flag, expected):
+    model = tmp_path / "model"
+    model.mkdir()
+    argv = ["--model", str(model)] + ([flag] if flag else [])
+    config = cli.build_serving_engine_config(_parse_cli_args(argv))
+    assert config.enable_dplb is expected
+    assert config.resolve_dplb() is expected
+    from dataclasses import replace
+    dspark = replace(config, executor_cls="PyptoDeepSeekV4DSparkExecutor")
+    assert dspark.resolve_dplb() is expected
