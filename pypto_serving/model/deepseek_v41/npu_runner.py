@@ -72,7 +72,39 @@ from .weight_loader import (
 from .weight_spec import pack_mx_scale
 
 
+MAX_PREFILL_TOKENS_PER_DP = 4096
+
+
 # cache_resources
+_CACHE_GEOMETRY = {
+    "BLOCK_SIZE": 128,
+    "C2A_STORAGE_ROWS": 64,
+    "C1A_STORAGE_ROWS": 128,
+    "COMPRESSED_POOL_UNIT_ROWS": 64,
+}
+
+
+def validate_lib_cache_abi(abi):
+    """Reject incompatible cache geometry before compilation or device allocation.
+
+    Recent pypto-lib revisions removed the standalone ABI version and expose the
+    logical block size as ``BLOCK_SIZE``.  Keep accepting the old
+    ``LOGICAL_BLOCK_SIZE`` spelling while validating the geometry that actually
+    determines cache addressing.
+    """
+    values = {}
+    for name, expected in _CACHE_GEOMETRY.items():
+        aliases = ("BLOCK_SIZE", "LOGICAL_BLOCK_SIZE") if name == "BLOCK_SIZE" else (name,)
+        value = next((getattr(abi, alias) for alias in aliases if hasattr(abi, alias)), None)
+        values[name] = value
+    mismatches = {name: values[name] for name, expected in _CACHE_GEOMETRY.items()
+                  if type(values[name]) is not int or values[name] != expected}
+    if mismatches:
+        raise MissingCompositeInterface(
+            f"V4.1 requires cache geometry (128-token blocks, compact C2A pages, sliding windows); "
+            f"incompatible pypto-lib constants: {mismatches}")
+
+
 @dataclass(frozen=True)
 class CacheBufferSpec:
     name: str
@@ -90,6 +122,27 @@ class DecodeCachePlan:
     buffers: tuple[CacheBufferSpec, ...]
     request_slots: int
     physical_request_slots: int
+    window_scratch_pages: int = 0
+
+    def source_shapes(self, name):
+        """Describe page counts and physical row strides for each packed source."""
+        spec = next(spec for spec in self.buffers if spec.name == name)
+        if name == "window_cache_pool":
+            pages = self.physical_group_blocks[self.family_groups.window]
+            return ((pages, *spec.shape[2:]),) * len(self.group_sources[self.family_groups.window]["window"])
+        if name.startswith(("compressed_cache_", "index_cache_")):
+            family = "compressed" if name.startswith("compressed_") else "index"
+            shapes = {}
+            for group, rows in ((self.family_groups.c2a, 64), (self.family_groups.c1a, 128)):
+                for source in self.group_sources[group][family]:
+                    shapes[source] = (self.physical_group_blocks[group], rows, *spec.shape[3:])
+            if set(shapes) != set(range(len(shapes))):
+                raise ValueError("cache producer IDs must be contiguous")
+            return tuple(shapes[source] for source in range(len(shapes)))
+        if name == "state_cache_pool":
+            count = spec.shape[1] // self.physical_request_slots
+            return ((self.physical_request_slots, *spec.shape[2:]),) * count
+        raise ValueError(f"unknown V4.1 cache field: {name}")
 
 
 def cache_bytes_per_rank(plan: DecodeCachePlan) -> int:
@@ -165,7 +218,7 @@ def allocate_cache_with_retry(worker, requested_slots, plan_for_slots, state_res
 
 
 def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
-                            request_slots, abi) -> DecodeCachePlan:
+                            request_slots, abi, max_prefill_tokens=MAX_PREFILL_TOKENS_PER_DP) -> DecodeCachePlan:
     """Match scheduler page capacities to decode_fwd's source-sliced pools.
 
     ``abi`` is the imported decode_fwd module from the selected lib revision.
@@ -177,6 +230,7 @@ def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
     # compiled for TP1 and the lib module does not expose a TP_SIZE constant.
     # Use the selected serving topology as the source of truth instead of
     # reaching through an optional lib implementation detail.
+    validate_lib_cache_abi(abi)
     abi_tp_size = int(getattr(abi, "TP_SIZE", 1))
     if abi_tp_size <= 0:
         raise ValueError(f"invalid V4.1 decode TP size: {abi_tp_size}")
@@ -199,6 +253,10 @@ def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
             raise ValueError(f"{group.name} cache capacity conflicts with the scheduler")
         group_blocks[group.name] = blocks
     physical_group_blocks = {name: blocks + 1 for name, blocks in group_blocks.items()}
+    if type(max_prefill_tokens) is not int or not 0 < max_prefill_tokens <= MAX_PREFILL_TOKENS_PER_DP:
+        raise ValueError("invalid prefill scratch capacity")
+    scratch_pages = (max_prefill_tokens + 127) // 128
+    physical_group_blocks[resolved.window] += scratch_pages
 
     kv_sources = sum(layer.kv_source == layer.layer_id for layer in layers)
     c2a_sources = sum(layer.mode == "c2a_full" for layer in layers)
@@ -227,25 +285,25 @@ def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
         raise ValueError("decode cache dimensions disagree with the V4.1 EP4/EP8 topology")
     block = abi.BLOCK_SIZE
     window_pages = physical_group_blocks[resolved.window]
-    # One lib source axis covers both compression families, so its stride must
-    # fit the larger physical page namespace without remapping scheduler IDs.
-    compressed_pages = max(physical_group_blocks[resolved.c2a],
-                           physical_group_blocks[resolved.c1a])
+    # Packed pools use 64-row units; a C1A physical page occupies two units.
+    compressed_units = (
+        len(group_sources[resolved.c2a]["compressed"]) * physical_group_blocks[resolved.c2a]
+        + 2 * len(group_sources[resolved.c1a]["compressed"]) * physical_group_blocks[resolved.c1a])
     buffers = (
         CacheBufferSpec("window_cache_pool", (
             world, len(layers) * window_pages, block, 1, abi.WINDOW_CACHE_BYTES), torch.uint8),
         CacheBufferSpec("compressed_cache_pool", (
-            world, kv_sources * compressed_pages, block, 1, abi.COMPRESSED_CACHE_BYTES), torch.uint8),
+            world, compressed_units, 64, 1, abi.COMPRESSED_CACHE_BYTES), torch.uint8),
         CacheBufferSpec("index_cache_pool", (
-            world, kv_sources * compressed_pages, block, 1, index // 2), torch.uint8),
+            world, compressed_units, 64, 1, index // 2), torch.uint8),
         CacheBufferSpec("index_cache_scale_pool", (
-            world, kv_sources * compressed_pages, block, 1, index // abi.INDEX_CACHE_GROUP),
+            world, compressed_units, 64, 1, index // abi.INDEX_CACHE_GROUP),
                         torch.float8_e8m0fnu),
         CacheBufferSpec("state_cache_pool", (
             world, c2a_sources * (request_slots + 1), abi.STATE_CAPACITY, abi.STATE_WIDTH), torch.float32),
     )
     return DecodeCachePlan(primary_num_blocks, resolved, group_blocks, physical_group_blocks,
-                           group_sources, buffers, request_slots, request_slots + 1)
+                           group_sources, buffers, request_slots, request_slots + 1, scratch_pages)
 
 
 def make_state_reset_buffer(plan: DecodeCachePlan) -> torch.Tensor:
@@ -305,29 +363,13 @@ class DecodeCachePools:
         self.source_counts = {}
         try:
             for spec in plan.buffers:
-                if spec.name.startswith("window_cache_"):
-                    group = plan.family_groups.window
-                    stride = plan.physical_group_blocks[group]
-                    sources = len(plan.group_sources[group]["window"])
-                elif spec.name.startswith(("compressed_cache_", "index_cache_")):
-                    family = "compressed" if spec.name.startswith("compressed_") else "index"
-                    stride = max(plan.physical_group_blocks[group] for group, families in
-                                 plan.group_sources.items() if family in families)
-                    ids = {slot for families in plan.group_sources.values()
-                           for slot in families.get(family, ())}
-                    sources = len(ids)
-                    if ids != set(range(sources)):
-                        raise ValueError(f"{family} cache source IDs must be contiguous")
-                else:
-                    stride = plan.physical_request_slots
-                    sources = spec.shape[1] // stride
-                if spec.shape[1] != sources * stride:
-                    raise ValueError("cache source axis disagrees with the resident pool")
-                self.source_counts[spec.name] = sources
-                for source in range(sources):
+                shapes = plan.source_shapes(spec.name)
+                if sum(math.prod(shape) for shape in shapes) != math.prod(spec.shape[1:]):
+                    raise ValueError("cache source geometry disagrees with the resident pool")
+                self.source_counts[spec.name] = len(shapes)
+                for source, shape in enumerate(shapes):
                     self.tensors[spec.name, source] = alloc_device_buffer(
-                        worker, (spec.shape[0], stride, *spec.shape[2:]), spec.dtype,
-                        stacked=True)
+                        worker, (spec.shape[0], *shape), spec.dtype, stacked=True)
         except BaseException:
             self.close()
             raise
@@ -376,18 +418,25 @@ class DecodeCachePools:
             )
 
     def reset_request(self, owner, *, padding=False):
-        """Clear only this request's physical pages and C2A pending state."""
+        """Clear private recurrent state; immutable prefix KV survives release.
+
+        Reassigned KV pages are overwritten before their rows become visible.
+        Even an unreferenced page may remain in the prefix-cache hash table.
+        """
         if self.page_resets is None:
             raise ValueError("request reset requires pre-fork cache page buffers")
         partition = owner.partition
         if type(partition) is not int or not 0 <= partition < self.plan.buffers[0].shape[0]:
             raise ValueError("invalid DP partition")
-        if set(owner.pages) != set(self.plan.group_sources):
-            raise ValueError("request page families disagree with the cache plan")
         if (type(owner.slot) is not int or
                 (padding and owner.slot != self.plan.request_slots) or
                 (not padding and not 0 <= owner.slot < self.plan.request_slots)):
             raise ValueError("request state slot is outside its cache family")
+        if not padding:
+            self.reset_state_slot(partition, owner.slot)
+            return
+        if set(owner.pages) != set(self.plan.group_sources):
+            raise ValueError("request page families disagree with the cache plan")
         fields = {
             "window": ("window_cache_pool",),
             "compressed": ("compressed_cache_pool",),
@@ -409,12 +458,14 @@ class DecodeCachePools:
                     for source in sources:
                         target = self.view(name, source)
                         shard = target.shards[partition]
+                        source_page_bytes = math.prod(target.shape[2:]) * zero.element_size()
                         for page in pages:
-                            self.worker.copy_to(
-                                shard.data_ptr - shard.byte_offset, zero[partition].data_ptr(), page_bytes,
-                                dst_offset=shard.byte_offset + page * page_bytes,
-                                worker_id=partition,
-                            )
+                            for offset in range(0, source_page_bytes, page_bytes):
+                                self.worker.copy_to(
+                                    shard.data_ptr - shard.byte_offset, zero[partition].data_ptr(), page_bytes,
+                                    dst_offset=shard.byte_offset + page * source_page_bytes + offset,
+                                    worker_id=partition,
+                                )
         self.reset_state_slot(partition, owner.slot)
 
     def reset_padding(self, partition):
@@ -443,33 +494,19 @@ class DecodeFullCachePools(DecodeCachePools):
         self.tensors, self.source_counts, self._full = {}, {}, {}
         try:
             for spec in plan.buffers:
-                if spec.name.startswith("window_cache_"):
-                    group = plan.family_groups.window
-                    stride = plan.physical_group_blocks[group]
-                    sources = len(plan.group_sources[group]["window"])
-                elif spec.name.startswith(("compressed_cache_", "index_cache_")):
-                    family = "compressed" if spec.name.startswith("compressed_") else "index"
-                    stride = max(plan.physical_group_blocks[group] for group, families in
-                                 plan.group_sources.items() if family in families)
-                    sources = len({slot for families in plan.group_sources.values()
-                                   for slot in families.get(family, ())})
-                else:
-                    stride = plan.physical_request_slots
-                    sources = spec.shape[1] // stride
-                if spec.shape[1] != sources * stride:
-                    raise ValueError(f"{spec.name} packed cache source axis is invalid")
-                self.source_counts[spec.name] = sources
+                shapes = plan.source_shapes(spec.name)
+                if sum(math.prod(shape) for shape in shapes) != math.prod(spec.shape[1:]):
+                    raise ValueError(f"{spec.name} packed cache source geometry is invalid")
+                self.source_counts[spec.name] = len(shapes)
                 base = alloc_device_buffer(worker, spec.shape, spec.dtype, stacked=True)
                 self._full[spec.name] = base
-                slice_shape = (stride, *spec.shape[2:])
-                slot_bytes = math.prod(slice_shape) * torch.empty((), dtype=spec.dtype).element_size()
-                for source in range(sources):
-                    shards = tuple(worker.view_tensor(shard, slice_shape,
-                                                      byte_offset=source * slot_bytes,
-                                                      worker_id=rank)
+                offset = 0
+                for source, shape in enumerate(shapes):
+                    shards = tuple(worker.view_tensor(shard, shape, byte_offset=offset, worker_id=rank)
                                    for rank, shard in enumerate(base.shards))
                     self.tensors[spec.name, source] = StackedDeviceTensor(
-                        shards, (spec.shape[0], *slice_shape), base.worker_ids)
+                        shards, (spec.shape[0], *shape), base.worker_ids)
+                    offset += math.prod(shape) * torch.empty((), dtype=spec.dtype).element_size()
         except BaseException:
             self.close()
             raise
@@ -484,10 +521,9 @@ class DecodeFullCachePools(DecodeCachePools):
         plan = self.plan
         family = plan.family_groups
         window_pages = plan.physical_group_blocks[family.window]
-        compressed_pages = max(plan.physical_group_blocks[family.c2a],
-                               plan.physical_group_blocks[family.c1a])
-        if window_pages != compressed_pages:
-            raise ValueError("lib prefill requires one common cache page extent")
+        compressed_pages = plan.physical_group_blocks[family.c2a]
+        if compressed_pages != plan.physical_group_blocks[family.c1a]:
+            raise ValueError("lib prefill requires equal C2A and C1A logical page extents")
         names = {
             "window_cache": "window_cache_pool",
             "compressed_cache": "compressed_cache_pool",
@@ -501,10 +537,14 @@ class DecodeFullCachePools(DecodeCachePools):
         result = {}
         for target, source in names.items():
             base = self.full(source)
-            pages = plan.physical_request_slots if target == "state_cache" else window_pages
-            sources = compressed_sources if target in ("index_cache", "index_scales") else self.source_counts[source]
-            if base.shape[1] < sources * pages or (target not in ("index_cache", "index_scales")
-                                                   and base.shape[1] != sources * pages):
+            if target == "state_cache":
+                pages = plan.physical_request_slots
+            elif target == "window_cache":
+                pages = window_pages
+            else:
+                pages = compressed_pages
+            sources = base.shape[1] // pages
+            if base.shape[1] != sources * pages:
                 raise ValueError(f"{source} cannot be viewed with lib prefill source/page axes")
             shape = (sources, pages, *base.shape[2:])
             shards = tuple(self.worker.view_tensor(shard, shape, byte_offset=0, worker_id=rank)
@@ -554,8 +594,8 @@ class CompositeBindings:
 
     No default implementation fabricates results. A supplied adapter must handle
     all DP partitions collectively, including empty partitions, and retain input
-    objects until wait() completes. reset_request must clear every persistent
-    cache and compressor slot for that request before returning.
+    objects until wait() completes. reset_request must clear private recurrent state before reuse and preserve
+    immutable cached KV pages after request release.
     """
     revision: str
     entries: Mapping[tuple[str, str], Callable]
@@ -733,7 +773,6 @@ def lookup_token_embeddings(
 
 # metadata
 _MAX_REQUESTS_PER_DP = 12
-MAX_PREFILL_TOKENS_PER_DP = 4096
 
 
 def _validate_dp_capacity(partitions, token_counts, *, phase, dp_size):
@@ -750,7 +789,7 @@ def _validate_dp_capacity(partitions, token_counts, *, phase, dp_size):
         raise ValueError("V4.1 lib supports at most 4096 prefill tokens per DP partition")
 
 
-def validate_page_tables(rows, partitions, ends, groups):
+def validate_page_tables(rows, partitions, ends, groups, *, defer_ownership=False):
     """Copy private full-history page tables and reject active request aliases.
 
     Physical IDs are local to each DP partition. Without an explicit num_blocks
@@ -764,8 +803,6 @@ def validate_page_tables(rows, partitions, ends, groups):
     dp_size = groups[0].num_partitions
     if any(group.num_partitions != dp_size for group in groups):
         raise ValueError("V4.1 cache groups require the same DP partition count")
-    if any(group.sliding_window is not None for group in groups):
-        raise MissingCompositeInterface("rolling cache page lowering requires a verified composite contract")
     if len(rows) != len(partitions) or len(rows) != len(ends):
         raise ValueError("page tables, partitions and request extents must have matching rows")
     required = {group.name for group in groups}
@@ -788,12 +825,14 @@ def validate_page_tables(rows, partitions, ends, groups):
             if group.num_blocks is not None and any(page >= group.num_blocks for page in ids):
                 raise ValueError("physical page ID exceeds the configured cache pool")
             required_pages = math.ceil(end / group.spec.token_capacity)
+            if group.sliding_window is not None:
+                required_pages = min(required_pages, group.max_blocks_per_seq)
             if not required_pages <= len(ids) <= group.max_blocks_per_seq:
                 raise ValueError("cache page table does not cover the request extent within its capacity")
             if len(set(ids)) != len(ids):
                 raise ValueError("a full-history request must not alias its own cache pages")
             addresses = {(partition, group.name, page) for page in ids}
-            if owners.intersection(addresses):
+            if not defer_ownership and owners.intersection(addresses):
                 raise ValueError("active requests must not share writable cache pages")
             owners.update(addresses)
             copied[group.name] = ids
@@ -816,7 +855,7 @@ def prefill_requests(batch, config, runtime, groups):
     if len(set(batch.request_ids)) != count:
         raise ValueError("prefill requests must have distinct IDs")
     for name in ("chunk_lens", "chunk_offsets", "chunk_starts", "seq_lens", "prompt_lens",
-                 "block_ids_by_group", "cache_partitions"):
+                 "block_ids_by_group", "read_block_ids_by_group", "cache_partitions"):
         if len(getattr(batch, name)) != count:
             raise ValueError(f"prefill {name} must contain one entry per request")
     tokens = batch.token_ids
@@ -851,12 +890,13 @@ def prefill_requests(batch, config, runtime, groups):
     _validate_dp_capacity(batch.cache_partitions, batch.chunk_lens, phase="prefill",
                           dp_size=groups[0].num_partitions)
     pages = validate_page_tables(
-        batch.block_ids_by_group, batch.cache_partitions, batch.seq_lens, groups,
+        batch.block_ids_by_group, batch.cache_partitions, batch.seq_lens, groups, defer_ownership=True,
     )
     return [
-        (key, partition, start, chunk, prompt, table)
-        for key, partition, start, chunk, prompt, table in zip(
+        (key, partition, start, chunk, prompt, table, read_pages)
+        for key, partition, start, chunk, prompt, table, read_pages in zip(
             batch.request_ids, batch.cache_partitions, batch.chunk_starts, chunks, batch.prompt_lens, pages,
+            batch.read_block_ids_by_group,
         )
     ]
 
@@ -885,7 +925,8 @@ def decode_requests(batch, config, runtime, groups):
         raise ValueError("decode requires one partition and grouped page table per request")
     _validate_dp_capacity(batch.cache_partitions, (1 for _ in range(count)), phase="decode",
                           dp_size=groups[0].num_partitions)
-    pages = validate_page_tables(batch.block_ids_by_group, batch.cache_partitions, ends, groups)
+    pages = validate_page_tables(batch.block_ids_by_group, batch.cache_partitions, ends, groups,
+                                 defer_ownership=True)
     return [(key, partition, end - 1, token, table)
             for key, partition, end, token, table in zip(
                 batch.request_ids, batch.cache_partitions, ends, ids, pages)]
@@ -1033,11 +1074,13 @@ def prepare_compressed_metadata(
     """Lower full-history pages with joint KV/index physical page numbering.
 
     The resource allocator must use the same page IDs for compressed KV and
-    index-key pools. Each pool stores 128 compressed rows per page. This does
+    index-key pools. C2A pages store 64 rows and C1A pages store 128. This does
     not select candidates/Top-K or materialize compressed attention indices.
     Those remain device outputs from the appropriate lib producer composite.
 
     Request IDs are local packed batch rows; state slots are stable ledger IDs.
+    Replay rows before the shared prefix boundary retain normal reads and
+    private state updates, but -1 write slots suppress both KV and index publication.
     Ratio-2 publishes only completed pairs, rotating them at the pair's first
     position. An odd-length chunk leaves its tail in the request's state block.
     The formulas match lib metadata.paged_slots/compressor_metadata at fbe92bfc.
@@ -1047,7 +1090,8 @@ def prepare_compressed_metadata(
             raise ValueError("compressed metadata requires a ForwardStep and SegmentTopology")
         if type(ratio) is not int or ratio not in (1, 2):
             raise ValueError("compression ratio must be 1 or 2")
-        if (type(cache_pages) is not int or not 0 < cache_pages <= (2**31 - 1) // 128
+        storage_rows = 128 // ratio
+        if (type(cache_pages) is not int or not 0 < cache_pages <= (2**31 - 1) // storage_rows
                 or type(max_requests) is not int or max_requests <= 0
                 or type(state_blocks) is not int or not 0 < state_blocks <= 2**31 - 1
                 or type(max_prepare_bytes) is not int or max_prepare_bytes <= 0):
@@ -1057,7 +1101,7 @@ def prepare_compressed_metadata(
         if step.phase not in ("prefill", "decode"):
             raise ValueError("unsupported forward phase")
         groups = [[] for _ in range(topology.dp)]
-        counts, owners, slots, names = [0] * topology.dp, set(), set(), set()
+        counts, owners, slots, names = [0] * topology.dp, {}, set(), set()
         columns = 1
         for request in step.requests:
             group, count = request.partition, len(request.token_ids)
@@ -1078,15 +1122,19 @@ def prepare_compressed_metadata(
                 raise ValueError("requests must own distinct compressor state slots")
             slots.add(key)
             pages = request.pages.get(compressed_group)
-            needed = (request.end // ratio + 127) // 128
+            needed = (request.end // ratio + storage_rows - 1) // storage_rows
             if not isinstance(pages, (tuple, list)) or len(pages) < needed:
                 raise ValueError("compressed pages must cover all completed history")
-            for page in pages:
+            for index, page in enumerate(pages):
                 if type(page) is not int or not 0 <= page < cache_pages:
                     raise ValueError("compressed page is outside the joint KV/index pool")
-                if (group, page) in owners:
-                    raise ValueError("compressed pages must be private within each DP group")
-                owners.add((group, page))
+                immutable = (index + 1) * 128 <= max(request.start, request.shared_prefix_tokens)
+                previous = owners.get((group, page))
+                if previous is not None and previous != (True, index):
+                    raise ValueError("compressed requests may share only matching immutable prefix pages")
+                if previous is not None and not immutable:
+                    raise ValueError("compressed writable suffix pages must be private")
+                owners[group, page] = (immutable, index)
             columns = max(columns, len(pages))
             groups[group].append((request, counts[group], tuple(pages)))
             counts[group] += count
@@ -1119,7 +1167,9 @@ def prepare_compressed_metadata(
                 for local, position in enumerate(range(request.start, request.end)):
                     if (position + 1) % ratio == 0:
                         logical = position // ratio
-                        writes[group, offset + local] = pages[logical // 128] * 128 + logical % 128
+                        if position >= request.shared_prefix_tokens:
+                            writes[group, offset + local] = (
+                                pages[logical // storage_rows] * storage_rows + logical % storage_rows)
                         rope[group, offset + local] = position + 1 - ratio
         def replicate(tensor):
             return tensor.repeat_interleave(topology.tp, dim=0)
@@ -1134,6 +1184,7 @@ def compile_decode_fwd(compiler, lib_root, topology):
 
     load_segment_modules(lib_root, topology)
     module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
+    validate_lib_cache_abi(module)
     entry = module.l3_decode_fwd
     annotation = inspect.signature(entry._func).parameters["attention_num_tokens"].annotation
     shape = tuple(getattr(annotation, "shape", ()))
@@ -1157,14 +1208,14 @@ def compile_decode_fwd_dspark(compiler, lib_root, topology):
     load_segment_modules(lib_root, topology)
     module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd_dspark")
     entries = {"decode": module.l3_decode_fwd_dspark}
-    state = importlib.import_module("models.deepseek_v4_1_flash.dspark_state")
+    state = importlib.import_module("models.deepseek_v4_1_flash.dspark_init")
     entries.update({name.removeprefix("l3_"): getattr(state, name) for name in (
         "l3_bootstrap_inputs", "l3_publish_bootstrap",
         "l3_prepare_prefill_drafter_geometry")})
     entries["dspark_drafter"] = importlib.import_module(
         "models.deepseek_v4_1_flash.dspark_drafter").l3_dspark_drafter
     entries["markov_sample"] = importlib.import_module(
-        "models.deepseek_v4_1_flash.dspark_markov").l3_markov_sample_from_hidden
+        "models.deepseek_v4_1_flash.markov").l3_markov_output
     programs = {}
     param_names = {}
     for name, entry in entries.items():
@@ -1209,13 +1260,6 @@ class DecodeForwardSegment:
         arguments.update({name: metadata.fields[name] for name in (
             "window_slots", "window_indices", "c2a_compressed_slots", "c1a_compressed_slots",
         )})
-        arguments.update(
-            final_norm_weight=final.norm_weight,
-            lm_head_weight=final.head_weight,
-            logit_row_indices=final.host.logit_row_indices,
-            logits=final.host.logits,
-            sampled_ids=final.host.sampled_ids,
-        )
         if engram is not None and "engram_lookup" in param_names:
             arguments.update(engram_lookup=metadata.fields["engram_lookup"],
                             engram_wkv=engram.wkv,
@@ -1336,7 +1380,9 @@ class V41ModelRunner:
             self.ledger = RequestLedger(
                 max_requests=self.bindings.cache_groups[0].max_requests_per_partition,
                 max_seq_len=self.runtime.max_seq_len,
-                partitions=self.plan.placement.dp_size)
+                partitions=self.plan.placement.dp_size,
+                sliding_groups=tuple(g.name for g in self.bindings.cache_groups
+                                     if g.sliding_window is not None))
         if getattr(self.resources, "dspark", None) is not None:
             self.resources.ledger = self.ledger
         return self.ledger
@@ -1353,11 +1399,17 @@ class V41ModelRunner:
             with self._lock:
                 ledger = self._request_ledger()
                 requests = prefill_requests(batch, model.config, self.runtime, self.bindings.cache_groups)
-                step = ledger.begin_prefill(requests)
-                return self._run_transaction(step, batch.input_embeddings)
+                hits = batch.prefix_cache_hit_tokens
+                if hits and len(hits) != len(batch.request_ids):
+                    raise ValueError("prefix boundaries must contain one entry per prefill request")
+                new_requests = tuple(key for key in batch.request_ids if key not in ledger.owners)
+                step = ledger.begin_prefill(requests, prefix_cache_hits=dict(zip(batch.request_ids, hits)))
+                return self._run_transaction(step, batch.input_embeddings, initialize_requests=new_requests)
 
-    def _run_transaction(self, step, embeddings):
+    def _run_transaction(self, step, embeddings, *, initialize_requests=()):
         try:
+            for key in initialize_requests:
+                self._reset_request(key, self.ledger.owners[key])
             result = self._execute_step(step, embeddings)
             with profile_span("v41.wait", cat="v41.host", level="verbose"):
                 self.bindings.wait(self.resources)
@@ -1518,6 +1570,7 @@ class V41ModelRunner:
                 batch.block_ids_by_group, batch.cache_partitions,
                 [start + 1 + len(drafts[key]) for key, _, start, _, _ in requests],
                 self.bindings.cache_groups,
+                defer_ownership=True,
             )
             step = ledger.begin_decode(requests, drafts=drafts)
             try:
@@ -1679,6 +1732,7 @@ class SwaWindowMetadata:
     window_slots: torch.Tensor
     window_indices: torch.Tensor
     group_counts: tuple[int, ...]
+    window_restore_slots: torch.Tensor | None = None
 
 
 class HostEngramResources:
@@ -1736,12 +1790,14 @@ class HostEngramResources:
             offsets = [0] * topology.dp
             for request in step.requests:
                 start = offsets[request.partition]
+                if request.shared_prefix_tokens and request.request_id not in self.host.history:
+                    self.host.begin_replay(request.request_id, max(0, request.shared_prefix_tokens - 128))
                 count = len(request.token_ids)
                 if count > topology.capacity:
                     raise ValueError("Engram rows must fit the current-token capacity")
                 if row_stride is not None and count > row_stride:
                     raise ValueError("Engram active rows exceed the request stride")
-                values = self.host.lookup(request.token_ids, start_pos=request.start,
+                values = self.host.lookup(request.token_ids, topology.capacity, request.start,
                                           request_id=request.request_id)
                 for tp_rank in range(topology.tp):
                     rank = request.partition * topology.tp + tp_rank
@@ -1821,12 +1877,14 @@ def prepare_swa_window_metadata(
     cache_pages: int,
     window_group: str = "window",
     max_prepare_bytes: int = 32 << 20,
+    scratch_base: int | None = None,
 ) -> SwaWindowMetadata:
     """Map each active row to a unique cache write and at most 128 causal reads.
 
     Page IDs address a partition-private cache of [pages, 128, 1, 512] payloads.
-    Full-history tables preserve old rows while the whole new chunk is published;
-    a 128-slot modulo ring would overwrite keys needed by early chunk queries.
+    Prefill writes into rank-local scratch while reading entry history from a
+    private ring. Only the final 128 new rows are copied into that ring after
+    attention finishes. Decode writes directly into the request's private ring.
     TP peers receive the same group-global metadata. No cache contents, RoPE,
     request ownership or completion state are changed by this host preparation.
     """
@@ -1837,6 +1895,11 @@ def prepare_swa_window_metadata(
             raise ValueError("cache_pages must fit the INT32 window-index ABI")
         if type(max_prepare_bytes) is not int or max_prepare_bytes <= 0:
             raise ValueError("max_prepare_bytes must be a positive integer")
+        if scratch_base is not None and (
+            type(scratch_base) is not int or scratch_base < 0 or step.phase != "prefill"
+            or scratch_base * 128 + topology.capacity > cache_pages * 128
+        ):
+            raise ValueError("prefill scratch must fit the window pool")
         if step.phase not in ("prefill", "decode"):
             raise ValueError("unsupported forward phase")
         counts, ranges, owners, requests = [0] * topology.dp, [], set(), set()
@@ -1853,8 +1916,12 @@ def prepare_swa_window_metadata(
             if counts[group] + count > topology.capacity:
                 raise ValueError("DP token count exceeds SWA capacity")
             pages = request.pages.get(window_group)
-            if not isinstance(pages, (tuple, list)) or len(pages) < (request.end + 127) // 128:
-                raise ValueError("SWA requires a full-history physical page table through the chunk end")
+            if not isinstance(pages, (tuple, list)) or len(pages) < min(3, (request.end + 127) // 128):
+                raise ValueError("SWA requires a complete private window ring")
+            if scratch_base is None and step.phase == "prefill" and (
+                (request.end - 1) // 128 - max(0, request.start - 127) // 128 >= len(pages)
+            ):
+                raise ValueError("prefill requires scratch when the chunk would overwrite entry history")
             for page in pages:
                 if type(page) is not int or not 0 <= page < cache_pages:
                     raise ValueError("SWA physical page is outside its partition cache pool")
@@ -1862,7 +1929,9 @@ def prepare_swa_window_metadata(
                 if key in owners:
                     raise ValueError("SWA pages must be private; shared or repeated physical pages are unsupported")
                 owners.add(key)
-            ranges.append((group, counts[group], request.start, count, tuple(pages)))
+            ranges.append((group, counts[group], request.start, count, tuple(pages),
+                           max(0, request.shared_prefix_tokens - 128),
+                           request.read_pages.get(window_group, {})))
             counts[group] += count
         rows = topology.dp * topology.capacity
         estimate = rows * (128 * 4 + 2 * 8) * (topology.tp + 1)
@@ -1870,19 +1939,29 @@ def prepare_swa_window_metadata(
             raise ValueError(f"SWA metadata requires estimated {estimate} bytes; budget={max_prepare_bytes}")
         positions = torch.zeros(topology.dp, topology.capacity, dtype=torch.int64)
         slots = torch.full_like(positions, -1)
+        restore = torch.full_like(positions, -1)
         indices = torch.full((topology.dp, topology.capacity, 128), -1, dtype=torch.int32)
-        for group, row, start, count, pages in ranges:
+        for group, row, start, count, pages, valid_from, read_pages in ranges:
+            def ring_slot(position):
+                if position < start and position // 128 in read_pages:
+                    return read_pages[position // 128] * 128 + position % 128
+                return pages[position // 128 % len(pages)] * 128 + position % 128
             for local in range(count):
                 position = start + local
                 positions[group, row + local] = position
-                slots[group, row + local] = pages[position // 128] * 128 + position % 128
-                visible = range(max(0, position - 127), position + 1)
-                addresses = [pages[p // 128] * 128 + p % 128 for p in visible]
+                slots[group, row + local] = (ring_slot(position) if scratch_base is None
+                                             else scratch_base * 128 + row + local)
+                if scratch_base is not None and local >= count - 128:
+                    restore[group, row + local] = ring_slot(position)
+                visible = range(max(valid_from, position - 127), position + 1)
+                addresses = [(scratch_base * 128 + row + p - start
+                              if scratch_base is not None and p >= start else ring_slot(p)) for p in visible]
                 indices[group, row + local, :len(addresses)] = torch.tensor(addresses, dtype=torch.int32)
         return SwaWindowMetadata(
             positions.repeat_interleave(topology.tp, dim=0),
             slots.repeat_interleave(topology.tp, dim=0),
             indices.repeat_interleave(topology.tp, dim=0), tuple(counts),
+            restore.repeat_interleave(topology.tp, dim=0),
         )
 
 
@@ -2038,6 +2117,7 @@ class PrefillMetadataResources:
         self.topology = topology
         self.max_requests = max_requests
         self.window_pages = window_pages
+        self.window_scratch_base = None
         self.compressed_pages = {"c2a": c2a_pages, "c1a": c1a_pages}
         self.fields = {}
         self.full_hidden_size = full_hidden_size
@@ -2062,12 +2142,13 @@ class PrefillMetadataResources:
         shared("moe_counts", (world,), torch.int32)
         shared("window_slots", (world, tokens), torch.int64, -1)
         shared("window_indices", (world, tokens, 128), torch.int32, -1)
+        shared("window_restore_slots", (world, tokens), torch.int64, -1)
         for name in ("rope_cos", "rope_sin", "compressed_rope_cos", "compressed_rope_sin"):
             shared(name, (world, tokens, width), torch.float32)
         for name in ("c2a_compressed_rope_cos", "c2a_compressed_rope_sin"):
             shared(name, (world, tokens, width), torch.float32)
         for prefix in self.compressed_pages:
-            block_tokens = 256 if prefix == "c2a" else 128
+            block_tokens = 128
             # Columns cover one request's history; entries address the whole physical pool.
             table_pages = (max_seq_len + block_tokens - 1) // block_tokens
             for name, shape, dtype, fill in (
@@ -2131,9 +2212,11 @@ class PrefillMetadataResources:
         # DP8 at the maximum 4096-row capacity needs 33 MiB of SWA scratch.
         with profile_span('v41.PrefillMetadataResources.stage', cat='v41.host', level='verbose'):
             swa = prepare_swa_window_metadata(
-                step, self.topology, cache_pages=self.window_pages, max_prepare_bytes=64 << 20)
+                step, self.topology, cache_pages=self.window_pages, max_prepare_bytes=64 << 20,
+                scratch_base=self.window_scratch_base if step.phase == "prefill" else None)
             self.fields["window_slots"].copy_(swa.window_slots)
             self.fields["window_indices"].copy_(swa.window_indices)
+            self.fields["window_restore_slots"].copy_(swa.window_restore_slots)
             cos, sin = gather_swa_rope_rows(
                 swa, self.tables[""], max_prepare_bytes=64 << 20)
             self.fields["rope_cos"].copy_(cos)
@@ -2224,6 +2307,7 @@ class PrefillMetadataResources:
             "logit_rows": "full_logit_rows",
             "position_ids": "full_position_ids", "freqs_cos": "full_freqs_cos",
             "freqs_sin": "full_freqs_sin", "window_slots": "full_window_slots",
+            "window_restore_slots": "window_restore_slots",
             "window_indices": "full_window_indices",
             "token_to_req_indices": "full_token_requests",
             "query_start_loc": "full_query_starts",
@@ -2559,7 +2643,7 @@ class ResidentDSparkCache:
         from models.deepseek_v4_1_flash.config import WINDOW_CACHE_BYTES
 
         self.worker = worker
-        blocks = DSPARK_MAX_BATCH_PER_DP * ((max_seq_len + DSPARK_WINDOW - 1) // DSPARK_WINDOW)
+        blocks = DSPARK_MAX_BATCH_PER_DP * 3
         self.window_cache = alloc_device_buffer(
             worker, (world, DSPARK_DRAFT_LAYERS, blocks, DSPARK_WINDOW, 1, WINDOW_CACHE_BYTES),
             torch.uint8, stacked=True)
@@ -2668,10 +2752,17 @@ class ResidentDSparkBuffers:
 
 
 # resident_resources
+# Names the Lib's DSpark decode program must expose as resident device buffers.
+# The refactored Lib decode ABI (b127ab43 onward, merged as eac6fb1f) no longer
+# carries "target_hidden", "context_valid", or "context_positions" as decode
+# program parameters: the drafter derives its context extent from target_hidden,
+# and the decode program publishes target_hidden_padded instead. The serving
+# still allocates those workspace buffers for the drafter stage, so only the
+# decode-side contract drops them.
 _DSPARK_RESIDENT_DECODE_SCRATCH = frozenset((
     "x_hc", "pre_mix", "position_ids", "request_ids", "window_slots", "window_indices",
-    "c2a_slots", "c1a_slots", "query_starts", "target_hidden_padded", "target_hidden",
-    "context_valid", "context_positions", "num_sampled", "anchor_ids", "first_query_positions",
+    "c2a_slots", "c1a_slots", "query_starts", "target_hidden_padded",
+    "num_sampled", "anchor_ids", "first_query_positions",
     "context_slots", "context_rope_cos", "context_rope_sin", "query_rope_cos", "query_rope_sin",
     "draft_head_hidden", "committed",
 ))
@@ -2716,7 +2807,7 @@ class V41ResidentResources:
                  prefill_program=None, prefill_param_names=None,
                  dspark_programs=None, dspark_param_names=None, max_seq_len=None,
                  dspark_weight_contract=None, dspark_lowering_provider=None,
-                 dspark_host_resources=None):
+                 dspark_host_resources=None, decode_head_program=None):
         weight_bank.finish(weight_param_names)
         if decode_host is not None and (decode_input_host is None or
                 decode_host.topology != decode_input_host.topology):
@@ -2764,6 +2855,7 @@ class V41ResidentResources:
         self._prefill_fwd = None
         self._decode_fwd = None
         self._decode_binding = None
+        self._decode_head_program = decode_head_program
         self._weight_bank = weight_bank
         self._weight_param_names = tuple(weight_param_names)
         self._prefill_binding = (prefill_program, prefill_param_names, run_config, prefill_host.topology)
@@ -2803,6 +2895,15 @@ class V41ResidentResources:
             else:
                 cache = DecodeFullCachePools(self.worker, cache_plan, state_reset, page_resets)
             self.cache = self._own(cache)
+            plan = cache.plan
+            prefill_host.window_pages = plan.physical_group_blocks[plan.family_groups.window]
+            prefill_host.window_scratch_base = plan.group_blocks[plan.family_groups.window] + 1
+            for metadata_host in (prefill_host, decode_host):
+                if metadata_host is not None:
+                    metadata_host.compressed_pages = {
+                        family: plan.physical_group_blocks[getattr(plan.family_groups, family)]
+                        for family in ("c2a", "c1a")
+                    }
             if self.dspark_host_resources is not None:
                 if dspark_weight_contract is None:
                     raise MissingCompositeInterface(
@@ -2856,6 +2957,7 @@ class V41ResidentResources:
         target = {name: value for name, value in self._decode_fwd.arguments.items()
                   if name not in _TARGET_DYNAMIC_KEYS}
         target["embedding_weight"] = self.dspark_embedding.tensor
+        target.update(final_norm_weight=self.final.norm_weight, lm_head_weight=self.final.head_weight)
         for name in ("logit_row_indices", "attention_num_tokens", "moe_num_tokens", "state_block_table"):
             target[name] = resources.decode_workspace[name]
         target["c2a_index_block_table"] = resources.cache_tables["target_c2a"]
@@ -3007,17 +3109,26 @@ class V41ResidentResources:
             offset = offsets[rank]
             size = len(request.token_ids)
             offsets[rank] += size
-            if request.start and progress.get(rank) != (request.request_id, request.start):
-                raise ValueError("DSpark prefill taps must continue the same request")
+            previous_progress = progress.get(rank)
+            if previous_progress is None or previous_progress[0] != request.request_id:
+                if request.start != max(0, request.shared_prefix_tokens - 128):
+                    raise ValueError("DSpark prefill taps must start at the replay origin")
+                retained_count = 0
+            else:
+                if previous_progress[1] != request.start:
+                    raise ValueError("DSpark prefill taps must continue the same request")
+                retained_count = previous_progress[2]
             if size >= capacity:
                 retained[rank, :capacity].copy_(source[rank, offset + size - capacity:offset + size])
+                retained_count = capacity
             else:
-                previous = min(request.start, capacity - size)
+                previous = min(retained_count, capacity - size)
                 if previous:
-                    old_end = min(request.start, capacity)
-                    retained[rank, :previous].copy_(retained[rank, old_end - previous:old_end].clone())
+                    retained[rank, :previous].copy_(
+                        retained[rank, retained_count - previous:retained_count].clone())
                 retained[rank, previous:previous + size].copy_(source[rank, offset:offset + size])
-            progress[rank] = (request.request_id, request.end)
+                retained_count = previous + size
+            progress[rank] = (request.request_id, request.end, retained_count)
         self._dspark_prefill_progress = progress
 
     def _stage_dspark_prefill(self, resources, batch, request_ids, sampled_token_ids):
@@ -3038,9 +3149,10 @@ class V41ResidentResources:
             prompt_length = int(batch.prompt_lens[0])
             if not 0 < prompt_length <= resources.layout.max_seq_len:
                 raise ValueError("DSpark prefill prompt exceeds the configured context capacity")
-            if getattr(self, "_dspark_prefill_progress", {}).get(rank) != (request_id, prompt_length):
+            progress = getattr(self, "_dspark_prefill_progress", {}).get(rank)
+            if progress is None or progress[:2] != (request_id, prompt_length):
                 raise ValueError("DSpark bootstrap requires all target prefill chunks to complete")
-            retained_count = min(prompt_length, resources.layout.max_prefill_tokens, DSPARK_WINDOW)
+            retained_count = progress[2]
             if retained_count < min(prompt_length, DSPARK_WINDOW):
                 raise ValueError("DSpark prefill buffer cannot retain the visible draft context")
             prefix_start = prompt_length - retained_count
@@ -3079,8 +3191,6 @@ class V41ResidentResources:
             ranks, rows = self._stage_dspark_decode(resources, batch)
             workspace = resources.decode_workspace
             target = self._build_dspark_target_model(resources)
-            target["logits"].zero_()
-            target["sampled_ids"].fill_(-1)
             outputs = {name: workspace[name] for name in (
                 "accepted_counts", "accepted_ids", "last_sampled", "draft_ids", "confidences")}
             outputs["request_rows"] = rows
@@ -3254,7 +3364,13 @@ class V41ResidentResources:
         if (self.closed or step is not self._step or step.phase != "decode"
                 or self._decode_fwd is None):
             raise ValueError("full decode requires the active decode step")
-        return self._decode_fwd.run(state, group_counts=self._group_counts)
+        state = self._decode_fwd.run(state, group_counts=self._group_counts)
+        self.worker.run(
+            self._decode_head_program.compiled, state.residual, state.pre_mix,
+            self.final.norm_weight, self.final.head_weight, self.final.host.logit_row_indices,
+            self.final.host.logits, self.final.host.sampled_ids, config=self.run_config,
+        )
+        return state
 
     def dispatch_dspark(self, stage, arguments):
         """Dispatch one compiled DSpark composite with an exact ABI check.
@@ -3290,10 +3406,7 @@ class V41ResidentResources:
             reset_windows = False
             if stage in ("dspark_drafter", "decode"):
                 module = importlib.import_module("models.deepseek_v4_1_flash.dspark_drafter")
-                hidden_name = "draft_head_hidden" if stage == "decode" else "head_hidden"
-                batch = int(arguments[hidden_name].shape[1])
-                chunks = (batch + module.DSPARK_CHUNK_REQUESTS - 1) // module.DSPARK_CHUNK_REQUESTS
-                stride = chunks * module.DSPARK_DRAFT_LAYERS
+                stride = module.DSPARK_DRAFT_LAYERS
                 key = id(program.compiled)
                 epoch = self._dspark_drafter_epochs.get(key, 1)
                 # The pinned A5 int32 AtomicAdd signal stops advancing at 2048.
@@ -3340,14 +3453,6 @@ class V41ResidentResources:
                 raise MissingCompositeInterface(
                     "V4.1 DSpark lowering is missing mappings: " + ", ".join(missing)
                 )
-            try:
-                module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd_dspark")
-                function = (module.prefill_bootstrap_dspark if phase == "prefill"
-                            else module.decode_fwd_dspark)
-            except (ImportError, AttributeError) as exc:
-                raise MissingCompositeInterface(
-                    "V4.1 DSpark lib orchestration entry is unavailable"
-                ) from exc
             runner = _DSparkOrchestratorRunner(self, phase)
             try:
                 kwargs = dict(
@@ -3355,23 +3460,45 @@ class V41ResidentResources:
                     logits_epoch=lowered.logits_epoch,
                 )
                 if phase == "prefill":
-                    function(
+                    module = importlib.import_module("models.deepseek_v4_1_flash.dspark_init")
+                    module.dspark_init(
                         runner, lowered.state, lowered.workspace, lowered.draft_model,
                         lowered.markov_model, lowered.cache_tables, lowered.rope_tables,
                         **kwargs,
                     )
                 else:
-                    function(
-                        runner, lowered.state, lowered.workspace, lowered.target_model,
-                        lowered.draft_model, lowered.markov_model, lowered.cache_tables,
-                        lowered.rope_tables, **kwargs,
-                    )
+                    runner(None, self._dspark_decode_arguments(lowered))
                 runner.finish()
             except MissingCompositeInterface:
                 raise
             except BaseException as exc:
                 self.failed = True
                 raise RuntimeError(f"V4.1 DSpark {phase} orchestration failed") from exc
+
+    def _dspark_decode_arguments(self, lowered):
+        """Bind the Lib recurrent composite without rebuilding its device graph."""
+        target = lowered.target_model
+        arguments = dict(lowered.workspace)
+        arguments.update({name: value for name, value in target.items() if name not in (
+            "embedding_weight", "logit_row_indices", "attention_num_tokens", "moe_num_tokens",
+        )})
+        arguments.update(
+            slot_ids=lowered.state.slot_ids, generations=lowered.state.generations,
+            state_tokens=lowered.state.tokens, state_meta=lowered.state.meta,
+            target_embedding_weight=target["embedding_weight"],
+            target_window_table=lowered.cache_tables["target_window"],
+            target_c2a_table=lowered.cache_tables["target_c2a"],
+            target_c1a_table=lowered.cache_tables["target_c1a"],
+            c2a_index_block_table=lowered.cache_tables["target_c2a"],
+            c1a_index_block_table=lowered.cache_tables["target_c1a"],
+            draft_table=lowered.cache_tables["draft"],
+            draft_cos=lowered.rope_tables["draft_cos"], draft_sin=lowered.rope_tables["draft_sin"],
+            attention_num_tokens=target["attention_num_tokens"], moe_num_tokens=target["moe_num_tokens"],
+            moe_epoch=lowered.moe_epoch, logits_epoch=lowered.logits_epoch,
+        )
+        arguments.update({"draft_" + name: value for name, value in lowered.draft_model.items()})
+        arguments.update({"markov_" + name: value for name, value in lowered.markov_model.items()})
+        return {name: arguments[name] for name in self.dspark_param_names["decode"]}
 
     def _read_dspark_output(self, lowered, name):
         """Return an owned CPU copy of one device-produced DSpark output."""
@@ -3649,11 +3776,21 @@ def selected_decode_topology(lib_root=None, *, dp_size=None):
             continue
         target = statement.targets[0]
         if not isinstance(target, ast.Name) or target.id not in (
-                "DECODE_BATCH", "DSPARK_SPEC_TOKENS", "DECODE_SEQ"):
+                "DECODE_BATCH", "DSPARK_SPEC_TOKENS", "DECODE_SEQ", *_CACHE_GEOMETRY,
+                "LOGICAL_BLOCK_SIZE"):
             continue
         if target.id in values:
             raise MissingCompositeInterface(f"duplicate V4.1 lib decode config: {target.id}")
         values[target.id] = statement.value
+    from types import SimpleNamespace
+
+    cache_values = {name: value.value for name, value in values.items()
+                    if name in _CACHE_GEOMETRY and isinstance(value, ast.Constant)}
+    if "BLOCK_SIZE" not in cache_values and "LOGICAL_BLOCK_SIZE" in values:
+        value = values["LOGICAL_BLOCK_SIZE"]
+        if isinstance(value, ast.Constant):
+            cache_values["LOGICAL_BLOCK_SIZE"] = value.value
+    validate_lib_cache_abi(SimpleNamespace(**cache_values))
     batch = values.get("DECODE_BATCH")
     spec = values.get("DSPARK_SPEC_TOKENS")
     rows = values.get("DECODE_SEQ")
@@ -3779,6 +3916,8 @@ def make_production_bindings(
         else:
             dspark_programs, dspark_param_names = {}, {}
         prefill, prefill_names = compile_prefill_fwd(compiler, root, prefill_topology)
+        head_entry = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd").l3_generation_head
+        decode_head = compiler.compile("v41_generation_head", head_entry)
         abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
         kv_sources, index_sources, c2a_sources = _sources(layers)
         layout = DecodeWeightLayout.from_lib(abi, tp_size=topology.tp)
@@ -3878,7 +4017,7 @@ def make_production_bindings(
             dspark_host.rope_tables["draft_cos"].copy_(decode_host.fields["freqs_cos"])
             dspark_host.rope_tables["draft_sin"].copy_(decode_host.fields["freqs_sin"])
         programs_by_id = {}
-        for program in (prefill, decode, *dspark_programs.values()):
+        for program in (prefill, decode, decode_head, *dspark_programs.values()):
             programs_by_id.setdefault(id(program.compiled), program)
         programs = tuple(programs_by_id.values())
         resident_started = time.perf_counter()
@@ -3895,6 +4034,7 @@ def make_production_bindings(
             dspark_weight_contract=dspark_weight_contract,
             dspark_lowering_provider=dspark_lowering_provider,
             dspark_host_resources=dspark_host,
+            decode_head_program=decode_head,
         )
         _LOG.info("V4.1 resident upload and allocation %.2fs",
                   time.perf_counter() - resident_started)

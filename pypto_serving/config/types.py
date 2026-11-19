@@ -140,6 +140,8 @@ class KVCacheGroupSpec:
     # Prefill reads entry history through a retained view while a compact ring
     # is rebound for the current chunk's writes.
     preserve_prefill_history: bool = False
+    # Private rolling scratch is rebuilt by replay instead of prefix restoration.
+    prefix_cacheable: bool = True
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -207,6 +209,7 @@ class RuntimeConfig:
     # A nonzero window opts into grouped prefix caching with private draft
     # caches rebuilt from this many freshly prefilled suffix tokens.
     speculative_prefix_cache_replay_tokens: int = 0
+    prefix_cache_replay_before_hit: bool = False
     # Source-token cadence for sparse grouped state checkpoints; zero keeps
     # only replay/shared boundaries. Independent of the Prefill chunk size.
     prefix_cache_retention_interval: int = 8192
@@ -358,6 +361,8 @@ class PrefillBatch:
     # Stable full prompt lengths. Unlike seq_lens, these do not change between
     # chunked-prefill steps and let device prepare identify the terminal chunk.
     prompt_lens: list[int] = field(default_factory=list)
+    # Immutable prefix pages may extend beyond the first replayed token.
+    prefix_cache_hit_tokens: list[int] = field(default_factory=list)
     allow_device_greedy_sampling: bool = False
     allow_device_topk_sampling: bool = False
     kv_allocations: list[KvAllocation] = field(default_factory=list)

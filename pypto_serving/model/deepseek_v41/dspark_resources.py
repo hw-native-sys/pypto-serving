@@ -79,10 +79,12 @@ _DRAFT_DYNAMIC_KEYS = frozenset({
     "target_hidden", "num_sampled", "last_sampled", "next_prefill_tokens", "anchor_ids",
     "first_query_positions", "block_tables", "context_slots", "context_rope_cos",
     "context_rope_sin", "query_rope_cos", "query_rope_sin", "head_hidden",
+    "draft_x_hc", "draft_pre_mix",
     "moe_epoch",
 })
 _MARKOV_DYNAMIC_KEYS = frozenset({
     "head_hidden", "num_sampled", "last_sampled", "next_prefill_tokens", "anchor_ids",
+    "draft_x_hc", "draft_pre_mix",
     "draft_ids", "confidences", "logits_epoch",
 })
 
@@ -178,6 +180,8 @@ class DSparkResourceLayout:
             "query_rope_cos": (world, batch * DSPARK_SPECULATIVE_TOKENS, DSPARK_ROPE_HALF),
             "query_rope_sin": (world, batch * DSPARK_SPECULATIVE_TOKENS, DSPARK_ROPE_HALF),
             "draft_head_hidden": (world, batch, DSPARK_SPECULATIVE_TOKENS, self.hidden_size),
+            "draft_x_hc": (world, DSPARK_PADDED_ROWS, DSPARK_HC_MULT, self.hidden_size),
+            "draft_pre_mix": (world, DSPARK_PADDED_ROWS, DSPARK_HC_MULT),
             "draft_ids": (world, batch, DSPARK_SPECULATIVE_TOKENS),
             "confidences": (world, batch, DSPARK_SPECULATIVE_TOKENS),
             "committed": (world, batch),
@@ -200,6 +204,7 @@ class DSparkResourceLayout:
         result.update({name: torch.float32 for name in (
             "x_hc", "pre_mix", "context_rope_cos", "context_rope_sin",
             "query_rope_cos", "query_rope_sin", "confidences",
+            "draft_x_hc", "draft_pre_mix",
         )})
         result.update({name: torch.bfloat16 for name in ("target_hidden_padded", "target_hidden", "draft_head_hidden")})
         expected = set(self.decode_shapes)
@@ -349,16 +354,15 @@ def allocate_dspark_host_resources(layout: DSparkResourceLayout) -> DSparkHostRe
     for name in ("sampled_rows", "prefill_positions", "prefill_request_ids"):
         prefill[name].fill_(-1)
     table_pages = (layout.max_seq_len + DSPARK_WINDOW - 1) // DSPARK_WINDOW
-    compressed_pages = (layout.max_seq_len + 255) // 256
     cache_tables = {
         "target_window": _shared(
-            (layout.dp_size, DSPARK_MAX_BATCH_PER_DP, table_pages), torch.int32),
+            (layout.dp_size, DSPARK_MAX_BATCH_PER_DP, min(3, table_pages)), torch.int32),
         "target_c2a": _shared(
-            (layout.dp_size, DSPARK_MAX_BATCH_PER_DP, compressed_pages), torch.int32),
+            (layout.dp_size, DSPARK_MAX_BATCH_PER_DP, table_pages), torch.int32),
         "target_c1a": _shared(
             (layout.dp_size, DSPARK_MAX_BATCH_PER_DP, table_pages), torch.int32),
         "draft": _shared(
-            (layout.dp_size, DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH_PER_DP, table_pages),
+            (layout.dp_size, DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH_PER_DP, 3),
             torch.int32),
     }
     for value in cache_tables.values():

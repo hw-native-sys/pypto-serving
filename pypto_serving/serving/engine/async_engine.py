@@ -281,6 +281,7 @@ class ReplicaEngineCore:
                 runtime.supports_chunked_prefill_with_speculation
             ),
             speculative_prefix_cache_replay_tokens=runtime.speculative_prefix_cache_replay_tokens,
+            prefix_cache_replay_before_hit=runtime.prefix_cache_replay_before_hit,
             prefix_cache_retention_interval=runtime.prefix_cache_retention_interval,
             requires_homogeneous_prefill_decode=(
                 runtime.requires_homogeneous_prefill_decode
@@ -1080,6 +1081,7 @@ class ReplicaEngineCore:
                         for name, block_ids in sr.block_ids_by_group.items()
                     },
                     cache_partition=sr.cache_partition,
+                    prefix_cache_hit_tokens=req.prefix_cache_hit_tokens,
                     read_block_ids_by_group=sr.read_block_ids_by_group,
                     checkpoint_ends=sr.checkpoint_plan.boundaries if sr.checkpoint_plan else (),
                     state_write_block_ids_by_group=sr.checkpoint_plan.write_blocks if sr.checkpoint_plan else {},
