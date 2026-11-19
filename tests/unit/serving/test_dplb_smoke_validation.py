@@ -107,3 +107,90 @@ def test_smoke_server_configuration_preserves_requested_diagnostic_mode(smoke, t
     assert command[command.index("--dplb-dfx-level") + 1] == "off"
     assert "--no-enable-dplb" in command
     assert "--enable-prefix-caching" in command
+
+
+@pytest.fixture
+def scheduled_events(tmp_path):
+    from types import SimpleNamespace
+    from pypto_serving.serving.engine.async_engine import EngineConfig, ReplicaEngineCore
+    from pypto_serving.serving.sched.scheduler import Request, ScheduledRequest, SchedulerOutput
+    from pypto_serving.serving.server.ipc import StepCommand
+
+    manager = KvCacheManager()
+    manager.init_groups((KVCacheGroupSpec("kv", (0,), KVCacheSpec(16, 16, 1), 16,
+                                         num_partitions=2),), max_batch_size=4)
+    recorder = DplbDfxRecorder(DplbDfxConfig(level="load"), tmp_path)
+    manager.dplb_dfx = recorder
+    core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.config = EngineConfig(device_ids=(4, 5, 6, 7))
+    core.kv_cache_manager = manager
+    core.scheduler = SimpleNamespace(running=[])
+    core._dplb_dfx = recorder
+    assert recorder.start("m2")
+    block_ids = manager.ensure_group_blocks("r", 32, partition=1)
+    request = Request("r", [1, 2], max_new_tokens=8)
+    scheduled = ScheduledRequest(request, 1, False, num_computed_tokens=32,
+                                 num_speculative_tokens=2, cache_partition=1,
+                                 block_ids_by_group=block_ids)
+    output = SchedulerOutput(scheduled_requests=[scheduled], num_decode_tokens=3)
+    command = StepCommand([], [], [], [], step_id=7)
+    core._emit_dfx_step_plan(output, command, dispatch_ordinal=3)
+    core._emit_dfx_step_outcome(7, output, {"r": [9, 10]}, {"r": 2})
+    assert recorder.close()
+    return [json.loads(line) for line in recorder.sink.path.read_text().splitlines()], core._dfx_topology()
+
+
+def test_m2_smoke_requires_scheduled_evidence(smoke, completed):
+    with pytest.raises(RuntimeError, match="missing M2"):
+        smoke["validate_capture"](completed, 2, require_scheduled_load=True)
+
+
+def test_m2_validator_accepts_matching_events(smoke, scheduled_events):
+    events, topology = scheduled_events
+    summary = smoke["validate_scheduled_load"](events, topology)
+    assert summary["planned_steps"] == summary["paired_steps"] == 1
+    assert summary["worker_accepted_draft_tokens"] == 1
+
+
+@pytest.mark.parametrize("fault,reason", [
+    ("ordinal", "matching submitted step"),
+    ("identity", "identity mismatch"),
+    ("count", "active count mismatch"),
+    ("tokens", "decode token mismatch"),
+    ("group", "group aggregate mismatch"),
+    ("rows", "unobserved runner rows"),
+    ("outcome", "boundary explanation"),
+    ("duplicate", "duplicate scheduled step"),
+])
+def test_m2_validator_rejects_corrupted_evidence(smoke, scheduled_events, fault, reason):
+    events, topology = scheduled_events
+    plan = next(event for event in events if event["event"] == "step_plan")
+    outcome = next(event for event in events if event["event"] == "step_outcome")
+    if fault == "ordinal":
+        outcome["dispatch_ordinal"] += 1
+    elif fault == "identity":
+        outcome["requests"][0]["request_uid"] = "wrong"
+    elif fault == "count":
+        plan["active_count"] += 1
+    elif fault == "tokens":
+        plan["decode_tokens"] += 1
+    elif fault == "group":
+        plan["groups"][1]["participating_request_count"] += 1
+    elif fault == "rows":
+        plan["requests"][0]["row_extent"]["valid_rows"] = 128
+    elif fault == "outcome":
+        extra = dict(plan, step_id=8, dispatch_ordinal=4)
+        events.insert(events.index(outcome), extra)
+    elif fault == "duplicate":
+        events.insert(events.index(outcome), plan)
+    with pytest.raises(RuntimeError, match=reason):
+        smoke["validate_scheduled_load"](events, topology)
+
+
+def test_m2_validator_explains_pending_boundary_steps(smoke, scheduled_events):
+    events, topology = scheduled_events
+    plan = next(event for event in events if event["event"] == "step_plan")
+    events.insert(-1, dict(plan, step_id=8, dispatch_ordinal=4))
+    events[-1]["in_flight_step_ids"] = [8]
+    result = smoke["validate_scheduled_load"](events, topology)
+    assert result["pending_at_capture_end"] == [8]

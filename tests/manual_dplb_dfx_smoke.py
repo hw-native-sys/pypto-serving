@@ -35,10 +35,14 @@ from test_deepseek_v4_accuracy import (  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from dplb_scheduled_validation import validate_scheduled_load  # noqa: E402
+
 MODEL_ID = "dplb-dfx-smoke"
 
 
-def validate_capture(path: Path, expected_groups: int, *, require_prefix_hit: bool = False) -> dict:
+def validate_capture(
+    path: Path, expected_groups: int, *, require_prefix_hit: bool = False, require_scheduled_load: bool = False,
+) -> dict:
     manifests = sorted(path.glob("dplb/*/*.manifest.json"))
     if len(manifests) != 2:
         raise RuntimeError(f"expected two completed captures, found {len(manifests)}")
@@ -77,6 +81,7 @@ def validate_capture(path: Path, expected_groups: int, *, require_prefix_hit: bo
             for row in releases[-1]["groups"]
         ):
             raise RuntimeError("group load did not return to zero")
+        scheduled = validate_scheduled_load(events, status["topology"]) if require_scheduled_load else None
         summaries.append(
             dict(
                 capture_id=status["capture_id"],
@@ -84,6 +89,7 @@ def validate_capture(path: Path, expected_groups: int, *, require_prefix_hit: bo
                 groups=sorted({event["selected_group"] for event in commits}),
                 commits=len(commits),
                 terminals=len(terminals),
+                scheduled_load=scheduled,
             )
         )
     if require_prefix_hit and not prefix_hits:
@@ -140,7 +146,7 @@ def server_command(args, devices: tuple[int, ...], port: int) -> list[str]:
     return command
 
 
-def run_workload(process, port: int, output: Path, timeout: int) -> dict:
+def run_workload(process, port: int, output: Path, timeout: int, *, concurrency: int = 4) -> dict:
     deadline = time.monotonic() + timeout
 
     def post(endpoint, payload):
@@ -170,6 +176,7 @@ def run_workload(process, port: int, output: Path, timeout: int) -> dict:
         "The Seventeen-Arch Bridge joins the island. " * 128,
     ]
     results = []
+    measurements = []
     for window in range(2):
         # These control endpoints return an empty 200 response.
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -185,10 +192,16 @@ def run_workload(process, port: int, output: Path, timeout: int) -> dict:
                 if response.status != 200:
                     raise RuntimeError("profile start failed")
         try:
-            with ThreadPoolExecutor(max_workers=4) as pool:
+            started = time.monotonic()
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
                 batch = list(pool.map(completion, prompts))
             # Exact same prefix is sent after its producer has completed.
             batch.append(completion(prompts[1]))
+            elapsed = time.monotonic() - started
+            measurements.append(dict(
+                window=window, elapsed_seconds=elapsed, completed_requests=len(batch),
+                output_tokens=32 * len(batch), output_tokens_per_second=32 * len(batch) / elapsed,
+            ))
             results.append(batch)
             (output / f"responses-{window}.json").write_text(json.dumps(batch, indent=2) + "\n")
         finally:
@@ -202,7 +215,12 @@ def run_workload(process, port: int, output: Path, timeout: int) -> dict:
             ) as response:
                 if response.status != 200:
                     raise RuntimeError("profile stop failed")
-    return dict(completed_requests=sum(map(len, results)), output_tokens=32 * sum(map(len, results)))
+    return dict(
+        completed_requests=sum(map(len, results)), output_tokens=32 * sum(map(len, results)),
+        workload_concurrency=concurrency,
+        workload_measurements=measurements,
+        measurement_scope="smoke_wall_time_after_compilation_warmup_not_formal_overhead",
+    )
 
 
 def main() -> None:
@@ -217,6 +235,7 @@ def main() -> None:
     parser.add_argument("--dfx-level", choices=("off", "load"), default="load")
     parser.add_argument("--startup-seconds", type=int, default=2400)
     parser.add_argument("--workload-seconds", type=int, default=1200)
+    parser.add_argument("--concurrency", type=int, choices=(1, 4), default=4)
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
     args.model = args.model.resolve()
@@ -248,6 +267,7 @@ def main() -> None:
         kernel_dir=str(kernel_dir),
         policy_enabled=config.enable_dplb,
         dfx_level=config.dplb_dfx_config.level,
+        workload_concurrency=args.concurrency,
     )
     args.output_dir.mkdir(parents=True, exist_ok=False)
     program_build_dir = None
@@ -275,10 +295,15 @@ def main() -> None:
         try:
             port = int(command[command.index("--port") + 1])
             _wait_for_health(process, port, time.monotonic() + args.startup_seconds)
-            result.update(run_workload(process, port, args.output_dir, args.workload_seconds))
+            result.update(run_workload(
+                process, port, args.output_dir, args.workload_seconds, concurrency=args.concurrency,
+            ))
             if args.dfx_level == "load":
                 result.update(
-                    validate_capture(args.output_dir / "profile", args.ep // 4, require_prefix_hit=True)
+                    validate_capture(
+                        args.output_dir / "profile", args.ep // 4,
+                        require_prefix_hit=True, require_scheduled_load=True,
+                    )
                 )
             elif list((args.output_dir / "profile").glob("dplb/*/*.jsonl")):
                 raise RuntimeError("DFX off wrote a capture")

@@ -344,6 +344,25 @@ class StopTokenMask:
     remaining_tokens: int
 
 
+@dataclass(frozen=True)
+class DispatchInvocation:
+    """Stable identity for one serving step across worker and L3 dispatches."""
+
+    invocation_id: str
+    step_id: int
+    execution_slot: int = 0
+    pipeline_generation: int = 0
+
+    def as_profile_args(self) -> dict[str, object]:
+        """Return scalar fields suitable for host profile span arguments."""
+        return {
+            "invocation_id": self.invocation_id,
+            "step_id": self.step_id,
+            "execution_slot": self.execution_slot,
+            "pipeline_generation": self.pipeline_generation,
+        }
+
+
 @dataclass
 class PrefillBatch:
     """Packed inputs for a batched prompt prefill call."""
@@ -374,6 +393,8 @@ class PrefillBatch:
     # Optional serving-owned DSpark stage arguments.  The V4.1 adapter accepts
     # only already-bound lib composite arguments; it never rebuilds operators.
     dspark_stages: object | None = None
+    # Serving step identity propagated to executor, runner, and L3 spans.
+    invocation: DispatchInvocation | None = None
 
 
 @dataclass
@@ -419,6 +440,8 @@ class DecodeBatch:
     # Optional serving-owned DSpark stage arguments for one complete target ->
     # accept -> drafter -> Markov -> commit round.
     dspark_stages: object | None = None
+    # Serving step identity propagated to executor, runner, and L3 spans.
+    invocation: DispatchInvocation | None = None
 
 
 @dataclass

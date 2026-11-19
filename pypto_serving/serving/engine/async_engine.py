@@ -81,6 +81,9 @@ WORKER_KILL_GRACE_SECONDS = 5.0
 # twenty minutes by default -- so waiting it out would put the whole bounded
 # sequence behind an unbounded wait. Stopping the worker is what ends that read.
 LOOP_DRAIN_GRACE_SECONDS = 5.0
+# The worker's asynchronous decode lane owns two ping-pong device buffers. Keep
+# the identity contract aligned with that ownership even when scheduling is sync.
+_DISPATCH_EXECUTION_SLOTS = 2
 
 
 @dataclass
@@ -342,8 +345,11 @@ class ReplicaEngineCore:
         self._initialization_steps: set[int] = set()
         self._max_in_flight = 2 if self._async_scheduling else 1
         self._step_counter = 0
+        self._dispatch_instance_id = uuid.uuid4().hex[:12]
+        self._pipeline_slot_generations: dict[int, int] = {}
         self._dfx_dispatch_ordinal = 0
         self._dfx_dispatch_ordinals: dict[int, int] = {}
+        self._dfx_step_contexts: dict[int, dict] = {}
         # step_ids of dispatched steps whose worker StepResult has NOT yet been
         # consumed off _output_queue but whose batch was discarded (error/timeout
         # dropped the pipeline). The worker is FIFO and emits exactly one result
@@ -486,7 +492,7 @@ class ReplicaEngineCore:
                     ),
                     prefill_tokens=scheduled.num_new_tokens if scheduled.is_prefill else 0,
                     decode_tokens=planned_decode_tokens,
-                    speculative_proposed_tokens=scheduled.num_speculative_tokens,
+                    speculative_budget_tokens=scheduled.num_speculative_tokens,
                     cache_partition=scheduled.cache_partition,
                     block_table_extents={
                         name: len(block_ids)
@@ -513,21 +519,42 @@ class ReplicaEngineCore:
         dfx = getattr(self, "_dplb_dfx", None)
         if dfx is None or not dfx.capturing:
             return
+        capture_id = dfx.capture_id
         request_rows = self._dfx_step_request_rows(scheduler_output)
+        context = dict(
+            capture_id=capture_id,
+            dispatch_ordinal=dispatch_ordinal,
+            invocation_id=step_command.invocation_id,
+            execution_slot=step_command.execution_slot,
+            pipeline_generation=step_command.pipeline_generation,
+            requests=[
+                {key: row[key] for key in (
+                    "request_id", "request_uid", "admission_epoch", "identity_status", "cache_partition",
+                )} for row in request_rows
+            ],
+        )
+        if not hasattr(self, "_dfx_step_contexts"):
+            self._dfx_step_contexts = {}
+        self._dfx_step_contexts[step_command.step_id] = context
         stages = {row["stage"] for row in request_rows}
         prefill_lengths = [row["num_new_tokens"] for row in request_rows if row["is_prefill"]]
-        decode_lengths = [row["decode_tokens"] for row in request_rows if not row["is_prefill"]]
+        decode_lengths = [row["logical_length_after"] for row in request_rows if not row["is_prefill"]]
         dfx.emit(
             "step_plan",
+            expected_capture_id=capture_id,
+            view="scheduler_planned",
             step_id=step_command.step_id,
+            invocation_id=step_command.invocation_id,
+            execution_slot=step_command.execution_slot,
+            pipeline_generation=step_command.pipeline_generation,
             dispatch_ordinal=dispatch_ordinal,
             stage=next(iter(stages)) if len(stages) == 1 else "mixed",
             active_count=len(request_rows),
             running_count=len(self.scheduler.running),
             prefill_tokens=scheduler_output.num_prefill_tokens,
             decode_tokens=scheduler_output.num_decode_tokens,
-            speculative_proposed_tokens=sum(
-                row["speculative_proposed_tokens"] for row in request_rows
+            speculative_budget_tokens=sum(
+                row["speculative_budget_tokens"] for row in request_rows
             ),
             length_distribution=dict(
                 prefill=self._dfx_length_distribution(prefill_lengths),
@@ -559,29 +586,44 @@ class ReplicaEngineCore:
         error: str | None = None,
     ) -> None:
         """Record worker completion without claiming device-level timing."""
-        dispatch_ordinal = getattr(self, "_dfx_dispatch_ordinals", {}).pop(step_id, step_id)
+        getattr(self, "_dfx_dispatch_ordinals", {}).pop(step_id, None)
+        context = getattr(self, "_dfx_step_contexts", {}).pop(step_id, None)
         dfx = getattr(self, "_dplb_dfx", None)
         if dfx is None or not dfx.capturing:
             return
+        if context is None or context["capture_id"] != dfx.capture_id:
+            return
         drafts = num_draft_tokens or {}
         outcomes = []
-        for scheduled in scheduler_output.scheduled_requests:
+        for scheduled, identity in zip(scheduler_output.scheduled_requests, context["requests"]):
             request_id = scheduled.request.request_id
             value = new_tokens.get(request_id, ())
             returned = len(value) if isinstance(value, (list, tuple)) else int(value is not None)
             proposed = int(drafts.get(request_id, 0))
             outcomes.append(
                 dict(
-                    **dfx.request_fields(request_id),
-                    returned_tokens=returned,
-                    speculative_proposed_tokens=proposed,
-                    speculative_accepted_tokens=max(0, returned - 1) if proposed else 0,
+                    **identity,
+                    result_disposition=(
+                        "discarded" if scheduled.request.status.is_finished
+                        or scheduled.request.status is RequestStatus.PREEMPTED
+                        or status != "completed" else "pending_scheduler_apply"
+                    ),
+                    returned_tokens=returned if status == "completed" else None,
+                    speculative_proposed_tokens=proposed if status == "completed" else None,
+                    speculative_accepted_tokens=(
+                        max(0, returned - 1) if proposed else 0
+                    ) if status == "completed" else None,
                 )
             )
         dfx.emit(
             "step_outcome",
+            expected_capture_id=context["capture_id"],
+            view="worker_returned_before_scheduler_apply",
             step_id=step_id,
-            dispatch_ordinal=dispatch_ordinal,
+            invocation_id=context["invocation_id"],
+            execution_slot=context["execution_slot"],
+            pipeline_generation=context["pipeline_generation"],
+            dispatch_ordinal=context["dispatch_ordinal"],
             status=status,
             error=error,
             requests=outcomes,
@@ -716,6 +758,7 @@ class ReplicaEngineCore:
         async with self._dfx_profile_lock:
             if active:
                 started = dfx.start(capture_id, topology=self._dfx_topology(),
+                                    in_flight_step_ids=[sid for sid, _ in self._batch_queue],
                                     policy=self.kv_cache_manager._dfx_policy(),
                                     settings=dict(executor=self.config.executor_cls,
                                                   max_model_len=self._runtime.max_seq_len,
@@ -735,7 +778,11 @@ class ReplicaEngineCore:
             else:
                 # Host observations end here, independently of the worker's FIFO
                 # acknowledgement. No diagnostic device work is submitted.
-                dfx.stop(counters_end=self._dfx_counters())
+                dfx.stop(counters_end=self._dfx_counters(),
+                         in_flight_step_ids=sorted(
+                             sid for sid, context in self._dfx_step_contexts.items()
+                             if context["capture_id"] == dfx.capture_id
+                         ))
             try:
                 await self._set_worker_profile_active(active)
             except BaseException:
@@ -1186,7 +1233,7 @@ class ReplicaEngineCore:
                 raise
             self._input_queue.put(encoded)
         dfx = getattr(self, "_dplb_dfx", None)
-        if dfx is not None:
+        if dfx is not None and dfx.capturing:
             self._dfx_dispatch_ordinal = getattr(self, "_dfx_dispatch_ordinal", 0) + 1
             self._dfx_dispatch_ordinals[self._step_counter] = self._dfx_dispatch_ordinal
             self._emit_dfx_step_plan(
@@ -1414,12 +1461,23 @@ class ReplicaEngineCore:
                     cache_partition=sr.cache_partition,
                 ))
 
+        execution_slot = step_id % _DISPATCH_EXECUTION_SLOTS
+        generations = getattr(self, "_pipeline_slot_generations", None)
+        if generations is None:
+            generations = {}
+            self._pipeline_slot_generations = generations
+        pipeline_generation = generations.get(execution_slot, 0) + 1
+        generations[execution_slot] = pipeline_generation
+        instance_id = getattr(self, "_dispatch_instance_id", "legacy")
         return StepCommand(
             new_requests=new_requests,
             prefill_requests=prefill_requests,
             decode_requests=decode_requests,
             finished_request_ids=finished_ids,
             step_id=step_id,
+            invocation_id=f"{instance_id}:{step_id}",
+            execution_slot=execution_slot,
+            pipeline_generation=pipeline_generation,
         )
 
     async def _flush_pending_frees(self) -> None:

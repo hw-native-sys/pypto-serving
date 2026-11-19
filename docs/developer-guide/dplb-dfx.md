@@ -169,7 +169,15 @@ proposal capacity separately from returned output. `row_extent.valid_rows` and
 the event records that limitation instead of treating table extent as executed
 attention work. `groups` includes logical DP-group topology and TP members when
 the serving layout can prove them. `step_outcome` is paired by `step_id` and
-`dispatch_ordinal`, and reports worker output without claiming device timing.
+`dispatch_ordinal`, and reports worker output before scheduler truncation or
+application. It preserves the request UID, admission epoch, and cache partition
+frozen at submission, including cancelled and preempted requests. The plan's
+`speculative_budget_tokens` describes reserved capacity; the outcome's
+`speculative_proposed_tokens` and `speculative_accepted_tokens` come from the
+worker and must not be counted as client output. Late results never create new
+request identities or enter a different capture. Capture boundaries list
+in-flight step IDs so an unmatched plan at the boundary is explainable.
+No device timing is claimed.
 Execution-slot fields remain explicitly unavailable until the worker-side
 prepare/submit hooks are added.
 
@@ -232,7 +240,7 @@ python tests/manual_dplb_dfx_smoke.py --check-only \
 Real execution must use the matching environment/toolchain and task queue:
 
 ```bash
-task-submit --device auto --device-num 16 --max-time 6000 --run \
+task-submit --device auto --device-num 16 --max-time 0 --timeout 0 --run \
   'PYPTO_WORKER_INIT_TIMEOUT=3600 PYPTO_DSV4_STARTUP_TIMEOUT_SECONDS=4200 \
     python tests/manual_dplb_dfx_smoke.py \
     --model /path/to/dspark-checkpoint --ep 16 --startup-seconds 4200 \
@@ -240,12 +248,18 @@ task-submit --device auto --device-num 16 --max-time 6000 --run \
 ```
 
 The worker-init timeout is independent of the outer HTTP health deadline.
-Keep both within the task execution limit and allow time for the workload
-and shutdown. These bounds allow a diagnostic retry; they do not guarantee
+Allow time for the workload and shutdown; the queue limit is disabled above.
+These bounds allow a diagnostic retry; they do not guarantee
 that initialization will complete on a given dependency stack.
 
 Use `--no-dplb` to exercise count balancing and `--dfx-level off` for a
 generation control without DFX files. Use separate output directories per run.
+Each smoke also allocates a fresh private build directory under
+`PYPTO_PROG_BUILD_DIR`, or under its output directory when that variable is
+unset. The selected directory is saved in `configuration.json`. Reusing a
+mutable build directory can pair a regenerated kernel table with an older
+source-adjacent orchestration binary; separate profile outputs alone do not
+prevent that mismatch.
 The configuration-only check passed locally. The initial sandbox view showed
 only two devices and a stopped queue daemon. An outside-sandbox check corrected
 that observation: the host queue was running with sixteen devices. Real
@@ -264,6 +278,54 @@ reached the worker's independent 1800-second initialization timeout before
 HTTP health or capture start. A further run with the coordinated deadlines
 above was stopped by the user during resident initialization (exit 130).
 All recorded task processes exited and all sixteen device locks were released.
-Hardware validation is paused. No generation responses or DFX captures were
-produced; these results do not establish successful NPU generation, capture
-correctness, observer overhead or a DPLB performance improvement.
+Those initial attempts produced no generation responses or DFX captures.
+They do not establish successful NPU generation, capture correctness,
+observer overhead or a DPLB performance improvement. Later M2 results follow.
+
+## M2 validation
+
+The smoke now requires `step_plan`/`step_outcome` pairs, stable request identities,
+logical DP-group membership and token accounting, and explicit in-flight
+boundary explanations. A placement-only capture cannot pass this M2 verdict.
+Host integration tests exercise the actual engine scheduling/result paths with a
+deterministic fake worker, including two in-flight steps, cancellation,
+preemption, errors/timeouts, repeated windows, and identical DFX off/load command
+and output replay. Real NPU coverage must be recorded separately; these tests
+still do not validate execution slots or L3 invocation correlation.
+
+The November 18-19, 2026 validation accumulated 820 distinct passing Host
+cases across staged runs. A real sixteen-device DP4/EP16/TP4 K7 load smoke
+completed ten requests and 320 client output tokens. Both captures passed:
+28 and 24 planned steps paired with their worker outcomes, four prefix hits,
+no event loss, and logical group load returning to zero. Worker-returned token
+counts are measured before scheduler application and differ from client output.
+
+The subsequent DFX-off control failed on its first warmup request after a
+generic AICPU exception (507018), followed by a failed device drain (507015)
+and unconfirmed communication-window cleanup. The underlying cause remains
+undetermined. Hardware off/load output equivalence and observer overhead are
+therefore unverified. A capture-stop boundary fix added after the load process
+started was validated by Host integration tests only. Both task phases exited
+and released their device allocation.
+
+### Follow-up controls on November 19, 2026
+
+Fresh, independent build directories let both off and load complete ten
+requests and 320 client tokens each. Load produced two complete captures with
+49 paired steps and four prefix hits. No DFX files were created in off.
+
+The earlier failure used a regenerated 334-entry kernel table alongside an
+older orchestration binary. That binary's executable text matches a fresh
+333-entry build, whose function IDs differ from the regenerated table. The
+faulting PC maps to HCA merge argument unpacking, consistent with the wrong
+kernel receiving another task's arguments. The smoke now always allocates a
+private build directory, including when the caller supplies a build base.
+This avoids the observed mismatch; source-adjacent binary invalidation in
+PyPTO still needs a separate fix.
+
+Strict output comparison passed for nine of ten requests. The first window's
+garden response differed; the second load window matched off. Usage and
+finish reasons matched for every request. Hardware output equivalence is
+therefore still unproven. A serial control with `--concurrency 1` is queued
+to investigate batch/cache-history effects. These diagnostic smoke runs do
+not establish observer overhead or a DPLB performance improvement.

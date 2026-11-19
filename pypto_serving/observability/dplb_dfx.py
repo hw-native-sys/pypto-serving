@@ -260,7 +260,7 @@ class DplbDfxRecorder:
                 replica=self.replica,
                 replica_instance_id=self.instance,
                 device_timing="unavailable",
-                observation_level="placement",
+                observation_level="placement_and_scheduled_load",
                 serving_source=self.source,
                 output_byte_limit=self.config.max_bytes,
                 clock_instance_id=self.clock_instance,
@@ -280,9 +280,10 @@ class DplbDfxRecorder:
                 self._timer.start()
             return True
 
-    def emit(self, event: str, **fields) -> bool:
+    def emit(self, event: str, *, expected_capture_id: str | None = None, **fields) -> bool:
         with self._lock:
-            if not self.capturing or self.sink is None:
+            if (not self.capturing or self.sink is None
+                    or (expected_capture_id is not None and expected_capture_id != self.capture_id)):
                 return False
             self._sequence += 1
             return self.sink.put(

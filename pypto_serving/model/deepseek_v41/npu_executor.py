@@ -210,7 +210,16 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
     def lookup_embeddings(self, model, token_ids):
         return self.runners[model.config.model_id].lookup_embeddings(token_ids)
 
+    def _set_invocation_context(self, batch) -> None:
+        """Forward serving step identity to the resident runner."""
+        if not self.runners:
+            return
+        setter = getattr(next(iter(self.runners.values())), "set_invocation_context", None)
+        if callable(setter):
+            setter(getattr(batch, "invocation", None))
+
     def run_prefill(self, model, batch):
+        self._set_invocation_context(batch)
         return self.runners[model.config.model_id].run_prefill(model, batch)
 
     @property
@@ -220,10 +229,12 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         return None
 
     def run_decode(self, model, batch):
+        self._set_invocation_context(batch)
         return self.runners[model.config.model_id].run_decode(model, batch)
 
     def run_dspark_prefill_batch(self, batch: PrefillBatch):
         """Dispatch serving-owned, already-lowered DSpark bootstrap stages."""
+        self._set_invocation_context(batch)
         if not self.runners:
             raise RuntimeError("V4.1 DSpark runner is not registered")
         if len(self.runners) != 1:
@@ -247,6 +258,7 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
 
     def run_dspark_decode_batch(self, batch: DecodeBatch) -> DecodeResult:
         """Dispatch one serving-owned DSpark verification round."""
+        self._set_invocation_context(batch)
         if not self.runners:
             raise RuntimeError("V4.1 DSpark runner is not registered")
         if len(self.runners) != 1:

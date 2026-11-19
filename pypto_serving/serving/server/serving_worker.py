@@ -24,6 +24,7 @@ import torch
 from pypto_serving.config.types import (
     DecodeBatch,
     DecodeResult,
+    DispatchInvocation,
     PrefillBatch,
     SamplingParams,
     StopTokenMask,
@@ -849,6 +850,27 @@ class WorkerProcess:
             logger.error(f"Worker step failed: {e}", exc_info=True)
             return StepResult(new_tokens={}, error=str(e), step_id=cmd.step_id)
 
+    @staticmethod
+    def _command_invocation(cmd: StepCommand) -> DispatchInvocation | None:
+        """Translate IPC identity fields into the batch-level context object."""
+        if not cmd.invocation_id:
+            return None
+        return DispatchInvocation(
+            invocation_id=cmd.invocation_id,
+            step_id=cmd.step_id,
+            execution_slot=cmd.execution_slot,
+            pipeline_generation=cmd.pipeline_generation,
+        )
+
+    def _call_batch_prefill(self, scheduled, runtime_model, new_tokens, **kwargs) -> None:
+        """Call the prefill hook while keeping older test/integration overrides valid."""
+        try:
+            self._batch_prefill(scheduled, runtime_model, new_tokens, **kwargs)
+        except TypeError as exc:
+            if "unexpected keyword argument 'invocation'" not in str(exc):
+                raise
+            self._batch_prefill(scheduled, runtime_model, new_tokens)
+
     def _apply_command_lifecycle(
         self,
         cmd: StepCommand,
@@ -935,13 +957,18 @@ class WorkerProcess:
             args={"prefill": len(cmd.prefill_requests), "decode": len(cmd.decode_requests)},
         ):
             if cmd.prefill_requests:
+                invocation = self._command_invocation(cmd)
                 max_prefill_batch = self.executor.max_prefill_batch_size
                 if max_prefill_batch is None:
                     if prepared_decode is not None and getattr(self.executor, "supports_async_prefill_reclaim", False):
-                        self._batch_prefill(cmd.prefill_requests, runtime_model, new_tokens,
-                                            prefill_slot=prepared_decode.buffer_slot)
+                        self._call_batch_prefill(
+                            cmd.prefill_requests, runtime_model, new_tokens,
+                            prefill_slot=prepared_decode.buffer_slot, invocation=invocation,
+                        )
                     else:
-                        self._batch_prefill(cmd.prefill_requests, runtime_model, new_tokens)
+                        self._call_batch_prefill(
+                            cmd.prefill_requests, runtime_model, new_tokens, invocation=invocation,
+                        )
                 else:
                     if max_prefill_batch <= 0:
                         raise ValueError("executor max_prefill_batch_size must be positive")
@@ -956,10 +983,14 @@ class WorkerProcess:
                         ),
                     ):
                         if prepared_decode is not None and getattr(self.executor, "supports_async_prefill_reclaim", False):
-                            self._batch_prefill(chunk, runtime_model, new_tokens,
-                                                prefill_slot=prepared_decode.buffer_slot)
+                            self._call_batch_prefill(
+                                chunk, runtime_model, new_tokens,
+                                prefill_slot=prepared_decode.buffer_slot, invocation=invocation,
+                            )
                         else:
-                            self._batch_prefill(chunk, runtime_model, new_tokens)
+                            self._call_batch_prefill(
+                                chunk, runtime_model, new_tokens, invocation=invocation,
+                            )
             if cmd.decode_requests:
                 num_draft_tokens = self._batch_decode(
                     cmd.decode_requests,
@@ -968,6 +999,7 @@ class WorkerProcess:
                     prepared_decode=prepared_decode,
                     step_id=cmd.step_id,
                     prefill_requests=len(cmd.prefill_requests),
+                    invocation=self._command_invocation(cmd),
                 )
 
         # Retain the tokens just sampled so a following pipelined decode step can
@@ -1092,6 +1124,7 @@ class WorkerProcess:
         runtime_model,
         new_tokens: dict[str, list[int]],
         prefill_slot: int | None = None,
+        invocation: DispatchInvocation | None = None,
     ) -> None:
         with profile_span(
             "WorkerProcess.batch_prefill",
@@ -1099,6 +1132,7 @@ class WorkerProcess:
             args={"batch_size": len(scheduled), "request_ids": [pr.request_id for pr in scheduled]},
         ):
             batch = self._make_prefill_batch(scheduled, runtime_model)
+            batch.invocation = invocation
             allow_device_greedy_sampling = batch.allow_device_greedy_sampling
             allow_device_topk_sampling = batch.allow_device_topk_sampling
             if prefill_slot is not None and getattr(self.executor, "supports_async_prefill_reclaim", False):
@@ -1213,6 +1247,7 @@ class WorkerProcess:
                     return _PreparedDecodeWork(prepared=None, buffer_slot=buffer_slot)
                 model = self.model_record.runtime_model
                 batch = self._make_prefill_batch(scheduled, model)
+                batch.invocation = self._command_invocation(cmd)
                 with profile_span("WorkerProcess.prepare_prefill", cat="worker",
                                   args={"step_id": cmd.step_id, "buffer_slot": buffer_slot}):
                     plan = self.executor.prepare_prefill(model, batch, buffer_slot=buffer_slot)
@@ -1247,6 +1282,7 @@ class WorkerProcess:
             allow_device_topk_sampling=allow_device_topk_sampling,
             bind_policy=False,
         )
+        batch.invocation = self._command_invocation(cmd)
         with profile_span(
             "WorkerProcess.prepare_decode",
             cat="worker",
@@ -1322,6 +1358,7 @@ class WorkerProcess:
         prepared_decode: _PreparedDecodeWork | None = None,
         step_id: int = 0,
         prefill_requests: int = 0,
+        invocation: DispatchInvocation | None = None,
     ) -> dict[str, int]:
         with profile_span(
             "WorkerProcess.batch_decode",
@@ -1338,6 +1375,7 @@ class WorkerProcess:
                 allow_device_greedy_sampling=allow_device_greedy_sampling,
                 allow_device_topk_sampling=allow_device_topk_sampling,
             )
+            batch.invocation = invocation
             if (isinstance(getattr(runtime_model, "extra", None), dict)
                     and runtime_model.extra.get("family") == "deepseek_v41"
                     and getattr(runtime_model.runtime, "num_speculative_tokens", 0) == 5):

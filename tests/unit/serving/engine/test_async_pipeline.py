@@ -335,6 +335,32 @@ def test_restarted_request_registers_committed_output_length(monkeypatch):
     assert not context.worker_release_done.is_set() and not context.worker_release_ack.is_set()
 
 
+def test_step_command_carries_stable_cross_layer_invocation_identity():
+    core, _ = _async_pipeline_core()
+    request = _running_decode_request()
+    core.scheduler.running.append(request)
+    core.scheduler.requests[request.request_id] = request
+    first = core._build_step_command(
+        SchedulerOutput(scheduled_requests=[ScheduledRequest(
+            request=request, num_new_tokens=1, is_prefill=False,
+        )]),
+        [],
+        step_id=1,
+    )
+    second = core._build_step_command(
+        SchedulerOutput(scheduled_requests=[ScheduledRequest(
+            request=request, num_new_tokens=1, is_prefill=False,
+        )]),
+        [],
+        step_id=3,
+    )
+    assert first.invocation_id.endswith(":1")
+    assert second.invocation_id.endswith(":3")
+    assert first.execution_slot == second.execution_slot == 1
+    assert first.pipeline_generation == 1
+    assert second.pipeline_generation == 2
+
+
 def test_async_pipeline_dispatches_two_steps_before_applying_first(monkeypatch):
     """Depth-2: the loop dispatches step N+1 while step N is still in flight,
     so two commands reach the worker before the first result is applied."""
@@ -538,3 +564,195 @@ def test_async_pipeline_drains_stale_result_after_error(monkeypatch):
     got = decode_result(asyncio.run(core._get_live_result()))
     assert got.step_id == 99
     assert core._discard_result_step_ids == set()
+
+
+@pytest.fixture
+def observed_pipeline(tmp_path):
+    from pypto_serving.observability.dplb_dfx import DplbDfxConfig, DplbDfxRecorder
+
+    core, commands = _async_pipeline_core(num_speculative_tokens=2)
+    recorder = DplbDfxRecorder(DplbDfxConfig(level="load"), tmp_path)
+    core._dplb_dfx = recorder
+    core.kv_cache_manager.dplb_dfx = recorder
+    core._dfx_dispatch_ordinal = 0
+    core._dfx_dispatch_ordinals = {}
+    assert recorder.start("first")
+    request = _running_decode_request(first_output=50)
+    core.scheduler.running.append(request)
+    core.scheduler.requests[request.request_id] = request
+    yield core, commands, recorder, request
+    assert recorder.close()
+
+
+def _dfx_rows(recorder):
+    import json
+
+    assert recorder.close()
+    return [json.loads(line) for line in recorder.sink.path.read_text().splitlines()]
+
+
+def test_dfx_pipeline_pairs_two_inflight_commands(observed_pipeline):
+    core, commands, recorder, request = observed_pipeline
+    assert core._try_dispatch_step()
+    assert core._try_dispatch_step()
+    assert len(core._batch_queue) == 2
+    asyncio.run(core._await_and_apply_oldest())
+    asyncio.run(core._await_and_apply_oldest())
+    rows = _dfx_rows(recorder)
+    plans = [row for row in rows if row["event"] == "step_plan"]
+    outcomes = [row for row in rows if row["event"] == "step_outcome"]
+    assert [row["step_id"] for row in plans] == [cmd.step_id for cmd in commands]
+    assert [row["dispatch_ordinal"] for row in plans] == [row["dispatch_ordinal"] for row in outcomes]
+    assert plans[0]["requests"][0]["num_computed_tokens"] == 2
+    assert plans[1]["requests"][0]["num_computed_tokens"] == 5
+    assert request.output_token_ids == [50, 51, 52]
+    assert not core._dfx_dispatch_ordinals
+
+
+def test_dfx_cancelled_request_keeps_original_identity(observed_pipeline):
+    core, _, recorder, request = observed_pipeline
+    assert core._try_dispatch_step()
+    core.scheduler.abort_request(request.request_id)
+    assert asyncio.run(core._await_and_apply_oldest())
+    rows = _dfx_rows(recorder)
+    plan = next(row for row in rows if row["event"] == "step_plan")
+    outcome = next(row for row in rows if row["event"] == "step_outcome")
+    terminal = next(row for row in rows if row["event"] == "request_terminal")
+    assert outcome["requests"][0]["request_uid"] == plan["requests"][0]["request_uid"]
+    assert terminal["request_uid"] == plan["requests"][0]["request_uid"]
+    assert not recorder._requests
+    assert request.output_token_ids == [50]
+
+
+def test_dfx_late_result_does_not_enter_next_capture(observed_pipeline):
+    core, _, recorder, _ = observed_pipeline
+    assert core._try_dispatch_step()
+    assert recorder.close()
+    assert recorder.start("second")
+    assert asyncio.run(core._await_and_apply_oldest())
+    rows = _dfx_rows(recorder)
+    assert not any(row["event"] == "step_outcome" for row in rows)
+    assert not recorder._requests
+    assert not core._dfx_dispatch_ordinals
+
+
+def test_dfx_midflight_start_does_not_invent_a_plan(observed_pipeline):
+    core, _, recorder, _ = observed_pipeline
+    assert recorder.close()
+    assert core._try_dispatch_step()
+    assert recorder.start("second")
+    assert asyncio.run(core._await_and_apply_oldest())
+    assert not any(row["event"] == "step_outcome" for row in _dfx_rows(recorder))
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_dfx_failed_pipeline_has_error_and_discard_outcomes(observed_pipeline, timeout):
+    import queue
+
+    core, commands, recorder, _ = observed_pipeline
+    assert core._try_dispatch_step()
+    assert core._try_dispatch_step()
+
+    def result(timeout=None):
+        if timeout_failure:
+            raise queue.Empty
+        return encode_result(StepResult(new_tokens={}, step_id=commands[0].step_id, error="injected"))
+
+    timeout_failure = timeout
+    core._output_queue = SimpleNamespace(get=result)
+    assert not asyncio.run(core._await_and_apply_oldest())
+    outcomes = [row for row in _dfx_rows(recorder) if row["event"] == "step_outcome"]
+    assert [row["status"] for row in outcomes] == ["error", "discarded"]
+    assert not core._dfx_dispatch_ordinals
+
+
+def test_dfx_fixed_input_replay_matches_disabled_commands_and_tokens(tmp_path):
+    from pypto_serving.observability.dplb_dfx import DplbDfxConfig, DplbDfxRecorder
+    from pypto_serving.serving.server.ipc import encode_command
+
+    runs = []
+    for observed in (False, True):
+        core, commands = _async_pipeline_core(num_speculative_tokens=2)
+        recorder = None
+        if observed:
+            recorder = DplbDfxRecorder(DplbDfxConfig(level="load"), tmp_path)
+            core._dplb_dfx = recorder
+            core.kv_cache_manager.dplb_dfx = recorder
+            core._dfx_dispatch_ordinal = 0
+            core._dfx_dispatch_ordinals = {}
+            assert recorder.start("replay")
+        request = _running_decode_request(first_output=50)
+        core.scheduler.running.append(request)
+        core.scheduler.requests[request.request_id] = request
+        for _ in range(2):
+            assert core._try_dispatch_step()
+        for _ in range(2):
+            assert asyncio.run(core._await_and_apply_oldest())
+        runs.append(([encode_command(cmd) for cmd in commands], list(request.output_token_ids)))
+        if recorder is not None:
+            assert recorder.close()
+            assert not core._dfx_step_contexts
+    assert runs[0] == runs[1]
+
+
+def test_dfx_preemption_reuses_uid_and_preserves_original_epoch(observed_pipeline):
+    core, _, recorder, request = observed_pipeline
+    assert core._try_dispatch_step()
+    # The real allocator/scheduler preemption path resets the request while its
+    # worker result remains queued, before any re-admission is allowed.
+    victim = core.scheduler._preempt_lowest_priority(Request("other", [1], 1), set(), {}, SchedulerOutput())
+    assert victim["request"] is request
+    recorder.request_fields(request.request_id, acquire=True)
+    assert asyncio.run(core._await_and_apply_oldest())
+    rows = _dfx_rows(recorder)
+    plan = next(row for row in rows if row["event"] == "step_plan")
+    outcome = next(row for row in rows if row["event"] == "step_outcome")
+    assert outcome["requests"][0]["request_uid"] == plan["requests"][0]["request_uid"]
+    assert outcome["requests"][0]["admission_epoch"] == plan["requests"][0]["admission_epoch"]
+    assert outcome["requests"][0]["result_disposition"] == "discarded"
+
+
+def test_dfx_stop_explains_step_already_waiting_for_worker(observed_pipeline):
+    core, commands, recorder, _ = observed_pipeline
+    core._dfx_profile_lock = asyncio.Lock()
+
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def held_result():
+            entered.set()
+            await release.wait()
+            return encode_result(StepResult(new_tokens={"r": [51]}, step_id=commands[0].step_id))
+
+        async def acknowledge(_active):
+            return None
+
+        core._get_live_result = held_result
+        core._set_worker_profile_active = acknowledge
+        assert core._try_dispatch_step()
+        waiting = asyncio.create_task(core._await_and_apply_oldest())
+        await entered.wait()
+        assert not core._batch_queue
+        await core.stop_profile()
+        release.set()
+        assert await waiting
+
+    asyncio.run(run())
+    end = next(row for row in _dfx_rows(recorder) if row["event"] == "capture_end")
+    assert end["in_flight_step_ids"] == [commands[0].step_id]
+
+
+def test_dfx_reused_request_id_does_not_relabel_old_result(observed_pipeline):
+    core, _, recorder, request = observed_pipeline
+    assert core._try_dispatch_step()
+    core.scheduler.abort_request(request.request_id)
+    replacement = Request(request.request_id, [2, 3], max_new_tokens=4)
+    core.scheduler.add_request(replacement)
+    assert asyncio.run(core._await_and_apply_oldest())
+    rows = _dfx_rows(recorder)
+    planned = next(row for row in rows if row["event"] == "step_plan")["requests"][0]
+    actual = next(row for row in rows if row["event"] == "step_outcome")["requests"][0]
+    arrived = next(row for row in rows if row["event"] == "request_arrived")
+    assert actual["request_uid"] == planned["request_uid"]
+    assert actual["request_uid"] != arrived["request_uid"]
+    assert replacement.output_token_ids == []

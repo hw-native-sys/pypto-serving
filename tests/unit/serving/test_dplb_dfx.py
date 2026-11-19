@@ -170,6 +170,9 @@ def test_step_snapshot_records_scheduled_load_and_worker_outcome(capture):
         )],
         finished_request_ids=[],
         step_id=7,
+        invocation_id="engine-a:7",
+        execution_slot=1,
+        pipeline_generation=4,
     )
 
     core._emit_dfx_step_plan(scheduler_output, command, dispatch_ordinal=3)
@@ -184,13 +187,17 @@ def test_step_snapshot_records_scheduled_load_and_worker_outcome(capture):
     plan = next(event for event in events if event["event"] == "step_plan")
     row = plan["requests"][0]
     assert plan["step_id"] == 7
+    assert plan["invocation_id"] == "engine-a:7"
+    assert plan["execution_slot"] == 1
+    assert plan["pipeline_generation"] == 4
     assert plan["dispatch_ordinal"] == 3
     assert plan["active_count"] == 1
     assert plan["decode_tokens"] == 3
+    assert plan["length_distribution"]["decode"]["values"] == [33]
     assert row["stage"] == "decode"
     assert row["logical_length_after"] == 33
     assert row["logical_length_status"] == "committed_snapshot"
-    assert row["speculative_proposed_tokens"] == 2
+    assert row["speculative_budget_tokens"] == 2
     assert row["row_extent"]["valid_rows"] is None
     assert row["row_extent"]["unavailable_reason"] == "runner_prepare_not_observed"
     group = next(group for group in plan["groups"] if group["group_id"] == 1)
@@ -199,6 +206,9 @@ def test_step_snapshot_records_scheduled_load_and_worker_outcome(capture):
 
     outcome = next(event for event in events if event["event"] == "step_outcome")
     assert outcome["status"] == "completed"
+    assert outcome["invocation_id"] == "engine-a:7"
+    assert outcome["execution_slot"] == 1
+    assert outcome["pipeline_generation"] == 4
     assert outcome["requests"][0]["returned_tokens"] == 2
     assert outcome["requests"][0]["speculative_accepted_tokens"] == 1
 
