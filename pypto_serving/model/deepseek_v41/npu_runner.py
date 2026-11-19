@@ -2752,10 +2752,17 @@ class ResidentDSparkBuffers:
 
 
 # resident_resources
+# Names the Lib's DSpark decode program must expose as resident device buffers.
+# The refactored Lib decode ABI (b127ab43 onward, merged as eac6fb1f) no longer
+# carries "target_hidden", "context_valid", or "context_positions" as decode
+# program parameters: the drafter derives its context extent from target_hidden,
+# and the decode program publishes target_hidden_padded instead. The serving
+# still allocates those workspace buffers for the drafter stage, so only the
+# decode-side contract drops them.
 _DSPARK_RESIDENT_DECODE_SCRATCH = frozenset((
     "x_hc", "pre_mix", "position_ids", "request_ids", "window_slots", "window_indices",
-    "c2a_slots", "c1a_slots", "query_starts", "target_hidden_padded", "target_hidden",
-    "context_valid", "context_positions", "num_sampled", "anchor_ids", "first_query_positions",
+    "c2a_slots", "c1a_slots", "query_starts", "target_hidden_padded",
+    "num_sampled", "anchor_ids", "first_query_positions",
     "context_slots", "context_rope_cos", "context_rope_sin", "query_rope_cos", "query_rope_sin",
     "draft_head_hidden", "committed",
 ))
