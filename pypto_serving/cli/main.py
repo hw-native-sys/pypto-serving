@@ -237,6 +237,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--enable-dplb", action=argparse.BooleanOptionalAction, default=False,
+        help="Balance grouped DP admission by request count and KV length (default: off).",
+    )
+    parser.add_argument(
         "--enable-prefix-caching",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -373,6 +377,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         max_num_scheduled_tokens=args.max_num_batched_tokens,
         long_prefill_token_threshold=args.long_prefill_token_threshold,
         enable_prefix_cache=enable_prefix_cache,
+        enable_dplb=args.enable_dplb,
         enable_chunk_prefill=args.enable_chunked_prefill,
     )
 
@@ -460,6 +465,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         device_ids=devices,
         parallel_config=parallel,
         executor_cls=_executor_cls_for_model_family("deepseek_v41"),
+        enable_dplb=args.enable_dplb,
         runtime_config=runtime,
         profile_config=_build_profile_config(args),
         max_num_running_reqs=args.max_num_seqs,

@@ -117,6 +117,7 @@ The HTTP completion path always ignores EOS. Chat requests can set `max_completi
 
 | Argument | Default | Description |
 | --- | --- | --- |
+| `--enable-dplb` / `--no-enable-dplb` | disabled | Balance grouped DP admission by request count and logical KV length; longest prefix-cache hits retain priority. |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | enabled | Enable or disable prefix caching for supported paths. |
 | `--enable-chunked-prefill` / `--no-enable-chunked-prefill` | enabled | Enable or disable chunked prefill. |
 | `--speculative-config JSON` | unset | Model-specific speculative decoding configuration; currently supported by DeepSeek V4. |
