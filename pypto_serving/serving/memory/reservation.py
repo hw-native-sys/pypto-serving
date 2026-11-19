@@ -120,6 +120,7 @@ class GroupedCacheReservations:
                     max_cache_hit_tokens=prompt_tokens,
                     shareable_group_names=shareable_group_names,
                     partition=partition,
+                    load_tokens=prompt_tokens,
                 )
                 if prefix_hit_tokens:
                     # A cached page may otherwise have only this request as an
@@ -132,6 +133,7 @@ class GroupedCacheReservations:
                 self.manager.ensure_group_blocks(
                     request_id, prompt_tokens,
                     partition=(selected_prefix_partition if selected_prefix_partition is not None else partition),
+                    load_tokens=prompt_tokens,
                 )
                 selected = self.manager.group_request_partition(request_id)
                 if selected is None:

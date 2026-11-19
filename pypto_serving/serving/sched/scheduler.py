@@ -615,6 +615,7 @@ class Scheduler:
                         request.request_id,
                         request.group_block_hashes,
                         max_cache_hit_tokens=request.group_checkpoint_boundary,
+                        load_tokens=request.num_prompt_tokens,
                     )
                     request.group_shared_prefix_boundary = self.kv_cache_manager.group_history_prefix_hit(
                         request.group_block_hashes, request.group_checkpoint_boundary,
@@ -1293,6 +1294,7 @@ class Scheduler:
                     request.request_id,
                     total_tokens,
                     partition=request.cache_partition,
+                    load_tokens=request.num_prompt_tokens,
                 )
                 request.cache_partition = self.kv_cache_manager.group_request_partition(
                     request.request_id

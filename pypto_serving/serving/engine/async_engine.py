@@ -111,11 +111,16 @@ class EngineConfig:
 
     # Feature flags
     enable_prefix_cache: bool = True
+    enable_dplb: bool = False
     enable_chunk_prefill: bool = True
     # Async (pipelined) scheduling. None = auto (on). Speculative/MTP decoders
     # are supported: the scheduler optimistically reserves the upper bound of
     # tokens per step and subtracts the shortfall once the worker replies.
     async_scheduling: bool | None = None
+
+    def resolve_dplb(self) -> bool:
+        """Keep existing count balancing unless KV-aware admission is requested."""
+        return self.enable_dplb
 
     def resolve_async_scheduling(self) -> bool:
         """Resolve the async-scheduling flag (default on for all executors)."""
@@ -255,6 +260,7 @@ class ReplicaEngineCore:
             num_blocks=None,
             block_size=block_size,
             enable_prefix_cache=self.config.enable_prefix_cache,
+            enable_dplb=self.config.resolve_dplb(),
         )
         self._cache_tiering = None
         if runtime.kv_offload_bytes < 0:

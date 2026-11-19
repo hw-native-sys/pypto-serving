@@ -219,6 +219,7 @@ class KvCacheManager:
         num_blocks: int | None = None,
         block_size: int = 64,
         enable_prefix_cache: bool = True,
+        enable_dplb: bool = False,
     ) -> None:
         """Create an empty registry of model-specific KV pools."""
         self._pools: dict[str, _CachePool] = {}
@@ -230,6 +231,8 @@ class KvCacheManager:
         self.request_blocks: dict[str, list[KVCacheBlock]] = {}
         self._group_pools: dict[str, _GroupBlockPool] = {}
         self._group_request_partitions: dict[str, int] = {}
+        self.enable_dplb = enable_dplb
+        self._group_request_tokens: dict[str, int] = {}
         self._next_group_partition = 0
         self._group_checkpoints: GroupPrefixCheckpoints | None = None
         self.checkpoint_writer = GroupCheckpointWriter(self)
@@ -868,6 +871,7 @@ class KvCacheManager:
         max_cache_hit_tokens: int,
         shareable_group_names: tuple[str, ...] | None = None,
         partition: int | None = None,
+        load_tokens: int | None = None,
     ) -> tuple[dict[str, list[int]], int, int | None]:
         if not self.enable_prefix_cache or not self._group_pools:
             return {}, 0, None
@@ -875,10 +879,13 @@ class KvCacheManager:
             raise ValueError(f"Request {request_id!r} already owns grouped KV cache blocks")
         best_blocks, best_hit_tokens, best_partition = self.select_group_prefix_blocks(
             block_hashes, max_cache_hit_tokens=max_cache_hit_tokens,
-            shareable_group_names=shareable_group_names, partition=partition)
+            shareable_group_names=shareable_group_names, partition=partition, load_tokens=load_tokens)
         if best_partition is None or not best_hit_tokens:
             return {}, 0, None
         self._group_request_partitions[request_id] = best_partition
+        if self.enable_dplb:
+            self._next_group_partition = (best_partition + 1) % self.group_partition_count
+        self._group_request_tokens[request_id] = max(best_hit_tokens, load_tokens or 0)
         for name, pool in self._group_pools.items():
             owned = best_blocks[name]
             pool.request_blocks[request_id] = list(owned)
@@ -895,7 +902,7 @@ class KvCacheManager:
 
     def select_group_prefix_blocks(
         self, block_hashes, *, max_cache_hit_tokens, shareable_group_names=None, partition=None,
-        lookup=None, checkpoint_keys=None,
+        lookup=None, checkpoint_keys=None, load_tokens=None,
     ):
         """Select the longest complete grouped prefix without mutating ownership.
 
@@ -951,12 +958,16 @@ class KvCacheManager:
         best_hit_tokens = 0
         best_blocks: dict[str, list[KVCacheBlock | None]] = {}
         candidate_partitions = (
-            range(self.group_partition_count)
+            list(range(self.group_partition_count))
             if partition is None
-            else (partition,)
+            else [partition]
         )
         if partition is not None and not 0 <= partition < self.group_partition_count:
             raise ValueError(f"Invalid cache partition {partition}")
+        if self.enable_dplb:
+            candidate_partitions = self._rank_group_partitions(
+                candidate_partitions, load_tokens or max_hit_tokens
+            )
         request_limit = next(iter(self._group_pools.values())).spec.max_requests_per_partition
         for candidate_partition in candidate_partitions:
             if (request_limit is not None and
@@ -1524,8 +1535,37 @@ class KvCacheManager:
             )
         ]
 
+    def _rank_group_partitions(self, candidates: list[int], token_count: int) -> list[int]:
+        """Rank admission targets using DeepInfer's two-dimensional heuristic.
+
+        Short sequences fill concurrency gaps, breaking ties toward larger KV
+        loads. Long sequences fill KV gaps. Exact ties rotate to avoid rank bias.
+        KV ownership never moves after admission. Logical lengths include the
+        full prompt even while chunked prefill has allocated only its first chunk.
+        """
+        counts = [0] * self.group_partition_count
+        tokens = [0] * self.group_partition_count
+        for request_id, partition in self._group_request_partitions.items():
+            counts[partition] += 1
+            tokens[partition] += self._group_request_tokens.get(request_id, 0)
+        short = token_count * sum(counts) <= sum(tokens)
+
+        def score(partition):
+            rotation = (partition - self._next_group_partition) % self.group_partition_count
+            if self.enable_dplb:
+                load = (
+                    (counts[partition], -tokens[partition]) if short
+                    else (tokens[partition], counts[partition])
+                )
+            else:
+                load = (counts[partition], 0)
+            return (*load, rotation)
+
+        return sorted(candidates, key=score)
+
     def select_group_partition(
         self, request_id: str, token_count: int, *, partitions: Sequence[int] | None = None,
+        load_tokens: int | None = None,
     ) -> int | None:
         """Choose among capacity-qualified partitions, optionally restricted by the caller."""
         candidates = self._candidate_group_partitions(request_id, token_count, partitions)
@@ -1535,17 +1575,17 @@ class KvCacheManager:
         if assigned is not None:
             return assigned
 
-        first_pool = next(iter(self._group_pools.values()))
-        owned_counts = {
-            partition: sum(
-                request_partition == partition
-                for request_partition in first_pool.request_partitions.values()
-            )
-            for partition in candidates
-        }
-        from .placement import least_loaded_partition
-        partition = least_loaded_partition(candidates, owned_counts, self._next_group_partition,
-                                           self.group_partition_count)
+        if self.enable_dplb:
+            partition = self._rank_group_partitions(candidates, max(token_count, load_tokens or 0))[0]
+        else:
+            first_pool = next(iter(self._group_pools.values()))
+            owned_counts = dict.fromkeys(candidates, 0)
+            for owner in first_pool.request_partitions.values():
+                if owner in owned_counts:
+                    owned_counts[owner] += 1
+            from .placement import least_loaded_partition
+            partition = least_loaded_partition(candidates, owned_counts, self._next_group_partition,
+                                               self.group_partition_count)
         if partition not in candidates:
             raise RuntimeError("placement selected an ineligible cache partition")
         self._next_group_partition = (partition + 1) % self.group_partition_count
@@ -1576,6 +1616,7 @@ class KvCacheManager:
         token_count: int,
         *,
         partition: int | None = None,
+        load_tokens: int | None = None,
     ) -> dict[str, list[int]]:
         """Atomically grow all cache groups for a request and return block IDs."""
         if not self._group_pools:
@@ -1604,7 +1645,7 @@ class KvCacheManager:
         selected = (
             partition
             if partition is not None
-            else self.select_group_partition(request_id, token_count)
+            else self.select_group_partition(request_id, token_count, load_tokens=load_tokens)
         )
         if selected is None or not self.can_ensure_group_blocks(
             request_id,
@@ -1633,6 +1674,7 @@ class KvCacheManager:
             )
 
         self._group_request_partitions.setdefault(request_id, selected)
+        self._group_request_tokens[request_id] = max(token_count, load_tokens or 0)
         for name, pool in self._group_pools.items():
             owned = pool.request_blocks.setdefault(request_id, [])
             pool.request_partitions.setdefault(request_id, selected)
@@ -1704,6 +1746,7 @@ class KvCacheManager:
             self._release_group_blocks(pool, partition, self._group_tail(
                 blocks, end if pool.spec.sliding_window is not None else None))
         self._group_request_partitions.pop(request_id, None)
+        self._group_request_tokens.pop(request_id, None)
         self._maintain_group_checkpoints()
 
     @property
