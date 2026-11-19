@@ -146,7 +146,7 @@ class LowlatModelRunner(ModelRunner):
         return self.cache.counts["ori"]
 
     def register_contexts(self, contexts):
-        from pypto_serving.config.types import RequestExecutionContext
+        from pypto_serving.serving.model_extension import RequestExecutionContext
 
         if len(contexts)>1 or self.state is not None:
             raise ValueError("Lowlat accepts one new request context while idle")
@@ -327,7 +327,9 @@ class LowlatModelRunner(ModelRunner):
 
         from .execution_policy import decode_prefill_metadata
 
-        metadata=decode_prefill_metadata(batch.execution_metadata.get(state.request_id,b""))
+        extension = batch.model_extensions.get(state.request_id)
+        payload = extension.payload if extension is not None else b""
+        metadata=decode_prefill_metadata(payload)
         with PrefillSubmissions(self.worker, state, self.transfers) as submissions:
             if self.prefix_namespace and metadata.page_identities:
                 self.cache.adopt_page_identities(metadata.page_identities)

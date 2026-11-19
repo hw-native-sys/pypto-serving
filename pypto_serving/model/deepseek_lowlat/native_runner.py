@@ -13,7 +13,8 @@ import logging
 import time
 
 import torch
-from pypto_serving.config.types import DecodeResult, RequestExecutionContext
+from pypto_serving.config.types import DecodeResult
+from pypto_serving.serving.model_extension import RequestExecutionContext
 
 from .profiling import operation
 from .bindings import parameter_rows

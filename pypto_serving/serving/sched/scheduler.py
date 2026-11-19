@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-from pypto_serving.config.decoding import DecodeReservation
 from .execution import SchedulingPolicy, RequestPolicyState, StepPolicyState
 
 import logging
@@ -204,7 +203,9 @@ class ScheduledRequest:
     cache_partition: int | None = None
     resumed_from_preemption: bool = False
     group_blocks_retained: bool = False
-    decode_reservation: DecodeReservation | None = None
+    # Opaque model execution plan. The common scheduler never interprets its
+    # cycle/frame fields; the selected model policy owns the payload.
+    decode_reservation: object | None = None
     confirmed_input_end: int | None = None
     execution_plan: StepPolicyState | None = None
     cache_aux_snapshots: tuple = ()

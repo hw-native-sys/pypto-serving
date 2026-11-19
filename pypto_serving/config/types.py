@@ -9,14 +9,16 @@
 
 from __future__ import annotations
 
-from .decoding import DecodeReservation
-
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from typing import Literal
 
 import torch
 
 from pypto_serving.model.tokenizer import TokenizerAdapter
+from pypto_serving.serving.model_extension import (  # noqa: F401
+    ModelStepExtension,
+    RequestExecutionContext,
+)
 
 
 PREFILL_CHUNK_SIZE_CHOICES = (1024, 2048, 4096, 8192)
@@ -320,25 +322,6 @@ class StopTokenMask:
     remaining_tokens: int
 
 
-@dataclass(frozen=True)
-class RequestExecutionContext:
-    """Admission-resolved request limits passed before its first device step."""
-
-    request_id: str
-    prompt_tokens: int
-    max_output_tokens: int
-    initial_output_tokens: int = 0
-    execution_generation: int = 0
-
-    def __post_init__(self):
-        if (not isinstance(self.request_id, str) or not self.request_id
-                or any(type(v) is not int for v in
-                       (self.prompt_tokens, self.max_output_tokens, self.initial_output_tokens, self.execution_generation))
-                or self.execution_generation < 0 or self.prompt_tokens <= 0 or self.max_output_tokens <= 0
-                or not 0 <= self.initial_output_tokens <= self.max_output_tokens):
-            raise ValueError("invalid request execution context")
-
-
 @dataclass
 class PrefillBatch:
     """Packed inputs for a batched prompt prefill call."""
@@ -362,7 +345,19 @@ class PrefillBatch:
     # Opaque request-local generation constraints, interpreted only by capable runners.
     constraint_states: dict[str, object] = field(default_factory=dict)
     stop_token_masks: dict[str, StopTokenMask] = field(default_factory=dict)
-    execution_metadata: dict[str, bytes] = field(default_factory=dict)
+    model_extensions: dict[str, ModelStepExtension] = field(default_factory=dict)
+    # Compatibility input for older worker adapters. It is converted to typed
+    # extensions at construction and is not retained as a common execution
+    # field.
+    execution_metadata: InitVar[dict[str, bytes] | None] = None
+
+    def __post_init__(self, execution_metadata: dict[str, bytes] | None) -> None:
+        if execution_metadata:
+            for request_id, payload in execution_metadata.items():
+                self.model_extensions.setdefault(
+                    request_id,
+                    ModelStepExtension("legacy-model-metadata", 1, payload),
+                )
 
 
 @dataclass
@@ -405,7 +400,9 @@ class DecodeBatch:
     # its embedding (shape ``[B, hidden]``). Left ``None`` for single-token decoders.
     prev_token_ids: torch.Tensor | None = None
     prev_hidden_states: torch.Tensor | None = None
-    decode_reservations: tuple[DecodeReservation | None, ...] = ()
+    # Deprecated compatibility slot. Model adapters should use model_extensions.
+    decode_reservations: tuple[object | None, ...] = ()
+    model_extensions: tuple[ModelStepExtension | None, ...] = ()
 
 
 @dataclass
@@ -425,6 +422,7 @@ class DecodeResult:
     num_draft_tokens: list[int] | None = None
     retired_reservation_ids: tuple[int, ...] = ()
     execution_receipts: tuple[bytes, ...] = ()
+    model_extension: ModelStepExtension | None = None
 
 
 @dataclass

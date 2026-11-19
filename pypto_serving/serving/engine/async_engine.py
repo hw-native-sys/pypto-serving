@@ -1043,7 +1043,7 @@ class ReplicaEngineCore:
                     initial_output_tokens=len(req.output_token_ids),
                     max_output_tokens=req.max_new_tokens,
                     execution_generation=req.execution_generation,
-                    execution_metadata=self._policy().request_metadata(req),
+                    model_extension=self._policy().request_metadata(req),
                     constraint_spec=req.constraint_spec.to_wire() if req.constraint_spec else None,
                     initialize_from_cache=req.requires_initial_step,
                     initial_output_token_ids=(
@@ -1066,7 +1066,7 @@ class ReplicaEngineCore:
                         for name, block_ids in sr.block_ids_by_group.items()
                     },
                     cache_partition=sr.cache_partition,
-                    execution_metadata=self._policy().prefill_metadata(
+                    model_extension=self._policy().prefill_metadata(
                         sr,is_new=any(r.request_id==req_id for r in new_requests),cache=self.kv_cache_manager),
                 ))
             else:

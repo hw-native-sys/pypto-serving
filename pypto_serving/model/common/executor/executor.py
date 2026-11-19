@@ -26,6 +26,7 @@ from pypto_serving.config.types import (
     SamplingParams,
 )
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.serving.model_extension import ModelExecutionCapabilities
 
 
 class ModelExecutor(ABC):
@@ -34,6 +35,13 @@ class ModelExecutor(ABC):
     def __init__(self, kv_cache_manager: KvCacheManager | None = None) -> None:
         """Store the KV cache manager shared with the engine (optional for serving path)."""
         self._kv_cache_manager = kv_cache_manager
+
+    @property
+    def capabilities(self) -> ModelExecutionCapabilities:
+        """Return the worker capabilities as one stable typed contract."""
+        from .capabilities import resolve_executor_capabilities
+
+        return resolve_executor_capabilities(self)
 
     def cache_group_sizes(self, model_id: str) -> dict[str, int]:
         """Report independently planned pools, or use primary-pool scaling."""

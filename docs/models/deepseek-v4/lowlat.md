@@ -435,3 +435,23 @@ late prefill chunk costs, per-rank indexer/runner spans, chunk-boundary overhead
 and post-prefill native setup. Host runner spans still include runtime waits;
 operator-level attribution requires further instrumentation. Profile TPOT
 must not replace the separate uninstrumented benchmark.
+
+## Serving/model boundary
+
+Lowlat native execution is carried through a typed model extension. The common
+engine owns request admission, token scheduling, ordinary KV block lifetime and
+IPC ordering. The lowlat adapter owns native cycle/frame reservations, physical
+lookahead, retirement receipts and rolling checkpoint publication.
+
+`RequestExecutionContext` and `ModelStepExtension` live in
+`pypto_serving.serving.model_extension`. Prefill batches convert legacy byte
+metadata into a versioned opaque extension at construction. Executor features
+are resolved once into `ModelExecutionCapabilities` during worker
+initialization; the worker hot path does not probe executor attributes for
+async or sampling behavior. Lowlat decode receipts are exposed through a
+`deepseek_v4_flash_lowlat` result extension while the legacy receipt fields
+remain wire-compatible for older workers.
+
+The compatibility fields in the common dataclasses are transitional input
+aliases. New model adapters should use `model_extensions` and the capability
+contract. The generic scheduler never interprets native reservation payloads.

@@ -67,7 +67,10 @@ class NewRequestData(msgspec.Struct):
     # Effective limit after scheduler admission/clamping. Optional for legacy senders.
     max_output_tokens: int | None = None
     execution_generation: int = 0
-    execution_metadata: bytes = b""
+    # Opaque, versioned model-owned request extension. The common IPC layer
+    # carries bytes but never interprets lowlat metadata.
+    model_extension: bytes = b""
+    execution_metadata: bytes = b""  # compatibility alias for older senders
 
 
 class PrefillRequest(msgspec.Struct):
@@ -83,7 +86,8 @@ class PrefillRequest(msgspec.Struct):
     # Model-specific grouped cache tables and their stable rank partition.
     block_ids_by_group: dict[str, list[int]] = msgspec.field(default_factory=dict)
     cache_partition: int | None = None
-    execution_metadata: bytes = b""
+    model_extension: bytes = b""
+    execution_metadata: bytes = b""  # compatibility alias for older senders
 
 
 class DecodeReservationData(msgspec.Struct):
@@ -118,6 +122,7 @@ class DecodeRequest(msgspec.Struct):
     block_ids_by_group: dict[str, list[int]] = msgspec.field(default_factory=dict)
     cache_partition: int | None = None
     decode_reservation: DecodeReservationData | None = None
+    model_extension: bytes = b""
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +193,7 @@ class StepResult(msgspec.Struct):
     retired_reservation_ids: tuple[int, ...] = ()
     execution_receipts: tuple[bytes, ...] = ()
     cache_publications: tuple[CachePublicationProof, ...] = ()
+    model_extension: bytes = b""
 
 
 class ProfileResult(msgspec.Struct, tag="profile"):

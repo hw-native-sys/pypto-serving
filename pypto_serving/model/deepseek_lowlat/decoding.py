@@ -14,6 +14,43 @@ import msgspec
 
 
 @dataclass(frozen=True)
+class DecodeReservation:
+    """Lowlat-only physical execution plan for one native parent."""
+
+    reservation_id: int
+    request_id: str
+    generation: int
+    cycles: int
+    max_output_tokens: int
+    physical_input_end: int
+    remaining_lower_bound: int
+    frame_id: int
+
+    def __post_init__(self):
+        values = (
+            self.reservation_id, self.generation, self.cycles, self.max_output_tokens,
+            self.physical_input_end, self.remaining_lower_bound, self.frame_id,
+        )
+        if (
+            any(type(value) is not int for value in values)
+            or not isinstance(self.request_id, str) or not self.request_id
+            or self.reservation_id <= 0 or self.generation <= 0 or self.cycles <= 0
+            or self.max_output_tokens <= 0 or self.physical_input_end <= 0
+            or self.remaining_lower_bound <= 0 or self.frame_id < 0
+            or self.max_output_tokens > self.remaining_lower_bound
+        ):
+            raise ValueError("invalid lowlat decode reservation")
+
+
+@dataclass(frozen=True)
+class LowlatDecodeExtension:
+    """Native retirement data consumed by the lowlat execution policy."""
+
+    retired_reservation_ids: tuple[int, ...]
+    execution_receipts: tuple[bytes, ...]
+
+
+@dataclass(frozen=True)
 class NativeDecodeRetirement:
     reservation_id: int
     request_id: str

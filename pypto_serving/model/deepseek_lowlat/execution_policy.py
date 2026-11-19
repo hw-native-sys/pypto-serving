@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import msgspec
 
-from pypto_serving.config.types import RequestExecutionContext
+from pypto_serving.serving.model_extension import RequestExecutionContext
 from pypto_serving.model.execution_policy import ExecutionPolicy
 from pypto_serving.serving.memory.protocol import CachePageIdentity, GroupCacheCopyPlan
 from .contract import validate_sampling
@@ -112,13 +112,22 @@ class LowlatExecutionPolicy(ExecutionPolicy):
     def confirm_step(self, output, result, cache):
         from .decoding import decode_retirement, validate_native_retirement
 
+        extension = result.model_extension
+        if isinstance(extension, bytes):
+            extension = None
+        if extension is not None and extension.kind == "deepseek_v4_flash_lowlat":
+            retired_reservation_ids = extension.payload.retired_reservation_ids
+            execution_receipts = extension.payload.execution_receipts
+        else:
+            retired_reservation_ids = result.retired_reservation_ids
+            execution_receipts = result.execution_receipts
         expected = [s for s in output.scheduled_requests if s.decode_reservation is not None]
-        if result.retired_reservation_ids != tuple(
+        if retired_reservation_ids != tuple(
             s.decode_reservation.reservation_id for s in expected
-        ) or len(result.execution_receipts) != len(expected):
+        ) or len(execution_receipts) != len(expected):
             raise ValueError("native physical retirement receipt count/ID differs")
         updates = []
-        for scheduled, payload in zip(expected, result.execution_receipts, strict=True):
+        for scheduled, payload in zip(expected, execution_receipts, strict=True):
             receipt = decode_retirement(payload)
             request = scheduled.request
             validate_native_retirement(

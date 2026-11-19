@@ -11,8 +11,7 @@
 
 from dataclasses import dataclass
 
-from pypto_serving.config.decoding import DecodeReservation
-from .decoding import choose_native_parent
+from .decoding import DecodeReservation, choose_native_parent
 from pypto_serving.serving.sched.execution import SchedulingPolicy, RequestPolicyState, StepPolicyState
 from pypto_serving.serving.memory.protocol import GroupCacheCopyPlan
 from .prefix_protocol import PrefixResumeDescriptor
