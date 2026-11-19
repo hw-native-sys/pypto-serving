@@ -46,8 +46,6 @@ from .task_args import (
 from .engram import HostEngram
 from .dspark_resources import DSPARK_MAX_BATCH_PER_DP, DSPARK_WINDOW
 from .dspark_runtime import (
-    DECODE_STAGE_ORDER,
-    PREFILL_STAGE_ORDER,
     DSPARK_ROWS_PER_REQUEST,
     DSPARK_SPECULATIVE_TOKENS,
     DSparkDecodeDispatch,
@@ -231,15 +229,17 @@ def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
     # fit the larger physical page namespace without remapping scheduler IDs.
     compressed_pages = max(physical_group_blocks[resolved.c2a],
                            physical_group_blocks[resolved.c1a])
+    compressed_units = c2a_sources + 2 * (kv_sources - c2a_sources)
+    compressed_rows = abi.COMPRESSED_POOL_UNIT_ROWS
     buffers = (
         CacheBufferSpec("window_cache_pool", (
             world, len(layers) * window_pages, block, 1, abi.WINDOW_CACHE_BYTES), torch.uint8),
         CacheBufferSpec("compressed_cache_pool", (
-            world, kv_sources * compressed_pages, block, 1, abi.COMPRESSED_CACHE_BYTES), torch.uint8),
+            world, compressed_units * compressed_pages, compressed_rows, 1, abi.COMPRESSED_CACHE_BYTES), torch.uint8),
         CacheBufferSpec("index_cache_pool", (
-            world, kv_sources * compressed_pages, block, 1, index // 2), torch.uint8),
+            world, compressed_units * compressed_pages, compressed_rows, 1, index // 2), torch.uint8),
         CacheBufferSpec("index_cache_scale_pool", (
-            world, kv_sources * compressed_pages, block, 1, index // abi.INDEX_CACHE_GROUP),
+            world, compressed_units * compressed_pages, compressed_rows, 1, index // abi.INDEX_CACHE_GROUP),
                         torch.float8_e8m0fnu),
         CacheBufferSpec("state_cache_pool", (
             world, c2a_sources * (request_slots + 1), abi.STATE_CAPACITY, abi.STATE_WIDTH), torch.float32),
@@ -271,6 +271,24 @@ def make_cache_page_reset_buffers(plan: DecodeCachePlan) -> dict[str, torch.Tens
             page.view(torch.uint8).fill_(127)
         result[spec.name] = page
     return result
+
+
+def _cache_source_shapes(plan, spec):
+    """Resolve logical producer views over the compact physical cache units."""
+    if spec.name.startswith("window_cache_"):
+        group = plan.family_groups.window
+        pages = plan.physical_group_blocks[group]
+        return ((pages, *spec.shape[2:]),) * len(plan.group_sources[group]["window"])
+    if spec.name.startswith(("compressed_cache_", "index_cache_")):
+        family = "compressed" if spec.name.startswith("compressed_") else "index"
+        pages = max(plan.physical_group_blocks[group] for group, families in
+                    plan.group_sources.items() if family in families)
+        rows = {source: spec.shape[2] * (1 if group == plan.family_groups.c2a else 2)
+                for group, families in plan.group_sources.items()
+                for source in families.get(family, ())}
+        return tuple((pages, rows[source], *spec.shape[3:]) for source in range(len(rows)))
+    pages = plan.physical_request_slots
+    return ((pages, *spec.shape[2:]),) * (spec.shape[1] // pages)
 
 
 class DecodeCachePools:
@@ -305,28 +323,13 @@ class DecodeCachePools:
         self.source_counts = {}
         try:
             for spec in plan.buffers:
-                if spec.name.startswith("window_cache_"):
-                    group = plan.family_groups.window
-                    stride = plan.physical_group_blocks[group]
-                    sources = len(plan.group_sources[group]["window"])
-                elif spec.name.startswith(("compressed_cache_", "index_cache_")):
-                    family = "compressed" if spec.name.startswith("compressed_") else "index"
-                    stride = max(plan.physical_group_blocks[group] for group, families in
-                                 plan.group_sources.items() if family in families)
-                    ids = {slot for families in plan.group_sources.values()
-                           for slot in families.get(family, ())}
-                    sources = len(ids)
-                    if ids != set(range(sources)):
-                        raise ValueError(f"{family} cache source IDs must be contiguous")
-                else:
-                    stride = plan.physical_request_slots
-                    sources = spec.shape[1] // stride
-                if spec.shape[1] != sources * stride:
+                shapes = _cache_source_shapes(plan, spec)
+                if math.prod(spec.shape[1:]) != sum(math.prod(shape) for shape in shapes):
                     raise ValueError("cache source axis disagrees with the resident pool")
-                self.source_counts[spec.name] = sources
-                for source in range(sources):
+                self.source_counts[spec.name] = len(shapes)
+                for source, shape in enumerate(shapes):
                     self.tensors[spec.name, source] = alloc_device_buffer(
-                        worker, (spec.shape[0], stride, *spec.shape[2:]), spec.dtype,
+                        worker, (spec.shape[0], *shape), spec.dtype,
                         stacked=True)
         except BaseException:
             self.close()
@@ -409,12 +412,14 @@ class DecodeCachePools:
                     for source in sources:
                         target = self.view(name, source)
                         shard = target.shards[partition]
+                        units_per_page = target.shape[2] // spec.shape[2]
                         for page in pages:
-                            self.worker.copy_to(
-                                shard.data_ptr - shard.byte_offset, zero[partition].data_ptr(), page_bytes,
-                                dst_offset=shard.byte_offset + page * page_bytes,
-                                worker_id=partition,
-                            )
+                            for unit in range(units_per_page):
+                                self.worker.copy_to(
+                                    shard.data_ptr - shard.byte_offset, zero[partition].data_ptr(), page_bytes,
+                                    dst_offset=shard.byte_offset + (page * units_per_page + unit) * page_bytes,
+                                    worker_id=partition,
+                                )
         self.reset_state_slot(partition, owner.slot)
 
     def reset_padding(self, partition):
@@ -443,33 +448,21 @@ class DecodeFullCachePools(DecodeCachePools):
         self.tensors, self.source_counts, self._full = {}, {}, {}
         try:
             for spec in plan.buffers:
-                if spec.name.startswith("window_cache_"):
-                    group = plan.family_groups.window
-                    stride = plan.physical_group_blocks[group]
-                    sources = len(plan.group_sources[group]["window"])
-                elif spec.name.startswith(("compressed_cache_", "index_cache_")):
-                    family = "compressed" if spec.name.startswith("compressed_") else "index"
-                    stride = max(plan.physical_group_blocks[group] for group, families in
-                                 plan.group_sources.items() if family in families)
-                    sources = len({slot for families in plan.group_sources.values()
-                                   for slot in families.get(family, ())})
-                else:
-                    stride = plan.physical_request_slots
-                    sources = spec.shape[1] // stride
-                if spec.shape[1] != sources * stride:
+                shapes = _cache_source_shapes(plan, spec)
+                if math.prod(spec.shape[1:]) != sum(math.prod(shape) for shape in shapes):
                     raise ValueError(f"{spec.name} packed cache source axis is invalid")
-                self.source_counts[spec.name] = sources
+                self.source_counts[spec.name] = len(shapes)
                 base = alloc_device_buffer(worker, spec.shape, spec.dtype, stacked=True)
                 self._full[spec.name] = base
-                slice_shape = (stride, *spec.shape[2:])
-                slot_bytes = math.prod(slice_shape) * torch.empty((), dtype=spec.dtype).element_size()
-                for source in range(sources):
+                offset = 0
+                for source, slice_shape in enumerate(shapes):
                     shards = tuple(worker.view_tensor(shard, slice_shape,
-                                                      byte_offset=source * slot_bytes,
+                                                      byte_offset=offset,
                                                       worker_id=rank)
                                    for rank, shard in enumerate(base.shards))
                     self.tensors[spec.name, source] = StackedDeviceTensor(
                         shards, (spec.shape[0], *slice_shape), base.worker_ids)
+                    offset += math.prod(slice_shape) * torch.empty((), dtype=spec.dtype).element_size()
         except BaseException:
             self.close()
             raise
@@ -502,7 +495,8 @@ class DecodeFullCachePools(DecodeCachePools):
         for target, source in names.items():
             base = self.full(source)
             pages = plan.physical_request_slots if target == "state_cache" else window_pages
-            sources = compressed_sources if target in ("index_cache", "index_scales") else self.source_counts[source]
+            sources = (base.shape[1] // pages if target in ("compressed_cache", "index_cache", "index_scales")
+                       else self.source_counts[source])
             if base.shape[1] < sources * pages or (target not in ("index_cache", "index_scales")
                                                    and base.shape[1] != sources * pages):
                 raise ValueError(f"{source} cannot be viewed with lib prefill source/page axes")
@@ -1033,7 +1027,8 @@ def prepare_compressed_metadata(
     """Lower full-history pages with joint KV/index physical page numbering.
 
     The resource allocator must use the same page IDs for compressed KV and
-    index-key pools. Each pool stores 128 compressed rows per page. This does
+    index-key pools. C2A pages store 64 compressed rows and C1A pages store 128.
+    Both page families cover 128 original token positions. This does
     not select candidates/Top-K or materialize compressed attention indices.
     Those remain device outputs from the appropriate lib producer composite.
 
@@ -1047,6 +1042,7 @@ def prepare_compressed_metadata(
             raise ValueError("compressed metadata requires a ForwardStep and SegmentTopology")
         if type(ratio) is not int or ratio not in (1, 2):
             raise ValueError("compression ratio must be 1 or 2")
+        storage_rows = 128 // ratio
         if (type(cache_pages) is not int or not 0 < cache_pages <= (2**31 - 1) // 128
                 or type(max_requests) is not int or max_requests <= 0
                 or type(state_blocks) is not int or not 0 < state_blocks <= 2**31 - 1
@@ -1078,7 +1074,7 @@ def prepare_compressed_metadata(
                 raise ValueError("requests must own distinct compressor state slots")
             slots.add(key)
             pages = request.pages.get(compressed_group)
-            needed = (request.end // ratio + 127) // 128
+            needed = (request.end // ratio + storage_rows - 1) // storage_rows
             if not isinstance(pages, (tuple, list)) or len(pages) < needed:
                 raise ValueError("compressed pages must cover all completed history")
             for page in pages:
@@ -1119,7 +1115,9 @@ def prepare_compressed_metadata(
                 for local, position in enumerate(range(request.start, request.end)):
                     if (position + 1) % ratio == 0:
                         logical = position // ratio
-                        writes[group, offset + local] = pages[logical // 128] * 128 + logical % 128
+                        writes[group, offset + local] = (
+                            pages[logical // storage_rows] * storage_rows + logical % storage_rows
+                        )
                         rope[group, offset + local] = position + 1 - ratio
         def replicate(tensor):
             return tensor.repeat_interleave(topology.tp, dim=0)
@@ -1157,16 +1155,14 @@ def compile_decode_fwd_dspark(compiler, lib_root, topology):
     load_segment_modules(lib_root, topology)
     module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd_dspark")
     entries = {"decode": module.l3_decode_fwd_dspark}
-    state = importlib.import_module("models.deepseek_v4_1_flash.dspark_state")
-    entries.update({name.removeprefix("l3_"): getattr(state, name) for name in (
-        "l3_bootstrap_inputs", "l3_publish_bootstrap",
-        "l3_prepare_prefill_drafter_geometry")})
-    entries["dspark_drafter"] = importlib.import_module(
-        "models.deepseek_v4_1_flash.dspark_drafter").l3_dspark_drafter
-    entries["markov_sample"] = importlib.import_module(
-        "models.deepseek_v4_1_flash.dspark_markov").l3_markov_sample_from_hidden
+    bootstrap_l2 = importlib.import_module(
+        "models.deepseek_v4_1_flash.prefill_bootstrap_l2"
+    )
+    entries["prefill_bootstrap_l2"] = bootstrap_l2.l3_prefill_bootstrap_dspark
+    drafter = importlib.import_module("models.deepseek_v4_1_flash.dspark_drafter").l3_dspark_drafter
+    markov = importlib.import_module("models.deepseek_v4_1_flash.markov").l3_markov_output
     programs = {}
-    param_names = {}
+    param_names = {"dspark_drafter": tuple(drafter.param_names), "markov_sample": tuple(markov.param_names)}
     for name, entry in entries.items():
         kwargs = {}
         params = set(entry.param_names)
@@ -1228,7 +1224,9 @@ class DecodeForwardSegment:
             arguments["attention_num_tokens"] = metadata.fields["moe_counts"]
         missing = set(param_names) - set(arguments) - {
             "x_hc", "pre_mix", "attention_num_tokens"}
-        extra = set(arguments) - set(param_names)
+        # The backbone entry leaves output projection and sampling to DSpark.
+        output_head_fields = {"final_norm_weight", "lm_head_weight", "logit_row_indices", "logits", "sampled_ids"}
+        extra = set(arguments) - set(param_names) - output_head_fields
         if missing or extra:
             raise ValueError(f"full decode ABI mismatch: missing={sorted(missing)} extra={sorted(extra)}")
         self.arguments = arguments
@@ -1236,6 +1234,10 @@ class DecodeForwardSegment:
 
     def run(self, state, *, group_counts):
         with profile_span('v41.DecodeForwardSegment.run', cat='v41.host', level='verbose'):
+            if "sampled_ids" not in self.param_names:
+                raise MissingCompositeInterface(
+                    "the selected Lib decode entry is backbone-only; ordinary decode requires an output composite"
+                )
             if self.failed:
                 raise RuntimeError("full decode failed; close the worker before retrying")
             if state.layout != "tp_local_token":
@@ -2067,7 +2069,7 @@ class PrefillMetadataResources:
         for name in ("c2a_compressed_rope_cos", "c2a_compressed_rope_sin"):
             shared(name, (world, tokens, width), torch.float32)
         for prefix in self.compressed_pages:
-            block_tokens = 256 if prefix == "c2a" else 128
+            block_tokens = 128
             # Columns cover one request's history; entries address the whole physical pool.
             table_pages = (max_seq_len + block_tokens - 1) // block_tokens
             for name, shape, dtype, fill in (
@@ -2102,6 +2104,8 @@ class PrefillMetadataResources:
             shared("full_counts", (world, 2), torch.int32)
             shared("full_replay_rows", (world, tokens), torch.int32, -1)
             shared("full_position_ids", (world, 2, tokens), torch.int32, -1)
+            # Serving writes directly to the persistent window pages.
+            shared("window_restore_slots", (world, tokens), torch.int64, -1)
             shared("full_window_slots", (world, 2, tokens), torch.int64, -1)
             shared("full_window_indices", (world, 2, tokens, 128), torch.int32, -1)
             shared("full_token_requests", (world, 2, tokens), torch.int32, -1)
@@ -2224,7 +2228,7 @@ class PrefillMetadataResources:
             "logit_rows": "full_logit_rows",
             "position_ids": "full_position_ids", "freqs_cos": "full_freqs_cos",
             "freqs_sin": "full_freqs_sin", "window_slots": "full_window_slots",
-            "window_indices": "full_window_indices",
+            "window_indices": "full_window_indices", "window_restore_slots": "window_restore_slots",
             "token_to_req_indices": "full_token_requests",
             "query_start_loc": "full_query_starts",
             "c2a_index_block_table": "c2a_index_block_table",
@@ -2442,7 +2446,7 @@ class ResidentDSparkWeights:
         try:
             # Heads are replicated over EP.  Read them once and upload one copy
             # to every rank; the three draft layers remain rank-local.
-            heads = contracts[0].load_heads().tensors
+            heads = contracts[0].load_heads(main_projection_mxfp8=True).tensors
             for name, value in heads.items():
                 shards = []
                 for rank in range(world):
@@ -2670,34 +2674,11 @@ class ResidentDSparkBuffers:
 # resident_resources
 _DSPARK_RESIDENT_DECODE_SCRATCH = frozenset((
     "x_hc", "pre_mix", "position_ids", "request_ids", "window_slots", "window_indices",
-    "c2a_slots", "c1a_slots", "query_starts", "target_hidden_padded", "target_hidden",
-    "context_valid", "context_positions", "num_sampled", "anchor_ids", "first_query_positions",
+    "c2a_slots", "c1a_slots", "query_starts", "target_hidden_padded",
+    "num_sampled", "anchor_ids", "first_query_positions",
     "context_slots", "context_rope_cos", "context_rope_sin", "query_rope_cos", "query_rope_sin",
     "draft_head_hidden", "committed",
 ))
-
-
-class _DSparkOrchestratorRunner:
-    """Adapt the lib's callable stage runner to resident serving resources."""
-
-    def __init__(self, resources, phase):
-        self.resources = resources
-        self.expected = PREFILL_STAGE_ORDER if phase == "prefill" else DECODE_STAGE_ORDER
-        self.index = 0
-
-    def __call__(self, _entry, arguments):
-        if self.index >= len(self.expected):
-            raise RuntimeError("V4.1 DSpark lib emitted more stages than its ABI")
-        stage = self.expected[self.index]
-        self.index += 1
-        self.resources.dispatch_dspark(stage, arguments)
-
-    def finish(self):
-        if self.index != len(self.expected):
-            raise RuntimeError(
-                "V4.1 DSpark lib emitted an incomplete stage sequence: "
-                f"{self.index}/{len(self.expected)}"
-            )
 
 
 class V41ResidentResources:
@@ -3079,8 +3060,6 @@ class V41ResidentResources:
             ranks, rows = self._stage_dspark_decode(resources, batch)
             workspace = resources.decode_workspace
             target = self._build_dspark_target_model(resources)
-            target["logits"].zero_()
-            target["sampled_ids"].fill_(-1)
             outputs = {name: workspace[name] for name in (
                 "accepted_counts", "accepted_ids", "last_sampled", "draft_ids", "confidences")}
             outputs["request_rows"] = rows
@@ -3288,12 +3267,9 @@ class V41ResidentResources:
                 for name in _DSPARK_RESIDENT_DECODE_SCRATCH:
                     bound[name] = self.dspark_buffers.decode_workspace[name]
             reset_windows = False
-            if stage in ("dspark_drafter", "decode"):
+            if stage in ("dspark_drafter", "decode", "prefill_bootstrap_l2"):
                 module = importlib.import_module("models.deepseek_v4_1_flash.dspark_drafter")
-                hidden_name = "draft_head_hidden" if stage == "decode" else "head_hidden"
-                batch = int(arguments[hidden_name].shape[1])
-                chunks = (batch + module.DSPARK_CHUNK_REQUESTS - 1) // module.DSPARK_CHUNK_REQUESTS
-                stride = chunks * module.DSPARK_DRAFT_LAYERS
+                stride = module.DSPARK_DRAFT_LAYERS
                 key = id(program.compiled)
                 epoch = self._dspark_drafter_epochs.get(key, 1)
                 # The pinned A5 int32 AtomicAdd signal stops advancing at 2048.
@@ -3317,7 +3293,7 @@ class V41ResidentResources:
             finally:
                 if reset_windows:
                     self.worker._reset_persistent_windows = previous_reset
-            if stage in ("dspark_drafter", "decode"):
+            if stage in ("dspark_drafter", "decode", "prefill_bootstrap_l2"):
                 self._dspark_drafter_epochs[key] = epoch + stride
 
     def _run_dspark_orchestrator(self, lowered: DSparkLoweredInputs, *, phase: str) -> None:
@@ -3341,37 +3317,80 @@ class V41ResidentResources:
                     "V4.1 DSpark lowering is missing mappings: " + ", ".join(missing)
                 )
             try:
-                module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd_dspark")
-                function = (module.prefill_bootstrap_dspark if phase == "prefill"
-                            else module.decode_fwd_dspark)
-            except (ImportError, AttributeError) as exc:
-                raise MissingCompositeInterface(
-                    "V4.1 DSpark lib orchestration entry is unavailable"
-                ) from exc
-            runner = _DSparkOrchestratorRunner(self, phase)
-            try:
-                kwargs = dict(
-                    moe_epoch=lowered.moe_epoch,
-                    logits_epoch=lowered.logits_epoch,
-                )
                 if phase == "prefill":
-                    function(
-                        runner, lowered.state, lowered.workspace, lowered.draft_model,
-                        lowered.markov_model, lowered.cache_tables, lowered.rope_tables,
-                        **kwargs,
-                    )
-                else:
-                    function(
-                        runner, lowered.state, lowered.workspace, lowered.target_model,
-                        lowered.draft_model, lowered.markov_model, lowered.cache_tables,
-                        lowered.rope_tables, **kwargs,
-                    )
-                runner.finish()
+                    self._run_dspark_prefill_l2(lowered)
+                    return
+                arguments = {
+                    **lowered.target_model,
+                    **{f"draft_{name}": value for name, value in lowered.draft_model.items()},
+                    **{f"markov_{name}": value for name, value in lowered.markov_model.items()},
+                    **lowered.workspace,
+                    "slot_ids": lowered.state.slot_ids,
+                    "generations": lowered.state.generations,
+                    "state_tokens": lowered.state.tokens,
+                    "state_meta": lowered.state.meta,
+                    "target_embedding_weight": lowered.target_model["embedding_weight"],
+                    "target_window_table": lowered.cache_tables["target_window"],
+                    "target_c2a_table": lowered.cache_tables["target_c2a"],
+                    "target_c1a_table": lowered.cache_tables["target_c1a"],
+                    "draft_table": lowered.cache_tables["draft"],
+                    "draft_cos": lowered.rope_tables["draft_cos"],
+                    "draft_sin": lowered.rope_tables["draft_sin"],
+                    "moe_epoch": lowered.moe_epoch,
+                    "logits_epoch": lowered.logits_epoch,
+                }
+                self.dispatch_dspark("decode", {
+                    name: arguments[name] for name in self.dspark_param_names["decode"]
+                })
             except MissingCompositeInterface:
                 raise
             except BaseException as exc:
                 self.failed = True
                 raise RuntimeError(f"V4.1 DSpark {phase} orchestration failed") from exc
+
+    def _run_dspark_prefill_l2(self, lowered: DSparkLoweredInputs) -> None:
+        """Dispatch the fused V4.1 bootstrap composite with resident buffers."""
+        workspace = lowered.workspace
+        state = lowered.state
+        arguments = {
+            "slot_ids": state.slot_ids,
+            "generations": state.generations,
+            "state_meta": state.meta,
+            "state_tokens": state.tokens,
+            "prompt_lengths": workspace["prompt_lengths"],
+            "position_limits": workspace["position_limits"],
+            "sampled_rows": workspace["sampled_rows"],
+            "sampled_ids": workspace["prefill_sampled_ids"],
+            "next_prefill_tokens": workspace["next_prefill_tokens"],
+            "first_query_positions": workspace["first_query_positions"],
+            "positions": workspace["prefill_positions"],
+            "request_ids": workspace["prefill_request_ids"],
+            "num_tokens": workspace["prefill_counts"],
+            "target_hidden": workspace["prefill_target_hidden"],
+            "num_sampled": workspace["zero_sampled"],
+            "last_sampled": workspace["zero_last_sampled"],
+            "context_slots": workspace["context_slots"],
+            "context_rope_cos": workspace["context_rope_cos"],
+            "context_rope_sin": workspace["context_rope_sin"],
+            "query_rope_cos": workspace["query_rope_cos"],
+            "query_rope_sin": workspace["query_rope_sin"],
+            "draft_ids": workspace["draft_ids"],
+            "confidences": workspace["confidences"],
+            "head_hidden": workspace["draft_head_hidden"],
+            "draft_x_hc": workspace["draft_x_hc"],
+            "draft_pre_mix": workspace["draft_pre_mix"],
+            "block_tables": lowered.cache_tables["draft"],
+            "rope_cos_table": lowered.rope_tables["draft_cos"],
+            "rope_sin_table": lowered.rope_tables["draft_sin"],
+            "moe_epoch": lowered.moe_epoch,
+            "logits_epoch": lowered.logits_epoch,
+        }
+        arguments.update(lowered.draft_model)
+        arguments.update(lowered.markov_model)
+        arguments["embedding_weight"] = self.dspark_embedding.tensor
+        arguments["window_cache"] = self.dspark_cache.window_cache
+        arguments["lm_head_weight"] = self.final.head_weight
+        self.dispatch_dspark("prefill_bootstrap_l2", arguments)
 
     def _read_dspark_output(self, lowered, name):
         """Return an owned CPU copy of one device-produced DSpark output."""

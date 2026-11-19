@@ -276,7 +276,7 @@ class V41DSparkWeightContract:
         """Fail before payload I/O when a speculative checkpoint is incomplete."""
         self.loader.store.require(self.required_names)
 
-    def load_heads(self) -> V41DSparkHeadWeights:
+    def load_heads(self, *, main_projection_mxfp8: bool = False) -> V41DSparkHeadWeights:
         """Load only the replicated head tensors and normalize main-proj layout.
 
         The checkpoint stores ``main_proj`` as ``[D, 3D]`` while the lib ABI
@@ -323,8 +323,15 @@ class V41DSparkWeightContract:
             scale_name = "mtp.0.main_proj.scale"
             self.loader.store.require((scale_name,))
             scale = self.loader.store.load_many((scale_name,))[scale_name]
-            result["main_proj_weight"] = _dequantize_main_projection(main_proj, scale)
+            if main_projection_mxfp8:
+                weight, packed_scale = fp8_input_major(main_proj, scale)
+                result["main_proj_weight"] = pack_nz(weight)
+                result["main_proj_scale"] = packed_scale
+            else:
+                result["main_proj_weight"] = _dequantize_main_projection(main_proj, scale)
         elif main_proj.dtype == torch.bfloat16:
+            if main_projection_mxfp8:
+                raise ValueError("the selected Lib DSpark projection requires a block32 FP8 checkpoint")
             result["main_proj_weight"] = main_proj.transpose(0, 1).contiguous()
         else:
             raise ValueError("DSpark main_proj.weight must be BF16 or block32 FP8 E4M3")
