@@ -278,6 +278,30 @@ class Scheduler:
         self._next_grouped_cache_phase = "decode"
 
     def add_request(self, request: Request) -> None:
+        self.validate_request(request)
+        if not self.config.enable_prefix_cache:
+            rejection = self._single_prefill_rejection(request)
+            if rejection is not None:
+                raise ValueError(rejection)
+        if self.config.enable_prefix_cache:
+            if self.kv_cache_manager.has_groups:
+                request.group_checkpoint_boundary = self.kv_cache_manager.group_prefix_cache_boundary(
+                    request.num_prompt_tokens,
+                    replay_tokens=self.config.speculative_prefix_cache_replay_tokens,
+                )
+                request.group_block_hashes = self.kv_cache_manager.compute_group_block_hashes(
+                    request.prompt_token_ids
+                )
+            else:
+                request.block_hashes = self.kv_cache_manager.compute_block_hashes(
+                    request.prompt_token_ids
+                )
+        request.status = RequestStatus.WAITING
+        self.waiting.append(request)
+        self.requests[request.request_id] = request
+
+    def validate_request(self, request: Request) -> None:
+        """Reject invalid lengths and cap generation before request admission."""
         prompt_len = len(request.prompt_token_ids)
         max_seq_len = self.config.max_seq_len
         if prompt_len > max_seq_len:
@@ -312,26 +336,6 @@ class Scheduler:
                 f"Request {request.request_id} min_tokens {request.min_tokens} exceeds "
                 f"available generation tokens {request.max_new_tokens}"
             )
-        if not self.config.enable_prefix_cache:
-            rejection = self._single_prefill_rejection(request)
-            if rejection is not None:
-                raise ValueError(rejection)
-        if self.config.enable_prefix_cache:
-            if self.kv_cache_manager.has_groups:
-                request.group_checkpoint_boundary = self.kv_cache_manager.group_prefix_cache_boundary(
-                    request.num_prompt_tokens,
-                    replay_tokens=self.config.speculative_prefix_cache_replay_tokens,
-                )
-                request.group_block_hashes = self.kv_cache_manager.compute_group_block_hashes(
-                    request.prompt_token_ids
-                )
-            else:
-                request.block_hashes = self.kv_cache_manager.compute_block_hashes(
-                    request.prompt_token_ids
-                )
-        request.status = RequestStatus.WAITING
-        self.waiting.append(request)
-        self.requests[request.request_id] = request
 
     def admit_prefilled(
         self,

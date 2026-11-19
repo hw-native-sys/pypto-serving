@@ -241,6 +241,8 @@ class KvCacheManager:
         self.blocks: list[KVCacheBlock] = []
         self.free_queue = FreeKVCacheBlockQueue()
         self.hash_to_block: dict[bytes, KVCacheBlock] = {}
+        # Keep alternate owners when a hash is published by multiple blocks.
+        self._duplicate_hash_blocks: dict[bytes, dict[int, KVCacheBlock]] = {}
         self.request_blocks: dict[str, list[KVCacheBlock]] = {}
         self._group_pools: dict[str, _GroupBlockPool] = {}
         self._group_request_partitions: dict[str, int] = {}
@@ -385,8 +387,7 @@ class KvCacheManager:
                     self.release(allocated)
                 return None
             if block.block_hash is not None:
-                self.hash_to_block.pop(block.block_hash, None)
-                block.block_hash = None
+                self._forget_cached_block(block)
             block.ref_cnt = 1
             blocks.append(block)
         return blocks
@@ -431,10 +432,37 @@ class KvCacheManager:
         """Publish a full block to the prefix cache."""
         if not self.enable_prefix_cache:
             return
-        if block.block_hash is not None and block.block_hash in self.hash_to_block:
-            del self.hash_to_block[block.block_hash]
+        if block.block_hash is not None:
+            self._forget_cached_block(block)
+        owner = self.hash_to_block.get(block_hash)
+        if owner is not None:
+            duplicates = self._duplicate_hash_blocks.setdefault(
+                block_hash, {owner.block_id: owner}
+            )
+            duplicates[block.block_id] = block
         block.block_hash = block_hash
         self.hash_to_block[block_hash] = block
+
+    def _forget_cached_block(self, block: KVCacheBlock) -> None:
+        """Remove a block from the prefix index and promote a duplicate owner."""
+        block_hash = block.block_hash
+        if block_hash is None:
+            return
+        duplicates = self._duplicate_hash_blocks.get(block_hash)
+        if duplicates is not None:
+            duplicates.pop(block.block_id, None)
+            if len(duplicates) == 1:
+                self.hash_to_block[block_hash] = next(iter(duplicates.values()))
+                del self._duplicate_hash_blocks[block_hash]
+            elif duplicates:
+                if self.hash_to_block.get(block_hash) is block:
+                    self.hash_to_block[block_hash] = duplicates[next(reversed(duplicates))]
+            else:
+                self.hash_to_block.pop(block_hash, None)
+                del self._duplicate_hash_blocks[block_hash]
+        elif self.hash_to_block.get(block_hash) is block:
+            del self.hash_to_block[block_hash]
+        block.block_hash = None
 
     def cache_block_ids(
         self,

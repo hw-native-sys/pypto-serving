@@ -501,9 +501,10 @@ class ReplicaEngineCore:
         await self._drain_loop_task()
         if admission is not None:
             admission.close()
+        tiering = getattr(self, "_cache_tiering", None)
         try:
-            if self._cache_tiering is not None:
-                await self._cache_tiering.close()
+            if tiering is not None:
+                await tiering.close()
         except BaseException:
             try:
                 await asyncio.to_thread(self._shutdown_worker, timeout=30)
@@ -788,7 +789,9 @@ class ReplicaEngineCore:
         else:
             # A request retained by AgentInfer never reached the worker, so
             # there is no FIFO release acknowledgement to wait for.
-            ctx.worker_release_done.set()
+            release_done = getattr(ctx, "worker_release_done", None)
+            if release_done is not None:
+                release_done.set()
         self._record_scheduler_stats()
         stat_logger = getattr(self, "_stat_logger", None)
         if stat_logger is not None:
