@@ -99,14 +99,23 @@ class PyptoExecutor(ModelExecutor, ABC):
             self._compiled[model_id] = compiled
         return num_pages
 
+    @staticmethod
+    def _set_invocation_context(runner: ModelRunner, batch: PrefillBatch | DecodeBatch) -> None:
+        """Pass serving identity to runners that expose shared L3 dispatch."""
+        setter = getattr(runner, "set_invocation_context", None)
+        if callable(setter):
+            setter(getattr(batch, "invocation", None))
+
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         """Delegate prefill execution to the registered model runner."""
+        runner = self._runners[model.config.model_id]
+        self._set_invocation_context(runner, batch)
         with profile_span(
             "PyptoExecutor.run_prefill",
             cat="executor",
             args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)},
         ):
-            return self._runners[model.config.model_id].run_prefill(model, batch)
+            return runner.run_prefill(model, batch)
 
     @property
     def supports_async_prefill_reclaim(self) -> bool:
@@ -122,11 +131,13 @@ class PyptoExecutor(ModelExecutor, ABC):
 
     def prepare_prefill(self, model: RuntimeModel, batch: PrefillBatch, *, buffer_slot: int) -> object:
         runner = self._runners[model.config.model_id]
+        self._set_invocation_context(runner, batch)
         with profile_span("PyptoExecutor.prepare_prefill", cat="executor"):
             return runner.prepare_prefill(model, batch, buffer_slot=buffer_slot)
 
     def dispatch_prepared_prefill(self, model: RuntimeModel, batch: PrefillBatch, prepared: object) -> object:
         runner = self._runners[model.config.model_id]
+        self._set_invocation_context(runner, batch)
         with profile_span("PyptoExecutor.dispatch_prepared_prefill", cat="executor"):
             return _PendingRunnerPrefill(model.config.model_id, runner.dispatch_prepared_prefill(model, batch, prepared))
 
@@ -141,6 +152,7 @@ class PyptoExecutor(ModelExecutor, ABC):
         self, model: RuntimeModel, batch: PrefillBatch, *, buffer_slot: int, prepared: object | None = None,
     ) -> PrefillResult:
         runner = self._runners[model.config.model_id]
+        self._set_invocation_context(runner, batch)
         with profile_span("PyptoExecutor.run_prefill", cat="executor",
                           args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)}):
             return runner.run_prefill_in_slot(model, batch, buffer_slot=buffer_slot, prepared=prepared)
@@ -165,12 +177,14 @@ class PyptoExecutor(ModelExecutor, ABC):
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
         """Delegate decode execution to the registered model runner."""
+        runner = self._runners[model.config.model_id]
+        self._set_invocation_context(runner, batch)
         with profile_span(
             "PyptoExecutor.run_decode",
             cat="executor",
             args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)},
         ):
-            return self._runners[model.config.model_id].run_decode(model, batch)
+            return runner.run_decode(model, batch)
 
     @property
     def supports_async_decode_prepare(self) -> bool:
@@ -190,6 +204,7 @@ class PyptoExecutor(ModelExecutor, ABC):
     ) -> object:
         """Build runner-owned metadata for a future decode dispatch."""
         runner = self._runners[model.config.model_id]
+        self._set_invocation_context(runner, batch)
         prepare = getattr(runner, "prepare_decode", None)
         if not callable(prepare):
             return super().prepare_decode(model, batch, buffer_slot=buffer_slot)
@@ -208,6 +223,7 @@ class PyptoExecutor(ModelExecutor, ABC):
     ) -> DecodeResult:
         """Execute one previously prepared runner snapshot."""
         runner = self._runners[model.config.model_id]
+        self._set_invocation_context(runner, batch)
         execute = getattr(runner, "run_prepared_decode", None)
         if not callable(execute):
             return super().run_prepared_decode(model, batch, prepared)
@@ -236,6 +252,7 @@ class PyptoExecutor(ModelExecutor, ABC):
     ) -> object:
         """Submit only the device phase of a prepared decode."""
         runner = self._runners[model.config.model_id]
+        self._set_invocation_context(runner, batch)
         dispatch = getattr(runner, "dispatch_prepared_decode", None)
         if not callable(dispatch):
             return super().dispatch_prepared_decode(model, batch, prepared)
