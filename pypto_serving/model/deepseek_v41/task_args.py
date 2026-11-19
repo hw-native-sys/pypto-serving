@@ -49,7 +49,7 @@ def build_cache_groups(layers: tuple[LayerPlan, ...], max_seq_len: int, *,
         name, producers[name], KVCacheSpec(block_size, 16, ratio),
         (max_seq_len + block_size - 1) // block_size, num_partitions=dp_size,
         max_requests_per_partition=request_slots,
-    ) for name, block_size, ratio in (("window", 128, 1), ("c2a", 256, 2), ("c1a", 128, 1)))
+    ) for name, block_size, ratio in (("window", 128, 1), ("c2a", 128, 2), ("c1a", 128, 1)))
     validate_cache_groups(layers, groups, max_seq_len, dp_size=dp_size)
     return groups
 
@@ -72,7 +72,7 @@ def validate_cache_groups(
     expected = {
         "window": (tuple(range(40)), 128, 1),
         "c2a": (tuple(layer.layer_id for layer in layers
-                      if layer.mode == "c2a_full" and layer.kv_source == layer.layer_id), 256, 2),
+                      if layer.mode == "c2a_full" and layer.kv_source == layer.layer_id), 128, 2),
         "c1a": (tuple(layer.layer_id for layer in layers
                       if layer.mode == "c1a_full" and layer.kv_source == layer.layer_id), 128, 1),
     }
@@ -87,7 +87,7 @@ def validate_cache_groups(
         family = matches[0]
         _, block_size, ratio = expected[family]
         if (group.spec.block_size != block_size or group.spec.compress_ratio != ratio
-                or group.spec.storage_block_size != 128 or group.num_partitions != dp_size
+                or group.spec.storage_block_size != block_size // ratio or group.num_partitions != dp_size
                 or group.sliding_window is not None or group.is_eagle_group
                 or type(group.max_requests_per_partition) is not int
                 or not 1 <= group.max_requests_per_partition <= 12

@@ -34,7 +34,7 @@ _PREFILL_WORKSPACE_KEYS = (
     "next_prefill_tokens", "first_query_positions", "prefill_positions",
     "prefill_request_ids", "prefill_counts", "context_slots", "context_rope_cos",
     "context_rope_sin", "query_rope_cos", "query_rope_sin", "prefill_target_hidden",
-    "zero_sampled", "zero_last_sampled", "draft_head_hidden", "draft_ids",
+    "zero_sampled", "zero_last_sampled", "draft_x_hc", "draft_pre_mix", "draft_head_hidden", "draft_ids",
     "confidences",
 )
 _DECODE_WORKSPACE_KEYS = (
