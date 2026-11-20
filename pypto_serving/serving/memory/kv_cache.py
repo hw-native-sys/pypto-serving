@@ -1428,9 +1428,13 @@ class KvCacheManager:
         self,
         request_id: str,
         token_count: int,
+        partitions: Sequence[int] | None = None,
     ) -> list[int]:
         assigned = self._group_request_partitions.get(request_id)
-        candidates = [assigned] if assigned is not None else list(range(self.group_partition_count))
+        if assigned is not None:
+            candidates = (assigned,) if partitions is None or assigned in partitions else ()
+        else:
+            candidates = range(self.group_partition_count) if partitions is None else partitions
         limit = next(iter(self._group_pools.values())).spec.max_requests_per_partition
         return [
             partition
@@ -1444,8 +1448,11 @@ class KvCacheManager:
             )
         ]
 
-    def _select_group_partition(self, request_id: str, token_count: int) -> int | None:
-        candidates = self._candidate_group_partitions(request_id, token_count)
+    def select_group_partition(
+        self, request_id: str, token_count: int, *, partitions: Sequence[int] | None = None,
+    ) -> int | None:
+        """Choose among capacity-qualified partitions, optionally restricted by the caller."""
+        candidates = self._candidate_group_partitions(request_id, token_count, partitions)
         if not candidates:
             return None
         assigned = self._group_request_partitions.get(request_id)
@@ -1460,14 +1467,13 @@ class KvCacheManager:
             )
             for partition in candidates
         }
-        minimum = min(owned_counts.values())
-        least_loaded = {partition for partition, count in owned_counts.items() if count == minimum}
-        for offset in range(self.group_partition_count):
-            partition = (self._next_group_partition + offset) % self.group_partition_count
-            if partition in least_loaded:
-                self._next_group_partition = (partition + 1) % self.group_partition_count
-                return partition
-        raise RuntimeError("group partition selection became inconsistent")
+        from .placement import least_loaded_partition
+        partition = least_loaded_partition(candidates, owned_counts, self._next_group_partition,
+                                           self.group_partition_count)
+        if partition not in candidates:
+            raise RuntimeError("placement selected an ineligible cache partition")
+        self._next_group_partition = (partition + 1) % self.group_partition_count
+        return partition
 
     def can_ensure_group_blocks(
         self,
@@ -1522,7 +1528,7 @@ class KvCacheManager:
         selected = (
             partition
             if partition is not None
-            else self._select_group_partition(request_id, token_count)
+            else self.select_group_partition(request_id, token_count)
         )
         if selected is None or not self.can_ensure_group_blocks(
             request_id,

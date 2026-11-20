@@ -544,6 +544,7 @@ class Scheduler:
             }
             scheduled.cache_partition = request.cache_partition
             output.scheduled_requests.append(scheduled)
+            self._on_scheduled(scheduled)
             scheduled_req_ids.add(request.request_id)
             num_scheduled_tokens[request.request_id] = scheduled_tokens
             if is_prefill:
@@ -589,7 +590,7 @@ class Scheduler:
             request.request_id for request in output.preempted_requests
         }
         remaining_waiting: deque[Request] = deque()
-        while self.waiting and token_budget > 0:
+        while self.waiting and token_budget > 0 and self._can_admit_waiting():
             if len(self.running) >= self.config.max_num_running_reqs:
                 break
 
@@ -670,19 +671,15 @@ class Scheduler:
                 output.rejected_requests[request.request_id] = rejection
                 continue
 
+            # A full hit still replays one token, subject to the same batch
+            # limits as a cold request; it must not bypass a blocked partition.
+            if request.num_computed_tokens >= request.num_prompt_tokens:
+                request.num_computed_tokens = max(0, request.num_prompt_tokens - 1)
             num_new = self._limit_scheduled_tokens(request, token_budget)
-
             if num_new <= 0:
-                # Full prefix-cache hit: leave 1 token for prefill so the
-                # output uses the SAME kernel as the cold run (prefill, not
-                # decode), producing identical first generated token.
-                if request.num_computed_tokens >= request.num_prompt_tokens:
-                    request.num_computed_tokens = max(0, request.num_prompt_tokens - 1)
-                    num_new = 1
-                else:
-                    self._release_waiting_prefix_blocks(request)
-                    remaining_waiting.append(request)
-                    continue
+                self._release_waiting_prefix_blocks(request)
+                remaining_waiting.append(request)
+                continue
 
             scheduled = ScheduledRequest(request, num_new, True)
             allocated = self._try_allocate_request_blocks(request, num_new, scheduled=scheduled)
@@ -741,6 +738,7 @@ class Scheduler:
             }
             scheduled.cache_partition = request.cache_partition
             output.scheduled_requests.append(scheduled)
+            self._on_scheduled(scheduled)
             output.num_prefill_tokens += num_new
             token_budget -= num_new
 
@@ -748,6 +746,12 @@ class Scheduler:
         self.waiting = remaining_waiting
 
         return output
+
+    def _can_admit_waiting(self) -> bool:
+        return True
+
+    def _on_scheduled(self, scheduled: ScheduledRequest) -> None:
+        pass
 
     def _release_waiting_prefix_blocks(self, request: Request) -> None:
         """Roll back prefix-cache references when a waiting request is deferred."""
@@ -936,7 +940,7 @@ class Scheduler:
             if (
                 scheduled.is_prefill
                 and completes_prompt
-                and self.config.num_speculative_tokens > 0
+                and (self.config.num_speculative_tokens > 0 or self.config.stop_after_prefill)
             ):
                 request.terminal_prefill_in_flight = True
 
@@ -1161,13 +1165,18 @@ class Scheduler:
             self._release_scheduled_group_blocks(scheduled)
 
         retained_tokens = 0
+        source_final = self.config.stop_after_prefill and scheduled.is_prefill and sampled_this_step
         for token_id in token_ids:
             request.output_token_ids.append(token_id)
             retained_tokens += 1
             outputs.append(RequestOutput(
                 request_id=request.request_id, new_token_id=token_id,
                 num_output_tokens=len(request.output_token_ids),
+                prefill_finished=source_final,
             ))
+            if source_final:
+                request.prefill_complete = True
+                break
             if self._check_finish(request) is not None:
                 # Tokens after a finish are dropped (mirrors the sync path), so
                 # they must not count as retained.

@@ -34,6 +34,7 @@ from pypto_serving.serving.server.ipc import (
     DecodeRequest,
     NewRequestData,
     PrefillRequest,
+    ReleaseResult,
     StepCommand,
     StepResult,
     ShutdownCommand,
@@ -102,6 +103,7 @@ def test_worker_replays_committed_context_without_resampling_intermediate_chunks
     model = _model(max_batch_size=1, page_size=1, eos_token_id=0)
     executor = ReplayExecutor(manager)
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker.output_queue = Queue()
     worker._services = None
     worker._batch_builder = worker._make_decode_batch
     worker.executor = executor
@@ -272,7 +274,7 @@ def test_worker_releases_preempted_state_before_same_command_reregistration():
 
     assert released == ["req"]
     assert worker._req_cache["req"] == replacement
-    assert len(results) == 1
+    assert [type(decode_result(result)) for result in results] == [ReleaseResult, StepResult]
 
 
 def test_worker_release_does_not_remove_a_later_same_id_registration():
@@ -318,6 +320,7 @@ def test_constrained_worker_error_releases_matcher_and_next_request_is_healthy(m
 
     monkeypatch.setattr(serving_worker, "XGrammarProvider", Provider)
     worker = WorkerProcess.__new__(WorkerProcess)
+    worker.output_queue = Queue()
     worker._services = None
     worker._batch_builder = worker._make_decode_batch
     worker.executor = SimpleNamespace(release_finished_requests=released.extend)
@@ -575,14 +578,19 @@ def test_worker_prepares_next_decode_while_prior_device_step_runs(constrained, p
     # Step N+2 maps back to N's slot and must not prepare until reclaim has
     # finished reading that slot's captured outputs.
     assert not third_prepared.wait(timeout=0.1)
-    assert output_queue.empty()
+    if constrained:
+        assert output_queue.empty()
+    else:
+        assert decode_result(output_queue.get(timeout=5)) == ReleaseResult(["old"], 2)
     allow_first_reclaim.set()
     assert third_prepared.wait(timeout=5)
     assert second_dispatched.wait(timeout=5)
 
-    first_result = decode_result(output_queue.get(timeout=5))
-    second_result = decode_result(output_queue.get(timeout=5))
-    third_result = decode_result(output_queue.get(timeout=5))
+    results = [decode_result(output_queue.get(timeout=5)) for _ in range(3 + int(constrained))]
+    assert [value for value in results if isinstance(value, ReleaseResult)] == (
+        [ReleaseResult(["old"], 2)] if constrained else []
+    )
+    first_result, second_result, third_result = [value for value in results if isinstance(value, StepResult)]
     input_queue.put(encode_command(ShutdownCommand()))
     thread.join(timeout=5)
 

@@ -73,10 +73,10 @@ def test_worker_preserves_speculation_metadata_in_serial_and_reclaim_results(rec
     assert wire.num_draft_tokens == ({"spec": 7, "fallback": 0} if counts else {})
 
 
-def test_legacy_step_result_defaults_to_no_speculation():
+def test_step_result_defaults_to_no_speculation():
     import msgspec
 
-    result = decode_result(msgspec.msgpack.encode({"new_tokens": {"r": [1]}, "step_id": 9}))
+    result = decode_result(msgspec.msgpack.encode({"type": "step", "new_tokens": {"r": [1]}, "step_id": 9}))
     assert result.num_draft_tokens == {}
 
 

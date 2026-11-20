@@ -272,7 +272,8 @@ def test_terminal_output_waits_for_real_ack_or_reports_ddr_failure(monkeypatch, 
                 await asyncio.wait_for(consumer, .2)
             assert not ctx.worker_release_done.is_set() and not core._running
         else:
-            core._acknowledge_worker_frees(('r',))
+            ctx.worker_release_step = 1
+            core._acknowledge_worker_frees(('r',), 1)
             assert (await asyncio.wait_for(consumer, .2)).finished
         assert not session._failure.cancelled() and not core._request_contexts
     asyncio.run(run())

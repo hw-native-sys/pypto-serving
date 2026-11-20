@@ -50,6 +50,7 @@ from pypto_serving.serving.server.ipc import (
     MAX_CONTROL_PAYLOAD_BYTES,
     PrefillRequest,
     ProfileCommand,
+    ReleaseResult,
     ShutdownCommand,
     StepCommand,
     decode_profile_result,
@@ -180,6 +181,7 @@ class _RequestContext:
     # flight when the request reaches its token limit; publishing completion
     # before that step drains leaves request-local K7 state visible to metrics.
     worker_release_done: asyncio.Event = field(default_factory=asyncio.Event)
+    worker_release_step: int | None = None
     # Optional receipt for externally reserved state. Unlike release_done,
     # only an actual worker ACK sets it, never an initial terminal token.
     worker_release_ack: asyncio.Event | None = None
@@ -800,11 +802,19 @@ class ReplicaEngineCore:
         if request_id not in self._pending_free_ids:
             self._pending_free_ids.append(request_id)
 
-    def _acknowledge_worker_frees(self, request_ids: Sequence[str]) -> None:
+    def _acknowledge_worker_frees(self, request_ids: Sequence[str], step_id: int) -> None:
         """Publish worker FIFO release acknowledgements to request producers."""
+        pending = getattr(self, "_worker_free_ids_by_step", {})
+        if step_id in pending:
+            remaining = tuple(request for request in pending[step_id] if request not in request_ids)
+            if remaining:
+                pending[step_id] = remaining
+            else:
+                pending.pop(step_id)
         for request_id in request_ids:
             context = self._request_contexts.get(request_id)
-            if context is not None:
+            if context is not None and getattr(context, "worker_release_step", None) == step_id:
+                context.worker_release_step = None
                 context.worker_release_done.set()
                 receipt = getattr(context, "worker_release_ack", None)
                 if receipt is not None:
@@ -944,19 +954,19 @@ class ReplicaEngineCore:
         """
         step_id, scheduler_output = self._batch_queue.popleft()
         getattr(self, "_initialization_steps", set()).discard(step_id)
-        finished_ids = getattr(self, "_worker_free_ids_by_step", {}).pop(
-            step_id, ()
-        )
+        pending = getattr(self, "_worker_free_ids_by_step", {})
         try:
             with profile_span("scheduler.wait_worker_output", cat="scheduler"):
                 raw_output = await self._get_live_result()
         except queue.Empty:
             logger.error(f"Worker response timed out ({self._step_timeout:g}s)")
             # Timeout: the failed step's own result is still in transit.
-            self._handle_step_error(step_id, scheduler_output, result_pending=True, finished_ids=finished_ids)
+            self._handle_step_error(step_id, scheduler_output, result_pending=True,
+                                    finished_ids=pending.pop(step_id, ()))
             return False
 
         step_result = decode_result(raw_output)
+        finished_ids = pending.pop(step_id, ())
         if step_result.step_id != step_id:
             # Should never happen: the worker is FIFO and stale results are
             # drained in _get_live_result. Treat as a fatal desync rather than
@@ -972,8 +982,6 @@ class ReplicaEngineCore:
             # This step's result was just consumed; only in-flight steps pend.
             self._handle_step_error(step_id, scheduler_output, result_pending=False, finished_ids=finished_ids)
             return False
-
-        self._acknowledge_worker_frees(finished_ids)
 
         # Unwrap list[int] values back to int | list[int] for update_from_output.
         new_tokens: dict[str, int | list[int]] = {
@@ -995,11 +1003,16 @@ class ReplicaEngineCore:
         transit (the worker had already been sent those commands). Drain and
         drop them so a stale result is never applied to a live batch.
         """
+        deadline = time.monotonic() + self._step_timeout
         while True:
-            raw = await asyncio.to_thread(self._output_queue.get, timeout=self._step_timeout)
+            raw = await asyncio.to_thread(self._output_queue.get, timeout=max(0, deadline - time.monotonic()))
+            result = decode_result(raw)
+            if isinstance(result, ReleaseResult):
+                self._acknowledge_worker_frees(result.request_ids, result.step_id)
+                continue
             if not self._discard_result_step_ids:
                 return raw
-            sid = decode_result(raw).step_id
+            sid = result.step_id
             if sid in self._discard_result_step_ids:
                 self._discard_result_step_ids.discard(sid)
                 logger.info("Drained stale result for discarded step_id=%d", sid)
@@ -1031,6 +1044,9 @@ class ReplicaEngineCore:
         # a fresh NewRequestData record for the worker cache.
         for req_id in finished_ids:
             self._worker_known_req_ids.discard(req_id)
+            context = self._request_contexts.get(req_id)
+            if context is not None:
+                context.worker_release_step = step_id
 
         for sr in scheduler_output.scheduled_requests:
             req = sr.request
@@ -1045,6 +1061,7 @@ class ReplicaEngineCore:
                     # same FIFO command.  Its old-incarnation acknowledgement
                     # must not satisfy the eventual terminal release barrier.
                     release_done.clear()
+                    context.worker_release_step = None
                 receipt = getattr(context, "worker_release_ack", None)
                 if receipt is not None:
                     receipt.clear()
@@ -1148,6 +1165,10 @@ class ReplicaEngineCore:
             self._worker_known_req_ids.discard(req_id)
 
         self._step_counter += 1
+        for req_id in finished_ids:
+            context = self._request_contexts.get(req_id)
+            if context is not None:
+                context.worker_release_step = self._step_counter
         cleanup_cmd = StepCommand(
             new_requests=[],
             prefill_requests=[],
@@ -1171,7 +1192,6 @@ class ReplicaEngineCore:
         except Exception:
             logger.exception("Worker cleanup-step failed")
         else:
-            self._acknowledge_worker_frees(finished_ids)
             return
         # Release is idempotent. Preserve IDs until a positive ACK; a late
         # timeout reply is drained before the next attempt is acknowledged.
