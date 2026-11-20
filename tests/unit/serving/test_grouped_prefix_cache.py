@@ -142,6 +142,7 @@ def test_request_checkpoint_loses_joint_validity_when_a_member_is_evicted(name):
     block = next(block for group, block in members if group == name)
     pool = cache._group_pools[name]
     cache._invalidate_group_block(pool, key[0], pool.blocks[block])
+    cache._maintain_group_checkpoints()
     assert key not in checkpoints.checkpoints
     _, hit, _ = cache.acquire_group_prefix_blocks("query", cache.compute_group_block_hashes(tokens),
         max_cache_hit_tokens=boundary)
