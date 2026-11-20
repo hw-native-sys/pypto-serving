@@ -323,7 +323,9 @@ class V41DSparkWeightContract:
             scale_name = "mtp.0.main_proj.scale"
             self.loader.store.require((scale_name,))
             scale = self.loader.store.load_many((scale_name,))[scale_name]
-            result["main_proj_weight"] = _dequantize_main_projection(main_proj, scale)
+            main_proj_weight, main_proj_scale = fp8_input_major(main_proj, scale)
+            result["main_proj_weight"] = pack_nz(main_proj_weight)
+            result["main_proj_scale"] = main_proj_scale
         elif main_proj.dtype == torch.bfloat16:
             result["main_proj_weight"] = main_proj.transpose(0, 1).contiguous()
         else:

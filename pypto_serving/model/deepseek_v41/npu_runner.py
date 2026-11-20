@@ -47,7 +47,7 @@ from .engram import HostEngram
 from .dspark_resources import DSPARK_MAX_BATCH_PER_DP, DSPARK_WINDOW
 from .dspark_runtime import (
     DECODE_STAGE_ORDER,
-    PREFILL_STAGE_ORDER,
+    PROPOSE_STAGE_ORDER,
     DSPARK_ROWS_PER_REQUEST,
     DSPARK_SPECULATIVE_TOKENS,
     DSparkDecodeDispatch,
@@ -253,6 +253,14 @@ def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
             raise ValueError(f"{group.name} cache capacity conflicts with the scheduler")
         group_blocks[group.name] = blocks
     physical_group_blocks = {name: blocks + 1 for name, blocks in group_blocks.items()}
+    # The full prefill ABI exposes one shared page extent for its compressed
+    # cache tensor. C2A and C1A retain independent scheduler capacities, while
+    # their packed device views use the larger physical extent on both source
+    # families so every source has the same ``PAGES`` axis.
+    compressed_pages = max(physical_group_blocks[resolved.c2a],
+                           physical_group_blocks[resolved.c1a])
+    physical_group_blocks[resolved.c2a] = compressed_pages
+    physical_group_blocks[resolved.c1a] = compressed_pages
     if type(max_prefill_tokens) is not int or not 0 < max_prefill_tokens <= MAX_PREFILL_TOKENS_PER_DP:
         raise ValueError("invalid prefill scratch capacity")
     scratch_pages = (max_prefill_tokens + 127) // 128
@@ -1200,7 +1208,7 @@ def compile_decode_fwd(compiler, lib_root, topology):
 
 
 def compile_decode_fwd_dspark(compiler, lib_root, topology):
-    """Compile the recurrent decode entry and the prefill bootstrap programs."""
+    """Compile the DSpark decode and prefill-context composites."""
     import pypto.language as pl
 
     if topology.tp != 1:
@@ -1208,12 +1216,14 @@ def compile_decode_fwd_dspark(compiler, lib_root, topology):
     load_segment_modules(lib_root, topology)
     module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd_dspark")
     entries = {"decode": module.l3_decode_fwd_dspark}
-    state = importlib.import_module("models.deepseek_v4_1_flash.dspark_init")
-    entries.update({name.removeprefix("l3_"): getattr(state, name) for name in (
-        "l3_bootstrap_inputs", "l3_publish_bootstrap",
-        "l3_prepare_prefill_drafter_geometry")})
-    entries["dspark_drafter"] = importlib.import_module(
-        "models.deepseek_v4_1_flash.dspark_drafter").l3_dspark_drafter
+    drafter = importlib.import_module("models.deepseek_v4_1_flash.dspark_drafter")
+    entries["dspark_drafter"] = drafter.l3_dspark_drafter
+    context_kv = getattr(drafter, "l3_dspark_prefill_context_kv", None)
+    if context_kv is None:
+        raise MissingCompositeInterface(
+            "selected Lib must expose l3_dspark_prefill_context_kv for V4.1 DSpark"
+        )
+    entries["prefill_context_kv"] = context_kv
     entries["markov_sample"] = importlib.import_module(
         "models.deepseek_v4_1_flash.markov").l3_markov_output
     programs = {}
@@ -1624,7 +1634,7 @@ class V41ModelRunner:
                 ledger.abort(step, self._reset_request)
                 raise
 
-def compile_prefill_fwd(compiler, lib_root, topology):
+def compile_prefill_fwd(compiler, lib_root, topology, *, dspark_fused=False):
     """Compile the lib's complete CED prefill at the serving row capacity."""
     decode_topology = SegmentTopology.for_decode(tp=topology.tp, dp=topology.dp)
     load_segment_modules(lib_root, decode_topology)
@@ -1633,15 +1643,19 @@ def compile_prefill_fwd(compiler, lib_root, topology):
         sys.argv = [previous_argv[0], "--tp", str(topology.tp), "--ep", str(topology.world),
                     "--dp", str(topology.dp), "--capacity", str(topology.local_capacity),
                     "--moe-tokens", str(decode_topology.local_capacity)]
-        module = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd")
+        module = importlib.import_module(
+            "models.deepseek_v4_1_flash.prefill_fwd_dspark"
+            if dspark_fused else "models.deepseek_v4_1_flash.prefill_fwd"
+        )
     finally:
         sys.argv = previous_argv
     if (module.CAPACITY, module.RANKS) != (topology.local_capacity, topology.world):
         raise ValueError("lib prefill_fwd was imported for another capacity or EP topology")
     if module.MOE_TOKENS != decode_topology.local_capacity:
         raise ValueError("lib prefill MoE extent disagrees with the shared decode kernels")
-    entry = module.l3_prefill_fwd
-    return compiler.compile("v41_prefill_fwd", entry), tuple(entry.param_names)
+    entry = module.l3_prefill_fwd_dspark if dspark_fused else module.l3_prefill_fwd
+    compile_name = "v41_prefill_fwd_dspark" if dspark_fused else "v41_prefill_fwd"
+    return compiler.compile(compile_name, entry), tuple(entry.param_names)
 
 
 # segment_inputs
@@ -2436,7 +2450,8 @@ class PrefillForwardSegment:
     """Run the lib's complete 40-layer prefill using resident decode weights."""
 
     def __init__(self, worker, program, param_names, run_config, topology,
-                 weights, metadata, cache, final, engram=None):
+                 weights, metadata, cache, final, engram=None,
+                 dspark_weights=None, dspark_cache=None, dspark_resources=None):
         self.worker, self.program = worker, program
         self.param_names = tuple(param_names)
         self.run_config, self.metadata = run_config, metadata
@@ -2466,6 +2481,23 @@ class PrefillForwardSegment:
                                       engram_weight=engram.weight)
             elif "engram_lookup" not in param_names:
                 self.arguments.pop("engram_lookup", None)
+            if "draft_main_proj_weight" in param_names:
+                if dspark_weights is None or dspark_cache is None or dspark_resources is None:
+                    raise ValueError("fused DSpark prefill requires resident draft resources")
+                draft = dspark_weights
+                self.arguments.update(
+                    draft_main_proj_weight=draft.full("main_proj_weight"),
+                    draft_main_proj_scale=draft.full("main_proj_scale"),
+                    draft_main_norm_weight=draft.full("main_norm_weight"),
+                    draft_num_tokens=dspark_resources.prefill_workspace["prefill_counts"],
+                    draft_context_slots=dspark_resources.prefill_workspace["context_slots"],
+                    draft_context_rope_cos=dspark_resources.prefill_workspace["context_rope_cos"],
+                    draft_context_rope_sin=dspark_resources.prefill_workspace["context_rope_sin"],
+                    draft_wkv=draft.full("wkv"),
+                    draft_wkv_scale=draft.full("wkv_scale"),
+                    draft_kv_norm_weight=draft.full("kv_norm_weight"),
+                    draft_window_cache=dspark_cache.window_cache,
+                )
             if len(self.param_names) != len(set(self.param_names)) or set(self.param_names) != set(self.arguments):
                 raise ValueError("lib full prefill ABI differs from the serving binding")
         except BaseException:
@@ -2643,7 +2675,7 @@ class ResidentDSparkCache:
         from models.deepseek_v4_1_flash.config import WINDOW_CACHE_BYTES
 
         self.worker = worker
-        blocks = DSPARK_MAX_BATCH_PER_DP * 3
+        blocks = DSPARK_MAX_BATCH_PER_DP * ((max_seq_len + DSPARK_WINDOW - 1) // DSPARK_WINDOW)
         self.window_cache = alloc_device_buffer(
             worker, (world, DSPARK_DRAFT_LAYERS, blocks, DSPARK_WINDOW, 1, WINDOW_CACHE_BYTES),
             torch.uint8, stacked=True)
@@ -2733,6 +2765,17 @@ class ResidentDSparkBuffers:
         for host, device in zip(self.host.state.values(), self.state.values(), strict=True):
             self._copy(host, device)
 
+    def sync_state_bindings(self):
+        """Refresh request-to-slot bindings without clobbering device state.
+
+        ``decode_accept`` owns ``tokens`` and ``meta`` after the first
+        prefill.  The scheduler still rewrites ``slot_ids`` and
+        ``generations`` for the current batch row, so only those two fields
+        may be copied on every decode dispatch.
+        """
+        self._copy(self.host.state.slot_ids, self.state.slot_ids)
+        self._copy(self.host.state.generations, self.state.generations)
+
     def sync_cache_tables(self):
         for name, device in self.cache_tables.items():
             self._copy(self.host.cache_tables[name], device)
@@ -2773,7 +2816,8 @@ class _DSparkOrchestratorRunner:
 
     def __init__(self, resources, phase):
         self.resources = resources
-        self.expected = PREFILL_STAGE_ORDER if phase == "prefill" else DECODE_STAGE_ORDER
+        self.expected = (PREFILL_STAGE_ORDER if phase == "prefill" else
+                         PROPOSE_STAGE_ORDER if phase == "propose" else DECODE_STAGE_ORDER)
         self.index = 0
 
     def __call__(self, _entry, arguments):
@@ -3085,6 +3129,15 @@ class V41ResidentResources:
                     batch.block_ids_by_group[index],
                 ))
             self._stage_dspark_tables(resources, batch, partitions, request_rows)
+            # The current Lib DSpark ABI exposes one dynamic draft-table page
+            # per decode row. Select the page containing the current anchor
+            # while retaining the full host table for prefill context geometry.
+            draft = resources.cache_tables["draft"]
+            pages_per_slot = draft.shape[-1]
+            for index, (rank, row) in enumerate(zip(partitions, request_rows, strict=True)):
+                slot, _generation = self._resolve_dspark_state(request_ids[index])
+                page = positions[index] // DSPARK_WINDOW
+                draft[rank, :, row, 0] = slot * pages_per_slot + page
             if self.engram_host is not None:
                 self.engram_host.stage_lookup(
                     self.decode_host.fields["engram_lookup"],
@@ -3170,6 +3223,40 @@ class V41ResidentResources:
             if len(groups) != 1:
                 raise ValueError("DSpark bootstrap requires one cache allocation")
             self._stage_dspark_tables(resources, batch, (rank,), (0,))
+            # The first decode starts with the sampled anchor and no pending
+            # draft rows.  The next decode pass can therefore generate its
+            # proposal without terminal bootstrap state publication.
+            state = resources.state
+            state.reserve_slot(rank, slot, generation=generation,
+                               position_limit=resources.layout.max_seq_len)
+            state.bind_request(rank, 0, slot=slot, generation=generation)
+            meta = state.meta[rank, slot]
+            meta[0] = 1
+            meta[1] = generation
+            meta[2] = prompt_length
+            meta[3] = prompt_length
+            meta[4] = 0
+            meta[5] = resources.layout.max_seq_len
+            state.tokens[rank, slot].zero_()
+            state.tokens[rank, slot, 0] = int(sampled_token_ids[0])
+            # Geometry used to be produced by a separate L3 bootstrap stage.
+            # Build the context rows while lowering prefill so the context-KV
+            # composite receives complete slots and RoPE inputs.
+            workspace["context_slots"].fill_(-1)
+            workspace["context_rope_cos"].zero_()
+            workspace["context_rope_sin"].zero_()
+            positions = workspace["prefill_positions"][rank, :retained_count]
+            rope_cos = resources.rope_tables["draft_cos"][rank]
+            rope_sin = resources.rope_tables["draft_sin"][rank]
+            workspace["context_rope_cos"][rank, :retained_count].copy_(rope_cos[positions.long()])
+            workspace["context_rope_sin"][rank, :retained_count].copy_(rope_sin[positions.long()])
+            for layer in range(workspace["context_slots"].shape[1]):
+                table = resources.cache_tables["draft"][rank, layer, 0]
+                page_index = torch.div(positions, DSPARK_WINDOW, rounding_mode="floor")
+                page_offset = torch.remainder(positions, DSPARK_WINDOW)
+                workspace["context_slots"][rank, layer, :retained_count] = (
+                    table[page_index.long()] * DSPARK_WINDOW + page_offset
+                )
             return request_id, slot, generation
 
     def _dspark_payload(self, *, model, batch, phase, resources, **extra):
@@ -3210,6 +3297,40 @@ class V41ResidentResources:
             rope_tables=resources.rope_tables, outputs=outputs,
             request_ranks=(int(getattr(batch, "cache_partitions", [0])[0] or 0),),
         )
+
+    def _run_dspark_prefill_context(self, lowered):
+        """Write draft context KV after each completed main prefill."""
+        if "prefill_context_kv" not in self.dspark_programs:
+            raise MissingCompositeInterface(
+                "selected Lib does not expose l3_dspark_prefill_context_kv"
+            )
+        if self.dspark_weights is None or self.dspark_cache is None:
+            raise MissingCompositeInterface("DSpark draft resources are not initialized")
+        workspace = lowered.workspace
+        draft = lowered.draft_model
+        arguments = dict(
+            target_hidden=workspace["prefill_target_hidden"],
+            main_proj_weight=draft["main_proj_weight"],
+            main_proj_scale=draft["main_proj_scale"],
+            main_norm_weight=draft["main_norm_weight"],
+            num_tokens=workspace["prefill_counts"],
+            context_slots=workspace["context_slots"],
+            context_rope_cos=workspace["context_rope_cos"],
+            context_rope_sin=workspace["context_rope_sin"],
+            wkv=draft["wkv"],
+            wkv_scale=draft["wkv_scale"],
+            kv_norm_weight=draft["kv_norm_weight"],
+            window_cache=self.dspark_cache.window_cache,
+        )
+        names = self.dspark_param_names["prefill_context_kv"]
+        missing = set(names) - set(arguments)
+        extra = set(arguments) - set(names)
+        if missing or extra:
+            raise MissingCompositeInterface(
+                "DSpark prefill context ABI mismatch: "
+                f"missing={sorted(missing)} extra={sorted(extra)}"
+            )
+        self.dispatch_dspark("prefill_context_kv", arguments)
 
     def lower_dspark_prefill(self, *, model, batch, request_ids, sampled_token_ids):
         """Lower a terminal prefill batch through the serving-owned provider."""
@@ -3267,7 +3388,8 @@ class V41ResidentResources:
                 raise RuntimeError("full prefill was not registered")
             self._prefill_fwd = PrefillForwardSegment(
                 self.worker, program, names, run_config, topology,
-                self.weights, self.prefill_host, self.cache, self.final, self.engram)
+                self.weights, self.prefill_host, self.cache, self.final, self.engram,
+                self.dspark_weights, self.dspark_cache, self.dspark_host_resources)
 
     def _activate_decode(self):
         with profile_span('v41.V41ResidentResources._activate_decode', cat='v41.host', level='verbose'):
@@ -3298,6 +3420,10 @@ class V41ResidentResources:
             counts = (host.stage_full(dispatch_step, embeddings, self.engram_host)
                       if step.phase == "prefill" and self._prefill_fwd is not None else
                       host.stage(dispatch_step, self.engram_host) if host is not None else None)
+            if (step.phase == "prefill" and self.dspark_host_resources is not None
+                    and self._prefill_binding is not None
+                    and "draft_main_proj_weight" in self._prefill_binding[1]):
+                self._stage_fused_dspark_prefill(dispatch_step)
             input_runtime = self.decode_input if step.phase == "decode" else self.input
             if input_runtime is None:
                 raise ValueError("decode requires its own TP-local input capacity")
@@ -3313,6 +3439,34 @@ class V41ResidentResources:
             self._step, self._inputs = step, inputs
             self._group_counts = counts
             return state
+
+    def _stage_fused_dspark_prefill(self, step):
+        """Stage draft KV geometry for the current target-prefill chunk."""
+        resources = self.dspark_host_resources
+        prefill = resources.prefill_workspace
+        prefill["prefill_counts"].zero_()
+        prefill["context_slots"].fill_(-1)
+        prefill["context_rope_cos"].zero_()
+        prefill["context_rope_sin"].zero_()
+        offsets = [0] * resources.layout.dp_size
+        pages_per_slot = (resources.layout.max_seq_len + DSPARK_WINDOW - 1) // DSPARK_WINDOW
+        draft_cos = resources.rope_tables["draft_cos"]
+        draft_sin = resources.rope_tables["draft_sin"]
+        for request in step.requests:
+            rank = request.partition
+            count = len(request.token_ids)
+            offset = offsets[rank]
+            offsets[rank] += count
+            slot = request.state_slot
+            positions = torch.arange(request.start, request.end, dtype=torch.int32)
+            pages = slot * pages_per_slot + torch.div(
+                positions, DSPARK_WINDOW, rounding_mode="floor")
+            slots = pages * DSPARK_WINDOW + torch.remainder(positions, DSPARK_WINDOW)
+            prefill["context_slots"][rank, :, offset:offset + count] = slots
+            prefill["context_rope_cos"][rank, offset:offset + count] = draft_cos[rank, positions.long()]
+            prefill["context_rope_sin"][rank, offset:offset + count] = draft_sin[rank, positions.long()]
+        for rank, count in enumerate(offsets):
+            prefill["prefill_counts"][rank, 0] = count
 
     def run_prefill_fwd(self, state, step):
         if (self.closed or step is not self._step or step.phase != "prefill"
@@ -3466,6 +3620,13 @@ class V41ResidentResources:
                         lowered.markov_model, lowered.cache_tables, lowered.rope_tables,
                         **kwargs,
                     )
+                elif phase == "propose":
+                    module = importlib.import_module("models.deepseek_v4_1_flash.dspark_init")
+                    module.dspark_propose(
+                        runner, lowered.workspace, lowered.draft_model,
+                        lowered.markov_model, lowered.cache_tables, lowered.rope_tables,
+                        **kwargs,
+                    )
                 else:
                     runner(None, self._dspark_decode_arguments(lowered))
                 runner.finish()
@@ -3603,23 +3764,67 @@ class V41ResidentResources:
                 "serving must bind target hidden/sample outputs and publish draft state"
             )
         try:
-            self._run_dspark_orchestrator(lowered, phase="prefill")
-            draft_ids = self._read_dspark_output(lowered, "draft_ids")
+            # The fused prefill ABI writes draft context KV as part of the
+            # main prefill dispatch. Keep the standalone entry as a fallback
+            # for older Lib revisions.
+            prefill_names = () if self._prefill_binding is None else self._prefill_binding[1]
+            if "draft_main_proj_weight" not in prefill_names:
+                self._run_dspark_prefill_context(lowered)
             rank, row = self._dspark_request_rows(lowered, 1)
-            draft_ids = self._dspark_output_row(
-                draft_ids, rank=rank[0], row=row[0], kind="draft_ids")
-            drafts = []
-            if anchor + DSPARK_SPECULATIVE_TOKENS < self.dspark.states.position_limit:
-                self._validate_dspark_token_row(
-                    draft_ids, kind="draft_ids", minimum=DSPARK_SPECULATIVE_TOKENS)
-                drafts = [int(token) for token in draft_ids.tolist()]
-            state = self.dspark.record_bootstrap(
+            # Prefill lowering validates and reserves the slot before this
+            # method is called. Publish the active metadata after that final
+            # reservation, otherwise reserve_slot() clears STATE_VALID and
+            # the first decode is intentionally rejected by the Lib ABI.
+            resources = self.dspark_host_resources
+            if resources is not None:
+                state = resources.state
+                state.reserve_slot(
+                    rank[0], slot, generation=generation,
+                    position_limit=resources.layout.max_seq_len,
+                )
+                state.bind_request(rank[0], row[0], slot=slot, generation=generation)
+                meta = state.meta[rank[0], slot]
+                meta[0] = 1
+                meta[1] = generation
+                meta[2] = prompt_length
+                meta[3] = prompt_length
+                meta[4] = 0
+                meta[5] = resources.layout.max_seq_len
+                state.tokens[rank[0], slot].zero_()
+                state.tokens[rank[0], slot, 0] = int(
+                    lowered.workspace["next_prefill_tokens"][rank[0], row[0]]
+                )
+            if self.dspark_buffers is not None:
+                # The prefill stage publishes the initial valid state and
+                # page tables on the host.  Copy them once before decode
+                # starts.  Later decode rounds keep tokens/meta on device.
+                self.dspark_buffers.sync_state()
+                self.dspark_buffers.sync_cache_tables()
+            state = self.dspark.record_prefill(
                 request_id, slot=slot, generation=generation,
                 prompt_length=prompt_length, anchor=anchor,
-                draft_ids=drafts,
+                draft_ids=(),
                 anchor_token=int(lowered.workspace["next_prefill_tokens"][rank[0], row[0]]),
             )
             return state
+        except BaseException:
+            self.failed = True
+            raise
+
+    def run_dspark_propose(self, lowered=None):
+        """Generate proposals before CPU Engram lookup.
+
+        The caller must run the subsequent verify/accept composite after it
+        stages the candidate-dependent Engram rows.  This method is opt-in
+        until the matching Lib verify ABI is available.
+        """
+        if self.dspark is None:
+            raise MissingCompositeInterface("V4.1 DSpark programs were not registered")
+        if lowered is None:
+            raise MissingCompositeInterface("V4.1 DSpark proposal lowering is unavailable")
+        try:
+            self._run_dspark_orchestrator(lowered, phase="propose")
+            return self._read_dspark_output(lowered, "draft_ids")
         except BaseException:
             self.failed = True
             raise
@@ -3915,7 +4120,11 @@ def make_production_bindings(
                 compiler, root, topology)
         else:
             dspark_programs, dspark_param_names = {}, {}
-        prefill, prefill_names = compile_prefill_fwd(compiler, root, prefill_topology)
+        prefill, prefill_names = compile_prefill_fwd(
+            compiler, root, prefill_topology,
+            dspark_fused=(bool(runtime.num_speculative_tokens)
+                          and os.environ.get("PYPTO_DSPARK_FUSED_PREFILL") == "1"),
+        )
         head_entry = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd").l3_generation_head
         decode_head = compiler.compile("v41_generation_head", head_entry)
         abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
@@ -4010,7 +4219,9 @@ def make_production_bindings(
             dspark_host = allocate_dspark_host_resources(DSparkResourceLayout(
                 dp_size=topology.dp, max_seq_len=max_seq_len,
                 vocab_size=plan.weights.config.vocab_size,
-                max_prefill_tokens=min(max_seq_len, DSPARK_WINDOW),
+                max_prefill_tokens=(prefill_topology.capacity
+                                    if "draft_main_proj_weight" in prefill_names
+                                    else min(max_seq_len, DSPARK_WINDOW)),
             ))
             # Reuse the already validated target RoPE table.  The draft ABI
             # uses the same 32-wide adjacent-pair table as the target.
