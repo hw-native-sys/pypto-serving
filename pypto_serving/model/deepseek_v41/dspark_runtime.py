@@ -388,7 +388,10 @@ class V41DSparkRuntime:
         )
         try:
             state.initialize_prefill(prompt_length, anchor)
-            state.commit(draft_ids)
+            if draft_ids:
+                state.commit(draft_ids)
+            else:
+                state.draft_ids = ()
             state.anchor_token = anchor_token
         except BaseException:
             self.states.release((request_id,))
