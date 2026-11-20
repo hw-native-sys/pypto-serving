@@ -112,7 +112,7 @@ def test_worker_replays_committed_context_without_resampling_intermediate_chunks
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
     core._request_contexts = {}
     core._worker_known_req_ids = set()
-    request = Request("replay", [1, 2], max_new_tokens=2, min_tokens=2, eos_token_id=0)
+    request = Request("replay", [1, 2], max_new_tokens=3, min_tokens=2, eos_token_id=0)
     scheduler.add_request(request)
 
     initial = scheduler.schedule()
@@ -167,13 +167,26 @@ def test_worker_replays_committed_context_without_resampling_intermediate_chunks
     assert terminal_result.error is None and terminal_result.new_tokens == {"replay": [9]}
     resumed = scheduler.update_from_output(terminal, terminal_result.new_tokens)
 
-    assert [(item.new_token_id, item.finished) for item in resumed] == [(9, True)]
+    assert [(item.new_token_id, item.finished) for item in resumed] == [(9, False)]
     assert request.output_token_ids == [7, 9]
     assert request.num_output_placeholders == 0
     assert worker._accepted_output_lengths["replay"] == 2
     assert worker._stop_token_mask("replay") is None
     assert executor.prefill_batches[-1].stop_token_masks["replay"].remaining_tokens == 1
     assert executor.finalized_prefills == [(["replay"], [7]), (["replay"], [9])]
+
+    final = scheduler.schedule()
+    final_cmd = core._build_step_command(final, finished_ids=[])
+    if async_scheduling:
+        scheduler.advance_after_schedule(final)
+    worker.sampler.token_id = 10
+    final_result = worker._run_step_command(decode_command(encode_command(final_cmd)), None)
+    assert final_result.error is None and final_result.new_tokens == {"replay": [10]}
+    resumed = scheduler.update_from_output(final, final_result.new_tokens)
+    assert [(item.new_token_id, item.finished) for item in resumed] == [(10, True)]
+    assert request.output_token_ids == [7, 9, 10]
+    assert request.num_output_placeholders == 0
+    assert worker._accepted_output_lengths["replay"] == 3
 
 
 def test_partitioned_prefill_chunks_keep_cache_partitions_unique():

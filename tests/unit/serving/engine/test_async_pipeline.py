@@ -366,6 +366,33 @@ def test_async_pipeline_dispatches_two_steps_before_applying_first(monkeypatch):
     assert req.num_output_placeholders == 0
 
 
+def test_async_max_tokens_prevents_tail_decode_dispatch(monkeypatch):
+    async def run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    core, dispatched = _async_pipeline_core()
+    request = _running_decode_request(prompt=(1, 2), first_output=50)
+    request.max_new_tokens = 3
+    core.scheduler.running.append(request)
+    core.scheduler.requests[request.request_id] = request
+
+    # Tokens 51 and 52 are the only two decodes needed to reach max_new_tokens.
+    assert core._try_dispatch_step() is True
+    assert core._try_dispatch_step() is True
+    assert len(dispatched) == 2
+
+    assert asyncio.run(core._await_and_apply_oldest()) is True
+    # Token 52 is still in flight and already consumes the final output slot.
+    assert core._try_dispatch_step() is False
+    assert len(dispatched) == 2
+
+    assert asyncio.run(core._await_and_apply_oldest()) is True
+    assert request.output_token_ids == [50, 51, 52]
+    assert request.status is RequestStatus.FINISHED_LENGTH
+    assert request.num_output_placeholders == 0
+
+
 def test_async_pipeline_waits_for_terminal_prefill_before_first_decode(monkeypatch):
     async def run_inline(func, *args, **kwargs):
         return func(*args, **kwargs)
