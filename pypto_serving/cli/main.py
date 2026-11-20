@@ -252,6 +252,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Enable chunked prefill (default: True). Use --no-enable-chunked-prefill to disable.",
     )
+    parser.add_argument(
+        "--agentinfer-mode",
+        choices=("disabled", "enforce"),
+        default="disabled",
+        help="AgentInfer mode (default: disabled). Enforce uses the bundled scheduling policy.",
+    )
+    parser.add_argument(
+        "--agentinfer-config", type=json.loads, default={},
+        help="Experimental AgentInfer controls as a JSON object; requires --agentinfer-mode enforce.",
+    )
 
     # Profiling
     parser.add_argument(
@@ -286,6 +296,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     _validate_backend(args.backend)
+    if args.pd_role and args.agentinfer_mode == "enforce":
+        raise ValueError(
+            "PD deployment does not support --agentinfer-mode enforce; use --agentinfer-mode disabled"
+        )
     if args.max_num_seqs is None:
         if args.pd_role:
             from pypto_serving.pd.config import default_max_num_seqs
@@ -295,6 +309,11 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
             args.max_num_seqs = 16
 
     from pypto_serving.serving.engine.async_engine import EngineConfig
+    from pypto_serving.serving.agentinfer_admission import AgentInferOptions
+
+    agentinfer_config = AgentInferOptions.from_mapping(args.agentinfer_config)
+    if args.agentinfer_config and args.agentinfer_mode != "enforce":
+        raise ValueError("--agentinfer-config requires --agentinfer-mode enforce")
 
     model_dir = str(Path(args.model).resolve())
     executor_kwargs: dict[str, object] = {}
@@ -304,6 +323,10 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     if args.max_num_batched_tokens is None:
         args.max_num_batched_tokens = 1024 if model_family == "deepseek_v41" else 4096
     if model_family == "deepseek_v41":
+        if args.agentinfer_mode != "disabled":
+            raise ValueError(
+                "DeepSeek V4.1 does not support AgentInfer; use --agentinfer-mode disabled"
+            )
         return _build_v41_engine_config(args, model_dir, model_config_data, devices)
     model_variant = _resolve_model_variant(args)
     _validate_prefill_chunk_size(
@@ -345,6 +368,25 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         config_data=model_config_data,
         variant=model_variant,
     )
+    if args.agentinfer_mode != "disabled":
+        dspark_agentinfer = (
+            model_family == "deepseek_v4"
+            and model_variant == "dspark"
+            and num_speculative_tokens in (0, 7)
+            and args.enable_prefix_caching
+        )
+        supported = parallel_config.num_replicas == 1 and (
+            model_family == "qwen"
+            or (model_family == "deepseek_v4" and model_variant != "dspark"
+                and num_speculative_tokens == 1 and args.enable_prefix_caching)
+            or dspark_agentinfer
+        )
+        if not supported:
+            raise ValueError(
+                "AgentInfer requires single-replica Qwen, standard DeepSeek V4 "
+                "with MTP K=1 and prefix caching enabled, or DSpark K=0/K=7 "
+                "with prefix caching enabled"
+            )
     first_group = parallel_config.replica_device_groups[0]
     worker_device_ids = first_group if parallel_config.num_replicas == 1 else ()
     # DSpark rebuilds its private drafter context from a prefilled suffix.
@@ -374,6 +416,8 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         long_prefill_token_threshold=args.long_prefill_token_threshold,
         enable_prefix_cache=enable_prefix_cache,
         enable_chunk_prefill=args.enable_chunked_prefill,
+        agentinfer_mode=args.agentinfer_mode,
+        agentinfer_config=agentinfer_config,
     )
 
 

@@ -119,16 +119,74 @@ def test_request_checkpoint_matches_full_prompt_replay_boundary(
         cache._next_group_partition = group % 4
         boundary = _finish_prefill(scheduler, Request(str(group), prompt(group, length), max_new_tokens=512))
     for group in range(8):
-        request = Request(f"hot-{group}", prompt(group, length), max_new_tokens=512)
+        request = Request(f"hot-{group}", prompt(group, length), max_new_tokens=512, observe_prefix_cache=True)
         scheduler.add_request(request)
+        observed = cache.observe_group_prefix(
+            request.group_block_hashes, max_cache_hit_tokens=request.group_checkpoint_boundary,
+        )
         output = scheduler.schedule()
         assert output.prefix_cache_hits == boundary
+        assert observed.cached_tokens == request.prefix_cache_observation.cached_tokens == boundary
         step, = output.scheduled_requests
         assert step.num_computed_tokens == boundary
         scheduler.abort_request(request.request_id)
         scheduler.discard_scheduled_request(step)
     assert not cache._group_checkpoints.owners
     assert all(b.ref_cnt == 0 for pool in cache._group_pools.values() for b in pool.blocks)
+
+
+@pytest.mark.parametrize("chunk_tokens", [128, 8192])
+@pytest.mark.parametrize("speculative", [0, 7])
+def test_dspark_prefix_observation_matches_native_hit_without_pinning(chunk_tokens, speculative):
+    from pypto_serving.model.deepseek_dspark.npu_runner import build_dspark_cache_group_specs
+
+    groups = build_dspark_cache_group_specs(
+        43, (0, 0) + (4,) * 21 + (128,) * 20,
+        max_seq_len=310000, max_prefill_tokens=chunk_tokens, partitions=4,
+    )
+    cache = KvCacheManager(enable_prefix_cache=True)
+    cache.init_groups(groups, max_batch_size=4)
+    scheduler = Scheduler(SchedulerConfig(
+        max_seq_len=310000, max_num_running_reqs=4, max_num_scheduled_tokens=10240,
+        max_prefill_tokens_per_request=chunk_tokens, long_prefill_token_threshold=chunk_tokens,
+        num_speculative_tokens=speculative, speculative_prefix_cache_replay_tokens=128 if speculative else 0,
+        async_scheduling=bool(speculative), stop_after_prefill=not speculative, enable_prefix_cache=True,
+    ), cache)
+    cache._next_group_partition = 3
+    tokens = prompt(0, 16397)
+    boundary = _finish_prefill(scheduler, Request("warm", tokens, max_new_tokens=1))
+    hashes = cache.compute_group_block_hashes(tokens)
+
+    def snapshot():
+        return (
+            cache._next_group_partition,
+            dict(cache._group_request_partitions),
+            tuple((
+                tuple((
+                    block.ref_cnt, block.block_hash,
+                    block.prev_free.block_id if block.prev_free is not None else None,
+                    block.next_free.block_id if block.next_free is not None else None,
+                ) for block in pool.blocks),
+                tuple((queue.count, queue.head, queue.tail) for queue in pool.free_queues),
+                dict(pool.request_partitions),
+                dict(pool.request_blocks),
+            ) for pool in cache._group_pools.values()),
+        )
+
+    before = snapshot()
+    observed = cache.observe_group_prefix(hashes, max_cache_hit_tokens=boundary)
+    assert snapshot() == before
+    assert observed.cached_tokens == boundary
+
+    request = Request("hot", tokens, max_new_tokens=1, observe_prefix_cache=True)
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    step, = output.scheduled_requests
+    assert step.cache_partition == 3
+    assert observed.cached_tokens == output.prefix_cache_hits == step.num_computed_tokens
+    assert request.prefix_cache_observation.cached_tokens == boundary
+    scheduler.abort_request(request.request_id)
+    scheduler.discard_scheduled_request(step)
 
 
 @pytest.mark.parametrize("name", ["ori", "hca_state", "csa_state", "csa_inner_state"])
@@ -143,8 +201,11 @@ def test_request_checkpoint_loses_joint_validity_when_a_member_is_evicted(name):
     pool = cache._group_pools[name]
     cache._invalidate_group_block(pool, key[0], pool.blocks[block])
     assert key not in checkpoints.checkpoints
-    _, hit, _ = cache.acquire_group_prefix_blocks("query", cache.compute_group_block_hashes(tokens),
+    hashes = cache.compute_group_block_hashes(tokens)
+    observed = cache.observe_group_prefix(hashes, max_cache_hit_tokens=boundary)
+    _, hit, _ = cache.acquire_group_prefix_blocks("query", hashes,
         max_cache_hit_tokens=boundary)
+    assert observed.cached_tokens == hit
     if hit:
         cache.release_all_group_requests("query")
     assert hit < boundary

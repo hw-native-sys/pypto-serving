@@ -19,7 +19,9 @@ from enum import Enum, auto
 
 from pypto_serving.config.types import KVCacheGroupSpec
 from pypto_serving.serving.constraints import ConstraintSpec
-from pypto_serving.serving.memory.kv_cache import GroupBlockSnapshot, KVCacheCapacityError, KvCacheManager
+from pypto_serving.serving.memory.kv_cache import (
+    GroupBlockSnapshot, KVCacheCapacityError, KvCacheManager, PrefixCacheObservation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +167,8 @@ class Request:
     # prefill chunk. Keep this across decode so partial pages stay unpublished.
     group_cache_valid_from: dict[str, int] = field(default_factory=dict)
     prefix_cache_metrics_recorded: bool = False
+    observe_prefix_cache: bool = False
+    prefix_cache_observation: PrefixCacheObservation | None = None
     # Async scheduling: tokens scheduled optimistically but not yet sampled.
     # Stands in for output tokens still in flight so the next schedule() advances
     # correctly; decremented as real tokens are applied in update_from_output.
@@ -273,6 +277,30 @@ class Scheduler:
         self._next_grouped_cache_phase = "decode"
 
     def add_request(self, request: Request) -> None:
+        self.validate_request(request)
+        if not self.config.enable_prefix_cache:
+            rejection = self._single_prefill_rejection(request)
+            if rejection is not None:
+                raise ValueError(rejection)
+        if self.config.enable_prefix_cache:
+            if self.kv_cache_manager.has_groups:
+                request.group_checkpoint_boundary = self.kv_cache_manager.group_prefix_cache_boundary(
+                    request.num_prompt_tokens,
+                    replay_tokens=self.config.speculative_prefix_cache_replay_tokens,
+                )
+                request.group_block_hashes = self.kv_cache_manager.compute_group_block_hashes(
+                    request.prompt_token_ids
+                )
+            else:
+                request.block_hashes = self.kv_cache_manager.compute_block_hashes(
+                    request.prompt_token_ids
+                )
+        request.status = RequestStatus.WAITING
+        self.waiting.append(request)
+        self.requests[request.request_id] = request
+
+    def validate_request(self, request: Request) -> None:
+        """Reject invalid lengths and cap generation before request admission."""
         prompt_len = len(request.prompt_token_ids)
         max_seq_len = self.config.max_seq_len
         if prompt_len > max_seq_len:
@@ -307,26 +335,6 @@ class Scheduler:
                 f"Request {request.request_id} min_tokens {request.min_tokens} exceeds "
                 f"available generation tokens {request.max_new_tokens}"
             )
-        if not self.config.enable_prefix_cache:
-            rejection = self._single_prefill_rejection(request)
-            if rejection is not None:
-                raise ValueError(rejection)
-        if self.config.enable_prefix_cache:
-            if self.kv_cache_manager.has_groups:
-                request.group_checkpoint_boundary = self.kv_cache_manager.group_prefix_cache_boundary(
-                    request.num_prompt_tokens,
-                    replay_tokens=self.config.speculative_prefix_cache_replay_tokens,
-                )
-                request.group_block_hashes = self.kv_cache_manager.compute_group_block_hashes(
-                    request.prompt_token_ids
-                )
-            else:
-                request.block_hashes = self.kv_cache_manager.compute_block_hashes(
-                    request.prompt_token_ids
-                )
-        request.status = RequestStatus.WAITING
-        self.waiting.append(request)
-        self.requests[request.request_id] = request
 
     def admit_prefilled(
         self,
@@ -605,6 +613,11 @@ class Scheduler:
             # Prefix cache lookup
             if self.config.enable_prefix_cache:
                 if self.kv_cache_manager.has_groups:
+                    if request.observe_prefix_cache:
+                        request.prefix_cache_observation = self.kv_cache_manager.observe_group_prefix(
+                            request.group_block_hashes,
+                            max_cache_hit_tokens=request.group_checkpoint_boundary,
+                        )
                     tiering = self.kv_cache_manager.tiering
                     if tiering is not None and not tiering.prepare(
                         request.request_id, request.group_block_hashes, request.num_prompt_tokens,
@@ -645,6 +658,10 @@ class Scheduler:
                             )
                     cached_blocks = []
                 else:
+                    if request.observe_prefix_cache:
+                        request.prefix_cache_observation = self.kv_cache_manager.observe_prefix(
+                            request.prompt_token_ids,
+                        )
                     cached_blocks = self.kv_cache_manager.get_computed_blocks(
                         request.prompt_token_ids
                     )
@@ -755,6 +772,7 @@ class Scheduler:
         request.num_computed_tokens = 0
         request.num_blocks_cached = 0
         request.num_group_blocks_cached = {}
+        request.prefix_cache_observation = None
 
     def _prefill_chunk_limit(self) -> int | None:
         """Return the configured per-request prefill limit before step budget."""

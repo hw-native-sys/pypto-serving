@@ -44,6 +44,56 @@ curl --noproxy '*' http://127.0.0.1:8899/v1/chat/completions \
 
 `chat_template_kwargs` is passed to the model formatter, so supported settings such as Qwen thinking mode can be selected per request. The [HTTP API Reference](../api-reference/http.md#chat-fields) covers token limits and EOS controls; [Tool Calling](tool-calling.md) describes function calls for models with a registered parser.
 
+## AgentInfer Admission
+
+Add `--agentinfer-mode enforce` to enable AgentInfer admission. The scheduling
+core is adapted from [AgentInfer](https://github.com/openJiuwen-ai/agent-infer)
+and integrated with PyPTO Serving's native scheduler and KV cache.
+It supports one serving replica with prefix caching: Qwen, standard DeepSeek V4
+MTP K=1, or DeepSeek V4 DSpark K=0/K=7. PD deployments, multiple replicas, and
+DeepSeek V4.1 are not supported. The default mode is `disabled`.
+
+Optional policy bounds are provided with `--agentinfer-config`, for example:
+
+```bash
+pypto-serving --model /path/to/Qwen3-14B --agentinfer-mode enforce \
+  --agentinfer-config '{"resume_capacity_ratio":0.85,"force_resume_timeout_min_seconds":15,"force_resume_timeout_max_seconds":15}'
+```
+
+Requests with a stable agent identity share a Program across model calls.
+Requests without an identity use native admission. Completions and Chat can use
+session headers; Chat also accepts `agent_hint` or canonical
+`vllm_xargs.agentic_context`:
+
+| Request metadata | Program identity |
+| --- | --- |
+| `X-Claude-Code-Session-Id`, optionally `X-Claude-Code-Agent-Id` | Session and lead or subagent ID. |
+| `X-OpenCode-Session-Id` or `X-OpenCode-Session` | Session and lead ID. |
+| `X-DeepSeek-Harness-Session-Id` | Session and lead ID; auxiliary compaction requests are excluded. |
+| `Session-Id`, optionally `Thread-Id` and `X-Codex-Parent-Thread-Id` | Session and lead or thread ID, with parent lineage. |
+| `X-Session-Id` | Session and lead ID. |
+| `vllm_xargs.agentic_context` | Canonical Program identity with optional task and parent fields. |
+| `agent_hint.session_id`, optionally `parent_session_id` | Explicit Program identity and parent lineage. |
+
+Canonical context takes precedence over `agent_hint`, which takes precedence
+over headers. For example, `X-Session-Id: run-123` identifies Program
+`run-123:lead`, while `agent_hint.session_id: run-123` uses Program `run-123`.
+These mappings apply to the supported OpenAI-compatible endpoints.
+
+Text-action clients explicitly confirm task completion after verifying it.
+Send the Program ID and the Chat response `id` to `POST /v1/agent/lifecycle`:
+
+```json
+{"session_id":"run-123","request_id":"<chat response id>","lifecycle":"terminal"}
+```
+
+The endpoint returns `{"released":true}` when it releases the matching Program.
+Use `lifecycle: "continue"` to report another round. Delayed completion signals
+cannot release a newer round in the same Program. Chat clients can opt into
+automatic stop/tool-call lifecycle handling with
+`agent_hint.lifecycle_mode: "chat"`; a length-limited response does not confirm
+task completion. The default lifecycle mode is `explicit`.
+
 ## Stream Output
 
 Set `stream: true` on either generation endpoint to receive Server-Sent Events:
