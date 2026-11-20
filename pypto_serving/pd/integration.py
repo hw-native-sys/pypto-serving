@@ -33,7 +33,7 @@ from pypto_serving.serving.server.server import ChatCompletionRequest, Completio
 from pypto_serving.serving.server.serving_worker import spawn_worker
 from .adapter import select_adapter
 from .config import Config, log_context
-from .protocol import Binding, CapacityExhausted, Continuation, Node, decode
+from .protocol import CLOSING_HEADER, Binding, CapacityExhausted, Continuation, Node, decode
 from .scheduler import PrefillScheduler
 from .service import ExecutionError, NodeUnavailable, Service
 from .worker import Progress, Services, WorkerSettings
@@ -143,10 +143,11 @@ class Server(ServingServer):
 
     async def descriptor(self):
         node = self.service.node
+        headers = {CLOSING_HEADER: "1"} if self.service.closing else None
         if node is None:
-            return JSONResponse(dict(error="node initializing"), status_code=503)
+            return JSONResponse(dict(error="node initializing"), status_code=503, headers=headers)
         return JSONResponse(msgspec.to_builtins(msgspec.structs.replace(
-            node, healthy=self.service.is_ready())))
+            node, healthy=self.service.is_ready())), headers=headers)
 
     async def abort(self, request: HTTPRequest):
         binding = decode(await request.json(), Binding)

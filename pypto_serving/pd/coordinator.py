@@ -17,25 +17,29 @@ from fastapi.responses import Response, StreamingResponse
 import httpx
 import msgspec
 from pydantic import TypeAdapter
+from starlette.requests import ClientDisconnect
 
 from pypto_serving.tools.observe import record
-from .protocol import Binding, MAX_FRAME, Node, VERSION, decode
+from .protocol import CLOSING_HEADER, Binding, MAX_FRAME, Node, VERSION, decode
 from pypto_serving.router.http import (
     SESSION_HEADER, Retirement, RouterError, close_requests, error_response, failure,
-    request_headers, response_headers, resolve_session_id, send,
+    request_headers, response_headers, resolve_session_id, send, wait_for_disconnect,
 )
 from pypto_serving.router.routing import RoundRobin
 
 logger = logging.getLogger(__name__)
 _STREAM = TypeAdapter(bool)
+PROBE_TIMEOUT_SECONDS = 5.0
+PROBE_ATTEMPTS = 3
 
 
 class PDCoordinator:
     """Coordinate a request; the common router owns HTTP and node liveness."""
 
-    def __init__(self, config, registry, client, probe_client):
+    def __init__(self, config, registry, client, probe_client, probe_node):
         self.config, self.registry, self.client = config, registry, client
         self.probe_client = probe_client
+        self.probe_node = probe_node
         self.nodes = {}
         self.models, self.discovered = set(), set()
         self.policy = RoundRobin()
@@ -50,30 +54,48 @@ class PDCoordinator:
             values = {k: min(v, read) if v is not None else read for k, v in values.items()}
         return httpx.Timeout(**{**values, "read": read})
 
+    def _unready(self, name):
+        self.nodes.pop(name, None)
+        self.registry.set_ready(name, False)
+        return False
+
     async def probe(self, spec):
+        url = spec.base_url + "/internal/pd/descriptor"
+        timeout = self._timeout(PROBE_TIMEOUT_SECONDS, control=True)
+        attempts = 1 if self.registry.state(spec.name).draining else PROBE_ATTEMPTS
+        for attempt in range(attempts):
+            try:
+                response = await asyncio.wait_for(
+                    self.probe_client.get(url, timeout=timeout), PROBE_TIMEOUT_SECONDS)
+            except httpx.PoolTimeout:
+                if attempt == attempts - 1:
+                    raise  # Local connection pressure does not demote a node.
+            except (asyncio.TimeoutError, httpx.TransportError, OSError):
+                self._unready(spec.name)
+            else:
+                break
+        else:
+            return False
+        if response.headers.get(CLOSING_HEADER) == "1":
+            self.registry.set_draining(spec.name, True)
+            return self._unready(spec.name)
+
         try:
-            response = await self.probe_client.get(spec.base_url + "/internal/pd/descriptor",
-                                             timeout=self._timeout(5, control=True))
             response.raise_for_status()
             node = decode(response.json(), Node)
             if (node.node_id != spec.name or node.role != spec.role
                     or node.provider != self.config.provider or node.version != VERSION
                     or not node.contract.model):
                 raise ValueError("descriptor differs from configured PD node")
-            self.models.add(node.contract.model)
-            self.discovered.add(spec.name)
-            if not node.healthy:
-                self.nodes.pop(spec.name, None)
-                self.registry.set_ready(spec.name, False)
-                return False
-            self.nodes[spec.name] = node
-            return True
-        except httpx.PoolTimeout:
-            raise  # The shared HealthMonitor classifies local pool pressure.
         except (httpx.HTTPError, ValueError):
-            self.nodes.pop(spec.name, None)
-            self.registry.set_ready(spec.name, False)
-            return False
+            return self._unready(spec.name)
+        self.models.add(node.contract.model)
+        self.discovered.add(spec.name)
+        self.registry.set_draining(spec.name, False)
+        if not node.healthy:
+            return self._unready(spec.name)
+        self.nodes[spec.name] = node
+        return True
 
     def _candidates(self, model):
         result = []
@@ -91,6 +113,8 @@ class PDCoordinator:
 
     def _admit(self, payload):
         """Select current immutable node snapshots and reserve counts without yielding."""
+        if self.closing:
+            raise RouterError(503, "router_closing", "Router is closing")
         model = payload.get("model")
         if model is not None and not isinstance(model, str):
             raise ValueError("model must be a string")
@@ -98,7 +122,7 @@ class PDCoordinator:
         if not any(candidates):
             if model and model not in self.models and len(self.discovered) == len(self.registry.states):
                 raise RouterError(404, "model_not_found", f"Unknown model: {model}")
-            raise RouterError(503, "no_available_backend", "No compatible healthy P/D pair is available")
+            return None
         available = [pair if pair and all(self.registry.state(n.node_id).outstanding < self.config.capacity
                                           for n in pair) else None for pair in candidates]
         if not any(available):
@@ -114,6 +138,42 @@ class PDCoordinator:
         record(logger, "route", request=binding.request, prefill=p.node_id, decode=d.node_id,
                policy=self.config.policy, reason=reason, prefill_identity=p.key, decode_identity=d.key)
         return p, d, binding, endpoints, release
+
+    async def _wait_for_admission(self, request, payload):
+        """Wait on health only; no binding or counts are held while waiting."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + PROBE_TIMEOUT_SECONDS * PROBE_ATTEMPTS
+        probes = {}
+        while True:
+            remaining = deadline - loop.time()
+            eligible = tuple(state for state in self.registry.states if not state.draining)
+            if remaining <= 0 or len({state.spec.role for state in eligible}) < 2:
+                break
+            for state in eligible:
+                if not state.ready and state.name not in probes:
+                    probes[state.name] = self.probe_node(state)
+            pending = {probe for probe in probes.values() if not probe.done()}
+            if not pending:
+                break
+            disconnected = asyncio.create_task(wait_for_disconnect(request))
+            try:
+                done, _ = await asyncio.wait(pending | {disconnected}, timeout=remaining,
+                                             return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                disconnected.cancel()
+                await asyncio.gather(disconnected, return_exceptions=True)
+            if not disconnected.cancelled():
+                disconnected.result()
+                raise ClientDisconnect()
+            # Check for a queued close after releasing the listener and before binding.
+            if await request.is_disconnected():
+                raise ClientDisconnect()
+            if not done:
+                break
+            admission = self._admit(payload)
+            if admission is not None:
+                return admission
+        raise RouterError(503, "no_available_backend", "No compatible healthy P/D pair is available")
 
     async def close(self):
         self.closing = True
@@ -133,6 +193,8 @@ class PDCoordinator:
                 raise ValueError("request must be a JSON object")
             payload["stream"] = _STREAM.validate_python(payload.get("stream", False))
             return await self._forward(request, path, owner, payload, session_id)
+        except ClientDisconnect:
+            return Response(status_code=499)
         except (RouterError, ValueError, RuntimeError, asyncio.TimeoutError, OSError, httpx.HTTPError) as exc:
             error = failure(exc, timeout_code="pd_operation_timeout", protocol_code="pd_protocol_error")
             record(logger, "route.reject", session=session_id, reason=error.code, status=error.status,
@@ -155,7 +217,10 @@ class PDCoordinator:
                 logger.warning("HTTP abort not confirmed node=%s result=%s", endpoint.name, result)
 
     async def _forward(self, request, path, owner, payload, session_id):
-        p, d, binding, endpoints, release = self._admit(payload)
+        admission = self._admit(payload)
+        if admission is None:
+            admission = await self._wait_for_admission(request, payload)
+        p, d, binding, endpoints, release = admission
         p_task = d_task = response = None
         finished = False
         async def before_close():
