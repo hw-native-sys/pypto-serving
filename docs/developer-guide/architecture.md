@@ -66,7 +66,7 @@ Changes to request scheduling or cache allocation should include focused unit te
 
 ### Qwen Program chip runtime
 
-For Qwen3-14B Program execution, `EngineConfig(runtime_config=RuntimeConfig(chip_runtime="host_build_graph"))` selects HBG. The default is `"tensormap_and_ringbuffer"`. This is the chip scheduler policy, independent of the compiler backend and onboard/simulation execution mode. Other model executors currently reject HBG configuration at engine construction.
+For Qwen3-14B Program execution, `EngineConfig(runtime_config=RuntimeConfig(chip_runtime="host_build_graph"))` selects HBG. A5 DeepSeek V4.1 uses `host_build_graph` by default for K0 and DSpark K5. Use `--chip-runtime tensormap_and_ringbuffer` for an explicit TMR run. Other models default to `"tensormap_and_ringbuffer"`. This is the chip scheduler policy, independent of the compiler backend and onboard/simulation execution mode. Executors outside Qwen3-14B and A5 V4.1 reject HBG configuration at engine construction.
 
 The existing replica configuration, worker model loader and `RuntimeModel.runtime` carry this value. Qwen configures its shared compiler from the loaded model before compiling all three stages; the shared run-config builder passes the selection into `DistributedConfig.runtime`. The existing compiled-program worker consumes that configuration. No additional engine, executor or process environment selection is involved.
 

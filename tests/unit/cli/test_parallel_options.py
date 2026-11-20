@@ -36,6 +36,20 @@ def test_request_capacity_defaults_reach_scheduler_and_cache(tmp_path, role, spe
     assert config.runtime_config.max_batch_size == expected
 
 
+@pytest.mark.parametrize("tokens", [0, 5])
+@pytest.mark.parametrize("override", [None, "tensormap_and_ringbuffer"])
+def test_a5_v41_chip_runtime(tokens, override):
+    from pypto_serving.serving.engine.async_engine import EngineConfig
+
+    argv = ["--model", "/unused", "--platform", "a5", "--max-num-seqs", "12"]
+    if override:
+        argv += ["--chip-runtime", override]
+    runtime = cli._build_runtime_config(_parse_cli_args(argv), model_family="deepseek_v41",
+                                        num_speculative_tokens=tokens)
+    config = EngineConfig(platform="a5", executor_cls="PyptoDeepSeekV41Executor", runtime_config=runtime)
+    assert config.resolve_runtime_config().chip_runtime == (override or "host_build_graph")
+
+
 def test_cli_keeps_generic_model_chunk_sizes_unrestricted():
     args = _parse_cli_args(
         ["--model", "model", "--long-prefill-token-threshold", "128"]
