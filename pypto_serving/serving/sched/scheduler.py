@@ -914,6 +914,8 @@ class Scheduler:
                 scheduled.group_block_snapshot = self.kv_cache_manager.retain_group_block_snapshot(
                     scheduled.block_ids_by_group,
                     scheduled.cache_partition,
+                    token_count=(scheduled.num_computed_tokens + scheduled.num_new_tokens
+                                 + self._speculative_tokens_for(request, scheduled)),
                 )
             completes_prompt = (
                 request.num_computed_tokens + scheduled.num_new_tokens

@@ -125,7 +125,9 @@ class GroupedCacheReservations:
                     # A cached page may otherwise have only this request as an
                     # owner. Keep a separate read-only reference so suffix ring
                     # growth cannot reuse it as a remote-write destination.
-                    shared_snapshot = self.manager.retain_group_block_snapshot(shared_ids, selected_prefix_partition)
+                    shared_snapshot = self.manager.pin_cached_group_blocks(
+                        {name: pool.request_blocks[request_id] for name, pool in self.manager._group_pools.items()},
+                        selected_prefix_partition, token_count=prefix_hit_tokens)
             def allocate():
                 self.manager.ensure_group_blocks(
                     request_id, prompt_tokens,

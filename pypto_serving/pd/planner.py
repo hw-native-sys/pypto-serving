@@ -219,7 +219,7 @@ class SourcePins:
         if chunk.chunk in snapshots:
             raise RuntimeError("source snapshot already retained")
         if snapshot is None:
-            snapshot = self.cache.retain_group_block_snapshot(chunk.blocks, chunk.partition)
+            snapshot = self.cache.retain_group_block_snapshot(chunk.blocks, chunk.partition, token_count=chunk.end)
         self.active.setdefault(chunk.request, {})[chunk.chunk] = snapshot
 
     def release(self, request, chunk=None):
