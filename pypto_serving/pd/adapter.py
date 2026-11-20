@@ -164,8 +164,9 @@ class DSparkExtension:
                                tail.nbytes // (slots * rows), str(tail.dtype)))
         return tuple(result)
 
-    def worker_options(self):
-        return self.transfer.worker_options()
+    @staticmethod
+    def allocation_options(scope, name=""):
+        return {"exportable": True} if scope == "cache" or (scope, name) == ("prefill_state", "hidden") else {}
 
     def worker_ready(self):
         self.transfer.worker_ready()
