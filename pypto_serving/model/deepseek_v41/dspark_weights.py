@@ -155,26 +155,6 @@ def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
 
 
-def _dequantize_main_projection(payload: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Decode checkpoint block32 FP8 directly into the input-major BF16 ABI."""
-    rows, cols = payload.shape
-    if scale.dtype != torch.float8_e8m0fnu or tuple(scale.shape) != (
-        _ceil_div(rows, 32), _ceil_div(cols, 32)
-    ):
-        raise ValueError("DSpark main_proj.scale must be the matching block32 E8M0 grid")
-    codes = scale.contiguous().view(torch.uint8)
-    if bool((codes == 255).any()):
-        raise ValueError("DSpark main_proj.scale must contain finite E8M0 scales")
-    output = torch.empty((cols, rows), dtype=torch.bfloat16)
-    # Keep FP32 temporaries to one 32-row block, not the full [D, 3D] matrix.
-    for start in range(0, rows, 32):
-        stop = min(start + 32, rows)
-        factors = torch.exp2(codes[start // 32].float() - 127).repeat_interleave(32)[:cols]
-        values = payload[start:stop].float() * factors
-        output[:, start:stop].copy_(values.T)
-    return output
-
-
 @dataclass(frozen=True)
 class V41DSparkHeadWeights:
     """Small replicated heads in the ABI names expected by the lib stages."""
@@ -279,9 +259,8 @@ class V41DSparkWeightContract:
     def load_heads(self) -> V41DSparkHeadWeights:
         """Load only the replicated head tensors and normalize main-proj layout.
 
-        The checkpoint stores ``main_proj`` as ``[D, 3D]`` while the lib ABI
-        consumes BF16 ``[3D, D]``. Quantized main-projection payloads use the
-        checkpoint's block32 E8M0 scales; the confidence ABI requires FP32.
+        The lib ABI uses input-major FP8 NZ weights ``[3D, D]`` and packed
+        E8M0 scales ``[3D/32, D]``. The confidence ABI requires FP32.
         """
         values = self.loader.store.load_many(tuple(DSPARK_HEAD_SOURCE_TO_ABI))
         main_proj = values["mtp.0.main_proj.weight"]
@@ -319,15 +298,16 @@ class V41DSparkWeightContract:
             DSPARK_HEAD_SOURCE_TO_ABI[name]: value
             for name, value in values.items()
         }
-        if main_proj.dtype == torch.float8_e4m3fn:
-            scale_name = "mtp.0.main_proj.scale"
-            self.loader.store.require((scale_name,))
-            scale = self.loader.store.load_many((scale_name,))[scale_name]
-            result["main_proj_weight"] = _dequantize_main_projection(main_proj, scale)
-        elif main_proj.dtype == torch.bfloat16:
-            result["main_proj_weight"] = main_proj.transpose(0, 1).contiguous()
-        else:
-            raise ValueError("DSpark main_proj.weight must be BF16 or block32 FP8 E4M3")
+        if main_proj.dtype != torch.float8_e4m3fn:
+            raise ValueError("DSpark main_proj.weight must be block32 FP8 E4M3")
+        scale_name = "mtp.0.main_proj.scale"
+        self.loader.store.require((scale_name,))
+        scale = self.loader.store.load_many((scale_name,))[scale_name]
+        if scale.dtype != torch.float8_e8m0fnu or bool((scale.view(torch.uint8) == 255).any()):
+            raise ValueError("DSpark main_proj.scale must contain finite E8M0 scales")
+        weight, packed_scale = fp8_input_major(main_proj, scale)
+        result["main_proj_weight"] = pack_nz(weight)
+        result["main_proj_scale"] = packed_scale
         result["confidence_weight"] = confidence.float().contiguous()
         return V41DSparkHeadWeights(result)
 
