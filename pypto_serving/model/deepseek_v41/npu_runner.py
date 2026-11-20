@@ -4089,7 +4089,8 @@ def make_production_bindings(
             dspark_programs, dspark_param_names = {}, {}
         prefill, prefill_names = compile_prefill_fwd(
             compiler, root, prefill_topology,
-            dspark_fused=bool(runtime.num_speculative_tokens),
+            dspark_fused=(bool(runtime.num_speculative_tokens)
+                          and os.environ.get("PYPTO_DSPARK_FUSED_PREFILL") == "1"),
         )
         head_entry = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd").l3_generation_head
         decode_head = compiler.compile("v41_generation_head", head_entry)
