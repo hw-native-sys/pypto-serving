@@ -4219,7 +4219,9 @@ def make_production_bindings(
             dspark_host = allocate_dspark_host_resources(DSparkResourceLayout(
                 dp_size=topology.dp, max_seq_len=max_seq_len,
                 vocab_size=plan.weights.config.vocab_size,
-                max_prefill_tokens=min(max_seq_len, DSPARK_WINDOW),
+                max_prefill_tokens=(prefill_topology.capacity
+                                    if "draft_main_proj_weight" in prefill_names
+                                    else min(max_seq_len, DSPARK_WINDOW)),
             ))
             # Reuse the already validated target RoPE table.  The draft ABI
             # uses the same 32-wide adjacent-pair table as the target.
