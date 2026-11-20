@@ -48,7 +48,6 @@ from .dspark_resources import DSPARK_MAX_BATCH_PER_DP, DSPARK_WINDOW
 from .dspark_runtime import (
     DECODE_STAGE_ORDER,
     PROPOSE_STAGE_ORDER,
-    PREFILL_STAGE_ORDER,
     DSPARK_ROWS_PER_REQUEST,
     DSPARK_SPECULATIVE_TOKENS,
     DSparkDecodeDispatch,
@@ -1201,7 +1200,7 @@ def compile_decode_fwd(compiler, lib_root, topology):
 
 
 def compile_decode_fwd_dspark(compiler, lib_root, topology):
-    """Compile DSpark decode, bootstrap, and optional prefill context stages."""
+    """Compile the DSpark decode and prefill-context composites."""
     import pypto.language as pl
 
     if topology.tp != 1:
@@ -1209,18 +1208,14 @@ def compile_decode_fwd_dspark(compiler, lib_root, topology):
     load_segment_modules(lib_root, topology)
     module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd_dspark")
     entries = {"decode": module.l3_decode_fwd_dspark}
-    state = importlib.import_module("models.deepseek_v4_1_flash.dspark_init")
-    entries.update({name.removeprefix("l3_"): getattr(state, name) for name in (
-        "l3_bootstrap_inputs", "l3_publish_bootstrap",
-        "l3_prepare_prefill_drafter_geometry")})
     drafter = importlib.import_module("models.deepseek_v4_1_flash.dspark_drafter")
     entries["dspark_drafter"] = drafter.l3_dspark_drafter
-    # Issue #345 moves draft context KV preparation into the prefill path.  The
-    # stage is optional while Lib and Serving are released independently, so an
-    # older Lib keeps the existing bootstrap path.
     context_kv = getattr(drafter, "l3_dspark_prefill_context_kv", None)
-    if context_kv is not None:
-        entries["prefill_context_kv"] = context_kv
+    if context_kv is None:
+        raise MissingCompositeInterface(
+            "selected Lib must expose l3_dspark_prefill_context_kv for V4.1 DSpark"
+        )
+    entries["prefill_context_kv"] = context_kv
     entries["markov_sample"] = importlib.import_module(
         "models.deepseek_v4_1_flash.markov").l3_markov_output
     programs = {}
@@ -3688,7 +3683,7 @@ class V41ResidentResources:
         try:
             self._run_dspark_prefill_context(lowered)
             rank, row = self._dspark_request_rows(lowered, 1)
-            state = self.dspark.record_bootstrap(
+            state = self.dspark.record_prefill(
                 request_id, slot=slot, generation=generation,
                 prompt_length=prompt_length, anchor=anchor,
                 draft_ids=(),
