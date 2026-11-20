@@ -29,6 +29,7 @@ EXPECTED = {
     ("ci.yml", "unit-tests"): "a2a3",
     ("ci.yml", "v41-a5-smoke"): "a5",
     ("daily_ci.yml", "dspark-performance"): "a2a3",
+    ("daily_v41_a5.yml", "v41-performance"): "a5",
 }
 CALLERS = {
     (path.name, job_name): step

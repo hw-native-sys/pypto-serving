@@ -1,0 +1,113 @@
+name: Daily V4.1 A5 Performance
+
+on:
+  schedule:
+    - cron: '0 18 * * *'  # 02:00 Asia/Shanghai.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-v41-a5-performance
+  cancel-in-progress: false
+
+jobs:
+  v41-performance:
+    runs-on: [self-hosted, linux, npu-a5]
+    timeout-minutes: 720
+    env:
+      # Nightly uses eight cards. Manual validation uses four.
+      DEVICE_COUNT: ${{ github.event_name == 'schedule' && '8' || '4' }}
+      PTOAS_ROOT: ${{ github.workspace }}/v41-perf-checkout/ptoas-bin
+      PTO_ISA_ROOT: ${{ github.workspace }}/v41-perf-checkout/pto-isa
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      CCACHE_UMASK: '000'
+      PYPTO_WORKER_INIT_TIMEOUT: '3600'
+
+    steps:
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Check V4.1 checkpoint and CANN root
+        shell: bash
+        run: |
+          if [ -z "${PYPTO_DSV41_MODEL_DIR:-}" ] || [ ! -d "$PYPTO_DSV41_MODEL_DIR" ]; then
+            echo "::error::PYPTO_DSV41_MODEL_DIR must point to the V4.1 checkpoint on this A5 runner"
+            exit 1
+          fi
+          # Match the existing A5 smoke job's runner configuration repair.
+          root="${CANN_ROOT:-}"
+          parent="${root%/*}"
+          if [ ! -d "$root" ] && [ -n "$parent" ] && \
+             [ "${root##*/}" = "${parent##*/}" ] && [ -f "$parent/set_env.sh" ]; then
+            printf 'CANN_ROOT=%s\n' "$parent" >> "$GITHUB_ENV"
+          fi
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: v41-perf-checkout
+          needs-device: 'true'
+          runtime-platform: a5
+          # Use the same compiler as the existing A5 K5 guard.
+          pypto-revision: 7302cd7ffeb552b3bec7c0e5bd92f164ba9fbd4b
+          toolchain: bundle
+          build-namespace: pypto-serving-v41-daily
+          pip-cache-name: pip-pypto-serving-v41-daily
+
+      - name: Warm up and measure fixed V4.1 workload
+        id: benchmark
+        shell: bash
+        run: |
+          source "$GITHUB_WORKSPACE/v41-perf-checkout/activate.sh"
+          checkout="$GITHUB_WORKSPACE/v41-perf-checkout"
+          output="$checkout/daily-v41-results-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          printf -v checkout_q '%q' "$checkout"
+          printf -v model_q '%q' "$PYPTO_DSV41_MODEL_DIR"
+          printf -v output_q '%q' "$output"
+          printf -v source_q '%q' "$PYPTO_SRC"
+          printf -v cache_q '%q' "$CI_CACHE_ROOT/jit-v41-daily-$RUNNER_NAME-dp$DEVICE_COUNT"
+          run_cmd="cd $checkout_q && source activate.sh"
+          run_cmd="$run_cmd && PYPTO_SRC=$source_q PYTHONPATH=$checkout_q:\${PYTHONPATH:-}"
+          run_cmd="$run_cmd PYPTO_WORKER_INIT_TIMEOUT=3600 PYPTO_LOG_LEVEL=error PYPTO_RUNTIME_LOG=error"
+          run_cmd="$run_cmd PYPTO_CACHE=1 PYPTO_CACHE_READONLY=0 PYPTO_CACHE_DIR=$cache_q"
+          sidecar_var="PYPTO_V41_DAILY_DP${DEVICE_COUNT}_PREPACKED_WEIGHTS"
+          if [ -n "${!sidecar_var:-}" ]; then
+            printf -v sidecar_q '%q' "${!sidecar_var}"
+            run_cmd="$run_cmd $sidecar_var=$sidecar_q"
+          fi
+          run_cmd="$run_cmd python scripts/daily_serving_perf.py --profile v41-a5 --model $model_q --output-dir $output_q"
+          task-submit --device auto --device-num "$DEVICE_COUNT" \
+            --timeout 4800 --max-time 28800 --run "$run_cmd"
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: v41-perf-checkout
+
+      - name: Publish performance summary
+        if: always()
+        shell: bash
+        run: |
+          report="$GITHUB_WORKSPACE/v41-perf-checkout/daily-v41-results-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/report.md"
+          if [ -f "$report" ]; then
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'V4.1 performance produced no report; inspect setup and task-submit logs.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload performance results
+        if: ${{ always() && steps.benchmark.outcome != 'skipped' }}
+        uses: ./.github/actions/upload-results
+        with:
+          name: v41-a5-dp${{ env.DEVICE_COUNT }}-perf-${{ github.run_attempt }}
+          path: v41-perf-checkout/daily-v41-results-${{ github.run_id }}-${{ github.run_attempt }}
