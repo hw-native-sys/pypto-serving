@@ -25,6 +25,7 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_MAX_LOGIT_ROWS,
     DSPARK_RANKS,
     DSPARK_VOCAB_SIZE,
+    DSparkCacheLayout,
     DSparkModelRunner,
 )
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
@@ -144,7 +145,7 @@ def test_dspark_stages_eos_mask_for_prefill_and_k7_decode():
     runner._decode_task_args = [SimpleNamespace(tensors={"grammar_mask": masks, "valid_draft_counts": counts})]
     runner._decode_grammar_rows = [set(), set()]
     runner._compiled = SimpleNamespace(
-        layout=SimpleNamespace(tp_size=4), num_speculative_tokens=DSPARK_DRAFTER_QUERY_WIDTH,
+        layout=DSparkCacheLayout.for_ranks(16), num_speculative_tokens=DSPARK_DRAFTER_QUERY_WIDTH,
     )
     runner._drafter_state = lambda _: SimpleNamespace(pending_draft_tokens=[])
     inputs = SimpleNamespace(

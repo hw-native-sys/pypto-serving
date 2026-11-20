@@ -80,7 +80,7 @@ class DeepSeekDSpark:
             raise ValueError("index K/scale geometry mismatch")
         # Pair only peers that agree on terminal-state coverage as well as bytes.
         layout = digest(("history-prefix-state-tail", tuple(geometry[c.name].layout for c in COMPONENTS)))
-        return Contract("deepseek-v4-dspark-k7", model, layout, COMPONENTS)
+        return Contract("deepseek-v4-dspark", model, layout, COMPONENTS)
 
     def prefix_spec(self, tokens, cache):
         groups = tuple(g.name for g in cache.group_specs if g.sliding_window is None)
@@ -164,8 +164,9 @@ class DSparkExtension:
                                tail.nbytes // (slots * rows), str(tail.dtype)))
         return tuple(result)
 
-    def worker_options(self):
-        return self.transfer.worker_options()
+    @staticmethod
+    def allocation_options(scope, name=""):
+        return {"exportable": True} if scope == "cache" or (scope, name) == ("prefill_state", "hidden") else {}
 
     def worker_ready(self):
         self.transfer.worker_ready()
@@ -175,15 +176,21 @@ class DSparkExtension:
         with span(logger, "pd.compute_communication.initialize"):
             self.worker()._w._ensure_comm_base()
 
+    def needs_source_tail_capture(self, descriptors):
+        window = self.compiled.layout.sliding_window
+        return any(row.chunk_start < row.prompt_len and row.chunk_end > max(0, row.prompt_len - window)
+                   for row in descriptors)
+
     def wrap_capture(self, capture):
         if self.runner.speculative:
             return capture
-        window = self.compiled.layout.sliding_window
         def retain(batch, inputs, **kwargs):
             # P only exports the final prompt tail. Keep the existing all-rank
             # collective intact when any packed request overlaps that window.
-            if any(row.chunk_start < row.prompt_len and row.chunk_end > max(0, row.prompt_len - window)
-                   for row in inputs.descriptors):
+            needed = inputs.source_tail_capture
+            if needed is None:
+                needed = self.needs_source_tail_capture(inputs.descriptors)
+            if needed:
                 result = capture(batch, inputs, **kwargs)
                 for request, row in zip(inputs.request_ids, inputs.descriptors, strict=True):
                     if row.chunk_end == row.prompt_len:
@@ -271,7 +278,7 @@ class DSparkExtension:
         """
         import torch
         from pypto_serving.model.deepseek_dspark.npu_runner import (
-            DSPARK_DRAFTER_QUERY_WIDTH, DSPARK_SAMPLED_IDS_PAD, DSparkStepDescriptor,
+            DSPARK_SAMPLED_IDS_PAD, DSparkStepDescriptor,
         )
 
         runner = self.runner
@@ -303,7 +310,7 @@ class DSparkExtension:
             state.prefill_tail_positions = torch.arange(start, length, dtype=torch.int64)
             state.prefill_descriptor = DSparkStepDescriptor(
                 state.lease, state.generation, state.group, length - 1, 1, length, 0, 1, 0, ordinal,
-                bootstrap_enabled=(length + DSPARK_DRAFTER_QUERY_WIDTH - 1
+                bootstrap_enabled=(length + self.compiled.layout.draft_tokens - 1
                                    < runner._require_rope_tables().max_position))
             ring = torch.full((window,), -1, dtype=torch.int32)
             ring[state.prefill_tail_positions % window] = state.prefill_tail_positions.to(torch.int32)

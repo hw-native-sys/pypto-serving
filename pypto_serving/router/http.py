@@ -105,6 +105,11 @@ def error_response(error, session_id):
                         status_code=error.status, headers=headers)
 
 
+async def wait_for_disconnect(request):
+    while (await request.receive())["type"] != "http.disconnect":
+        pass
+
+
 async def send(client, registry, replica, path, *, headers, stream=True, timeout=None, **body):
     import httpx
 

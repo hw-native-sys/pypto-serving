@@ -380,6 +380,12 @@ class PrefillBatch:
     # only already-bound lib composite arguments; it never rebuilds operators.
     dspark_stages: object | None = None
 
+    @property
+    def has_terminal_chunk(self) -> bool:
+        return not self.prompt_lens or any(
+            end >= prompt for end, prompt in zip(self.seq_lens, self.prompt_lens, strict=True)
+        )
+
 
 @dataclass
 class PrefillResult:

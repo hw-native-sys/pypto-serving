@@ -25,6 +25,8 @@ from .pool import Extents
 # batching rationale: a tested large-payload default and a 1.5 MiB compact table.
 BATCH_BYTES = 256 << 20
 BATCH_SPANS = 32768
+_STOP_ONLY = 1
+_UNKNOWN = 2
 logger = logging.getLogger(__name__)
 
 
@@ -53,7 +55,8 @@ class Endpoint:
         with self.lock:
             if self.stopped.value:
                 raise RuntimeError("cache owner already stopped")
-            if self.failed.value:
+            failed = self.failed.value
+            if failed and (failed != _STOP_ONLY or operation != "stop"):
                 raise RuntimeError("cache owner endpoint is quarantined")
             try:
                 self.sequence.value += 1
@@ -62,13 +65,18 @@ class Endpoint:
                 if not self.parent.poll(60):
                     raise RuntimeError("cache owner completion unknown: response timeout")
                 received, success, result = self.parent.recv()
-                if received != sequence:
+                if received != sequence or type(success) is not bool:
                     raise RuntimeError("cache owner completion identity mismatch")
                 if not success:
-                    raise RuntimeError(f"cache owner failed: {result}")
+                    message, poisoned = result
             except Exception:
-                self.failed.value = True
+                self.failed.value = _UNKNOWN
                 raise
+            if not success:
+                # A confirmed registration failure precedes any copy. Stop may
+                # retire partial imports, while all data commands stay gated.
+                self.failed.value = _STOP_ONLY if operation == "register" and poisoned is False else _UNKNOWN
+                raise RuntimeError(f"cache owner failed: {message}")
             if operation == "stop":
                 self.stopped.value = True
             return result

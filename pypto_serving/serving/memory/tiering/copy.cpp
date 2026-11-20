@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <tuple>
 #include <vector>
+#include <unistd.h>
 
 struct Span {
     uintptr_t device, host;
@@ -37,7 +38,9 @@ extern "C" uint64_t prefault_read(const void *base, size_t bytes)
 {
     auto p = static_cast<const volatile uint8_t *>(base);
     uint64_t value = 0;
-    for (size_t i = 0; i < bytes; i += (2UL << 20)) {
+    // A fresh consumer mapping may use base pages even with MADV_HUGEPAGE.
+    const size_t page_bytes = static_cast<size_t>(getpagesize());
+    for (size_t i = 0; i < bytes; i += page_bytes) {
         value += p[i];
     }
     if (bytes) {
@@ -87,15 +90,11 @@ extern "C" int copy_cache_batch(const Span *spans, size_t count, int kind,
     for (const auto &c : commands) {
         void *dst = reinterpret_cast<void *>(store ? c.host : c.device);
         void *src = reinterpret_cast<void *>(store ? c.device : c.host);
-        const size_t dp = store ? c.host_pitch : c.device_pitch;
-        const size_t sp = store ? c.device_pitch : c.host_pitch;
-        if (c.rows == 1 || (dp == c.width && sp == c.width)) {
-            const auto bytes = c.width * c.rows;
-            code = aclrtMemcpyAsync(dst, bytes, src, bytes, static_cast<aclrtMemcpyKind>(kind), stream);
-        } else {
-            code = aclrtMemcpy2dAsync(dst, dp, src, sp, c.width, c.rows,
-                                    static_cast<aclrtMemcpyKind>(kind), stream);
-        }
+        const size_t dp = c.rows == 1 ? c.width : (store ? c.host_pitch : c.device_pitch);
+        const size_t sp = c.rows == 1 ? c.width : (store ? c.device_pitch : c.host_pitch);
+        // Use the same 2D path for strided and contiguous spans over imported VMM.
+        code = aclrtMemcpy2dAsync(dst, dp, src, sp, c.width, c.rows,
+                                 static_cast<aclrtMemcpyKind>(kind), stream);
         if (code) break;
     }
     ticks[1] = now();

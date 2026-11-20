@@ -189,12 +189,15 @@ linear-chain acceptance semantics, and the weight shard policy (synthetic
 checkpoints; the production checkpoint validates opt-in through
 `PYPTO_DSV4_DSPARK_MODEL_DIR`).
 
-## Speculative decoding (K=7)
+## Speculative decoding
 
 Select with `--speculative-config '{"method": "dspark",
-"num_speculative_tokens": 7}'`; `0` keeps the target-only path. K is fixed at
-`DSPARK_QUERY_WIDTH = 7` -- the decode tile is exactly one committed row plus
-seven draft rows.
+"num_speculative_tokens": 5}'` for K5, or use `7` for K7; `0` keeps the
+target-only path. K is fixed per instance. `DSparkCacheLayout` derives the
+verification tile as one committed row plus K draft rows, along with the
+drafter query, token-state and CSA transaction-ring widths. The sampler's
+physical eight-column stride and the 128-token bootstrap history remain
+independent of this logical width.
 
 The runner owns the request-to-lease map in `_drafter_states`.
 `_reserve_drafter_state()` and `release_finished_requests()` manage its lifetime;

@@ -4,15 +4,27 @@ PD is opt-in. Without `--pd-role`, Serving does not load PD or Mooncake, create 
 
 ## Requirements
 
-The initial adapter supports DeepSeek V4 Flash DSpark K7, greedy sampling, identical model weights and compatible cache formats on P and D. Use Serving's pinned PyPTO-Lib, which includes independent-head support from [Lib PR #1542](https://github.com/hw-native-sys/pypto-lib/pull/1542) and the matching checkpoint-publication ABI from [Lib PR #1707](https://github.com/hw-native-sys/pypto-lib/pull/1707).
+The adapter supports DeepSeek V4 Flash DSpark K5/K7, greedy sampling, identical model weights and compatible cache formats on P and D. Use Serving's pinned PyPTO-Lib, which includes independent-head support from [Lib PR #1542](https://github.com/hw-native-sys/pypto-lib/pull/1542) and the matching checkpoint-publication ABI from [Lib PR #1707](https://github.com/hw-native-sys/pypto-lib/pull/1707).
 
-Use matching PyPTO/Simpler source builds with owner-local service and allocation-retain hooks; these hooks are not upstream APIs yet. PyPTO must expose `chip_service_factories`, `retain_service_tensor`, and `release_service_tensor`, backed by Simpler's owner-local allocation pinning. Its `RunConfig` must support explicit `backend_type` and `execution_mode` fields. These are required interfaces, not a fallback to an older runtime.
+Use matching upstream PyPTO/Simpler builds with leased VMM Buffer exports (PyPTO #3397 and Simpler #3101). PyPTO must expose `alloc_tensor(exportable=True)`, `export_buffer`, and `release_export`; Simpler supplies `BufferMapping`. No owner-service SDK patch is required. `RunConfig` must support explicit `backend_type` and `execution_mode` fields.
 
 Control protocol version 3 separates the common replicated-page data contract from each node's local rank groups. All participants must use the same protocol version; older schemas are rejected. Every destination cache replica selects a complete source replica from the request's Prefill partition. Page/ring formats must remain compatible: this is replica mapping, not a general sharded-layout conversion.
 
-Follow the SDK's normal source-build instructions with its matching runtime pin and required PTOAS version. The tested integration uses PTOAS 0.67. Keep runtime revision checks enabled; a binary copied from another checkout is not a matching source installation.
+Follow the SDK's normal source-build instructions with its matching runtime pin and required PTOAS version. The native Buffer integration requires PTOAS 0.74 with its matching SDK pin. Keep runtime revision checks enabled; a binary copied from another checkout is not a matching source installation.
 
-Model nodes require Linux Python with `os.pidfd_open` and a working Mooncake Ascend installation. Startup checks these dependencies before loading weights. Mooncake registers all regions inside their real allocation owners before the first transfer; adding regions after a peer connection is established is not supported. Transfers are device-to-device without Host staging. Deploy on a trusted network: internal control endpoints are not authenticated.
+Model nodes require Linux Python with `os.pidfd_open` and a Mooncake Ascend build that supports `register_memory(address, extent, "npu")`. Startup checks the binding before loading weights. [Mooncake #2191](https://github.com/kvcache-ai/Mooncake/pull/2191)
+
+Each rank has an independent transfer process and ACL context. It imports leased buffers on the same host and registers its own mapped addresses with Mooncake before the first transfer. The compute Worker retains allocation ownership; registration never exposes its process-local pointer to another process. Adding regions after a peer connection is established is not supported. Transfers are device-to-device without Host staging. Deploy on a trusted network: internal control endpoints are not authenticated.
+
+On RoCE hosts, set these variables on both model nodes before starting Serving or loading the SDK.
+
+```bash
+export HCCL_INTRA_ROCE_ENABLE=1
+export HCCL_HOST_SOCKET_PORT_RANGE=auto
+export HCCL_NPU_SOCKET_PORT_RANGE=auto
+```
+
+Automatic HCCL ports let the compute communicator coexist with the AscendDirect transfer process on each device. AscendDirect can use a rank-table device port, so check the actual listeners and complete a P-to-D request before sending production traffic. Buffer export and mapping are independent of the network transport.
 
 Install `python -m pip install -e '.[pd]'` in each environment. The Router only needs this extra, not PyPTO, model weights, or NPUs. Optional constrained tools use the ordinary [XGrammar deployment requirements](../models/deepseek-v4/tool-constraints.md).
 
@@ -36,7 +48,7 @@ pypto-serving \
   --pd-config examples/pd.json --pd-role prefill --host 0.0.0.0 --port 8000
 ```
 
-Use `--pd-role decode` on D; both launchers specify K7, while P internally runs target-only prefill. D can use `--max-num-batched-tokens 2048` while P keeps 8192. D plans rolling KV from the smaller of its token budget and 8192, and ignores `--long-prefill-token-threshold`; continuation-state rings are budgeted separately. D still validates eight positions per request and does not run a local Prefill. The global scheduling budget does not force a batch to fill it.
+Use `--pd-role decode` on D; both launchers specify the chosen K, while P internally runs target-only prefill. Set `num_speculative_tokens` to `5` for K5 or retain `7` for K7. D can use `--max-num-batched-tokens 2048` while P keeps 8192. D plans rolling KV from the smaller of its token budget and 8192, and ignores `--long-prefill-token-threshold`; continuation-state rings are budgeted separately. D verifies K+1 positions per request and does not run a local Prefill. The global scheduling budget does not force a batch to fill it.
 
 P and D rings may differ in length. Handoff selects the model's required logical tail and checkpoint state, then maps each page through the two local tables; D receives directly into its reservation without copying or shrinking a ring at takeover. Full-history compressed KV and index suffixes retain their normal coverage, and final request-local state/bootstrap still transfers on a full KV hit. A model-contract fingerprint checks byte layouts and the matching/state policy. Revision-specific Host and device qualification is recorded in the [DDR offload PR validation](https://github.com/hw-native-sys/pypto-serving/pull/319). The historical topology and context checks below do not qualify every later revision.
 
@@ -112,7 +124,14 @@ iteration begins; it does not limit the duration of an active stream.
 The Router preserves its configured HTTP connect and write/pool timeouts. PD
 generation reads use `pd.request_timeout` as a read-idle timeout, with a separate
 response-header wait as described above. These are not an end-to-end generation
-deadline. Descriptor and HTTP abort probes cap each HTTP phase at five seconds.
+deadline. HTTP abort probes cap each HTTP phase at five seconds.
+
+When no compatible healthy pair is available, requests can wait up to 15 seconds
+for node recovery. The health poller and waiting requests share one probe round
+per node. Each round tries up to three descriptor probes, capped at five seconds
+each, with immediate retries after timeouts. The Router uses a healthy pair as
+soon as one is available and excludes nodes reporting shutdown. A client
+disconnect removes the waiting request before P/D dispatch or slot allocation.
 
 Before response headers, Router-generated errors contain `object: "error"`, a
 stable `code` and a readable `message`, with `X-PyPTO-Error-Source: router`.
@@ -235,7 +254,7 @@ Prepared synchronous and asynchronous paths exclude explicit input preparation. 
 
 ## Execution, extension and shutdown
 
-The common Router refreshes PD descriptors through its existing background health monitor. It becomes ready only when a compatible healthy P/D pair exists. Ordinary session-affine routing is unchanged; PD retains round-robin pair selection without session pinning. The PD coordinator fixes a pair per request and sends two ordinary generation POSTs concurrently. P prepares input once; D reserves shared read-only prefix and writable suffix/state. P sends token IDs and generation/parser settings once; D derives its Prefix hashes locally from the agreed model layout. After each confirmed prefill chunk, P submits a rank-mapped transfer only when pages need copying. Empty chunks still confirm sequence progress without creating a native job or pinning source pages. Owner-side communication and an independent progress channel overlap subsequent computation; taking a terminal result also retires its job record, without an extra command through the compute worker. D validates all required regions, commits through CacheManager, accepts the grammar seed, and adopts the request into ordinary K7 decode. Final request-local state is transferred even on a complete D prefix hit; output does not wait for P's source cleanup. Full-history compressed KV and index pages stream incrementally. Rolling target KV is sent at final handoff: its receive range covers the Decode tail and, where resident, the latest reusable Prefix checkpoint. The receiver validates that range and uses its actual publication floor, so uncopied older pages are never published. Physical ring periods and kernel shapes are unchanged. Final state and bootstrap hidden remain mandatory, including on a full D Prefix hit.
+The common Router refreshes PD descriptors through its existing background health monitor. It becomes ready only when a compatible healthy P/D pair exists. Ordinary session-affine routing is unchanged; PD retains round-robin pair selection without session pinning. The PD coordinator fixes a pair per request and sends two ordinary generation POSTs concurrently. P prepares input once; D reserves shared read-only prefix and writable suffix/state. P sends token IDs and generation/parser settings once; D derives its Prefix hashes locally from the agreed model layout. After each confirmed prefill chunk, P submits a rank-mapped transfer only when pages need copying. Empty chunks still confirm sequence progress without creating a native job or pinning source pages. Transfer-process communication and an independent progress channel overlap subsequent computation; taking a terminal result also retires its job record, without an extra command through the compute worker. D validates all required regions, commits through CacheManager, accepts the grammar seed, and adopts the request into ordinary speculative decode. Final request-local state is transferred even on a complete D prefix hit; output does not wait for P's source cleanup. Full-history compressed KV and index pages stream incrementally. Rolling target KV is sent at final handoff: its receive range covers the Decode tail and, where resident, the latest reusable Prefix checkpoint. The receiver validates that range and uses its actual publication floor, so uncopied older pages are never published. Physical ring periods and kernel shapes are unchanged. Final state and bootstrap hidden remain mandatory, including on a full D Prefix hit.
 
 DSpark sizes each cache group from the tightest post-resident rank budget using
 `--npu-memory-utilization` (default `0.90`), including filler/alignment, live rings,
@@ -253,4 +272,4 @@ P also captures the last 128 prompt tokens' target hidden states, without loadin
 
 Terminal output waits for request retirement, including the local state-release acknowledgement, before the Router can admit a replacement. Normal Decode completion reuses Serving's FIFO worker-release ACK without an extra control barrier. Initial-token termination and cancellation without that ACK still explicitly discard reserved state. HTTP cancellation does not cancel the owned retirement task. A confirmed abort for a request that was never admitted consumes no capacity and authorizes no writes.
 
-To shut down normally, stop admitting requests at the Router, let active requests finish, then stop P before D. Confirm sender registrations and pins have retired before freeing receiver memory. Deterministic errors reclaim normally; uncertain native completion gates the affected node and retains its writable suffix/state and bootstrap slot, not healthy shared prefix. Recovery is manual/external: no automatic restart, transfer replay, or backend fallback. Before write authorization, a cached placement without receive-suffix capacity can be released and retried once through normal cold allocation; this is not a transfer retry. Do not equate a closed HTTP connection with stopped DMA.
+To shut down normally, stop admitting requests at the Router, let active requests finish, then stop P before D. Confirm sender registrations and pins have retired before freeing receiver memory. Each consumer drains native work, unregisters and disconnects Mooncake, unmaps its VMM imports, and only then releases source export leases. An unconfirmed export, mapping cleanup, or native completion keeps that lease reachable; process/HTTP completion does not release it. Deterministic errors reclaim normally; uncertain native completion gates the affected node and retains its writable suffix/state and bootstrap slot, not healthy shared prefix. Recovery is manual/external: no automatic restart, transfer replay, or backend fallback. Before write authorization, a cached placement without receive-suffix capacity can be released and retried once through normal cold allocation; this is not a transfer retry. Do not equate a closed HTTP connection with stopped DMA.

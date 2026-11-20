@@ -24,6 +24,7 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_RANKS,
     DSPARK_VOCAB_SIZE,
     DSparkModelRunner,
+    DSparkCacheLayout,
 )
 
 
@@ -113,7 +114,7 @@ def test_k7_mask_rows_and_draft_caps_are_isolated() -> None:
     counts = torch.full((DSPARK_RANKS, DSPARK_DECODE_BATCH), DSPARK_DRAFTER_QUERY_WIDTH, dtype=torch.int32)
     runner._decode_task_args = [SimpleNamespace(tensors={"grammar_mask": masks, "valid_draft_counts": counts})]
     runner._decode_grammar_rows = [set(), set()]
-    runner._compiled = SimpleNamespace(layout=SimpleNamespace(tp_size=4))
+    runner._compiled = SimpleNamespace(layout=DSparkCacheLayout.for_ranks(16))
     runner._drafter_state = lambda request_id: SimpleNamespace(pending_draft_tokens=[11, 12, 13])
     inputs = SimpleNamespace(
         buffer_slot=0, request_ids=("r",), groups=(1,), group_ordinals=(5,), sampled_slots=((6, 40),)
@@ -144,7 +145,7 @@ def test_ordinary_dispatch_reuses_immutable_device_defaults() -> None:
 
     runner = DSparkModelRunner.__new__(DSparkModelRunner)
     runner._default_grammar_args = {}
-    runner._compiled = SimpleNamespace(layout=SimpleNamespace(ranks=1, decode_batch=64))
+    runner._compiled = SimpleNamespace(layout=SimpleNamespace(ranks=1, decode_batch=64, max_logit_rows=128, draft_tokens=7))
     runner._ensure_shared_host_allocation_before_worker = lambda _name: None
     runner._prepare_default_grammar_args()
     defaults = runner._default_grammar_args
@@ -195,7 +196,7 @@ def test_decode_double_buffers_shrink_and_failure_clear_old_rows():
 
     state = State()
     runner = DSparkModelRunner.__new__(DSparkModelRunner)
-    runner._compiled = SimpleNamespace(layout=SimpleNamespace(tp_size=1))
+    runner._compiled = SimpleNamespace(layout=DSparkCacheLayout.for_ranks(16, tp_size=1))
     runner._decode_task_args = [SimpleNamespace(tensors={
         "grammar_mask": torch.full((1, 16, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS), -1, dtype=torch.int16),
         "valid_draft_counts": torch.full((1, 2), 7, dtype=torch.int32),
@@ -237,7 +238,7 @@ def test_failed_decode_mask_staging_cannot_poison_reused_slot() -> None:
     counts = torch.full((DSPARK_RANKS, DSPARK_DECODE_BATCH), DSPARK_DRAFTER_QUERY_WIDTH, dtype=torch.int32)
     runner._decode_task_args = [SimpleNamespace(tensors={"grammar_mask": masks, "valid_draft_counts": counts})]
     runner._decode_grammar_rows = [set(), set()]
-    runner._compiled = SimpleNamespace(layout=SimpleNamespace(tp_size=4))
+    runner._compiled = SimpleNamespace(layout=DSparkCacheLayout.for_ranks(16))
     runner._drafter_state = lambda request_id: SimpleNamespace(pending_draft_tokens=[11])
     inputs = SimpleNamespace(
         buffer_slot=0, request_ids=("r",), groups=(1,), group_ordinals=(5,), sampled_slots=((6, 40),)

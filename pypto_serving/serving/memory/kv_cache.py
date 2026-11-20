@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import math
 import struct
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 
 import torch
@@ -88,9 +88,40 @@ class FreeKVCacheBlockQueue:
         self.tail = block
         self.count += 1
 
-    def append_n(self, blocks: list[KVCacheBlock]) -> None:
+    def append_n(self, blocks: Sequence[KVCacheBlock], *, front: bool = False) -> None:
+        """Link a known batch once, preserving its supplied eviction order."""
+        if not blocks:
+            return
+        first, last = blocks[0], blocks[-1]
+        previous = None
         for block in blocks:
-            self.append(block)
+            block.prev_free = previous
+            if previous is not None:
+                previous.next_free = block
+            previous = block
+        if front:
+            last.next_free = self.head
+            if self.head is not None:
+                self.head.prev_free = last
+            else:
+                self.tail = last
+            self.head = first
+        else:
+            first.prev_free = self.tail
+            last.next_free = None
+            if self.tail is not None:
+                self.tail.next_free = first
+            else:
+                self.head = first
+            self.tail = last
+        self.count += len(blocks)
+
+    def move_to_front(self, blocks: Sequence[KVCacheBlock]) -> None:
+        """Relink known queued nodes in O(batch size), without scanning the queue."""
+        blocks = list({block.block_id: block for block in blocks}.values())
+        for block in blocks:
+            self.remove(block)
+        self.append_n(blocks, front=True)
 
     def popleft(self) -> KVCacheBlock | None:
         if self.head is None:
@@ -175,7 +206,8 @@ class GroupBlockSnapshot:
     """Host-only pin returned by the cache manager; release through that manager."""
 
     _owner: KvCacheManager | None = field(repr=False)
-    _groups: tuple[tuple[FreeKVCacheBlockQueue, tuple[KVCacheBlock, ...]], ...] = field(repr=False)
+    # The ring endpoint is frozen at capture; live tables may subsequently wrap/COW.
+    _groups: tuple[tuple[_GroupBlockPool, int, tuple[KVCacheBlock, ...], int | None], ...] = field(repr=False)
 
 
 class KvCacheManager:
@@ -1131,6 +1163,8 @@ class KvCacheManager:
         self,
         block_ids_by_group: dict[str, Sequence[int]],
         partition: int,
+        *,
+        token_count: int | None = None,
     ) -> GroupBlockSnapshot:
         """Pin one scheduled grouped block-table snapshot until its step settles.
 
@@ -1158,11 +1192,13 @@ class KvCacheManager:
                             f"Cannot retain unowned grouped KV block {name}:{block_id}"
                         )
                     blocks.append(block)
-                groups.append((pool.free_queues[partition], tuple(blocks)))
+                end = (self._logical_group_blocks(pool, token_count)
+                       if token_count is not None and pool.spec.sliding_window is not None else None)
+                groups.append((pool, partition, tuple(blocks), end))
 
             # Resolve and validate everything before acquiring any references.
             snapshot = GroupBlockSnapshot(self, tuple(groups))
-            for _, blocks in snapshot._groups:
+            for _, _, blocks, _ in snapshot._groups:
                 for block in blocks:
                     block.ref_cnt += 1
             return snapshot
@@ -1175,18 +1211,55 @@ class KvCacheManager:
         with profile_span("cache.snapshot.release", cat="cache"):
             if snapshot._owner is not self:
                 raise RuntimeError("Grouped KV snapshot belongs to another manager or was already released")
-            for queue, blocks in snapshot._groups:
-                for block in blocks:
-                    if block.ref_cnt <= 0:
-                        raise RuntimeError(
-                            f"Grouped KV snapshot block {block.block_id} has invalid ref_cnt={block.ref_cnt}"
-                        )
-                    block.ref_cnt -= 1
-                    if block.ref_cnt == 0:
-                        queue.append(block)
+            for pool, partition, blocks, end in snapshot._groups:
+                self._release_group_blocks(pool, partition, self._group_tail(blocks, end))
             # A retired handle must not keep the manager or its pages alive.
             snapshot._groups = ()
             snapshot._owner = None
+            self._maintain_group_checkpoints()
+
+    @staticmethod
+    def _group_tail(blocks: Sequence, end: int | None = None):
+        """Iterate a logical vector/ring tail first, without sorting physical IDs."""
+        if end is None:
+            return reversed(blocks)
+        size = len(blocks)
+        return (blocks[index % size] for index in range(end - 1, end - size - 1, -1))
+
+    def _release_group_blocks(self, pool, partition, blocks: Iterable[KVCacheBlock | None]):
+        """Return references in supplied tail order; pins remain allocator fences."""
+        released, orphaned = [], []
+        checkpoints = self._group_checkpoints
+        for block in blocks:
+            if block is None:
+                continue
+            if block.ref_cnt <= 0:
+                raise RuntimeError(f"Grouped KV block {block.block_id} has invalid ref_cnt={block.ref_cnt}")
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0:
+                orphan = (checkpoints is not None and pool.spec.sliding_window is not None
+                          and (pool.spec.name, block.block_id) not in checkpoints.pages)
+                (orphaned if orphan else released).append(block)
+        queue = pool.free_queues[partition]
+        queue.append_n(released)
+        queue.append_n(orphaned, front=True)
+
+    def _maintain_group_checkpoints(self):
+        """Batch joint invalidation and relink only known, currently free orphans."""
+        checkpoints = self._group_checkpoints
+        if checkpoints is None or not (checkpoints.history_changed or checkpoints.orphans):
+            return
+        checkpoints.prune(self._group_pools)
+        batches = {}
+        for name, block_id in checkpoints.orphans:
+            pool = self._group_pools[name]
+            block = pool.blocks[block_id]
+            if block.ref_cnt == 0 and (name, block_id) not in checkpoints.pages:
+                partition = block_id // pool.blocks_per_partition
+                batches.setdefault(pool.free_queues[partition], []).append(block)
+        checkpoints.orphans.clear()
+        for queue, blocks in batches.items():
+            queue.move_to_front(blocks)
 
     def cache_group_blocks_from_snapshot(
         self,
@@ -1257,7 +1330,7 @@ class KvCacheManager:
                                            valid_from, checkpoint_boundary)
         return cached_counts
 
-    def _protect_group_checkpoint(self, request_id, hashes, tokens, partition, valid_from, boundary, *, preferred=True):
+    def _protect_group_checkpoint(self, request_id, hashes, tokens, partition, valid_from, boundary):
         if boundary is None:
             # Publishers without a local replay target (e.g. an external fill)
             # retain the allocator's latest checkpoint for future requests.
@@ -1272,9 +1345,9 @@ class KvCacheManager:
                 return
             self._group_checkpoints = GroupPrefixCheckpoints()
         owner = request_id if request_id in self._group_request_partitions else None
-        self._group_checkpoints.prune(self._group_pools)
+        self._maintain_group_checkpoints()
         self._group_checkpoints.publish(owner, self._group_pools, hashes, tokens, partition,
-                                        boundary, valid_from, preferred=preferred)
+                                        boundary, valid_from)
         if self.tiering is not None:
             self.tiering.publish_checkpoint(hashes, tokens, partition, boundary)
 
@@ -1298,19 +1371,22 @@ class KvCacheManager:
         if self.tiering is not None:
             self.tiering.capture(pool.spec.name, partition, block)
 
-    def pin_cached_group_blocks(self, members, partition):
+    def pin_cached_group_blocks(self, members, partition, *, token_count=None):
         """Retain exact immutable cache pages, including currently evictable pages."""
         groups = []
         for name, blocks in members.items():
             pool = self._group_pools[name]
-            blocks = tuple({block.block_id: block for block in blocks}.values())
+            if token_count is not None and pool.spec.sliding_window is not None:
+                end = self._logical_group_blocks(pool, token_count)
+                blocks = reversed(tuple(self._group_tail(blocks, end)))
+            blocks = tuple({block.block_id: block for block in blocks if block is not None}.values())
             if any(pool.hash_to_block.get((partition, block.block_hash)) is not block for block in blocks):
                 raise RuntimeError("cached snapshot content changed before pin")
-            groups.append((pool.free_queues[partition], blocks))
-        for queue, blocks in groups:
+            groups.append((pool, partition, blocks, None))
+        for pool, partition, blocks, _ in groups:
             for block in blocks:
                 if block.ref_cnt == 0:
-                    queue.remove(block)
+                    pool.free_queues[partition].remove(block)
                 block.ref_cnt += 1
         return GroupBlockSnapshot(self, tuple(groups))
 
@@ -1331,10 +1407,12 @@ class KvCacheManager:
                 pages[name, value] = block
         except BaseException:
             self.release_group_block_snapshot(GroupBlockSnapshot(
-                self, tuple((self._group_pools[name].free_queues[partition], tuple(blocks))
+                self, tuple((self._group_pools[name], partition, tuple(blocks), None)
                             for name, blocks in members.items())))
             raise
-        pin = GroupBlockSnapshot(self, tuple((self._group_pools[name].free_queues[partition], tuple(blocks))
+        finally:
+            self._maintain_group_checkpoints()
+        pin = GroupBlockSnapshot(self, tuple((self._group_pools[name], partition, tuple(blocks), None)
                                              for name, blocks in members.items()))
         return pages, pin
 
@@ -1372,9 +1450,7 @@ class KvCacheManager:
     ) -> KVCacheBlock:
         """Take and initialize one evictable block from a group partition."""
         queue = pool.free_queues[partition]
-        block = (self._group_checkpoints.victim(pool, queue)
-                 if self._group_checkpoints is not None and pool.spec.sliding_window is not None
-                 else queue.head)
+        block = queue.head
         if block is None:
             raise RuntimeError(
                 f"KV cache group {pool.spec.name!r} free queue became inconsistent"
@@ -1428,9 +1504,13 @@ class KvCacheManager:
         self,
         request_id: str,
         token_count: int,
+        partitions: Sequence[int] | None = None,
     ) -> list[int]:
         assigned = self._group_request_partitions.get(request_id)
-        candidates = [assigned] if assigned is not None else list(range(self.group_partition_count))
+        if assigned is not None:
+            candidates = (assigned,) if partitions is None or assigned in partitions else ()
+        else:
+            candidates = range(self.group_partition_count) if partitions is None else partitions
         limit = next(iter(self._group_pools.values())).spec.max_requests_per_partition
         return [
             partition
@@ -1444,8 +1524,11 @@ class KvCacheManager:
             )
         ]
 
-    def _select_group_partition(self, request_id: str, token_count: int) -> int | None:
-        candidates = self._candidate_group_partitions(request_id, token_count)
+    def select_group_partition(
+        self, request_id: str, token_count: int, *, partitions: Sequence[int] | None = None,
+    ) -> int | None:
+        """Choose among capacity-qualified partitions, optionally restricted by the caller."""
+        candidates = self._candidate_group_partitions(request_id, token_count, partitions)
         if not candidates:
             return None
         assigned = self._group_request_partitions.get(request_id)
@@ -1460,14 +1543,13 @@ class KvCacheManager:
             )
             for partition in candidates
         }
-        minimum = min(owned_counts.values())
-        least_loaded = {partition for partition, count in owned_counts.items() if count == minimum}
-        for offset in range(self.group_partition_count):
-            partition = (self._next_group_partition + offset) % self.group_partition_count
-            if partition in least_loaded:
-                self._next_group_partition = (partition + 1) % self.group_partition_count
-                return partition
-        raise RuntimeError("group partition selection became inconsistent")
+        from .placement import least_loaded_partition
+        partition = least_loaded_partition(candidates, owned_counts, self._next_group_partition,
+                                           self.group_partition_count)
+        if partition not in candidates:
+            raise RuntimeError("placement selected an ineligible cache partition")
+        self._next_group_partition = (partition + 1) % self.group_partition_count
+        return partition
 
     def can_ensure_group_blocks(
         self,
@@ -1522,7 +1604,7 @@ class KvCacheManager:
         selected = (
             partition
             if partition is not None
-            else self._select_group_partition(request_id, token_count)
+            else self.select_group_partition(request_id, token_count)
         )
         if selected is None or not self.can_ensure_group_blocks(
             request_id,
@@ -1584,25 +1666,14 @@ class KvCacheManager:
                         raise RuntimeError(
                             f"KV cache group {name!r} has an unallocated ring slot"
                         )
-                    if block.ref_cnt > 1:
-                        # The expired source page stays immutable for its other
-                        # owners. The replacement starts empty: no KV copy is
-                        # needed because this request is about to overwrite it.
-                        block.ref_cnt -= 1
-                        owned[slot] = self._take_group_block(pool, selected)
-                    else:
-                        # Rotate through the eviction queue even for a sole
-                        # owner. This preserves immutable rolling checkpoints
-                        # whenever spare pages exist, while still falling back
-                        # to the same physical page when the partition is
-                        # saturated.
-                        block.ref_cnt = 0
-                        pool.free_queues[selected].append(block)
-                        owned[slot] = self._take_group_block(pool, selected)
+                    # Other owners keep an immutable source. A sole-owner
+                    # page returns through the same eviction policy as pins;
+                    # unassociated working pages may be reused immediately.
+                    self._release_group_blocks(pool, selected, (block,))
+                    owned[slot] = self._take_group_block(pool, selected)
             pool.request_logical_blocks[request_id] = max(previous, target)
 
-        if self._group_checkpoints is not None:
-            self._group_checkpoints.prune(self._group_pools)
+        self._maintain_group_checkpoints()
         result = {}
         for name, pool in self._group_pools.items():
             block_ids = []
@@ -1626,21 +1697,14 @@ class KvCacheManager:
                 raise RuntimeError(f"Grouped request {request_id!r} has blocks without a partition")
 
             pool.request_partitions.pop(request_id, None)
-            pool.request_logical_blocks.pop(request_id, None)
+            end = pool.request_logical_blocks.pop(request_id, len(blocks))
             pool.request_blocks.pop(request_id, None)
             if partition is None:
                 continue
-            for block in blocks:
-                if block is None:
-                    continue
-                if block.ref_cnt <= 0:
-                    raise RuntimeError(
-                        f"Grouped KV block {block.block_id} has invalid ref_cnt={block.ref_cnt}"
-                    )
-                block.ref_cnt -= 1
-                if block.ref_cnt == 0:
-                    pool.free_queues[partition].append(block)
+            self._release_group_blocks(pool, partition, self._group_tail(
+                blocks, end if pool.spec.sliding_window is not None else None))
         self._group_request_partitions.pop(request_id, None)
+        self._maintain_group_checkpoints()
 
     @property
     def reservations(self) -> GroupedCacheReservations:

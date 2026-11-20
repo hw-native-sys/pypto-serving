@@ -128,10 +128,11 @@ class ServingRouter:
         # congestion indistinguishable from a dead backend, for every replica
         # at once, because the pool is what they have in common.
         self.probe_client = client_factory(config)
-        self.proxy = (PDCoordinator(pd_config, self.registry, self.client, self.probe_client) if config.is_pd
-                      else ReplicaProxy(self.registry, self.client, config.connect_timeout_seconds))
         self.health = HealthMonitor(config, self.registry, self.sessions, self.probe_client,
-                                    probe=self.proxy.probe if config.is_pd else None)
+                                    probe=(lambda spec: self.proxy.probe(spec)) if config.is_pd else None)
+        self.proxy = (PDCoordinator(pd_config, self.registry, self.client, self.probe_client,
+                                    self.health.probe_node) if config.is_pd
+                      else ReplicaProxy(self.registry, self.client, config.connect_timeout_seconds))
         self._admin_token = admin_token
         fleet_kwargs = {
             "state_path": state_path,

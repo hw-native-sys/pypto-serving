@@ -13,6 +13,7 @@ import ctypes
 from dataclasses import make_dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -201,13 +202,12 @@ def _runner(*, speculative: bool = False, max_position: int = 512, extension_fac
         runner._markov_task_args.allocate_host_shared(None)
         from pypto_serving.model.deepseek_dspark.npu_runner import (
             DSPARK_DRAFTER_BATCHES,
-            DSPARK_DRAFTER_CONTEXT_BUCKETS,
             DSPARK_DRAFT_LAYERS,
             DSPARK_DRAFTER_TABLE_BLOCKS,
         )
 
         ranks = layout.ranks
-        for extent in DSPARK_DRAFTER_CONTEXT_BUCKETS:
+        for extent in layout.drafter_context_buckets:
             group_extent = tp_size * extent
             runner._drafter_context_staging[extent] = {
                 "context_group_position_ids": torch.zeros(
@@ -737,6 +737,20 @@ def test_drafter_and_markov_task_arg_orders_match_pypto_lib_abis() -> None:
     )
     assert len(task_args_module._DRAFTER_TENSOR_ORDER) == 59
     assert len(task_args_module._MARKOV_TENSOR_ORDER) == 12
+
+
+def test_k5_host_redraft_reads_only_the_target_hidden_slab():
+    layout = replace(DSparkCacheLayout.for_ranks(8, num_speculative_tokens=5), ranks=1)
+    hidden = object()
+    read = Mock(side_effect=RuntimeError("stop after readback"))
+    runner = SimpleNamespace(
+        _compiled=SimpleNamespace(layout=layout), _active_drafter_target_hidden=None, _drafter_hidden_mirror=hidden,
+        _require_rope_tables=lambda: SimpleNamespace(max_position=4096), _read_drafter_hidden=read,
+    )
+    row = DSparkDrafterRequestRow("r", 0, 0, 128, 1, 42, 0, True)
+    with pytest.raises(RuntimeError, match="stop after readback"):
+        DSparkModelRunner._run_decode_drafter(runner, [[row]], buffer_slot=0)
+    read.assert_called_once_with(hidden, rows=96)
 
 
 def test_drafter_staging_contract() -> None:

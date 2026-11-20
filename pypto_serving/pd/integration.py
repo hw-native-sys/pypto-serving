@@ -9,7 +9,10 @@
 """Optional composition; Serving exposes capabilities, not PD business logic."""
 
 import asyncio
-from contextlib import asynccontextmanager
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import copy_context
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 import json
@@ -30,7 +33,8 @@ from pypto_serving.serving.server.server import ChatCompletionRequest, Completio
 from pypto_serving.serving.server.serving_worker import spawn_worker
 from .adapter import select_adapter
 from .config import Config, log_context
-from .protocol import Binding, CapacityExhausted, Continuation, Node, decode
+from .protocol import CLOSING_HEADER, Binding, CapacityExhausted, Continuation, Node, decode
+from .scheduler import PrefillScheduler
 from .service import ExecutionError, NodeUnavailable, Service
 from .worker import Progress, Services, WorkerSettings
 
@@ -48,16 +52,33 @@ class Chunk:
     state_slots: dict[str, int] = field(default_factory=dict)
 
 
-def prefill_scheduler(*, config, kv_cache_manager):
-    return Scheduler(config=replace(config, stop_after_prefill=True), kv_cache_manager=kv_cache_manager)
-
-
 class PrefillCore(ReplicaEngineCore):
     publish = None
 
+    def _try_dispatch_step(self):
+        # Dispatched batches each need a slot when their results are published.
+        # The scheduler accounts for pinned pages in the request's cache partition.
+        pending = Counter(s.request.request_id for _, output in self._batch_queue
+                          for s in output.scheduled_requests)
+        for request in self.scheduler.running:
+            request_id = request.request_id
+            entry = self.service.requests.get(request_id)
+            queue = self.service.chunks.get(request_id)
+            request.scheduling_held = not (
+                entry is not None and not entry.cancelled and entry.error is None
+                and queue is not None and queue.qsize() + pending[request_id] < queue.maxsize)
+        return super()._try_dispatch_step()
+
     def _process_step_output(self, output, tokens, drafts=None):
-        super()._process_step_output(output, tokens, drafts)
-        self.publish(output, tokens)
+        # Transfer the dispatch snapshot before generic reconciliation releases
+        # it: a later chunk may already have rebound the live rolling pages.
+        try:
+            with self.publish(output, tokens):
+                super()._process_step_output(output, tokens, drafts)
+        except BaseException:
+            for scheduled in output.scheduled_requests:
+                self.scheduler.discard_scheduled_request(scheduled)
+            raise
 
 
 class Server(ServingServer):
@@ -68,6 +89,25 @@ class Server(ServingServer):
                                  stop_profile=engine.stop_profile)
         super().__init__(facade, engine.config.model_id, generate)
         service.preflight = self._preflight_constraint
+        self._tokenizer_pool = (ThreadPoolExecutor(max_workers=1, thread_name_prefix="pd-input")
+                                if service.role == "prefill" else None)
+
+    async def close_inputs(self):
+        if self._tokenizer_pool is not None:
+            await asyncio.to_thread(self._tokenizer_pool.shutdown, cancel_futures=True)
+
+    async def _prefill(self, entry, public, kind, peer):
+        if kind == "chat":
+            prompt, config, parser, constraint = await self.prepare_chat(public)
+        else:
+            prompt, config = self.prepare_completion(public)
+            parser = constraint = None
+        self.service.adapter.validate(config)
+        tokens = tuple(await asyncio.get_running_loop().run_in_executor(
+            self._tokenizer_pool, copy_context().run, self.real_engine._tokenize_prompt, prompt))
+        continuation = Continuation(tokens, asdict(config), asdict(parser) if parser else None,
+                                    constraint.to_wire() if constraint else None)
+        await self.service.prefill(entry, continuation, peer)
 
     def _register_exception_handlers(self):
         super()._register_exception_handlers()
@@ -103,10 +143,11 @@ class Server(ServingServer):
 
     async def descriptor(self):
         node = self.service.node
+        headers = {CLOSING_HEADER: "1"} if self.service.closing else None
         if node is None:
-            return JSONResponse(dict(error="node initializing"), status_code=503)
+            return JSONResponse(dict(error="node initializing"), status_code=503, headers=headers)
         return JSONResponse(msgspec.to_builtins(msgspec.structs.replace(
-            node, healthy=self.service.is_ready())))
+            node, healthy=self.service.is_ready())), headers=headers)
 
     async def abort(self, request: HTTPRequest):
         binding = decode(await request.json(), Binding)
@@ -133,26 +174,26 @@ class Server(ServingServer):
         entry = self.service.register_http(binding, raw)
         if self.service.role == "prefill":
             try:
-                if kind == "chat":
-                    prompt, config, parser, constraint = await self.prepare_chat(public)
-                else:
-                    prompt, config = self.prepare_completion(public)
-                    parser = constraint = None
-                self.service.adapter.validate(config)
-                tokens = tuple(self.real_engine._tokenize_prompt(prompt))
-                continuation = Continuation(tokens, asdict(config), asdict(parser) if parser else None,
-                                            constraint.to_wire() if constraint else None)
-                entry.task = asyncio.create_task(self.service.prefill(entry, continuation, peer))
+                entry.task = asyncio.create_task(self._prefill(entry, public, kind, peer))
+                def completed(task):
+                    entry.transferred.set()
+                    if not task.cancelled():
+                        task.exception()
+                entry.task.add_done_callback(completed)
                 try:
-                    await asyncio.shield(entry.task)
+                    await entry.transferred.wait()
+                    if entry.error is not None:
+                        raise entry.error
+                    if entry.task.done():
+                        await entry.task
                 except asyncio.CancelledError:
-                    entry.cancelled = True
+                    await self.service.abort(entry)
                     await asyncio.shield(entry.task)
                     raise
                 return JSONResponse(dict(request=binding.request, status="ready"))
             except BaseException as exc:
                 if isinstance(exc, asyncio.CancelledError):
-                    entry.cancelled = True
+                    await self.service.abort(entry)
                 if entry.error is None:
                     self.service.fail(entry, exc)
                 if (entry.task is None or entry.task.done()) and binding.request not in self.service.pins.active:
@@ -196,8 +237,8 @@ class Application:
     def __init__(self, engine_config, config, role, endpoint, tokenizer, generate):
         self.boot = uuid.uuid4().hex
         self.adapter = select_adapter(engine_config.executor_cls)
-        if engine_config.runtime_config.num_speculative_tokens != 7:
-            raise ValueError("PD deployment requires the K7 model configuration")
+        if engine_config.runtime_config.num_speculative_tokens <= 0:
+            raise ValueError("PD deployment requires speculative decoding")
         self.config = config
         progress = channel = None
         if role == "prefill":
@@ -207,22 +248,22 @@ class Application:
         settings = WorkerSettings(self.boot, endpoint.transfer_hostname or endpoint.host,
                                   config.provider, config.capacity, len(config.prefill) + len(config.decode),
                                   config.handoff_timeout)
-        tokens = 0 if role == "prefill" else 7
+        tokens = 0 if role == "prefill" else engine_config.runtime_config.num_speculative_tokens
         engine_config = replace(engine_config,
             runtime_config=replace(engine_config.runtime_config, num_speculative_tokens=tokens),
             executor_kwargs={**engine_config.executor_kwargs, "num_speculative_tokens": tokens,
                 "execution_role": role,
                 "capture_prefill_tail": role == "prefill",
                 "runner_extension_factory": partial(self.adapter.worker_factory,
-                                                      settings=settings, progress_channel=channel)},
-            async_scheduling=role == "decode")
+                                                      settings=settings, progress_channel=channel)})
         self.engine = AsyncLLMEngine(engine_config, tokenizer, core_factory=partial(
             PrefillCore if role == "prefill" else ReplicaEngineCore,
-            scheduler_factory=prefill_scheduler if role == "prefill" else Scheduler,
+            scheduler_factory=PrefillScheduler if role == "prefill" else Scheduler,
             worker_factory=partial(spawn_worker, services_factory=Services)))
         self.core = self.engine.single_core()
         self.service = Service(config, endpoint, role, self.adapter, self.core, progress)
         if role == "prefill":
+            self.core.service = self.service
             self.core.publish = self.wrap_results()
         self.server = Server(self.service, self.engine, generate)
         self.app = self.server.app
@@ -237,30 +278,41 @@ class Application:
             await self.stop()
 
     def wrap_results(self):
-        counters = {}
+        @contextmanager
         def complete(output, tokens, drafts=None):
-            for scheduled in output.scheduled_requests:
-                if not scheduled.is_prefill:
-                    continue
-                request = scheduled.request
-                rid = request.request_id
-                end = scheduled.num_computed_tokens + scheduled.num_new_tokens
-                final = end >= request.num_prompt_tokens
-                first = tokens.get(rid)
-                if isinstance(first, list):
-                    first = first[0] if first else None
-                if final and first is None:
-                    raise RuntimeError("final Prefill has no sampled first token")
-                if scheduled.cache_partition is None:
-                    raise RuntimeError("Prefill has no cache partition")
-                self.core.scheduler.hold_request(rid)
-                chunk = counters.get(rid, 0)
-                counters[rid] = chunk + 1
-                if final:
-                    counters.pop(rid)
-                self.service.chunks[rid].put_nowait(Chunk(rid, chunk, scheduled.num_computed_tokens,
-                    end, final, first, {k: tuple(v) for k, v in scheduled.block_ids_by_group.items()},
-                    scheduled.cache_partition))
+            results = []
+            try:
+                for scheduled in output.scheduled_requests:
+                    if not scheduled.is_prefill:
+                        continue
+                    request = scheduled.request
+                    rid = request.request_id
+                    entry = self.service.requests.get(rid)
+                    if entry is None or entry.cancelled or request.status.is_finished:
+                        continue
+                    end = scheduled.num_computed_tokens + scheduled.num_new_tokens
+                    final = end >= request.num_prompt_tokens
+                    first = tokens.get(rid)
+                    if isinstance(first, list):
+                        first = first[0] if first else None
+                    if final and first is None:
+                        raise RuntimeError("final Prefill has no sampled first token")
+                    if scheduled.cache_partition is None:
+                        raise RuntimeError("Prefill has no cache partition")
+                    result = Chunk(rid, entry.produced_chunks, scheduled.num_computed_tokens,
+                        end, final, first, {k: tuple(v) for k, v in scheduled.block_ids_by_group.items()},
+                        scheduled.cache_partition)
+                    self.service.pins.retain(result, snapshot=scheduled.group_block_snapshot)
+                    scheduled.group_block_snapshot = None
+                    results.append((entry, result))
+                yield
+            except BaseException:
+                for _, result in results:
+                    self.service.pins.release(result.request, result.chunk)
+                raise
+            for entry, result in results:
+                entry.produced_chunks += 1
+                self.service.chunks[result.request].put_nowait(result)
         return complete
 
     async def start(self):
@@ -274,6 +326,7 @@ class Application:
     async def stop(self):
         # Unsafe retirement raises before registered allocations can be freed.
         await self.service.close()
+        await self.server.close_inputs()
         await self.engine.stop()
         if self.progress is not None:
             await self.progress.close()
@@ -284,7 +337,6 @@ def run(args, engine_config, generate):
     import uvicorn
     from pypto_serving.tools.profile import configure_profiler
     from pypto_serving.serving.utils.env import configure_runtime_logging
-    from inspect import signature
     from .transfer import provider_class
     from pypto_serving.model.tokenizer import load_tokenizer
     if args.prompt or not args.pd_config:
@@ -292,11 +344,8 @@ def run(args, engine_config, generate):
     config = Config.load(args.pd_config)
     if not hasattr(os, "pidfd_open"):
         raise ValueError("PD model nodes require Linux Python with os.pidfd_open")
-    from pypto.runtime.distributed_runner import DistributedWorker
-    if ("chip_service_factories" not in signature(DistributedWorker).parameters
-            or not all(hasattr(DistributedWorker, name)
-                       for name in ("retain_service_tensor", "release_service_tensor"))):
-        raise ValueError("PyPTO lacks the required owner-service and tensor-retain interfaces")
+    from pypto_serving.serving.utils.native_buffers import check_buffer_exports
+    check_buffer_exports()
     provider_class(config.provider).check_available()
     logging.basicConfig(level=logging.INFO)
     configure_runtime_logging()
