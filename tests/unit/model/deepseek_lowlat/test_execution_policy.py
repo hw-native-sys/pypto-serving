@@ -41,6 +41,11 @@ def test_default_policy_has_no_lowlat_behavior_or_model_metadata():
     policy.confirm_step(SchedulerOutput(), StepResult({}), object())
 
 
+def test_prefill_only_step_does_not_require_native_retirement_receipt():
+    policy = LowlatExecutionPolicy(EngineConfig())
+    policy.confirm_step(SchedulerOutput(), StepResult({}), Mock())
+
+
 def test_shared_reservation_does_not_impose_k5_cycle_or_frame_counts():
     reservation = DecodeReservation(1, "other-model", 2, 3, 9, 256, 20, 7)
     assert reservation.cycles == 3 and reservation.frame_id == 7

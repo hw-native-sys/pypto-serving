@@ -112,16 +112,21 @@ class LowlatExecutionPolicy(ExecutionPolicy):
     def confirm_step(self, output, result, cache):
         from .decoding import decode_decode_extension, decode_retirement, validate_native_retirement
 
-        if not result.model_extension:
-            raise ValueError("lowlat step is missing its execution extension")
-        extension = decode_decode_extension(result.model_extension)
-        retired_reservation_ids = extension.retired_reservation_ids
-        execution_receipts = extension.execution_receipts
         expected = [s for s in output.scheduled_requests if s.model_execution_plan is not None]
-        if retired_reservation_ids != tuple(
-            s.model_execution_plan.reservation_id for s in expected
-        ) or len(execution_receipts) != len(expected):
-            raise ValueError("native physical retirement receipt count/ID differs")
+        if expected:
+            if not result.model_extension:
+                raise ValueError("lowlat step is missing its execution extension")
+            extension = decode_decode_extension(result.model_extension)
+            retired_reservation_ids = extension.retired_reservation_ids
+            execution_receipts = extension.execution_receipts
+            if retired_reservation_ids != tuple(
+                s.model_execution_plan.reservation_id for s in expected
+            ) or len(execution_receipts) != len(expected):
+                raise ValueError("native physical retirement receipt count/ID differs")
+        else:
+            # A prefill-only step has no native parent to retire. Its result may
+            # still carry cache publication proofs, which are validated below.
+            execution_receipts = ()
         updates = []
         for scheduled, payload in zip(expected, execution_receipts, strict=True):
             receipt = decode_retirement(payload)
