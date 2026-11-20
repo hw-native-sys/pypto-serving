@@ -3419,6 +3419,10 @@ class V41ResidentResources:
             counts = (host.stage_full(dispatch_step, embeddings, self.engram_host)
                       if step.phase == "prefill" and self._prefill_fwd is not None else
                       host.stage(dispatch_step, self.engram_host) if host is not None else None)
+            if (step.phase == "prefill" and self.dspark_host_resources is not None
+                    and self._prefill_binding is not None
+                    and "draft_main_proj_weight" in self._prefill_binding[1]):
+                self._stage_fused_dspark_prefill(dispatch_step)
             input_runtime = self.decode_input if step.phase == "decode" else self.input
             if input_runtime is None:
                 raise ValueError("decode requires its own TP-local input capacity")
@@ -3434,6 +3438,34 @@ class V41ResidentResources:
             self._step, self._inputs = step, inputs
             self._group_counts = counts
             return state
+
+    def _stage_fused_dspark_prefill(self, step):
+        """Stage draft KV geometry for the current target-prefill chunk."""
+        resources = self.dspark_host_resources
+        prefill = resources.prefill
+        prefill["prefill_counts"].zero_()
+        prefill["context_slots"].fill_(-1)
+        prefill["context_rope_cos"].zero_()
+        prefill["context_rope_sin"].zero_()
+        offsets = [0] * resources.layout.dp_size
+        pages_per_slot = (resources.layout.max_seq_len + DSPARK_WINDOW - 1) // DSPARK_WINDOW
+        draft_cos = resources.rope_tables["draft_cos"]
+        draft_sin = resources.rope_tables["draft_sin"]
+        for request in step.requests:
+            rank = request.partition
+            count = len(request.token_ids)
+            offset = offsets[rank]
+            offsets[rank] += count
+            slot = request.state_slot
+            positions = torch.arange(request.start, request.end, dtype=torch.int32)
+            pages = slot * pages_per_slot + torch.div(
+                positions, DSPARK_WINDOW, rounding_mode="floor")
+            slots = pages * DSPARK_WINDOW + torch.remainder(positions, DSPARK_WINDOW)
+            prefill["context_slots"][rank, :, offset:offset + count] = slots
+            prefill["context_rope_cos"][rank, offset:offset + count] = draft_cos[rank, positions.long()]
+            prefill["context_rope_sin"][rank, offset:offset + count] = draft_sin[rank, positions.long()]
+        for rank, count in enumerate(offsets):
+            prefill["prefill_counts"][rank, 0] = count
 
     def run_prefill_fwd(self, state, step):
         if (self.closed or step is not self._step or step.phase != "prefill"
