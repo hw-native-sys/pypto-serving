@@ -24,6 +24,7 @@ DSPARK_SPECULATIVE_TOKENS = 5
 DSPARK_ROWS_PER_REQUEST = DSPARK_SPECULATIVE_TOKENS + 1
 
 DECODE_STAGE_ORDER = ("decode",)
+PROPOSE_STAGE_ORDER = ("dspark_drafter", "markov_sample")
 
 # These names are the serving-to-lib handoff, rather than an implementation
 # detail of any one runner.  Keep the contract explicit so a provider cannot
@@ -141,8 +142,8 @@ class DSparkLoweredInputs:
         the resident resource allocator.  In particular, this method never
         creates a placeholder tensor for a missing binding.
         """
-        if phase not in ("prefill", "decode"):
-            raise ValueError("DSpark phase must be 'prefill' or 'decode'")
+        if phase not in ("prefill", "decode", "propose"):
+            raise ValueError("DSpark phase must be 'prefill', 'propose' or 'decode'")
 
         def has_field(container, name):
             if isinstance(container, Mapping):
@@ -344,9 +345,10 @@ class DSparkStageRunner:
         self.dispatch = dispatch
 
     def run(self, stages: Sequence[tuple[str, Mapping[str, Any]]], *, phase: str) -> None:
-        if phase not in ("prefill", "decode"):
-            raise ValueError("DSpark phase must be 'prefill' or 'decode'")
-        expected = PREFILL_STAGE_ORDER if phase == "prefill" else DECODE_STAGE_ORDER
+        if phase not in ("prefill", "propose", "decode"):
+            raise ValueError("DSpark phase must be 'prefill', 'propose' or 'decode'")
+        expected = (PREFILL_STAGE_ORDER if phase == "prefill" else
+                    PROPOSE_STAGE_ORDER if phase == "propose" else DECODE_STAGE_ORDER)
         names = tuple(name for name, _ in stages)
         if names != expected:
             raise ValueError(f"DSpark {phase} stages must follow the lib order: {expected}")

@@ -47,6 +47,7 @@ from .engram import HostEngram
 from .dspark_resources import DSPARK_MAX_BATCH_PER_DP, DSPARK_WINDOW
 from .dspark_runtime import (
     DECODE_STAGE_ORDER,
+    PROPOSE_STAGE_ORDER,
     PREFILL_STAGE_ORDER,
     DSPARK_ROWS_PER_REQUEST,
     DSPARK_SPECULATIVE_TOKENS,
@@ -2779,7 +2780,8 @@ class _DSparkOrchestratorRunner:
 
     def __init__(self, resources, phase):
         self.resources = resources
-        self.expected = PREFILL_STAGE_ORDER if phase == "prefill" else DECODE_STAGE_ORDER
+        self.expected = (PREFILL_STAGE_ORDER if phase == "prefill" else
+                         PROPOSE_STAGE_ORDER if phase == "propose" else DECODE_STAGE_ORDER)
         self.index = 0
 
     def __call__(self, _entry, arguments):
@@ -3472,6 +3474,13 @@ class V41ResidentResources:
                         lowered.markov_model, lowered.cache_tables, lowered.rope_tables,
                         **kwargs,
                     )
+                elif phase == "propose":
+                    module = importlib.import_module("models.deepseek_v4_1_flash.dspark_init")
+                    module.dspark_propose(
+                        runner, lowered.workspace, lowered.draft_model,
+                        lowered.markov_model, lowered.cache_tables, lowered.rope_tables,
+                        **kwargs,
+                    )
                 else:
                     runner(None, self._dspark_decode_arguments(lowered))
                 runner.finish()
@@ -3626,6 +3635,24 @@ class V41ResidentResources:
                 anchor_token=int(lowered.workspace["next_prefill_tokens"][rank[0], row[0]]),
             )
             return state
+        except BaseException:
+            self.failed = True
+            raise
+
+    def run_dspark_propose(self, lowered=None):
+        """Generate proposals before CPU Engram lookup.
+
+        The caller must run the subsequent verify/accept composite after it
+        stages the candidate-dependent Engram rows.  This method is opt-in
+        until the matching Lib verify ABI is available.
+        """
+        if self.dspark is None:
+            raise MissingCompositeInterface("V4.1 DSpark programs were not registered")
+        if lowered is None:
+            raise MissingCompositeInterface("V4.1 DSpark proposal lowering is unavailable")
+        try:
+            self._run_dspark_orchestrator(lowered, phase="propose")
+            return self._read_dspark_output(lowered, "draft_ids")
         except BaseException:
             self.failed = True
             raise
