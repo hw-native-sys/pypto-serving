@@ -96,8 +96,8 @@ class DeepSeekV4LowlatPyptoExecutor(PyptoExecutor):
 
         runner=self._runners[model.config.model_id]
         for registration in registrations:
-            if registration.execution_metadata:
-                descriptor=decode_request_metadata(registration.execution_metadata).prefix_resume
+            if registration.model_extension:
+                descriptor=decode_request_metadata(registration.model_extension).prefix_resume
                 context=runner.request_contexts[registration.request_id]
                 runner.request_contexts[registration.request_id]=LowlatRequestContext(**asdict(context),prefix_resume=descriptor)
 

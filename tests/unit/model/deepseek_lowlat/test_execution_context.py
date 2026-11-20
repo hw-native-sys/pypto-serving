@@ -13,7 +13,8 @@ from unittest.mock import Mock
 import msgspec
 import pytest
 
-from pypto_serving.config.types import GenerateConfig, RequestExecutionContext, RuntimeConfig
+from pypto_serving.config.types import GenerateConfig, RuntimeConfig
+from pypto_serving.serving.model_extension import RequestExecutionContext
 from pypto_serving.serving.engine.async_engine import EngineConfig, ReplicaEngineCore
 from pypto_serving.serving.server.ipc import NewRequestData, StepCommand
 from pypto_serving.serving.server.serving_worker import WorkerProcess

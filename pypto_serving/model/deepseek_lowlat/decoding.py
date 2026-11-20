@@ -42,12 +42,27 @@ class DecodeReservation:
             raise ValueError("invalid lowlat decode reservation")
 
 
-@dataclass(frozen=True)
-class LowlatDecodeExtension:
+class LowlatDecodeExtension(msgspec.Struct, frozen=True):
     """Native retirement data consumed by the lowlat execution policy."""
 
     retired_reservation_ids: tuple[int, ...]
     execution_receipts: tuple[bytes, ...]
+
+
+def encode_decode_extension(extension: LowlatDecodeExtension) -> bytes:
+    return msgspec.msgpack.encode(extension)
+
+
+def decode_decode_extension(payload: bytes) -> LowlatDecodeExtension:
+    return msgspec.msgpack.decode(payload, type=LowlatDecodeExtension)
+
+
+def encode_reservation(reservation: DecodeReservation) -> bytes:
+    return msgspec.msgpack.encode(reservation.__dict__)
+
+
+def decode_reservation_payload(payload: bytes) -> DecodeReservation:
+    return msgspec.msgpack.decode(payload, type=DecodeReservation)
 
 
 @dataclass(frozen=True)

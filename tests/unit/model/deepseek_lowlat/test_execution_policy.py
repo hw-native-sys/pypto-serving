@@ -13,7 +13,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from pypto_serving.config.decoding import DecodeReservation
+from pypto_serving.model.deepseek_lowlat.decoding import DecodeReservation
 from pypto_serving.model.execution_policy import ExecutionPolicy
 from pypto_serving.model.deepseek_lowlat.decoding import validate_reservation
 from pypto_serving.model.deepseek_lowlat.execution_policy import LowlatExecutionPolicy
@@ -21,7 +21,12 @@ from pypto_serving.model.deepseek_lowlat.scheduling import LowlatScheduleState
 from pypto_serving.serving.engine.async_engine import EngineConfig
 from pypto_serving.serving.sched.scheduler import Request, ScheduledRequest, SchedulerOutput
 from pypto_serving.serving.server.ipc import StepResult
-from pypto_serving.model.deepseek_lowlat.decoding import NativeDecodeRetirement, encode_retirement
+from pypto_serving.model.deepseek_lowlat.decoding import (
+    LowlatDecodeExtension,
+    NativeDecodeRetirement,
+    encode_decode_extension,
+    encode_retirement,
+)
 
 
 def test_default_policy_has_no_lowlat_behavior_or_model_metadata():
@@ -52,12 +57,17 @@ def test_malformed_second_native_receipt_cannot_partially_commit_first_request()
         request = Request(str(identity), [1] * 128, max_new_tokens=7)
         request.execution_state = LowlatScheduleState(physical_end=128)
         reservation = DecodeReservation(identity, request.request_id, 1, 1, 6, 256, 6, 0)
-        scheduled.append(ScheduledRequest(request, 1, False, decode_reservation=reservation))
+        scheduled.append(ScheduledRequest(request, 1, False, model_execution_plan=reservation))
         receipts.append(NativeDecodeRetirement(identity, request.request_id, 1, 128, 134, (6,), (5,), 6, 0, 2))
         tokens[request.request_id] = [9] * 6
     bad = receipts[-1]
     receipts[-1] = NativeDecodeRetirement(bad.reservation_id, bad.request_id, 1, 999, 1005, (6,), (5,), 6, 0, 2)
-    result = StepResult(tokens, retired_reservation_ids=(1, 2), execution_receipts=tuple(map(encode_retirement, receipts)))
+    result = StepResult(
+        tokens,
+        model_extension=encode_decode_extension(
+            LowlatDecodeExtension((1, 2), tuple(map(encode_retirement, receipts)))
+        ),
+    )
     cache = Mock()
     with pytest.raises(ValueError, match="physical"):
         policy.confirm_step(SchedulerOutput(scheduled_requests=scheduled), result, cache)
@@ -69,7 +79,8 @@ def test_malformed_second_native_receipt_cannot_partially_commit_first_request()
 
 def test_model_state_and_context_extensions_are_absent_from_shared_types():
     from dataclasses import fields
-    from pypto_serving.config.types import RuntimeConfig, RequestExecutionContext, PrefillBatch
+    from pypto_serving.config.types import RuntimeConfig, PrefillBatch
+    from pypto_serving.serving.model_extension import RequestExecutionContext
 
     assert "confirmed_prefix_cache_namespace" not in {f.name for f in fields(RuntimeConfig)}
     assert "prefix_resume" not in {f.name for f in fields(RequestExecutionContext)}
@@ -92,7 +103,7 @@ def test_unsupported_model_metadata_version_fails_before_execution(kind):
 
 def test_worker_delivers_versioned_prefix_metadata_to_real_model_context_before_prefill():
     import msgspec
-    from pypto_serving.config.types import RequestExecutionContext
+    from pypto_serving.serving.model_extension import RequestExecutionContext
     from pypto_serving.model.deepseek_lowlat.execution_policy import LowlatRequestMetadata
     from pypto_serving.model.deepseek_lowlat.prefix_protocol import PrefixResumeDescriptor
     from pypto_serving.model.deepseek_lowlat.npu_executor import DeepSeekV4LowlatPyptoExecutor
@@ -119,7 +130,7 @@ def test_worker_delivers_versioned_prefix_metadata_to_real_model_context_before_
         None,
         max_output_tokens=64,
         execution_generation=7,
-        execution_metadata=msgspec.msgpack.encode(LowlatRequestMetadata(descriptor)),
+        model_extension=msgspec.msgpack.encode(LowlatRequestMetadata(descriptor)),
     )
     worker._apply_command_lifecycle(StepCommand([registration], [], [], []))
     context = runner.request_contexts["hot"]
@@ -133,7 +144,7 @@ def test_worker_delivers_versioned_prefix_metadata_to_real_model_context_before_
 
 def test_invalid_request_metadata_does_not_leak_k0_registration_after_error_cleanup():
     import msgspec
-    from pypto_serving.config.types import RequestExecutionContext
+    from pypto_serving.serving.model_extension import RequestExecutionContext
     from pypto_serving.model.deepseek_lowlat.npu_executor import DeepSeekV4LowlatPyptoExecutor
     from pypto_serving.model.deepseek_lowlat.npu_runner import LowlatModelRunner
     from pypto_serving.serving.server.ipc import NewRequestData
@@ -149,7 +160,7 @@ def test_invalid_request_metadata_does_not_leak_k0_registration_after_error_clea
         1.0,
         None,
         max_output_tokens=64,
-        execution_metadata=msgspec.msgpack.encode({"version": 2}),
+        model_extension=msgspec.msgpack.encode({"version": 2}),
     )
     with pytest.raises(ValueError, match="version"):
         executor.prepare_request_metadata(
@@ -167,8 +178,8 @@ def test_retirement_model_schema_is_versioned_and_opaque_to_shared_ipc():
     from pypto_serving.serving.server.ipc import encode_result, decode_result
 
     payload = b"model-owned-receipt"
-    result = StepResult({}, execution_receipts=(payload,))
-    assert decode_result(encode_result(result)).execution_receipts == (payload,)
+    result = StepResult({}, model_extension=payload)
+    assert decode_result(encode_result(result)).model_extension == payload
     assert "decode_retirements" not in {f.name for f in fields(DecodeResult)}
     for bad in (b"invalid", msgspec.msgpack.encode({"version": 2, "retirement": {}})):
         with pytest.raises((ValueError, msgspec.DecodeError)):

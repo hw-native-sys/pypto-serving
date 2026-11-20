@@ -110,20 +110,23 @@ class LowlatExecutionPolicy(ExecutionPolicy):
         )
 
     def confirm_step(self, output, result, cache):
-        from .decoding import decode_retirement, validate_native_retirement
+        from .decoding import decode_decode_extension, decode_retirement, validate_native_retirement
 
         extension = result.model_extension
         if isinstance(extension, bytes):
-            extension = None
-        if extension is not None and extension.kind == "deepseek_v4_flash_lowlat":
-            retired_reservation_ids = extension.payload.retired_reservation_ids
-            execution_receipts = extension.payload.execution_receipts
+            extension = decode_decode_extension(extension) if extension else None
+            extension_kind = "deepseek_v4_flash_lowlat"
         else:
-            retired_reservation_ids = result.retired_reservation_ids
-            execution_receipts = result.execution_receipts
-        expected = [s for s in output.scheduled_requests if s.decode_reservation is not None]
+            extension_kind = extension.kind if extension is not None else ""
+        if extension is not None and extension_kind == "deepseek_v4_flash_lowlat":
+            payload = extension.payload if hasattr(extension, "payload") else extension
+            retired_reservation_ids = payload.retired_reservation_ids
+            execution_receipts = payload.execution_receipts
+        else:
+            raise ValueError("lowlat step is missing its typed execution extension")
+        expected = [s for s in output.scheduled_requests if s.model_execution_plan is not None]
         if retired_reservation_ids != tuple(
-            s.decode_reservation.reservation_id for s in expected
+            s.model_execution_plan.reservation_id for s in expected
         ) or len(execution_receipts) != len(expected):
             raise ValueError("native physical retirement receipt count/ID differs")
         updates = []
@@ -132,7 +135,7 @@ class LowlatExecutionPolicy(ExecutionPolicy):
             request = scheduled.request
             validate_native_retirement(
                 receipt,
-                scheduled.decode_reservation,
+                scheduled.model_execution_plan,
                 previous_input_end=request.execution_state.physical_end,
                 previous_raw_outputs=request.execution_state.raw_output_count,
                 max_output_tokens=request.max_new_tokens,

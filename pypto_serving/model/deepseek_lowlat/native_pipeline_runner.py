@@ -17,7 +17,14 @@ import time
 
 import torch
 from pypto_serving.serving.model_extension import ModelStepExtension
-from .decoding import DecodeReservation, LowlatDecodeExtension, NativeDecodeRetirement, encode_retirement
+from .decoding import (
+    DecodeReservation,
+    LowlatDecodeExtension,
+    NativeDecodeRetirement,
+    decode_reservation_payload,
+    encode_reservation,
+    encode_retirement,
+)
 from pypto_serving.config.types import DecodeResult
 
 from .profiling import operation
@@ -91,14 +98,12 @@ class NativePipelineRunner(NativeModelRunner):
 
     @operation("lowlat.native.prepare", category="lowlat")
     def prepare_decode(self, model, batch, *, buffer_slot=0):
-        if len(batch.request_ids) != 1 or len(batch.decode_reservations) != 1:
+        if len(batch.request_ids) != 1 or len(batch.model_extensions) != 1:
             raise ValueError("native pipeline requires one explicit reservation")
-        extension = batch.model_extensions[0] if batch.model_extensions else None
-        reservation = (
-            extension.payload
-            if extension is not None and extension.kind == "deepseek_v4_flash_lowlat"
-            else batch.decode_reservations[0]
-        )
+        extension = batch.model_extensions[0]
+        reservation = extension.payload if extension.kind == "deepseek_v4_flash_lowlat" else None
+        if isinstance(reservation, bytes):
+            reservation = decode_reservation_payload(reservation)
         from .decoding import validate_reservation
 
         validate_reservation(reservation)
@@ -208,8 +213,6 @@ class NativePipelineRunner(NativeModelRunner):
                 ))
                 result = DecodeResult(None, None, sampled_token_ids=torch.tensor([packet.state.last_token]),
                     accepted_token_ids=[list(packet.token_ids)], num_draft_tokens=None,
-                    retired_reservation_ids=(pending.prepared.reservation.reservation_id,),
-                    execution_receipts=(receipt,),
                     model_extension=ModelStepExtension(
                         "deepseek_v4_flash_lowlat",
                         1,
@@ -240,7 +243,7 @@ class NativePipelineRunner(NativeModelRunner):
         return self.reclaim_prepared_decode(self.dispatch_prepared_decode(model, batch, prepared))
 
     def run_decode(self, model, batch):
-        if batch.model_extensions or (batch.decode_reservations and batch.decode_reservations[0] is not None):
+        if batch.model_extensions:
             return self.run_prepared_decode(model, batch, self.prepare_decode(model, batch))
         # Warmup and offline diagnostics still execute exactly one bounded parent.
         # Production async commands must carry the scheduler's reservation.
@@ -265,8 +268,7 @@ class NativePipelineRunner(NativeModelRunner):
             self.request_contexts[state.request_id] = replace(context, execution_generation=1)
         batch = replace(
             batch,
-            model_extensions=(ModelStepExtension("deepseek_v4_flash_lowlat", 1, reservation),),
-            decode_reservations=(reservation,),
+            model_extensions=(ModelStepExtension("deepseek_v4_flash_lowlat", 1, encode_reservation(reservation)),),
         )
         return self.run_prepared_decode(model, batch, self.prepare_decode(model, batch))
 

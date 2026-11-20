@@ -445,13 +445,11 @@ lookahead, retirement receipts and rolling checkpoint publication.
 
 `RequestExecutionContext` and `ModelStepExtension` live in
 `pypto_serving.serving.model_extension`. Prefill batches convert legacy byte
-metadata into a versioned opaque extension at construction. Executor features
+metadata into a versioned opaque extension at construction. The IPC protocol
+has no lowlat-specific reservation or receipt fields; it carries only the
+versioned model extension bytes. Executor features
 are resolved once into `ModelExecutionCapabilities` during worker
 initialization; the worker hot path does not probe executor attributes for
 async or sampling behavior. Lowlat decode receipts are exposed through a
-`deepseek_v4_flash_lowlat` result extension while the legacy receipt fields
-remain wire-compatible for older workers.
-
-The compatibility fields in the common dataclasses are transitional input
-aliases. New model adapters should use `model_extensions` and the capability
-contract. The generic scheduler never interprets native reservation payloads.
+`deepseek_v4_flash_lowlat` result extension. The generic scheduler never
+interprets native reservation payloads.

@@ -9,16 +9,13 @@
 
 from __future__ import annotations
 
-from dataclasses import InitVar, dataclass, field
+from dataclasses import dataclass, field
 from typing import Literal
 
 import torch
 
 from pypto_serving.model.tokenizer import TokenizerAdapter
-from pypto_serving.serving.model_extension import (  # noqa: F401
-    ModelStepExtension,
-    RequestExecutionContext,
-)
+from pypto_serving.serving.model_extension import ModelStepExtension
 
 
 PREFILL_CHUNK_SIZE_CHOICES = (1024, 2048, 4096, 8192)
@@ -346,18 +343,6 @@ class PrefillBatch:
     constraint_states: dict[str, object] = field(default_factory=dict)
     stop_token_masks: dict[str, StopTokenMask] = field(default_factory=dict)
     model_extensions: dict[str, ModelStepExtension] = field(default_factory=dict)
-    # Compatibility input for older worker adapters. It is converted to typed
-    # extensions at construction and is not retained as a common execution
-    # field.
-    execution_metadata: InitVar[dict[str, bytes] | None] = None
-
-    def __post_init__(self, execution_metadata: dict[str, bytes] | None) -> None:
-        if execution_metadata:
-            for request_id, payload in execution_metadata.items():
-                self.model_extensions.setdefault(
-                    request_id,
-                    ModelStepExtension("legacy-model-metadata", 1, payload),
-                )
 
 
 @dataclass
@@ -400,8 +385,6 @@ class DecodeBatch:
     # its embedding (shape ``[B, hidden]``). Left ``None`` for single-token decoders.
     prev_token_ids: torch.Tensor | None = None
     prev_hidden_states: torch.Tensor | None = None
-    # Deprecated compatibility slot. Model adapters should use model_extensions.
-    decode_reservations: tuple[object | None, ...] = ()
     model_extensions: tuple[ModelStepExtension | None, ...] = ()
 
 
@@ -420,8 +403,6 @@ class DecodeResult:
     # Actual verified drafts per request, before scheduler output truncation.
     # None disables speculation metrics; zero denotes a target-only fallback.
     num_draft_tokens: list[int] | None = None
-    retired_reservation_ids: tuple[int, ...] = ()
-    execution_receipts: tuple[bytes, ...] = ()
     model_extension: ModelStepExtension | None = None
 
 

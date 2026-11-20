@@ -205,7 +205,7 @@ class ScheduledRequest:
     group_blocks_retained: bool = False
     # Opaque model execution plan. The common scheduler never interprets its
     # cycle/frame fields; the selected model policy owns the payload.
-    decode_reservation: object | None = None
+    model_execution_plan: object | None = None
     confirmed_input_end: int | None = None
     execution_plan: StepPolicyState | None = None
     cache_aux_snapshots: tuple = ()
@@ -500,8 +500,8 @@ class Scheduler:
                 else 0
             )
             reservation = None
-            if self.policy.uses_decode_reservations and not is_prefill:
-                reservation=self.policy.reserve_decode(self,request)
+            if self.policy.uses_model_execution_plan and not is_prefill:
+                reservation=self.policy.reserve_execution_plan(self,request)
                 if reservation is None:
                     running_to_keep.append(request)
                     continue
@@ -539,7 +539,7 @@ class Scheduler:
                         for name, block_ids in request.allocated_group_block_ids.items()
                     },
                     cache_partition=request.cache_partition,
-                    decode_reservation=reservation,
+                    model_execution_plan=reservation,
                 )
             )
             scheduled_req_ids.add(request.request_id)
@@ -872,8 +872,8 @@ class Scheduler:
             return
         for scheduled in scheduler_output.scheduled_requests:
             request = scheduled.request
-            if scheduled.decode_reservation is not None:
-                self._pending_reservations.setdefault(request.request_id, []).append(scheduled.decode_reservation)
+            if scheduled.model_execution_plan is not None:
+                self._pending_reservations.setdefault(request.request_id, []).append(scheduled.model_execution_plan)
             if scheduled.block_ids_by_group:
                 if scheduled.cache_partition is None:
                     raise RuntimeError("Grouped async step has no cache partition")
@@ -921,8 +921,8 @@ class Scheduler:
         Mirrors the accounting ``schedule()`` uses when allocating blocks: only
         greedy decode steps get speculative capacity.
         """
-        if scheduled.decode_reservation is not None:
-            return scheduled.decode_reservation.max_output_tokens-1
+        if scheduled.model_execution_plan is not None:
+            return scheduled.model_execution_plan.max_output_tokens-1
         if scheduled.is_prefill or request.temperature > 0.0:
             return 0
         # Use the dispatch snapshot: async advancement may already have changed
@@ -941,7 +941,7 @@ class Scheduler:
         outputs: list[RequestOutput] = []
 
         for scheduled in scheduler_output.scheduled_requests:
-            self._retire_decode_reservation(scheduled)
+            self._retire_model_execution_plan(scheduled)
             request = scheduled.request
             self._release_aux_snapshots(scheduled)
             if scheduled.is_prefill:
@@ -1160,8 +1160,8 @@ class Scheduler:
         )
         scheduled.group_blocks_retained = False
 
-    def _retire_decode_reservation(self, scheduled):
-        reservation = scheduled.decode_reservation
+    def _retire_model_execution_plan(self, scheduled):
+        reservation = scheduled.model_execution_plan
         if reservation is None:
             return
         pending = self._pending_reservations.get(reservation.request_id, [])
@@ -1173,7 +1173,7 @@ class Scheduler:
 
     def discard_scheduled_request(self, scheduled: ScheduledRequest) -> None:
         """Drop one failed/stale async step without publishing its KV hashes."""
-        self._retire_decode_reservation(scheduled)
+        self._retire_model_execution_plan(scheduled)
         self._release_scheduled_group_blocks(scheduled)
 
     def _check_finish(self, request: Request) -> RequestStatus | None:

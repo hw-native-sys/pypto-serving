@@ -19,7 +19,7 @@ class StepPolicyState:
 
 
 class SchedulingPolicy:
-    uses_decode_reservations = False
+    uses_model_execution_plan = False
     explicit_cache_publication = False
     serial_prefill = False
 
@@ -29,7 +29,7 @@ class SchedulingPolicy:
     def admit(self, scheduler, request):
         pass
 
-    def reserve_decode(self, scheduler, request):
+    def reserve_execution_plan(self, scheduler, request):
         return None
 
     def adopt_prefix(self, scheduler, request):

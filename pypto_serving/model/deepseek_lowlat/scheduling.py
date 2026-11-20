@@ -35,7 +35,7 @@ class LowlatSchedulingPolicy(SchedulingPolicy):
     prefix_namespace: str = ""
 
     @property
-    def uses_decode_reservations(self):
+    def uses_model_execution_plan(self):
         return True
 
     @property
@@ -67,7 +67,7 @@ class LowlatSchedulingPolicy(SchedulingPolicy):
         request.execution_generation = scheduler.next_execution_generation()
         request.execution_state.physical_end = request.num_prompt_tokens
 
-    def reserve_decode(self, scheduler, request):
+    def reserve_execution_plan(self, scheduler, request):
         pending = scheduler.pending_reservations(request.request_id)
         remaining = request.max_new_tokens - len(request.output_token_ids)
         choice = choose_native_parent(remaining, pending)

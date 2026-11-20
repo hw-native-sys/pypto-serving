@@ -32,7 +32,7 @@ class ExecutionPolicy:
         return {}
 
     def confirm_step(self, output, result, cache):
-        if result.execution_receipts or result.retired_reservation_ids or result.cache_publications:
+        if result.model_extension or result.cache_publications:
             raise ValueError("Executor returned undeclared execution receipts")
 
     def request_metadata(self, request):

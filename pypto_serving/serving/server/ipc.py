@@ -70,7 +70,6 @@ class NewRequestData(msgspec.Struct):
     # Opaque, versioned model-owned request extension. The common IPC layer
     # carries bytes but never interprets lowlat metadata.
     model_extension: bytes = b""
-    execution_metadata: bytes = b""  # compatibility alias for older senders
 
 
 class PrefillRequest(msgspec.Struct):
@@ -87,18 +86,6 @@ class PrefillRequest(msgspec.Struct):
     block_ids_by_group: dict[str, list[int]] = msgspec.field(default_factory=dict)
     cache_partition: int | None = None
     model_extension: bytes = b""
-    execution_metadata: bytes = b""  # compatibility alias for older senders
-
-
-class DecodeReservationData(msgspec.Struct):
-    reservation_id: int
-    request_id: str
-    generation: int
-    cycles: int
-    max_output_tokens: int
-    physical_input_end: int
-    remaining_lower_bound: int
-    frame_id: int
 
 
 class DecodeRequest(msgspec.Struct):
@@ -121,7 +108,6 @@ class DecodeRequest(msgspec.Struct):
     # Model-specific grouped cache tables and their stable rank partition.
     block_ids_by_group: dict[str, list[int]] = msgspec.field(default_factory=dict)
     cache_partition: int | None = None
-    decode_reservation: DecodeReservationData | None = None
     model_extension: bytes = b""
 
 
@@ -190,8 +176,6 @@ class StepResult(msgspec.Struct):
     # Echoes the originating StepCommand.step_id (pipeline ordering guard).
     step_id: int = 0
     num_draft_tokens: dict[str, int] = msgspec.field(default_factory=dict)
-    retired_reservation_ids: tuple[int, ...] = ()
-    execution_receipts: tuple[bytes, ...] = ()
     cache_publications: tuple[CachePublicationProof, ...] = ()
     model_extension: bytes = b""
 

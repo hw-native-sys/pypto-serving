@@ -27,7 +27,7 @@ def reservation_fields(value):
     if reservation is None:
         reservation = getattr(getattr(value, "prepared", None), "reservation", None)
     if reservation is None:
-        reservations = getattr(value, "decode_reservations", ())
+        reservations = getattr(value, "model_extensions", ())
         if isinstance(reservations, tuple) and len(reservations) == 1:
             reservation = reservations[0]
     if reservation is None:

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import torch
+import msgspec
 
 from pypto_serving.config.types import (
     DecodeBatch,
@@ -261,6 +262,15 @@ class WorkerProcess:
             )
             self._executor_capabilities = capabilities
         return capabilities
+
+    @staticmethod
+    def _encode_model_extension(extension: ModelStepExtension | None) -> bytes:
+        """Encode an adapter-owned result payload without interpreting it."""
+        if extension is None:
+            return b""
+        if isinstance(extension.payload, bytes):
+            return extension.payload
+        return msgspec.msgpack.encode(extension.payload)
 
     def _resolve_executor_cls(self):
         if self.config.executor_cls == "PyptoDeepSeekV4LowlatExecutor":
@@ -741,8 +751,7 @@ class WorkerProcess:
                 )
             return StepResult(
                 new_tokens=new_tokens, step_id=work.cmd.step_id, num_draft_tokens=num_draft_tokens,
-                retired_reservation_ids=decode_result.retired_reservation_ids,
-                execution_receipts=decode_result.execution_receipts
+                model_extension=self._encode_model_extension(decode_result.model_extension),
             )
         except Exception as exc:
             logger.error("Worker decode reclaim failed: %s", exc, exc_info=True)
@@ -876,7 +885,7 @@ class WorkerProcess:
             expected_cache_entries=expected_cache_entries,
         )
         if getattr(self.executor, "uses_request_execution_context", False) is True:
-            from pypto_serving.config.types import RequestExecutionContext
+            from pypto_serving.serving.model_extension import RequestExecutionContext
 
             contexts = [RequestExecutionContext(r.request_id, len(r.prompt_token_ids),
                                                 r.max_output_tokens, r.initial_output_tokens, r.execution_generation)
@@ -884,9 +893,6 @@ class WorkerProcess:
             self.executor.prepare_request_contexts(self.model_record.runtime_model, contexts)
             prepare_metadata=getattr(self.executor,"prepare_request_metadata",None)
             if callable(prepare_metadata):
-                for request in cmd.new_requests:
-                    if not request.execution_metadata and request.model_extension:
-                        request.execution_metadata = request.model_extension
                 prepare_metadata(self.model_record.runtime_model,cmd.new_requests)
         for new_request in cmd.new_requests:
             previous_state = self._constraint_states.pop(new_request.request_id, None)
@@ -953,8 +959,7 @@ class WorkerProcess:
         runtime_model = self.model_record.runtime_model
         new_tokens: dict[str, list[int]] = {}
         num_draft_tokens: dict[str, int] = {}
-        retirements = []
-        execution_receipts = []
+        model_extension = b""
 
         with profile_span(
             "WorkerProcess.execute_step",
@@ -988,15 +993,13 @@ class WorkerProcess:
                         else:
                             self._batch_prefill(chunk, runtime_model, new_tokens)
             if cmd.decode_requests:
-                num_draft_tokens = self._batch_decode(
+                num_draft_tokens, model_extension = self._batch_decode(
                     cmd.decode_requests,
                     runtime_model,
                     new_tokens,
                     prepared_decode=prepared_decode,
                     step_id=cmd.step_id,
                     prefill_requests=len(cmd.prefill_requests),
-                    **({"retirement_receipts": retirements, "execution_receipts": execution_receipts}
-                       if any(r.decode_reservation is not None for r in cmd.decode_requests) else {}),
                 )
 
         # Retain the tokens just sampled so a following pipelined decode step can
@@ -1006,8 +1009,7 @@ class WorkerProcess:
                 self._record_last_tokens(req_id, tokens)
 
         return StepResult(new_tokens=new_tokens, step_id=cmd.step_id, num_draft_tokens=num_draft_tokens,
-                          retired_reservation_ids=tuple(retirements),
-                          execution_receipts=tuple(execution_receipts),
+                          model_extension=model_extension,
                           cache_publications=(self.executor.take_cache_publications(runtime_model)
                               if callable(getattr(self.executor,"take_cache_publications",None)) else ()))
 
@@ -1091,11 +1093,9 @@ class WorkerProcess:
             cache_partitions=[pr.cache_partition for pr in scheduled],
         )
         batch.model_extensions = {
-            pr.request_id: ModelStepExtension(
-                "model-step", 1, pr.model_extension or pr.execution_metadata
-            )
+            pr.request_id: ModelStepExtension("model-step", 1, pr.model_extension)
             for pr in scheduled
-            if pr.model_extension or pr.execution_metadata
+            if pr.model_extension
         }
         batch.constraint_states = {
             pr.request_id: state
@@ -1273,8 +1273,6 @@ class WorkerProcess:
         bind_policy: bool = True,
     ) -> DecodeBatch:
         """Build a decode batch snapshot, optionally resolving prior output tokens."""
-        from pypto_serving.config.decoding import DecodeReservation
-
         device = runtime_model.runtime.device
         decode_tokens = (
             [self._resolve_decode_token(dr) for dr in scheduled]
@@ -1307,13 +1305,9 @@ class WorkerProcess:
             block_ids=[dr.block_ids for dr in scheduled],
             block_ids_by_group=[dr.block_ids_by_group for dr in scheduled],
             cache_partitions=[dr.cache_partition for dr in scheduled],
-            decode_reservations=tuple(
-                DecodeReservation(**{name: getattr(dr.decode_reservation, name)
-                                      for name in dr.decode_reservation.__struct_fields__})
-                if dr.decode_reservation is not None else None for dr in scheduled),
             model_extensions=tuple(
-                ModelStepExtension("deepseek_v4_flash_lowlat", 1, dr.decode_reservation)
-                if dr.decode_reservation is not None else None
+                ModelStepExtension("deepseek_v4_flash_lowlat", 1, dr.model_extension)
+                if dr.model_extension else None
                 for dr in scheduled
             ),
             constraint_states={
@@ -1336,9 +1330,7 @@ class WorkerProcess:
         prepared_decode: _PreparedDecodeWork | None = None,
         step_id: int = 0,
         prefill_requests: int = 0,
-        retirement_receipts: list[int] | None = None,
-        execution_receipts: list | None = None,
-    ) -> dict[str, int]:
+    ) -> tuple[dict[str, int], bytes]:
         with profile_span(
             "WorkerProcess.batch_decode",
             cat="worker",
@@ -1376,10 +1368,6 @@ class WorkerProcess:
                     batch,
                     prepared,
                 )
-            if retirement_receipts is not None:
-                retirement_receipts.extend(decode_result.retired_reservation_ids)
-            if execution_receipts is not None:
-                execution_receipts.extend(decode_result.execution_receipts)
             num_draft_tokens = self._consume_decode_result(scheduled, decode_result, new_tokens, batch=batch)
             if self._decode_metrics:
                 self._decode_metrics.record(
@@ -1389,7 +1377,7 @@ class WorkerProcess:
                     mode="sync_prepared" if prepared_decode is not None else "sync_unprepared",
                     prefill_requests=prefill_requests,
                 )
-            return num_draft_tokens
+            return num_draft_tokens, self._encode_model_extension(decode_result.model_extension)
 
     def _consume_decode_result(
         self,

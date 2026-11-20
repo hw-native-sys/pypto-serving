@@ -12,7 +12,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from pypto_serving.config.types import DecodeBatch, RequestExecutionContext
+from pypto_serving.config.types import DecodeBatch
+from pypto_serving.serving.model_extension import RequestExecutionContext
 from pypto_serving.model.deepseek_lowlat.native_runner import NativeModelRunner
 from pypto_serving.model.deepseek_lowlat.npu_runner import LowlatModelRunner
 from pypto_serving.model.deepseek_lowlat.speculation import NativeState, validate_packets

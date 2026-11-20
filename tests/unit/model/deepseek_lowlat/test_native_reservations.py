@@ -9,14 +9,15 @@
 from dataclasses import replace
 
 import pytest
+import msgspec
 
 from pypto_serving.model.deepseek_lowlat.scheduling import LowlatSchedulingPolicy
-from pypto_serving.config.decoding import DecodeReservation
+from pypto_serving.model.deepseek_lowlat.decoding import DecodeReservation
 from pypto_serving.model.deepseek_lowlat.decoding import choose_native_parent
 from pypto_serving.model.deepseek_lowlat.contract import build_lowlat_cache_group_specs
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.sched.scheduler import Request, RequestStatus, Scheduler, SchedulerConfig
-from pypto_serving.serving.server.ipc import (DecodeRequest, DecodeReservationData, StepCommand,
+from pypto_serving.serving.server.ipc import (DecodeRequest, StepCommand,
                                              decode_command, encode_command)
 
 
@@ -55,9 +56,9 @@ def test_two_parents_have_separate_reservations_and_reconcile_actual_variable_co
     instance, request = scheduler()
     a, b = accept(instance), accept(instance)
     first, second = a.scheduled_requests[0], b.scheduled_requests[0]
-    assert first.decode_reservation.cycles == second.decode_reservation.cycles == 2
-    assert first.decode_reservation.frame_id != second.decode_reservation.frame_id
-    assert first.decode_reservation.generation == request.execution_generation > 0
+    assert first.model_execution_plan.cycles == second.model_execution_plan.cycles == 2
+    assert first.model_execution_plan.frame_id != second.model_execution_plan.frame_id
+    assert first.model_execution_plan.generation == request.execution_generation > 0
     assert request.num_output_placeholders == 24
     assert instance.schedule().is_empty
     assert first.block_ids_by_group == second.block_ids_by_group
@@ -78,7 +79,7 @@ def test_23token_budget_does_not_accept_a_second_parent_before_retirement():
     a = accept(instance)
     assert instance.schedule().is_empty
     instance.update_from_output(a, {"r": [10, 11]})
-    assert accept(instance).scheduled_requests[0].decode_reservation.remaining_lower_bound == 21
+    assert accept(instance).scheduled_requests[0].model_execution_plan.remaining_lower_bound == 21
 
 
 @pytest.mark.parametrize("terminal", ["eos", "abort"])
@@ -100,10 +101,10 @@ def test_eos_or_abort_discards_and_retires_the_already_accepted_successor(termin
 
 def test_wire_round_trip_preserves_generation_cycle_budget_range_and_frame():
     reservation = DecodeReservation(13, "r", 5, 2, 12, 256, 24, 1)
-    dr = DecodeRequest("r", -1, 128, [], decode_reservation=DecodeReservationData(**vars(reservation)))
+    dr = DecodeRequest("r", -1, 128, [], model_extension=msgspec.msgpack.encode(vars(reservation)))
     command = StepCommand([], [], [dr], [], 88)
-    restored = decode_command(encode_command(command)).decode_requests[0].decode_reservation
-    assert {name: getattr(restored, name) for name in restored.__struct_fields__} == vars(reservation)
+    restored = decode_command(encode_command(command)).decode_requests[0].model_extension
+    assert msgspec.msgpack.decode(restored) == vars(reservation)
 
 
 @pytest.mark.parametrize("field", ["reservation_id", "generation", "physical_input_start", "physical_input_end",
@@ -157,7 +158,7 @@ def test_continuous_variable_acceptance_reconciles_two_inflight_parents_through_
         assert queue, (budget, raw_remaining)
         step = queue.pop(0)
         scheduled = step.scheduled_requests[0]
-        reservation = scheduled.decode_reservation
+        reservation = scheduled.model_execution_plan
         advances, accepted, emitted = [], [], 0
         for cycle in range(reservation.cycles):
             # Independent cycle acceptance, including0and5; never infer from parent width.
@@ -177,7 +178,7 @@ def test_continuous_variable_acceptance_reconciles_two_inflight_parents_through_
         raw_count += emitted
         scheduled.confirmed_input_end = physical_end
         instance.update_from_output(step, {"r": list(range(100+iteration, 100+iteration+emitted))})
-        assert request.num_output_placeholders == sum(s.scheduled_requests[0].decode_reservation.max_output_tokens
+        assert request.num_output_placeholders == sum(s.scheduled_requests[0].model_execution_plan.max_output_tokens
                                                       for s in queue)
         if not request.status.is_finished:
             assert request.num_computed_tokens == 4+len(request.output_token_ids)+request.num_output_placeholders-1

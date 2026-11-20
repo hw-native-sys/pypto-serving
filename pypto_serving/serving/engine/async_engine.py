@@ -1081,10 +1081,9 @@ class ReplicaEngineCore:
                     last_token = PLACEHOLDER_TOKEN
                 else:
                     last_token = output_ids[-1] if output_ids else prompt_ids[-1]
-                from pypto_serving.serving.server.ipc import DecodeReservationData
-                reservation = sr.decode_reservation
+                reservation = sr.model_execution_plan
                 decode_requests.append(DecodeRequest(
-                    decode_reservation=(DecodeReservationData(**vars(reservation)) if reservation else None),
+                    model_extension=(msgspec.msgpack.encode(vars(reservation)) if reservation else b""),
                     request_id=req_id,
                     last_token=last_token,
                     # Context length for THIS step, snapshotted at schedule time:

@@ -134,7 +134,7 @@ def test_resume_and_completion_proofs_survive_real_ipc_roundtrip():
         None,
         max_output_tokens=64,
         execution_generation=request.execution_generation,
-        execution_metadata=msgspec.msgpack.encode(
+        model_extension=msgspec.msgpack.encode(
             LowlatRequestMetadata(request.execution_state.prefix_resume)
         ),
     )
@@ -152,7 +152,7 @@ def test_resume_and_completion_proofs_survive_real_ipc_roundtrip():
     cmd = StepCommand([new], [prefill], [], [])
     recovered = decode_command(encode_command(cmd))
     assert recovered == cmd
-    descriptor = decode_request_metadata(recovered.new_requests[0].execution_metadata).prefix_resume
+    descriptor = decode_request_metadata(recovered.new_requests[0].model_extension).prefix_resume
     assert descriptor == request.execution_state.prefix_resume
     context = RequestExecutionContext(
         "hot", 1536, 64, execution_generation=request.execution_generation, prefix_resume=descriptor
