@@ -1200,7 +1200,7 @@ def compile_decode_fwd(compiler, lib_root, topology):
 
 
 def compile_decode_fwd_dspark(compiler, lib_root, topology):
-    """Compile the recurrent decode entry and the prefill bootstrap programs."""
+    """Compile DSpark decode, bootstrap, and optional prefill context stages."""
     import pypto.language as pl
 
     if topology.tp != 1:
@@ -1212,8 +1212,14 @@ def compile_decode_fwd_dspark(compiler, lib_root, topology):
     entries.update({name.removeprefix("l3_"): getattr(state, name) for name in (
         "l3_bootstrap_inputs", "l3_publish_bootstrap",
         "l3_prepare_prefill_drafter_geometry")})
-    entries["dspark_drafter"] = importlib.import_module(
-        "models.deepseek_v4_1_flash.dspark_drafter").l3_dspark_drafter
+    drafter = importlib.import_module("models.deepseek_v4_1_flash.dspark_drafter")
+    entries["dspark_drafter"] = drafter.l3_dspark_drafter
+    # Issue #345 moves draft context KV preparation into the prefill path.  The
+    # stage is optional while Lib and Serving are released independently, so an
+    # older Lib keeps the existing bootstrap path.
+    context_kv = getattr(drafter, "l3_dspark_prefill_context_kv", None)
+    if context_kv is not None:
+        entries["prefill_context_kv"] = context_kv
     entries["markov_sample"] = importlib.import_module(
         "models.deepseek_v4_1_flash.markov").l3_markov_output
     programs = {}
