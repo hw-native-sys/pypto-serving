@@ -362,7 +362,7 @@ def allocate_dspark_host_resources(layout: DSparkResourceLayout) -> DSparkHostRe
         "target_c1a": _shared(
             (layout.dp_size, DSPARK_MAX_BATCH_PER_DP, table_pages), torch.int32),
         "draft": _shared(
-            (layout.dp_size, DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH_PER_DP, 3),
+            (layout.dp_size, DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH_PER_DP, table_pages),
             torch.int32),
     }
     for value in cache_tables.values():

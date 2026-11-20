@@ -2653,8 +2653,7 @@ class ResidentDSparkCache:
         from models.deepseek_v4_1_flash.config import WINDOW_CACHE_BYTES
 
         self.worker = worker
-        # DSpark keeps a three-page sliding window per request.
-        blocks = DSPARK_MAX_BATCH_PER_DP * 3
+        blocks = DSPARK_MAX_BATCH_PER_DP * ((max_seq_len + DSPARK_WINDOW - 1) // DSPARK_WINDOW)
         self.window_cache = alloc_device_buffer(
             worker, (world, DSPARK_DRAFT_LAYERS, blocks, DSPARK_WINDOW, 1, WINDOW_CACHE_BYTES),
             torch.uint8, stacked=True)
@@ -3111,6 +3110,12 @@ class V41ResidentResources:
             # The current Lib DSpark ABI exposes one dynamic draft-table page
             # per decode row. Select the page containing the current anchor
             # while retaining the full host table for prefill context geometry.
+            draft = resources.cache_tables["draft"]
+            pages_per_slot = draft.shape[-1]
+            for index, (rank, row) in enumerate(zip(partitions, request_rows, strict=True)):
+                slot, _generation = self._resolve_dspark_state(request_ids[index])
+                page = positions[index] // DSPARK_WINDOW
+                draft[rank, :, row, 0] = slot * pages_per_slot + page
             if self.engram_host is not None:
                 self.engram_host.stage_lookup(
                     self.decode_host.fields["engram_lookup"],
@@ -3227,9 +3232,8 @@ class V41ResidentResources:
                 table = resources.cache_tables["draft"][rank, layer, 0]
                 page_index = torch.div(positions, DSPARK_WINDOW, rounding_mode="floor")
                 page_offset = torch.remainder(positions, DSPARK_WINDOW)
-                ring_page = torch.remainder(page_index, table.shape[0])
                 workspace["context_slots"][rank, layer, :retained_count] = (
-                    table[ring_page.long()] * DSPARK_WINDOW + page_offset
+                    table[page_index.long()] * DSPARK_WINDOW + page_offset
                 )
             return request_id, slot, generation
 
