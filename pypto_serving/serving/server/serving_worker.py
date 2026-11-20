@@ -44,6 +44,7 @@ from pypto_serving.serving.server.ipc import (
     PrefillRequest,
     ProfileCommand,
     ProfileResult,
+    ReleaseResult,
     ShutdownCommand,
     StepCommand,
     StepResult,
@@ -859,10 +860,12 @@ class WorkerProcess:
             self._constraint_states = {}
         if not hasattr(self, "_accepted_output_lengths"):
             self._accepted_output_lengths = {}
-        self._release_finished_request_state(
+        released = self._release_finished_request_state(
             cmd.finished_request_ids,
             expected_cache_entries=expected_cache_entries,
         )
+        if released:
+            self.output_queue.put(encode_result(ReleaseResult(released, cmd.step_id)))
         for new_request in cmd.new_requests:
             previous_state = self._constraint_states.pop(new_request.request_id, None)
             if previous_state is not None:
@@ -892,10 +895,11 @@ class WorkerProcess:
         request_ids: list[str],
         *,
         expected_cache_entries: dict[str, object] | None = None,
-    ) -> None:
+    ) -> list[str]:
         """Release executor and worker mirrors after older device work is safe."""
         if not request_ids:
-            return
+            return []
+        released = []
         release_finished = getattr(self.executor, "release_finished_requests", None)
         if callable(release_finished):
             release_finished(request_ids)
@@ -918,6 +922,8 @@ class WorkerProcess:
             )
             if callable(release_sampler):
                 release_sampler([req_id])
+            released.append(req_id)
+        return released
 
     def _execute_step(
         self,

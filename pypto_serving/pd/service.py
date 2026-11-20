@@ -20,6 +20,7 @@ from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.tools.observe import record, span
+from .admission import DFirst
 from .planner import (Geometry, SourcePins, merge_ranges, page_indices, page_ranges, physical,
                       plan_chunk, rolling_bounds)
 from .protocol import (Binding, CapacityExhausted, Completion, Continuation, Node, Placement, Plan, Topology,
@@ -28,6 +29,9 @@ from .session import PeerPool, Session
 from .transfer import TransferError
 
 logger = logging.getLogger(__name__)
+
+# One confirmed chunk can be queued ahead of the two pending compute results.
+PREFILL_CHUNK_QUEUE_CAPACITY = 3
 
 
 class NodeUnavailable(RuntimeError):
@@ -57,6 +61,7 @@ class Request:
     pending_digest: str | None = None
     error: Exception | None = None
     chunk: int = 0
+    produced_chunks: int = 0
     end: int = 0
     p_hit: int = 0
     task: object = None
@@ -75,6 +80,7 @@ class Service:
         self.config, self.endpoint, self.role = config, endpoint, role
         self.adapter, self.core, self.progress = adapter, core, progress
         self.cache = core.kv_cache_manager
+        self.admission = DFirst()
         self.requests, self.terminal = {}, OrderedDict()
         self.peers = PeerPool(len(config.prefill) + len(config.decode))
         self.pins = SourcePins(self.cache)
@@ -329,22 +335,19 @@ class Service:
             entry.prefix = prefix
             entry.normalized_digest = digest(continuation)
             try:
+                requirements = self.admission.requirements(len(continuation.tokens), config.max_new_tokens, prefix)
                 if self.cache.tiering is not None:
                     await self.cache.tiering.restore(
-                        request, {k: [bytes.fromhex(h) for h in hashes] for k, hashes in prefix.hashes.items()},
-                        len(continuation.tokens), maximum=len(continuation.tokens), groups=tuple(prefix.hashes),
+                        request, requirements["prefix_block_hashes"], len(continuation.tokens),
+                        maximum=len(continuation.tokens), groups=requirements["shareable_group_names"],
                         cancelled=lambda: entry.cancelled or not self.is_ready())
                 if not self.is_ready():
                     raise NodeUnavailable("PD node is unavailable")
-                if (sum(r.reservation is not None for r in self.requests.values())
-                        >= self.core.config.max_num_running_reqs):
+                if not self.admission.accepts(sum(r.reservation is not None for r in self.requests.values()),
+                                              self.core.config.max_num_running_reqs):
                     raise CapacityExhausted("Decode active reservation capacity exhausted. Retry later.")
                 reservation = self.cache.reserve_group_cache(
-                    request, request, len(continuation.tokens) + config.max_new_tokens,
-                    prompt_token_count=len(continuation.tokens),
-                    prefix_block_hashes={k: [bytes.fromhex(h) for h in hashes]
-                                         for k, hashes in prefix.hashes.items()},
-                    shareable_group_names=tuple(prefix.hashes))
+                    request, request, **requirements)
                 entry.reservation = reservation
                 entry.state_task = asyncio.create_task(self.worker("reserve_state", dict(
                     request=request, partition=reservation.partition, prompt_len=len(continuation.tokens))))
@@ -403,6 +406,10 @@ class Service:
             self.observe("completion", entry, plan_digest=completion.plan_digest, end=entry.end)
             if plan.final:
                 self.cache.commit_group_cache(request, valid_from=plan.valid_from)
+                # Final coverage and definitive native completion close this
+                # binding's write sequence; P-local retirement is independent.
+                entry.source_done.set()
+                self.observe("source_done", entry, confirmation_source="final_completion")
                 self.observe("commit", entry, plan_digest=completion.plan_digest, end=entry.end,
                              state=self.cache.group_cache_reservation(request).state.value)
                 try:
@@ -414,12 +421,6 @@ class Service:
                 except Exception as exc:
                     self.fail(entry, exc)
                     return dict(error=str(exc))
-            return {}
-        if operation == "source_done":
-            entry.source_done.set()
-            self.observe("source_done", entry)
-            if entry.cancelled or entry.error is not None:
-                await self.abort(entry, stopped=True)
             return {}
         if operation == "abort":
             stopped = payload["stopped"]
@@ -534,6 +535,11 @@ class Service:
         if self.cache.tiering is not None:
             self.cache.tiering.cancel(entry.binding.request)
         if self.role == "prefill":
+            if entry.continuation is None and entry.task is not None:
+                entry.task.cancel()  # Input preparation has not allocated a handoff.
+            queue = self.chunks.get(entry.binding.request)
+            if queue is not None and queue.empty():
+                queue.put_nowait(None)  # Wake the sender; this is not native stop proof.
             return
         if stopped:
             entry.source_done.set()
@@ -576,8 +582,10 @@ class Service:
         request = entry.binding.request
         config = GenerateConfig(**continuation.config)
         self.adapter.validate(config)
-        queue = self.chunks[request] = asyncio.Queue(maxsize=2)
+        queue = self.chunks[request] = asyncio.Queue(maxsize=PREFILL_CHUNK_QUEUE_CAPACITY)
         async def consume():
+            if entry.cancelled:
+                return
             async for _ in self.core.add_request(request, "", config, prompt_token_ids=continuation.tokens,
                                                   constraint_spec=(ConstraintSpec.from_wire(continuation.constraint)
                                                                    if continuation.constraint else None)):
@@ -591,6 +599,8 @@ class Service:
                                               self.config.handoff_timeout)
             try:
                 placement = decode(await call("begin", continuation=continuation), Placement)
+                if entry.cancelled:
+                    raise ValueError("request cancelled")
                 peer_geometry = session.geometry
                 drain = asyncio.create_task(consume())
                 p_hit = None
@@ -601,10 +611,13 @@ class Service:
                     if chunk_task not in done:
                         chunk_task.cancel()
                         await asyncio.gather(chunk_task, return_exceptions=True)
-                        if drain in done:
-                            await drain
+                        if drain not in done:
+                            raise TimeoutError("Prefill produced no confirmed chunk within handoff_timeout")
+                        await drain
                         raise RuntimeError("Prefill ended before its next confirmed chunk")
                     chunk = chunk_task.result()
+                    if chunk is None:
+                        raise ValueError("request cancelled")
                     if p_hit is None:
                         p_hit = chunk.start
                         entry.p_hit = p_hit
@@ -629,8 +642,6 @@ class Service:
                     plan_timing.update(construct_ms=construct_timing["duration_ms"],
                         construct_thread_cpu_ms=construct_timing["thread_cpu_ms"],
                         digest_ms=digest_timing["duration_ms"], digest_thread_cpu_ms=digest_timing["thread_cpu_ms"])
-                    if plan.copies:
-                        self.pins.retain(chunk)
                     entry.pending = plan
                     entry.pending_digest = plan_digest
                     submitted = False
@@ -641,18 +652,19 @@ class Service:
                         submitted = True  # A lost independent-submit reply is still uncertain.
                         job = await self.worker("submit", plan)
                     async def settle(plan=plan, job=job, plan_digest=plan_digest, plan_timing=plan_timing):
+                        nonlocal submitted
                         try:
                             completion = (await self.progress.wait(job) if job is not None
                                           else Completion(plan_digest, plan.units))
                         except TransferError as exc:
                             if not exc.uncertain:
-                                self.pins.release(request)
+                                self.pins.release(request, plan.chunk)
                             raise
                         completion.check(plan_digest, plan.units)
+                        submitted = False
                         entry.chunk, entry.end = plan.chunk + 1, plan.end
                         entry.completion_source = "owner_completion" if job is not None else "empty_plan"
-                        if job is not None:
-                            self.pins.release(request)
+                        self.pins.release(request, plan.chunk)
                         self.observe("completion", entry, plan_digest=completion.plan_digest, end=plan.end,
                                      native_write=job is not None, plan_ms=plan_timing["duration_ms"],
                                      plan_thread_cpu_ms=plan_timing["thread_cpu_ms"],
@@ -669,11 +681,19 @@ class Service:
                     if chunk.final:
                         await inflight
                         break
-                    self.core.scheduler.resume_request(request)
+                # All plans have definitive completion and D has committed the
+                # final state. No more writes can be authorized for this binding.
+                # Source-local worker/DDR retirement need not delay D's response.
+                entry.transferred.set()
                 self.core.finish_prefilled_request(request)
                 await drain
-                await call("source_done")
             except BaseException as exc:
+                if entry.transferred.is_set() and entry.error is None:
+                    self.fail(entry, exc)
+                    self.gated = True
+                    if self.cache.tiering is not None:
+                        self.cache.tiering.wake()
+                    raise
                 if inflight is not None and not inflight.done():
                     try:
                         await asyncio.shield(inflight)
@@ -772,6 +792,12 @@ class Service:
         self.closing = True
         if self.cache.tiering is not None:
             self.cache.tiering.wake()
+        if self.role == "prefill":
+            retiring = [entry.task for entry in self.requests.values()
+                        if entry.transferred.is_set() and entry.task is not None]
+            if retiring:
+                await asyncio.wait_for(asyncio.shield(asyncio.gather(*retiring, return_exceptions=True)),
+                                       self.config.handoff_timeout)
         if self.requests or self.pins.active or self.gated:
             raise RuntimeError("node has active/uncertain handoffs; retire it through external orchestration")
         if self.role == "prefill":

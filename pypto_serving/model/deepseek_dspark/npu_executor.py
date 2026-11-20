@@ -416,7 +416,8 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         bootstrap_one_l2 = None
         normal_k7 = speculative and os.environ.get("PYPTO_DSPARK_BOOTSTRAP_METADATA_DEVICE") != "0"
         prefill_async_flag = os.environ.get("PYPTO_DSPARK_PREFILL_ASYNC")
-        prefill_async = (prefill_async_flag == "1" or (prefill_async_flag is None and normal_k7))
+        source_only = self._execution_role == "prefill" and self._capture_prefill_tail
+        prefill_async = (prefill_async_flag == "1" or (prefill_async_flag is None and (normal_k7 or source_only)))
         device_bootstrap_metadata = speculative and (
             os.environ.get("PYPTO_DSPARK_BOOTSTRAP_METADATA_DEVICE") == "1" or (normal_k7 and prefill_async)
         )
@@ -432,8 +433,9 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         prefill_device_tail = self._capture_prefill_tail or (speculative and (
             device_bootstrap or os.environ.get("PYPTO_DSPARK_PREFILL_TAIL_DEVICE") == "1"
         ))
-        if prefill_async and (not speculative or (device_bootstrap and not device_bootstrap_metadata)):
-            raise ValueError("Async DSpark prefill requires K=7 and Host metadata; device bootstrap needs metadata")
+        if prefill_async and ((not speculative and not source_only)
+                              or (device_bootstrap and not device_bootstrap_metadata)):
+            raise ValueError("Async DSpark prefill requires K=7 or target-only source capture; bootstrap needs metadata")
         decode = None
         rope: DSparkRopeTables | None = None
         if self._compile_kernels:

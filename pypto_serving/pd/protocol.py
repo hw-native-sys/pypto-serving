@@ -15,7 +15,7 @@ import uuid
 
 import msgspec
 
-VERSION = 3
+VERSION = 4
 MAX_FRAME = 16 * 1024 * 1024
 
 

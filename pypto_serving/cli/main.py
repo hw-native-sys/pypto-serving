@@ -247,6 +247,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="DSpark sparse checkpoint interval in source tokens (default: 8192; 0 disables periodic points).",
     )
     parser.add_argument(
+        "--async-scheduling", action=argparse.BooleanOptionalAction, default=None,
+        help="Overlap engine scheduling with execution (default: enabled for supported executors).",
+    )
+    parser.add_argument(
         "--enable-chunked-prefill",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -374,6 +378,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         long_prefill_token_threshold=args.long_prefill_token_threshold,
         enable_prefix_cache=enable_prefix_cache,
         enable_chunk_prefill=args.enable_chunked_prefill,
+        async_scheduling=args.async_scheduling,
     )
 
 
