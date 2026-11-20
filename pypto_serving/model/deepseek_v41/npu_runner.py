@@ -3178,6 +3178,22 @@ class V41ResidentResources:
             if len(groups) != 1:
                 raise ValueError("DSpark bootstrap requires one cache allocation")
             self._stage_dspark_tables(resources, batch, (rank,), (0,))
+            # The first decode starts with the sampled anchor and no pending
+            # draft rows.  The next decode pass can therefore generate its
+            # proposal without terminal bootstrap state publication.
+            state = resources.state
+            state.reserve_slot(rank, slot, generation=generation,
+                               position_limit=resources.layout.max_seq_len)
+            state.bind_request(rank, 0, slot=slot, generation=generation)
+            meta = state.meta[rank, slot]
+            meta[0] = 1
+            meta[1] = generation
+            meta[2] = prompt_length
+            meta[3] = prompt_length
+            meta[4] = 0
+            meta[5] = resources.layout.max_seq_len
+            state.tokens[rank, slot].zero_()
+            state.tokens[rank, slot, 0] = int(sampled_token_ids[0])
             return request_id, slot, generation
 
     def _dspark_payload(self, *, model, batch, phase, resources, **extra):
@@ -3218,6 +3234,40 @@ class V41ResidentResources:
             rope_tables=resources.rope_tables, outputs=outputs,
             request_ranks=(int(getattr(batch, "cache_partitions", [0])[0] or 0),),
         )
+
+    def _run_dspark_prefill_context(self, lowered):
+        """Write draft context KV after each completed main prefill."""
+        if "prefill_context_kv" not in self.dspark_programs:
+            raise MissingCompositeInterface(
+                "selected Lib does not expose l3_dspark_prefill_context_kv"
+            )
+        if self.dspark_weights is None or self.dspark_cache is None:
+            raise MissingCompositeInterface("DSpark draft resources are not initialized")
+        workspace = lowered.workspace
+        draft = lowered.draft_model
+        arguments = dict(
+            target_hidden=workspace["prefill_target_hidden"],
+            main_proj_weight=draft["main_proj_weight"],
+            main_proj_scale=draft["main_proj_scale"],
+            main_norm_weight=draft["main_norm_weight"],
+            num_tokens=workspace["prefill_counts"],
+            context_slots=workspace["context_slots"],
+            context_rope_cos=workspace["context_rope_cos"],
+            context_rope_sin=workspace["context_rope_sin"],
+            wkv=draft["wkv"],
+            wkv_scale=draft["wkv_scale"],
+            kv_norm_weight=draft["kv_norm_weight"],
+            window_cache=self.dspark_cache.window_cache,
+        )
+        names = self.dspark_param_names["prefill_context_kv"]
+        missing = set(names) - set(arguments)
+        extra = set(arguments) - set(names)
+        if missing or extra:
+            raise MissingCompositeInterface(
+                "DSpark prefill context ABI mismatch: "
+                f"missing={sorted(missing)} extra={sorted(extra)}"
+            )
+        self.dispatch_dspark("prefill_context_kv", arguments)
 
     def lower_dspark_prefill(self, *, model, batch, request_ids, sampled_token_ids):
         """Lower a terminal prefill batch through the serving-owned provider."""
@@ -3618,20 +3668,12 @@ class V41ResidentResources:
                 "serving must bind target hidden/sample outputs and publish draft state"
             )
         try:
-            self._run_dspark_orchestrator(lowered, phase="prefill")
-            draft_ids = self._read_dspark_output(lowered, "draft_ids")
+            self._run_dspark_prefill_context(lowered)
             rank, row = self._dspark_request_rows(lowered, 1)
-            draft_ids = self._dspark_output_row(
-                draft_ids, rank=rank[0], row=row[0], kind="draft_ids")
-            drafts = []
-            if anchor + DSPARK_SPECULATIVE_TOKENS < self.dspark.states.position_limit:
-                self._validate_dspark_token_row(
-                    draft_ids, kind="draft_ids", minimum=DSPARK_SPECULATIVE_TOKENS)
-                drafts = [int(token) for token in draft_ids.tolist()]
             state = self.dspark.record_bootstrap(
                 request_id, slot=slot, generation=generation,
                 prompt_length=prompt_length, anchor=anchor,
-                draft_ids=drafts,
+                draft_ids=(),
                 anchor_token=int(lowered.workspace["next_prefill_tokens"][rank[0], row[0]]),
             )
             return state

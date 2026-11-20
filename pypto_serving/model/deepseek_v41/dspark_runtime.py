@@ -53,11 +53,7 @@ _DECODE_CACHE_KEYS = ("target_window", "target_c2a", "target_c1a", "draft")
 _ROPE_KEYS = ("draft_cos", "draft_sin")
 
 PREFILL_STAGE_ORDER = (
-    "bootstrap_inputs",
-    "prepare_prefill_drafter_geometry",
-    "dspark_drafter",
-    "markov_sample",
-    "publish_bootstrap",
+    "prefill_context_kv",
 )
 
 
