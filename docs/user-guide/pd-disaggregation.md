@@ -122,7 +122,14 @@ iteration begins; it does not limit the duration of an active stream.
 The Router preserves its configured HTTP connect and write/pool timeouts. PD
 generation reads use `pd.request_timeout` as a read-idle timeout, with a separate
 response-header wait as described above. These are not an end-to-end generation
-deadline. Descriptor and HTTP abort probes cap each HTTP phase at five seconds.
+deadline. HTTP abort probes cap each HTTP phase at five seconds.
+
+When no compatible healthy pair is available, requests can wait up to 15 seconds
+for node recovery. The health poller and waiting requests share one probe round
+per node. Each round tries up to three descriptor probes, capped at five seconds
+each, with immediate retries after timeouts. The Router uses a healthy pair as
+soon as one is available and excludes nodes reporting shutdown. A client
+disconnect removes the waiting request before P/D dispatch or slot allocation.
 
 Before response headers, Router-generated errors contain `object: "error"`, a
 stable `code` and a readable `message`, with `X-PyPTO-Error-Source: router`.

@@ -17,6 +17,7 @@ import msgspec
 
 VERSION = 4
 MAX_FRAME = 16 * 1024 * 1024
+CLOSING_HEADER = "x-pypto-pd-closing"
 
 
 class CapacityExhausted(RuntimeError):
