@@ -508,6 +508,7 @@ def build_dspark_cache_group_specs(
     partitions: int = DSPARK_CACHE_PARTITIONS,
     decode_only: bool = False,
     prefill_only: bool = False,
+    num_speculative_tokens: int = DSPARK_SPECULATIVE_TOKENS,
 ) -> tuple[KVCacheGroupSpec, ...]:
     """Describe the seven DSpark cache families as scheduler-visible groups.
 
@@ -535,12 +536,13 @@ def build_dspark_cache_group_specs(
         raise ValueError("A cache deployment cannot be both Prefill-only and Decode-only")
     # Prefill publishes its entire chunk before reading the historical window.
     # Keep both resident, including a boundary page for unaligned chunks.
-    in_flight_tokens = max(min(max_prefill_tokens, max_seq_len), DSPARK_DECODE_SEQ)
+    decode_seq = (num_speculative_tokens or DSPARK_SPECULATIVE_TOKENS) + 1
+    in_flight_tokens = max(min(max_prefill_tokens, max_seq_len), decode_seq)
 
     def ring_blocks(history: int, page_tokens: int, *, state: bool = False) -> int:
-        # Two in-flight K7 steps plus the common checkpoint alignment span.
-        writes = min(max_seq_len, DSPARK_COMPRESSED_BLOCK_TOKENS + 2 * DSPARK_DECODE_SEQ)
-        writes = max(DSPARK_DECODE_SEQ, writes) if state and decode_only else in_flight_tokens
+        # Two in-flight steps plus the common checkpoint alignment span.
+        writes = min(max_seq_len, DSPARK_COMPRESSED_BLOCK_TOKENS + 2 * decode_seq)
+        writes = max(decode_seq, writes) if state and decode_only else in_flight_tokens
         if state and prefill_only:
             writes = min(in_flight_tokens, 1024)
         return math.ceil((history - 1 + writes) / page_tokens) + 1
@@ -683,8 +685,15 @@ class DSparkCacheLayout:
     def for_ranks(
         cls, ranks: int, *, tp_size: int = DSPARK_TP_SIZE,
         lm_head_tp_size: int = DSPARK_LM_HEAD_TP_SIZE,
+        num_speculative_tokens: int = DSPARK_SPECULATIVE_TOKENS,
     ) -> "DSparkCacheLayout":
         """Derive the Lib group batch while preserving the per-owner decode slab."""
+        if (isinstance(num_speculative_tokens, bool) or not isinstance(num_speculative_tokens, int)
+                or not 0 <= num_speculative_tokens < DSPARK_DRAFTER_ROPE_CANDIDATE_ROWS // 2):
+            raise ValueError("DSpark draft count must fit the fixed RoPE candidate slab")
+        # Target-only P retains the target ABI; its internal K0 is not an S1 model.
+        seq = (num_speculative_tokens or DSPARK_SPECULATIVE_TOKENS) + 1
+        local_tokens = DSPARK_DECODE_LOCAL_BATCH * seq
         ranks = int(ranks)
         if ranks not in (8, 16) or tp_size not in (1, 2, 4) or ranks % tp_size:
             raise ValueError("DSpark requires 8 or 16 ranks and attention TP 1, 2 or 4")
@@ -699,11 +708,37 @@ class DSparkCacheLayout:
             lm_head_tp_size=lm_head_tp_size,
             partitions=partitions,
             decode_batch=group_batch,
-            decode_tokens=group_batch * DSPARK_DECODE_SEQ,
+            decode_seq=seq,
+            decode_tokens=group_batch * seq,
+            decode_local_tokens=local_tokens,
+            moe_tokens=local_tokens,
+            max_logit_rows=local_tokens,
             prefill_local_tokens=DSPARK_PREFILL_DISPATCH_TOKENS // tp_size,
             prefill_batch=partitions * group_batch,
             prefill_requests=group_batch,
         )
+
+    @property
+    def draft_tokens(self) -> int:
+        return self.decode_seq - 1
+
+    @property
+    def csa_state_table_blocks(self) -> int:
+        return math.ceil((8 + self.decode_seq) / DSPARK_C4_STATE_PAGE_TOKENS)
+
+    @property
+    def csa_state_ring_tokens(self) -> int:
+        return self.csa_state_table_blocks * DSPARK_C4_STATE_PAGE_TOKENS
+
+    @property
+    def drafter_context_rows(self) -> int:
+        return max(self.decode_local_tokens, self.sliding_window)
+
+    @property
+    def drafter_context_buckets(self) -> tuple[int, ...]:
+        # Bootstrap may need the complete history even when Decode's slab shrinks.
+        return tuple(sorted({batch * self.decode_seq for batch in DSPARK_DRAFTER_BATCHES}
+                            | {self.drafter_context_rows}))
 
     @property
     def decode_capacity(self) -> int:
@@ -1644,6 +1679,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             partitions=self._compiled.layout.partitions,
             decode_only=self._execution_role == "decode",
             prefill_only=self._execution_role == "prefill",
+            num_speculative_tokens=self._compiled.num_speculative_tokens,
         )
         names = tuple(spec.name for spec in specs)
         if names != DSPARK_CACHE_GROUP_NAMES:
@@ -1663,6 +1699,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         """Use the scheduler's physical ring period for device-side modulo."""
         specs = self._cache_group_specs or build_dspark_cache_group_specs(
             DSPARK_FWD_NUM_LAYERS, self._compiled.compress_ratios,
+            num_speculative_tokens=self._compiled.num_speculative_tokens,
         )
         return next(spec.max_blocks_per_seq for spec in specs if spec.name == group_name)
 
@@ -1822,7 +1859,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
 
     @property
     def speculative(self) -> bool:
-        """Whether the K=7 drafter chain is enabled for this runner."""
+        """Whether the speculative drafter chain is enabled for this runner."""
         return self._compiled.num_speculative_tokens > 0
 
     @property
@@ -1865,7 +1902,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         if tensors is None:
             raise RuntimeError(
                 "DSpark drafter weights are not available (speculation requires "
-                "num_speculative_tokens=7)"
+                "num_speculative_tokens > 0)"
             )
         return tensors
 
@@ -1980,7 +2017,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 task_args.allocate_host_shared(None)
                 task_args.tensors["grammar_mask"].fill_(-1)
                 if self._compiled.decode_full_fused:
-                    task_args.tensors["valid_draft_counts"].fill_(DSPARK_DRAFTER_QUERY_WIDTH)
+                    task_args.tensors["valid_draft_counts"].fill_(self._compiled.layout.draft_tokens)
                 self._decode_task_args.append(task_args)
         self._prepare_default_grammar_args()
         if self.speculative:
@@ -2017,7 +2054,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     self._drafter_hidden_mirror = shared_empty(
                         (
                             self._compiled.layout.ranks,
-                            DSPARK_DRAFTER_CONTEXT_ROWS,
+                            self._compiled.layout.drafter_context_rows,
                             DSPARK_MAIN_HIDDEN_DIM,
                         ),
                         torch.bfloat16,
@@ -2054,7 +2091,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                             else None
                         ),
                         accepted_token_ids=shared_empty(
-                            (ranks, local_batch, DSPARK_DECODE_SEQ),
+                            (ranks, local_batch, self._compiled.layout.decode_seq),
                             torch.int32,
                             name="dspark_accepted_token_ids",
                         ),
@@ -2108,7 +2145,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                         ),
                         draft_token_ids=(
                             shared_empty(
-                                (ranks, local_batch, DSPARK_DRAFTER_QUERY_WIDTH),
+                                (ranks, local_batch, self._compiled.layout.draft_tokens),
                                 torch.int32,
                                 name="dspark_state_draft_token_ids",
                             )
@@ -2202,7 +2239,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                         args.tensors[name].zero_()
                 # One shared buffer per dynamic extent, allocated before the
                 # worker fork like every other host-shared tensor.
-                for extent in DSPARK_DRAFTER_CONTEXT_BUCKETS:
+                for extent in self._compiled.layout.drafter_context_buckets:
                     group_extent = self._compiled.layout.tp_size * extent
                     self._drafter_context_staging[extent] = {
                         "context_group_position_ids": shared_empty(
@@ -2295,7 +2332,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
 
             with profile_span("DSparkModelRunner.prepare.drafter_scratch", cat="executor"):
                 for name, (shape, dtype) in drafter_scratch_specs(
-                    self._compiled.layout.ranks
+                    self._compiled.layout
                 ).items():
                     self._alloc_zeroed_stacked_tensor(name, shape, dtype, scope="drafter")
                 self._materialize_dspark_device_state_tokens()
@@ -2304,7 +2341,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     "device_state_target_hidden",
                     (
                         self._compiled.layout.ranks,
-                        DSPARK_DRAFTER_CONTEXT_ROWS,
+                        self._compiled.layout.drafter_context_rows,
                         DSPARK_MAIN_HIDDEN_DIM,
                     ),
                     torch.bfloat16,
@@ -2466,7 +2503,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 ("hidden", (ranks, self._compiled.layout.decode_batch, DSPARK_SLIDING_WINDOW,
                             DSPARK_MAIN_HIDDEN_DIM), torch.bfloat16),
                 ("positions", (ranks, self._compiled.layout.decode_batch, DSPARK_SLIDING_WINDOW), torch.int32),
-                ("context", (ranks, max(DSPARK_DRAFTER_CONTEXT_ROWS,
+                ("context", (ranks, max(self._compiled.layout.drafter_context_rows,
                                        DSPARK_DRAFTER_BATCHES[0] * DSPARK_SLIDING_WINDOW
                                        // self._compiled.layout.tp_size),
                              DSPARK_MAIN_HIDDEN_DIM), torch.bfloat16),
@@ -2477,8 +2514,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             ranks = self._compiled.layout.ranks
             for name, shape, dtype in (
                 ("next_prefill_tokens", (ranks, DSPARK_DRAFTER_MAX_BATCH), torch.int64),
-                ("draft_token_ids", (ranks, DSPARK_DRAFTER_MAX_BATCH, DSPARK_DRAFTER_QUERY_WIDTH), torch.int32),
-                ("confidence_probs", (ranks, DSPARK_DRAFTER_MAX_BATCH, DSPARK_DRAFTER_QUERY_WIDTH), torch.float32),
+                ("draft_token_ids", (ranks, DSPARK_DRAFTER_MAX_BATCH, self._compiled.layout.draft_tokens), torch.int32),
+                ("confidence_probs", (ranks, DSPARK_DRAFTER_MAX_BATCH, self._compiled.layout.draft_tokens), torch.float32),
             ):
                 self._alloc_zeroed_stacked_tensor(name, shape, dtype, scope="bootstrap")
         if self._compiled.bootstrap_metadata is not None:
@@ -2648,7 +2685,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         )
 
         for name, (shape, dtype) in decode_scratch_specs(
-            self._compiled.layout.ranks
+            self._compiled.layout
         ).items():
             self._alloc_zeroed_stacked_tensor(name, shape, dtype, scope="decode")
 
@@ -3348,7 +3385,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     sampling_enabled=True,
                     bootstrap_enabled=(
                         self.speculative
-                        and prompt_len + DSPARK_DRAFTER_QUERY_WIDTH - 1 < max_position
+                        and prompt_len + self._compiled.layout.draft_tokens - 1 < max_position
                     ),
                 )
             )
@@ -3712,14 +3749,14 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._ensure_shared_host_allocation_before_worker("default grammar buffers")
         ranks = self._compiled.layout.ranks
         mask = shared_empty(
-            (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS),
+            (ranks, self._compiled.layout.max_logit_rows, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS),
             torch.int16,
             name="dspark_default_grammar_mask",
         )
         mask.fill_(-1)
         counts = shared_empty((ranks, self._compiled.layout.decode_batch), torch.int32,
                               name="dspark_default_draft_counts")
-        counts.fill_(DSPARK_DRAFTER_QUERY_WIDTH)
+        counts.fill_(self._compiled.layout.draft_tokens)
         self._default_grammar_args = {
             "grammar_mask": StaticDeviceTensor(mask),
             "valid_draft_counts": StaticDeviceTensor(counts),
@@ -3808,9 +3845,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         counts = task_args.tensors["valid_draft_counts"]
         previous = self._decode_grammar_rows[slot]
         self._decode_grammar_rows[slot] = set()
-        counts.fill_(DSPARK_DRAFTER_QUERY_WIDTH)
+        counts.fill_(self._compiled.layout.draft_tokens)
         active: set[tuple[int, int]] = set()
-        limits = [DSPARK_DRAFTER_QUERY_WIDTH] * len(inputs.request_ids)
+        limits = [self._compiled.layout.draft_tokens] * len(inputs.request_ids)
         layout = self._compiled.layout
         try:
             for index, (request_id, group, ordinal, (rank, row)) in enumerate(zip(
@@ -3825,8 +3862,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     continue
                 if constraint is None:
                     valid = min(
-                        getattr(self._compiled, "num_speculative_tokens", DSPARK_DRAFTER_QUERY_WIDTH),
-                        DSPARK_DRAFTER_QUERY_WIDTH,
+                        getattr(self._compiled, "num_speculative_tokens", self._compiled.layout.draft_tokens),
+                        self._compiled.layout.draft_tokens,
                     )
                     # Unprotected rows already use the immutable all-allowed mask.
                     row_count = min(valid + 1, mask.remaining_tokens)
@@ -3834,11 +3871,11 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 else:
                     drafts = (
                         self._drafter_state(request_id).pending_draft_tokens
-                        if getattr(self._compiled, "num_speculative_tokens", DSPARK_DRAFTER_QUERY_WIDTH) > 0
+                        if getattr(self._compiled, "num_speculative_tokens", self._compiled.layout.draft_tokens) > 0
                         else []
                     )
                     valid, rows = constraint.plan_draft_rows(drafts)
-                    if not 0 <= valid <= min(len(drafts), DSPARK_DRAFTER_QUERY_WIDTH):
+                    if not 0 <= valid <= min(len(drafts), self._compiled.layout.draft_tokens):
                         raise ValueError("constraint provider returned an invalid draft prefix length")
                     row_count = valid + 1
                 if rows.shape != (row_count, DSPARK_VOCAB_SIZE // 32):
@@ -3853,7 +3890,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         except Exception:
             for rank, row in previous | active:
                 masks[rank, row].fill_(-1)
-            counts.fill_(DSPARK_DRAFTER_QUERY_WIDTH)
+            counts.fill_(self._compiled.layout.draft_tokens)
             raise
         # Rows overwritten by the new plan need no intermediate all-allowed fill.
         for rank, row in previous - active:
@@ -4062,7 +4099,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             return None
         max_position = self._require_rope_tables().max_position
         counts: list[int] = []
-        limits = draft_count_limits or (DSPARK_DRAFTER_QUERY_WIDTH,) * len(inputs.request_ids)
+        limits = draft_count_limits or (self._compiled.layout.draft_tokens,) * len(inputs.request_ids)
         for request_id, speculative, limit in zip(
             inputs.request_ids, inputs.speculative_flags, limits, strict=True
         ):
@@ -4361,7 +4398,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         *,
         dispatch: bool = True,
     ) -> tuple[list[list[int]], list[list[DSparkDrafterRequestRow]]]:
-        """Run K=7 prefix acceptance and recurrent-state advance on device."""
+        """Run draft-prefix acceptance and recurrent-state advance on device."""
         program = self._compiled.state_accept
         if (dispatch and program is None) or not self._dspark_state_buffers:
             raise RuntimeError("DSpark device-state acceptance program is not available")
@@ -4384,13 +4421,13 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 raise RuntimeError("DSpark standalone accept scratch is unavailable")
             target_hidden = self._alloc_zeroed_stacked_tensor(
                 "dspark_target_hidden",
-                (layout.ranks, DSPARK_DECODE_LOCAL_TOKENS, DSPARK_MAIN_HIDDEN_DIM),
+                (layout.ranks, self._compiled.layout.decode_local_tokens, DSPARK_MAIN_HIDDEN_DIM),
                 torch.bfloat16,
                 scope="decode",
             )
             drafter_hidden = self._alloc_zeroed_stacked_tensor(
                 "device_state_target_hidden",
-                (layout.ranks, DSPARK_DRAFTER_CONTEXT_ROWS, DSPARK_MAIN_HIDDEN_DIM),
+                (layout.ranks, self._compiled.layout.drafter_context_rows, DSPARK_MAIN_HIDDEN_DIM),
                 torch.bfloat16,
                 scope="drafter",
             )
@@ -4436,7 +4473,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             ]
             accepted.append(tokens)
             state.verify_steps += 1
-            state.proposed_tokens += DSPARK_DRAFTER_QUERY_WIDTH
+            state.proposed_tokens += self._compiled.layout.draft_tokens
             state.matched_drafts += count - 1
             state.accepted_tokens += count
             state.committed_count += count
@@ -4500,7 +4537,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     ]
                     tokens, matched = _accept_dspark_tokens(main, state.pending_draft_tokens)
                     state.verify_steps += 1
-                    state.proposed_tokens += DSPARK_DRAFTER_QUERY_WIDTH
+                    state.proposed_tokens += self._compiled.layout.draft_tokens
                     state.matched_drafts += matched
                     state.accepted_tokens += len(tokens)
                     state.committed_count += len(tokens)
@@ -4564,7 +4601,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         kept: list[list[DSparkDrafterRequestRow]] = [[] for _ in rows_by_rank]
         for rank, rows in enumerate(rows_by_rank):
             for row in rows:
-                if row.anchor + DSPARK_DRAFTER_QUERY_WIDTH < max_position:
+                if row.anchor + self._compiled.layout.draft_tokens < max_position:
                     kept[rank].append(row)
                 else:
                     state = self._drafter_state(row.request_id)
@@ -4586,7 +4623,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         host_hidden = None
         if device_hidden is None:
             mirror = self._read_drafter_hidden(
-                self._drafter_hidden_mirror, rows=DSPARK_DRAFTER_CONTEXT_ROWS
+                self._drafter_hidden_mirror, rows=self._compiled.layout.drafter_context_rows
             )
             host_hidden = torch.zeros(
                 (layout.ranks, context_rows, DSPARK_MAIN_HIDDEN_DIM), dtype=torch.bfloat16
@@ -5056,7 +5093,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     batch_tables(
                         "csa_state",
                         blocks_by_name["csa_state"],
-                        depth=DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS,
+                        depth=self._compiled.layout.csa_state_table_blocks,
                         ring=True,
                     )
                     if host_state_tables
@@ -5066,7 +5103,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     batch_tables(
                         "csa_inner_state",
                         blocks_by_name["csa_inner_state"],
-                        depth=DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS,
+                        depth=self._compiled.layout.csa_state_table_blocks,
                         ring=True,
                     )
                     if host_state_tables
@@ -5340,7 +5377,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     )
                 drafts = state.pending_draft_tokens
                 window_fits = anchors[index] + layout.decode_seq <= max_position
-                if len(drafts) == DSPARK_DRAFTER_QUERY_WIDTH and window_fits:
+                if len(drafts) == self._compiled.layout.draft_tokens and window_fits:
                     speculative_flags.append(True)
                     pending_drafts.append(list(drafts))
                 else:
@@ -5433,12 +5470,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                         plan.request_blocks[group_plan.request_indices[row]]["csa_state"],
                         position=int(starts[row].item()) + layout.decode_seq - 1,
                         page_tokens=DSPARK_C4_STATE_PAGE_TOKENS,
-                        depth=DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS,
+                        depth=self._compiled.layout.csa_state_table_blocks,
                     )
                     if anchor_flags[row]
                     else builder.ring_table(
                         (scratch["csa_state"][row],),
-                        depth=DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS,
+                        depth=self._compiled.layout.csa_state_table_blocks,
                     )
                     for row in range(group_batch)
                 ]
@@ -5449,12 +5486,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                         plan.request_blocks[group_plan.request_indices[row]]["csa_inner_state"],
                         position=int(starts[row].item()) + layout.decode_seq - 1,
                         page_tokens=DSPARK_C4_STATE_PAGE_TOKENS,
-                        depth=DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS,
+                        depth=self._compiled.layout.csa_state_table_blocks,
                     )
                     if anchor_flags[row]
                     else builder.ring_table(
                         (scratch["csa_inner_state"][row],),
-                        depth=DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS,
+                        depth=self._compiled.layout.csa_state_table_blocks,
                     )
                     for row in range(group_batch)
                 ]
@@ -5477,10 +5514,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             committed_rows = anchor_flags.unsqueeze(-1) & (
                 torch.arange(positions.shape[-1]).unsqueeze(0) < commit.unsqueeze(-1)
             )
-            # The decode kernel addresses a 16-row transaction ring: eight historical
-            # rows followed by the eager S=8 projection writes.
-            # Commit-gate the seven unaccepted rows before mapping into it.
-            csa_state_ring_positions = positions % DSPARK_CSA_DECODE_STATE_RING_TOKENS
+            # The transaction ring holds eight history rows plus this step's
+            # eager projection writes. Gate uncommitted draft rows before mapping.
+            csa_state_ring_positions = positions % self._compiled.layout.csa_state_ring_tokens
             csa_state_slots = builder.paged_slot_mapping(
                 csa_state_ring_positions, csa_state_tables,
                 block_size=DSPARK_C4_STATE_PAGE_TOKENS,
@@ -6021,14 +6057,14 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         # The group-context tensors dispatch through fixed shared extents, so
         # callers stage a bucket extent and pad padding rows with position
         # zero / -1 slots themselves.
-        if context_rows not in DSPARK_DRAFTER_CONTEXT_BUCKETS:
+        if context_rows not in self._compiled.layout.drafter_context_buckets:
             raise ValueError(
                 f"DSpark drafter context rows {context_rows} must be one of "
-                f"{DSPARK_DRAFTER_CONTEXT_BUCKETS}"
+                f"{self._compiled.layout.drafter_context_buckets}"
             )
         context_staging = self._drafter_context_staging[context_rows]
         group_context = tp * context_rows
-        query_rows = DSPARK_DRAFTER_MAX_BATCH * DSPARK_DRAFTER_QUERY_WIDTH
+        query_rows = DSPARK_DRAFTER_MAX_BATCH * self._compiled.layout.draft_tokens
         group_query = tp * query_rows
         rope = self._require_rope_tables()
         max_position = rope.max_position
@@ -6115,15 +6151,15 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                         )
                     context_positions_local[rank, start + offset] = position
                     context_valid_local[rank, start + offset, :] = True
-                # Query: seven fresh positions after the anchor.
-                for offset in range(DSPARK_DRAFTER_QUERY_WIDTH):
+                # Query: fresh draft positions after the anchor.
+                for offset in range(self._compiled.layout.draft_tokens):
                     position = row.anchor + 1 + offset
                     if position >= max_position:
                         raise ValueError(
                             f"DSpark drafter query position {position} exceeds the "
                             f"rope table for request {row.request_id!r}"
                         )
-                    token = index * DSPARK_DRAFTER_QUERY_WIDTH + offset
+                    token = index * self._compiled.layout.draft_tokens + offset
                     query_positions_local[rank, token] = position
                     query_valid_local[rank, token, :] = True
                 # Slot mappings are computed per rank from the OWNER's lease
@@ -6144,8 +6180,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                             context_positions_local[rank, local_row : local_row + 1],
                         )
                         context_slots_local[rank, :, local_row] = slots.reshape(-1)
-                for offset in range(DSPARK_DRAFTER_QUERY_WIDTH):
-                    token = index * DSPARK_DRAFTER_QUERY_WIDTH + offset
+                for offset in range(self._compiled.layout.draft_tokens):
+                    token = index * self._compiled.layout.draft_tokens + offset
                     if query_valid_local[rank, token, 0]:
                         slots = self._drafter_slots_for_positions(
                             ring,
@@ -6223,8 +6259,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         for rank, rows in enumerate(rows_by_rank):
             real = len(rows)
             if real:
-                markov_tensors["logit_row_indices"][rank, : real * DSPARK_DRAFTER_QUERY_WIDTH] = (
-                    torch.arange(real * DSPARK_DRAFTER_QUERY_WIDTH, dtype=torch.int32)
+                markov_tensors["logit_row_indices"][rank, : real * self._compiled.layout.draft_tokens] = (
+                    torch.arange(real * self._compiled.layout.draft_tokens, dtype=torch.int32)
                 )
         return batch, context_rows
 
@@ -6503,7 +6539,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             state.device_state_initialized = True
             state.prompt_len = state.prefill_descriptor.prompt_len
             state.committed_count = state.prompt_len
-            state.device_draft_count = DSPARK_DRAFTER_QUERY_WIDTH if state.prefill_descriptor.bootstrap_valid else 0
+            state.device_draft_count = self._compiled.layout.draft_tokens if state.prefill_descriptor.bootstrap_valid else 0
             state.proposed_tokens += state.device_draft_count
 
     def _run_device_bootstrap_wave(self, request_ids: Sequence[str]) -> None:
@@ -6619,7 +6655,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             state.device_state_initialized = True
             state.prompt_len = descriptor.prompt_len
             state.committed_count = descriptor.prompt_len
-            state.device_draft_count = DSPARK_DRAFTER_QUERY_WIDTH if descriptor.bootstrap_valid else 0
+            state.device_draft_count = self._compiled.layout.draft_tokens if descriptor.bootstrap_valid else 0
             state.proposed_tokens += state.device_draft_count
 
     def _seed_prefill_wave(
@@ -6658,7 +6694,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 )
             state.prompt_len = anchor + 1
             state.committed_count = state.prompt_len
-            if anchor + DSPARK_DRAFTER_QUERY_WIDTH >= max_position:
+            if anchor + self._compiled.layout.draft_tokens >= max_position:
                 # No room for a draft chain under the ceiling: seed nothing
                 # and let the first verify fall back to the anchor-only path.
                 state.pending_draft_tokens = []
@@ -6691,7 +6727,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         # Group-context buffers dispatch at fixed extents: round the seed's
         # tail up to the next shared bucket.
         context_rows = next(
-            size for size in DSPARK_DRAFTER_CONTEXT_BUCKETS if context_rows <= size
+            size for size in self._compiled.layout.drafter_context_buckets if context_rows <= size
         )
         hidden = None if device_tail else torch.zeros(
             (layout.ranks, context_rows, DSPARK_MAIN_HIDDEN_DIM), dtype=torch.bfloat16
@@ -6750,12 +6786,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 continue  # capacity-skipped above; decode falls back
             state.pending_draft_tokens = [int(v) for v in drafts[leader, row_of]]
             state.pending_confidence = [float(v) for v in confidence[leader, row_of]]
-            if len(state.pending_draft_tokens) != DSPARK_DRAFTER_QUERY_WIDTH:
+            if len(state.pending_draft_tokens) != self._compiled.layout.draft_tokens:
                 raise RuntimeError(
                     f"DSpark seeding produced {len(state.pending_draft_tokens)} drafts "
                     f"for {request_id!r}"
                 )
-            state.proposed_tokens += DSPARK_DRAFTER_QUERY_WIDTH
+            state.proposed_tokens += self._compiled.layout.draft_tokens
             self._initialize_dspark_device_state(state)
         # Requests too close to the position ceiling carry draft_count=0 but
         # still need a valid device slot for their anchor-only fallback.
@@ -6807,14 +6843,14 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         if state.current_token_id is None or state.prompt_len <= 0:
             raise RuntimeError("DSpark device state cannot be initialized from partial state")
         token_row = torch.full(
-            (DSPARK_STATE_TOKEN_WIDTH,),
+            (self._compiled.layout.decode_seq,),
             DSPARK_NOISE_TOKEN_ID,
             dtype=torch.long,
         )
         token_row[0] = state.current_token_id
         if state.pending_draft_tokens:
-            if len(state.pending_draft_tokens) != DSPARK_DRAFTER_QUERY_WIDTH:
-                raise RuntimeError("DSpark device state requires either zero or seven drafts")
+            if len(state.pending_draft_tokens) != self._compiled.layout.draft_tokens:
+                raise RuntimeError("DSpark device state requires either zero or the configured number of drafts")
             token_row[1:] = torch.tensor(state.pending_draft_tokens, dtype=torch.long)
         meta_row = torch.zeros((DSPARK_STATE_META_WIDTH,), dtype=torch.int32)
         meta_row[DSparkStateMetaColumn.VALID] = 1
@@ -6828,14 +6864,14 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         return token_row, meta_row
 
     def _materialize_dspark_device_state_tokens(self) -> StackedDeviceTensor:
-        """Allocate replicated current-token and K=7 draft state."""
+        """Allocate replicated current-token and draft state."""
         state = self._dspark_device_state_tokens
         if state is None:
             state = self._alloc_empty_stacked_tensor(
                 (
                     self._compiled.layout.ranks,
                     self._compiled.layout.decode_batch,
-                    DSPARK_STATE_TOKEN_WIDTH,
+                    self._compiled.layout.decode_seq,
                 ),
                 torch.long,
             )
@@ -6920,7 +6956,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     (
                         self._compiled.layout.ranks,
                         self._compiled.layout.decode_batch,
-                        DSPARK_STATE_TOKEN_WIDTH,
+                        self._compiled.layout.decode_seq,
                     ),
                     torch.long,
                     scope="drafter",
@@ -6992,7 +7028,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         batch: int,
         rows_by_rank: list[list[DSparkDrafterRequestRow]],
     ) -> None:
-        """Commit Markov's K=7 output into persistent device request state."""
+        """Commit Markov's draft output into persistent device request state."""
         program = self._compiled.state_commit
         if program is None:
             raise RuntimeError("DSpark device-state draft commit program is not available")
@@ -7114,7 +7150,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             "dspark_target_hidden",
             (
                 self._compiled.layout.ranks,
-                DSPARK_DECODE_LOCAL_TOKENS,
+                self._compiled.layout.decode_local_tokens,
                 DSPARK_MAIN_HIDDEN_DIM,
             ),
             torch.bfloat16,

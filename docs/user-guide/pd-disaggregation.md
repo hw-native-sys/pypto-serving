@@ -4,7 +4,7 @@ PD is opt-in. Without `--pd-role`, Serving does not load PD or Mooncake, create 
 
 ## Requirements
 
-The initial adapter supports DeepSeek V4 Flash DSpark K7, greedy sampling, identical model weights and compatible cache formats on P and D. Use Serving's pinned PyPTO-Lib, which includes independent-head support from [Lib PR #1542](https://github.com/hw-native-sys/pypto-lib/pull/1542) and the matching checkpoint-publication ABI from [Lib PR #1707](https://github.com/hw-native-sys/pypto-lib/pull/1707).
+The adapter supports DeepSeek V4 Flash DSpark K5/K7, greedy sampling, identical model weights and compatible cache formats on P and D. Use Serving's pinned PyPTO-Lib, which includes independent-head support from [Lib PR #1542](https://github.com/hw-native-sys/pypto-lib/pull/1542) and the matching checkpoint-publication ABI from [Lib PR #1707](https://github.com/hw-native-sys/pypto-lib/pull/1707).
 
 Use matching PyPTO/Simpler source builds with owner-local service and allocation-retain hooks; these hooks are not upstream APIs yet. PyPTO must expose `chip_service_factories`, `retain_service_tensor`, and `release_service_tensor`, backed by Simpler's owner-local allocation pinning. Its `RunConfig` must support explicit `backend_type` and `execution_mode` fields. These are required interfaces, not a fallback to an older runtime.
 
@@ -36,7 +36,7 @@ pypto-serving \
   --pd-config examples/pd.json --pd-role prefill --host 0.0.0.0 --port 8000
 ```
 
-Use `--pd-role decode` on D; both launchers specify K7, while P internally runs target-only prefill. D can use `--max-num-batched-tokens 2048` while P keeps 8192. D plans rolling KV from the smaller of its token budget and 8192, and ignores `--long-prefill-token-threshold`; continuation-state rings are budgeted separately. D still validates eight positions per request and does not run a local Prefill. The global scheduling budget does not force a batch to fill it.
+Use `--pd-role decode` on D; both launchers specify the chosen K, while P internally runs target-only prefill. Set `num_speculative_tokens` to `5` for K5 or retain `7` for K7. D can use `--max-num-batched-tokens 2048` while P keeps 8192. D plans rolling KV from the smaller of its token budget and 8192, and ignores `--long-prefill-token-threshold`; continuation-state rings are budgeted separately. D verifies K+1 positions per request and does not run a local Prefill. The global scheduling budget does not force a batch to fill it.
 
 P and D rings may differ in length. Handoff selects the model's required logical tail and checkpoint state, then maps each page through the two local tables; D receives directly into its reservation without copying or shrinking a ring at takeover. Full-history compressed KV and index suffixes retain their normal coverage, and final request-local state/bootstrap still transfers on a full KV hit. A model-contract fingerprint checks byte layouts and the matching/state policy. Revision-specific Host and device qualification is recorded in the [DDR offload PR validation](https://github.com/hw-native-sys/pypto-serving/pull/319). The historical topology and context checks below do not qualify every later revision.
 

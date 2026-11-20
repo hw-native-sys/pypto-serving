@@ -201,13 +201,12 @@ def _runner(*, speculative: bool = False, max_position: int = 512, extension_fac
         runner._markov_task_args.allocate_host_shared(None)
         from pypto_serving.model.deepseek_dspark.npu_runner import (
             DSPARK_DRAFTER_BATCHES,
-            DSPARK_DRAFTER_CONTEXT_BUCKETS,
             DSPARK_DRAFT_LAYERS,
             DSPARK_DRAFTER_TABLE_BLOCKS,
         )
 
         ranks = layout.ranks
-        for extent in DSPARK_DRAFTER_CONTEXT_BUCKETS:
+        for extent in layout.drafter_context_buckets:
             group_extent = tp_size * extent
             runner._drafter_context_staging[extent] = {
                 "context_group_position_ids": torch.zeros(

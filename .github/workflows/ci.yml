@@ -90,8 +90,8 @@ jobs:
           checkout-path: dist-checkout
           needs-device: 'true'
           runtime-platform: a2a3
-          # Match the Lib's explicit AIV shards and external-call specialization.
-          pypto-revision: 7302cd7ffeb552b3bec7c0e5bd92f164ba9fbd4b
+          # Include the leased-buffer APIs and the DSpark HC-pre compact Acc fix.
+          pypto-revision: d4877b8a67be95006828d78f58ef0ae55220c732
           toolchain: bundle
           # CI_CACHE_ROOT is shared with pypto and pypto-lib, whose jobs already
           # claim `serving` / `pip-serving`. Name both after this repo so the two

@@ -10,7 +10,7 @@
 
 The ``_PREFILL_TENSOR_ORDER`` / ``_DECODE_TENSOR_ORDER`` tuples below ARE the
 positional contracts of ``l3_prefill_fwd`` (103 args) and ``l3_decode_fwd``
-(110 args). Fused decode also binds K=7 draft counts and resident state.
+(110 args). Fused decode also binds draft counts and resident state.
 Every argument declares its
 kind at registration: host-shared slots (per-step metadata), static weights
 (upload-once), worker-resident cache pools and scratch (runner materializers),
@@ -35,17 +35,13 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_DECODE_HCA_CMP_TABLE_BLOCKS,
     DSPARK_DECODE_HCA_STATE_TABLE_BLOCKS,
     DSPARK_DECODE_IDX_TABLE_BLOCKS,
-    DSPARK_DECODE_LOCAL_TOKENS,
-    DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS,
     DSPARK_BLOCK_SIZE,
     DSPARK_CHECKPOINT_TILE_TOKENS,
     DSPARK_CHECKPOINTS_PER_TILE,
-    DSPARK_DRAFTER_CONTEXT_ROWS,
     DSPARK_DRAFTER_BATCHES,
     DSPARK_DRAFTER_TABLE_BLOCKS,
     DSPARK_DRAFTER_KV_BLOCKS,
     DSPARK_DRAFTER_MAX_BATCH,
-    DSPARK_DRAFTER_QUERY_WIDTH,
     DSPARK_DRAFT_LAYERS,
     DSPARK_HEAD_DIM,
     DSPARK_GRAMMAR_SEGMENTS,
@@ -53,8 +49,6 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_HC_MULT,
     DSPARK_HIDDEN_SIZE,
     DSPARK_MAIN_HIDDEN_DIM,
-    DSPARK_MAX_LOGIT_ROWS,
-    DSPARK_MOE_TOKENS,
     DSPARK_PREFILL_CSA_CMP_TABLE_BLOCKS,
     DSPARK_PREFILL_CSA_INNER_STATE_TABLE_BLOCKS,
     DSPARK_PREFILL_CSA_STATE_TABLE_BLOCKS,
@@ -168,12 +162,12 @@ def _prefill_slots(layout, *, host_hidden: bool = False) -> dict[str, tuple[torc
         "csa_idx_slot_mapping_full": (torch.int64, (ranks, tokens)),
         "csa_state_slot_mapping_full": (torch.int64, (ranks, tokens)),
         "csa_inner_state_slot_mapping_full": (torch.int64, (ranks, tokens)),
-        "logit_row_indices": (torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS)),
+        "logit_row_indices": (torch.int32, (ranks, layout.max_logit_rows)),
         "grammar_mask": (
-            torch.int16, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS),
+            torch.int16, (ranks, layout.max_logit_rows, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS),
         ),
         "sampled_ids": (
-            torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_SAMPLED_IDS_PAD),
+            torch.int32, (ranks, layout.max_logit_rows, DSPARK_SAMPLED_IDS_PAD),
         ),
     }
     if host_hidden:
@@ -213,7 +207,7 @@ def _prefill_scratch_sources(runner: DSparkModelRunner) -> dict[str, Any]:
         ),
         "x_out": ((ranks, tokens, hidden), torch.bfloat16),
         "logits": (
-            (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_VOCAB_SIZE), torch.float32,
+            (ranks, layout.max_logit_rows, DSPARK_VOCAB_SIZE), torch.float32,
         ),
     }
     return {
@@ -282,10 +276,10 @@ def _decode_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
         "csa_cmp_freqs_cos": (torch.bfloat16, (ranks, group_tokens, *rope)),
         "csa_cmp_freqs_sin": (torch.bfloat16, (ranks, group_tokens, *rope)),
         "csa_compress_state_block_table": (
-            torch.int32, (ranks, group_batch, DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS),
+            torch.int32, (ranks, group_batch, layout.csa_state_table_blocks),
         ),
         "csa_inner_compress_state_block_table": (
-            torch.int32, (ranks, group_batch, DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS),
+            torch.int32, (ranks, group_batch, layout.csa_state_table_blocks),
         ),
         "csa_cmp_block_table": (
             torch.int32, (ranks, local_batch, DSPARK_DECODE_CMP_C4_TABLE_BLOCKS),
@@ -321,13 +315,13 @@ def _decode_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
         "hca_kv_seq_lens": (torch.int32, (ranks, local_batch)),
         "input_ids": (torch.int64, (ranks, local_tokens)),
         "num_tokens_per_owner": (torch.int32, (ranks,)),
-        "logit_row_indices": (torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS)),
+        "logit_row_indices": (torch.int32, (ranks, layout.max_logit_rows)),
         "grammar_mask": (
-            torch.int16, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS),
+            torch.int16, (ranks, layout.max_logit_rows, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS),
         ),
         "valid_draft_counts": (torch.int32, (ranks, group_batch)),
         "sampled_ids": (
-            torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_SAMPLED_IDS_PAD),
+            torch.int32, (ranks, layout.max_logit_rows, DSPARK_SAMPLED_IDS_PAD),
         ),
     }
     return slot_specs
@@ -337,43 +331,44 @@ def _decode_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
 _DECODE_CACHE_POOL_NAMES = ("raw_kv_pool", "csa_idx_kv_cache", "csa_idx_kv_scale")
 
 
-def decode_scratch_specs(ranks: int) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+def decode_scratch_specs(layout) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     """Device-resident decode workspaces shared by ordered decode runs."""
+    ranks = layout.ranks
     return {
         "hidden_workspace": (
-            (ranks, DSPARK_DECODE_LOCAL_TOKENS, DSPARK_HIDDEN_SIZE), torch.bfloat16,
+            (ranks, layout.decode_local_tokens, DSPARK_HIDDEN_SIZE), torch.bfloat16,
         ),
         "x_ping": (
-            (ranks, DSPARK_DECODE_LOCAL_TOKENS, DSPARK_HC_MULT, DSPARK_HIDDEN_SIZE),
+            (ranks, layout.decode_local_tokens, DSPARK_HC_MULT, DSPARK_HIDDEN_SIZE),
             torch.float32,
         ),
         "x_pong": (
-            (ranks, DSPARK_DECODE_LOCAL_TOKENS, DSPARK_HC_MULT, DSPARK_HIDDEN_SIZE),
+            (ranks, layout.decode_local_tokens, DSPARK_HC_MULT, DSPARK_HIDDEN_SIZE),
             torch.float32,
         ),
         "x_attn_active": (
-            (ranks, DSPARK_DECODE_LOCAL_TOKENS, DSPARK_HC_MULT, DSPARK_HIDDEN_SIZE),
+            (ranks, layout.decode_local_tokens, DSPARK_HC_MULT, DSPARK_HIDDEN_SIZE),
             torch.float32,
         ),
         "x_moe_next": (
-            (ranks, DSPARK_MOE_TOKENS, DSPARK_HC_MULT, DSPARK_HIDDEN_SIZE),
+            (ranks, layout.moe_tokens, DSPARK_HC_MULT, DSPARK_HIDDEN_SIZE),
             torch.float32,
         ),
         "pre_hc_hidden_out": (
-            (ranks, DSPARK_DECODE_LOCAL_TOKENS, DSPARK_HC_MULT, DSPARK_HIDDEN_SIZE),
+            (ranks, layout.decode_local_tokens, DSPARK_HC_MULT, DSPARK_HIDDEN_SIZE),
             torch.float32,
         ),
         # Decode's layers-40/41/42 hidden tap: one [3*D] row per decode token
         # row of the fixed 16x8 local tile (pypto-lib#1084).
         "dspark_target_hidden": (
-            (ranks, DSPARK_DECODE_LOCAL_TOKENS, DSPARK_MAIN_HIDDEN_DIM),
+            (ranks, layout.decode_local_tokens, DSPARK_MAIN_HIDDEN_DIM),
             torch.bfloat16,
         ),
         "x_out": (
-            (ranks, DSPARK_DECODE_LOCAL_TOKENS, DSPARK_HIDDEN_SIZE), torch.bfloat16,
+            (ranks, layout.decode_local_tokens, DSPARK_HIDDEN_SIZE), torch.bfloat16,
         ),
         "logits": (
-            (ranks, DSPARK_MAX_LOGIT_ROWS, DSPARK_VOCAB_SIZE), torch.float32,
+            (ranks, layout.max_logit_rows, DSPARK_VOCAB_SIZE), torch.float32,
         ),
     }
 
@@ -384,7 +379,7 @@ def decode_task_args(runner: DSparkModelRunner) -> TaskArgs:
     slot_specs = _decode_slots(layout)
     static_weights = set(_PREFILL_STATIC_WEIGHT_NAMES)
     ranks = layout.ranks
-    scratch = decode_scratch_specs(ranks)
+    scratch = decode_scratch_specs(layout)
 
     ta = TaskArgs(stacked=True)
     tensor_order = (
@@ -580,8 +575,8 @@ def _drafter_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
     """Host-shared drafter slot name -> (dtype, full shape)."""
     ranks = layout.ranks
     batch = DSPARK_DRAFTER_MAX_BATCH
-    context = DSPARK_DRAFTER_CONTEXT_ROWS
-    query = batch * DSPARK_DRAFTER_QUERY_WIDTH
+    context = layout.drafter_context_rows
+    query = batch * layout.draft_tokens
     group_query = layout.tp_size * query
     rope = (DSPARK_ROPE_HEAD_DIM,)
     return {
@@ -606,7 +601,7 @@ def _drafter_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
 def bootstrap_metadata_specs(layout) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     """Ordered output ABI for the descriptor-driven bootstrap metadata program."""
     ranks, tp = layout.ranks, layout.tp_size
-    query = DSPARK_DRAFTER_MAX_BATCH * DSPARK_DRAFTER_QUERY_WIDTH
+    query = DSPARK_DRAFTER_MAX_BATCH * layout.draft_tokens
     return {
         "tail_selectors": ((ranks, DSPARK_DRAFTER_BATCHES[0], 4), torch.int32),
         "num_sampled": ((ranks, DSPARK_DRAFTER_BATCHES[0]), torch.int32),
@@ -623,11 +618,11 @@ def bootstrap_metadata_specs(layout) -> dict[str, tuple[tuple[int, ...], torch.d
         "query_freqs_sin": ((ranks, query, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
         "query_group_freqs_cos": ((ranks, tp * query, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
         "query_group_freqs_sin": ((ranks, tp * query, DSPARK_ROPE_HEAD_DIM), torch.bfloat16),
-        "logit_row_indices": ((ranks, 128), torch.int32),
+        "logit_row_indices": ((ranks, layout.max_logit_rows), torch.int32),
     }
 
 
-def drafter_scratch_specs(ranks: int) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+def drafter_scratch_specs(layout) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     """The drafter's persistent device buffers (private KV pools + outputs).
 
     Exposed so the runner can materialize them before the KV-capacity
@@ -635,6 +630,7 @@ def drafter_scratch_specs(ranks: int) -> dict[str, tuple[tuple[int, ...], torch.
     sizing the target pools without them lets startup succeed but OOM at the
     first draft, outside the cache-allocation retry path.
     """
+    ranks = layout.ranks
     return {
         "kv_caches": (
             (
@@ -648,14 +644,14 @@ def drafter_scratch_specs(ranks: int) -> dict[str, tuple[tuple[int, ...], torch.
             torch.bfloat16,
         ),
         "initial_hidden": (
-            (ranks, DSPARK_MOE_TOKENS, DSPARK_HC_MULT, DSPARK_HIDDEN_SIZE),
+            (ranks, layout.moe_tokens, DSPARK_HC_MULT, DSPARK_HIDDEN_SIZE),
             torch.float32,
         ),
         "intermediate_hidden": (
             (
                 ranks,
                 DSPARK_DRAFT_LAYERS,
-                DSPARK_MOE_TOKENS,
+                layout.moe_tokens,
                 DSPARK_HC_MULT,
                 DSPARK_HIDDEN_SIZE,
             ),
@@ -665,7 +661,7 @@ def drafter_scratch_specs(ranks: int) -> dict[str, tuple[tuple[int, ...], torch.
             (
                 ranks,
                 DSPARK_DRAFTER_MAX_BATCH,
-                DSPARK_DRAFTER_QUERY_WIDTH,
+                layout.draft_tokens,
                 DSPARK_HIDDEN_SIZE,
             ),
             torch.bfloat16,
@@ -678,42 +674,7 @@ def drafter_task_args(runner: DSparkModelRunner) -> TaskArgs:
     layout = runner._compiled.layout
     slot_specs = _drafter_slots(layout)
     ranks = layout.ranks
-    scratch = {
-        "kv_caches": (
-            (
-                ranks,
-                DSPARK_DRAFT_LAYERS,
-                DSPARK_DRAFTER_KV_BLOCKS,
-                DSPARK_BLOCK_SIZE,
-                1,
-                DSPARK_HEAD_DIM,
-            ),
-            torch.bfloat16,
-        ),
-        "initial_hidden": (
-            (ranks, DSPARK_MOE_TOKENS, DSPARK_HC_MULT, DSPARK_HIDDEN_SIZE),
-            torch.float32,
-        ),
-        "intermediate_hidden": (
-            (
-                ranks,
-                DSPARK_DRAFT_LAYERS,
-                DSPARK_MOE_TOKENS,
-                DSPARK_HC_MULT,
-                DSPARK_HIDDEN_SIZE,
-            ),
-            torch.float32,
-        ),
-        "head_hidden": (
-            (
-                ranks,
-                DSPARK_DRAFTER_MAX_BATCH,
-                DSPARK_DRAFTER_QUERY_WIDTH,
-                DSPARK_HIDDEN_SIZE,
-            ),
-            torch.bfloat16,
-        ),
-    }
+    scratch = drafter_scratch_specs(layout)
 
     ta = TaskArgs(stacked=True)
     for name in _DRAFTER_TENSOR_ORDER:
@@ -771,14 +732,14 @@ def _markov_slots(layout) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
         "num_sampled": (torch.int32, (ranks, DSPARK_DRAFTER_MAX_BATCH)),
         "last_sampled": (torch.int64, (ranks, DSPARK_DRAFTER_MAX_BATCH)),
         "next_prefill_tokens": (torch.int64, (ranks, DSPARK_DRAFTER_MAX_BATCH)),
-        "logit_row_indices": (torch.int32, (ranks, DSPARK_MAX_LOGIT_ROWS)),
+        "logit_row_indices": (torch.int32, (ranks, layout.max_logit_rows)),
         "draft_token_ids": (
             torch.int32,
-            (ranks, DSPARK_DRAFTER_MAX_BATCH, DSPARK_DRAFTER_QUERY_WIDTH),
+            (ranks, DSPARK_DRAFTER_MAX_BATCH, layout.draft_tokens),
         ),
         "confidence_probs": (
             torch.float32,
-            (ranks, DSPARK_DRAFTER_MAX_BATCH, DSPARK_DRAFTER_QUERY_WIDTH),
+            (ranks, DSPARK_DRAFTER_MAX_BATCH, layout.draft_tokens),
         ),
     }
 
@@ -791,7 +752,7 @@ def markov_task_args(runner: DSparkModelRunner) -> TaskArgs:
     head_hidden_shape = (
         ranks,
         DSPARK_DRAFTER_MAX_BATCH,
-        DSPARK_DRAFTER_QUERY_WIDTH,
+        layout.draft_tokens,
         DSPARK_HIDDEN_SIZE,
     )
 

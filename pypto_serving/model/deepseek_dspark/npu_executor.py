@@ -39,7 +39,6 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_FWD_NUM_LAYERS,
     DSPARK_NOISE_TOKEN_ID,
     DSPARK_RANKS,
-    DSPARK_SPECULATIVE_TOKENS,
     DSparkCacheLayout,
     DSparkCompiledKernels,
     DSparkRopeTables,
@@ -180,8 +179,11 @@ def _dspark_import_context(
         config.EP = layout.ranks
         config.TP = layout.tp_size
         config.DP = layout.partitions
-        if config.DECODE_SEQ != layout.decode_seq:
-            raise ValueError("DSpark Lib verification width does not match the Serving layout")
+        config.DSPARK_SPEC_TOKENS = layout.draft_tokens
+        config.DECODE_SEQ = layout.decode_seq
+        config.HCA_STATE_BLOCKS_PER_REQUEST = (128 + layout.decode_seq + 7) // 8
+        config.CSA_STATE_BLOCKS_PER_REQUEST = layout.csa_state_table_blocks
+        config.CSA_INNER_STATE_BLOCKS_PER_REQUEST = layout.csa_state_table_blocks
         # Lib derives owner, drafter and head extents from B/S at import.
         # Configure the existing 16-request owner tile instead of inheriting
         # B=64 at TP1 and quadrupling padded workspaces and filler execution.
@@ -240,18 +242,12 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         # scheduler cache partitions, packed-prefill capacity) from it.
         self._topology_layout = DSparkCacheLayout.for_ranks(
             cache_ranks, tp_size=tp_size, lm_head_tp_size=lm_head_tp_size,
+            num_speculative_tokens=num_speculative_tokens,
         )
         if execution_role not in ("mixed", "prefill", "decode"):
             raise ValueError("invalid DSpark execution role")
         self._execution_role = execution_role
         self._runner_extension_factory = runner_extension_factory
-        if self._num_speculative_tokens not in (0, DSPARK_SPECULATIVE_TOKENS):
-            raise ValueError(
-                "DSpark speculation is fixed at K="
-                f"{DSPARK_SPECULATIVE_TOKENS} (DSPARK_QUERY_WIDTH); got "
-                f"{self._num_speculative_tokens}. Use 0 to serve the target "
-                "model without speculation."
-            )
         self._embedding_cache: dict[str, torch.Tensor] = {}
         # The persistent JIT cache is resolved by PyPTO through the run config
         # policy; an explicit build dir stays a diagnostic/output request.
@@ -401,7 +397,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         state_commit = None
         if speculative:
             self._validate_drafter_config(model, config_data)
-            # The drafter weights are required (and loaded) only at K=7.
+            # The drafter weights are required (and loaded) only with speculation.
             weight_store.validate_drafter_startup_contract(
                 n_routed_experts=n_routed_experts
             )
@@ -414,16 +410,16 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         bootstrap_tokens = None
         bootstrap_metadata = None
         bootstrap_one_l2 = None
-        normal_k7 = speculative and os.environ.get("PYPTO_DSPARK_BOOTSTRAP_METADATA_DEVICE") != "0"
+        normal_speculation = speculative and os.environ.get("PYPTO_DSPARK_BOOTSTRAP_METADATA_DEVICE") != "0"
         prefill_async_flag = os.environ.get("PYPTO_DSPARK_PREFILL_ASYNC")
         source_only = self._execution_role == "prefill" and self._capture_prefill_tail
-        prefill_async = (prefill_async_flag == "1" or (prefill_async_flag is None and (normal_k7 or source_only)))
+        prefill_async = (prefill_async_flag == "1" or (prefill_async_flag is None and (normal_speculation or source_only)))
         device_bootstrap_metadata = speculative and (
-            os.environ.get("PYPTO_DSPARK_BOOTSTRAP_METADATA_DEVICE") == "1" or (normal_k7 and prefill_async)
+            os.environ.get("PYPTO_DSPARK_BOOTSTRAP_METADATA_DEVICE") == "1" or (normal_speculation and prefill_async)
         )
         bootstrap_one_l2_flag = os.environ.get("PYPTO_DSPARK_BOOTSTRAP_ONE_L2")
         bootstrap_one_l2_enabled = (
-            bootstrap_one_l2_flag == "1" or (bootstrap_one_l2_flag is None and normal_k7 and prefill_async)
+            bootstrap_one_l2_flag == "1" or (bootstrap_one_l2_flag is None and normal_speculation and prefill_async)
         )
         if bootstrap_one_l2_enabled and not device_bootstrap_metadata:
             raise ValueError("One-L2 DSpark bootstrap requires device bootstrap metadata")
@@ -435,7 +431,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         ))
         if prefill_async and ((not speculative and not source_only)
                               or (device_bootstrap and not device_bootstrap_metadata)):
-            raise ValueError("Async DSpark prefill requires K=7 or target-only source capture; bootstrap needs metadata")
+            raise ValueError("Async DSpark prefill requires speculation or target-only source capture; bootstrap needs metadata")
         decode = None
         rope: DSparkRopeTables | None = None
         if self._compile_kernels:
@@ -484,7 +480,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
             if speculative:
                 # The fused decode program owns every recurrent decode stage,
                 # but prefill still needs one standalone draft step to seed
-                # the first K=7 tokens. pypto-lib#1314 folded the integrated
+                # the first draft tokens. pypto-lib#1314 folded the integrated
                 # draft-step+markov+state program away, so the pair now
                 # dispatches split: the bare drafter, then the standalone
                 # markov sampler; the persistent device state is published by
