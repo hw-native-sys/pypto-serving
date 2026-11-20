@@ -16,10 +16,10 @@ import threading
 import time
 
 import torch
-from pypto_serving.serving.model_extension import ModelStepExtension
 from .decoding import (
     DecodeReservation,
     LowlatDecodeExtension,
+    encode_decode_extension,
     NativeDecodeRetirement,
     decode_reservation_payload,
     encode_reservation,
@@ -100,10 +100,7 @@ class NativePipelineRunner(NativeModelRunner):
     def prepare_decode(self, model, batch, *, buffer_slot=0):
         if len(batch.request_ids) != 1 or len(batch.model_extensions) != 1:
             raise ValueError("native pipeline requires one explicit reservation")
-        extension = batch.model_extensions[0]
-        reservation = extension.payload if extension.kind == "deepseek_v4_flash_lowlat" else None
-        if isinstance(reservation, bytes):
-            reservation = decode_reservation_payload(reservation)
+        reservation = decode_reservation_payload(batch.model_extensions[0])
         from .decoding import validate_reservation
 
         validate_reservation(reservation)
@@ -213,14 +210,10 @@ class NativePipelineRunner(NativeModelRunner):
                 ))
                 result = DecodeResult(None, None, sampled_token_ids=torch.tensor([packet.state.last_token]),
                     accepted_token_ids=[list(packet.token_ids)], num_draft_tokens=None,
-                    model_extension=ModelStepExtension(
-                        "deepseek_v4_flash_lowlat",
-                        1,
-                        LowlatDecodeExtension(
-                            (pending.prepared.reservation.reservation_id,),
-                            (receipt,),
-                        ),
-                    ))
+                    model_extension=encode_decode_extension(LowlatDecodeExtension(
+                        (pending.prepared.reservation.reservation_id,),
+                        (receipt,),
+                    )))
                 self.native.commit(packet)
                 self.native.frames.consume(index)
                 self.native.frames.release(index)
@@ -268,7 +261,7 @@ class NativePipelineRunner(NativeModelRunner):
             self.request_contexts[state.request_id] = replace(context, execution_generation=1)
         batch = replace(
             batch,
-            model_extensions=(ModelStepExtension("deepseek_v4_flash_lowlat", 1, encode_reservation(reservation)),),
+            model_extensions=(encode_reservation(reservation),),
         )
         return self.run_prepared_decode(model, batch, self.prepare_decode(model, batch))
 

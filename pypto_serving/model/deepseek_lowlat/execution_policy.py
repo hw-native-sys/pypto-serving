@@ -112,18 +112,11 @@ class LowlatExecutionPolicy(ExecutionPolicy):
     def confirm_step(self, output, result, cache):
         from .decoding import decode_decode_extension, decode_retirement, validate_native_retirement
 
-        extension = result.model_extension
-        if isinstance(extension, bytes):
-            extension = decode_decode_extension(extension) if extension else None
-            extension_kind = "deepseek_v4_flash_lowlat"
-        else:
-            extension_kind = extension.kind if extension is not None else ""
-        if extension is not None and extension_kind == "deepseek_v4_flash_lowlat":
-            payload = extension.payload if hasattr(extension, "payload") else extension
-            retired_reservation_ids = payload.retired_reservation_ids
-            execution_receipts = payload.execution_receipts
-        else:
-            raise ValueError("lowlat step is missing its typed execution extension")
+        if not result.model_extension:
+            raise ValueError("lowlat step is missing its execution extension")
+        extension = decode_decode_extension(result.model_extension)
+        retired_reservation_ids = extension.retired_reservation_ids
+        execution_receipts = extension.execution_receipts
         expected = [s for s in output.scheduled_requests if s.model_execution_plan is not None]
         if retired_reservation_ids != tuple(
             s.model_execution_plan.reservation_id for s in expected

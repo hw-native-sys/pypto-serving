@@ -11,6 +11,7 @@
 from functools import wraps
 
 from pypto_serving.tools.profile import is_enabled, profile_span
+from .decoding import decode_reservation_payload
 
 
 def handle_fields(handle):
@@ -29,7 +30,9 @@ def reservation_fields(value):
     if reservation is None:
         reservations = getattr(value, "model_extensions", ())
         if isinstance(reservations, tuple) and len(reservations) == 1:
-            reservation = reservations[0]
+            payload = reservations[0]
+            if payload:
+                reservation = decode_reservation_payload(payload)
     if reservation is None:
         return {}
     return {name: item for name, item in vars(reservation).items()

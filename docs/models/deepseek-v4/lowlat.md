@@ -438,18 +438,15 @@ must not replace the separate uninstrumented benchmark.
 
 ## Serving/model boundary
 
-Lowlat native execution is carried through a typed model extension. The common
-engine owns request admission, token scheduling, ordinary KV block lifetime and
-IPC ordering. The lowlat adapter owns native cycle/frame reservations, physical
-lookahead, retirement receipts and rolling checkpoint publication.
+Lowlat native execution is carried through a versioned opaque model extension.
+The common engine owns request admission, token scheduling, ordinary KV block
+lifetime and IPC ordering. The lowlat adapter owns native cycle/frame
+reservations, physical lookahead, retirement receipts and rolling checkpoint
+publication.
 
-`RequestExecutionContext` and `ModelStepExtension` live in
-`pypto_serving.serving.model_extension`. Prefill batches convert legacy byte
-metadata into a versioned opaque extension at construction. The IPC protocol
-has no lowlat-specific reservation or receipt fields; it carries only the
-versioned model extension bytes. Executor features
-are resolved once into `ModelExecutionCapabilities` during worker
-initialization; the worker hot path does not probe executor attributes for
-async or sampling behavior. Lowlat decode receipts are exposed through a
-`deepseek_v4_flash_lowlat` result extension. The generic scheduler never
-interprets native reservation payloads.
+`RequestExecutionContext` is the only shared model context in
+`pypto_serving.serving.model_extension`; per-step model data is `bytes` in
+common batches and IPC. Lowlat encodes and validates reservation and retirement
+payloads inside `model/deepseek_lowlat`. Executor capability properties are part
+of the `ModelExecutor` contract and the worker reads them directly. The generic
+scheduler never interprets native reservation payloads.

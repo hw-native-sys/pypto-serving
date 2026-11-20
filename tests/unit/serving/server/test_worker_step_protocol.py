@@ -668,6 +668,7 @@ def test_mixed_decode_does_not_overwrite_prepared_next_step():
     class Executor:
         supports_async_decode_prepare = True
         supports_async_decode_reclaim = False
+        supports_async_prefill_reclaim = False
         supports_device_decode_embedding = True
         supports_device_sampling = True
         device_topk_sampling_k = 0

@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import torch
-import msgspec
 
 from pypto_serving.config.types import (
     DecodeBatch,
@@ -32,8 +31,6 @@ from pypto_serving.config.types import (
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.constraints.provider import ConstraintState, XGrammarProvider
 from pypto_serving.serving.sampling.capabilities import SamplingCapabilities
-from pypto_serving.serving.model_extension import ModelExecutionCapabilities, ModelStepExtension
-from pypto_serving.model.common.executor.capabilities import resolve_executor_capabilities
 from pypto_serving.serving.sampling.stop_rules import blocked_token_ids
 from pypto_serving.observability.decode_metrics import DecodeStepRecorder
 from pypto_serving.serving.utils.gc_utils import freeze_gc_heap
@@ -164,7 +161,6 @@ class WorkerProcess:
         self._services = None
         self._batch_builder = self._make_decode_batch
         self.executor = None
-        self._executor_capabilities = ModelExecutionCapabilities()
         self.sampler = None
         self.model_record = None
         self._page_size: int = 64
@@ -218,7 +214,6 @@ class WorkerProcess:
                 pypto_build_dir=str(pypto_build_dir) if pypto_build_dir is not None else None,
                 **self.config.executor_kwargs,
             )
-            self._executor_capabilities = resolve_executor_capabilities(self.executor)
 
             loaded = ModelLoader().load(
                 model_id=self.config.model_id,
@@ -249,28 +244,6 @@ class WorkerProcess:
                 self._batch_builder = self._services.wrap_batch(self._make_decode_batch)
             logger.info("Worker model loaded and ready")
             return num_pages
-
-    def _capabilities(self) -> ModelExecutionCapabilities:
-        """Return capabilities for production workers and lightweight test doubles."""
-        capabilities = self.__dict__.get("_executor_capabilities")
-        if capabilities is None:
-            executor = self.__dict__.get("executor")
-            capabilities = (
-                resolve_executor_capabilities(executor)
-                if executor is not None
-                else ModelExecutionCapabilities()
-            )
-            self._executor_capabilities = capabilities
-        return capabilities
-
-    @staticmethod
-    def _encode_model_extension(extension: ModelStepExtension | None) -> bytes:
-        """Encode an adapter-owned result payload without interpreting it."""
-        if extension is None:
-            return b""
-        if isinstance(extension.payload, bytes):
-            return extension.payload
-        return msgspec.msgpack.encode(extension.payload)
 
     def _resolve_executor_cls(self):
         if self.config.executor_cls == "PyptoDeepSeekV4LowlatExecutor":
@@ -317,7 +290,7 @@ class WorkerProcess:
         config = getattr(self, "config", None)
         executor = getattr(self, "executor", None)
         async_enabled = bool(config is not None and config.resolve_async_scheduling())
-        if async_enabled and executor is not None and self._capabilities().async_decode_prepare:
+        if async_enabled and executor is not None and self.executor.supports_async_decode_prepare:
             self._pipelined_busy_loop()
         else:
             self._serial_busy_loop()
@@ -417,8 +390,8 @@ class WorkerProcess:
                 if (
                     isinstance(cmd, StepCommand)
                     and (cmd.decode_requests or (cmd.prefill_requests and
-                         self._capabilities().async_prefill_reclaim))
-                    and self._capabilities().device_decode_embedding
+                         self.executor.supports_async_prefill_reclaim))
+                    and self.executor.supports_device_decode_embedding
                 ):
                     # Every writer must own its slot, including the decode
                     # half of a mixed command that stages later on the device
@@ -697,7 +670,7 @@ class WorkerProcess:
             prepared is not None and prepared.error is None
             and prepared.prefill_prepared is not None and prepared.prefill_batch is not None
             and cmd.prefill_requests and not cmd.decode_requests
-            and bool(self._capabilities().async_prefill_reclaim)
+            and bool(self.executor.supports_async_prefill_reclaim)
         )
 
     def _reclaim_pending_prefill(self, work: _PendingPrefillOutput) -> StepResult:
@@ -724,7 +697,7 @@ class WorkerProcess:
             and cmd.decode_requests
             and not cmd.prefill_requests
             and not cmd.new_requests
-            and bool(self._capabilities().async_decode_reclaim)
+            and bool(self.executor.supports_async_decode_reclaim)
         )
 
     def _reclaim_pending_decode(self, work: _PendingDecodeOutput) -> StepResult:
@@ -751,7 +724,7 @@ class WorkerProcess:
                 )
             return StepResult(
                 new_tokens=new_tokens, step_id=work.cmd.step_id, num_draft_tokens=num_draft_tokens,
-                model_extension=self._encode_model_extension(decode_result.model_extension),
+                model_extension=decode_result.model_extension,
             )
         except Exception as exc:
             logger.error("Worker decode reclaim failed: %s", exc, exc_info=True)
@@ -969,7 +942,7 @@ class WorkerProcess:
             if cmd.prefill_requests:
                 max_prefill_batch = self.executor.max_prefill_batch_size
                 if max_prefill_batch is None:
-                    if prepared_decode is not None and self._capabilities().async_prefill_reclaim:
+                    if prepared_decode is not None and self.executor.supports_async_prefill_reclaim:
                         self._batch_prefill(cmd.prefill_requests, runtime_model, new_tokens,
                                             prefill_slot=prepared_decode.buffer_slot)
                     else:
@@ -987,7 +960,7 @@ class WorkerProcess:
                             self.executor, "max_prefill_tokens_per_partition", None
                         ),
                     ):
-                        if prepared_decode is not None and self._capabilities().async_prefill_reclaim:
+                        if prepared_decode is not None and self.executor.supports_async_prefill_reclaim:
                             self._batch_prefill(chunk, runtime_model, new_tokens,
                                                 prefill_slot=prepared_decode.buffer_slot)
                         else:
@@ -1093,7 +1066,7 @@ class WorkerProcess:
             cache_partitions=[pr.cache_partition for pr in scheduled],
         )
         batch.model_extensions = {
-            pr.request_id: ModelStepExtension("model-step", 1, pr.model_extension)
+            pr.request_id: pr.model_extension
             for pr in scheduled
             if pr.model_extension
         }
@@ -1124,7 +1097,7 @@ class WorkerProcess:
             batch = self._make_prefill_batch(scheduled, runtime_model)
             allow_device_greedy_sampling = batch.allow_device_greedy_sampling
             allow_device_topk_sampling = batch.allow_device_topk_sampling
-            if prefill_slot is not None and self._capabilities().async_prefill_reclaim:
+            if prefill_slot is not None and self.executor.supports_async_prefill_reclaim:
                 prefill_result = self.executor.run_prefill_in_slot(
                     runtime_model, batch, buffer_slot=prefill_slot,
                 )
@@ -1280,7 +1253,7 @@ class WorkerProcess:
             else [0] * len(scheduled)
         )
         decode_token_tensor = torch.tensor(decode_tokens, dtype=torch.long, device=device)
-        if self._capabilities().device_decode_embedding:
+        if self.executor.supports_device_decode_embedding:
             decode_embeddings = None
         else:
             decode_embeddings = self.executor.lookup_embeddings(runtime_model, decode_token_tensor)
@@ -1305,11 +1278,7 @@ class WorkerProcess:
             block_ids=[dr.block_ids for dr in scheduled],
             block_ids_by_group=[dr.block_ids_by_group for dr in scheduled],
             cache_partitions=[dr.cache_partition for dr in scheduled],
-            model_extensions=tuple(
-                ModelStepExtension("deepseek_v4_flash_lowlat", 1, dr.model_extension)
-                if dr.model_extension else None
-                for dr in scheduled
-            ),
+            model_extensions=tuple(dr.model_extension or None for dr in scheduled),
             constraint_states={
                 dr.request_id: state
                 for dr in scheduled
@@ -1377,7 +1346,7 @@ class WorkerProcess:
                     mode="sync_prepared" if prepared_decode is not None else "sync_unprepared",
                     prefill_requests=prefill_requests,
                 )
-            return num_draft_tokens, self._encode_model_extension(decode_result.model_extension)
+            return num_draft_tokens, decode_result.model_extension
 
     def _consume_decode_result(
         self,
@@ -1554,7 +1523,7 @@ class WorkerProcess:
         return all(
             request.temperature <= 0.0
             or (
-                self._capabilities().device_stochastic_sampling
+                self.executor.supports_device_stochastic_sampling
                 and request.top_p >= 1.0
             )
             for request in requests

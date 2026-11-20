@@ -6,15 +6,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Typed seams between common serving and model-specific execution.
+"""Request context shared with a model adapter.
 
-The common engine owns the lifetime of these values.  Their payload is owned by
-the selected model adapter and is never inspected by the HTTP server or the
-generic scheduler.
+Per-step model data stays opaque bytes in common serving types and IPC.
+The selected adapter owns its encoding and validation.
 """
 
 from dataclasses import dataclass
-from typing import Any
 
 
 @dataclass(frozen=True)
@@ -44,31 +42,3 @@ class RequestExecutionContext:
             or not 0 <= self.initial_output_tokens <= self.max_output_tokens
         ):
             raise ValueError("invalid request execution context")
-
-
-@dataclass(frozen=True)
-class ModelStepExtension:
-    """Opaque model-owned metadata carried by one engine/worker step."""
-
-    kind: str
-    version: int
-    payload: Any
-
-    def __post_init__(self) -> None:
-        if not self.kind or type(self.version) is not int or self.version <= 0:
-            raise ValueError("invalid model step extension")
-
-
-@dataclass(frozen=True)
-class ModelExecutionCapabilities:
-    """Executor capabilities resolved once after model registration."""
-
-    device_sampling: bool = False
-    device_stochastic_sampling: bool = False
-    device_embedding: bool = False
-    device_decode_embedding: bool = False
-    async_decode_prepare: bool = False
-    async_decode_reclaim: bool = False
-    async_prefill_reclaim: bool = False
-    prefill_tail_requires_reclaim: bool = False
-

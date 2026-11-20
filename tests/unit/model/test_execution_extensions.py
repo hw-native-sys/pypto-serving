@@ -6,20 +6,11 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-from pypto_serving.model.common.executor.capabilities import resolve_executor_capabilities
-from pypto_serving.serving.model_extension import (
-    ModelExecutionCapabilities,
-    ModelStepExtension,
-    RequestExecutionContext,
+
+from pypto_serving.model.deepseek_lowlat.decoding import (
+    LowlatDecodeExtension, decode_decode_extension, encode_decode_extension,
 )
-
-
-def test_model_extension_keeps_payload_opaque():
-    payload = object()
-    extension = ModelStepExtension("model-a", 1, payload)
-    assert extension.payload is payload
-    assert extension.kind == "model-a"
-
+from pypto_serving.serving.model_extension import RequestExecutionContext
 
 def test_request_context_is_shared_admission_state_without_model_fields():
     context = RequestExecutionContext("request", 128, 64, execution_generation=3)
@@ -27,11 +18,8 @@ def test_request_context_is_shared_admission_state_without_model_fields():
     assert not hasattr(context, "prefix_resume")
 
 
-def test_capabilities_are_resolved_once_at_executor_boundary():
-    class Executor:
-        supports_device_sampling = True
-        supports_async_decode_prepare = True
-
-    capabilities = resolve_executor_capabilities(Executor())
-    assert capabilities == ModelExecutionCapabilities(device_sampling=True, async_decode_prepare=True)
-
+def test_model_extension_is_an_opaque_bytes_payload():
+    payload = LowlatDecodeExtension((7,), (b"receipt",))
+    encoded = encode_decode_extension(payload)
+    assert isinstance(encoded, bytes)
+    assert decode_decode_extension(encoded) == payload

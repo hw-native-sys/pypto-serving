@@ -15,7 +15,6 @@ from typing import Literal
 import torch
 
 from pypto_serving.model.tokenizer import TokenizerAdapter
-from pypto_serving.serving.model_extension import ModelStepExtension
 
 
 PREFILL_CHUNK_SIZE_CHOICES = (1024, 2048, 4096, 8192)
@@ -342,7 +341,7 @@ class PrefillBatch:
     # Opaque request-local generation constraints, interpreted only by capable runners.
     constraint_states: dict[str, object] = field(default_factory=dict)
     stop_token_masks: dict[str, StopTokenMask] = field(default_factory=dict)
-    model_extensions: dict[str, ModelStepExtension] = field(default_factory=dict)
+    model_extensions: dict[str, bytes] = field(default_factory=dict)
 
 
 @dataclass
@@ -385,7 +384,7 @@ class DecodeBatch:
     # its embedding (shape ``[B, hidden]``). Left ``None`` for single-token decoders.
     prev_token_ids: torch.Tensor | None = None
     prev_hidden_states: torch.Tensor | None = None
-    model_extensions: tuple[ModelStepExtension | None, ...] = ()
+    model_extensions: tuple[bytes | None, ...] = ()
 
 
 @dataclass
@@ -403,7 +402,7 @@ class DecodeResult:
     # Actual verified drafts per request, before scheduler output truncation.
     # None disables speculation metrics; zero denotes a target-only fallback.
     num_draft_tokens: list[int] | None = None
-    model_extension: ModelStepExtension | None = None
+    model_extension: bytes = b""
 
 
 @dataclass

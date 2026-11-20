@@ -14,10 +14,11 @@ import threading
 import pytest
 import torch
 
-from pypto_serving.model.deepseek_lowlat.decoding import DecodeReservation
+from pypto_serving.model.deepseek_lowlat.decoding import (
+    DecodeReservation, decode_decode_extension, decode_reservation_payload, encode_reservation,
+)
 from pypto_serving.config.types import DecodeBatch
 from pypto_serving.serving.model_extension import RequestExecutionContext
-from pypto_serving.serving.model_extension import ModelStepExtension
 from pypto_serving.model.deepseek_lowlat.native_pipeline_runner import NativePipelineRunner
 from pypto_serving.model.deepseek_lowlat.speculation import NativeState, validate_packets
 from pypto_serving.model.deepseek_lowlat.state import LowlatRequestState
@@ -41,7 +42,7 @@ def runner(remaining=24):
         min(12 if remaining >= 7 else 6, remaining), 128+remaining+1+6, remaining, 0)
     batch = DecodeBatch(["r"], torch.tensor([0]), None, torch.tensor([999]),
         block_ids_by_group=[{"ori": [4, 2]}],
-        model_extensions=(ModelStepExtension("deepseek_v4_flash_lowlat", 1, reservation),))
+        model_extensions=(encode_reservation(reservation),))
     return instance, batch, hosts
 
 
@@ -54,8 +55,8 @@ def publish(hosts, index, state, cycles=2):
 
 def accepted_pair(instance, batch):
     first = instance.dispatch_prepared_decode(None, batch, instance.prepare_decode(None, batch))
-    second_reservation = replace(batch.model_extensions[0].payload, reservation_id=2, remaining_lower_bound=12, frame_id=1)
-    second_batch = replace(batch, model_extensions=(replace(batch.model_extensions[0], payload=second_reservation),))
+    second_reservation = replace(decode_reservation_payload(batch.model_extensions[0]), reservation_id=2, remaining_lower_bound=12, frame_id=1)
+    second_batch = replace(batch, model_extensions=(encode_reservation(second_reservation),))
     second = instance.dispatch_prepared_decode(None, second_batch, instance.prepare_decode(None, second_batch))
     return first, second
 
@@ -67,12 +68,12 @@ def test_two_accepted_parents_capture_independent_frames_and_return_real_retirem
     packet = publish(hosts, 0, before)
     publish(hosts, 1, packet.state)
     output_a = instance.reclaim_prepared_decode(first)
-    assert output_a.model_extension.payload.retired_reservation_ids == (1,) and len(output_a.accepted_token_ids[0]) == 12
+    assert decode_decode_extension(output_a.model_extension).retired_reservation_ids == (1,) and len(output_a.accepted_token_ids[0]) == 12
     assert output_a.num_draft_tokens is None
     assert instance._accepted == [second]
     hosts[0]["s_emitted"].fill_(-777)
     output_b = instance.reclaim_prepared_decode(second)
-    assert output_b.model_extension.payload.retired_reservation_ids == (2,) and len(output_b.accepted_token_ids[0]) == 12
+    assert decode_decode_extension(output_b.model_extension).retired_reservation_ids == (2,) and len(output_b.accepted_token_ids[0]) == 12
     assert output_a.accepted_token_ids[0][0] == 100
     assert instance.native.state.remaining == 0 and instance.state.kv_committed_tokens == 152
     assert instance.state.pending_handles == [] and instance.native.frames.idle()
@@ -97,8 +98,8 @@ def test_second_parent_can_be_accepted_while_first_result_waits_without_holding_
     thread = threading.Thread(target=reclaim)
     thread.start()
     assert entered.wait(2)
-    successor = replace(batch.model_extensions[0].payload, reservation_id=2, remaining_lower_bound=12, frame_id=1)
-    second_batch = replace(batch, model_extensions=(replace(batch.model_extensions[0], payload=successor),))
+    successor = replace(decode_reservation_payload(batch.model_extensions[0]), reservation_id=2, remaining_lower_bound=12, frame_id=1)
+    second_batch = replace(batch, model_extensions=(encode_reservation(successor),))
     second = instance.dispatch_prepared_decode(None, second_batch, instance.prepare_decode(None, second_batch))
     publish(hosts, 1, packet.state)
     release.set()
@@ -165,8 +166,8 @@ def test_predecessor_can_retire_while_successor_submission_is_blocked():
         assert release.wait(5)
         return Mock()
     instance.native.frames.worker.submit.side_effect = blocked_submit
-    successor = replace(batch.model_extensions[0].payload, reservation_id=2, frame_id=1, remaining_lower_bound=12)
-    second_batch = replace(batch, model_extensions=(replace(batch.model_extensions[0], payload=successor),))
+    successor = replace(decode_reservation_payload(batch.model_extensions[0]), reservation_id=2, frame_id=1, remaining_lower_bound=12)
+    second_batch = replace(batch, model_extensions=(encode_reservation(successor),))
     errors, accepted = [], []
     def dispatch():
         try:

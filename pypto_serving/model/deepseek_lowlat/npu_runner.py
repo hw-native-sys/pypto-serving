@@ -327,8 +327,7 @@ class LowlatModelRunner(ModelRunner):
 
         from .execution_policy import decode_prefill_metadata
 
-        extension = batch.model_extensions.get(state.request_id)
-        payload = extension.payload if extension is not None else b""
+        payload = batch.model_extensions.get(state.request_id, b"")
         metadata=decode_prefill_metadata(payload)
         with PrefillSubmissions(self.worker, state, self.transfers) as submissions:
             if self.prefix_namespace and metadata.page_identities:
