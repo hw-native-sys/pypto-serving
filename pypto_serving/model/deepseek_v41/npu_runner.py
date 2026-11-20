@@ -3194,6 +3194,24 @@ class V41ResidentResources:
             meta[5] = resources.layout.max_seq_len
             state.tokens[rank, slot].zero_()
             state.tokens[rank, slot, 0] = int(sampled_token_ids[0])
+            # Geometry used to be produced by a separate L3 bootstrap stage.
+            # Build the context rows while lowering prefill so the context-KV
+            # composite receives complete slots and RoPE inputs.
+            workspace["context_slots"].fill_(-1)
+            workspace["context_rope_cos"].zero_()
+            workspace["context_rope_sin"].zero_()
+            positions = workspace["prefill_positions"][rank, :retained_count]
+            rope_cos = resources.rope_tables["draft_cos"][rank]
+            rope_sin = resources.rope_tables["draft_sin"][rank]
+            workspace["context_rope_cos"][rank, :retained_count].copy_(rope_cos[positions.long()])
+            workspace["context_rope_sin"][rank, :retained_count].copy_(rope_sin[positions.long()])
+            for layer in range(workspace["context_slots"].shape[1]):
+                table = resources.cache_tables["draft"][rank, layer, 0]
+                page_index = torch.div(positions, DSPARK_WINDOW, rounding_mode="floor")
+                page_offset = torch.remainder(positions, DSPARK_WINDOW)
+                workspace["context_slots"][rank, layer, :retained_count] = (
+                    table[page_index.long()] * DSPARK_WINDOW + page_offset
+                )
             return request_id, slot, generation
 
     def _dspark_payload(self, *, model, batch, phase, resources, **extra):
