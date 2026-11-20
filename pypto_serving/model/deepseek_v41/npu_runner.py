@@ -1654,7 +1654,8 @@ def compile_prefill_fwd(compiler, lib_root, topology, *, dspark_fused=False):
     if module.MOE_TOKENS != decode_topology.local_capacity:
         raise ValueError("lib prefill MoE extent disagrees with the shared decode kernels")
     entry = module.l3_prefill_fwd_dspark if dspark_fused else module.l3_prefill_fwd
-    return compiler.compile("v41_prefill_fwd", entry), tuple(entry.param_names)
+    compile_name = "v41_prefill_fwd_dspark" if dspark_fused else "v41_prefill_fwd"
+    return compiler.compile(compile_name, entry), tuple(entry.param_names)
 
 
 # segment_inputs
