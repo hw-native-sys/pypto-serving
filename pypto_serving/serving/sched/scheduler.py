@@ -646,7 +646,7 @@ class Scheduler:
                     cached_blocks = []
                 else:
                     cached_blocks = self.kv_cache_manager.get_computed_blocks(
-                        request.prompt_token_ids
+                        request.prompt_token_ids, block_hashes=request.block_hashes
                     )
                     if cached_blocks:
                         request.cached_block_ids = [b.block_id for b in cached_blocks]
