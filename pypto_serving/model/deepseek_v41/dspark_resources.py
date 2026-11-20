@@ -54,7 +54,7 @@ _STATE_GENERATION = 1
 # The target backbone has additional per-layer arguments and is checked by its
 # compiled ABI; the drafter/Markov heads are fixed by the V4.1 DSpark entry.
 _DRAFT_MODEL_KEYS = frozenset({
-    "embedding_weight", "main_proj_weight", "main_norm_weight",
+    "embedding_weight", "main_proj_weight", "main_proj_scale", "main_norm_weight",
     "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight",
     "wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale",
     "wkv", "wkv_scale", "kv_norm_weight", "attn_sink", "wo_a", "wo_a_scale",
@@ -362,7 +362,7 @@ def allocate_dspark_host_resources(layout: DSparkResourceLayout) -> DSparkHostRe
         "target_c1a": _shared(
             (layout.dp_size, DSPARK_MAX_BATCH_PER_DP, table_pages), torch.int32),
         "draft": _shared(
-            (layout.dp_size, DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH_PER_DP, 3),
+            (layout.dp_size, DSPARK_DRAFT_LAYERS, DSPARK_MAX_BATCH_PER_DP, table_pages),
             torch.int32),
     }
     for value in cache_tables.values():

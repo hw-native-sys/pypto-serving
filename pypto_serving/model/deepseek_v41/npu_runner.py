@@ -253,6 +253,14 @@ def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
             raise ValueError(f"{group.name} cache capacity conflicts with the scheduler")
         group_blocks[group.name] = blocks
     physical_group_blocks = {name: blocks + 1 for name, blocks in group_blocks.items()}
+    # The full prefill ABI exposes one shared page extent for its compressed
+    # cache tensor. C2A and C1A retain independent scheduler capacities, while
+    # their packed device views use the larger physical extent on both source
+    # families so every source has the same ``PAGES`` axis.
+    compressed_pages = max(physical_group_blocks[resolved.c2a],
+                           physical_group_blocks[resolved.c1a])
+    physical_group_blocks[resolved.c2a] = compressed_pages
+    physical_group_blocks[resolved.c1a] = compressed_pages
     if type(max_prefill_tokens) is not int or not 0 < max_prefill_tokens <= MAX_PREFILL_TOKENS_PER_DP:
         raise ValueError("invalid prefill scratch capacity")
     scratch_pages = (max_prefill_tokens + 127) // 128
@@ -2645,7 +2653,7 @@ class ResidentDSparkCache:
         from models.deepseek_v4_1_flash.config import WINDOW_CACHE_BYTES
 
         self.worker = worker
-        blocks = DSPARK_MAX_BATCH_PER_DP * 3
+        blocks = DSPARK_MAX_BATCH_PER_DP * ((max_seq_len + DSPARK_WINDOW - 1) // DSPARK_WINDOW)
         self.window_cache = alloc_device_buffer(
             worker, (world, DSPARK_DRAFT_LAYERS, blocks, DSPARK_WINDOW, 1, WINDOW_CACHE_BYTES),
             torch.uint8, stacked=True)
@@ -2734,6 +2742,17 @@ class ResidentDSparkBuffers:
     def sync_state(self):
         for host, device in zip(self.host.state.values(), self.state.values(), strict=True):
             self._copy(host, device)
+
+    def sync_state_bindings(self):
+        """Refresh request-to-slot bindings without clobbering device state.
+
+        ``decode_accept`` owns ``tokens`` and ``meta`` after the first
+        prefill.  The scheduler still rewrites ``slot_ids`` and
+        ``generations`` for the current batch row, so only those two fields
+        may be copied on every decode dispatch.
+        """
+        self._copy(self.host.state.slot_ids, self.state.slot_ids)
+        self._copy(self.host.state.generations, self.state.generations)
 
     def sync_cache_tables(self):
         for name, device in self.cache_tables.items():
@@ -3088,6 +3107,15 @@ class V41ResidentResources:
                     batch.block_ids_by_group[index],
                 ))
             self._stage_dspark_tables(resources, batch, partitions, request_rows)
+            # The current Lib DSpark ABI exposes one dynamic draft-table page
+            # per decode row. Select the page containing the current anchor
+            # while retaining the full host table for prefill context geometry.
+            draft = resources.cache_tables["draft"]
+            pages_per_slot = draft.shape[-1]
+            for index, (rank, row) in enumerate(zip(partitions, request_rows, strict=True)):
+                slot, _generation = self._resolve_dspark_state(request_ids[index])
+                page = positions[index] // DSPARK_WINDOW
+                draft[rank, :, row, 0] = slot * pages_per_slot + page
             if self.engram_host is not None:
                 self.engram_host.stage_lookup(
                     self.decode_host.fields["engram_lookup"],
@@ -3683,6 +3711,35 @@ class V41ResidentResources:
         try:
             self._run_dspark_prefill_context(lowered)
             rank, row = self._dspark_request_rows(lowered, 1)
+            # Prefill lowering validates and reserves the slot before this
+            # method is called. Publish the active metadata after that final
+            # reservation, otherwise reserve_slot() clears STATE_VALID and
+            # the first decode is intentionally rejected by the Lib ABI.
+            resources = self.dspark_host_resources
+            if resources is not None:
+                state = resources.state
+                state.reserve_slot(
+                    rank[0], slot, generation=generation,
+                    position_limit=resources.layout.max_seq_len,
+                )
+                state.bind_request(rank[0], row[0], slot=slot, generation=generation)
+                meta = state.meta[rank[0], slot]
+                meta[0] = 1
+                meta[1] = generation
+                meta[2] = prompt_length
+                meta[3] = prompt_length
+                meta[4] = 0
+                meta[5] = resources.layout.max_seq_len
+                state.tokens[rank[0], slot].zero_()
+                state.tokens[rank[0], slot, 0] = int(
+                    lowered.workspace["next_prefill_tokens"][rank[0], row[0]]
+                )
+            if self.dspark_buffers is not None:
+                # The prefill stage publishes the initial valid state and
+                # page tables on the host.  Copy them once before decode
+                # starts.  Later decode rounds keep tokens/meta on device.
+                self.dspark_buffers.sync_state()
+                self.dspark_buffers.sync_cache_tables()
             state = self.dspark.record_prefill(
                 request_id, slot=slot, generation=generation,
                 prompt_length=prompt_length, anchor=anchor,

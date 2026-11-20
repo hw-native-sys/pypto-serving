@@ -453,7 +453,10 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         supports_chunked_prefill_with_speculation=True,
         speculative_prefix_cache_replay_tokens=128,
         prefix_cache_replay_before_hit=True,
-        prefill_chunk_alignment=128,
+        # The V4.1 prefill ABI accepts arbitrary positive token counts. Keep
+        # the scheduler budget (including the historical 80-token test chunk)
+        # instead of rounding a sub-page chunk down to zero.
+        prefill_chunk_alignment=1,
     )
     return EngineConfig(
         model_id=args.served_model_name or Path(model_dir).name,
