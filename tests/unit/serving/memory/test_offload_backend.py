@@ -139,11 +139,8 @@ def test_drain_failure_stops_progress_thread_and_retains_pool():
 def test_copy_owner_finishing_initialization_after_timeout_stops(monkeypatch):
     from pypto_serving.serving.memory.tiering import simpler
     release, closed = threading.Event(), []
-    def current_context(pointer):
-        ctypes.cast(pointer, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(1)
-        return 0
-    acl = SimpleNamespace(aclrtGetCurrentContext=current_context, aclrtSetCurrentContext=lambda _: 0)
-    monkeypatch.setattr(simpler.ctypes, 'CDLL', lambda _: acl)
+    monkeypatch.setattr(simpler, 'DeviceContext', lambda _: SimpleNamespace(
+        bind=lambda: None, close=lambda: closed.append('context')))
     monkeypatch.setattr(simpler, 'NativeCopy', lambda _: SimpleNamespace(
         initialize_pool=lambda _: release.wait(2), close=lambda: closed.append(True)))
     monkeypatch.setenv('PYPTO_WORKER_INIT_TIMEOUT', '0')
@@ -154,7 +151,7 @@ def test_copy_owner_finishing_initialization_after_timeout_stops(monkeypatch):
     finally:
         release.set()
         service.thread.join(2)
-    assert not service.thread.is_alive() and closed == [True]
+    assert not service.thread.is_alive() and closed == [True, 'context']
 
 
 @pytest.mark.parametrize('stage,rollback_fails', [
@@ -165,18 +162,26 @@ def test_copy_owner_initialization_rolls_back_only_acquired_stages(monkeypatch, 
     from simpler import buffer
     from pypto_serving.serving.memory.tiering import simpler
     events, retired = [], SimpleNamespace(value=False)
+    def context(device):
+        events.append('context')
+        if stage == 'context':
+            raise RuntimeError('ACL context unavailable')
+        def bind():
+            events.append('attach')
+            if stage == 'attach':
+                raise RuntimeError('attach failed')
+        return SimpleNamespace(bind=bind, close=lambda: events.append('context-close'))
+    monkeypatch.setattr(simpler, 'DeviceContext', context)
     def call(name, *args):
         events.append(name)
-        if name in ('aclrtGetCurrentContext', 'aclrtCreateStream'):
+        if name == 'aclrtCreateStream':
             ctypes.cast(args[0], ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(1)
-        return int((stage == 'context' and name == 'aclrtGetCurrentContext')
-                   or (stage == 'attach' and name == 'aclrtSetCurrentContext')
-                   or (stage == 'stream' and name == 'aclrtCreateStream')
+        return int((stage == 'stream' and name == 'aclrtCreateStream')
                    or (stage == 'register' and name == 'aclrtHostRegisterV2')
                    or (rollback_fails and name == 'aclrtHostUnregister'))
     acl = SimpleNamespace(**{name: (lambda *args, n=name: call(n, *args)) for name in (
-        'aclrtGetCurrentContext', 'aclrtSetCurrentContext', 'aclrtCreateStream', 'aclrtDestroyStream',
-        'aclrtSynchronizeStream', 'aclrtHostRegisterV2', 'aclrtHostUnregister')})
+        'aclrtCreateStream', 'aclrtDestroyStream', 'aclrtSynchronizeStream',
+        'aclrtHostRegisterV2', 'aclrtHostUnregister')})
     def acquire(name):
         events.append(name)
         if stage == name:

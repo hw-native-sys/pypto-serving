@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Owner-local DMA over long-lived Simpler host Buffers, outside compute submission."""
+"""Independent DMA consumers over leased VMM and long-lived Host Buffers."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ import ctypes
 import logging
 import threading
 import time
+
+from pypto_serving.serving.utils.native_buffers import DeviceContext
 
 from .pool import advise
 from .backend import BATCH_BYTES, BATCH_SPANS
@@ -44,8 +46,8 @@ class Span(ctypes.Structure):
 class NativeCopy:
     """One owner thread, one independent copy stream, allocation-scoped registrations."""
 
-    def __init__(self, context):
-        self.context = context
+    def __init__(self, device_id):
+        self.device_id = device_id
         self.thread = threading.get_ident()
         self.acl = ctypes.CDLL("libascendcl.so")
         pointer = ctypes.c_void_p
@@ -77,12 +79,22 @@ class NativeCopy:
         if self.thread != threading.get_ident() or self.closed or self.poisoned:
             raise RuntimeError("cache copy owner unavailable")
 
-    def register(self, name, token, descriptor):
+    def register(self, name, exported):
+        from simpler.buffer_export import BufferExport, BufferImportError, BufferMapping
+
         self._check()
         if name in self.regions:
             raise ValueError("duplicate cache allocation")
-        address, extent = self.context.pin(token, descriptor)
-        self.regions[name] = (token, address, extent, len(self.regions))
+        exported = BufferExport(**exported)
+        if exported.device_id != self.device_id:
+            raise ValueError("cache export belongs to a different device")
+        try:
+            mapping = BufferMapping(exported)
+        except BufferImportError as error:
+            self.regions[name] = (error.mapping, 0, 0, len(self.regions))
+            raise
+        self.regions[name] = (mapping, 0, 0, len(self.regions))
+        self.regions[name] = (mapping, mapping.base, mapping.descriptor.nbytes, self.regions[name][3])
 
     def initialize_pool(self, wire):
         from simpler.buffer import ImportContext, ImportRegistry
@@ -169,25 +181,21 @@ class NativeCopy:
         if self.pool is not None:
             self.registry.unregister(self.pool.identity)
             self.pool = None
-        for name, (token, _, _, _) in tuple(self.regions.items()):
-            self.context.unpin(token)
+        for name, (mapping, _, _, _) in tuple(self.regions.items()):
+            mapping.close()
             del self.regions[name]
         self._call("aclrtDestroyStream", self.stream)
         self.closed = True
 
 
 class CopyService:
-    """Independent child-owner endpoint. All Buffer and native work stays in its thread."""
+    """One copy process with its own ACL context and sequential DMA thread."""
 
-    def __init__(self, context, channel, pool, retired):
-        self.context, self.channel, self.pool = context, channel, pool
-        self.retired = retired
+    def __init__(self, device_id, channel, pool, retired):
+        self.channel, self.pool = channel, pool
+        self.device_id, self.retired = device_id, retired
         try:
-            acl = ctypes.CDLL("libascendcl.so")
-            self.acl_context = ctypes.c_void_p()
-            acl.aclrtGetCurrentContext.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
-            if acl.aclrtGetCurrentContext(ctypes.byref(self.acl_context)) or not self.acl_context.value:
-                raise RuntimeError("cache service requires the allocation owner's ACL context")
+            self.context = DeviceContext(device_id)
         except BaseException:
             self.retired.value = True  # No thread, mapping, registration or DMA exists yet.
             self.channel.close()
@@ -207,11 +215,8 @@ class CopyService:
         provider = None
         initialized = False
         try:
-            acl = ctypes.CDLL("libascendcl.so")
-            acl.aclrtSetCurrentContext.argtypes = [ctypes.c_void_p]
-            if acl.aclrtSetCurrentContext(self.acl_context):
-                raise RuntimeError("cannot attach cache-copy thread to owner context")
-            provider = NativeCopy(self.context)
+            self.context.bind()
+            provider = NativeCopy(self.device_id)
             self.provider = provider
             provider.initialize_pool(self.pool)
             initialized = True
@@ -232,9 +237,10 @@ class CopyService:
                 if sequence != expected:
                     raise RuntimeError("stale cache-copy command")
                 try:
-                    if operation == "register":
-                        name, token, descriptor = payload
-                        result = provider.register(name, token, _descriptor(descriptor))
+                    if operation == "ready":
+                        result = None
+                    elif operation == "register":
+                        result = provider.register(*payload)
                     elif operation == "copy_batch":
                         result = provider.copy_batch(*payload)
                     elif operation == "stop":
@@ -260,6 +266,7 @@ class CopyService:
     def _retire(self, provider):
         if provider is not None:
             provider.close()  # Rejects uncertain DMA; never unmaps a registered pool on error.
+        self.context.close()
         self.stopped = True
         self.retired.value = True
 
@@ -270,3 +277,19 @@ class CopyService:
             raise RuntimeError("cache copy thread is still active")
         if not self.stopped:
             raise RuntimeError("cache copy owner has not been safely retired") from self.error
+
+
+def serve_copy(device_id, channel, pool, retired):
+    service = CopyService.__new__(CopyService)
+    try:
+        service.__init__(device_id, channel, pool, retired)
+        service.thread.join()
+    except BaseException:
+        logger.exception("cache copy process failed")
+        if not retired.value:
+            # An unconfirmed copy/import is not permission to destroy its context.
+            threading.Event().wait()
+        raise
+    if not retired.value:
+        threading.Event().wait()
+        raise RuntimeError("cache copy process has not safely retired")

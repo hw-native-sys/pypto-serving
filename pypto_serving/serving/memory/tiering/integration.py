@@ -42,6 +42,8 @@ class Session:
                 or config.runtime_config.kv_offload_backend != "simpler"
                 or not config.enable_prefix_cache):
             raise ValueError("DDR offload requires DSpark prefix caching and the simpler backend")
+        from pypto_serving.serving.utils.native_buffers import check_buffer_exports
+        check_buffer_exports()
         capacity = config.runtime_config.kv_offload_bytes // PAGESIZE * PAGESIZE
         if capacity <= 0:
             raise ValueError("DDR pool is smaller than one physical page")

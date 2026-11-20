@@ -336,7 +336,6 @@ def run(args, engine_config, generate):
     import uvicorn
     from pypto_serving.tools.profile import configure_profiler
     from pypto_serving.serving.utils.env import configure_runtime_logging
-    from inspect import signature
     from .transfer import provider_class
     from pypto_serving.model.tokenizer import load_tokenizer
     if args.prompt or not args.pd_config:
@@ -344,11 +343,8 @@ def run(args, engine_config, generate):
     config = Config.load(args.pd_config)
     if not hasattr(os, "pidfd_open"):
         raise ValueError("PD model nodes require Linux Python with os.pidfd_open")
-    from pypto.runtime.distributed_runner import DistributedWorker
-    if ("chip_service_factories" not in signature(DistributedWorker).parameters
-            or not all(hasattr(DistributedWorker, name)
-                       for name in ("retain_service_tensor", "release_service_tensor"))):
-        raise ValueError("PyPTO lacks the required owner-service and tensor-retain interfaces")
+    from pypto_serving.serving.utils.native_buffers import check_buffer_exports
+    check_buffer_exports()
     provider_class(config.provider).check_available()
     logging.basicConfig(level=logging.INFO)
     configure_runtime_logging()
