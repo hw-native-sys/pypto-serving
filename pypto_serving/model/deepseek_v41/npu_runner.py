@@ -1634,7 +1634,7 @@ class V41ModelRunner:
                 ledger.abort(step, self._reset_request)
                 raise
 
-def compile_prefill_fwd(compiler, lib_root, topology):
+def compile_prefill_fwd(compiler, lib_root, topology, *, dspark_fused=False):
     """Compile the lib's complete CED prefill at the serving row capacity."""
     decode_topology = SegmentTopology.for_decode(tp=topology.tp, dp=topology.dp)
     load_segment_modules(lib_root, decode_topology)
@@ -1643,14 +1643,17 @@ def compile_prefill_fwd(compiler, lib_root, topology):
         sys.argv = [previous_argv[0], "--tp", str(topology.tp), "--ep", str(topology.world),
                     "--dp", str(topology.dp), "--capacity", str(topology.local_capacity),
                     "--moe-tokens", str(decode_topology.local_capacity)]
-        module = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd")
+        module = importlib.import_module(
+            "models.deepseek_v4_1_flash.prefill_fwd_dspark"
+            if dspark_fused else "models.deepseek_v4_1_flash.prefill_fwd"
+        )
     finally:
         sys.argv = previous_argv
     if (module.CAPACITY, module.RANKS) != (topology.local_capacity, topology.world):
         raise ValueError("lib prefill_fwd was imported for another capacity or EP topology")
     if module.MOE_TOKENS != decode_topology.local_capacity:
         raise ValueError("lib prefill MoE extent disagrees with the shared decode kernels")
-    entry = module.l3_prefill_fwd
+    entry = module.l3_prefill_fwd_dspark if dspark_fused else module.l3_prefill_fwd
     return compiler.compile("v41_prefill_fwd", entry), tuple(entry.param_names)
 
 
@@ -2446,7 +2449,8 @@ class PrefillForwardSegment:
     """Run the lib's complete 40-layer prefill using resident decode weights."""
 
     def __init__(self, worker, program, param_names, run_config, topology,
-                 weights, metadata, cache, final, engram=None):
+                 weights, metadata, cache, final, engram=None,
+                 dspark_weights=None, dspark_cache=None, dspark_resources=None):
         self.worker, self.program = worker, program
         self.param_names = tuple(param_names)
         self.run_config, self.metadata = run_config, metadata
@@ -2476,6 +2480,23 @@ class PrefillForwardSegment:
                                       engram_weight=engram.weight)
             elif "engram_lookup" not in param_names:
                 self.arguments.pop("engram_lookup", None)
+            if "draft_main_proj_weight" in param_names:
+                if dspark_weights is None or dspark_cache is None or dspark_resources is None:
+                    raise ValueError("fused DSpark prefill requires resident draft resources")
+                draft = dspark_weights
+                self.arguments.update(
+                    draft_main_proj_weight=draft.full("main_proj_weight"),
+                    draft_main_proj_scale=draft.full("main_proj_scale"),
+                    draft_main_norm_weight=draft.full("main_norm_weight"),
+                    draft_num_tokens=dspark_resources.prefill["prefill_counts"],
+                    draft_context_slots=dspark_resources.prefill["context_slots"],
+                    draft_context_rope_cos=dspark_resources.prefill["context_rope_cos"],
+                    draft_context_rope_sin=dspark_resources.prefill["context_rope_sin"],
+                    draft_wkv=draft.full("wkv"),
+                    draft_wkv_scale=draft.full("wkv_scale"),
+                    draft_kv_norm_weight=draft.full("kv_norm_weight"),
+                    draft_window_cache=dspark_cache.window_cache,
+                )
             if len(self.param_names) != len(set(self.param_names)) or set(self.param_names) != set(self.arguments):
                 raise ValueError("lib full prefill ABI differs from the serving binding")
         except BaseException:
@@ -3366,7 +3387,8 @@ class V41ResidentResources:
                 raise RuntimeError("full prefill was not registered")
             self._prefill_fwd = PrefillForwardSegment(
                 self.worker, program, names, run_config, topology,
-                self.weights, self.prefill_host, self.cache, self.final, self.engram)
+                self.weights, self.prefill_host, self.cache, self.final, self.engram,
+                self.dspark_weights, self.dspark_cache, self.dspark_host_resources)
 
     def _activate_decode(self):
         with profile_span('v41.V41ResidentResources._activate_decode', cat='v41.host', level='verbose'):
@@ -3709,7 +3731,12 @@ class V41ResidentResources:
                 "serving must bind target hidden/sample outputs and publish draft state"
             )
         try:
-            self._run_dspark_prefill_context(lowered)
+            # The fused prefill ABI writes draft context KV as part of the
+            # main prefill dispatch. Keep the standalone entry as a fallback
+            # for older Lib revisions.
+            prefill_names = () if self._prefill_binding is None else self._prefill_binding[1]
+            if "draft_main_proj_weight" not in prefill_names:
+                self._run_dspark_prefill_context(lowered)
             rank, row = self._dspark_request_rows(lowered, 1)
             # Prefill lowering validates and reserves the slot before this
             # method is called. Publish the active metadata after that final
@@ -4060,7 +4087,10 @@ def make_production_bindings(
                 compiler, root, topology)
         else:
             dspark_programs, dspark_param_names = {}, {}
-        prefill, prefill_names = compile_prefill_fwd(compiler, root, prefill_topology)
+        prefill, prefill_names = compile_prefill_fwd(
+            compiler, root, prefill_topology,
+            dspark_fused=bool(runtime.num_speculative_tokens),
+        )
         head_entry = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd").l3_generation_head
         decode_head = compiler.compile("v41_generation_head", head_entry)
         abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
