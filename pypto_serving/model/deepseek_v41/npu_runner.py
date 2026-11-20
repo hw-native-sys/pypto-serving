@@ -2488,10 +2488,10 @@ class PrefillForwardSegment:
                     draft_main_proj_weight=draft.full("main_proj_weight"),
                     draft_main_proj_scale=draft.full("main_proj_scale"),
                     draft_main_norm_weight=draft.full("main_norm_weight"),
-                    draft_num_tokens=dspark_resources.prefill["prefill_counts"],
-                    draft_context_slots=dspark_resources.prefill["context_slots"],
-                    draft_context_rope_cos=dspark_resources.prefill["context_rope_cos"],
-                    draft_context_rope_sin=dspark_resources.prefill["context_rope_sin"],
+                    draft_num_tokens=dspark_resources.prefill_workspace["prefill_counts"],
+                    draft_context_slots=dspark_resources.prefill_workspace["context_slots"],
+                    draft_context_rope_cos=dspark_resources.prefill_workspace["context_rope_cos"],
+                    draft_context_rope_sin=dspark_resources.prefill_workspace["context_rope_sin"],
                     draft_wkv=draft.full("wkv"),
                     draft_wkv_scale=draft.full("wkv_scale"),
                     draft_kv_norm_weight=draft.full("kv_norm_weight"),
@@ -3442,7 +3442,7 @@ class V41ResidentResources:
     def _stage_fused_dspark_prefill(self, step):
         """Stage draft KV geometry for the current target-prefill chunk."""
         resources = self.dspark_host_resources
-        prefill = resources.prefill
+        prefill = resources.prefill_workspace
         prefill["prefill_counts"].zero_()
         prefill["context_slots"].fill_(-1)
         prefill["context_rope_cos"].zero_()
