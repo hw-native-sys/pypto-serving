@@ -80,7 +80,7 @@ class DeepSeekDSpark:
             raise ValueError("index K/scale geometry mismatch")
         # Pair only peers that agree on terminal-state coverage as well as bytes.
         layout = digest(("history-prefix-state-tail", tuple(geometry[c.name].layout for c in COMPONENTS)))
-        return Contract("deepseek-v4-dspark-k7", model, layout, COMPONENTS)
+        return Contract("deepseek-v4-dspark", model, layout, COMPONENTS)
 
     def prefix_spec(self, tokens, cache):
         groups = tuple(g.name for g in cache.group_specs if g.sliding_window is None)
@@ -271,7 +271,7 @@ class DSparkExtension:
         """
         import torch
         from pypto_serving.model.deepseek_dspark.npu_runner import (
-            DSPARK_DRAFTER_QUERY_WIDTH, DSPARK_SAMPLED_IDS_PAD, DSparkStepDescriptor,
+            DSPARK_SAMPLED_IDS_PAD, DSparkStepDescriptor,
         )
 
         runner = self.runner
@@ -303,7 +303,7 @@ class DSparkExtension:
             state.prefill_tail_positions = torch.arange(start, length, dtype=torch.int64)
             state.prefill_descriptor = DSparkStepDescriptor(
                 state.lease, state.generation, state.group, length - 1, 1, length, 0, 1, 0, ordinal,
-                bootstrap_enabled=(length + DSPARK_DRAFTER_QUERY_WIDTH - 1
+                bootstrap_enabled=(length + self.compiled.layout.draft_tokens - 1
                                    < runner._require_rope_tables().max_position))
             ring = torch.full((window,), -1, dtype=torch.int32)
             ring[state.prefill_tail_positions % window] = state.prefill_tail_positions.to(torch.int32)

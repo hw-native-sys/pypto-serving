@@ -236,8 +236,8 @@ class Application:
     def __init__(self, engine_config, config, role, endpoint, tokenizer, generate):
         self.boot = uuid.uuid4().hex
         self.adapter = select_adapter(engine_config.executor_cls)
-        if engine_config.runtime_config.num_speculative_tokens != 7:
-            raise ValueError("PD deployment requires the K7 model configuration")
+        if engine_config.runtime_config.num_speculative_tokens <= 0:
+            raise ValueError("PD deployment requires speculative decoding")
         self.config = config
         progress = channel = None
         if role == "prefill":
@@ -247,7 +247,7 @@ class Application:
         settings = WorkerSettings(self.boot, endpoint.transfer_hostname or endpoint.host,
                                   config.provider, config.capacity, len(config.prefill) + len(config.decode),
                                   config.handoff_timeout)
-        tokens = 0 if role == "prefill" else 7
+        tokens = 0 if role == "prefill" else engine_config.runtime_config.num_speculative_tokens
         engine_config = replace(engine_config,
             runtime_config=replace(engine_config.runtime_config, num_speculative_tokens=tokens),
             executor_kwargs={**engine_config.executor_kwargs, "num_speculative_tokens": tokens,
