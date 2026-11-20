@@ -102,12 +102,20 @@ class CacheOffloadExtension:
                                tp=self.runner._compiled.layout.tp_size))
 
     def close(self):
-        for endpoint in self.endpoints[:len(self.processes)]:
+        owners = tuple(zip(self.endpoints, self.processes))
+        for endpoint, process in owners:
             if not endpoint.stopped.value:
-                endpoint.call("stop")
-        for process in self.processes:
+                try:
+                    endpoint.call("stop")
+                except (RuntimeError, OSError, EOFError):
+                    # A failed startup may finish rolling back after the ready
+                    # deadline. It must publish retirement before exiting.
+                    process.join(10)
+                    if process.exitcode != 0 or not endpoint.stopped.value:
+                        raise
+        for endpoint, process in owners:
             process.join(10)
-            if process.is_alive() or process.exitcode != 0:
+            if process.exitcode != 0 or not endpoint.stopped.value:
                 raise RuntimeError("cache copy process did not retire normally")
         worker = self.runner._shared_l3_worker()
         while self.exports:

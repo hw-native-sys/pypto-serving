@@ -12,7 +12,9 @@ Control protocol version 3 separates the common replicated-page data contract fr
 
 Follow the SDK's normal source-build instructions with its matching runtime pin and required PTOAS version. The native Buffer integration requires PTOAS 0.74 with its matching SDK pin. Keep runtime revision checks enabled; a binary copied from another checkout is not a matching source installation.
 
-Model nodes require Linux Python with `os.pidfd_open` and a working Mooncake Ascend installation. Startup checks these dependencies before loading weights. Each rank has an independent transfer process and ACL context. It imports leased buffers on the same host and registers its own mapped addresses with Mooncake before the first transfer. The compute Worker retains allocation ownership; registration never exposes its process-local pointer to another process. Adding regions after a peer connection is established is not supported. Transfers are device-to-device without Host staging. Deploy on a trusted network: internal control endpoints are not authenticated.
+Model nodes require Linux Python with `os.pidfd_open` and a Mooncake Ascend build that supports `register_memory(address, extent, "npu")`. Startup checks the binding before loading weights. [Mooncake #2191](https://github.com/kvcache-ai/Mooncake/pull/2191)
+
+Each rank has an independent transfer process and ACL context. It imports leased buffers on the same host and registers its own mapped addresses with Mooncake before the first transfer. The compute Worker retains allocation ownership; registration never exposes its process-local pointer to another process. Adding regions after a peer connection is established is not supported. Transfers are device-to-device without Host staging. Deploy on a trusted network: internal control endpoints are not authenticated.
 
 On RoCE hosts, set these variables on both model nodes before starting Serving or loading the SDK.
 

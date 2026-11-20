@@ -93,6 +93,26 @@ def test_timeout_quarantines_endpoint_before_any_later_send():
         SimplerBackend([], dict(tp=4, groups={'idx': (('k', 2, 7, 128),)}), PAGESIZE)
 
 
+@pytest.mark.parametrize("poisoned", [False, True])
+def test_registration_error_only_allows_confirmed_cleanup(poisoned):
+    sent = []
+    replies = iter(((1, False, ("partial import", poisoned)), (2, True, None)))
+    pipe = SimpleNamespace(send=sent.append, poll=lambda _: True, recv=lambda: next(replies))
+    endpoint = Endpoint(pipe, None, SimpleNamespace(value=0), threading.Lock(),
+                        SimpleNamespace(value=False), SimpleNamespace(value=False))
+    with pytest.raises(RuntimeError, match="partial import"):
+        endpoint.call("register")
+    with pytest.raises(RuntimeError, match="quarantined"):
+        endpoint.call("copy_batch")
+    if poisoned:
+        with pytest.raises(RuntimeError, match="quarantined"):
+            endpoint.call("stop")
+        assert len(sent) == 1 and not endpoint.stopped.value
+    else:
+        endpoint.call("stop")
+        assert len(sent) == 2 and endpoint.stopped.value
+
+
 @pytest.mark.parametrize('started,failed', [(False, False), (True, False), (True, True)])
 def test_partial_startup_releases_pool_only_after_owner_ack(started, failed):
     async def run():
@@ -139,19 +159,21 @@ def test_drain_failure_stops_progress_thread_and_retains_pool():
 def test_copy_owner_finishing_initialization_after_timeout_stops(monkeypatch):
     from pypto_serving.serving.memory.tiering import simpler
     release, closed = threading.Event(), []
+    retired = SimpleNamespace(value=False)
     monkeypatch.setattr(simpler, 'DeviceContext', lambda _: SimpleNamespace(
         bind=lambda: None, close=lambda: closed.append('context')))
     monkeypatch.setattr(simpler, 'NativeCopy', lambda _: SimpleNamespace(
         initialize_pool=lambda _: release.wait(2), close=lambda: closed.append(True)))
     monkeypatch.setenv('PYPTO_WORKER_INIT_TIMEOUT', '0')
-    service = simpler.CopyService.__new__(simpler.CopyService)
+    monkeypatch.setattr(simpler.logger, 'exception', lambda *_: release.set())
+    process_main = threading.Thread(target=simpler.serve_copy,
+        args=(None, SimpleNamespace(close=lambda: None), {}, retired), daemon=True)
+    process_main.start()
     try:
-        with pytest.raises(RuntimeError, match='initialization failed'):
-            service.__init__(None, SimpleNamespace(close=lambda: None), {}, SimpleNamespace(value=False))
+        process_main.join(2)
+        assert not process_main.is_alive() and retired.value and closed == [True, 'context']
     finally:
         release.set()
-        service.thread.join(2)
-    assert not service.thread.is_alive() and closed == [True, 'context']
 
 
 @pytest.mark.parametrize('stage,rollback_fails', [
