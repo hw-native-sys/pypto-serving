@@ -176,15 +176,21 @@ class DSparkExtension:
         with span(logger, "pd.compute_communication.initialize"):
             self.worker()._w._ensure_comm_base()
 
+    def needs_source_tail_capture(self, descriptors):
+        window = self.compiled.layout.sliding_window
+        return any(row.chunk_start < row.prompt_len and row.chunk_end > max(0, row.prompt_len - window)
+                   for row in descriptors)
+
     def wrap_capture(self, capture):
         if self.runner.speculative:
             return capture
-        window = self.compiled.layout.sliding_window
         def retain(batch, inputs, **kwargs):
             # P only exports the final prompt tail. Keep the existing all-rank
             # collective intact when any packed request overlaps that window.
-            if any(row.chunk_start < row.prompt_len and row.chunk_end > max(0, row.prompt_len - window)
-                   for row in inputs.descriptors):
+            needed = inputs.source_tail_capture
+            if needed is None:
+                needed = self.needs_source_tail_capture(inputs.descriptors)
+            if needed:
                 result = capture(batch, inputs, **kwargs)
                 for request, row in zip(inputs.request_ids, inputs.descriptors, strict=True):
                     if row.chunk_end == row.prompt_len:

@@ -159,7 +159,7 @@ class ModelExecutor(ABC):
         raise NotImplementedError(f"{type(self).__name__} does not support split prefill reclaim")
 
     def run_prefill_in_slot(
-        self, model: RuntimeModel, batch: PrefillBatch, *, buffer_slot: int,
+        self, model: RuntimeModel, batch: PrefillBatch, *, buffer_slot: int, prepared: object | None = None,
     ) -> PrefillResult:
         raise NotImplementedError(f"{type(self).__name__} does not support owned prefill slots")
 
