@@ -4574,9 +4574,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         device_hidden = self._active_drafter_target_hidden
         host_hidden = None
         if device_hidden is None:
-            mirror = self._read_drafter_hidden(
-                self._drafter_hidden_mirror, rows=self._compiled.layout.drafter_context_rows
-            )
+            mirror = self._read_drafter_hidden(self._drafter_hidden_mirror, rows=layout.decode_local_tokens)
             host_hidden = torch.zeros(
                 (layout.ranks, context_rows, DSPARK_MAIN_HIDDEN_DIM), dtype=torch.bfloat16
             )

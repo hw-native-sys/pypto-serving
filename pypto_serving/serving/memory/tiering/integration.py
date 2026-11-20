@@ -151,7 +151,7 @@ class Session:
     async def _close(self):
         if self.cache is None:
             if self._worker_started:
-                await asyncio.gather(*(asyncio.to_thread(owner.call, "stop") for owner in self.owners
+                await asyncio.gather(*(asyncio.to_thread(owner.stop) for owner in self.owners
                                        if not owner.stopped.value))
             self.pool.close()
             self.copy_library.cleanup()

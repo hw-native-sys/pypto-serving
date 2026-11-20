@@ -13,14 +13,16 @@ import math
 import socket
 import threading
 from concurrent.futures import Future
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from dataclasses import replace
+from unittest.mock import AsyncMock, Mock
 
 import msgspec
 import pytest
 
 from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
-from pypto_serving.pd.worker import Progress, ProgressServer, WorkerRuntime
+from pypto_serving.pd.worker import Progress, ProgressServer, WorkerRuntime, WorkerSettings
 from pypto_serving.pd.adapter import CACHE_COMPONENTS, COMPONENTS, DeepSeekDSpark
 from pypto_serving.pd.config import Config, Endpoint
 from pypto_serving.pd.integration import Chunk
@@ -168,6 +170,76 @@ def test_owner_rejects_out_of_bounds_and_retains_unknown_registration():
     assert provider.local
 
 
+@pytest.mark.parametrize("location", ["", ", location='cpu'"])
+def test_mooncake_preflight_requires_location_without_initializing(tmp_path, monkeypatch, location):
+    package = tmp_path / "mooncake"
+    package.mkdir()
+    (package / "__init__.py").touch()
+    (package / "engine.py").write_text(
+        "class TransferEngine:\n"
+        "    def __init__(self): raise AssertionError('unexpected initialization')\n"
+        f"    def register_memory(self, address, extent{location}): raise AssertionError('unexpected registration')\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    if location:
+        Mooncake.check_available()
+    else:
+        with pytest.raises(ValueError, match="Mooncake #2191"):
+            Mooncake.check_available()
+
+
+def test_pd_unmap_retries_after_provider_disconnect(monkeypatch):
+    from simpler import buffer_export
+    from pypto_serving.pd import transfer
+
+    engine, context, channel = Mock(), Mock(), Mock()
+    first, second = (Mock(base=4096, descriptor=SimpleNamespace(nbytes=64)) for _ in range(2))
+    second.close.side_effect = [RuntimeError("incomplete unmap"), None]
+    calls = Mock()
+    calls.attach_mock(engine.release, "disconnect")
+    calls.attach_mock(first.close, "close_first")
+    calls.attach_mock(second.close, "close_second")
+    monkeypatch.setenv("MC_TRANSFER_TIMEOUT", "")
+    monkeypatch.setattr(transfer, "configure_ports", Mock())
+    monkeypatch.setattr(transfer, "configure_profiler", Mock())
+    monkeypatch.setattr(transfer, "DeviceContext", Mock(return_value=context))
+    monkeypatch.setattr(buffer_export, "BufferExport", SimpleNamespace)
+    monkeypatch.setattr(buffer_export, "BufferMapping", Mock(side_effect=[first, second]))
+    commands = [dict(operation="register", exported={"device_id": 0}, extent=64, name=name)
+                for name in ("kv", "state")] + [dict(operation=op) for op in ("release", "stop")]
+    monkeypatch.setattr(transfer, "_receive", Mock(side_effect=[
+        dict(boot="boot", sequence=i, **cmd) for i, cmd in enumerate(commands, 1)]))
+    send = Mock()
+    monkeypatch.setattr(transfer, "_send", send)
+    transfer._serve(channel, "boot", 0, 0, "host", "test", lambda *_: engine, None)
+    assert [c[0] for c in calls.mock_calls] == ["disconnect", "close_first", "close_second", "close_second"]
+    assert all("error" not in c.args[1] for c in send.call_args_list)
+    context.close.assert_called_once()
+
+
+def test_probe_failure_retires_all_unregistered_owners(monkeypatch):
+    from pypto_serving.pd import transfer
+
+    processes = [Mock(pid=100 + rank, exitcode=0) for rank in range(2)]
+    processes[0].is_alive.return_value = False
+    processes[1].is_alive.side_effect = [True, False]
+    monkeypatch.setattr(transfer.multiprocessing, "get_context",
+                        Mock(return_value=SimpleNamespace(Process=Mock(side_effect=processes))))
+    probe = Mock(side_effect=[100, TransferError("probe unknown", uncertain=True)])
+    monkeypatch.setattr(transfer.TransferWorker, "ready", probe)
+    rpc = Mock(side_effect=AssertionError("startup rollback must not require an RPC"))
+    monkeypatch.setattr(transfer.TransferWorker, "call", rpc)
+    model = SimpleNamespace(ranks=2, worker=lambda: SimpleNamespace(dc=SimpleNamespace(device_ids=(0, 1))))
+    runtime = WorkerRuntime(WorkerSettings("boot", "host", "mooncake", 2, 2), model)
+    with pytest.raises(TransferError, match="probe unknown"):
+        runtime.worker_ready()
+    assert all(owner.process is None and owner.parent.fileno() == -1 for owner in runtime.owners)
+    processes[0].terminate.assert_not_called()
+    processes[1].terminate.assert_called_once()
+    rpc.assert_not_called()
+    runtime.close()
+
+
 def service():
     config = Config((Endpoint("p", 8111, "p"),), (Endpoint("d", 8112, "d"),), log_enabled=False)
     contract = Contract("test", "model", "layout", (Component("kv", "kv", "kv"),))
@@ -179,6 +251,34 @@ def service():
     result = Service(config, config.endpoint("decode"), "decode", None, core, None)
     result.node = d
     return result, p, d
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_prefill_handshake_is_bounded(monkeypatch, cancelled):
+    async def run():
+        s, p, d = service()
+        s.config = replace(s.config, handoff_timeout=60 if cancelled else .02)
+        s.node, s.role, s.adapter = p, "prefill", Mock()
+        reader = asyncio.StreamReader()
+        sent = asyncio.Event()
+        writer = Mock(drain=AsyncMock(side_effect=sent.set))
+        monkeypatch.setattr(asyncio, "open_connection", AsyncMock(return_value=(reader, writer)))
+        entry = s.register_http(Binding.create(p, d, {}), {})
+        entry.task = asyncio.create_task(s.prefill(entry, Continuation((1,), {}, None, None), d))
+        try:
+            if cancelled:
+                await asyncio.wait_for(sent.wait(), 2)
+                await s.abort(entry)
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(asyncio.shield(entry.task), 2)
+            else:
+                with pytest.raises(asyncio.TimeoutError):
+                    await entry.task
+            assert entry.continuation is None and not s.pins.active
+        finally:
+            await s.peers.close()
+        writer.transport.abort.assert_called_once()
+    asyncio.run(run())
 
 
 def test_active_handoff_capacity_uses_the_retryable_error():
@@ -228,6 +328,90 @@ def test_cancel_and_unknown_cannot_release_unconfirmed_native_writes():
             s.cache.release_group_cache(binding.request)
         await s.control(p, (), "abort", {"binding": msgspec.to_builtins(binding), "stopped": True})
         assert s.status(binding.request)["reservation"] == {"present": False, "state": None}
+    asyncio.run(run())
+
+
+def test_final_completion_retires_cancelled_decode():
+    async def run():
+        s, p, d = service()
+        binding = Binding.create(p, d, {})
+        entry = s.register_http(binding, {})
+        entry.reservation = s.cache.reserve_group_cache(binding.request, binding.request, 256, prompt_token_count=128)
+        s.cache.authorize_group_cache_write(binding.request)
+        entry.pending = Plan(binding, "continuation", 0, 0, 128, True, ((0, 0),),
+                             (Copy("kv", 0, 0, 0, 0, 64),), ((0, "kv"),))
+        entry.pending_digest = digest(entry.pending)
+        entry.state_task = asyncio.create_task(asyncio.sleep(0))
+        s.worker = AsyncMock()
+        await s.close_output(entry, terminal=False)
+        assert entry.cancelled and entry.task.done() and not entry.source_done.is_set()
+        assert s.cache.group_cache_reservation(binding.request) is not None
+        payload = dict(binding=msgspec.to_builtins(binding),
+                       completion=msgspec.to_builtins(Completion(entry.pending_digest, ())))
+        with pytest.raises(ValueError, match="mismatched transfer completion"):
+            await s.control(p, (), "complete", payload)
+        s.worker.assert_not_called()
+        payload["completion"] = msgspec.to_builtins(Completion(entry.pending_digest, entry.pending.units))
+        assert await s.control(p, (), "complete", payload) == {}
+        assert entry.source_done.is_set() and not s.requests
+        assert s.cache.group_cache_reservation(binding.request) is None
+        s.worker.assert_awaited_once_with("discard_state", binding.request)
+    asyncio.run(run())
+
+
+def test_prefill_failure_after_first_chunk_retires_decode_reservation():
+    async def run():
+        case = handoff(256)
+        destination, entry, first = case.destination, case.entry, case.plans[0]
+        entry.chunk = entry.end = 0
+        entry.response_closed = True
+        entry.state_task = asyncio.create_task(asyncio.sleep(0))
+        destination.core.scheduler = SimpleNamespace(requests={})
+        destination.worker = AsyncMock()
+        config = service()[0].config
+        request = entry.binding.request
+        completed = asyncio.Event()
+        tables = case.p.ensure_group_blocks(case.source_request, first.end, partition=0)
+        chunk = Chunk(request, 0, 0, first.end, False, None,
+                      {name: tuple(ids) for name, ids in tables.items()}, 0, {"bootstrap": 0})
+
+        async def prefill(*args, **kwargs):
+            source.pins.retain(chunk)
+            await source.chunks[request].put(chunk)
+            yield None
+            await asyncio.wait_for(completed.wait(), 2)
+            raise RuntimeError("second prefill chunk failed")
+
+        core = SimpleNamespace(kv_cache_manager=case.p, is_ready=lambda: True,
+                               add_request=prefill, abort_request=AsyncMock())
+        progress = SimpleNamespace(wait=AsyncMock(return_value=Completion(digest(first), first.units)))
+        source = Service(config, config.endpoint("prefill"), "prefill", destination.adapter, core, progress)
+        source.node, source.geometry = case.nodes[0], case.source_geometry
+        source.worker = AsyncMock(return_value="job")
+
+        async def rpc(operation, payload):
+            if operation == "begin":
+                reservation = entry.reservation
+                return msgspec.to_builtins(Placement(request, 0, reservation.partition,
+                                           reservation.block_ids_by_group, entry.state_slots))
+            reply = await destination.control(source.node, source.geometry, operation, msgspec.to_builtins(payload))
+            if operation == "complete":
+                assert entry.end == first.end and entry.end < len(entry.continuation.tokens)
+                assert case.d.group_cache_reservation(request).write_authorized
+                completed.set()
+            return reply
+
+        @asynccontextmanager
+        async def peer(*args):
+            yield SimpleNamespace(call=rpc, geometry=destination.geometry)
+
+        source.peers.use = peer
+        sending = source.register_http(entry.binding, {})
+        with pytest.raises(RuntimeError, match="second prefill chunk failed"):
+            await asyncio.wait_for(source.prefill(sending, entry.continuation, destination.node), 3)
+        assert entry.source_done.is_set() and case.d.group_cache_reservation(request) is None
+        assert not destination.requests and not source.requests and not source.pins.active
+        destination.worker.assert_awaited_once_with("discard_state", request)
     asyncio.run(run())
 
 

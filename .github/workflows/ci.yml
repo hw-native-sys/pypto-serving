@@ -180,7 +180,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: hw-native-sys/pypto-lib
-          ref: da5350d2bfc40ce12edeaafd44b698050f6dc85b
+          ref: 51ef4b74e985f960b597947534af6877e8f62aac
           path: qwen-hbg-lib
           persist-credentials: false
 

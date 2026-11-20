@@ -670,18 +670,19 @@ class Scheduler:
             if request.num_computed_tokens >= request.num_prompt_tokens:
                 request.num_computed_tokens = max(0, request.num_prompt_tokens - 1)
             num_new = self._limit_scheduled_tokens(request, token_budget)
-            if num_new <= 0:
+            if num_new <= 0 and (
+                not grouped_prefix_hit or self._can_admit_waiting_partition(request.cache_partition)
+            ):
                 self._release_waiting_prefix_blocks(request)
                 remaining_waiting.append(request)
                 continue
 
             scheduled = ScheduledRequest(request, num_new, True)
-            allocated = self._try_allocate_request_blocks(request, num_new, scheduled=scheduled)
+            allocated = num_new > 0 and self._try_allocate_request_blocks(request, num_new, scheduled=scheduled)
             if not allocated and grouped_prefix_hit:
-                # A grouped hit is rank-local. If its partition cannot hold the
-                # uncached suffix, release the hit and retry cold so an idle
-                # partition can admit the request instead of repeatedly
-                # selecting the same capacity-constrained cached partition.
+                # A grouped hit is rank-local. If its partition is busy or
+                # cannot hold the suffix, release the hit and try an idle
+                # partition from the beginning of the prompt.
                 hit_partition = request.cache_partition
                 self._release_waiting_prefix_blocks(request)
                 cold_num_new = self._limit_scheduled_tokens(request, token_budget)
@@ -704,6 +705,8 @@ class Scheduler:
             if not allocated:
                 self._release_waiting_prefix_blocks(request)
                 remaining_waiting.append(request)
+                if num_new <= 0:
+                    continue
                 break
 
             if not self._prepare_checkpoint(scheduled, num_new, output):
@@ -742,6 +745,9 @@ class Scheduler:
         return output
 
     def _can_admit_waiting(self) -> bool:
+        return True
+
+    def _can_admit_waiting_partition(self, partition: int | None) -> bool:
         return True
 
     def _on_scheduled(self, scheduled: ScheduledRequest) -> None:

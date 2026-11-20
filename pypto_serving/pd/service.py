@@ -227,21 +227,28 @@ class Service:
 
     async def connect(self, node):
         endpoint = self.config.endpoint("decode", node.node_id)
-        reader, writer = await asyncio.open_connection(endpoint.host, endpoint.control_port)
-        try:
+        writer = None
+
+        async def exchange():
+            nonlocal writer
+            reader, writer = await asyncio.open_connection(endpoint.host, endpoint.control_port)
             await send(writer, dict(node=self.node, registry=self.registry))
-            hello = await receive(reader)
+            return reader, await receive(reader)
+
+        try:
+            reader, hello = await asyncio.wait_for(exchange(), self.config.handoff_timeout)
             peer = decode(hello["node"], Node)
             if (peer != node or not self.node.compatible(peer) or digest(hello["registry"]) != peer.registry
                     or decode(hello["registry"]["topology"], Topology) != peer.topology):
                 raise ValueError("peer identity/contract changed before handshake")
+            geometry = tuple(decode(g, Geometry) for g in hello["registry"]["geometry"])
             await self.worker("install", hello["registry"])
             session = Session(reader, writer, self.config.capacity * 2)
-            session.geometry = tuple(decode(g, Geometry) for g in hello["registry"]["geometry"])
+            session.geometry = geometry
             return session
         except BaseException:
-            writer.close()
-            await writer.wait_closed()
+            if writer is not None:
+                writer.transport.abort()  # Setup has not authorized any writes.
             raise
 
     async def _accept(self, reader, writer):
@@ -405,6 +412,11 @@ class Service:
             entry.completion_source = "sender_completion" if plan.copies else "empty_plan"
             self.observe("completion", entry, plan_digest=completion.plan_digest, end=entry.end)
             if plan.final:
+                if entry.cancelled or entry.error is not None:
+                    # The validated final completion is now proof that deferred
+                    # cancellation can retire the reservation and state.
+                    await self.abort(entry, stopped=True)
+                    return {}
                 self.cache.commit_group_cache(request, valid_from=plan.valid_from)
                 # Final coverage and definitive native completion close this
                 # binding's write sequence; P-local retirement is independent.
@@ -536,7 +548,7 @@ class Service:
             self.cache.tiering.cancel(entry.binding.request)
         if self.role == "prefill":
             if entry.continuation is None and entry.task is not None:
-                entry.task.cancel()  # Input preparation has not allocated a handoff.
+                entry.task.cancel()  # Input preparation or peer setup has not begun a handoff.
             queue = self.chunks.get(entry.binding.request)
             if queue is not None and queue.empty():
                 queue.put_nowait(None)  # Wake the sender; this is not native stop proof.
@@ -577,7 +589,6 @@ class Service:
             entry.state_task = None
 
     async def prefill(self, entry, continuation, peer):
-        entry.continuation = continuation
         entry.normalized_digest = digest(continuation)
         request = entry.binding.request
         config = GenerateConfig(**continuation.config)
@@ -594,6 +605,8 @@ class Service:
         inflight = None
         submitted = False
         async with self.peers.use(peer.key, lambda: self.connect(peer)) as session:
+            entry.continuation = continuation
+
             async def call(op, **payload):
                 return await asyncio.wait_for(session.call(op, dict(binding=entry.binding, **payload)),
                                               self.config.handoff_timeout)
@@ -709,7 +722,9 @@ class Service:
                         self.pins.release(request)
                     await self.core.abort_request(request)
                     if drain is not None:
-                        await drain
+                        # The task may already carry the Prefill error we are
+                        # handling. Drain it before notifying Decode of stop.
+                        await asyncio.gather(drain, return_exceptions=True)
                 try:
                     await call("abort", stopped=not uncertain)
                 except Exception:

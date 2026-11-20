@@ -66,10 +66,25 @@ class Mooncake:
     @staticmethod
     def check_available():
         # Import in a disposable process, before weights/fork, without starting an engine.
-        result = subprocess.run([sys.executable, "-c", "from mooncake.engine import TransferEngine"],
+        probe = """\
+from inspect import signature
+from mooncake.engine import TransferEngine
+
+register = TransferEngine.register_memory
+try:
+    binding = signature(register)
+except (TypeError, ValueError):
+    # Pybind11 publishes the argument names in its generated signature.
+    if "location:" not in (register.__doc__ or "").split("\\n", 1)[0]:
+        raise TypeError("register_memory has no location argument")
+else:
+    binding.bind(None, 0, 0, "npu")
+"""
+        result = subprocess.run([sys.executable, "-c", probe],
                                 capture_output=True, text=True, timeout=30)
         if result.returncode:
-            raise ValueError("Mooncake Python/native import failed: " + result.stderr[-1000:])
+            raise ValueError("Mooncake Ascend must support register_memory(address, extent, location) "
+                             "from Mooncake #2191: " + result.stderr[-1000:])
 
     def __init__(self, hostname, engine_factory=None):
         self.owner = (os.getpid(), threading.get_ident())
@@ -251,8 +266,13 @@ class TransferWorker:
                 if poller.poll(50):
                     self.uncertain = True
                     return
-        self.monitor = threading.Thread(target=observe, name="pd-transfer-health", daemon=True)
-        self.monitor.start()
+        monitor = threading.Thread(target=observe, name="pd-transfer-health", daemon=True)
+        try:
+            monitor.start()
+        except BaseException:
+            os.close(self.pidfd)
+            raise
+        self.monitor = monitor
         return pid
 
     def register(self, runtime, tensor, name):
@@ -273,22 +293,30 @@ class TransferWorker:
             runtime.release_export(exported)
             self.retained.pop(0)
 
-    def close(self):
+    def close(self, *, startup_failed=False):
         if self.retained:
             raise RuntimeError("cannot close registered transfer process")
-        if self.process is None:
-            self.child.close()
-            self.parent.close()
-            return
-        self.call("stop")
+        process = self.process
+        if process is not None and process.pid is not None and not startup_failed:
+            self.call("stop")
         self.monitor_stop.set()
         if self.monitor is not None:
             self.monitor.join(1)
             os.close(self.pidfd)
+            self.monitor = None
+        self.child.close()
         self.parent.close()
-        self.process.join(10)
-        if self.process.is_alive() or self.process.exitcode != 0:
+        if process is None or process.pid is None:
+            return
+        process.join(10)
+        if startup_failed and process.is_alive():
+            # The startup probe comes before exports or any possible writes.
+            process.terminate()
+            process.join(5)
+        if process.is_alive() or (not startup_failed and process.exitcode != 0):
             raise RuntimeError("transfer process did not retire normally")
+        process.close()
+        self.process = None
 
 
 def _serve(channel, boot, rank, device_id, hostname, provider_name, factory, profile_config):
@@ -304,8 +332,23 @@ def _serve(channel, boot, rank, device_id, hostname, provider_name, factory, pro
         configure_profiler(profile_config, process_name=f"pd-transfer-{rank}", initially_active=False)
         os.environ["MC_TRANSFER_TIMEOUT"] = "30"
         provider = factory(provider_name, hostname)
+
+        def disconnect():
+            nonlocal provider
+            if provider is not None:
+                provider.release()
+                provider = None
+
         while True:
-            request = _receive(channel)
+            try:
+                request = _receive(channel)
+            except EOFError:
+                if mappings:
+                    raise
+                disconnect()
+                context.close()
+                channel.close()
+                return
             sequence += 1
             if request["boot"] != boot or request["sequence"] != sequence:
                 raise ValueError("stale transfer command")
@@ -337,13 +380,16 @@ def _serve(channel, boot, rank, device_id, hostname, provider_name, factory, pro
                               segments=len(copies)):
                         provider.write(request["peer"], copies)
                 elif op == "release":
-                    provider.release()
+                    disconnect()
                     while mappings:
                         try:
                             mappings[0].close()
-                        except Exception as exc:
-                            # DMA has drained and the provider disconnected; retry only the mapping cleanup.
-                            raise TransferError(f"buffer unmap incomplete: {exc}") from exc
+                        except Exception:
+                            # The provider is disconnected. Retry only this import.
+                            try:
+                                mappings[0].close()
+                            except Exception as exc:
+                                raise TransferError(f"buffer unmap incomplete: {exc}") from exc
                         mappings.pop(0)
                 elif op == "profile":
                     profiler = get_profiler(initially_active=False)
@@ -353,7 +399,7 @@ def _serve(channel, boot, rank, device_id, hostname, provider_name, factory, pro
                 elif op == "stop":
                     if mappings:
                         raise RuntimeError("registered transfer process cannot stop")
-                    provider.release()
+                    disconnect()
                     context.close()
                     stopped = True
                 else:

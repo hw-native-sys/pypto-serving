@@ -38,14 +38,16 @@ class PrefillScheduler(Scheduler):
         return super()._schedule(output, allow_reject_stalled=False)
 
     def _can_admit_waiting(self):
-        return any(tokens > 0 and self._rows[partition] > 0 and partition not in self._continuing
-                   for partition, tokens in enumerate(self._remaining))
+        return any(self._can_admit_waiting_partition(p) for p in range(len(self._remaining)))
+
+    def _can_admit_waiting_partition(self, partition):
+        return self._remaining[partition] > 0 and self._rows[partition] > 0 and partition not in self._continuing
 
     def _limit_scheduled_tokens(self, request, token_budget):
         partition = request.cache_partition if self.kv_cache_manager.has_groups else 0
         if partition is None:
             available = max((tokens for partition, tokens in enumerate(self._remaining)
-                             if self._rows[partition] > 0 and partition not in self._continuing), default=0)
+                             if self._can_admit_waiting_partition(partition)), default=0)
         elif (self._rows[partition] <= 0
               or self._continuing.get(partition, request.request_id) != request.request_id):
             return 0
@@ -57,8 +59,7 @@ class PrefillScheduler(Scheduler):
         cache = self.kv_cache_manager
         if cache.has_groups and request.cache_partition is None:
             candidates = [partition for partition, tokens in enumerate(self._remaining)
-                          if tokens >= num_new_tokens and self._rows[partition] > 0
-                          and partition not in self._continuing]
+                          if tokens >= num_new_tokens and self._can_admit_waiting_partition(partition)]
             partition = cache.select_group_partition(request.request_id,
                 request.num_computed_tokens + num_new_tokens, partitions=candidates)
             if partition is None:

@@ -283,13 +283,12 @@ def serve_copy(device_id, channel, pool, retired):
     service = CopyService.__new__(CopyService)
     try:
         service.__init__(device_id, channel, pool, retired)
-        service.thread.join()
     except BaseException:
-        logger.exception("cache copy process failed")
-        if not retired.value:
-            # An unconfirmed copy/import is not permission to destroy its context.
-            threading.Event().wait()
-        raise
+        logger.exception("cache copy startup failed")
+    thread = getattr(service, "thread", None)
+    if thread is not None and thread.ident is not None:
+        thread.join()
     if not retired.value:
+        # Keep the context alive when the owner could not confirm retirement.
+        logger.error("cache copy process has not safely retired")
         threading.Event().wait()
-        raise RuntimeError("cache copy process has not safely retired")

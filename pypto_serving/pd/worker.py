@@ -87,9 +87,18 @@ class WorkerRuntime:
         # Create consumer channels only after compute owners have forked.
         self.owners = tuple(TransferWorker(self.settings.boot, i, self.settings.hostname, self.settings.provider)
                             for i in range(self.model.ranks))
-        devices = self.model.worker().dc.device_ids
-        for owner, device in zip(self.owners, devices, strict=True):
-            owner.start(device)
+        try:
+            devices = self.model.worker().dc.device_ids
+            for owner, device in zip(self.owners, devices, strict=True):
+                owner.start(device)
+        except BaseException:
+            for owner in self.owners:
+                try:
+                    owner.close(startup_failed=True)
+                except Exception:
+                    self.uncertain = True
+                    logger.exception("failed to retire transfer rank %s during startup rollback", owner.rank)
+            raise
 
     def prepare(self):
         if self.registry is None:
