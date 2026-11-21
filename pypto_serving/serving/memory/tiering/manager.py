@@ -11,9 +11,13 @@
 from collections import deque
 from dataclasses import dataclass, field
 from itertools import count
+import logging
+from queue import Empty, SimpleQueue
 import time
 
 from .policy import LRU
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -35,6 +39,7 @@ class Page:
     readers: int = 0
     units: set = field(default_factory=set)
     queued_ns: int = 0
+    host_copy: bool = False
 
 
 class CacheTier:
@@ -55,6 +60,8 @@ class CacheTier:
         self.closing = False
         self.trace = trace
         self.notify = notify
+        self.on_store = self.on_remove = None
+        self.host_completed = SimpleQueue()
         self.counters = dict(stored_bytes=0, loaded_bytes=0, evicted_bytes=0, stores=0, loads=0)
 
     def capture(self, key, source, size, lease, *, charge=None):
@@ -78,6 +85,34 @@ class CacheTier:
         self.queued.append(page)
         if self.notify is not None:
             self.notify()
+
+    def warm(self, key, source, copy):
+        """Opportunistic Host promotion; never wait for cache space or evict for it."""
+        if self.closing or self.error or key in self.pages:
+            return None
+        size, charge = self.backend.size(source), self.backend.footprint(source)
+        handle = next(self.sequence)
+        if self.used + charge > self.capacity or not self.backend.reserve(handle, source):
+            return None
+        page = Page(key, handle, size, None, None, charge, host_copy=True)
+        self.pages[key] = self.by_handle[handle] = page
+        self.used += charge
+        page.future = copy(handle)
+        self.inflight[handle] = page
+        def completed(_):
+            self.host_completed.put(handle)
+            if self.notify is not None:
+                self.notify()
+        page.future.add_done_callback(completed)
+        return page.future
+
+    def _completed_stores(self):
+        yield from self.backend.pop_completed("store")
+        while True:
+            try:
+                yield self.host_completed.get_nowait()
+            except Empty:
+                return
 
     def publish(self, identity, keys):
         """A unit is the complete logical KV/state recovery set, not a physical allocation."""
@@ -166,6 +201,8 @@ class CacheTier:
             del self.pages[page.key]
             del self.by_handle[page.handle]
             self.retiring[page.handle] = (page, self.backend.release(page.handle))
+            if self.on_remove is not None:
+                self.on_remove(page.key)
 
     def _evict(self):
         for kind, identity in self.policy.candidates(self.clock()):
@@ -199,19 +236,38 @@ class CacheTier:
             raise RuntimeError("DDR work is quarantined") from self.error
         try:
             reaped_pages = reaped_bytes = max_pin_age_ns = 0
-            for handle in self.backend.pop_completed("store"):
+            for handle in self._completed_stores():
                 page = self.inflight.get(handle)
                 if page is None:  # An unsubmitted STORE may have been cancelled during close.
                     continue
-                self.completed(page.future, page.size)
+                if page.host_copy:
+                    try:
+                        proof = page.future.result()
+                        if not proof.get("host_completed") or proof.get("bytes") != page.size:
+                            raise RuntimeError("Host promotion has no completion proof")
+                    except Exception as error:
+                        self.backend.discard_host(page.handle)
+                        for identity in tuple(self.pending_by_page.get(page.key, ())):
+                            self._forget_pending(identity)
+                        del self.pages[page.key], self.by_handle[page.handle], self.inflight[page.handle]
+                        self.used -= page.charge
+                        if self.on_remove is not None:
+                            self.on_remove(page.key)
+                        logger.warning("kv_cache_promotion_failed error=%s", error)
+                        continue
+                else:
+                    self.completed(page.future, page.size)
                 page.future = None
                 del self.inflight[page.handle]
                 page.ready = True
-                self.release_pin(page.lease)
+                if self.on_store is not None and not self.closing:
+                    self.on_store(page)
+                if page.lease is not None:
+                    self.release_pin(page.lease)
                 page.lease = page.source = None
                 self.counters["stored_bytes"] += page.size
                 self.counters["stores"] += 1
-                if self.trace is not None:
+                if self.trace is not None and not page.host_copy:
                     reaped_pages += 1
                     reaped_bytes += page.size
                     max_pin_age_ns = max(max_pin_age_ns, time.monotonic_ns()-page.queued_ns)
@@ -264,7 +320,7 @@ class CacheTier:
             del self.pages[page.key]
             del self.by_handle[page.handle]
         for handle, page in tuple(self.inflight.items()):
-            if page.future.cancel():
+            if not page.host_copy and page.future.cancel():
                 self.release_pin(page.lease)
                 self.used -= page.charge
                 del self.inflight[handle]

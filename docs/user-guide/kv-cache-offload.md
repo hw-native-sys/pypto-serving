@@ -214,6 +214,9 @@ Records include request restore start/ready/cancellation/failure; per-owner batc
 identity, direction, partition, cache groups, physical bytes and initiating LOAD
 request IDs; descriptor preparation, native planning/submission/completion and
 RPC timestamps; and one-second residency/queue/cumulative-counter snapshots.
+Batch timing separates endpoint lock acquisition, send/receive, owner receipt,
+native execution and reply preparation. These are Host timestamps, not a measure
+of Python scheduling or device utilization by themselves.
 Shared restores list their original request IDs rather than counting a shared
 transfer twice. STORE batches are shared cache work and have no invented owning
 HTTP request. No prompts, cache contents, hashes or raw addresses are recorded.
@@ -243,3 +246,61 @@ their sum, for aggregate active-window bandwidth. Native submission can overlap
 DMA, so the final completion wait is not the entire copy time. Monotonic clocks
 are local to a host. Decode dispatch-to-reclaim spans can show Host-step envelope
 overlap, but do not establish overlap with actual device kernels.
+
+## Optional SSD cache
+
+An optional local SSD tier retains the same reusable contents as DDR. Enable it
+per model process with an existing directory:
+
+```bash
+--enable-prefix-caching --kv-offload-bytes 20000000000 \
+--kv-ssd-bytes 30000000000 --kv-ssd-path /data/cache
+```
+
+SSD defaults to zero capacity and creates no SSD threads, files or work windows
+when disabled. A positive capacity requires DDR offload and prefix caching.
+Both budgets include alignment and TP replicas across the entire instance.
+Two LOAD windows per rank are reserved inside the DDR budget, targeting 32 MiB
+each. Smaller budgets reduce the window size while still fitting the largest
+page. At 16 ranks, full-size windows consume 1 GiB of the stated DDR budget;
+STORE uses the existing cached DDR pages rather than these windows.
+
+The same hierarchy coordinator handles DDR and SSD lookup, source readers,
+shared restores and cancellation. One logical checkpoint member index spans
+the stores; each store retains its own physical allocations and completion proof.
+Evicting one replica does not invalidate healthy copies in another tier.
+Only contents eligible for DDR enter SSD. Reads reuse HBM and DDR first, reading
+only missing members from SSD. File I/O runs in background threads; owner-local
+H2D uses the existing compact copy queue. DDR promotion runs separately and does
+not delay an otherwise completed HBM restore. Read references protect file slots
+and DDR ranges until their users finish. LRU reclaims eligible SSD contents.
+Re-publishing immutable contents already confirmed in SSD does not recapture
+them from HBM merely to populate DDR. Missing or failed SSD copies remain
+eligible for capture.
+
+The directory must support direct I/O, preallocation and hole punching. Each
+process owns a private file namespace, removed after its I/O drains. Contents are
+volatile; there is no index recovery after restart.
+
+SSD uses the same optional offload trace. `ssd_file` records one logical page's
+file admission, executor dispatch, I/O start/end, useful/physical bytes and syscall
+count. A vector call covers the TP views up to the system iovec limit; aligned
+partial results advance both the file offset and remaining views. Admission to
+dispatch includes capacity/extent preparation, while dispatch to I/O start is
+executor waiting. The I/O span includes the Python loop and syscall waiting.
+
+`ssd_handoff` records window assignment, staging start, all file reads settling
+and confirmed native readiness. Its cache handles join `batch.work_handles`;
+request IDs remain the original restore IDs. `ssd_promotion` reports independent
+Host copy queue/execution, and `ssd_store_reaped` reports DDR reader retirement.
+`state.tiers.ssd` adds bounded queue, window and physical-usage summaries without
+scanning every file page. These intervals can overlap and must not simply be
+summed as request latency. Errors or wakeups alone are not completion proof.
+
+Normal shutdown drains I/O and readers, closes the data file descriptors and
+removes the instance's private directory, unregisters owner mappings and releases
+the shared DDR backing. SSD contents are not retained between runs.
+`ssd_closed.files_removed` confirms file cleanup; `shutdown.resources_closed`
+confirms normal backend/pool retirement. Verify both and process/file references
+when qualifying cleanup. Deleted files held open by another process still occupy
+space; HTTP shutdown or a zero cache counter alone does not prove release.

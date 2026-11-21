@@ -225,6 +225,7 @@ class CopyService:
                     continue
                 try:
                     sequence, operation, payload = self.channel.recv()
+                    received_ns = time.monotonic_ns()
                 except EOFError:
                     self._retire(provider)
                     break
@@ -241,6 +242,9 @@ class CopyService:
                         result = self._retire(provider)
                     else:
                         raise ValueError("unknown cache-copy operation")
+                    if operation == "copy_batch":
+                        result["rpc_timing"] = dict(owner_received_ns=received_ns,
+                                                   owner_reply_start_ns=time.monotonic_ns())
                     self.channel.send((sequence, True, result))
                 except Exception as error:
                     self.channel.send((sequence, False, (str(error), provider.poisoned)))
