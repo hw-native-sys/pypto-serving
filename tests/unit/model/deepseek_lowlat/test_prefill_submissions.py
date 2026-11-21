@@ -138,3 +138,24 @@ def test_stage_recovery_keeps_both_transfers_poisoned_if_decode_recovery_fails(m
     instance.transfers.poison.assert_called()
     assert instance.transfers.poisoned
     assert not instance.state.pending_handles
+
+
+def test_stage_recovery_skips_poison_only_after_both_transfers_reset(monkeypatch):
+    instance, batch, _ = fixture(monkeypatch, "copy")
+    instance.prefill_transfers = Mock(busy=False, poisoned=True)
+    instance.prefill_transfers.recover_after_stage_failure.side_effect = (
+        lambda: setattr(instance.prefill_transfers, "poisoned", False)
+    )
+    instance.transfers.busy = False
+    instance.transfers.recover_after_prefill_failure.side_effect = (
+        lambda: setattr(instance.transfers, "poisoned", False)
+    )
+
+    with pytest.raises(RuntimeError, match="copy"):
+        instance.run_prefill(None, batch)
+
+    instance.prefill_transfers.recover_after_stage_failure.assert_called_once()
+    instance.transfers.recover_after_prefill_failure.assert_called_once()
+    instance.transfers.poison.assert_not_called()
+    assert not instance.prefill_transfers.poisoned
+    assert not instance.transfers.poisoned
