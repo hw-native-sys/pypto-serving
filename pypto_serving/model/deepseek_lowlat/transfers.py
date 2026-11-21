@@ -138,3 +138,11 @@ class DecodeTransferSlots:
             raise RuntimeError("request metadata remains leased")
         self.generation = None
         self.uploaded_tables.clear()
+
+    def recover_after_prefill_failure(self):
+        """Clear a prefill-only poison after all transfers are known idle."""
+        if self.busy:
+            raise RuntimeError("cannot recover decode transfers while a lease is active")
+        self.poisoned = False
+        self.generation = None
+        self.uploaded_tables.clear()

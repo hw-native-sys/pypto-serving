@@ -61,8 +61,8 @@ class LowlatServingContract:
             raise ValueError("lowlat M0 requires --max-num-seqs 1 --block-size 128")
         if getattr(args, "pd_role", None):
             raise ValueError("lowlat M0 does not support disaggregated prefill/decode")
-        if self.num_speculative_tokens == 5 and (args.max_model_len < 8 or args.max_num_batched_tokens < 6):
-            raise ValueError("native K5 requires context>=8 and a scheduled token budget>=6")
+        if self.num_speculative_tokens == 5 and (args.max_model_len < 8 or args.max_num_batched_tokens < 12):
+            raise ValueError("native K5 requires context>=8 and a scheduled token budget>=12")
         # K5 lowlat always uses the rolling cache contract.  The layout and
         # initialization policy are implementation details, not CLI options.
         LowlatCapacityPlan(args.max_model_len, args.long_prefill_token_threshold, "rolling")

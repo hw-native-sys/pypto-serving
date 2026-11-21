@@ -101,4 +101,6 @@ def test_failed_copy_poison_prevents_reusing_partial_metadata():
     worker.failure=False
     with pytest.raises(RuntimeError,match='poisoned'): transfers.stage(inputs(8),revision=2)
     assert not transfers.busy and transfers.table_revision is None
+    transfers.recover_after_stage_failure()
+    check_device(transfers.stage(inputs(8), revision=2), inputs(8))
     arena.close()

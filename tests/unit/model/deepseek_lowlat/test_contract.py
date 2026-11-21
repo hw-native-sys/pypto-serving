@@ -125,3 +125,10 @@ def test_million_context_cli_uses_rolling_capacity(cli_args):
     specs = {spec.name: spec for spec in config.resolve_runtime_config().kv_cache_groups}
     assert specs["cmp_c4"].num_blocks == 8192
     assert specs["hca_state"].num_blocks == 18
+
+
+@pytest.mark.parametrize("budget", [6, 11])
+def test_lowlat_rejects_token_budget_below_native_parent_minimum(cli_args, budget):
+    cli_args.max_num_batched_tokens = budget
+    with pytest.raises(ValueError, match="budget>=12"):
+        build_serving_engine_config(cli_args)

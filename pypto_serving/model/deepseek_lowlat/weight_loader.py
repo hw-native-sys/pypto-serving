@@ -248,13 +248,27 @@ class LowlatWeightStore(LazySafetensorsStore):
                 else ((4096, 2048) if matrix == 2 else (2048, 4096))
             )
             stride = prod(self.owners[name].shape[1:]) // (43 * 257)
+            replicated_w2_scales = None
+            if name == "routed_w2_scale":
+                replicated_w2_scales = {
+                    expert: self.load_tensor(
+                        f"layers.{layer}.ffn."
+                        + (f"experts.{expert}" if expert < 256 else "shared_experts")
+                        + ".w2.scale"
+                    )
+                    for expert in range(257)
+                }
             for rank in range(8):
                 bank = torch.empty((257, stride), dtype=self.owners[name].dtype)
                 for expert in range(257):
                     prefix = f"layers.{layer}.ffn." + (
                         f"experts.{expert}" if expert < 256 else "shared_experts"
                     )
-                    source = self.load_tensor(f"{prefix}.w{matrix}." + ("scale" if scale else "weight"))
+                    source = (
+                        replicated_w2_scales[expert]
+                        if replicated_w2_scales is not None
+                        else self.load_tensor(f"{prefix}.w{matrix}." + ("scale" if scale else "weight"))
+                    )
                     if tuple(source.shape) != expected:
                         if not scale or source.numel() != prod(expected):
                             raise ValueError(

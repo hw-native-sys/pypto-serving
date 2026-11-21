@@ -101,6 +101,12 @@ def test_receipt_rejects_changed_state_or_incomplete_evidence(tmp_path, damage):
     if damage is None:
         assert validate(tmp_path)["valid"] is True
         assert validate(tmp_path)["requests"] == 3
+        changed = json.loads((tmp_path / "1.json").read_text())
+        changed["token_ids"][1] += 1
+        (tmp_path / "1.json").write_text(json.dumps(changed))
+        with pytest.raises(ValueError):
+            validate(tmp_path)
+        assert not (tmp_path / "validation.json").exists()
     else:
         with pytest.raises(ValueError): validate(tmp_path)
         assert not (tmp_path/"validation.json").exists()

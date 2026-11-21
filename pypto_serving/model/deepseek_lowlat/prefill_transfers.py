@@ -96,3 +96,10 @@ class PrefillTransferSlots:
             raise
         finally:
             self.busy = False
+
+    def recover_after_stage_failure(self):
+        """Invalidate partial table contents after a pre-submit copy failure."""
+        if self.busy:
+            raise RuntimeError("cannot recover prefill metadata while a copy lease is active")
+        self.poisoned = False
+        self.table_revision = None

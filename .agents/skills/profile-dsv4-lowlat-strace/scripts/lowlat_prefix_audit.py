@@ -186,8 +186,10 @@ def install(directory):
 def validate(directory):
     from pypto_serving.model.deepseek_lowlat.cache import TENSOR_GROUPS
 
+    receipt = Path(directory) / "validation.json"
+    receipt.unlink(missing_ok=True)
     records = [json.loads(path.read_text()) for path in Path(directory).glob("*.json")
-               if path.name != "validation.json"]
+               if path.name != receipt.name]
     cold = [r for r in records if [c["kind"] for c in r["copies"]] == ["checkpoint"]]
     hot = [r for r in records if [c["kind"] for c in r["copies"]] == ["restore"]]
     if len(cold) != 1 or len(hot) != 2 or len(records) != 3:
@@ -212,7 +214,7 @@ def validate(directory):
                   checks=["exact_output_ids", "complete_logical_cache_pages_all_ranks",
                           "checkpoint_after_prior_decode", "terminal_history_seed", "native_seed_all_ranks"],
                   limitation="Does not qualify partial pages, numerical golden, cancellation, eviction or long context")
-    (Path(directory) / "validation.json").write_text(json.dumps(result, indent=2) + "\n")
+    receipt.write_text(json.dumps(result, indent=2) + "\n")
     return result
 
 

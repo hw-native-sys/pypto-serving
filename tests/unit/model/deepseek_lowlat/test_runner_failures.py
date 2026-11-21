@@ -9,7 +9,6 @@
 """Exercise completion and release ordering through the actual runner methods."""
 
 from types import SimpleNamespace
-from contextlib import nullcontext
 from dataclasses import dataclass
 from unittest.mock import Mock
 
@@ -20,6 +19,7 @@ from pypto_serving.config.types import DecodeBatch
 from pypto_serving.model.deepseek_lowlat import npu_runner
 from pypto_serving.model.deepseek_lowlat.npu_runner import LowlatModelRunner
 from pypto_serving.model.deepseek_lowlat.state import LowlatRequestState
+from pypto_serving.model.deepseek_lowlat.kernel_loader import isolated_profile
 
 
 def runner():
@@ -153,7 +153,7 @@ def test_startup_reserves_cache_before_checkpoint_upload(monkeypatch):
         prefill=SimpleNamespace(compiled=object()),
         single_metadata={},
         prefill_metadata={},
-        context=nullcontext,
+        context=isolated_profile,
     )
     instance = LowlatModelRunner(programs, None)
     instance._check_budget = lambda runtime, additional: events.append(("budget", additional))

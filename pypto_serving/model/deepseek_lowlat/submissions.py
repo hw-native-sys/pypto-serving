@@ -30,6 +30,13 @@ class PrefillSubmissions:
     def __init__(self, worker, state, transfers):
         self.worker, self.state, self.transfers = worker, state, transfers
         self.handles = []
+        self.recoverable_failure = False
+
+    def mark_recoverable_failure(self):
+        """Mark a failure that happened before any runtime handle was submitted."""
+        if self.handles:
+            raise RuntimeError("a prefill handle was already submitted")
+        self.recoverable_failure = True
 
     def __getattr__(self, name):
         return getattr(self.worker, name)
@@ -51,7 +58,8 @@ class PrefillSubmissions:
 
     def __exit__(self, kind, error, traceback):
         if kind is not None:
-            self.transfers.poison()
+            if not self.recoverable_failure:
+                self.transfers.poison()
             return False
         try:
             self.ensure_published()

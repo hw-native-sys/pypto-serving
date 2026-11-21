@@ -38,7 +38,7 @@ class NativeDraftWeights:
             for name in required:
                 quantized = (name.startswith("mtp.") and name.endswith(".weight")
                              and (".ffn.experts." in name or ".ffn.shared_experts." in name
-                                  or name.endswith(".attn.wq_b.weight")))
+                                  or name.endswith((".attn.wq_b.weight", ".attn.wo_b.weight"))))
                 if not quantized:
                     continue
                 path = self.store.path_for(name)

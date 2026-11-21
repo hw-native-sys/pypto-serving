@@ -106,6 +106,7 @@ def evidence(tmp_path):
         )
         cursor += cycles * 6
         epoch += cycles
+        span("lowlat.native.release", done - 2, 1, {"frame_id": frame})
     save(tmp_path, "serving-trace/trace.json", {"traceEvents": events})
     lines = [f"[chip_process pid={100 + d} dev={d}] ready" for d in range(8)]
     for identity, ts, dur in ((7, 15, 60), (8, 115, 80), (9, 200, 80), (10, 330, 60)):

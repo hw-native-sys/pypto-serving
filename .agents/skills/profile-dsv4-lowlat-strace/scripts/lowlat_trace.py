@@ -48,6 +48,7 @@ def native_parents(events, run):
     named = lambda name: sorted((e for e in spans if e["name"] == name), key=lambda e: e["ts"])
     submits, captures = named("lowlat.native.submit"), named("lowlat.native.capture")
     dispatches, retirements = named("lowlat.native.dispatch"), named("lowlat.native.retire")
+    releases = named("lowlat.native.release")
     require(submits and len(submits) == len(captures) == len(dispatches) == len(retirements),
             "native submit/capture/dispatch/retirement counts differ")
     by_frame = defaultdict(list)
@@ -75,6 +76,10 @@ def native_parents(events, run):
         ca = capture["args"]
         retire = [r for r in retirements if r["args"].get("reservation_id") == rid and contains(r, capture)]
         require(len(retire) == 1 and end(submit) <= capture["ts"], "capture/retirement order differs")
+        release = [r for r in releases
+                   if r["args"].get("frame_id") == frame
+                   and capture["ts"] <= r["ts"] <= end(retire[0])]
+        require(len(release) == 1, "native frame release is missing or ambiguous")
         require(ca["physical_input_start"] == current_end, "native physical input has a gap")
         require(previous_epoch is None or ca["epoch"] == previous_epoch, "native epoch has a gap")
         advances, accepted, ids = ca["advances"], ca["accepted_drafts"], ca["emitted_ids"]
@@ -90,13 +95,14 @@ def native_parents(events, run):
         require(remaining >= 0 and ca["remaining_output_tokens"] == remaining, "native remaining budget differs")
         require(ca["next_epoch"] == ca["epoch"]+cycles, "next native epoch differs")
         current_end, previous_epoch = ca["physical_input_end"], ca["next_epoch"]
-        prior_frame_end[frame] = end(retire[0])
+        prior_frame_end[frame] = end(release[0])
         parents.append(dict(step=number, reservation_id=rid, request_id=da["request_id"],
             generation=da["generation"], runtime_run_id=sa["runtime_run_id"], cycles=cycles,
             frame_id=frame, emitted=len(ids), emitted_ids=ids, accepted_drafts=sum(accepted),
             physical_input_start=ca["physical_input_start"], physical_input_end=current_end,
             submit_ts_us=submit["ts"], submit_end_us=end(submit),
-            capture_ts_us=capture["ts"], retire_end_us=end(retire[0])))
+            capture_ts_us=capture["ts"], frame_release_ts_us=end(release[0]),
+            retire_end_us=end(retire[0])))
     require(remaining == 0, "profile did not emit the complete post-prefill budget")
     require(len({p["request_id"] for p in parents}) == 1 and len({p["generation"] for p in parents}) == 1,
             "profile contains more than one active request/generation")
@@ -215,7 +221,8 @@ def _analyze(directory):
         identity = int(attrs(root).get("run_id", -1))
         if identity not in by_run:
             require(not (root.ts/1000 < stop and (root.ts+root.dur)/1000 > start
-                        and "chip.run.runner_run" in invocation.by_name()),
+                        and any(name in invocation.by_name()
+                                for name in ("chip.run.runner_run", "simpler_run.runner_run"))),
                     "unattributed chip execution overlaps formal profile")
             continue
         require(root.ts/1000 >= start and (root.ts+root.dur)/1000 <= stop,

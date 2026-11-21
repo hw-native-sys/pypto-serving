@@ -37,29 +37,31 @@ def isolated_profile(modules=None, *, context_capacity=16384):
             for name, module in sys.modules.items()
             if name == _PREFIX or name.startswith(_PREFIX + ".")
         }
-        for name in before:
-            sys.modules.pop(name, None)
-        sys.argv = [
-            "lowlat-serving",
-            "--tp",
-            "8",
-            "--spec-tokens",
-            "0",
-            "--moe-banks",
-            "43",
-            "--max-seq-len",
-            str(context_capacity),
-        ]
-        lib = Path(os.environ.get("PYPTO_LIB_ROOT", Path(__file__).resolve().parents[3] / "pypto-lib"))
-        sys.path.insert(0, str(lib))
-        parent = importlib.import_module("models")
         missing = object()
-        previous_attribute = getattr(parent, "deepseek_v4_flash_lowlat", missing)
-        if modules:
-            sys.modules.update(modules)
-            setattr(parent, "deepseek_v4_flash_lowlat", modules[_PREFIX])
         captured = {}
+        parent = None
+        previous_attribute = missing
         try:
+            for name in before:
+                sys.modules.pop(name, None)
+            sys.argv = [
+                "lowlat-serving",
+                "--tp",
+                "8",
+                "--spec-tokens",
+                "0",
+                "--moe-banks",
+                "43",
+                "--max-seq-len",
+                str(context_capacity),
+            ]
+            lib = Path(os.environ.get("PYPTO_LIB_ROOT", Path(__file__).resolve().parents[3] / "pypto-lib"))
+            sys.path.insert(0, str(lib))
+            parent = importlib.import_module("models")
+            previous_attribute = getattr(parent, "deepseek_v4_flash_lowlat", missing)
+            if modules:
+                sys.modules.update(modules)
+                setattr(parent, "deepseek_v4_flash_lowlat", modules[_PREFIX])
             yield captured
         finally:
             captured.update(
@@ -72,11 +74,12 @@ def isolated_profile(modules=None, *, context_capacity=16384):
             for name in captured:
                 sys.modules.pop(name, None)
             sys.modules.update(before)
-            if previous_attribute is missing:
-                if hasattr(parent, "deepseek_v4_flash_lowlat"):
-                    delattr(parent, "deepseek_v4_flash_lowlat")
-            else:
-                setattr(parent, "deepseek_v4_flash_lowlat", previous_attribute)
+            if parent is not None:
+                if previous_attribute is missing:
+                    if hasattr(parent, "deepseek_v4_flash_lowlat"):
+                        delattr(parent, "deepseek_v4_flash_lowlat")
+                else:
+                    setattr(parent, "deepseek_v4_flash_lowlat", previous_attribute)
             sys.argv, sys.path[:] = old_argv, old_path
 
 
@@ -172,8 +175,8 @@ def compile_native_programs(programs, *, cycles=(1,)):
             if len(parameter_rows(metadata)) != 153:
                 raise ValueError("native compact ABI must have153parameters")
             programs.native[cycle], programs.native_metadata[cycle] = compiled, metadata
-    if any(m["params"] != programs.native_metadata[1]["params"]
-           for m in programs.native_metadata.values()):
+    baseline = next(iter(programs.native_metadata.values()))
+    if any(m["params"] != baseline["params"] for m in programs.native_metadata.values()):
         raise ValueError("native one/two parameter metadata differ")
     programs.native_modules = captured
     (programs.output_dir/"lowlat-native-abi.json").write_text(json.dumps(

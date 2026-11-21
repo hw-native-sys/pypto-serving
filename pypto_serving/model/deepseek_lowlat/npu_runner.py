@@ -365,6 +365,14 @@ class LowlatModelRunner(ModelRunner):
                 self.prefill_input.begin_copy()
                 try:
                     scratch = self._stage(self.prefill_bindings, inputs)
+                except BaseException:
+                    if (self.prefill_transfers is not None
+                            and hasattr(self.prefill_transfers, "recover_after_stage_failure")
+                            and hasattr(self.transfers, "recover_after_prefill_failure")):
+                        submissions.mark_recoverable_failure()
+                        self.prefill_transfers.recover_after_stage_failure()
+                        self.transfers.recover_after_prefill_failure()
+                    raise
                 finally:
                     self.prefill_input.end_copy()
                 for name, shape in (

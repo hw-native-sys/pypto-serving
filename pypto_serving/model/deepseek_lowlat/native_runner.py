@@ -137,7 +137,13 @@ class NativeModelRunner(LowlatModelRunner):
         return 7
 
     def preflight(self, record):
-        self.register_contexts([RequestExecutionContext("__lowlat_warmup__", 1, 2)])
+        # Keep the mandatory probe inside the admitted physical capacity.  The
+        # smallest supported context (8) can fit one output plus six native
+        # lookahead positions, but not the historical two-output probe.
+        max_output_tokens = min(2, self.contract.compiled_context - 7)
+        if max_output_tokens < 1:
+            raise ValueError("native preflight requires one output within context/lookahead capacity")
+        self.register_contexts([RequestExecutionContext("__lowlat_warmup__", 1, max_output_tokens)])
         return super().preflight(record)
 
     def release_finished_requests(self, request_ids):

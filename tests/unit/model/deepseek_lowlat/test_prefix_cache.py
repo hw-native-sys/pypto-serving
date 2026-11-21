@@ -96,7 +96,7 @@ def finish_prompt(manager, scheduler, rid, tokens):
         pytest.fail("Prefix request made no bounded progress")
     assert all(table == maps[0] for table in maps)
     assert all(block.ref_cnt == 0 for pool in manager._group_pools.values() for block in pool.blocks)
-    return request, starts
+    return request, starts, maps
 
 
 @pytest.mark.parametrize("speculative,asynchronous", [(5, True)])
@@ -104,18 +104,19 @@ def finish_prompt(manager, scheduler, rid, tokens):
 def test_cold_hot_checkpoint_restore_with_stable_exclusive_rings(speculative, asynchronous, length):
     manager, scheduler = setup(speculative, asynchronous)
     tokens = list(range(length))
-    cold, starts = finish_prompt(manager, scheduler, "cold", tokens)
+    cold, starts, _ = finish_prompt(manager, scheduler, "cold", tokens)
     boundary = max(0, length - 128) // 128 * 128
     assert starts[0] == 0
     if boundary:
         assert boundary in [s for s in starts[1:]]
-    hot, hot_starts = finish_prompt(manager, scheduler, "hot", tokens)
+    hot, hot_starts, hot_maps = finish_prompt(manager, scheduler, "hot", tokens)
     assert hot_starts[0] == boundary
     if boundary:
         assert hot.execution_state.prefix_resume.hit_tokens == boundary
         assert length - boundary >= 128
         source = {p.page_id for p in hot.execution_state.prefix_resume.pages if p.group == "hca_state"}
-        assert not source.intersection(hot.allocated_group_block_ids.get("hca_state", ()))
+        destination = set(hot_maps[0]["hca_state"])
+        assert not source.intersection(destination)
 
 
 def test_resume_and_completion_proofs_survive_real_ipc_roundtrip():
@@ -184,7 +185,7 @@ def test_aborted_restore_releases_pins_and_checkpoint_reservations():
     assert any(b.ref_cnt > 0 for p in manager._group_pools.values() for b in p.blocks)
     scheduler.discard_scheduled_request(output.scheduled_requests[0])
     assert all(b.ref_cnt == 0 for p in manager._group_pools.values() for b in p.blocks)
-    _, starts = finish_prompt(manager, scheduler, "next", tokens)
+    _, starts, _ = finish_prompt(manager, scheduler, "next", tokens)
     assert starts[0] == 1408
 
 
