@@ -103,3 +103,7 @@ class PrefillTransferSlots:
             raise RuntimeError("cannot recover prefill metadata while a copy lease is active")
         self.poisoned = False
         self.table_revision = None
+
+    def poison(self):
+        """Keep partial metadata unusable when paired recovery cannot complete."""
+        self.poisoned = True

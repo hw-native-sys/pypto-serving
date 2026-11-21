@@ -115,3 +115,26 @@ def test_prefill_failure_poison_retains_accepted_handle_and_never_publishes_curs
     instance.cache.release.assert_called_once()
     with pytest.raises(RuntimeError):
         instance._request(["next"], 1)
+
+
+def test_stage_recovery_keeps_both_transfers_poisoned_if_decode_recovery_fails(monkeypatch):
+    instance, batch, _ = fixture(monkeypatch, "copy")
+    instance.prefill_transfers = Mock(busy=False, poisoned=True)
+    instance.prefill_transfers.recover_after_stage_failure.side_effect = (
+        lambda: setattr(instance.prefill_transfers, "poisoned", False)
+    )
+    instance.prefill_transfers.poison.side_effect = lambda: setattr(
+        instance.prefill_transfers, "poisoned", True
+    )
+    instance.transfers.busy = False
+    instance.transfers.recover_after_prefill_failure.side_effect = RuntimeError("decode recovery failed")
+
+    with pytest.raises(RuntimeError, match="decode recovery failed"):
+        instance.run_prefill(None, batch)
+
+    instance.prefill_transfers.recover_after_stage_failure.assert_called_once()
+    instance.prefill_transfers.poison.assert_called_once()
+    assert instance.prefill_transfers.poisoned
+    instance.transfers.poison.assert_called()
+    assert instance.transfers.poisoned
+    assert not instance.state.pending_handles

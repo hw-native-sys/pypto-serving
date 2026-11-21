@@ -36,6 +36,7 @@ class Worker:
         self.storage={}
         self.copies=[]
         self.failure=False
+        self.fail_after=None
 
     def alloc_tensor(self, shape, dtype, *, worker_id):
         host=torch.empty(shape,dtype=dtype)
@@ -51,7 +52,8 @@ class Worker:
         assert dst in self.storage
         assert any(root.data_ptr() <= src and src+size <= root.data_ptr()+root.numel()*root.element_size()
                    for root in self.inherited)
-        if self.failure: raise RuntimeError("copy failed")
+        if self.failure or (self.fail_after is not None and len(self.copies) >= self.fail_after):
+            raise RuntimeError("copy failed")
         ctypes.memmove(dst,src,size)
         self.copies.append((dst,size,worker_id))
 
@@ -101,6 +103,18 @@ def test_failed_copy_poison_prevents_reusing_partial_metadata():
     worker.failure=False
     with pytest.raises(RuntimeError,match='poisoned'): transfers.stage(inputs(8),revision=2)
     assert not transfers.busy and transfers.table_revision is None
+    transfers.recover_after_stage_failure()
+    check_device(transfers.stage(inputs(8), revision=2), inputs(8))
+    arena.close()
+
+
+def test_later_copy_failure_poison_prevents_reusing_partial_metadata():
+    transfers=slots();worker=Worker(transfers.inherited);arena=TensorArena(worker);transfers.bind(arena)
+    worker.fail_after=1
+    with pytest.raises(RuntimeError,match='copy failed'): transfers.stage(inputs(8),revision=1)
+    assert transfers.poisoned and not transfers.busy and transfers.table_revision is None
+    worker.fail_after=None
+    with pytest.raises(RuntimeError,match='poisoned'): transfers.stage(inputs(8),revision=2)
     transfers.recover_after_stage_failure()
     check_device(transfers.stage(inputs(8), revision=2), inputs(8))
     arena.close()

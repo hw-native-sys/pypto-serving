@@ -267,6 +267,45 @@ class LowlatModelRunner(ModelRunner):
             result[name] = value
         return result
 
+    def _recover_prefill_stage_failure(self, submissions, state):
+        """Recover a failed pre-submit staging copy only as an all-or-nothing action.
+
+        A failed copy may have left either transfer slot partially initialized.  The
+        submission scope may skip its normal decode poison only after both slots are
+        idle, no runtime handle is pending, and both invalidations have completed.
+        """
+        prefill = self.prefill_transfers
+        decode = self.transfers
+        if not (
+            prefill is not None
+            and hasattr(prefill, "recover_after_stage_failure")
+            and hasattr(decode, "recover_after_prefill_failure")
+        ):
+            return False
+        if (
+            getattr(prefill, "busy", False)
+            or getattr(decode, "busy", False)
+            or state.pending_handles
+            or submissions.handles
+        ):
+            return False
+
+        try:
+            prefill.recover_after_stage_failure()
+            decode.recover_after_prefill_failure()
+            submissions.mark_recoverable_failure()
+        except BaseException:
+            # The first recovery may already have cleared its poison.  Preserve
+            # poison on both sides whenever the paired recovery is incomplete.
+            poison_prefill = getattr(prefill, "poison", None)
+            if poison_prefill is not None:
+                poison_prefill()
+            else:
+                prefill.poisoned = True
+            decode.poison()
+            raise
+        return True
+
     def _read_sample(self, owner):
         host = self.transfers.readback
         self.worker.copy_from(host.data_ptr(), owner.shards[0].data_ptr, 4, worker_id=0)
@@ -363,18 +402,19 @@ class LowlatModelRunner(ModelRunner):
                 inputs["input_ids"] = inputs.pop("input_ids_full")
                 padded = hidden.shape[1]
                 self.prefill_input.begin_copy()
+                copy_active = True
                 try:
                     scratch = self._stage(self.prefill_bindings, inputs)
                 except BaseException:
-                    if (self.prefill_transfers is not None
-                            and hasattr(self.prefill_transfers, "recover_after_stage_failure")
-                            and hasattr(self.transfers, "recover_after_prefill_failure")):
-                        submissions.mark_recoverable_failure()
-                        self.prefill_transfers.recover_after_stage_failure()
-                        self.transfers.recover_after_prefill_failure()
+                    # End the host-input lease before touching either transfer
+                    # slot; recovery must observe all copy leases as idle.
+                    self.prefill_input.end_copy()
+                    copy_active = False
+                    self._recover_prefill_stage_failure(submissions, state)
                     raise
                 finally:
-                    self.prefill_input.end_copy()
+                    if copy_active:
+                        self.prefill_input.end_copy()
                 for name, shape in (
                     ("attn_stage", hidden.shape),
                     ("x_out", (8, padded, 4096)),
