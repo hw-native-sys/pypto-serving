@@ -60,9 +60,13 @@ class Backend:
         self.live[handle] = self.device.setdefault(source, source)
         return self.job('store', handle, dict(bytes=1, stopped=True, native_completed=True))
 
-    def load(self, handle, destination, *, request=None):
-        self.device[destination] = self.live[handle]
-        return self.job('load', handle, dict(bytes=1, stopped=True, native_completed=True))
+    def load(self, copies, *, request=None):
+        futures = []
+        for handle, destination in copies:
+            self.device[destination] = self.live[handle]
+            futures.append(self.job('load', (handle, destination[1]),
+                                    dict(bytes=1, stopped=True, native_completed=True)))
+        return tuple(futures)
 
     def release(self, handle):
         del self.live[handle]
@@ -135,17 +139,62 @@ def test_joint_checkpoint_restore_preserves_content_and_alignment(length):
     assert cache.acquire_group_prefix_blocks('miss', hashes, max_cache_hit_tokens=boundary)[1] == 0
     if not boundary:
         return
-    assert not tier.prepare('restore', hashes, length, maximum=boundary)
+    assert tier.prepare('restore', hashes, length, maximum=boundary) == (False, None)
     tier.progress()
-    assert tier.prepare('restore', hashes, length, maximum=boundary)
+    assert tier.prepare('restore', hashes, length, maximum=boundary) == (True, 0)
     tables, hit, partition = cache.acquire_group_prefix_blocks('restore', hashes, max_cache_hit_tokens=boundary)
     assert hit == boundary and partition == 0
     for name, ids in tables.items():
         for local in ids:
             block = cache._group_pools[name].block_from_local_id(0, local)
-            assert backend.device[name, 0, local] == expected[0, name, block.block_hash]
+            assert backend.device[name, 0, local] == expected[name, block.block_hash]
     cache.release_all_group_requests('restore')
     assert all(not b.ref_cnt for p in cache._group_pools.values() for b in p.blocks)
+
+
+def test_cross_dp_load_has_independent_destinations_and_shared_readers():
+    cache, tier, backend = fixture(partitions=3)
+    tokens = prompt(0, 513)
+    boundary = warm(cache, tokens)
+    assert boundary == 384
+    required, = (keys for (end, _), keys in tier.tier.units.items() if end == boundary)
+    pages = {key: tier.tier.pages[key] for key in required}
+    values = {page.key: backend.live[page.handle] for page in pages.values()}
+    assert {source[1] for source in values.values()} == {0}
+    evict(cache)
+    for source in values.values():
+        backend.device[source] = "overwritten"
+    backend.hold = True
+    hashes = cache.compute_group_block_hashes(tokens)
+    for request, partition in (("same-a", 1), ("other", 2), ("same-b", 1)):
+        assert tier.prepare(request, hashes, len(tokens), maximum=boundary, partition=partition) == (False, None)
+    assert len(tier.loads) == 2 * len(pages)
+    assert all(page.readers == 2 for page in pages.values())
+    tier.cancel("same-a")
+    for load in reversed(tuple(tier.loads.values())):
+        if load.partition == 2:
+            load.future.set_result(dict(bytes=1, stopped=True, native_completed=True))
+    tier.progress()
+    assert tier.prepare("other", hashes, len(tokens), maximum=boundary) == (True, 2)
+    assert all(page.readers == 1 for page in pages.values())
+    assert tier.prepare("same-b", hashes, len(tokens), maximum=boundary) == (False, None)
+    for load in tuple(tier.loads.values()):
+        load.future.set_result(dict(bytes=1, stopped=True, native_completed=True))
+    tier.progress()
+    assert tier.prepare("same-b", hashes, len(tokens), maximum=boundary) == (True, 1)
+    assert not tier.pending and not tier.loads
+    for partition in (1, 2):
+        request = f"restore-{partition}"
+        tables, hit, actual = cache.acquire_group_prefix_blocks(
+            request, hashes, max_cache_hit_tokens=boundary, preferred_partition=partition,
+        )
+        assert (hit, actual) == (boundary, partition)
+        for name, ids in tables.items():
+            for local in ids:
+                block = cache._group_pools[name].block_from_local_id(partition, local)
+                assert backend.device[name, partition, local] == values[name, block.block_hash]
+        cache.release_all_group_requests(request)
+    assert all(tier.tier.pages[key] is page and page.readers == 0 for key, page in pages.items())
 
 
 @pytest.mark.parametrize('outcome', ['shared', 'unknown'])
@@ -204,6 +253,7 @@ def test_d_reserves_only_after_its_independent_history_restore(cancelled):
         node.cache = node.core.kv_cache_manager = cache
         node.core.config = SimpleNamespace(max_num_running_reqs=8, runtime_config=SimpleNamespace(max_seq_len=655360))
         node.adapter, calls = DeepSeekDSpark(), []
+        cache._next_group_partition = 2
         async def worker(operation, payload):
             calls.append(operation)
             assert not tier.pending
@@ -214,6 +264,7 @@ def test_d_reserves_only_after_its_independent_history_restore(cancelled):
             continuation=msgspec.to_builtins(Continuation(tuple(tokens), {'max_new_tokens': 32}, None, None)))))
         await until(lambda: bool(tier.loads))
         assert entry.reservation is None and not calls
+        assert {partition for partition, _, _ in tier.loads} == {2}
         assert all(name in ('cmp_c128', 'cmp_c4', 'idx') for _, name, _ in tier.loads)
         if cancelled:
             await node.abort(entry, stopped=True)
@@ -223,7 +274,9 @@ def test_d_reserves_only_after_its_independent_history_restore(cancelled):
             future.set_result(dict(bytes=1, stopped=True, native_completed=True))
         await until(lambda: not tier.loads)
         if not cancelled:
-            assert (await task).hit == 512 and calls == ['reserve_state']
+            placement = await task
+            assert (placement.hit, placement.partition) == (512, 2)
+            assert calls == ['reserve_state']
             await node.abort(entry, stopped=True)
         await session.close()
     asyncio.run(run())

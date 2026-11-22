@@ -343,8 +343,9 @@ class Service:
             entry.normalized_digest = digest(continuation)
             try:
                 requirements = self.admission.requirements(len(continuation.tokens), config.max_new_tokens, prefix)
+                restored_partition = None
                 if self.cache.tiering is not None:
-                    await self.cache.tiering.restore(
+                    restored_partition = await self.cache.tiering.restore(
                         request, requirements["prefix_block_hashes"], len(continuation.tokens),
                         maximum=len(continuation.tokens), groups=requirements["shareable_group_names"],
                         cancelled=lambda: entry.cancelled or not self.is_ready())
@@ -354,7 +355,7 @@ class Service:
                                               self.core.config.max_num_running_reqs):
                     raise CapacityExhausted("Decode active reservation capacity exhausted. Retry later.")
                 reservation = self.cache.reserve_group_cache(
-                    request, request, **requirements)
+                    request, request, preferred_partition=restored_partition, **requirements)
                 entry.reservation = reservation
                 entry.state_task = asyncio.create_task(self.worker("reserve_state", dict(
                     request=request, partition=reservation.partition, prompt_len=len(continuation.tokens))))

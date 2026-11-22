@@ -40,7 +40,7 @@ class Owner:
 
 @pytest.mark.parametrize('tp,failed', [(1, False), (4, False), (4, True)])
 def test_tp_index_scale_completion_and_unknown_retirement(tp, failed):
-    owners = [Owner(failed and i == 0) for i in range(tp)]
+    owners = [Owner(failed and i == 0) for i in range(2 * tp)]
     backend = SimplerBackend(owners, dict(tp=tp, groups={'idx': (('k', 2, 7, 128), ('scale', 2, 7, 4))}),
                              tp*4*PAGESIZE)
     assert backend.reserve(1, ('idx', 0, 0)) and len(set(backend.records[1].extents)) == tp
@@ -53,11 +53,41 @@ def test_tp_index_scale_completion_and_unknown_retirement(tp, failed):
         assert backend.records and not any(op == 'stop' for o in owners for op, _ in o.calls)
     else:
         assert future.result(2)['bytes'] == tp*264
-        assert backend.load(1, ('idx', 0, 1), request='r').result(2)['native_completed']
+        for partition in range(2):
+            loaded, = backend.load(((1, ('idx', partition, partition + 1)),), request='r')
+            assert loaded.result(2)['native_completed']
+        for lane, extent in enumerate(backend.records[1].extents):
+            load, = [
+                payload for op, payload in owners[tp + lane].calls if op == 'copy_batch'
+            ]
+            direction, ((handle, offset, size, spans),) = load
+            assert (direction, handle, (offset, size)) == ('load', 1, extent)
+            assert [(span[0], span[1]) for span in spans] == [('k', 2 * 128), ('scale', 2 * 4)]
         backend.release(1).result(2)
         assert backend.extents.free == [(0, tp*4*PAGESIZE)]
         backend.close()
+        assert list(backend.pop_completed('load')) == [(1, 0), (1, 1)]
         assert all(o.calls[-1][0] == 'stop' for o in owners)
+
+
+def test_load_batch_is_validated_and_published_together():
+    owner = Owner()
+    backend = SimplerBackend([owner], dict(tp=1, groups={'idx': (('k', 1, 3, 128),)}), 3 * PAGESIZE)
+    try:
+        for handle in (1, 2):
+            assert backend.reserve(handle, ('idx', 0, handle - 1))
+            backend.store(handle, ('idx', 0, handle - 1)).result(2)
+        first = (1, ('idx', 0, 1))
+        with pytest.raises(ValueError, match='page outside'):
+            backend.load((first, (2, ('idx', 0, 3))), request='invalid')
+        assert not any(storage.active for storage in backend.records.values())
+        owner.calls.clear()
+        futures = backend.load((first, (2, ('idx', 0, 2))), request='valid')
+        assert all(future.result(2)['native_completed'] for future in futures)
+        load, = [payload for op, payload in owner.calls if op == 'copy_batch']
+        assert load[0] == 'load' and [page[0] for page in load[1]] == [1, 2]
+    finally:
+        backend.close()
 
 
 def test_completion_releases_copy_refs_before_model_result_and_ignores_late_notifications():

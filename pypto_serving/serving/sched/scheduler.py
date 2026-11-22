@@ -601,12 +601,15 @@ class Scheduler:
             if self.config.enable_prefix_cache:
                 if self.kv_cache_manager.has_groups:
                     tiering = self.kv_cache_manager.tiering
-                    if tiering is not None and not tiering.prepare(
-                        request.request_id, request.group_block_hashes, request.num_prompt_tokens,
-                        maximum=request.group_checkpoint_boundary,
-                    ):
-                        remaining_waiting.append(request)
-                        continue
+                    restored_partition = None
+                    if tiering is not None:
+                        ready, restored_partition = tiering.prepare(
+                            request.request_id, request.group_block_hashes, request.num_prompt_tokens,
+                            maximum=request.group_checkpoint_boundary,
+                        )
+                        if not ready:
+                            remaining_waiting.append(request)
+                            continue
                     (
                         request.allocated_group_block_ids,
                         request.num_computed_tokens,
@@ -615,6 +618,7 @@ class Scheduler:
                         request.request_id,
                         request.group_block_hashes,
                         max_cache_hit_tokens=request.group_checkpoint_boundary,
+                        preferred_partition=restored_partition,
                     )
                     request.group_shared_prefix_boundary = self.kv_cache_manager.group_history_prefix_hit(
                         request.group_block_hashes, request.group_checkpoint_boundary,

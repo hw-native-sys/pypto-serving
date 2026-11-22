@@ -67,6 +67,7 @@ class GroupedCacheReservations:
         prompt_token_count: int | None = None,
         prefix_block_hashes: dict[str, list[bytes]] | None = None,
         shareable_group_names: tuple[str, ...] = (),
+        preferred_partition: int | None = None,
     ) -> GroupCacheReservation:
         """Atomically reserve every configured group through the existing allocator.
 
@@ -120,6 +121,7 @@ class GroupedCacheReservations:
                     max_cache_hit_tokens=prompt_tokens,
                     shareable_group_names=shareable_group_names,
                     partition=partition,
+                    preferred_partition=preferred_partition,
                 )
                 if prefix_hit_tokens:
                     # A cached page may otherwise have only this request as an

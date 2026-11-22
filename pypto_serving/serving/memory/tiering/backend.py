@@ -9,6 +9,7 @@
 """Independent owner endpoints and pooled asynchronous cache transfers."""
 
 from collections import deque
+from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from itertools import count
@@ -35,7 +36,7 @@ class StorageBackend(Protocol):
     def footprint(self, source: object) -> int: ...
     def reserve(self, handle: int, source: object) -> bool: ...
     def store(self, handle: int, source: object) -> Future: ...
-    def load(self, handle: int, destination: object, *, request=None) -> Future: ...
+    def load(self, copies: Iterable[tuple[int, object]], *, request=None) -> tuple[Future, ...]: ...
     def release(self, handle: int) -> Future: ...
     def pop_completed(self, operation: str): ...
     def set_notify(self, notify): ...
@@ -102,7 +103,7 @@ def endpoints(context, ranks):
 
 @dataclass
 class Storage:
-    ranks: tuple
+    group: str
     size: int
     extents: tuple
     active: int = 0
@@ -113,6 +114,7 @@ class Storage:
 @dataclass
 class Job:
     future: Future
+    ranks: tuple
     operation: str
     handle: int
     spans: tuple
@@ -147,6 +149,7 @@ class SimplerBackend:
         self.notify = notify
 
     def pop_completed(self, operation):
+        """Yield STORE handles or LOAD (handle, destination partition) pairs."""
         queue = self.completed[operation]
         while True:
             try:
@@ -184,31 +187,36 @@ class SimplerBackend:
             extents = self.extents.reserve(handle, len(ranks), size)
             if extents is None:
                 return False
-            self.records[handle] = Storage(ranks, size, extents)
+            self.records[handle] = Storage(source[0], size, extents)
             return True
 
-    def _submit(self, operation, handle, source, *, request=None):
-        ranks, spans, size = self.plan(source)
+    def _submit(self, operation, copies, *, request=None):
         with self.lock:
             if self.closing:
                 raise RuntimeError("cache backend is closing")
-            storage = self.records[handle]
-            if (ranks != storage.ranks or size != storage.size or storage.uncertain
-                    or (operation == "load" and not storage.complete)
-                    or (operation == "store" and (storage.complete or storage.active))):
-                raise ValueError("cache storage layout or generation mismatch")
-            future = Future()
-            job = Job(future, operation, handle, spans, storage, time.monotonic_ns(), source[0], request)
-            storage.active += 1
-            self.queue.put_nowait(job)
-            self.wake.set()
-            return future
+            jobs = []
+            for handle, source in copies:
+                ranks, spans, size = self.plan(source)
+                storage = self.records[handle]
+                if (source[0] != storage.group or size != storage.size or storage.uncertain
+                        or (operation == "load" and not storage.complete)
+                        or (operation == "store" and (storage.complete or storage.active))):
+                    raise ValueError("cache storage layout or generation mismatch")
+                jobs.append(Job(Future(), ranks, operation, handle, spans, storage, 0, source[0], request))
+            if jobs:
+                enqueued = time.monotonic_ns()
+                for job in jobs:
+                    job.enqueued = enqueued
+                    job.storage.active += 1
+                self.queue.put_nowait(jobs)
+                self.wake.set()
+            return tuple(job.future for job in jobs)
 
     def store(self, handle, source):
-        return self._submit("store", handle, source)
+        return self._submit("store", ((handle, source),))[0]
 
-    def load(self, handle, destination, *, request=None):
-        return self._submit("load", handle, destination, request=request)
+    def load(self, copies, *, request=None):
+        return self._submit("load", copies, request=request)
 
     def release(self, handle):
         future = Future()
@@ -255,7 +263,11 @@ class SimplerBackend:
             return
         finally:
             # One notification per batch, after every TP owner has returned.
-            self.completed[jobs[0].operation].put(tuple(job.handle for job in jobs))
+            if jobs[0].operation == "load":
+                destination = jobs[0].ranks[0] // self.tp
+                self.completed["load"].put(tuple((job.handle, destination) for job in jobs))
+            else:
+                self.completed["store"].put(tuple(job.handle for job in jobs))
             notify = self.notify
             if notify is not None:
                 notify()
@@ -271,7 +283,7 @@ class SimplerBackend:
                     queue_ns=sum(dispatched-job.enqueued for job in jobs),
                     queue_max_ns=max(dispatched-job.enqueued for job in jobs),
                     rpc_start_ns=dispatched, rpc_end_ns=ended)
-                for rank, reply in zip(jobs[0].storage.ranks, replies):
+                for rank, reply in zip(jobs[0].ranks, replies):
                     self.trace.emit("batch", **common, partition=rank // self.tp, owner=rank,
                         prepare_start_ns=reply["prepare_start_ns"], prepare_end_ns=reply["prepare_end_ns"],
                         native_start_ns=reply["started_ns"], submitted_ns=reply["submitted_ns"],
@@ -293,10 +305,11 @@ class SimplerBackend:
                         del active[partition]
                 while True:
                     try:
-                        job = self.queue.get_nowait()
+                        submitted = self.queue.get_nowait()
                     except Empty:
                         break
-                    pending[job.storage.ranks[0] // self.tp][job.operation].append(job)
+                    for job in submitted:
+                        pending[job.ranks[0] // self.tp][job.operation].append(job)
                 for partition, waiting in enumerate(pending):
                     if partition in active or not any(waiting.values()):
                         continue
@@ -326,7 +339,7 @@ class SimplerBackend:
                         continue
                     dispatched = time.monotonic_ns()
                     calls = []
-                    for copy_index, rank in enumerate(jobs[0].storage.ranks):
+                    for copy_index, rank in enumerate(jobs[0].ranks):
                         payload = tuple((job.handle, *job.storage.extents[copy_index], job.spans) for job in jobs)
                         call = executor.submit(self.owners[rank].call, "copy_batch", (direction, payload))
                         call.add_done_callback(lambda _: self.wake.set())

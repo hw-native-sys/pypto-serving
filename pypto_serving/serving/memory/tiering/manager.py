@@ -143,10 +143,13 @@ class CacheTier:
         if self.queued and self.notify is not None:
             self.notify()
 
-    def load(self, page, destination, *, request=None):
-        if self.pages.get(page.key) is not page or not page.ready or page.readers <= 0:
-            raise ValueError("LOAD requires a current DDR reader")
-        return self.backend.load(page.handle, destination, request=request)
+    def load(self, copies, *, request=None):
+        requests = []
+        for page, destination in copies:
+            if self.pages.get(page.key) is not page or not page.ready or page.readers <= 0:
+                raise ValueError("LOAD requires a current DDR reader")
+            requests.append((page.handle, destination))
+        return self.backend.load(requests, request=request)
 
     @staticmethod
     def completed(future, expected):

@@ -868,6 +868,7 @@ class KvCacheManager:
         max_cache_hit_tokens: int,
         shareable_group_names: tuple[str, ...] | None = None,
         partition: int | None = None,
+        preferred_partition: int | None = None,
     ) -> tuple[dict[str, list[int]], int, int | None]:
         if not self.enable_prefix_cache or not self._group_pools:
             return {}, 0, None
@@ -875,7 +876,8 @@ class KvCacheManager:
             raise ValueError(f"Request {request_id!r} already owns grouped KV cache blocks")
         best_blocks, best_hit_tokens, best_partition = self.select_group_prefix_blocks(
             block_hashes, max_cache_hit_tokens=max_cache_hit_tokens,
-            shareable_group_names=shareable_group_names, partition=partition)
+            shareable_group_names=shareable_group_names, partition=partition,
+            preferred_partition=preferred_partition)
         if best_partition is None or not best_hit_tokens:
             return {}, 0, None
         self._group_request_partitions[request_id] = best_partition
@@ -895,12 +897,14 @@ class KvCacheManager:
 
     def select_group_prefix_blocks(
         self, block_hashes, *, max_cache_hit_tokens, shareable_group_names=None, partition=None,
-        lookup=None, checkpoint_keys=None,
+        lookup=None, shared_checkpoint_boundaries=(), score=None, preferred_partition=None,
+        equivalent_partitions=(),
     ):
         """Select the longest complete grouped prefix without mutating ownership.
 
-        Cache namespaces are rank-local, so every partition is evaluated and
-        the partition with the longest hit is selected. Full-history groups
+        Evaluate the eligible partitions and prefer the longest complete hit.
+        A preferred partition breaks ties unless a score is supplied.
+        Full-history groups
         match from the start. Rolling groups match only the immutable tail
         needed to resume at the candidate boundary. EAGLE/MTP page hashes
         already include the boundary token consumed by their last shifted KV
@@ -950,6 +954,8 @@ class KvCacheManager:
         best_partition: int | None = None
         best_hit_tokens = 0
         best_blocks: dict[str, list[KVCacheBlock | None]] = {}
+        best_score = ()
+        equivalent_match = None
         candidate_partitions = (
             range(self.group_partition_count)
             if partition is None
@@ -957,93 +963,107 @@ class KvCacheManager:
         )
         if partition is not None and not 0 <= partition < self.group_partition_count:
             raise ValueError(f"Invalid cache partition {partition}")
+        if partition is None and preferred_partition is not None:
+            candidate_partitions = (preferred_partition, *(owner for owner in candidate_partitions
+                                                           if owner != preferred_partition))
         request_limit = next(iter(self._group_pools.values())).spec.max_requests_per_partition
         for candidate_partition in candidate_partitions:
             if (request_limit is not None and
                     sum(owner == candidate_partition for owner in self._group_request_partitions.values()) >= request_limit):
                 continue
-            candidate = max_candidate
-            for name in selected_names:
-                pool = self._group_pools[name]
-                if pool.spec.sliding_window is not None:
-                    continue
-                token_capacity = pool.spec.spec.token_capacity
-                max_blocks = min(
-                    candidate // token_capacity,
-                    pool.spec.max_blocks_per_seq,
-                    len(block_hashes[name]),
-                )
-                num_hit_blocks = 0
-                for block_hash in block_hashes[name][:max_blocks]:
-                    block = lookup(pool, candidate_partition, block_hash)
-                    if block is None:
-                        break
-                    num_hit_blocks += 1
-                candidate = min(candidate, num_hit_blocks * token_capacity)
-
-            candidate -= candidate % alignment
-            candidate_blocks: dict[str, list[KVCacheBlock | None]] = {}
-            if any(self._group_pools[name].spec.is_checkpoint_state for name in selected_names):
-                # State is materialized at sparse publication boundaries, not at
-                # every computed token. Validate only resident joint candidates.
-                keys = checkpoint_keys if checkpoint_keys is not None else (
-                    self._group_checkpoints.checkpoints if self._group_checkpoints is not None else ())
-                candidates = sorted({key[1] for key in keys
-                                     if key[0] == candidate_partition and key[1] <= candidate}, reverse=True)
+            equivalent = candidate_partition in equivalent_partitions
+            if equivalent and equivalent_match is not None:
+                candidate, candidate_blocks = equivalent_match
             else:
-                candidates = range(candidate, 0, -alignment)
-            candidate = 0
-            for boundary in candidates:
-                candidate = boundary
-                candidate_blocks = {}
-                valid = True
-                for name, pool in self._group_pools.items():
-                    if name not in expected_names:
-                        candidate_blocks[name] = []
+                candidate = max_candidate
+                for name in selected_names:
+                    pool = self._group_pools[name]
+                    if pool.spec.sliding_window is not None:
                         continue
                     token_capacity = pool.spec.spec.token_capacity
-                    end_block = candidate // token_capacity
-                    if end_block > len(block_hashes[name]):
-                        valid = False
-                        break
-
-                    if pool.spec.sliding_window is None:
-                        if end_block > pool.spec.max_blocks_per_seq:
-                            valid = False
-                            break
-                        selected: list[KVCacheBlock | None] = []
-                        lookup_indices = range(end_block)
-                    else:
-                        table_size = min(end_block, pool.spec.max_blocks_per_seq)
-                        selected = [None] * table_size
-                        tail_blocks = min(
-                            end_block,
-                            pool.spec.sliding_window // token_capacity,
-                        )
-                        lookup_indices = range(end_block - tail_blocks, end_block)
-
-                    for block_index in lookup_indices:
-                        block_hash = block_hashes[name][block_index]
+                    max_blocks = min(
+                        candidate // token_capacity,
+                        pool.spec.max_blocks_per_seq,
+                        len(block_hashes[name]),
+                    )
+                    num_hit_blocks = 0
+                    for block_hash in block_hashes[name][:max_blocks]:
                         block = lookup(pool, candidate_partition, block_hash)
                         if block is None:
+                            break
+                        num_hit_blocks += 1
+                    candidate = min(candidate, num_hit_blocks * token_capacity)
+
+                candidate -= candidate % alignment
+                candidate_blocks: dict[str, list[KVCacheBlock | None]] = {}
+                if any(self._group_pools[name].spec.is_checkpoint_state for name in selected_names):
+                    # State is materialized at sparse publication boundaries, not at
+                    # every computed token. Validate only resident joint candidates.
+                    keys = () if equivalent or self._group_checkpoints is None else self._group_checkpoints.checkpoints
+                    boundaries = {key[1] for key in keys
+                                  if key[0] == candidate_partition and key[1] <= candidate}
+                    boundaries.update(boundary for boundary in shared_checkpoint_boundaries if boundary <= candidate)
+                    candidates = sorted(boundaries, reverse=True)
+                else:
+                    candidates = range(candidate, 0, -alignment)
+                candidate = 0
+                for boundary in candidates:
+                    candidate = boundary
+                    candidate_blocks = {}
+                    valid = True
+                    for name, pool in self._group_pools.items():
+                        if name not in expected_names:
+                            candidate_blocks[name] = []
+                            continue
+                        token_capacity = pool.spec.spec.token_capacity
+                        end_block = candidate // token_capacity
+                        if end_block > len(block_hashes[name]):
                             valid = False
                             break
+
                         if pool.spec.sliding_window is None:
-                            selected.append(block)
+                            if end_block > pool.spec.max_blocks_per_seq:
+                                valid = False
+                                break
+                            selected: list[KVCacheBlock | None] = []
+                            lookup_indices = range(end_block)
                         else:
-                            selected[block_index % len(selected)] = block
-                    if not valid:
+                            table_size = min(end_block, pool.spec.max_blocks_per_seq)
+                            selected = [None] * table_size
+                            tail_blocks = min(
+                                end_block,
+                                pool.spec.sliding_window // token_capacity,
+                            )
+                            lookup_indices = range(end_block - tail_blocks, end_block)
+
+                        for block_index in lookup_indices:
+                            block_hash = block_hashes[name][block_index]
+                            block = lookup(pool, candidate_partition, block_hash)
+                            if block is None:
+                                valid = False
+                                break
+                            if pool.spec.sliding_window is None:
+                                selected.append(block)
+                            else:
+                                selected[block_index % len(selected)] = block
+                        if not valid:
+                            break
+                        candidate_blocks[name] = selected
+
+                    if valid:
                         break
-                    candidate_blocks[name] = selected
+                    candidate = 0
+                if equivalent:
+                    equivalent_match = candidate, candidate_blocks
 
-                if valid:
-                    break
-                candidate = 0
-
-            if candidate > best_hit_tokens:
+            if candidate and candidate >= best_hit_tokens:
+                rank = score(candidate_partition, candidate_blocks) if score is not None else ()
+                if rank is None or (candidate == best_hit_tokens and rank >= best_score):
+                    continue
                 best_partition = candidate_partition
                 best_hit_tokens = candidate
                 best_blocks = candidate_blocks
+                best_score = rank
 
         if best_partition is None or best_hit_tokens == 0:
             return {}, 0, None
@@ -1718,11 +1738,13 @@ class KvCacheManager:
         partition: int | None = None, prompt_token_count: int | None = None,
         prefix_block_hashes: dict[str, list[bytes]] | None = None,
         shareable_group_names: tuple[str, ...] = (),
+        preferred_partition: int | None = None,
     ) -> GroupCacheReservation:
         return self.reservations.reserve_group_cache(
             reservation_id, request_id, token_capacity, partition=partition,
             prompt_token_count=prompt_token_count, prefix_block_hashes=prefix_block_hashes,
             shareable_group_names=shareable_group_names,
+            preferred_partition=preferred_partition,
         )
 
     def group_cache_reservation(self, reservation_id: str) -> GroupCacheReservation | None:
