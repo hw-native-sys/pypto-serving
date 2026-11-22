@@ -24,6 +24,7 @@ DSPARK_SPECULATIVE_TOKENS = 5
 DSPARK_ROWS_PER_REQUEST = DSPARK_SPECULATIVE_TOKENS + 1
 
 DECODE_STAGE_ORDER = ("decode",)
+PROPOSE_STAGE_ORDER = ("dspark_drafter", "markov_sample")
 
 # These names are the serving-to-lib handoff, rather than an implementation
 # detail of any one runner.  Keep the contract explicit so a provider cannot
@@ -52,11 +53,7 @@ _DECODE_CACHE_KEYS = ("target_window", "target_c2a", "target_c1a", "draft")
 _ROPE_KEYS = ("draft_cos", "draft_sin")
 
 PREFILL_STAGE_ORDER = (
-    "bootstrap_inputs",
-    "prepare_prefill_drafter_geometry",
-    "dspark_drafter",
-    "markov_sample",
-    "publish_bootstrap",
+    "prefill_context_kv",
 )
 
 
@@ -141,8 +138,8 @@ class DSparkLoweredInputs:
         the resident resource allocator.  In particular, this method never
         creates a placeholder tensor for a missing binding.
         """
-        if phase not in ("prefill", "decode"):
-            raise ValueError("DSpark phase must be 'prefill' or 'decode'")
+        if phase not in ("prefill", "decode", "propose"):
+            raise ValueError("DSpark phase must be 'prefill', 'propose' or 'decode'")
 
         def has_field(container, name):
             if isinstance(container, Mapping):
@@ -185,7 +182,7 @@ def coerce_dspark_lowered(value: Any) -> DSparkLoweredInputs:
 
 @dataclass(frozen=True)
 class DSparkPrefillDispatch:
-    """Already-lowered DSpark bootstrap arguments carried by a prefill batch.
+    """Already-lowered DSpark prefill arguments carried by a prefill batch.
 
     The scheduler owns tensor allocation and argument lowering.  This value
     only gives the serving runner a typed hand-off; it never constructs a
@@ -267,14 +264,14 @@ class DSparkRequestState:
     valid: bool = False
     anchor_token: int | None = None
 
-    def bootstrap(self, prompt_length: int, anchor: int) -> None:
+    def initialize_prefill(self, prompt_length: int, anchor: int) -> None:
         if prompt_length <= 0 or prompt_length > self.position_limit:
             raise ValueError("DSpark prompt length is outside the position limit")
         # Prefill has no previously emitted token: its next-token anchor is
         # allowed at the prompt boundary. Recurrent decode anchors are inside
         # the committed stream and advance from this position.
         if not 0 <= anchor <= prompt_length:
-            raise ValueError("DSpark bootstrap anchor must not exceed the prompt boundary")
+            raise ValueError("DSpark prefill anchor must not exceed the prompt boundary")
         self.prompt_length = prompt_length
         self.anchor = anchor
         self.committed = prompt_length
@@ -344,9 +341,10 @@ class DSparkStageRunner:
         self.dispatch = dispatch
 
     def run(self, stages: Sequence[tuple[str, Mapping[str, Any]]], *, phase: str) -> None:
-        if phase not in ("prefill", "decode"):
-            raise ValueError("DSpark phase must be 'prefill' or 'decode'")
-        expected = PREFILL_STAGE_ORDER if phase == "prefill" else DECODE_STAGE_ORDER
+        if phase not in ("prefill", "propose", "decode"):
+            raise ValueError("DSpark phase must be 'prefill', 'propose' or 'decode'")
+        expected = (PREFILL_STAGE_ORDER if phase == "prefill" else
+                    PROPOSE_STAGE_ORDER if phase == "propose" else DECODE_STAGE_ORDER)
         names = tuple(name for name, _ in stages)
         if names != expected:
             raise ValueError(f"DSpark {phase} stages must follow the lib order: {expected}")
@@ -363,24 +361,24 @@ class V41DSparkRuntime:
         self.states = DSparkStateTable(max_seq_len)
         self.stages = DSparkStageRunner(resources)
 
-    def bootstrap(self, request_id: str, *, slot: int, generation: int,
-                  prompt_length: int, anchor: int,
-                  stages: Sequence[tuple[str, Mapping[str, Any]]]) -> DSparkRequestState:
+    def initialize_prefill(self, request_id: str, *, slot: int, generation: int,
+                           prompt_length: int, anchor: int,
+                           stages: Sequence[tuple[str, Mapping[str, Any]]]) -> DSparkRequestState:
         state = self.states.reserve(
             request_id, slot=slot, generation=generation, prompt_length=prompt_length,
         )
         try:
-            state.bootstrap(prompt_length, anchor)
+            state.initialize_prefill(prompt_length, anchor)
             self.stages.run(stages, phase="prefill")
         except BaseException:
             self.states.release((request_id,))
             raise
         return state
 
-    def record_bootstrap(self, request_id: str, *, slot: int, generation: int,
-                         prompt_length: int, anchor: int,
-                         draft_ids: Sequence[int], anchor_token: int | None = None) -> DSparkRequestState:
-        """Commit outputs already produced by the lib bootstrap composite.
+    def record_prefill(self, request_id: str, *, slot: int, generation: int,
+                       prompt_length: int, anchor: int,
+                       draft_ids: Sequence[int], anchor_token: int | None = None) -> DSparkRequestState:
+        """Commit state produced by the prefill context composite.
 
         The device orchestration path has its own runner and therefore must not
         dispatch the stage list a second time merely to update host bookkeeping.
@@ -389,8 +387,11 @@ class V41DSparkRuntime:
             request_id, slot=slot, generation=generation, prompt_length=prompt_length,
         )
         try:
-            state.bootstrap(prompt_length, anchor)
-            state.commit(draft_ids)
+            state.initialize_prefill(prompt_length, anchor)
+            if draft_ids:
+                state.commit(draft_ids)
+            else:
+                state.draft_ids = ()
             state.anchor_token = anchor_token
         except BaseException:
             self.states.release((request_id,))
