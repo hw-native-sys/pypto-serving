@@ -54,7 +54,7 @@ _STATE_GENERATION = 1
 # The target backbone has additional per-layer arguments and is checked by its
 # compiled ABI; the drafter/Markov heads are fixed by the V4.1 DSpark entry.
 _DRAFT_MODEL_KEYS = frozenset({
-    "embedding_weight", "main_proj_weight", "main_norm_weight",
+    "embedding_weight", "main_proj_weight", "main_proj_scale", "main_norm_weight",
     "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight",
     "wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale",
     "wkv", "wkv_scale", "kv_norm_weight", "attn_sink", "wo_a", "wo_a_scale",
@@ -163,6 +163,11 @@ class DSparkResourceLayout:
             "attention_num_tokens": (world,),
             "moe_num_tokens": (world,),
             "logit_row_indices": (world, DSPARK_PREFILL_SAMPLE_ROWS),
+            "sampling_temperatures": (world, DSPARK_TARGET_ROWS),
+            "sampling_top_ks": (world, DSPARK_TARGET_ROWS),
+            "sampling_top_ps": (world, DSPARK_TARGET_ROWS),
+            "sampling_seeds": (world, DSPARK_TARGET_ROWS),
+            "sampling_positions": (world, DSPARK_TARGET_ROWS),
             "target_hidden_padded": (world, DSPARK_PADDED_ROWS, self.main_hidden_size),
             "target_hidden": (world, DSPARK_TARGET_ROWS, self.main_hidden_size),
             "target_sampled_ids": (world, DSPARK_TARGET_ROWS, DSPARK_SAMPLED_STRIDE),
@@ -196,6 +201,7 @@ class DSparkResourceLayout:
             "context_valid", "context_positions", "num_sampled", "first_query_positions",
             "draft_ids", "committed", "target_sampled_ids", "state_block_table",
             "attention_num_tokens", "moe_num_tokens",
+            "sampling_top_ks", "sampling_seeds", "sampling_positions",
         )}
         result.update({name: torch.int64 for name in (
             "input_ids", "window_slots", "c2a_slots", "c1a_slots", "context_slots",
@@ -204,7 +210,7 @@ class DSparkResourceLayout:
         result.update({name: torch.float32 for name in (
             "x_hc", "pre_mix", "context_rope_cos", "context_rope_sin",
             "query_rope_cos", "query_rope_sin", "confidences",
-            "draft_x_hc", "draft_pre_mix",
+            "draft_x_hc", "draft_pre_mix", "sampling_temperatures", "sampling_top_ps",
         )})
         result.update({name: torch.bfloat16 for name in ("target_hidden_padded", "target_hidden", "draft_head_hidden")})
         expected = set(self.decode_shapes)

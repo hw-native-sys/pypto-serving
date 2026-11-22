@@ -43,6 +43,7 @@ _DECODE_WORKSPACE_KEYS = (
     "c1a_slots", "query_starts", "target_hidden_padded", "target_hidden",
     "target_sampled_ids", "accepted_ids", "accepted_counts", "context_valid",
     "context_positions", "num_sampled", "last_sampled", "anchor_ids",
+    "sampling_temperatures", "sampling_top_ks", "sampling_top_ps", "sampling_seeds", "sampling_positions",
     "first_query_positions", "context_slots", "context_rope_cos", "context_rope_sin",
     "query_rope_cos", "query_rope_sin", "draft_head_hidden", "draft_ids",
     "confidences", "zero_prefill_tokens", "committed",
