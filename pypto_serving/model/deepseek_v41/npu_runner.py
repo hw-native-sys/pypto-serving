@@ -3129,15 +3129,6 @@ class V41ResidentResources:
                     batch.block_ids_by_group[index],
                 ))
             self._stage_dspark_tables(resources, batch, partitions, request_rows)
-            # The current Lib DSpark ABI exposes one dynamic draft-table page
-            # per decode row. Select the page containing the current anchor
-            # while retaining the full host table for prefill context geometry.
-            draft = resources.cache_tables["draft"]
-            pages_per_slot = draft.shape[-1]
-            for index, (rank, row) in enumerate(zip(partitions, request_rows, strict=True)):
-                slot, _generation = self._resolve_dspark_state(request_ids[index])
-                page = positions[index] // DSPARK_WINDOW
-                draft[rank, :, row, 0] = slot * pages_per_slot + page
             if self.engram_host is not None:
                 self.engram_host.stage_lookup(
                     self.decode_host.fields["engram_lookup"],
@@ -3171,6 +3162,10 @@ class V41ResidentResources:
                 if previous_progress[1] != request.start:
                     raise ValueError("DSpark prefill taps must continue the same request")
                 retained_count = previous_progress[2]
+            if self._prefill_binding and "draft_main_proj_weight" in self._prefill_binding[1]:
+                # This chunk's KV is already resident. Track continuity only.
+                progress[rank] = (request.request_id, request.end, 0)
+                continue
             if size >= capacity:
                 retained[rank, :capacity].copy_(source[rank, offset + size - capacity:offset + size])
                 retained_count = capacity
@@ -3206,7 +3201,8 @@ class V41ResidentResources:
             if progress is None or progress[:2] != (request_id, prompt_length):
                 raise ValueError("DSpark bootstrap requires all target prefill chunks to complete")
             retained_count = progress[2]
-            if retained_count < min(prompt_length, DSPARK_WINDOW):
+            fused = self._prefill_binding and "draft_main_proj_weight" in self._prefill_binding[1]
+            if not fused and retained_count < min(prompt_length, DSPARK_WINDOW):
                 raise ValueError("DSpark prefill buffer cannot retain the visible draft context")
             prefix_start = prompt_length - retained_count
             workspace["prompt_lengths"][rank, 0] = prompt_length
@@ -3239,6 +3235,8 @@ class V41ResidentResources:
             meta[5] = resources.layout.max_seq_len
             state.tokens[rank, slot].zero_()
             state.tokens[rank, slot, 0] = int(sampled_token_ids[0])
+            if fused:
+                return request_id, slot, generation
             # Geometry used to be produced by a separate L3 bootstrap stage.
             # Build the context rows while lowering prefill so the context-KV
             # composite receives complete slots and RoPE inputs.
