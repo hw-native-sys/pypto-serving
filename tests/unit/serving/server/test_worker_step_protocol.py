@@ -31,6 +31,7 @@ from pypto_serving.serving.sched.scheduler import (
 )
 from pypto_serving.serving.server import serving_worker
 from pypto_serving.serving.server.ipc import (
+    ControlCommand,
     DecodeRequest,
     NewRequestData,
     PrefillRequest,
@@ -39,6 +40,7 @@ from pypto_serving.serving.server.ipc import (
     StepResult,
     ShutdownCommand,
     decode_command,
+    decode_control_result,
     decode_result,
     encode_command,
 )
@@ -799,6 +801,49 @@ def test_worker_routes_decode_failures_through_device_fifo():
     assert isinstance(second, serving_worker._CompletedStepOutput)
     assert second.result.error == "malformed"
     assert isinstance(output_work_queue.get_nowait(), ShutdownCommand)
+
+
+def test_pd_host_reservation_replies_while_older_decode_reclaim_is_blocked():
+    from pypto_serving.pd.worker import Services
+
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = Services.__new__(Services)
+    worker._services.handle_command = lambda operation, _: operation.encode()
+    worker.profile_output_queue = Queue()
+    worker.output_queue = Queue()
+    worker._pending_decode_condition = threading.Condition()
+    worker._pending_decode_request_counts = {}
+    commands, outputs = Queue(), Queue()
+    reclaiming, finish_reclaim = threading.Event(), threading.Event()
+
+    def reclaim(work):
+        reclaiming.set()
+        assert finish_reclaim.wait(5)
+        return StepResult({}, step_id=work.cmd.step_id)
+
+    worker._reclaim_pending_decode = reclaim
+    outputs.put(serving_worker._PendingDecodeOutput(
+        StepCommand([], [], [], [], 1), (), None, 0, None,
+    ))
+    commands.put((ControlCommand(1, "reserve_state"), None, {}))
+    commands.put((ControlCommand(2, "discard_state"), None, {}))
+    commands.put((ShutdownCommand(), None, {}))
+    output = threading.Thread(target=worker._output_reclaim_loop, args=(outputs, [threading.Semaphore(0)]))
+    device = threading.Thread(target=worker._device_execution_loop, args=(commands, outputs))
+    output.start()
+    device.start()
+    try:
+        assert reclaiming.wait(2)
+        reserve = decode_control_result(worker.profile_output_queue.get(timeout=2))
+        assert reserve.command_id == 1 and reserve.payload == b"reserve_state" and reserve.error is None
+        assert worker.profile_output_queue.empty() and worker.output_queue.empty()
+    finally:
+        finish_reclaim.set()
+        device.join(5)
+        output.join(5)
+    assert not device.is_alive() and not output.is_alive()
+    assert decode_result(worker.output_queue.get_nowait()).step_id == 1
+    assert decode_control_result(worker.profile_output_queue.get_nowait()).command_id == 2
 
 
 def test_worker_reclaims_device_accepted_tokens_after_request_cache_release():

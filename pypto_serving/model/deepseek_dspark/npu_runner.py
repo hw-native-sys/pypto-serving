@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pypto_serving.model.common.runner.task_args import TaskArgs
+    from pypto_serving.pd.adapter import _PreparedBootstrapRow
 
 import numpy as np
 import torch
@@ -1272,11 +1273,7 @@ class DSparkPreparedDecodePlan:
     owner_ranks: tuple[int, ...]
     owner_rows: tuple[int, ...]
     buffer_slot: int
-    # A newly adopted PD request has no Decode-local device state yet.  Its
-    # first prepared step must bind P's sampled token on the device lane before
-    # publishing the local drafter state.  Later steps consume recurrent device
-    # state and remain fully token-independent.
-    bootstrap_request_ids: tuple[str, ...] = ()
+    bootstrap_rows: tuple[_PreparedBootstrapRow, ...] = ()
     dispatch_inputs: DSparkPreparedDecodeInputs | None = None
 
 
@@ -1579,6 +1576,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._drafter_lease_zero: torch.Tensor | None = None
         self._drafter_task_args: TaskArgs | None = None
         self._markov_task_args: TaskArgs | None = None
+        self._bootstrap_one_l2_args: tuple[Any, ...] = ()
         self._fused_drafter_task_args: list[TaskArgs] = []
         self._fused_markov_task_args: list[TaskArgs] = []
         self._drafter_context_staging: dict[int, dict[str, torch.Tensor]] = {}
@@ -1884,11 +1882,6 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
     @staticmethod
     def prepared_decode_requires_token(prepared: object) -> bool:
         """A fully staged one-L2 snapshot reads its next token from device state."""
-        if (
-            isinstance(prepared, DSparkPreparedDecodePlan)
-            and prepared.bootstrap_request_ids
-        ):
-            return True
         return not (
             isinstance(prepared, DSparkPreparedDecodePlan)
             and prepared.dispatch_inputs is not None
@@ -2355,6 +2348,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     torch.bfloat16,
                     scope="drafter",
                 )
+        if self._compiled.bootstrap_one_l2 is not None:
+            self._bootstrap_one_l2_args = self._bind_one_l2_bootstrap_args()
         self._l3_shared_buffers_ready = True
 
     def _ensure_shared_host_allocation_before_worker(self, name: str) -> None:
@@ -3954,9 +3949,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         if inputs is None or inputs.dispatch_args is None:
             raise RuntimeError("DSpark fused decode was not fully bound during prepare")
         self._ensure_l3_shared_buffers(model)
-        return self._ready_dispatch(batch, inputs)
+        return self._ready_dispatch(batch, prepared)
 
-    def _dispatch_ready_decode(self, batch, inputs):
+    def _dispatch_ready_decode(self, batch, prepared):
+        inputs = prepared.dispatch_inputs
         for request_id in inputs.request_ids:
             if not self._drafter_state(request_id).device_state_initialized:
                 raise RuntimeError(
@@ -6214,7 +6210,16 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 )
         return batch, context_rows
 
-    def _grant_prefill_generations(self, request_ids: Sequence[str]) -> None:
+    def _prefill_generation_row(self, generation: int) -> torch.Tensor:
+        grant = torch.zeros(DSPARK_STATE_META_WIDTH, dtype=torch.int32)
+        grant[DSparkStateMetaColumn.GENERATION] = generation
+        grant[DSparkStateMetaColumn.POSITION_LIMIT] = self._require_rope_tables().max_position
+        return grant
+
+    def _grant_prefill_generations(
+        self, request_ids: Sequence[str], *,
+        prepared_rows: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+    ) -> None:
         """Publish lease ownership before any descriptor-driven device preparation."""
         layout = self._compiled.layout
         worker = self._shared_l3_worker()
@@ -6224,12 +6229,13 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             state = self._drafter_state(request_id)
             if state.prefill_generation_initialized:
                 continue
-            grant = torch.zeros(DSPARK_STATE_META_WIDTH, dtype=torch.int32)
-            grant[DSparkStateMetaColumn.GENERATION] = state.generation
-            grant[DSparkStateMetaColumn.POSITION_LIMIT] = self._require_rope_tables().max_position
-            empty_positions = torch.full((DSPARK_SLIDING_WINDOW,), -1, dtype=torch.int32)
+            if prepared_rows is None:
+                grant = self._prefill_generation_row(state.generation)
+                ring = torch.full((DSPARK_SLIDING_WINDOW,), -1, dtype=torch.int32)
+            else:
+                grant, ring = prepared_rows[request_id]
             for rank in range(state.group * layout.tp_size, (state.group + 1) * layout.tp_size):
-                for target, source in ((meta, grant), (positions, empty_positions)):
+                for target, source in ((meta, grant), (positions, ring)):
                     row_bytes = source.numel() * source.element_size()
                     worker.copy_to(
                         target.shards[rank].data_ptr, source.data_ptr(), row_bytes,
@@ -6416,7 +6422,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._bootstrap_prefill_requests(request_ids, sampled_token_ids)
 
     def _bootstrap_prefill_requests(
-        self, request_ids: Sequence[str], sampled_token_ids: Sequence[int]
+        self, request_ids: Sequence[str], sampled_token_ids: Sequence[int], *,
+        descriptor_rows: dict[str, torch.Tensor] | None = None,
     ) -> None:
         # The drafter seed ABI has one context/lease per group. Pack independent
         # groups together, then seed further requests in that group in later waves.
@@ -6442,11 +6449,15 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 waves.append([])
             waves[wave].append((request_id, int(token)))
         for wave in waves:
-            self._seed_prefill_wave(
-                [request_id for request_id, _ in wave], [token for _, token in wave]
-            )
+            ids = [request_id for request_id, _ in wave]
+            if self._compiled.bootstrap_metadata is not None:
+                self._run_device_bootstrap_wave(ids, descriptor_rows)
+            else:
+                self._seed_prefill_wave(ids, [token for _, token in wave])
 
-    def _stage_bootstrap_descriptors(self, request_ids: Sequence[str]) -> int:
+    def _stage_bootstrap_descriptors(
+        self, request_ids: Sequence[str], descriptor_rows: dict[str, torch.Tensor] | None = None,
+    ) -> int:
         batch = DSPARK_DRAFTER_BATCHES[0]
         rows = self._packed_host_prefix(self._prefill_prepare_buffers.bootstrap_descriptors, batch)
         rows.fill_(-1)
@@ -6460,19 +6471,17 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             if ordinal >= batch:
                 raise ValueError("Device bootstrap exceeds one TP group's padded batch")
             ordinals[state.group] = ordinal + 1
-            rows[state.group * tp:(state.group + 1) * tp, ordinal] = torch.tensor(
-                state.prefill_descriptor.to_row(), dtype=torch.int32
-            )
+            row = (torch.tensor(state.prefill_descriptor.to_row(), dtype=torch.int32)
+                   if descriptor_rows is None else descriptor_rows[request_id])
+            rows[state.group * tp:(state.group + 1) * tp, ordinal] = row
         return batch
 
-    def _prepare_device_bootstrap(self, request_ids: Sequence[str]) -> int:
-        batch = self._stage_bootstrap_descriptors(request_ids)
+    def _prepare_device_bootstrap(self, batch: int) -> None:
         rows = self._packed_host_prefix(self._prefill_prepare_buffers.bootstrap_descriptors, batch)
         self._run_l3(
             self._compiled.bootstrap_tokens, rows, self._prefill_prepared_device["sampled_ids"],
             self._stacked_device_prefix(self._device_scratch[("bootstrap", "next_prefill_tokens")], batch),
         )
-        return batch
 
     def _publish_device_bootstrap(self, request_ids: Sequence[str], batch: int) -> None:
         self._run_l3(
@@ -6492,7 +6501,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             state.device_draft_count = self._compiled.layout.draft_tokens if state.prefill_descriptor.bootstrap_valid else 0
             state.proposed_tokens += state.device_draft_count
 
-    def _run_device_bootstrap_wave(self, request_ids: Sequence[str]) -> None:
+    def _run_device_bootstrap_wave(
+        self, request_ids: Sequence[str], descriptor_rows: dict[str, torch.Tensor] | None,
+    ) -> None:
         """Skip inactive draft waves while still committing sample-only anchors."""
         from pypto_serving.model.deepseek_dspark.task_args import bootstrap_metadata_specs
 
@@ -6517,14 +6528,14 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         if os.environ.get("PYPTO_DSPARK_TRACE_PREFILL") == "1":
             logger.info("DSpark bootstrap wave: requests=%d draft_requests=%d action=%s",
                         len(request_ids), active_count, "draft" if active_count else "publish_only")
+        batch = self._stage_bootstrap_descriptors(request_ids, descriptor_rows)
         if not active_count:
-            batch = self._stage_bootstrap_descriptors(request_ids)
             self._publish_device_bootstrap(request_ids, batch)
             return
         if self._compiled.bootstrap_one_l2 is not None:
             self._run_one_l2_bootstrap_wave(request_ids)
             return
-        batch = self._prepare_device_bootstrap(request_ids)
+        self._prepare_device_bootstrap(batch)
         metadata = {
             name: self._device_scratch[("bootstrap_meta", name)]
             for name in bootstrap_metadata_specs(self._compiled.layout)
@@ -6549,11 +6560,11 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._run_drafter_and_markov(batch, context_rows, target_hidden=context, bootstrap=True)
         self._publish_device_bootstrap(request_ids, batch)
 
-    def _run_one_l2_bootstrap_wave(self, request_ids: Sequence[str]) -> None:
-        """Bind all bootstrap stages to one L2 program per rank."""
+    def _bind_one_l2_bootstrap_args(self) -> tuple[Any, ...]:
+        """Bind fixed bootstrap views after their shared buffers are materialized."""
         from pypto_serving.model.deepseek_dspark.task_args import bootstrap_metadata_specs
 
-        batch = self._stage_bootstrap_descriptors(request_ids)
+        batch = DSPARK_DRAFTER_BATCHES[0]
         context_rows = DSPARK_SLIDING_WINDOW // self._compiled.layout.tp_size * batch
         context = self._device_scratch[("prefill_state", "context")]
         drafter_args = dict(zip(
@@ -6594,9 +6605,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             args[name] = metadata[name]
         program = self._compiled.bootstrap_one_l2
         parameter_infos = program.compiled._get_metadata()[0]
-        self._run_l3(program, *(
-            args[name.partition("__ssa_v")[0]] for name in (info.name for info in parameter_infos)
-        ))
+        return tuple(args[info.name.partition("__ssa_v")[0]] for info in parameter_infos)
+
+    def _run_one_l2_bootstrap_wave(self, request_ids: Sequence[str]) -> None:
+        self._run_l3(self._compiled.bootstrap_one_l2, *self._bootstrap_one_l2_args)
         for request_id in request_ids:
             state = self._drafter_state(request_id)
             descriptor = state.prefill_descriptor
@@ -6612,9 +6624,6 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self, request_ids: Sequence[str], sampled_token_ids: Sequence[int]
     ) -> None:
         """Seed at most one request per TP group using independent prompt tails."""
-        if self._compiled.bootstrap_metadata is not None:
-            self._run_device_bootstrap_wave(request_ids)
-            return
         layout = self._compiled.layout
         tp = layout.tp_size
         rows_by_rank: list[list[DSparkDrafterRequestRow]] = [[] for _ in range(layout.ranks)]
@@ -6622,7 +6631,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         tails: dict[int, tuple[torch.Tensor | None, torch.Tensor]] = {}
         device_tail = self._compiled.prefill_capture is not None
         device_bootstrap = self._compiled.prefill_publish is not None
-        bootstrap_batch = self._prepare_device_bootstrap(request_ids) if device_bootstrap else None
+        bootstrap_batch = self._stage_bootstrap_descriptors(request_ids) if device_bootstrap else None
+        if bootstrap_batch is not None:
+            self._prepare_device_bootstrap(bootstrap_batch)
         max_position = self._require_rope_tables().max_position
         for request_id, token in zip(request_ids, sampled_token_ids, strict=True):
             state = self._drafter_state(request_id)
@@ -7231,6 +7242,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         for task_args in self._decode_task_args:
             task_args.close()
         self._decode_task_args = []
+        self._bootstrap_one_l2_args = ()
         self._decode_table_rows.clear()
         self._default_grammar_args.clear()
         # Speculative resources: the executor retains its runners, so

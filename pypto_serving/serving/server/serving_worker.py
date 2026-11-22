@@ -446,6 +446,9 @@ class WorkerProcess:
                 barrier.completed.wait()
                 continue
             if isinstance(cmd, ControlCommand):
+                if self._services is not None and self._services.is_host_only_command(cmd.operation):
+                    self._handle_control_command(cmd)
+                    continue
                 barrier = _ControlBarrier(command=cmd, completed=threading.Event())
                 output_work_queue.put(barrier)
                 barrier.completed.wait()
@@ -805,7 +808,7 @@ class WorkerProcess:
             )
 
     def _handle_control_command(self, cmd: ControlCommand) -> None:
-        """Run a worker-owned PD operation after all older device work settles."""
+        """Run a PD operation at its ordered Worker control point."""
         error = None
         payload = b""
         try:

@@ -8,11 +8,17 @@
 # -----------------------------------------------------------------------------------------------------------
 """Model-specific transfer semantics; generic PD code only consumes this interface."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, replace
 import logging
 from math import lcm, prod
 import threading
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    import torch
+    from pypto_serving.model.deepseek_dspark.npu_runner import DSparkStepDescriptor
 
 from pypto_serving.tools.observe import record, span
 from pypto_serving.tools.profile import profile_span
@@ -21,6 +27,20 @@ from .protocol import Component, Contract, Prefix, digest
 from .worker import WorkerRuntime
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _PreparedBootstrapRow:
+    """Private Host inputs owned by a prepared Decode batch."""
+
+    request_id: str
+    descriptor: DSparkStepDescriptor
+    descriptor_row: torch.Tensor
+    first_token: int
+    sampled_row: torch.Tensor
+    tail_positions: torch.Tensor
+    position_ring: torch.Tensor
+    generation_row: torch.Tensor
 
 
 class ModelAdapter(Protocol):
@@ -243,20 +263,16 @@ class DSparkExtension:
 
     def wrap_prepare(self, prepare):
         def build(batch, *, buffer_slot):
-            bootstrap = tuple(r for r in batch.initial_request_ids
-                              if not self.draft_states[r].device_state_initialized)
-            return replace(prepare(batch, buffer_slot=buffer_slot), bootstrap_request_ids=bootstrap)
+            plan = prepare(batch, buffer_slot=buffer_slot)
+            bootstrap = self._prepare_bootstrap_rows(batch.prefill_first_tokens)
+            return replace(plan, bootstrap_rows=bootstrap) if bootstrap else plan
         return build
 
     def wrap_dispatch(self, dispatch):
-        def submit(batch, inputs):
-            fresh = [i for i, request in enumerate(batch.request_ids)
-                     if request in batch.initial_request_ids
-                     and not self.draft_states[request].device_state_initialized]
-            if fresh:
-                with profile_span("pd.dspark.bootstrap", cat="pd", args={"requests": len(fresh)}):
-                    self.bootstrap(batch, fresh)
-            return dispatch(batch, inputs)
+        def submit(batch, plan):
+            if plan.bootstrap_rows:
+                self.bootstrap(plan.bootstrap_rows)
+            return dispatch(batch, plan)
         return submit
 
     def handle(self, operation, value):
@@ -270,60 +286,90 @@ class DSparkExtension:
             return None
         raise ValueError("unknown model operation")
 
-    def bootstrap(self, batch, fresh):
-        """Reuse terminal-prefill bootstrap after the asynchronous final handoff.
-
-        Only hidden rows cross the network. Absolute positions are determined
-        by the agreed prompt length; lease generations remain local to D.
-        """
+    def _prepare_bootstrap_rows(self, first_tokens: tuple[tuple[str, int], ...]) -> tuple[_PreparedBootstrapRow, ...]:
+        """Prepare private Host rows while the previous Decode batch is in flight."""
+        fresh = [
+            (request_id, token, state)
+            for request_id, token in first_tokens
+            if not (state := self.draft_states[request_id]).device_state_initialized
+        ]
+        if not fresh:
+            return ()
         import torch
         from pypto_serving.model.deepseek_dspark.npu_runner import (
             DSPARK_SAMPLED_IDS_PAD, DSparkStepDescriptor,
         )
 
-        runner = self.runner
-        if self.compiled.bootstrap_metadata is None:
-            raise RuntimeError("PD continuation requires device prefill bootstrap")
-        with profile_span("pd.dspark.bootstrap.wait", cat="pd", args={"requests": len(fresh)}):
-            runner._wait_for_pending_decode_dispatches()
-        requests = [batch.request_ids[i] for i in fresh]
-        # Scrub reused draft KV, never the received target cache or hidden tail.
-        for request in requests:
-            state = self.draft_states[request]
-            key = state.group, state.lease
-            if key in runner._drafter_dirty_leases:
-                runner._clear_drafter_lease(*key)
-                runner._drafter_dirty_leases.remove(key)
-        runner._grant_prefill_generations(requests)
-        positions = runner._device_scratch[("prefill_state", "positions")]
-        sampled = runner._prefill_prepared_device["sampled_ids"]
         window = self.compiled.layout.sliding_window
+        max_position = self.runner._require_rope_tables().max_position
         ordinals = {}
-        for index in fresh:
-            request = batch.request_ids[index]
-            state = self.draft_states[request]
+        prepared = []
+        for request_id, token, state in fresh:
             ordinal = ordinals.get(state.group, 0)
             ordinals[state.group] = ordinal + 1
             length = state.prompt_len
-            start = max(0, length - window)
-            state.prefill_tail_start, state.prefill_tail_end = start, length
-            state.prefill_tail_positions = torch.arange(start, length, dtype=torch.int64)
-            state.prefill_descriptor = DSparkStepDescriptor(
+            positions = torch.arange(max(0, length - window), length, dtype=torch.int64)
+            descriptor = DSparkStepDescriptor(
                 state.lease, state.generation, state.group, length - 1, 1, length, 0, 1, 0, ordinal,
-                bootstrap_enabled=(length + self.compiled.layout.draft_tokens - 1
-                                   < runner._require_rope_tables().max_position))
+                bootstrap_enabled=length + self.compiled.layout.draft_tokens - 1 < max_position,
+            )
             ring = torch.full((window,), -1, dtype=torch.int32)
-            ring[state.prefill_tail_positions % window] = state.prefill_tail_positions.to(torch.int32)
-            token = int(batch.token_ids[index].reshape(-1)[-1].item())
-            state.current_token_id = token
-            row = torch.full((DSPARK_SAMPLED_IDS_PAD,), token, dtype=torch.int32)
-            for rank in range(state.group * self.tp, (state.group + 1) * self.tp):
-                for target, source, slot in ((positions, ring, state.lease), (sampled, row, ordinal)):
-                    size = source.numel() * source.element_size()
-                    self.worker().copy_to(target.shards[rank].data_ptr, source.data_ptr(), size,
-                                          dst_offset=slot * size, worker_id=target.worker_ids[rank])
-        with profile_span("pd.dspark.bootstrap.execute", cat="pd", args={"requests": len(fresh)}):
-            runner._bootstrap_prefill_requests(requests, [0] * len(requests))
+            ring[positions % window] = positions.to(torch.int32)
+            prepared.append(_PreparedBootstrapRow(
+                request_id=request_id, descriptor=descriptor,
+                descriptor_row=torch.tensor(descriptor.to_row(), dtype=torch.int32),
+                first_token=token, sampled_row=torch.full((DSPARK_SAMPLED_IDS_PAD,), token, dtype=torch.int32),
+                tail_positions=positions, position_ring=ring,
+                generation_row=self.runner._prefill_generation_row(state.generation),
+            ))
+        return tuple(prepared)
+
+    def bootstrap(self, prepared_rows: tuple[_PreparedBootstrapRow, ...]) -> None:
+        """Publish prepared Host inputs and seed device state before this batch's Decode."""
+        fresh = []
+        for row in prepared_rows:
+            state = self.draft_states[row.request_id]
+            descriptor = row.descriptor
+            if (state.group, state.lease, state.generation) != (
+                descriptor.cache_partition, descriptor.request_slot, descriptor.generation,
+            ):
+                raise RuntimeError(f"Stale PD bootstrap lease for {row.request_id!r}")
+            if not state.device_state_initialized:
+                fresh.append((row, state))
+        if not fresh:
+            return
+        runner = self.runner
+        requests = [row.request_id for row, _ in fresh]
+        grants = {row.request_id: (row.generation_row, row.position_ring) for row, _ in fresh}
+        descriptors = {row.request_id: row.descriptor_row for row, _ in fresh}
+        profile_args = {"requests": len(requests)}
+        with profile_span("pd.dspark.bootstrap", cat="pd", args=profile_args):
+            with profile_span("pd.dspark.bootstrap.wait", cat="pd", args=profile_args):
+                runner._wait_for_pending_decode_dispatches()
+            # Scrub reused draft KV, preserving the received target cache and hidden tail.
+            for row, state in fresh:
+                key = state.group, state.lease
+                if key in runner._drafter_dirty_leases:
+                    runner._clear_drafter_lease(*key)
+                    runner._drafter_dirty_leases.remove(key)
+                state.prefill_tail_end = row.descriptor.prompt_len
+                state.prefill_tail_start = state.prefill_tail_end - row.tail_positions.numel()
+                state.prefill_tail_positions = row.tail_positions
+                state.prefill_descriptor = row.descriptor
+                state.current_token_id = row.first_token
+            runner._grant_prefill_generations(requests, prepared_rows=grants)
+            sampled = runner._prefill_prepared_device["sampled_ids"]
+            worker = self.worker()
+            for row, state in fresh:
+                source = row.sampled_row
+                size = source.numel() * source.element_size()
+                for rank in range(state.group * self.tp, (state.group + 1) * self.tp):
+                    worker.copy_to(
+                        sampled.shards[rank].data_ptr, source.data_ptr(), size,
+                        dst_offset=row.descriptor.block_table_row * size, worker_id=sampled.worker_ids[rank],
+                    )
+            with profile_span("pd.dspark.bootstrap.execute", cat="pd", args=profile_args):
+                runner._bootstrap_prefill_requests(requests, [0] * len(requests), descriptor_rows=descriptors)
 
     def set_profile_active(self, active):
         for owner in self.transfer.owners:
