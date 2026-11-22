@@ -1215,7 +1215,8 @@ def compile_decode_fwd_dspark(compiler, lib_root, topology):
         raise MissingCompositeInterface("V4.1 DSpark currently requires TP1")
     load_segment_modules(lib_root, topology)
     module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd_dspark")
-    entries = {"decode": module.l3_decode_fwd_dspark}
+    entries = {"decode": module.l3_decode_fwd_dspark, "propose": module.l3_dspark_propose,
+               "verify": module.l3_dspark_verify}
     drafter = importlib.import_module("models.deepseek_v4_1_flash.dspark_drafter")
     entries["dspark_drafter"] = drafter.l3_dspark_drafter
     context_kv = getattr(drafter, "l3_dspark_prefill_context_kv", None)
@@ -1235,8 +1236,9 @@ def compile_decode_fwd_dspark(compiler, lib_root, topology):
             kwargs["moe_epoch"] = pl.RUNTIME
         if "logits_epoch" in params:
             kwargs["logits_epoch"] = pl.RUNTIME
-        programs[name] = compiler.compile("v41_dspark_" + name, entry, **kwargs)
         param_names[name] = tuple(entry.param_names)
+        if name in ("propose", "verify", "prefill_context_kv"):
+            programs[name] = compiler.compile("v41_dspark_" + name, entry, **kwargs)
     return programs, param_names
 
 
@@ -1575,6 +1577,13 @@ class V41ModelRunner:
         with self._lock:
             ledger = self._request_ledger()
             requests = decode_requests(batch, model.config, self.runtime, self.bindings.cache_groups)
+            states = self.resources.dspark.states
+            limits = [start + 1 + (DSPARK_SPECULATIVE_TOKENS if
+                      start + DSPARK_SPECULATIVE_TOKENS < states.get(key).position_limit else 0)
+                      for key, _, start, _, _ in requests]
+            validate_page_tables(batch.block_ids_by_group, batch.cache_partitions, limits,
+                                 self.bindings.cache_groups, defer_ownership=True)
+            self.resources.propose_for_batch(model, batch)
             drafts = {key: self.resources.dspark.states.get(key).draft_ids for key in batch.request_ids}
             validate_page_tables(
                 batch.block_ids_by_group, batch.cache_partitions,
@@ -3065,6 +3074,44 @@ class V41ResidentResources:
             draft[rank, :, row] = torch.arange(
                 slot * pages_per_slot, (slot + 1) * pages_per_slot, dtype=torch.int32)
 
+    def _stage_proposal(self, resources, batch):
+        state = resources.state
+        state.slot_ids.fill_(-1)
+        state.generations.zero_()
+        ws = resources.decode_workspace
+        for key in ("anchor_ids", "first_query_positions", "query_rope_cos", "query_rope_sin"):
+            ws[key].zero_()
+        ranks = tuple(map(int, batch.cache_partitions))
+        rows = []
+        used = {}
+        for key, rank in zip(batch.request_ids, ranks, strict=True):
+            row = used.get(rank, 0)
+            used[rank] = row + 1
+            rows.append(row)
+            slot, generation = self._resolve_dspark_state(key)
+            request = self.dspark.states.get(key)
+            state.bind_request(rank, row, slot=slot, generation=generation)
+            if request.anchor + DSPARK_SPECULATIVE_TOKENS >= request.position_limit:
+                continue
+            ws["anchor_ids"][rank, row] = request.anchor_token
+            ws["first_query_positions"][rank, row] = request.anchor
+            begin = row * DSPARK_SPECULATIVE_TOKENS
+            for kind in ("cos", "sin"):
+                source = resources.rope_tables["draft_" + kind]
+                ws["query_rope_" + kind][rank, begin:begin + DSPARK_SPECULATIVE_TOKENS].copy_(
+                    source[rank, request.anchor:request.anchor + DSPARK_SPECULATIVE_TOKENS])
+        self._stage_dspark_tables(resources, batch, ranks, rows)
+        return ranks, tuple(rows)
+
+    def propose_for_batch(self, model, batch):
+        lowered = self._dspark_payload(model=model, batch=batch, phase="propose",
+                                       resources=self.dspark_host_resources)
+        self.dispatch_dspark("propose", self._dspark_decode_arguments(lowered, "propose"))
+        candidates = self._read_dspark_output(lowered, "draft_ids")
+        for key, rank, row in zip(batch.request_ids, lowered.request_ranks,
+                                  lowered.outputs["request_rows"], strict=True):
+            self.dspark.states.get(key).commit(candidates[rank, row].tolist())
+
     def _stage_dspark_decode(self, resources, batch):
         with profile_span('v41.V41ResidentResources._stage_dspark_decode', cat='v41.host', level='verbose'):
             request_ids = tuple(batch.request_ids)
@@ -3272,8 +3319,11 @@ class V41ResidentResources:
         markov = {name: heads.full(name) for name in _MARKOV_MODEL_KEYS
                   if name in heads.tensors}
         markov["lm_head_weight"] = self.final.head_weight
-        if phase == "decode":
-            ranks, rows = self._stage_dspark_decode(resources, batch)
+        if phase in ("decode", "propose"):
+            if phase == "decode":
+                ranks, rows = self._stage_dspark_decode(resources, batch)
+            else:
+                ranks, rows = self._stage_proposal(resources, batch)
             workspace = resources.decode_workspace
             target = self._build_dspark_target_model(resources)
             outputs = {name: workspace[name] for name in (
@@ -3548,15 +3598,15 @@ class V41ResidentResources:
                     f"missing={sorted(required - supplied)} extra={sorted(supplied - required)}"
                 )
             bound = arguments
-            if stage == "decode" and self.dspark_buffers is not None:
+            if stage in ("decode", "verify") and self.dspark_buffers is not None:
                 # The composite produces and consumes these intermediates on device.
                 # Retain their existing allocations across calls and return only the
                 # small sampling outputs through the host-backed arguments.
                 bound = dict(arguments)
-                for name in _DSPARK_RESIDENT_DECODE_SCRATCH:
+                for name in _DSPARK_RESIDENT_DECODE_SCRATCH.intersection(bound):
                     bound[name] = self.dspark_buffers.decode_workspace[name]
             reset_windows = False
-            if stage in ("dspark_drafter", "decode"):
+            if stage in ("dspark_drafter", "decode", "propose"):
                 module = importlib.import_module("models.deepseek_v4_1_flash.dspark_drafter")
                 stride = module.DSPARK_DRAFT_LAYERS
                 key = id(program.compiled)
@@ -3582,7 +3632,7 @@ class V41ResidentResources:
             finally:
                 if reset_windows:
                     self.worker._reset_persistent_windows = previous_reset
-            if stage in ("dspark_drafter", "decode"):
+            if stage in ("dspark_drafter", "decode", "propose"):
                 self._dspark_drafter_epochs[key] = epoch + stride
 
     def _run_dspark_orchestrator(self, lowered: DSparkLoweredInputs, *, phase: str) -> None:
@@ -3634,7 +3684,7 @@ class V41ResidentResources:
                 self.failed = True
                 raise RuntimeError(f"V4.1 DSpark {phase} orchestration failed") from exc
 
-    def _dspark_decode_arguments(self, lowered):
+    def _dspark_decode_arguments(self, lowered, stage="decode"):
         """Bind the Lib recurrent composite without rebuilding its device graph."""
         target = lowered.target_model
         arguments = dict(lowered.workspace)
@@ -3657,7 +3707,7 @@ class V41ResidentResources:
         )
         arguments.update({"draft_" + name: value for name, value in lowered.draft_model.items()})
         arguments.update({"markov_" + name: value for name, value in lowered.markov_model.items()})
-        return {name: arguments[name] for name in self.dspark_param_names["decode"]}
+        return {name: arguments[name] for name in self.dspark_param_names[stage]}
 
     def _read_dspark_output(self, lowered, name):
         """Return an owned CPU copy of one device-produced DSpark output."""
@@ -3843,11 +3893,10 @@ class V41ResidentResources:
         try:
             for request_id in request_ids:
                 self.dspark.states.get(request_id)
-            self._run_dspark_orchestrator(lowered, phase="decode")
+            self.dispatch_dspark("verify", self._dspark_decode_arguments(lowered, "verify"))
             counts_tensor = self._read_dspark_output(lowered, "accepted_counts")
             accepted_tensor = self._read_dspark_output(lowered, "accepted_ids")
             sampled_tensor = self._read_dspark_output(lowered, "last_sampled")
-            drafts_tensor = self._read_dspark_output(lowered, "draft_ids")
             ranks, rows = self._dspark_request_rows(lowered, len(request_ids))
             accepted, counts, sampled, drafts, proposed_counts = [], [], [], [], []
             for request_id, rank, row in zip(request_ids, ranks, rows, strict=True):
@@ -3865,19 +3914,11 @@ class V41ResidentResources:
                 state = self.dspark.states.get(request_id)
                 proposed_counts.append(len(state.draft_ids))
                 state.validate_accept(count, sampled_token)
-                draft = []
-                if state.anchor + count + DSPARK_SPECULATIVE_TOKENS < state.position_limit:
-                    draft_row = self._dspark_output_row(
-                        drafts_tensor, rank=rank, row=row, kind="draft_ids")
-                    self._validate_dspark_token_row(
-                        draft_row, kind="draft_ids", minimum=DSPARK_SPECULATIVE_TOKENS)
-                    draft = [int(token) for token in draft_row[:DSPARK_SPECULATIVE_TOKENS].tolist()]
                 accepted.append(token_ids)
                 counts.append(count)
                 sampled.append(sampled_token)
-                drafts.append(draft)
             self.dspark.apply_decode_outputs(
-                request_ids, accepted_counts=counts, last_sampled=sampled, draft_ids=drafts,
+                request_ids, accepted_counts=counts, last_sampled=sampled, draft_ids=None,
             )
             draft_counts = lowered.outputs.get("draft_counts", lowered.workspace.get("draft_counts"))
             if draft_counts is None:
