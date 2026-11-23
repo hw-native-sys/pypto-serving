@@ -107,6 +107,7 @@ nav:
       - GLM-5.3-Flash Optimization: models/glm53-optimization.md
       - DeepSeek V4:
           - Overview: models/deepseek-v4/index.md
+          - V4.1 Optimization: models/deepseek-v4/v41-optimization.md
           - MTP Deployment: models/deepseek-v4/mtp.md
           - DSpark Deployment: models/deepseek-v4/dspark.md
           - DSpark Tool Constraints: models/deepseek-v4/tool-constraints.md
