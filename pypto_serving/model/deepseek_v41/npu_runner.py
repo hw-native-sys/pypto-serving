@@ -34,6 +34,7 @@ from pypto_serving.tools.profile import profile_span
 
 from pypto_serving.config.types import DecodeResult, KVCacheGroupSpec, PrefillResult
 from pypto_serving.model.common.runner.buffer_set import alloc_device_buffer
+from pypto_serving.serving.memory.page_math import ceil_div, page_address, token_to_page
 
 from .task_args import (
     ForwardStep,
@@ -72,6 +73,7 @@ from .weight_loader import (
 from .weight_spec import pack_mx_scale
 
 
+DEFAULT_MAX_NUM_BATCHED_TOKENS = 1024
 MAX_PREFILL_TOKENS_PER_DP = 4096
 
 
@@ -255,7 +257,7 @@ def plan_decode_cache_pools(layers, groups, *, max_seq_len, primary_num_blocks,
     physical_group_blocks = {name: blocks + 1 for name, blocks in group_blocks.items()}
     if type(max_prefill_tokens) is not int or not 0 < max_prefill_tokens <= MAX_PREFILL_TOKENS_PER_DP:
         raise ValueError("invalid prefill scratch capacity")
-    scratch_pages = (max_prefill_tokens + 127) // 128
+    scratch_pages = ceil_div(max_prefill_tokens, _CACHE_GEOMETRY["BLOCK_SIZE"])
     physical_group_blocks[resolved.window] += scratch_pages
 
     kv_sources = sum(layer.kv_source == layer.layer_id for layer in layers)
@@ -1889,15 +1891,16 @@ def prepare_swa_window_metadata(
     request ownership or completion state are changed by this host preparation.
     """
     with profile_span('v41.prepare_swa_window_metadata', cat='v41.host', level='verbose'):
+        page_tokens = _CACHE_GEOMETRY["BLOCK_SIZE"]
         if not isinstance(step, ForwardStep) or not isinstance(topology, SegmentTopology):
             raise ValueError("SWA metadata requires a ForwardStep and SegmentTopology")
-        if type(cache_pages) is not int or not 0 < cache_pages <= (2**31 - 1) // 128:
+        if type(cache_pages) is not int or not 0 < cache_pages <= (2**31 - 1) // page_tokens:
             raise ValueError("cache_pages must fit the INT32 window-index ABI")
         if type(max_prepare_bytes) is not int or max_prepare_bytes <= 0:
             raise ValueError("max_prepare_bytes must be a positive integer")
         if scratch_base is not None and (
             type(scratch_base) is not int or scratch_base < 0 or step.phase != "prefill"
-            or scratch_base * 128 + topology.capacity > cache_pages * 128
+            or scratch_base * page_tokens + topology.capacity > cache_pages * page_tokens
         ):
             raise ValueError("prefill scratch must fit the window pool")
         if step.phase not in ("prefill", "decode"):
@@ -1916,10 +1919,10 @@ def prepare_swa_window_metadata(
             if counts[group] + count > topology.capacity:
                 raise ValueError("DP token count exceeds SWA capacity")
             pages = request.pages.get(window_group)
-            if not isinstance(pages, (tuple, list)) or len(pages) < min(3, (request.end + 127) // 128):
+            if not isinstance(pages, (tuple, list)) or len(pages) < min(3, ceil_div(request.end, page_tokens)):
                 raise ValueError("SWA requires a complete private window ring")
             if scratch_base is None and step.phase == "prefill" and (
-                (request.end - 1) // 128 - max(0, request.start - 127) // 128 >= len(pages)
+                ceil_div(request.end, page_tokens) - token_to_page(max(0, request.start - page_tokens + 1), page_tokens) > len(pages)
             ):
                 raise ValueError("prefill requires scratch when the chunk would overwrite entry history")
             for page in pages:
@@ -1930,7 +1933,7 @@ def prepare_swa_window_metadata(
                     raise ValueError("SWA pages must be private; shared or repeated physical pages are unsupported")
                 owners.add(key)
             ranges.append((group, counts[group], request.start, count, tuple(pages),
-                           max(0, request.shared_prefix_tokens - 128),
+                           max(0, request.shared_prefix_tokens - page_tokens),
                            request.read_pages.get(window_group, {})))
             counts[group] += count
         rows = topology.dp * topology.capacity
@@ -1943,18 +1946,19 @@ def prepare_swa_window_metadata(
         indices = torch.full((topology.dp, topology.capacity, 128), -1, dtype=torch.int32)
         for group, row, start, count, pages, valid_from, read_pages in ranges:
             def ring_slot(position):
-                if position < start and position // 128 in read_pages:
-                    return read_pages[position // 128] * 128 + position % 128
-                return pages[position // 128 % len(pages)] * 128 + position % 128
+                page_id = token_to_page(position, page_tokens)
+                if position < start and page_id in read_pages:
+                    return page_address(read_pages[page_id], position, page_tokens)
+                return page_address(pages[page_id % len(pages)], position, page_tokens)
             for local in range(count):
                 position = start + local
                 positions[group, row + local] = position
                 slots[group, row + local] = (ring_slot(position) if scratch_base is None
-                                             else scratch_base * 128 + row + local)
-                if scratch_base is not None and local >= count - 128:
+                                             else scratch_base * page_tokens + row + local)
+                if scratch_base is not None and local >= count - page_tokens:
                     restore[group, row + local] = ring_slot(position)
-                visible = range(max(valid_from, position - 127), position + 1)
-                addresses = [(scratch_base * 128 + row + p - start
+                visible = range(max(valid_from, position - page_tokens + 1), position + 1)
+                addresses = [(scratch_base * page_tokens + row + p - start
                               if scratch_base is not None and p >= start else ring_slot(p)) for p in visible]
                 indices[group, row + local, :len(addresses)] = torch.tensor(addresses, dtype=torch.int32)
         return SwaWindowMetadata(

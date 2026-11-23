@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from pypto_serving.config.parallel import ParallelConfig, parse_device_ids
 from pypto_serving.config.types import (
+    DEFAULT_MAX_NUM_BATCHED_TOKENS,
     PREFILL_CHUNK_SIZE_CHOICES,
     GenerateConfig,
     RuntimeConfig,
@@ -301,10 +302,10 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
-    if args.max_num_batched_tokens is None:
-        args.max_num_batched_tokens = 1024 if model_family == "deepseek_v41" else 4096
     if model_family == "deepseek_v41":
         return _build_v41_engine_config(args, model_dir, model_config_data, devices)
+    if args.max_num_batched_tokens is None:
+        args.max_num_batched_tokens = DEFAULT_MAX_NUM_BATCHED_TOKENS
     model_variant = _resolve_model_variant(args)
     _validate_prefill_chunk_size(
         model_family,
@@ -388,6 +389,9 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         MAX_PREFILL_TOKENS_PER_DP, MissingCompositeInterface, SegmentTopology, load_composite_bindings,
     )
     from pypto_serving.model.deepseek_v41.encoding import V41TextConfig
+    if args.max_num_batched_tokens is None:
+        from pypto_serving.model.deepseek_v41.npu_runner import DEFAULT_MAX_NUM_BATCHED_TOKENS as V41_DEFAULT_MAX_NUM_BATCHED_TOKENS
+        args.max_num_batched_tokens = V41_DEFAULT_MAX_NUM_BATCHED_TOKENS
     from pypto_serving.model.deepseek_v41.weight_loader import RankPlacement, plan_layers
     from pypto_serving.serving.engine.async_engine import EngineConfig
 
@@ -418,6 +422,10 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         raise ValueError("V4.1 --max-model-len must fit the checkpoint position capacity")
     if args.max_num_seqs <= 0 or args.max_num_batched_tokens <= 0:
         raise ValueError("V4.1 batch and token capacities must be positive")
+    if args.max_num_batched_tokens > MAX_PREFILL_TOKENS_PER_DP:
+        raise ValueError(
+            f"V4.1 max_num_batched_tokens exceeds the Lib prefill capacity {MAX_PREFILL_TOKENS_PER_DP}"
+        )
 
     parallel = ParallelConfig(
         data_parallel_size=1, tensor_parallel_size=1, expert_parallel_size=dp_size,

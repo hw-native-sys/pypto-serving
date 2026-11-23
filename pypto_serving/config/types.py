@@ -18,6 +18,7 @@ from pypto_serving.model.tokenizer import TokenizerAdapter
 
 
 PREFILL_CHUNK_SIZE_CHOICES = (1024, 2048, 4096, 8192)
+DEFAULT_MAX_NUM_BATCHED_TOKENS = 4096
 
 
 @dataclass(frozen=True)

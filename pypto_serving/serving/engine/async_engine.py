@@ -154,6 +154,28 @@ class EngineConfig:
             prefix_cache_retention_interval=retention_interval,
         )
 
+    def build_scheduler_config(self) -> SchedulerConfig:
+        """Build scheduler settings from this engine's effective runtime."""
+        runtime = self.resolve_runtime_config()
+        return SchedulerConfig(
+            max_num_running_reqs=self.max_num_running_reqs,
+            max_num_scheduled_tokens=self.max_num_scheduled_tokens,
+            long_prefill_token_threshold=self.long_prefill_token_threshold,
+            max_prefill_tokens_per_request=runtime.max_prefill_tokens_per_request,
+            prefill_chunk_alignment=runtime.prefill_chunk_alignment,
+            prefill_chunk_size_choices=runtime.prefill_chunk_size_choices,
+            max_seq_len=runtime.max_seq_len,
+            enable_prefix_cache=self.enable_prefix_cache,
+            enable_chunk_prefill=self.enable_chunk_prefill,
+            num_speculative_tokens=runtime.num_speculative_tokens,
+            supports_chunked_prefill_with_speculation=runtime.supports_chunked_prefill_with_speculation,
+            speculative_prefix_cache_replay_tokens=runtime.speculative_prefix_cache_replay_tokens,
+            prefix_cache_replay_before_hit=runtime.prefix_cache_replay_before_hit,
+            prefix_cache_retention_interval=runtime.prefix_cache_retention_interval,
+            requires_homogeneous_prefill_decode=runtime.requires_homogeneous_prefill_decode,
+            async_scheduling=self.resolve_async_scheduling(),
+        )
+
     def worker_device_ids(self) -> tuple[int, ...]:
         """Return the device ids this engine worker should own."""
         if self.parallel_config is not None:
@@ -266,28 +288,7 @@ class ReplicaEngineCore:
             self._cache_tiering = Session(self)
             self.config = self._cache_tiering.configure(self.config)
         self._async_scheduling = self.config.resolve_async_scheduling()
-        scheduler_config = SchedulerConfig(
-            max_num_running_reqs=self.config.max_num_running_reqs,
-            max_num_scheduled_tokens=self.config.max_num_scheduled_tokens,
-            long_prefill_token_threshold=self.config.long_prefill_token_threshold,
-            max_prefill_tokens_per_request=runtime.max_prefill_tokens_per_request,
-            prefill_chunk_alignment=runtime.prefill_chunk_alignment,
-            prefill_chunk_size_choices=runtime.prefill_chunk_size_choices,
-            max_seq_len=runtime.max_seq_len,
-            enable_prefix_cache=self.config.enable_prefix_cache,
-            enable_chunk_prefill=self.config.enable_chunk_prefill,
-            num_speculative_tokens=runtime.num_speculative_tokens,
-            supports_chunked_prefill_with_speculation=(
-                runtime.supports_chunked_prefill_with_speculation
-            ),
-            speculative_prefix_cache_replay_tokens=runtime.speculative_prefix_cache_replay_tokens,
-            prefix_cache_replay_before_hit=runtime.prefix_cache_replay_before_hit,
-            prefix_cache_retention_interval=runtime.prefix_cache_retention_interval,
-            requires_homogeneous_prefill_decode=(
-                runtime.requires_homogeneous_prefill_decode
-            ),
-            async_scheduling=self._async_scheduling,
-        )
+        scheduler_config = self.config.build_scheduler_config()
         # Validate before worker startup, while the manager's pools are still lazy.
         scheduler_config.validate_cache_groups(runtime.kv_cache_groups)
         self.scheduler = scheduler_factory(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)
