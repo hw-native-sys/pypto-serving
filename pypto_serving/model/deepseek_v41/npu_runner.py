@@ -2330,6 +2330,11 @@ class FinalOutputHostResources:
     logit_row_indices: torch.Tensor
     logits: torch.Tensor
     sampled_ids: torch.Tensor
+    sampling_temperatures: torch.Tensor
+    sampling_top_ks: torch.Tensor
+    sampling_top_ps: torch.Tensor
+    sampling_seeds: torch.Tensor
+    sampling_positions: torch.Tensor
 
     @property
     def inherited_host_tensors(self):
@@ -2338,7 +2343,9 @@ class FinalOutputHostResources:
     @property
     def all_host_tensors(self):
         return (self.norm_weight, self.head_weight, self.logit_row_indices,
-                self.logits, self.sampled_ids)
+                self.logits, self.sampled_ids, self.sampling_temperatures,
+                self.sampling_top_ks, self.sampling_top_ps, self.sampling_seeds,
+                self.sampling_positions)
 
 
 def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
@@ -2361,7 +2368,8 @@ def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
     required_bytes = (topology.world * shard_rows * hidden * 2
                       + topology.world * hidden * 2
                       + topology.world * max_logit_rows * vocab * 4
-                      + topology.world * max_logit_rows * (1 + sampled_pad) * 4)
+                      + topology.world * max_logit_rows * (1 + sampled_pad) * 4
+                      + topology.world * max_logit_rows * (2 * 4 + 3 * 4))
     if required_bytes > max_host_bytes:
         raise ValueError(f"final output host buffers require {required_bytes} bytes")
 
@@ -2371,6 +2379,14 @@ def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
     logits = torch.zeros((topology.world, max_logit_rows, vocab), dtype=torch.float32).share_memory_()
     sampled = torch.full((topology.world, max_logit_rows, sampled_pad), -1,
                          dtype=torch.int32).share_memory_()
+    # The current pypto-lib generation head always owns sampling.  V4.1's
+    # serving path still reads logits on the host, so bind a deterministic
+    # greedy policy while keeping the new ABI complete.
+    sampling_temperatures = torch.zeros((topology.world, max_logit_rows), dtype=torch.float32).share_memory_()
+    sampling_top_ks = torch.full((topology.world, max_logit_rows), vocab, dtype=torch.int32).share_memory_()
+    sampling_top_ps = torch.ones((topology.world, max_logit_rows), dtype=torch.float32).share_memory_()
+    sampling_seeds = torch.zeros((topology.world, max_logit_rows), dtype=torch.int32).share_memory_()
+    sampling_positions = torch.zeros((topology.world, max_logit_rows), dtype=torch.int32).share_memory_()
 
     norm_value = loader.load("norm.weight").weight
     if norm_value.dtype != torch.bfloat16 or tuple(norm_value.shape) != (hidden,):
@@ -2392,7 +2408,10 @@ def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
     for dp_rank in range(1, topology.dp):
         for tp_rank in range(topology.tp):
             head[dp_rank * topology.tp + tp_rank].copy_(head[tp_rank])
-    return FinalOutputHostResources(norm, head, indices, logits, sampled)
+    return FinalOutputHostResources(
+        norm, head, indices, logits, sampled, sampling_temperatures,
+        sampling_top_ks, sampling_top_ps, sampling_seeds, sampling_positions,
+    )
 
 
 class FinalOutputWeights:
@@ -2413,7 +2432,17 @@ class FinalOutputWeights:
                 or host.logit_row_indices.dtype != torch.int32 or host.logit_row_indices.shape != (world, 16)
                 or host.logits.dtype != torch.float32
                 or host.logits.shape != (world, 16, host.head_weight.shape[-1] * topology.tp)
-                or host.sampled_ids.dtype != torch.int32 or host.sampled_ids.shape != (world, 16, 8)):
+                or host.sampled_ids.dtype != torch.int32 or host.sampled_ids.shape != (world, 16, 8)
+                or host.sampling_temperatures.dtype != torch.float32
+                or host.sampling_temperatures.shape != (world, 16)
+                or host.sampling_top_ks.dtype != torch.int32
+                or host.sampling_top_ks.shape != (world, 16)
+                or host.sampling_top_ps.dtype != torch.float32
+                or host.sampling_top_ps.shape != (world, 16)
+                or host.sampling_seeds.dtype != torch.int32
+                or host.sampling_seeds.shape != (world, 16)
+                or host.sampling_positions.dtype != torch.int32
+                or host.sampling_positions.shape != (world, 16)):
             raise ValueError("final output host buffers disagree with the lib TP1/DP ABI")
         self.worker, self.host, self.topology = worker, host, topology
         self._resident = []
@@ -2422,6 +2451,16 @@ class FinalOutputWeights:
             self._resident.append(self.norm_weight)
             self.head_weight = worker.alloc_stacked_tensor(host.head_weight)
             self._resident.append(self.head_weight)
+            self.sampling_temperatures = worker.alloc_stacked_tensor(host.sampling_temperatures)
+            self._resident.append(self.sampling_temperatures)
+            self.sampling_top_ks = worker.alloc_stacked_tensor(host.sampling_top_ks)
+            self._resident.append(self.sampling_top_ks)
+            self.sampling_top_ps = worker.alloc_stacked_tensor(host.sampling_top_ps)
+            self._resident.append(self.sampling_top_ps)
+            self.sampling_seeds = worker.alloc_stacked_tensor(host.sampling_seeds)
+            self._resident.append(self.sampling_seeds)
+            self.sampling_positions = worker.alloc_stacked_tensor(host.sampling_positions)
+            self._resident.append(self.sampling_positions)
         except BaseException:
             self.close()
             raise
@@ -2458,7 +2497,20 @@ class PrefillForwardSegment:
                 final_norm_weight=final.norm_weight, lm_head_weight=final.head_weight,
                 x_hc_out=self.residual, pre_mix_out=self.pre_mix,
                 logits=final.host.logits, sampled_ids=final.host.sampled_ids,
+                sampling_temperatures=final.sampling_temperatures,
+                sampling_top_ks=final.sampling_top_ks,
+                sampling_top_ps=final.sampling_top_ps,
+                sampling_seeds=final.sampling_seeds,
+                sampling_positions=final.sampling_positions,
             )
+            # Keep the binding readable against one older cached prefill
+            # artifact while the source tree tracks the current lib ABI.
+            for name in (
+                "sampling_temperatures", "sampling_top_ks", "sampling_top_ps",
+                "sampling_seeds", "sampling_positions",
+            ):
+                if name not in self.param_names:
+                    self.arguments.pop(name, None)
             if engram is not None and "engram_lookup" in param_names:
                 self.arguments.update(engram_lookup=metadata.fields["engram_lookup"],
                                       engram_wkv=engram.wkv,
@@ -2801,13 +2853,13 @@ class V41ResidentResources:
 
     def __init__(self, programs, run_config, *, weight_bank, weight_param_names,
                  cache_plan, state_reset, page_resets, input_host, final_host,
-                 prefill_host, topology,
+                 prefill_host, topology, decode_head_program, decode_head_param_names,
                  engram_host=None,
                  decode_input_host=None, decode_host=None, worker_factory=make_segment_worker,
                  prefill_program=None, prefill_param_names=None,
                  dspark_programs=None, dspark_param_names=None, max_seq_len=None,
                  dspark_weight_contract=None, dspark_lowering_provider=None,
-                 dspark_host_resources=None, decode_head_program=None):
+                 dspark_host_resources=None):
         weight_bank.finish(weight_param_names)
         if decode_host is not None and (decode_input_host is None or
                 decode_host.topology != decode_input_host.topology):
@@ -2856,6 +2908,7 @@ class V41ResidentResources:
         self._decode_fwd = None
         self._decode_binding = None
         self._decode_head_program = decode_head_program
+        self._decode_head_param_names = tuple(decode_head_param_names)
         self._weight_bank = weight_bank
         self._weight_param_names = tuple(weight_param_names)
         self._prefill_binding = (prefill_program, prefill_param_names, run_config, prefill_host.topology)
@@ -2886,6 +2939,29 @@ class V41ResidentResources:
             self.decode_input = (None if decode_input_host is None else
                                  self._own(InputStateRuntime(self.worker, decode_input_host)))
             self.final = self._own(FinalOutputWeights(self.worker, topology, final_host))
+            self._decode_head_arguments = {
+                "x_hc": None,
+                "pre_mix": None,
+                "final_norm_weight": self.final.norm_weight,
+                "lm_head_weight": self.final.head_weight,
+                "logit_rows": final_host.logit_row_indices,
+                "sampling_temperatures": self.final.sampling_temperatures,
+                "sampling_top_ks": self.final.sampling_top_ks,
+                "sampling_top_ps": self.final.sampling_top_ps,
+                "sampling_seeds": self.final.sampling_seeds,
+                "sampling_positions": self.final.sampling_positions,
+                "logits": final_host.logits,
+                "sampled_ids": final_host.sampled_ids,
+            }
+            head_params = set(self._decode_head_param_names)
+            if (len(head_params) != len(self._decode_head_param_names)
+                    or head_params != self._decode_head_arguments.keys()):
+                missing = sorted(head_params - self._decode_head_arguments.keys())
+                extra = sorted(self._decode_head_arguments.keys() - head_params)
+                raise MissingCompositeInterface(
+                    "V4.1 generation-head ABI differs from the serving binding "
+                    f"(declared={self._decode_head_param_names}, missing={missing}, extra={extra})"
+                )
             self.engram = (None if engram_host is None else self._own(
                 ResidentEngramWeights(self.worker, engram_host)))
             if callable(cache_plan):
@@ -3037,6 +3113,14 @@ class V41ResidentResources:
             for value in workspace.values():
                 if isinstance(value, torch.Tensor):
                     value.zero_()
+            # The latest DSpark target composite samples on device.  V4.1 K=5
+            # admission is greedy-only, so bind a valid deterministic policy
+            # even though the serving worker consumes the verified outputs.
+            workspace["sampling_temperatures"].zero_()
+            workspace["sampling_top_ks"].fill_(resources.layout.vocab_size)
+            workspace["sampling_top_ps"].fill_(1.0)
+            workspace["sampling_seeds"].zero_()
+            workspace["sampling_positions"].zero_()
             workspace["input_ids"].zero_()
             workspace["target_positions"].fill_(-1)
             workspace["active_widths"].zero_()
@@ -3073,6 +3157,9 @@ class V41ResidentResources:
                 workspace["target_positions"][rank, row, :width] = torch.arange(
                     int(positions[index]), int(positions[index]) + width,
                     dtype=torch.int32)
+                sampling_row = row * DSPARK_ROWS_PER_REQUEST
+                workspace["sampling_positions"][rank, sampling_row:sampling_row + width] = torch.arange(
+                    int(positions[index]), int(positions[index]) + width, dtype=torch.int32)
                 workspace["active_widths"][rank, row] = width
                 workspace["zero_prefill_tokens"][rank, row] = 0
                 workspace["state_block_table"][rank, row, 0] = slot
@@ -3365,10 +3452,11 @@ class V41ResidentResources:
                 or self._decode_fwd is None):
             raise ValueError("full decode requires the active decode step")
         state = self._decode_fwd.run(state, group_counts=self._group_counts)
+        head_arguments = dict(self._decode_head_arguments, x_hc=state.residual, pre_mix=state.pre_mix)
         self.worker.run(
-            self._decode_head_program.compiled, state.residual, state.pre_mix,
-            self.final.norm_weight, self.final.head_weight, self.final.host.logit_row_indices,
-            self.final.host.logits, self.final.host.sampled_ids, config=self.run_config,
+            self._decode_head_program.compiled,
+            *(head_arguments[name] for name in self._decode_head_param_names),
+            config=self.run_config,
         )
         return state
 
@@ -3917,6 +4005,7 @@ def make_production_bindings(
             dspark_programs, dspark_param_names = {}, {}
         prefill, prefill_names = compile_prefill_fwd(compiler, root, prefill_topology)
         head_entry = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd").l3_generation_head
+        decode_head_param_names = tuple(head_entry.param_names)
         decode_head = compiler.compile("v41_generation_head", head_entry)
         abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
         kv_sources, index_sources, c2a_sources = _sources(layers)
@@ -4035,6 +4124,7 @@ def make_production_bindings(
             dspark_lowering_provider=dspark_lowering_provider,
             dspark_host_resources=dspark_host,
             decode_head_program=decode_head,
+            decode_head_param_names=decode_head_param_names,
         )
         _LOG.info("V4.1 resident upload and allocation %.2fs",
                   time.perf_counter() - resident_started)
