@@ -3925,16 +3925,15 @@ def _check_runtime_binaries(platform):
         builder.get_binaries(runtime)
 
 
-def prefill_ring_heap(capacity, *, dp_size):
-    """Size the long-prefill attention and forward heaps.
+def prefill_ring_heap(capacity):
+    """Redistribute the existing 10 GiB budget for complete long prefills.
 
     A 4K attention scope exhausts ring 1 at 2 GiB. The worker reserves two
-    resource sets, so keep the DP4 budget at 10 GiB. Eight-card 4K forwards
-    also need more than 2 GiB on ring 0 for forward-lifetime allocations.
+    resource sets, so growing their total footprint crowds out DP4 weights.
+    Move space from the deepest ring while keeping the total budget fixed.
     """
-    forward_heap = (4 if dp_size == 8 and capacity == MAX_PREFILL_TOKENS_PER_DP else 2) << 30
     attention_heap = max(2 << 30, capacity * (1 << 20))
-    return (forward_heap, attention_heap, 2 << 30, (6 << 30) - attention_heap)
+    return (2 << 30, attention_heap, 2 << 30, (6 << 30) - attention_heap)
 
 
 def make_production_bindings(
@@ -3991,8 +3990,7 @@ def make_production_bindings(
                 pypto_build_dir=options.pypto_build_dir,
             ),
             ring_heap=(runtime.ring_heap if runtime.ring_heap is not None
-                       else prefill_ring_heap(prefill_topology.capacity, dp_size=topology.dp)),
-            ring_task_window=runtime.ring_task_window,
+                       else prefill_ring_heap(prefill_topology.capacity)),
             # DP4's 8K prefill can exhaust ring 2's default dependency pool.
             ring_dep_pool=(runtime.ring_dep_pool if runtime.ring_dep_pool is not None else
                            ((16384, 16384, 32764, 16384) if topology.dp == 4 else None)),
