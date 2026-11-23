@@ -14,11 +14,10 @@ concurrency:
 
 jobs:
   v41-performance:
-    runs-on: [self-hosted, linux, npu-a5]
+    runs-on: [self-hosted, linux, npu-a5, dt]
     timeout-minutes: 720
     env:
-      # Nightly uses eight cards. Manual validation uses four.
-      DEVICE_COUNT: ${{ github.event_name == 'schedule' && '8' || '4' }}
+      DEVICE_COUNT: '8'
       PTOAS_ROOT: ${{ github.workspace }}/v41-perf-checkout/ptoas-bin
       PTO_ISA_ROOT: ${{ github.workspace }}/v41-perf-checkout/pto-isa
       CMAKE_BUILD_PARALLEL_LEVEL: 16
