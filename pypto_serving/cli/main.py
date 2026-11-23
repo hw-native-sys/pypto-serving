@@ -453,7 +453,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         supports_chunked_prefill_with_speculation=True,
         speculative_prefix_cache_replay_tokens=128,
         prefix_cache_replay_before_hit=True,
-        prefill_chunk_alignment=128,
+        prefill_chunk_alignment=args.block_size if args.enable_prefix_caching else 1,
     )
     return EngineConfig(
         model_id=args.served_model_name or Path(model_dir).name,
