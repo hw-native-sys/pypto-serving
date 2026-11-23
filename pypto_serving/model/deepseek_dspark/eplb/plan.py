@@ -52,6 +52,10 @@ class RebalancePlan:
     layers: tuple[LayerMovePlan, ...]
     predicted_gain: float
     sampled_at: float = field(default_factory=monotonic)
+    # Mean rank load / mean peak rank load over the planned window, matching
+    # DeepInfer's rank_balance (moe_lb = 1 / rank_balance). Optional because a
+    # load-free window has no meaningful ratio.
+    target_balance: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "layers", tuple(self.layers))
@@ -65,6 +69,10 @@ class RebalancePlan:
         if (isinstance(self.predicted_gain, bool) or not isinstance(self.predicted_gain, (int, float))
                 or not math.isfinite(self.predicted_gain) or not 0 < self.predicted_gain <= 1):
             raise ValueError("Invalid predicted migration gain")
+        if self.target_balance is not None and (
+                isinstance(self.target_balance, bool) or not isinstance(self.target_balance, (int, float))
+                or not math.isfinite(self.target_balance) or not 0 < self.target_balance <= 1):
+            raise ValueError("Invalid target rank balance")
 
     @property
     def payload_bytes(self) -> int:

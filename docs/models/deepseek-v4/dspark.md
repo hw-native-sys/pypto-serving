@@ -60,10 +60,11 @@ the example permits up to 16 GiB and is not a recommended memory sizing value.
 
 By default, EPLB collects decode loads over a 128-step window and considers
 rebalancing every 1024 collected steps, with at most one layer per rebalance
-and a minimum relative gain of 0.05. Optional JSON fields include `window_size`,
-`step_interval`, `load_collection_phase` (`prefill` or `decode`), `policy`
-(`temporal_greedy` or `cumulative_greedy`), `max_layers_per_rebalance`, and
-`min_relative_gain`. Drafter balancing is unsupported. PD roles independently select
+(the first rebalance may cover more, see below) and a minimum relative gain of
+0.05. Optional JSON fields include `window_size`, `step_interval`,
+`sample_stride`, `load_collection_phase` (`prefill` or `decode`), `policy`
+(`temporal_greedy` or `cumulative_greedy`), `max_layers_per_rebalance`,
+`first_rebalance_layers`, and `min_relative_gain`. Drafter balancing is unsupported. PD roles independently select
 prefill or decode loads; D also supports TP1 with independent head TP4; see [PD EPLB](../../user-guide/pd-disaggregation.md#expert-load-balancing).
 
 Maintenance waits at most `maintenance_timeout_seconds` (default 1 second) for
@@ -72,8 +73,41 @@ compute outputs and conflicting DMA to settle before postponing a candidate.
 A measured pause-cost estimate is compared with predicted savings over
 `amortization_steps` (default 1024), with `maintenance_cost_margin` (default 1.25).
 The estimate uses dispatch wall time and load-balance gain as proxies, not a
-guarantee of kernel or end-to-end acceleration. Set `max_rebalances` to a positive
-count to learn that many placements and then freeze; zero (default) is unlimited.
+guarantee of kernel or end-to-end acceleration. Candidate layers are ordered by
+predicted gain per migrated byte, because the maintenance pause grows with the
+payload. Set `max_rebalances` to a positive count to learn that many placements
+and then freeze; zero (default) is unlimited.
+
+The first real migration allocates the transfer program's static `gm_sm`
+workspace (roughly 2.5 GiB per decode rank and above 4.4 GiB per prefill rank
+for EP16 W8A8). `maintenance_workspace_bytes` (default 5 GiB per rank) is
+subtracted from the KV-cache budget while migrations are enabled so that
+allocation cannot fail after the cache exists; lower it only when the
+configured layouts are known to need less, and raise it if a larger layout
+reports an allocation failure. `max_maintenances_per_minute` (default 12) is a
+hard per-rank safety ceiling independent of the policy cooldown; zero
+(unlimited) is intended only for controlled experiments.
+
+For high-throughput PD deployments, use a value-oriented policy: a whole-layer
+`max_migration_bytes` (for example 16 GiB), `min_relative_gain` 0.01 (the
+default 0.05 rejects the small gains an evenly loaded deployment offers),
+`step_interval` 1024, `cooldown_seconds` 30, and `num_redundant_experts` 16 so
+hot experts can be replicated. EPLB pays off when expert routing is
+concentrated; a uniform random workload leaves little headroom, so validate the
+settings against the deployment's own load.
+
+A migrated layer is skipped for `layer_cooldown_rebalances` subsequent
+rebalance opportunities (default 2, zero disables) so sampling noise cannot
+re-migrate the same layer every window.
+
+The initial placement keeps one base copy of every expert and spreads the
+redundant copies across ranks. The first rebalance uses
+`first_rebalance_layers` (default 16) instead of `max_layers_per_rebalance`, so
+cold start converges sooner; it still respects `max_migration_bytes`, so raise
+the byte budget if 16 layers do not fit. Prefill dispatches are far rarer than
+decode dispatches, so a prefill executor with a long `step_interval` may
+collect only one plan during a short run; use a shorter interval for prefill or
+enable EPLB only on decode.
 
 Serving and pypto-lib must both include the matching EPLB ABI. Maintenance drains
 in-flight outputs before migrating expert weights and scales, then publishes the

@@ -11,6 +11,7 @@
 import asyncio
 import json
 import logging
+from time import monotonic
 
 from fastapi import Request
 from fastapi.responses import Response, StreamingResponse
@@ -31,6 +32,13 @@ logger = logging.getLogger(__name__)
 _STREAM = TypeAdapter(bool)
 PROBE_TIMEOUT_SECONDS = 5.0
 PROBE_ATTEMPTS = 3
+# A probe read timeout does not prove the node is dead. A long-input prefill
+# burst can keep a healthy node busy enough to miss the short control timeout
+# for minutes while it keeps finishing every admitted request. Evicting it on
+# the first miss turns a slow node into a 503 storm, so the last known-good
+# snapshot stays routable for this bounded grace period; a process that is
+# actually gone refuses the connection (ConnectError) and is evicted at once.
+PROBE_READ_TIMEOUT_GRACE_SECONDS = 300.0
 
 
 class PDCoordinator:
@@ -41,6 +49,7 @@ class PDCoordinator:
         self.probe_client = probe_client
         self.probe_node = probe_node
         self.nodes = {}
+        self._unresponsive_since = {}
         self.models, self.discovered = set(), set()
         self.policy = RoundRobin()
         self.pair_ids = tuple((p.node_id, config.decode[(i + offset) % len(config.decode)].node_id)
@@ -87,15 +96,28 @@ class PDCoordinator:
                     or node.provider != self.config.provider or node.version != VERSION
                     or not node.contract.model):
                 raise ValueError("descriptor differs from configured PD node")
+            self._unresponsive_since.pop(spec.name, None)
+            self.models.add(node.contract.model)
+            self.discovered.add(spec.name)
+            self.registry.set_draining(spec.name, False)
+            if not node.healthy:
+                return self._unready(spec.name)
+            self.nodes[spec.name] = node
+            return True
+        except httpx.PoolTimeout:
+            raise  # The shared HealthMonitor classifies local pool pressure.
+        except httpx.ReadTimeout:
+            now = monotonic()
+            since = self._unresponsive_since.setdefault(spec.name, now)
+            if spec.name in self.nodes and now - since <= PROBE_READ_TIMEOUT_GRACE_SECONDS:
+                logger.debug("descriptor probe of %s timed out; keeping the busy node routable", spec.name)
+                return True
+            self._unresponsive_since.pop(spec.name, None)
+            self.registry.set_draining(spec.name, False)
+            return self._unready(spec.name)
         except (httpx.HTTPError, ValueError):
+            self._unresponsive_since.pop(spec.name, None)
             return self._unready(spec.name)
-        self.models.add(node.contract.model)
-        self.discovered.add(spec.name)
-        self.registry.set_draining(spec.name, False)
-        if not node.healthy:
-            return self._unready(spec.name)
-        self.nodes[spec.name] = node
-        return True
 
     def _candidates(self, model):
         result = []

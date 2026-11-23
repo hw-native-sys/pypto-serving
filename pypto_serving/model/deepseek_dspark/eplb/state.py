@@ -109,7 +109,32 @@ class Placement:
         physical = logical_experts + redundant_experts
         if physical % ranks or physical // ranks > logical_experts:
             raise ValueError("Invalid initial physical expert capacity")
-        mapping = np.tile(np.arange(physical, dtype=np.int64) % logical_experts, (layers, 1))
+        slots = physical // ranks
+        extra_per_rank = np.full(ranks, redundant_experts // ranks, dtype=np.int64)
+        extra_per_rank[: redundant_experts % ranks] += 1
+        # Keep one base copy of every expert and spread the redundant copies
+        # across ranks. Appending them after the base slots put every redundant
+        # slot on the last rank, so the replica traffic of the first experts
+        # concentrated there until the first rebalance replaced the layout.
+        mapping = np.empty((layers, physical), dtype=np.int64)
+        base_cursor = 0
+        extra_cursor = 0
+        for rank in range(ranks):
+            extra = int(extra_per_rank[rank])
+            base = slots - extra
+            start = rank * slots
+            base_experts = np.arange(base_cursor, base_cursor + base)
+            mapping[:, start:start + base] = base_experts[None, :]
+            base_cursor += base
+            rank_experts = set(base_experts.tolist())
+            for offset in range(extra):
+                while extra_cursor in rank_experts:
+                    extra_cursor = (extra_cursor + 1) % logical_experts
+                mapping[:, start + base + offset] = extra_cursor
+                rank_experts.add(extra_cursor)
+                extra_cursor = (extra_cursor + 1) % logical_experts
+        if base_cursor != logical_experts:
+            raise ValueError("Invalid initial placement coverage")
         return cls.from_map(mapping, logical_experts=logical_experts, ranks=ranks)
 
 
@@ -129,12 +154,20 @@ class LoadSample:
         expected = (self.placement.ranks, self.placement.layers, self.placement.local_slots)
         if counts.shape != expected or np.any(counts < 0):
             raise ValueError("Invalid physical load sample shape or counts")
-        if counts.sum(dtype=object) > np.iinfo(np.int64).max:
+        limit = np.iinfo(np.int64).max
+        # Real token counts are small enough that this bound proves the total
+        # cannot overflow. Reserve Python-integer summation for large inputs.
+        if counts.max() > limit // counts.size and counts.sum(dtype=object) > limit:
             raise ValueError("Load sample count overflow")
         object.__setattr__(self, "local_counts", counts)
 
     def logical_counts(self) -> np.ndarray:
         """Interpret counts using the layout captured at submission, never the latest one."""
+        if self.placement.physical_to_logical.shape[1] == self.placement.logical_experts:
+            # Coverage plus one physical slot per expert guarantees a permutation.
+            # Gather through the captured inverse even after a placement change.
+            physical = self.local_counts.transpose(1, 0, 2).reshape(self.placement.replica_count.shape)
+            return np.take_along_axis(physical, self.placement.logical_to_physical[:, :, 0], axis=1)
         logical = np.zeros_like(self.placement.replica_count)
         for layer in range(self.placement.layers):
             np.add.at(logical[layer], self.placement.physical_to_logical[layer],

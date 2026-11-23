@@ -9,8 +9,8 @@
 """Main host-side functional guard for the DSpark serving adaptation."""
 
 import ast
+import math
 import ctypes
-import weakref
 from collections import Counter
 from dataclasses import make_dataclass, replace
 from pathlib import Path
@@ -142,6 +142,7 @@ def test_empty_cache_geometry_uses_execution_role_even_with_k7_decode_kernel(rol
     specs = runner._resolve_cache_group_specs(SimpleNamespace(num_hidden_layers=43), runtime)
     expected = build_dspark_cache_group_specs(43, compiled.compress_ratios, max_seq_len=runtime.max_seq_len,
         max_prefill_tokens=8192, partitions=compiled.layout.partitions,
+        max_requests_per_partition=math.ceil(runtime.max_batch_size / compiled.layout.partitions),
         prefill_only=role == "prefill", decode_only=role == "decode")
     assert specs == expected
 

@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 from threading import Event
 
@@ -37,6 +38,14 @@ def runtime_fixture():
     runtime.bank_layout = SimpleNamespace(layer_views=lambda *_: tuple(range(6)), controls=layout.controls,
                                           expert_bytes=layout.expert_bytes)
     return runtime, layout
+
+
+def test_transfer_run_config_matches_ep16_receive_window():
+    runtime, _ = runtime_fixture()
+    config = runtime.run_config
+    assert config.ring_heap == [1 << 29, 1 << 29, 1 << 29, 1 << 32]
+    assert config.ring_task_window == 1 << 17
+    assert config.ring_dep_pool == 1 << 17
 
 
 def test_reclaim_order_follows_submission_and_copies_before_slot_reuse():
@@ -82,6 +91,37 @@ def test_failed_and_unrecorded_dispatches_do_not_stall_the_ordered_window():
     runtime.complete(second)
     runtime.assert_quiescent()
     assert runtime.take_ready_plan() is None
+
+
+def test_sample_stride_marks_only_selected_dispatches_for_collection():
+    runtime, _ = runtime_fixture()
+    runtime.config = replace(runtime.config, sample_stride=2)
+    output = torch.zeros((4, 1, 16), dtype=torch.int32)
+    first_control = torch.empty((4, 2), dtype=torch.int32)
+    second_control = torch.empty((4, 2), dtype=torch.int32)
+    first = runtime.begin("decode", output, first_control)
+    second = runtime.begin("decode", output, second_control)
+    assert not first.record_enabled
+    assert second.record_enabled
+    assert first_control[:, 1].tolist() == [0] * 4
+    assert second_control[:, 1].tolist() == [1] * 4
+    runtime.complete(first)
+    runtime.complete(second)
+
+
+def test_sample_stride_counts_only_selected_phase_dispatches():
+    runtime, _ = runtime_fixture()
+    runtime.config = replace(runtime.config, sample_stride=2)
+    output = torch.zeros((4, 1, 16), dtype=torch.int32)
+    selected = []
+    for phase, record in (("decode", True), ("prefill", True), ("decode", False), ("decode", True)):
+        control = torch.empty((4, 2), dtype=torch.int32)
+        context = runtime.begin(phase, output, control, record=record)
+        if context.record_enabled:
+            selected.append(context.dispatch_id)
+        runtime.complete(context)
+    assert selected == [4]
+    runtime.assert_quiescent()
 
 
 def test_corrupt_statistics_stop_future_dispatch_and_maintenance():
@@ -258,6 +298,23 @@ def test_runtime_preflight_preserves_role_and_only_collects_the_selected_phase(m
     runtime.close()
 
 
+def test_runtime_does_not_run_zero_migration_transfer_during_startup(monkeypatch):
+    base = Placement.initial(layers=1, logical_experts=8, ranks=4, redundant_experts=4)
+    config = EplbConfig(enabled=True, num_redundant_experts=4, window_size=1, step_interval=1,
+                        max_migration_bytes=100_000)
+    runtime = EplbRuntime(base, config, execution_role="decode")
+    layout = SimpleNamespace(expert_bytes=100, receive_bytes_per_rank=100, layer_views=lambda *_: ())
+    monkeypatch.setattr(ExpertBankLayout, "inspect", lambda *_: layout)
+    calls = []
+    worker = SimpleNamespace(alloc_stacked_tensor=lambda value: value,
+                             run=lambda *_args, **_kwargs: calls.append("transfer"))
+    runtime.prepare(worker, {}, SimpleNamespace(compiled=object()))
+    assert calls == []
+    assert runtime._epoch == 0
+    assert runtime.controller is not None
+    runtime.close()
+
+
 def test_plan_age_cooldown_and_measured_pause_gate_a_deferred_candidate(monkeypatch):
     from dataclasses import replace
     from pypto_serving.model.deepseek_dspark.eplb import runtime as runtime_module
@@ -287,3 +344,58 @@ def test_plan_age_cooldown_and_measured_pause_gate_a_deferred_candidate(monkeypa
     runtime.defer(plan)
     now += .2
     assert runtime.take_ready_plan() is plan
+
+
+def test_workspace_reserve_counts_only_when_migrations_are_enabled():
+    base = Placement.initial(layers=1, logical_experts=8, ranks=4, redundant_experts=4)
+    config = EplbConfig(enabled=True, num_redundant_experts=4, window_size=2, step_interval=2,
+                        max_migration_bytes=100_000, maintenance_workspace_bytes=3 << 30)
+    assert EplbRuntime(base, config).workspace_reserve_bytes == 3 << 30
+    # Disabling EPLB means no migration program, so no workspace is reserved.
+    disabled = EplbConfig(enabled=False, maintenance_workspace_bytes=3 << 30)
+    assert EplbRuntime(base, disabled).workspace_reserve_bytes == 0
+
+
+def test_maintenance_rate_limit_is_a_hard_per_minute_ceiling(monkeypatch):
+    from pypto_serving.model.deepseek_dspark.eplb import runtime as runtime_module
+
+    runtime, _ = runtime_fixture()
+    runtime.config = replace(runtime.config, max_maintenances_per_minute=2, cooldown_seconds=0)
+    now = 1000.0
+    monkeypatch.setattr(runtime_module, "monotonic", lambda: now)
+    runtime._commit_times.extend([now - 5.0, now - 1.0])
+    assert runtime._maintenance_rate_allows(now) is False
+    assert runtime.take_ready_plan() is None
+    # Only commits inside the trailing minute count against the ceiling.
+    runtime._commit_times.clear()
+    runtime._commit_times.extend([now - 90.0, now - 80.0])
+    assert runtime._maintenance_rate_allows(now) is True
+    # Zero disables the ceiling.
+    runtime.config = replace(runtime.config, max_maintenances_per_minute=0)
+    runtime._commit_times.extend([now - 1.0] * 50)
+    assert runtime._maintenance_rate_allows(now) is True
+
+
+def test_layer_cooldown_blocks_repeating_the_same_layer(monkeypatch):
+    runtime, _ = runtime_fixture()
+    ready_window(runtime)
+    plan = runtime.controller.take_ready_plan()
+    assert plan is not None and [move.layer_id for move in plan.layers] == [0]
+    runtime.controller.committed(plan)
+    captured = {}
+    original = controller_module.plan_rebalance
+
+    def spy(base, history, config, **kwargs):
+        captured.update(kwargs)
+        return original(base, history, config, **kwargs)
+
+    monkeypatch.setattr(controller_module, "plan_rebalance", spy)
+    ready_window(runtime)
+    runtime.controller.take_ready_plan()
+    assert captured["blocked_layers"] == frozenset({0})
+    # The only layer is blocked, so the planner cannot propose it again.
+    captured.clear()
+    runtime.controller.config = replace(runtime.controller.config, layer_cooldown_rebalances=0)
+    ready_window(runtime)
+    runtime.controller.take_ready_plan()
+    assert captured["blocked_layers"] == frozenset()

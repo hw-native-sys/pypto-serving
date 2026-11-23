@@ -22,6 +22,7 @@ import msgspec
 import pytest
 
 from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
+from pypto_serving.pd.maintenance import TransferGate
 from pypto_serving.pd.worker import Progress, ProgressServer, WorkerRuntime, WorkerSettings
 from pypto_serving.pd.adapter import CACHE_COMPONENTS, COMPONENTS, DeepSeekDSpark
 from pypto_serving.pd.config import Config, Endpoint
@@ -430,6 +431,7 @@ def test_cancelled_submit_ack_is_observed_until_native_completion(shutdown):
         job, native = digest(plan), Future()
         runtime = WorkerRuntime.__new__(WorkerRuntime)
         runtime.lock, runtime.jobs, runtime.uncertain = threading.RLock(), {}, False
+        runtime.gate = TransferGate(1)
         parent, child = socket.socketpair()
         accepted, reply = threading.Event(), threading.Event()
         def handle(operation, payload):

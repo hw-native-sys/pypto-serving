@@ -129,7 +129,8 @@ def balance_layer(history: np.ndarray, old: np.ndarray, *, ranks: int) -> np.nda
 
 
 def plan_rebalance(base: Placement, history: np.ndarray, config: EplbConfig,
-                   *, expert_bytes: int) -> RebalancePlan | None:
+                   *, expert_bytes: int,
+                   blocked_layers: frozenset[int] = frozenset()) -> RebalancePlan | None:
     """Budget complete layer candidates; never truncate a cycle into individual moves."""
     history = np.asarray(history, dtype=np.float64)
     if (history.ndim != 3 or history.shape[1:] != base.replica_count.shape or not len(history)
@@ -138,6 +139,11 @@ def plan_rebalance(base: Placement, history: np.ndarray, config: EplbConfig,
     if not history.any():
         return None
     scoring = history if config.policy == "temporal_greedy" else history.sum(axis=0, keepdims=True)
+    layer_limit = config.max_layers_per_rebalance
+    if base.generation == 0 and config.first_rebalance_layers > layer_limit:
+        # The first plan starts from the naive initial layout; cover more layers
+        # once so the remaining plans do not each pay another maintenance pause.
+        layer_limit = min(config.first_rebalance_layers, base.layers)
     candidates = []
     before_costs = [objective(scoring[:, layer], base.physical_to_logical[layer], base.ranks)
                     for layer in range(base.layers)]
@@ -149,6 +155,14 @@ def plan_rebalance(base: Placement, history: np.ndarray, config: EplbConfig,
     upper_gains = np.maximum(np.asarray(before_costs) - total_loads / base.ranks, 0) + slack
     order = sorted(range(base.layers), key=lambda layer: (-upper_gains[layer], layer))
     for layer in order:
+        if layer in blocked_layers:
+            # Recently migrated; let the layout settle before touching it again.
+            continue
+        # Reject layers whose best possible rank balance cannot meet the gain
+        # threshold. This avoids running the placement search on balanced
+        # high-throughput workloads without changing candidate admission.
+        if upper_gains[layer] < before_costs[layer] * config.min_relative_gain:
+            continue
         remaining_bytes = config.max_migration_bytes
         selected = []
         for candidate in sorted(candidates, key=lambda item: (-item[0], item[1])):
@@ -156,9 +170,9 @@ def plan_rebalance(base: Placement, history: np.ndarray, config: EplbConfig,
             if payload <= remaining_bytes:
                 selected.append(candidate)
                 remaining_bytes -= payload
-                if len(selected) == config.max_layers_per_rebalance:
+                if len(selected) == layer_limit:
                     break
-        if len(selected) == config.max_layers_per_rebalance and upper_gains[layer] < selected[-1][0]:
+        if len(selected) == layer_limit and upper_gains[layer] < selected[-1][0]:
             break
         old = base.physical_to_logical[layer]
         loads = scoring[:, layer]
@@ -173,8 +187,17 @@ def plan_rebalance(base: Placement, history: np.ndarray, config: EplbConfig,
     moves = []
     accepted_gain = 0.0
     used_bytes = 0
-    for gain, layer, new in sorted(candidates, key=lambda candidate: (-candidate[0], candidate[1])):
-        if len(moves) >= config.max_layers_per_rebalance:
+
+    def efficiency(candidate):
+        gain, layer, new = candidate
+        payload = int(np.count_nonzero(base.physical_to_logical[layer] != new)) * expert_bytes
+        # Maintenance pause grows with the migrated payload, so prefer the layer
+        # that returns the most predicted gain per migrated byte. Raw gain breaks
+        # ties (and stays first when expert_bytes is unknown).
+        return (-(gain / max(1, payload)), -gain, layer)
+
+    for gain, layer, new in sorted(candidates, key=efficiency):
+        if len(moves) >= layer_limit:
             break
         trial_map = mapping.copy()
         trial_map[layer] = new
@@ -191,7 +214,13 @@ def plan_rebalance(base: Placement, history: np.ndarray, config: EplbConfig,
         return None
     target = Placement.from_map(mapping, logical_experts=base.logical_experts,
                                 ranks=base.ranks, generation=base.generation + 1)
-    plan = RebalancePlan(base.generation, target, tuple(moves), accepted_gain / old_cost)
-    validate_plan(base, plan, expert_bytes=expert_bytes, max_layers=config.max_layers_per_rebalance,
+    target_cost = sum(objective(scoring[:, layer], target.physical_to_logical[layer], base.ranks)
+                      for layer in range(base.layers))
+    mean_peak = target_cost / (scoring.shape[0] * base.layers)
+    mean_load = float(scoring.sum() / (scoring.shape[0] * base.layers * base.ranks))
+    target_balance = mean_load / mean_peak if mean_peak > 0 else None
+    plan = RebalancePlan(base.generation, target, tuple(moves), accepted_gain / old_cost,
+                         target_balance=target_balance)
+    validate_plan(base, plan, expert_bytes=expert_bytes, max_layers=layer_limit,
                   max_migration_bytes=config.max_migration_bytes)
     return plan

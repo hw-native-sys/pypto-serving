@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from concurrent.futures import Future, ThreadPoolExecutor
+from collections import deque
 import logging
 from threading import Lock
 from time import monotonic, perf_counter
@@ -54,6 +55,7 @@ class EplbRuntime:
         self.tables: dict[str, Any] = {}
         self._lock = Lock()
         self._next_dispatch = 1
+        self._sample_dispatches = 0
         self._next_reclaim = 1
         self._completed: dict[int, LoadSample | None] = {}
         self._inflight: set[int] = set()
@@ -68,6 +70,7 @@ class EplbRuntime:
         self._pause_seconds = 0.0
         self._last_payload_bytes = 0
         self._commits = 0
+        self._commit_times: deque[float] = deque()
         ranks, slots = placement.ranks, placement.local_slots
         self._sources = shared_empty((ranks, ranks, slots, 2), torch.int32, name="eplb_sources")
         self._changed = shared_empty((ranks, ranks, slots), torch.int32, name="eplb_changed")
@@ -78,7 +81,32 @@ class EplbRuntime:
     def run_config(self):
         from pypto.runtime import RunConfig
 
-        return RunConfig(ring_heap=268435456, ring_task_window=32768, ring_dep_pool=32768)
+        # The transfer kernel borrows every local expert bank view.  EP16 W8A8
+        # migration also needs a roughly 2.6 GiB static gm_sm workspace, so the
+        # maintenance lane uses the 4 GiB decode ring budget from the serving
+        # launch configuration.  The larger heap is required by apply(), even
+        # though startup no longer runs a zero-migration transfer.
+        # Keep the first three shared L3 rings at the serving baseline and give
+        # only the maintenance lane the larger transfer budget.  Passing one
+        # integer would be expanded to four 4-GiB rings by the shared worker,
+        # reserving 16 GiB before the model cache is allocated.
+        return RunConfig(ring_heap=[1 << 29, 1 << 29, 1 << 29, 1 << 32],
+                         ring_task_window=131072, ring_dep_pool=131072)
+
+    @property
+    def workspace_reserve_bytes(self) -> int:
+        """Per-rank HBM reserved for the transfer program's static gm_sm arena.
+
+        The arena and its persistent windows are allocated at the first real
+        migration, after the KV cache exists. Reserving the space from the KV
+        budget keeps that first migration from OOMing at high memory
+        utilization; measured demand is ~2.5 GiB (decode) to >4.4 GiB
+        (prefill) per rank for EP16 W8A8. No reserve is needed while migrations
+        are disabled.
+        """
+        if not self.config.enabled or self.config.max_migration_bytes <= 0:
+            return 0
+        return self.config.maintenance_workspace_bytes
 
     def inherited_tensors(self) -> list[torch.Tensor]:
         return [self._sources, self._changed]
@@ -110,10 +138,14 @@ class EplbRuntime:
             raise RuntimeError("Enabled EPLB requires a compiled device maintenance program")
         layout = ExpertBankLayout.inspect(banks, self.placement)
         self.table(worker, "eplb_mapping")
-        views = layout.layer_views(worker, banks, 0)
-        # Warm persistent receive/signal windows before the KV capacity snapshot.
-        worker.run(transfer.compiled, *views, self._sources, self._changed, 1, config=self.run_config)
-        self._epoch = 1
+        # Do not execute a zero-migration transfer during startup.  The transfer
+        # program still allocates cross-rank windows and waits on barriers even when
+        # every slot is unchanged; that no-op path can poison device startup.  The
+        # real transfer remains in apply(), after a non-empty plan has been admitted.
+        logger.info("[eplb] prepared transfer views without zero-migration warmup")
+        # The first real migration publishes one increment per peer.  With no
+        # startup warmup, the signal epoch therefore starts at zero.
+        self._epoch = 0
         self.bank_layout = layout
         self.controller = EplbController(self.placement, self.config, expert_bytes=layout.expert_bytes,
                                          execution_role=self.execution_role)
@@ -125,8 +157,6 @@ class EplbRuntime:
         self.check_healthy()
         if self.controller is None:
             raise RuntimeError("EPLB dispatch before maintenance preflight")
-        record = (record and phase == self.controller.phase
-                  and (not self.config.max_rebalances or self._commits < self.config.max_rebalances))
         with self._lock:
             dispatch_id = self._next_dispatch
             if dispatch_id >= np.iinfo(np.int32).max:
@@ -134,6 +164,11 @@ class EplbRuntime:
             self._next_dispatch += 1
             placement = self.controller.current()
             self._inflight.add(dispatch_id)
+            record = (record and phase == self.controller.phase
+                      and (not self.config.max_rebalances or self._commits < self.config.max_rebalances))
+            if record:
+                self._sample_dispatches += 1
+                record = self._sample_dispatches % self.config.sample_stride == 0
         control[:, 0].fill_(dispatch_id)
         control[:, 1].fill_(int(record and phase == self.controller.phase))
         return DispatchContext(dispatch_id, phase, placement, output, record, monotonic())
@@ -176,6 +211,10 @@ class EplbRuntime:
         now = monotonic()
         if now < self._retry_at or now - self._last_commit < self.config.cooldown_seconds:
             return None
+        if not self._maintenance_rate_allows(now):
+            logger.debug("[eplb] rate limited role=%s cap=%d/min",
+                         self.execution_role, self.config.max_maintenances_per_minute)
+            return None
         if self._candidate is not None:
             plan, self._candidate = self._candidate, None
             return plan if self._admit(plan, now) else None
@@ -196,8 +235,9 @@ class EplbRuntime:
         if plan is not None:
             if not self._admit(plan, monotonic()):
                 return None
-            logger.info("[eplb] plan ready base_generation=%d planning_ms=%.3f",
-                        plan.base_generation, elapsed_ms)
+            logger.info("[eplb] plan ready base_generation=%d planning_ms=%.3f balance=%s",
+                        plan.base_generation, elapsed_ms,
+                        "n/a" if plan.target_balance is None else f"{plan.target_balance:.4f}")
         return plan
 
     def _admit(self, plan, now):
@@ -212,6 +252,22 @@ class EplbRuntime:
                         self.execution_role, savings * 1000, cost * 1000)
             return False
         return True
+
+    def _maintenance_rate_allows(self, now: float) -> bool:
+        """Apply the hard per-minute ceiling independent of the policy cooldown.
+
+        Extreme maintenance rates (hundreds to ~1000 applied migrations within
+        minutes) have wedged the PD peer link; the ceiling is a safety bound,
+        not a tuning knob. The default policy's cooldown keeps real deployments
+        far below it.
+        """
+        limit = self.config.max_maintenances_per_minute
+        if limit <= 0:
+            return True
+        cutoff = now - 60.0
+        while self._commit_times and self._commit_times[0] <= cutoff:
+            self._commit_times.popleft()
+        return len(self._commit_times) < limit
 
     def defer(self, plan):
         self.check_healthy()
@@ -278,12 +334,14 @@ class EplbRuntime:
             self.controller.committed(plan)
             self.placement = plan.target
             self._last_commit = monotonic()
+            self._commit_times.append(self._last_commit)
             self._commits += 1
             logger.info("[eplb] committed role=%s generation=%d layers=%s payload_bytes=%d predicted_gain=%.6f "
-                        "changed_slots=%d replica_changes=%d remote_bytes=%d elapsed_ms=%.3f",
+                        "changed_slots=%d replica_changes=%d remote_bytes=%d elapsed_ms=%.3f balance=%s",
                         self.execution_role, plan.target.generation, [move.layer_id for move in plan.layers],
                         plan.payload_bytes, plan.predicted_gain, changed_slots, replica_changes,
-                        remote_slots * self.bank_layout.expert_bytes, (perf_counter() - started) * 1000)
+                        remote_slots * self.bank_layout.expert_bytes, (perf_counter() - started) * 1000,
+                        "n/a" if plan.target_balance is None else f"{plan.target_balance:.4f}")
         except BaseException as error:
             if submitted:
                 self._failure = error

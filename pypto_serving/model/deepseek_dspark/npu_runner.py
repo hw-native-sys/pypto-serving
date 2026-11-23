@@ -1727,6 +1727,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         )
         return next(spec.max_blocks_per_seq for spec in specs if spec.name == group_name)
 
+    @staticmethod
+    def _cache_budget_bytes(free_bytes: int, total_bytes: int, utilization: float,
+                            reserve_bytes: int = 0) -> int:
+        """Per-rank KV budget: utilization target minus current use and EPLB reserve."""
+        return int(total_bytes * utilization) - (total_bytes - free_bytes) - reserve_bytes
+
     def _compute_kv_cache_pages(self, runtime: RuntimeConfig) -> dict[str, int]:
         """Plan independent pools from the tightest post-resident rank budget."""
         if runtime.total_kv_pages is not None:
@@ -1734,10 +1740,15 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         layout = self._compiled.layout
         worker = self._shared_l3_worker()
         utilization = runtime.npu_memory_utilization
+        reserve_bytes = 0 if self._eplb is None else self._eplb.workspace_reserve_bytes
         budgets = []
         for worker_id in range(layout.ranks):
             free_bytes, total_bytes = worker.device_memory_info(worker_id)
-            budgets.append(int(total_bytes * utilization) - (total_bytes - free_bytes))
+            budgets.append(self._cache_budget_bytes(free_bytes, total_bytes, utilization, reserve_bytes))
+        if reserve_bytes and min(budgets) <= 0:
+            raise RuntimeError(
+                f"EPLB maintenance reserve {reserve_bytes} bytes leaves no KV budget on rank "
+                f"{budgets.index(min(budgets))}; lower npu_memory_utilization or maintenance_workspace_bytes")
         step = layout.decode_seq
         if self._compiled.prefill is not None:
             step = max(step, min(runtime.max_prefill_tokens_per_request or DSPARK_PREFILL_MAX_TOKENS,
@@ -1748,9 +1759,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             step_tokens=step, filler_pages=layout.decode_batch,
             retention_interval=runtime.prefix_cache_retention_interval if self._compiled.prefill is not None else 0,
         )
-        logger.info("DSpark cache budget=%d bytes, planned=%d bytes including filler/alignment",
-                    min(budgets), cache_pool_bytes(self._cache_group_specs, counts,
-                                                  filler_pages=layout.decode_batch))
+        logger.info("DSpark cache budget=%d bytes, eplb_reserve=%d bytes, planned=%d bytes including filler/alignment",
+                    min(budgets), reserve_bytes, cache_pool_bytes(self._cache_group_specs, counts,
+                                                                  filler_pages=layout.decode_batch))
         return counts
 
     def _check_memory_target(self, runtime: RuntimeConfig) -> None:

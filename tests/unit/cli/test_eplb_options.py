@@ -77,3 +77,14 @@ def test_pd_decode_tp1_preserves_independent_head_and_expert_capacity():
     args.pd_role = "prefill"
     with pytest.raises(ValueError, match="TP4"):
         _resolve_eplb_config(args, "deepseek_v4", {})
+
+
+def test_eplb_accepts_workspace_reserve_and_rate_ceiling():
+    args = arguments("--enable-eplb", "--eplb-config", json.dumps({
+        "max_migration_bytes": 1 << 30,
+        "maintenance_workspace_bytes": 4 << 30,
+        "max_maintenances_per_minute": 6,
+    }))
+    config = _resolve_eplb_config(args, "deepseek_v4", {})
+    assert config.maintenance_workspace_bytes == 4 << 30
+    assert config.max_maintenances_per_minute == 6

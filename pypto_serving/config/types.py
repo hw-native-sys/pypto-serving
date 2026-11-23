@@ -29,11 +29,23 @@ class EplbConfig:
     num_redundant_experts: int = 0
     window_size: int = 128
     step_interval: int = 1024
+    # Select one load sample per N eligible phase dispatches. Window and
+    # planning intervals count selected samples, not skipped dispatches.
+    sample_stride: int = 1
     # None preserves the distinction between an omitted phase and an explicit one.
     load_collection_phase: str | None = None
     policy: str = "temporal_greedy"
     min_relative_gain: float = 0.05
     max_layers_per_rebalance: int = 1
+    # Layer budget for the first rebalance only (generation 0). The initial
+    # layout is a naive identity plus redundant copies, so covering more layers
+    # once at cold start removes several follow-up maintenance pauses. Zero
+    # keeps the regular max_layers_per_rebalance budget.
+    first_rebalance_layers: int = 16
+    # Skip a layer for this many subsequent rebalance opportunities after it
+    # moved. Sampling noise can otherwise report a fresh gain every window and
+    # re-migrate the same layers indefinitely; zero disables the cooldown.
+    layer_cooldown_rebalances: int = 2
     max_migration_bytes: int = 0
     transfer_backend: str = "device_maintenance"
     balance_drafter: bool = False
@@ -43,6 +55,16 @@ class EplbConfig:
     amortization_steps: int = 1024
     maintenance_cost_margin: float = 1.25
     max_rebalances: int = 0
+    # Per-rank HBM set aside for the transfer program's static gm_sm workspace.
+    # The arena is allocated on the first real migration, after the KV cache
+    # exists, so without a reserve the first migration can OOM at high memory
+    # utilization. Only counted when migrations are enabled (max_migration_bytes
+    # > 0). Measured need is ~2.5 GiB (decode) to >4.4 GiB (prefill) per rank.
+    maintenance_workspace_bytes: int = 5 << 30
+    # Hard safety ceiling on applied migrations per rank per minute, independent
+    # of the policy's cooldown. High-frequency maintenance has been observed to
+    # wedge the PD peer link after ~770-1000 migrations; 0 disables the ceiling.
+    max_maintenances_per_minute: int = 12
 
     def __post_init__(self) -> None:
         for name in ("enabled", "balance_drafter"):
@@ -50,9 +72,12 @@ class EplbConfig:
                 raise ValueError(f"EPLB {name} must be a boolean")
         for name, minimum in (
             ("num_redundant_experts", 0), ("window_size", 1), ("step_interval", 1),
-            ("max_layers_per_rebalance", 1), ("max_migration_bytes", 0),
+            ("sample_stride", 1),
+            ("max_layers_per_rebalance", 1), ("first_rebalance_layers", 0), ("max_migration_bytes", 0),
+            ("layer_cooldown_rebalances", 0),
             ("amortization_steps", 1),
             ("max_rebalances", 0),
+            ("maintenance_workspace_bytes", 0), ("max_maintenances_per_minute", 0),
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < minimum:

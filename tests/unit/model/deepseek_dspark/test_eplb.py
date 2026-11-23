@@ -35,12 +35,17 @@ def enabled(**kwargs):
 
 
 @pytest.mark.parametrize("kwargs", [
-    {"window_size": True}, {"step_interval": 0}, {"window_size": 3},
+    {"window_size": True}, {"step_interval": 0}, {"sample_stride": 0}, {"window_size": 3},
     {"num_redundant_experts": -1}, {"max_migration_bytes": 0},
     {"max_migration_bytes": 1.5}, {"min_relative_gain": float("nan")},
     {"min_relative_gain": float("inf")}, {"min_relative_gain": True},
     {"min_relative_gain": 1}, {"load_collection_phase": "both"},
     {"balance_drafter": True}, {"transfer_backend": "host_staged"}, {"policy": "unknown"},
+    {"maintenance_workspace_bytes": -1}, {"max_maintenances_per_minute": -1},
+    {"first_rebalance_layers": -1},
+    {"maintenance_workspace_bytes": True}, {"max_maintenances_per_minute": 1.5},
+    {"layer_cooldown_rebalances": -1}, {"layer_cooldown_rebalances": True},
+    {"layer_cooldown_rebalances": 1.5},
 ])
 def test_invalid_config_rejected(kwargs):
     with pytest.raises(ValueError):
@@ -60,6 +65,19 @@ def test_role_and_topology_contract():
     with pytest.raises(ValueError, match="capacity"):
         enabled(num_redundant_experts=1).validate_topology(
             logical_experts=256, ranks=16, tp_size=4, execution_role="mixed")
+
+
+def test_balanced_layers_skip_search_when_the_gain_bound_cannot_pass(monkeypatch):
+    from pypto_serving.model.deepseek_dspark.eplb import policy
+
+    base = Placement.initial(layers=43, logical_experts=256, ranks=8)
+    history = np.full((2, 43, 256), 8, dtype=np.float64)
+
+    def unexpected_search(*args, **kwargs):
+        raise AssertionError("balanced layers cannot meet the configured gain threshold")
+
+    monkeypatch.setattr(policy, "balance_layer", unexpected_search)
+    assert policy.plan_rebalance(base, history, enabled(min_relative_gain=.05), expert_bytes=100) is None
 
 
 @pytest.mark.parametrize("ranks,extra", [(8, 0), (8, 8), (16, 0), (16, 16), (16, 256)])
@@ -118,12 +136,43 @@ def test_load_sample_uses_rank_major_order_and_owns_its_counts():
     counts = np.arange(12).reshape(2, 2, 3)
     sample = LoadSample(1, "decode", layout, counts)
     counts[:] = 0
-    np.testing.assert_array_equal(sample.logical_counts(), [[7, 9, 2, 6], [13, 15, 5, 9]])
+    np.testing.assert_array_equal(sample.logical_counts(), [[8, 1, 8, 7], [14, 4, 14, 10]])
     assert sample.logical_counts().sum() == 66
     with pytest.raises(ValueError):
         LoadSample(2, "decode", layout, -np.ones((2, 2, 3), dtype=int))
     with pytest.raises(ValueError, match="overflow"):
         LoadSample(2, "decode", layout, np.full((2, 2, 3), np.iinfo(np.int64).max))
+
+
+def test_initial_placement_spreads_redundant_copies_across_ranks():
+    layout = Placement.initial(layers=1, logical_experts=256, ranks=16, redundant_experts=16)
+    mapping = layout.physical_to_logical[0].reshape(16, 17)
+    extras = mapping[:, -1]
+    assert len(set(extras.tolist())) == 16
+    for expert in extras:
+        assert np.count_nonzero(mapping == expert) == 2
+
+
+@pytest.mark.parametrize("ranks", [2, 8, 16])
+def test_single_replica_load_sample_uses_the_submitted_inverse_after_rebalance(ranks):
+    mapping = np.stack([np.roll(np.arange(32), shift) for shift in (0, 7, 19)])
+    layout = Placement.from_map(mapping, logical_experts=32, ranks=ranks, generation=1)
+    logical = np.arange(96).reshape(3, 32)
+    physical = np.take_along_axis(logical, mapping, axis=1)
+    counts = physical.reshape(3, ranks, 32 // ranks).transpose(1, 0, 2)
+    sample = LoadSample(1, "decode", layout, counts)
+    np.testing.assert_array_equal(sample.logical_counts(), logical)
+
+
+def test_load_sample_preserves_exact_int64_overflow_boundary():
+    layout = Placement.initial(layers=1, logical_experts=4, ranks=2)
+    counts = np.zeros((2, 1, 2), dtype=np.int64)
+    counts[0, 0, 0] = np.iinfo(np.int64).max
+    sample = LoadSample(1, "decode", layout, counts)
+    assert sample.logical_counts()[0, 0] == np.iinfo(np.int64).max
+    counts[1, 0, 1] = 1
+    with pytest.raises(ValueError, match="overflow"):
+        LoadSample(2, "decode", layout, counts)
 
 
 def test_cycle_and_replica_plan_preserves_all_six_weight_tensors():
@@ -184,6 +233,20 @@ def test_hot_expert_replication_improves_load_and_budget_accepts_whole_layers():
     assert plan_rebalance(base, loads, replace(config, max_migration_bytes=one_layer_bytes - 1),
                           expert_bytes=100) is None
     assert plan_rebalance(base, np.zeros_like(loads), config, expert_bytes=100) is None
+
+
+def test_first_rebalance_uses_a_larger_layer_budget():
+    base = Placement.initial(layers=4, logical_experts=8, ranks=4, redundant_experts=4)
+    loads = np.full((3, 4, 8), 10)
+    loads[:, :, 0] = 100
+    loads[:, :, 1] = 80
+    config = enabled(num_redundant_experts=4, max_layers_per_rebalance=1,
+                     first_rebalance_layers=3, max_migration_bytes=10**12)
+    first = plan_rebalance(base, loads, config, expert_bytes=100)
+    assert first is not None and len(first.layers) == 3
+    # Every later plan falls back to the regular per-commit budget.
+    later = plan_rebalance(first.target, loads, config, expert_bytes=100)
+    assert later is not None and len(later.layers) == 1
 
 
 def test_temporal_policy_separates_experts_with_correlated_bursts():
@@ -269,3 +332,31 @@ def test_resident_weight_budget_includes_scales_and_rejects_bad_bank_geometry():
     banks["routed_w2_scale"].full_shape = (16, 43 * 17, 2048)
     with pytest.raises(ValueError, match="geometry"):
         ExpertBankLayout.inspect(banks, placement)
+
+
+def test_policy_prefers_gain_per_migrated_byte():
+    # Layer 0 has the slightly larger gain but moves 600 bytes; layer 1 returns
+    # nearly the same gain for half the payload and must be chosen instead.
+    base = Placement.initial(layers=2, logical_experts=8, ranks=4)
+    history = np.array([[[53, 26, 96, 88, 18, 50, 93, 84],
+                         [70, 63, 4, 74, 47, 9, 24, 54]]], dtype=float)
+    plan = plan_rebalance(base, history, enabled(first_rebalance_layers=1), expert_bytes=100)
+    assert plan is not None
+    assert [move.layer_id for move in plan.layers] == [1]
+    assert plan.layers[0].payload_bytes == 300
+
+
+def test_plan_reports_the_target_rank_balance():
+    base = Placement.initial(layers=2, logical_experts=8, ranks=4)
+    history = np.array([[[100, 100, 100, 100, 1, 1, 1, 1],
+                         [50, 50, 1, 1, 1, 1, 1, 1]]], dtype=float)
+    plan = plan_rebalance(base, history, enabled(), expert_bytes=100)
+    assert plan is not None
+    assert plan.target_balance is not None and 0 < plan.target_balance <= 1
+    # A balanced target must be at least as good as the initial placement.
+    from pypto_serving.model.deepseek_dspark.eplb.policy import objective
+    before = sum(objective(history[:, layer], base.physical_to_logical[layer], base.ranks)
+                 for layer in range(base.layers))
+    after = sum(objective(history[:, layer], plan.target.physical_to_logical[layer], base.ranks)
+                for layer in range(base.layers))
+    assert after <= before
