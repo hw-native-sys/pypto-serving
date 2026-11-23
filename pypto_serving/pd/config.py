@@ -57,6 +57,7 @@ class Config:
     capacity: int = DEFAULT_CAPACITY
     handoff_timeout: float = 300.0
     request_timeout: float = 3600.0
+    prefill_waiting_window: int = 5
     run_id: str = field(default_factory=lambda: datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8])
     log_enabled: bool = True
     log_root: str = "serving_log/pd_disag"
@@ -81,6 +82,8 @@ class Config:
             raise ValueError("node control endpoints must be unique")
         if type(self.capacity) is not int or self.capacity < 1:
             raise ValueError("capacity must be positive")
+        if type(self.prefill_waiting_window) is not int or self.prefill_waiting_window < 1:
+            raise ValueError("prefill_waiting_window must be a positive integer")
         if not 0 < self.handoff_timeout <= self.request_timeout < float("inf"):
             raise ValueError("timeouts must be finite and request >= handoff > 0")
         if not self.run_id or Path(self.run_id).name != self.run_id or self.run_id in (".", ".."):
@@ -99,7 +102,8 @@ class Config:
         runtime = config.pd_options if config.pd_options is not None else {}
         logs = config.observability if config.observability is not None else {}
         if not isinstance(runtime, dict) or set(runtime) - {
-                "provider", "policy", "capacity", "handoff_timeout", "request_timeout", "run_id"}:
+                "provider", "policy", "capacity", "handoff_timeout", "request_timeout", "run_id",
+                "prefill_waiting_window"}:
             raise ValueError("invalid PD options")
         if not isinstance(logs, dict):
             raise ValueError("invalid observability options")

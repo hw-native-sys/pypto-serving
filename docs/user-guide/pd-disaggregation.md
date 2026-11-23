@@ -115,6 +115,10 @@ Completion/chat, streaming, tools and optional constraints reuse Serving's ordin
 
 HTTP, control (HTTP port + 10000 by default), and Mooncake's dynamic RPC/RoCE endpoints must be reachable. Optional entry fields are `control_port` and `transfer_hostname` for a distinct data-plane address. Optional fields in the top-level `pd` section are `provider` (currently `mooncake`), `policy` (currently `round_robin`), `capacity` (256 per node), `handoff_timeout` (300 seconds), `request_timeout` (3600 seconds), and `run_id`. Timeouts do not authorize reuse of possibly active memory.
 
+`pd.prefill_waiting_window` defaults to 5, including the queue head. Each request
+admitted ahead of a blocked head reduces its remaining lookahead by one. Set
+the window to 1 to admit new Prefill requests in queue order.
+
 `handoff_timeout` bounds individual control, transfer, and stop-confirmation operations. Waiting for the full Prefill before Decode uses `request_timeout`, so a long, progressing Prefill is not mistaken for a stalled transfer. Non-streaming JSON response headers also wait under `request_timeout`, because they follow generation; streaming setup headers retain `handoff_timeout`. Expiry still follows the normal abort and lease-retirement rules.
 
 An SSE response whose body iterator has not started within `handoff_timeout` is

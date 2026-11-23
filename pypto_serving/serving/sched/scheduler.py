@@ -587,6 +587,8 @@ class Scheduler:
         while self.waiting and token_budget > 0 and self._can_admit_waiting():
             if len(self.running) >= self.config.max_num_running_reqs:
                 break
+            if not self._can_scan_waiting(remaining_waiting):
+                break
 
             request = self.waiting.popleft()
             # Keep a victim PREEMPTED until any older in-flight result has
@@ -598,64 +600,16 @@ class Scheduler:
                 continue
 
             # Prefix cache lookup
-            if self.config.enable_prefix_cache:
-                if self.kv_cache_manager.has_groups:
-                    tiering = self.kv_cache_manager.tiering
-                    restored_partition = None
-                    if tiering is not None:
-                        ready, restored_partition = tiering.prepare(
-                            request.request_id, request.group_block_hashes, request.num_prompt_tokens,
-                            maximum=request.group_checkpoint_boundary,
-                        )
-                        if not ready:
-                            remaining_waiting.append(request)
-                            continue
-                    (
-                        request.allocated_group_block_ids,
-                        request.num_computed_tokens,
-                        request.cache_partition,
-                    ) = self.kv_cache_manager.acquire_group_prefix_blocks(
-                        request.request_id,
-                        request.group_block_hashes,
-                        max_cache_hit_tokens=request.group_checkpoint_boundary,
-                        preferred_partition=restored_partition,
-                    )
-                    request.group_shared_prefix_boundary = self.kv_cache_manager.group_history_prefix_hit(
-                        request.group_block_hashes, request.group_checkpoint_boundary,
-                    )
-                    request.num_group_blocks_cached = (
-                        self.kv_cache_manager.published_group_block_counts(
-                            request.num_computed_tokens
-                        )
-                        if request.num_computed_tokens
-                        else {}
-                    )
-                    if request.num_computed_tokens:
-                        logger.info(
-                            "prefix_cache_hit request_id=%s prefix_cache_hit_tokens=%d",
-                            request.request_id,
-                            request.num_computed_tokens,
-                        )
-                        request.prefix_cache_hit_tokens = request.num_computed_tokens
-                        if self.config.prefix_cache_replay_before_hit:
-                            request.num_computed_tokens = max(
-                                0, request.num_computed_tokens
-                                - self.config.speculative_prefix_cache_replay_tokens,
-                            )
-                    cached_blocks = []
-                else:
-                    cached_blocks = self.kv_cache_manager.get_computed_blocks(
-                        request.prompt_token_ids
-                    )
-                    if cached_blocks:
-                        request.cached_block_ids = [b.block_id for b in cached_blocks]
-                        request.num_computed_tokens = (
-                            len(cached_blocks) * self.kv_cache_manager.block_size
-                        )
-                        # Mark cached blocks as already published.
-                        request.num_blocks_cached = len(cached_blocks)
-            else:
-                cached_blocks = []
+            if self.kv_cache_manager.has_groups:
+                if not self._prepare_waiting_group(request, token_budget, head=not remaining_waiting):
+                    remaining_waiting.append(request)
+                    continue
+            elif self.config.enable_prefix_cache:
+                cached_blocks = self.kv_cache_manager.get_computed_blocks(request.prompt_token_ids)
+                if cached_blocks:
+                    request.cached_block_ids = [b.block_id for b in cached_blocks]
+                    request.num_computed_tokens = len(cached_blocks) * self.kv_cache_manager.block_size
+                    request.num_blocks_cached = len(cached_blocks)
 
             grouped_prefix_hit = (
                 self.kv_cache_manager.has_groups and request.prefix_cache_hit_tokens > 0
@@ -682,7 +636,7 @@ class Scheduler:
                 continue
 
             scheduled = ScheduledRequest(request, num_new, True)
-            allocated = num_new > 0 and self._try_allocate_request_blocks(request, num_new, scheduled=scheduled)
+            allocated = num_new > 0 and self._allocate_waiting(request, num_new, scheduled)
             if not allocated and grouped_prefix_hit:
                 # A grouped hit is rank-local. If its partition is busy or
                 # cannot hold the suffix, release the hit and try an idle
@@ -740,6 +694,7 @@ class Scheduler:
             scheduled.cache_partition = request.cache_partition
             output.scheduled_requests.append(scheduled)
             self._on_scheduled(scheduled)
+            self._on_waiting_scheduled(bypassed=bool(remaining_waiting))
             output.num_prefill_tokens += num_new
             token_budget -= num_new
 
@@ -753,6 +708,50 @@ class Scheduler:
 
     def _can_admit_waiting_partition(self, partition: int | None) -> bool:
         return True
+
+    def _can_scan_waiting(self, deferred: deque[Request]) -> bool:
+        return True
+
+    def _on_waiting_scheduled(self, *, bypassed: bool) -> None:
+        pass
+
+    def _allocate_waiting(self, request, num_new, scheduled) -> bool:
+        return self._try_allocate_request_blocks(request, num_new, scheduled=scheduled)
+
+    def _prepare_waiting_group(self, request, token_budget, *, head) -> bool:
+        if not self.config.enable_prefix_cache:
+            return True
+        cache = self.kv_cache_manager
+        partition = None
+        if cache.tiering is not None:
+            ready, partition = cache.tiering.prepare(
+                request.request_id, request.group_block_hashes, request.num_prompt_tokens,
+                maximum=request.group_checkpoint_boundary,
+            )
+            if not ready:
+                return False
+        self._record_waiting_group_prefix(request, cache.acquire_group_prefix_blocks(
+            request.request_id, request.group_block_hashes,
+            max_cache_hit_tokens=request.group_checkpoint_boundary, preferred_partition=partition,
+        ))
+        return True
+
+    def _record_waiting_group_prefix(self, request, match) -> None:
+        cache = self.kv_cache_manager
+        request.allocated_group_block_ids, hit, request.cache_partition = match
+        request.group_shared_prefix_boundary = cache.group_history_prefix_hit(
+            request.group_block_hashes, request.group_checkpoint_boundary,
+        )
+        request.num_group_blocks_cached = cache.published_group_block_counts(hit) if hit else {}
+        request.num_computed_tokens = self._prefill_start(request, hit)
+        if hit:
+            request.prefix_cache_hit_tokens = hit
+            logger.info("prefix_cache_hit request_id=%s prefix_cache_hit_tokens=%d", request.request_id, hit)
+
+    def _prefill_start(self, request, hit):
+        if self.config.prefix_cache_replay_before_hit:
+            return max(0, hit - self.config.speculative_prefix_cache_replay_tokens)
+        return max(0, min(hit, request.num_prompt_tokens - 1))
 
     def _on_scheduled(self, scheduled: ScheduledRequest) -> None:
         pass
@@ -830,18 +829,22 @@ class Scheduler:
         self,
         request: Request,
         token_budget: int,
+        *,
+        computed: int | None = None,
     ) -> int:
         """Apply per-request prefill limits and the remaining step budget."""
-        needed = request.num_new_tokens_needed
+        start = request.num_computed_tokens if computed is None else computed
+        needed = request.num_tokens - start
+        is_prefill = start < request.num_prefill_tokens
         limit = token_budget
-        if request.is_prefill:
+        if is_prefill:
             chunk_limit = self._prefill_chunk_limit()
             if chunk_limit is not None:
                 limit = min(limit, chunk_limit)
             if self._requires_single_prefill_dispatch() and needed > limit:
                 return 0
-        scheduled = max(0, min(needed, limit, self.config.max_seq_len - request.num_computed_tokens))
-        if request.is_prefill and request.num_computed_tokens + scheduled < request.num_prompt_tokens:
+        scheduled = max(0, min(needed, limit, self.config.max_seq_len - start))
+        if is_prefill and start + scheduled < request.num_prompt_tokens:
             # KDA's BF16 recurrence boundaries must stay fixed across dispatches.
             # Leave arbitrary final tails intact; defer unfinished work when the
             # remaining shared budget cannot fit one recurrence block.

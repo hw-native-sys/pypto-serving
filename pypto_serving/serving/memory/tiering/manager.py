@@ -49,6 +49,7 @@ class CacheTier:
         self.by_handle, self.inflight = {}, {}
         self.queued = deque()
         self.retiring = {}
+        self.revision = 0
         self.sequence = count(1)
         self.used = 0
         self.error = None
@@ -105,6 +106,7 @@ class CacheTier:
         if identity in self.pending_units:
             self._forget_pending(identity)
         self.units[identity] = keys
+        self.revision += 1
         for key in keys:
             page = self.pages[key]
             self.policy.on_remove(("page", page.handle))
@@ -186,6 +188,7 @@ class CacheTier:
                 for page in pages:
                     page.units.remove(identity)
             self._retire(tuple(page for page in pages if not page.units))
+            self.revision += 1
             return True
         return False
 
@@ -210,6 +213,7 @@ class CacheTier:
                 page.future = None
                 del self.inflight[page.handle]
                 page.ready = True
+                self.revision += 1
                 self.release_pin(page.lease)
                 page.lease = page.source = None
                 self.counters["stored_bytes"] += page.size

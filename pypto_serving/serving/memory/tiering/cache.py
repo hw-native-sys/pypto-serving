@@ -253,43 +253,103 @@ class TieredCache:
                                                  pending.partition, {}, pending.boundary)
             self.cancel(request, completed=True)
             return True, pending.partition
+        match = self.match_prefix(hashes, maximum, groups=groups, partition=partition)
+        return not self.start_restore(request, hashes, tokens, match, started_ns=started_ns), None
+
+    def match_prefix(self, hashes, maximum, *, groups=None, partition=None, score=True):
+        """Read a candidate without changing page ownership or eviction order."""
         if maximum <= 0 or not self.tier.pages:
-            return True, None
+            return {}, 0, None
         sizes = {name: self.cache._group_pools[name].spec.spec.token_capacity for name in hashes}
         boundaries = {
             boundary for boundary, identity in self.tier.units if boundary <= maximum and
             all(name in sizes and boundary // sizes[name] <= len(hashes[name]) and
                 hashes[name][boundary // sizes[name] - 1] == value for name, value in identity)
         }
-        tables, boundary, selected = self._select(hashes, maximum, groups, partition, boundaries)
-        if not boundary:
-            return True, None
-        # Selection returns physical ring slots. Freeze logical page order for
-        # delayed resident/restore pins before filtering holes or DDR entries.
+        if score:
+            return self._select(hashes, maximum, groups, partition, boundaries)
+        return self.cache.select_group_prefix_blocks(
+            hashes, max_cache_hit_tokens=maximum, shareable_group_names=groups, partition=partition,
+            lookup=self._lookup, shared_checkpoint_boundaries=boundaries,
+        )
+
+    def restore_demand(self, tables, partition):
+        """Count new targets and bytes for this destination, reusing in-flight LOAD."""
+        fresh = Counter()
+        size = 0
+        needs_load = False
         for name, values in tables.items():
-            spec = self.cache._group_pools[name].spec
-            if spec.sliding_window is not None:
-                tables[name] = tuple(reversed(tuple(self.cache._group_tail(
-                    values, boundary // spec.spec.token_capacity))))
+            for page in values:
+                if isinstance(page, Page):
+                    needs_load = True
+                    if (partition, *page.key) not in self.loads:
+                        fresh[name] += 1
+                        size += page.size
+        return fresh, size, needs_load
+
+    def restore_queue_rounds(self, partition):
+        load_queued = any(load.partition == partition and not load.ready for load in self.loads.values())
+        store_queued = any(page.source[1] == partition for page in self.tier.inflight.values())
+        return int(load_queued) + int(store_queued)
+
+    def touch_prefix(self, tables):
         for name, values in tables.items():
             for page in values:
                 if page is not None:
                     self.tier.touch(page.key if isinstance(page, Page) else (name, page.block_hash))
-        missing = {(selected, *page.key): page for values in tables.values()
+
+    def start_restore(self, request, hashes, tokens, match, *, reserve_step=None, started_ns=0):
+        """Take destination/step pages before making a LOAD visible to the backend."""
+        tables, boundary, selected = match
+        if not boundary:
+            return False
+        if self.tier.error:
+            raise RuntimeError("DDR work is quarantined") from self.tier.error
+        if self.trace is not None and not started_ns:
+            started_ns = time.monotonic_ns()
+        # Selection returns physical ring slots. Freeze logical page order for
+        # delayed resident/restore pins before filtering holes or DDR entries.
+        ordered = dict(tables)
+        for name, values in ordered.items():
+            spec = self.cache._group_pools[name].spec
+            if spec.sliding_window is not None:
+                ordered[name] = tuple(reversed(tuple(self.cache._group_tail(
+                    values, boundary // spec.spec.token_capacity))))
+        self.touch_prefix(ordered)
+        missing = {(selected, *page.key): page for values in ordered.values()
                    for page in values if isinstance(page, Page)}
         if not missing:
-            return True, None
+            return False
         resident = {name: tuple(page for page in values if page is not None and not isinstance(page, Page))
-                    for name, values in tables.items()}
+                    for name, values in ordered.items()}
         source_pin = self.cache.pin_cached_group_blocks(resident, selected)
         fresh = {key: page for key, page in missing.items() if key not in self.loads}
         shared_with = ({self.loads[key].request for key in missing if key not in fresh}
                        if self.trace is not None else set())
-        targets = target_pin = None
+        targets, target_pin = {}, None
         try:
             if fresh:
                 targets, target_pin = self.cache.reserve_group_restore_pages(
-                    tuple((key[1], key[2]) for key in fresh), selected)
+                    tuple((key[1], key[2]) for key in fresh), selected, headroom=int(reserve_step is None))
+            if reserve_step is not None:
+                targets_for_step = {**{page.key: self.loads[key].block for key, page in missing.items()
+                                       if key in self.loads}, **targets}
+                reserve_step({
+                    name: [targets_for_step[page.key] if isinstance(page, Page) else page for page in values]
+                    for name, values in tables.items()
+                })
+        except BaseException as error:
+            self.cache.release_group_block_snapshot(source_pin)
+            self.cache.release_group_block_snapshot(target_pin)
+            if isinstance(error, KVCacheCapacityError) and reserve_step is None:
+                if self.trace is not None:
+                    self.trace.emit("restore_skipped", request_id=request, reason="hbm_capacity",
+                                    prefix_tokens=boundary, partition=selected)
+                return False
+            raise
+
+        try:
+            if fresh:
                 readers = self.tier.acquire(page.key for page in fresh.values())
                 pins = RestorePins(target_pin, len(fresh))
                 placements = [(page, targets[page.key]) for page in readers]
@@ -318,13 +378,7 @@ class TieredCache:
                     shared_with=sorted(shared_with), prepare_ns=time.monotonic_ns()-started_ns)
             logger.info("kv_offload_restore request_id=%s prefix_tokens=%d partition=%d pages=%d",
                         request, boundary, selected, len(missing))
-            return False, None
-        except KVCacheCapacityError:
-            self.cache.release_group_block_snapshot(source_pin)
-            if self.trace is not None:
-                self.trace.emit("restore_skipped", request_id=request, reason="hbm_capacity",
-                                prefix_tokens=boundary, partition=selected)
-            return True, None
+            return True
         except BaseException as error:
             # Once submitted, native LOAD owns its targets even if later submission fails.
             self.quarantined.append((source_pin, target_pin, tuple(fresh)))

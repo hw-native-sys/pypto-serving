@@ -258,7 +258,8 @@ class Application:
                                                       settings=settings, progress_channel=channel)})
         self.engine = AsyncLLMEngine(engine_config, tokenizer, core_factory=partial(
             PrefillCore if role == "prefill" else ReplicaEngineCore,
-            scheduler_factory=PrefillScheduler if role == "prefill" else Scheduler,
+            scheduler_factory=(partial(PrefillScheduler, waiting_window=config.prefill_waiting_window)
+                               if role == "prefill" else Scheduler),
             worker_factory=partial(spawn_worker, services_factory=Services)))
         self.core = self.engine.single_core()
         self.service = Service(config, endpoint, role, self.adapter, self.core, progress)
