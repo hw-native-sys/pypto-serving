@@ -14,11 +14,10 @@ concurrency:
 
 jobs:
   v41-performance:
-    runs-on: [self-hosted, linux, npu-a5]
+    runs-on: [self-hosted, linux, npu-a5, dt]
     timeout-minutes: 720
     env:
-      # Nightly uses eight cards. Manual validation uses four.
-      DEVICE_COUNT: ${{ github.event_name == 'schedule' && '8' || '4' }}
+      DEVICE_COUNT: '8'
       PTOAS_ROOT: ${{ github.workspace }}/v41-perf-checkout/ptoas-bin
       PTO_ISA_ROOT: ${{ github.workspace }}/v41-perf-checkout/pto-isa
       CMAKE_BUILD_PARALLEL_LEVEL: 16
@@ -84,7 +83,8 @@ jobs:
             printf -v sidecar_q '%q' "${!sidecar_var}"
             run_cmd="$run_cmd $sidecar_var=$sidecar_q"
           fi
-          run_cmd="$run_cmd python scripts/daily_serving_perf.py --profile v41-a5 --model $model_q --output-dir $output_q"
+          run_cmd="$run_cmd python scripts/daily_serving_perf.py --profile v41-a5 --expected-device-count $DEVICE_COUNT"
+          run_cmd="$run_cmd --model $model_q --output-dir $output_q"
           task-submit --device auto --device-num "$DEVICE_COUNT" \
             --timeout 4800 --max-time 28800 --run "$run_cmd"
 
