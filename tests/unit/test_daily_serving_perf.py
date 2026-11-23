@@ -130,7 +130,7 @@ def test_v41_sidecar_preserves_standard_fallback(tmp_path, monkeypatch):
     })
     args = SimpleNamespace(
         profile="v41-a5", model=tmp_path, output_dir=tmp_path / "results",
-        startup_timeout=1, request_timeout=1,
+        startup_timeout=1, request_timeout=1, expected_device_count=None,
     )
     environments = []
     original = perf.subprocess.Popen
@@ -142,15 +142,33 @@ def test_v41_sidecar_preserves_standard_fallback(tmp_path, monkeypatch):
     assert environments[0]["PYPTO_V41_PREPACKED_WEIGHTS"] == "/standard-sidecar"
 
 
+def test_v41_rejects_dp4_allocation_when_dp8_is_expected(tmp_path, monkeypatch):
+    monkeypatch.setenv("TASK_DEVICE", "0,1,2,3")
+    started = []
+    monkeypatch.setattr(perf.subprocess, "Popen", lambda *args, **kwargs: started.append(args))
+    output = tmp_path / "results"
+    monkeypatch.setattr(perf.sys, "argv", [
+        str(SCRIPT), "--profile", "v41-a5", "--expected-device-count", "8",
+        "--model", str(tmp_path), "--output-dir", str(output),
+    ])
+
+    assert perf.main() == 1
+    assert started == []
+    result = json.loads((output / "results.json").read_text(encoding="utf-8"))
+    assert "Expected 8 devices, got 4 from TASK_DEVICE" in result["error"]
+    assert result["devices"] == [0, 1, 2, 3]
+    assert result["warmups"] == result["rounds"] == []
+
+
 @pytest.mark.parametrize("warmup_fails", [False, True])
 def test_v41_run_separates_warmup_and_preserves_failures(tmp_path, monkeypatch, warmup_fails):
     from pypto_serving.model import tokenizer
 
     monkeypatch.setattr(tokenizer, "load_tokenizer", lambda path: WordTokenizer())
     monkeypatch.setattr(perf, "revision", lambda path: "source-revision")
-    monkeypatch.setenv("TASK_DEVICE", "1,2,4,7")
+    monkeypatch.setenv("TASK_DEVICE", "0,1,2,3,4,5,6,7")
     monkeypatch.setenv("PYPTO_SRC", str(tmp_path))
-    monkeypatch.setenv("PYPTO_V41_DAILY_DP4_PREPACKED_WEIGHTS", "/matching-dp4-sidecar")
+    monkeypatch.setenv("PYPTO_V41_DAILY_DP8_PREPACKED_WEIGHTS", "/matching-dp8-sidecar")
     environments = []
 
     def start(command, **kwargs):
@@ -174,14 +192,15 @@ def test_v41_run_separates_warmup_and_preserves_failures(tmp_path, monkeypatch, 
     output = tmp_path / "results"
     args = SimpleNamespace(
         profile="v41-a5", model=tmp_path, output_dir=output, startup_timeout=1, request_timeout=1,
+        expected_device_count=8,
     )
     assert perf.run(args) == int(warmup_fails)
     result = json.loads((output / "results.json").read_text())
     assert len(result["warmups"]) == 1
     assert len(result["rounds"]) == (0 if warmup_fails else 2)
     assert (output / "inputs.json").is_file() and (output / "report.md").is_file()
-    assert environments[0]["PYPTO_DSV41_DP_SIZE"] == "4"
-    assert environments[0]["PYPTO_V41_PREPACKED_WEIGHTS"] == "/matching-dp4-sidecar"
+    assert environments[0]["PYPTO_DSV41_DP_SIZE"] == "8"
+    assert environments[0]["PYPTO_V41_PREPACKED_WEIGHTS"] == "/matching-dp8-sidecar"
     assert len(closed) == 1
 
 

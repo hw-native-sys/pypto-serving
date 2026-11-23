@@ -83,7 +83,8 @@ jobs:
             printf -v sidecar_q '%q' "${!sidecar_var}"
             run_cmd="$run_cmd $sidecar_var=$sidecar_q"
           fi
-          run_cmd="$run_cmd python scripts/daily_serving_perf.py --profile v41-a5 --model $model_q --output-dir $output_q"
+          run_cmd="$run_cmd python scripts/daily_serving_perf.py --profile v41-a5 --expected-device-count $DEVICE_COUNT"
+          run_cmd="$run_cmd --model $model_q --output-dir $output_q"
           task-submit --device auto --device-num "$DEVICE_COUNT" \
             --timeout 4800 --max-time 28800 --run "$run_cmd"
 

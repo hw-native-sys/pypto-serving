@@ -425,13 +425,16 @@ def run(args: argparse.Namespace) -> int:
     publish()
     process = None
     try:
+        devices = task_devices((4, 8) if v41_a5 else (16,))
+        results["devices"] = devices
+        if args.expected_device_count is not None and len(devices) != args.expected_device_count:
+            raise ValueError(f"Expected {args.expected_device_count} devices, got {len(devices)} from TASK_DEVICE")
+
         from pypto_serving.model.tokenizer import load_tokenizer
 
         results["serving_commit"] = revision(ROOT)
         results["pypto_lib_commit"] = revision(ROOT / "pypto-lib")
         results["pypto_commit"] = revision(Path(os.environ["PYPTO_SRC"]))
-        devices = task_devices((4, 8) if v41_a5 else (16,))
-        results["devices"] = devices
         if not args.model.is_dir():
             raise FileNotFoundError(f"model directory does not exist: {args.model}")
         tokenizer = load_tokenizer(args.model)
@@ -544,6 +547,7 @@ def main() -> int:
     parser.add_argument("--startup-timeout", type=int, default=3600)
     parser.add_argument("--request-timeout", type=int, default=3600)
     parser.add_argument("--profile", choices=("dspark", "v41-a5"), default="dspark")
+    parser.add_argument("--expected-device-count", type=int, choices=(4, 8, 16))
     return run(parser.parse_args())
 
 
