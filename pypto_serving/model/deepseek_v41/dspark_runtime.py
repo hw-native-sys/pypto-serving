@@ -265,6 +265,10 @@ class DSparkRequestState:
     anchor: int = 0
     committed: int = 0
     draft_ids: tuple[int, ...] = ()
+    # Stochastic requests use the target sampler without speculative
+    # verification.  The K=5 runtime remains selected so its device target
+    # sampling ABI can be reused, but no draft state is carried forward.
+    speculative: bool = True
     valid: bool = False
     anchor_token: int | None = None
 
@@ -295,6 +299,8 @@ class DSparkRequestState:
         """Validate the next acceptance without changing request state."""
         if not isinstance(accepted_count, int) or not 1 <= accepted_count <= DSPARK_ROWS_PER_REQUEST:
             raise ValueError("DSpark accepted count must contain the target token")
+        if not self.speculative and accepted_count != 1:
+            raise ValueError("non-speculative DSpark requests must accept exactly one target token")
         next_anchor = self.anchor + accepted_count
         if next_anchor >= self.position_limit:
             # There is no next draft anchor at the position limit.
@@ -305,6 +311,9 @@ class DSparkRequestState:
     def commit(self, draft_ids: Sequence[int]) -> None:
         if not self.valid:
             raise RuntimeError("cannot commit drafts for an uninitialized DSpark state")
+        if not self.speculative:
+            self.draft_ids = ()
+            return
         if self.anchor + DSPARK_SPECULATIVE_TOKENS >= self.position_limit:
             self.draft_ids = ()
             return
@@ -380,7 +389,8 @@ class V41DSparkRuntime:
 
     def record_bootstrap(self, request_id: str, *, slot: int, generation: int,
                          prompt_length: int, anchor: int,
-                         draft_ids: Sequence[int], anchor_token: int | None = None) -> DSparkRequestState:
+                         draft_ids: Sequence[int], anchor_token: int | None = None,
+                         speculative: bool = True) -> DSparkRequestState:
         """Commit outputs already produced by the lib bootstrap composite.
 
         The device orchestration path has its own runner and therefore must not
@@ -391,6 +401,7 @@ class V41DSparkRuntime:
         )
         try:
             state.bootstrap(prompt_length, anchor)
+            state.speculative = speculative
             state.commit(draft_ids)
             state.anchor_token = anchor_token
         except BaseException:
@@ -416,7 +427,7 @@ class V41DSparkRuntime:
             for index, (request_id, drafts) in enumerate(zip(request_ids, draft_ids, strict=True)):
                 state = self.states.get(request_id)
                 next_anchor = state.anchor + (int(accepted_counts[index]) if accepted_counts is not None else 0)
-                if (next_anchor + DSPARK_SPECULATIVE_TOKENS < state.position_limit
+                if (state.speculative and next_anchor + DSPARK_SPECULATIVE_TOKENS < state.position_limit
                         and len(drafts) != DSPARK_SPECULATIVE_TOKENS):
                     raise ValueError("DSpark must commit exactly five draft tokens")
         # Validate device-produced acceptance values before dispatching any

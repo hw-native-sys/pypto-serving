@@ -1049,6 +1049,15 @@ class WorkerProcess:
             token_chunks=[pr.chunk_tokens for pr in scheduled],
             seq_lens=[pr.num_computed_tokens + len(pr.chunk_tokens) for pr in scheduled],
             prompt_lens=[len(self._req_cache[pr.request_id].prompt_token_ids) for pr in scheduled],
+            sampling_params=[
+                SamplingParams(
+                    temperature=self._req_cache[pr.request_id].temperature,
+                    top_p=self._req_cache[pr.request_id].top_p,
+                    top_k=self._req_cache[pr.request_id].top_k,
+                    seed=self._req_cache[pr.request_id].seed,
+                )
+                for pr in scheduled
+            ],
             prefix_cache_hit_tokens=[pr.prefix_cache_hit_tokens for pr in scheduled],
             chunk_starts=[pr.num_computed_tokens for pr in scheduled],
             device=device, embedding_lookup=embedding_lookup,
@@ -1076,7 +1085,7 @@ class WorkerProcess:
 
     @staticmethod
     def _require_v41_dspark_stages(runtime_model, batch, *, phase: str) -> None:
-        """Reject V4.1 speculative work before it falls back to target-only dispatch."""
+        """Keep every V4.1 K=5 request on the DSpark target composite."""
         extra = getattr(runtime_model, "extra", {})
         runtime = getattr(runtime_model, "runtime", None)
         if (isinstance(extra, dict) and extra.get("family") == "deepseek_v41"

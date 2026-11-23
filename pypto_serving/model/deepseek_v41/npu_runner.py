@@ -32,7 +32,7 @@ import torch
 
 from pypto_serving.tools.profile import profile_span
 
-from pypto_serving.config.types import DecodeResult, KVCacheGroupSpec, PrefillResult
+from pypto_serving.config.types import DecodeResult, KVCacheGroupSpec, PrefillResult, SamplingParams
 from pypto_serving.model.common.runner.buffer_set import alloc_device_buffer
 
 from .task_args import (
@@ -73,6 +73,7 @@ from .weight_spec import pack_mx_scale
 
 
 MAX_PREFILL_TOKENS_PER_DP = 4096
+_DSPARK_STATE_DRAFT_COUNT = 4
 
 
 # cache_resources
@@ -3113,9 +3114,9 @@ class V41ResidentResources:
             for value in workspace.values():
                 if isinstance(value, torch.Tensor):
                     value.zero_()
-            # The latest DSpark target composite samples on device.  V4.1 K=5
-            # admission is greedy-only, so bind a valid deterministic policy
-            # even though the serving worker consumes the verified outputs.
+            sampling_params = tuple(getattr(batch, "sampling_params", ()))
+            if len(sampling_params) != len(request_ids):
+                raise ValueError("DSpark decode sampling parameters must match request order")
             workspace["sampling_temperatures"].zero_()
             workspace["sampling_top_ks"].fill_(resources.layout.vocab_size)
             workspace["sampling_top_ps"].fill_(1.0)
@@ -3146,11 +3147,21 @@ class V41ResidentResources:
                 if len(request_state.draft_ids) not in (0, DSPARK_SPECULATIVE_TOKENS):
                     raise MissingCompositeInterface(
                         f"DSpark request {request_id!r} has invalid draft state")
-                active_tokens = (int(tokens[index]), *request_state.draft_ids)
+                params = sampling_params[index]
+                if not isinstance(params, SamplingParams):
+                    raise TypeError("DSpark decode sampling parameters must be SamplingParams")
+                slot, generation = self._resolve_dspark_state(request_id)
+                draft_ids = request_state.draft_ids if request_state.speculative else ()
+                if not request_state.speculative:
+                    # The bootstrap composite has already produced a draft
+                    # block before the request policy is known to the decode
+                    # scheduler. Clear its device-visible count so decode
+                    # acceptance returns exactly the sampled target token.
+                    resources.state.meta[rank, slot, _DSPARK_STATE_DRAFT_COUNT] = 0
+                active_tokens = (int(tokens[index]), *draft_ids)
                 width = len(active_tokens)
                 if not 0 <= positions[index] < positions[index] + width <= request_state.position_limit:
                     raise ValueError("DSpark active target rows exceed the request position limit")
-                slot, generation = self._resolve_dspark_state(request_id)
                 state.slot_ids[rank, row] = slot
                 state.generations[rank, row] = generation
                 workspace["input_ids"][rank, row, :width] = torch.tensor(active_tokens, dtype=torch.int64)
@@ -3158,6 +3169,12 @@ class V41ResidentResources:
                     int(positions[index]), int(positions[index]) + width,
                     dtype=torch.int32)
                 sampling_row = row * DSPARK_ROWS_PER_REQUEST
+                top_k = resources.layout.vocab_size if params.top_k is None else int(params.top_k)
+                seed = 0 if params.seed is None else int(params.seed)
+                workspace["sampling_temperatures"][rank, sampling_row:sampling_row + width] = params.temperature
+                workspace["sampling_top_ks"][rank, sampling_row:sampling_row + width] = top_k
+                workspace["sampling_top_ps"][rank, sampling_row:sampling_row + width] = params.top_p
+                workspace["sampling_seeds"][rank, sampling_row:sampling_row + width] = seed
                 workspace["sampling_positions"][rank, sampling_row:sampling_row + width] = torch.arange(
                     int(positions[index]), int(positions[index]) + width, dtype=torch.int32)
                 workspace["active_widths"][rank, row] = width
@@ -3290,7 +3307,14 @@ class V41ResidentResources:
         request_id, slot, generation = self._stage_dspark_prefill(
             resources, batch, extra["request_ids"], extra["sampled_token_ids"])
         workspace = resources.prefill_workspace
-        outputs = {"draft_ids": workspace["draft_ids"], "request_rows": (0,)}
+        params = tuple(getattr(batch, "sampling_params", ()))
+        if len(params) != 1 or not isinstance(params[0], SamplingParams):
+            raise ValueError("DSpark prefill sampling parameters must contain one SamplingParams")
+        outputs = {
+            "draft_ids": workspace["draft_ids"],
+            "request_rows": (0,),
+            "speculative": params[0].temperature <= 0.0,
+        }
         return DSparkLoweredInputs(
             state=resources.state, workspace=workspace, draft_model=draft,
             markov_model=markov, cache_tables=resources.cache_tables,
@@ -3706,6 +3730,7 @@ class V41ResidentResources:
                 prompt_length=prompt_length, anchor=anchor,
                 draft_ids=drafts,
                 anchor_token=int(lowered.workspace["next_prefill_tokens"][rank[0], row[0]]),
+                speculative=bool(lowered.outputs.get("speculative", True)),
             )
             return state
         except BaseException:
@@ -3751,7 +3776,7 @@ class V41ResidentResources:
                 proposed_counts.append(len(state.draft_ids))
                 state.validate_accept(count, sampled_token)
                 draft = []
-                if state.anchor + count + DSPARK_SPECULATIVE_TOKENS < state.position_limit:
+                if state.speculative and state.anchor + count + DSPARK_SPECULATIVE_TOKENS < state.position_limit:
                     draft_row = self._dspark_output_row(
                         drafts_tensor, rank=rank, row=row, kind="draft_ids")
                     self._validate_dspark_token_row(

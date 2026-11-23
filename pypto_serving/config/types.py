@@ -363,6 +363,7 @@ class PrefillBatch:
     prompt_lens: list[int] = field(default_factory=list)
     # Immutable prefix pages may extend beyond the first replayed token.
     prefix_cache_hit_tokens: list[int] = field(default_factory=list)
+    sampling_params: list[SamplingParams] = field(default_factory=list)
     allow_device_greedy_sampling: bool = False
     allow_device_topk_sampling: bool = False
     kv_allocations: list[KvAllocation] = field(default_factory=list)

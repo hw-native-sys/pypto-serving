@@ -32,11 +32,11 @@ def sampling_capabilities(executor_cls: str, num_speculative_tokens: int) -> Sam
         # The V4 MTP fused sampler does not yet accept a stop-token mask.
         return SamplingCapabilities(honor_min_tokens=num_speculative_tokens == 0)
     if executor_cls == "PyptoDeepSeekV41Executor":
-        # The V4.1 DSpark target sampler does not yet accept a stop-token mask.
-        return SamplingCapabilities(
-            honor_min_tokens=num_speculative_tokens == 0,
-            greedy_only=num_speculative_tokens == 5,
-        )
+        # K=5 keeps speculative verification for greedy requests.  Stochastic
+        # requests use the same target composite with one active row, so the
+        # target device sampler can honor their policy without comparing draft
+        # tokens generated from a different distribution.
+        return SamplingCapabilities(honor_min_tokens=num_speculative_tokens == 0)
     if executor_cls in ("PyptoQwen14BExecutor", "PyptoGlm53Executor"):
         return SamplingCapabilities()
     raise ValueError(f"sampling capabilities are not declared for {executor_cls!r}")
