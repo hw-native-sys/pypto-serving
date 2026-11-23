@@ -2853,13 +2853,13 @@ class V41ResidentResources:
 
     def __init__(self, programs, run_config, *, weight_bank, weight_param_names,
                  cache_plan, state_reset, page_resets, input_host, final_host,
-                 prefill_host, topology,
+                 prefill_host, topology, decode_head_program, decode_head_param_names,
                  engram_host=None,
                  decode_input_host=None, decode_host=None, worker_factory=make_segment_worker,
                  prefill_program=None, prefill_param_names=None,
                  dspark_programs=None, dspark_param_names=None, max_seq_len=None,
                  dspark_weight_contract=None, dspark_lowering_provider=None,
-                 dspark_host_resources=None, decode_head_program=None):
+                 dspark_host_resources=None):
         weight_bank.finish(weight_param_names)
         if decode_host is not None and (decode_input_host is None or
                 decode_host.topology != decode_input_host.topology):
@@ -2908,6 +2908,7 @@ class V41ResidentResources:
         self._decode_fwd = None
         self._decode_binding = None
         self._decode_head_program = decode_head_program
+        self._decode_head_param_names = tuple(decode_head_param_names)
         self._weight_bank = weight_bank
         self._weight_param_names = tuple(weight_param_names)
         self._prefill_binding = (prefill_program, prefill_param_names, run_config, prefill_host.topology)
@@ -2938,6 +2939,29 @@ class V41ResidentResources:
             self.decode_input = (None if decode_input_host is None else
                                  self._own(InputStateRuntime(self.worker, decode_input_host)))
             self.final = self._own(FinalOutputWeights(self.worker, topology, final_host))
+            self._decode_head_arguments = {
+                "x_hc": None,
+                "pre_mix": None,
+                "final_norm_weight": self.final.norm_weight,
+                "lm_head_weight": self.final.head_weight,
+                "logit_rows": final_host.logit_row_indices,
+                "sampling_temperatures": self.final.sampling_temperatures,
+                "sampling_top_ks": self.final.sampling_top_ks,
+                "sampling_top_ps": self.final.sampling_top_ps,
+                "sampling_seeds": self.final.sampling_seeds,
+                "sampling_positions": self.final.sampling_positions,
+                "logits": final_host.logits,
+                "sampled_ids": final_host.sampled_ids,
+            }
+            head_params = set(self._decode_head_param_names)
+            if (len(head_params) != len(self._decode_head_param_names)
+                    or head_params != self._decode_head_arguments.keys()):
+                missing = sorted(head_params - self._decode_head_arguments.keys())
+                extra = sorted(self._decode_head_arguments.keys() - head_params)
+                raise MissingCompositeInterface(
+                    "V4.1 generation-head ABI differs from the serving binding "
+                    f"(declared={self._decode_head_param_names}, missing={missing}, extra={extra})"
+                )
             self.engram = (None if engram_host is None else self._own(
                 ResidentEngramWeights(self.worker, engram_host)))
             if callable(cache_plan):
@@ -3428,34 +3452,10 @@ class V41ResidentResources:
                 or self._decode_fwd is None):
             raise ValueError("full decode requires the active decode step")
         state = self._decode_fwd.run(state, group_counts=self._group_counts)
-        head_arguments = {
-            "x_hc": state.residual, "pre_mix": state.pre_mix,
-            "final_norm_weight": self.final.norm_weight,
-            "lm_head_weight": self.final.head_weight,
-            "logit_rows": self.final.host.logit_row_indices,
-            "sampling_temperatures": self.final.sampling_temperatures,
-            "sampling_top_ks": self.final.sampling_top_ks,
-            "sampling_top_ps": self.final.sampling_top_ps,
-            "sampling_seeds": self.final.sampling_seeds,
-            "sampling_positions": self.final.sampling_positions,
-            "logits": self.final.host.logits, "sampled_ids": self.final.host.sampled_ids,
-        }
-        head_names = getattr(self._decode_head_program, "param_names", None)
-        if head_names is None and hasattr(self._decode_head_program, "_get_metadata"):
-            head_names = tuple(
-                parameter.name.removesuffix("__ssa_v0")
-                for parameter in self._decode_head_program._get_metadata()[0]
-            )
-        if head_names is None:
-            head_names = tuple(head_arguments)
-        if set(head_names) - set(head_arguments):
-            raise MissingCompositeInterface(
-                "V4.1 generation-head ABI has unknown parameters: "
-                + ", ".join(sorted(set(head_names) - set(head_arguments)))
-            )
+        head_arguments = dict(self._decode_head_arguments, x_hc=state.residual, pre_mix=state.pre_mix)
         self.worker.run(
             self._decode_head_program.compiled,
-            *(head_arguments[name] for name in head_names),
+            *(head_arguments[name] for name in self._decode_head_param_names),
             config=self.run_config,
         )
         return state
@@ -4005,6 +4005,7 @@ def make_production_bindings(
             dspark_programs, dspark_param_names = {}, {}
         prefill, prefill_names = compile_prefill_fwd(compiler, root, prefill_topology)
         head_entry = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd").l3_generation_head
+        decode_head_param_names = tuple(head_entry.param_names)
         decode_head = compiler.compile("v41_generation_head", head_entry)
         abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
         kv_sources, index_sources, c2a_sources = _sources(layers)
@@ -4123,6 +4124,7 @@ def make_production_bindings(
             dspark_lowering_provider=dspark_lowering_provider,
             dspark_host_resources=dspark_host,
             decode_head_program=decode_head,
+            decode_head_param_names=decode_head_param_names,
         )
         _LOG.info("V4.1 resident upload and allocation %.2fs",
                   time.perf_counter() - resident_started)

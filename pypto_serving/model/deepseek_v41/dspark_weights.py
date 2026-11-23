@@ -261,7 +261,7 @@ class V41DSparkWeightContract:
         """Load only the replicated head tensors and normalize main-proj layout.
 
         The checkpoint stores ``main_proj`` as ``[D, 3D]`` while the current
-        lib ABI consumes FP8 ``[3D, D]`` plus block32 E8M0 scales.
+        lib ABI consumes NZ-packed FP8 ``[3D, D]`` plus block32 E8M0 scales.
         """
         values = self.loader.store.load_many(tuple(DSPARK_HEAD_SOURCE_TO_ABI))
         main_proj = values["mtp.0.main_proj.weight"]
@@ -305,7 +305,7 @@ class V41DSparkWeightContract:
         if scale.dtype != torch.float8_e8m0fnu or bool((scale.contiguous().view(torch.uint8) == 255).any()):
             raise ValueError("DSpark main_proj.scale must contain finite E8M0 scales")
         weight, packed_scale = fp8_input_major(main_proj, scale)
-        result["main_proj_weight"] = weight
+        result["main_proj_weight"] = pack_nz(weight)
         result["main_proj_scale"] = packed_scale
         result["confidence_weight"] = confidence.float().contiguous()
         return V41DSparkHeadWeights(result)
