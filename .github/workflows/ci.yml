@@ -169,6 +169,10 @@ jobs:
 
       - name: Run DSpark HTTP guard (K=7, one 8-card server)
         env:
+          # Cold startup compiles the programs and stages weights on all eight ranks.
+          PYPTO_WORKER_INIT_TIMEOUT: '3600'
+          PYPTO_DSV4_STARTUP_TIMEOUT_SECONDS: '3900'
+          PYPTO_DSV4_OVERALL_TIMEOUT_SECONDS: '4500'
           PYPTO_RUNTIME_LOG: error
           PYPTO_DSPARK_EP_SIZE: '8'
           PYPTO_DSPARK_RING_HEAP: '1073741824,1073741824,2147483648,4294967296'
@@ -180,6 +184,9 @@ jobs:
           run_cmd="$run_cmd && TASK_DEVICE=\$TASK_DEVICE"
           run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout"
           run_cmd="$run_cmd PYPTO_DSV4_DSPARK_MODEL_DIR=$PYPTO_DSV4_DSPARK_MODEL_DIR"
+          run_cmd="$run_cmd PYPTO_WORKER_INIT_TIMEOUT=$PYPTO_WORKER_INIT_TIMEOUT"
+          run_cmd="$run_cmd PYPTO_DSV4_STARTUP_TIMEOUT_SECONDS=$PYPTO_DSV4_STARTUP_TIMEOUT_SECONDS"
+          run_cmd="$run_cmd PYPTO_DSV4_OVERALL_TIMEOUT_SECONDS=$PYPTO_DSV4_OVERALL_TIMEOUT_SECONDS"
           run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
           run_cmd="$run_cmd PYPTO_DSPARK_EP_SIZE=$PYPTO_DSPARK_EP_SIZE"
           run_cmd="$run_cmd PYPTO_DSPARK_RING_HEAP=$PYPTO_DSPARK_RING_HEAP"
