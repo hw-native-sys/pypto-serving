@@ -37,8 +37,9 @@ class Session:
                 if future is None or future.done():
                     raise ValueError("unexpected control reply")
                 if "error" in reply:
-                    error_type = CapacityExhausted if reply.get("code") == "capacity_exhausted" else RuntimeError
-                    future.set_exception(error_type(reply["error"]))
+                    error = (CapacityExhausted(reply["error"], stage=reply.get("stage"))
+                             if reply.get("code") == "capacity_exhausted" else RuntimeError(reply["error"]))
+                    future.set_exception(error)
                 else:
                     future.set_result(reply["result"])
         except (Exception, asyncio.CancelledError) as exc:

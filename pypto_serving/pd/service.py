@@ -18,12 +18,13 @@ import msgspec
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.serving.constraints import ConstraintSpec
+from pypto_serving.serving.memory.kv_cache import KVCacheCapacityError
 from pypto_serving.serving.reasoning import OutputParserSpec
 from pypto_serving.tools.observe import record, span
 from .admission import DFirst
 from .planner import (Geometry, SourcePins, merge_ranges, page_indices, page_ranges, physical,
                       plan_chunk, rolling_bounds)
-from .protocol import (Binding, CapacityExhausted, Completion, Continuation, Node, Placement, Plan, Topology,
+from .protocol import (DECODE_RESERVATION, Binding, CapacityExhausted, Completion, Continuation, Node, Placement, Plan, Topology,
                        decode, digest, receive, send)
 from .session import PeerPool, Session
 from .transfer import TransferError
@@ -120,6 +121,7 @@ class Service:
         self.node = Node(self.endpoint.node_id, self.role, boot, contract, digest(self.registry),
                          topology, self.config.provider, self.cache.enable_prefix_cache)
         if self.role == "decode":
+            self.drafter_capacity = self.adapter.drafter_capacity(self.geometry)
             self.listener = await asyncio.start_server(self._accept, "0.0.0.0", self.endpoint.control_port)
         logger.info("ready node=%s role=%s boot=%s prefix=%s", self.node.node_id, self.role,
                     boot, self.node.prefix)
@@ -178,7 +180,8 @@ class Service:
             if not create:
                 raise ValueError("unknown PD request")
             if len(self.requests) >= self.config.capacity:
-                raise CapacityExhausted("PD request capacity exhausted. Retry later.")
+                raise CapacityExhausted("PD request capacity exhausted. Retry later.",
+                                        stage=DECODE_RESERVATION if self.role == "decode" else None)
             entry = self.requests[binding.request] = Request(binding)
         if entry.binding != binding:
             raise ValueError("request binding changed")
@@ -224,6 +227,71 @@ class Service:
         self.observe("finished", entry, cancelled=entry.cancelled, error=entry.error,
                      p_hit=entry.p_hit, d_hit=entry.reservation.prefix_hit_tokens
                      if entry.reservation is not None else 0)
+
+    def _decode_partitions(self, excluded):
+        leases = [0] * self.cache.group_partition_count
+        active = 0
+        for entry in self.requests.values():
+            if entry.reservation is not None:
+                active += 1
+                if not entry.worker_release_ack.is_set():
+                    leases[entry.reservation.partition] += 1
+        if not self.admission.accepts(active, self.core.config.max_num_running_reqs):
+            return ()
+        return tuple(group for group, used in enumerate(leases)
+                     if used < self.drafter_capacity and group not in excluded)
+
+    async def _reserve_decode(self, entry, prompt_tokens, max_new_tokens):
+        request = entry.binding.request
+        requirements = None
+        excluded = set()
+        while partitions := self._decode_partitions(excluded):
+            if entry.cancelled:
+                raise ValueError("request cancelled before resource reservation")
+            if not self.is_ready():
+                raise NodeUnavailable("PD node is unavailable")
+            if requirements is None:
+                entry.prefix = self.adapter.prefix_spec(entry.continuation.tokens, self.cache)
+                requirements = self.admission.requirements(prompt_tokens, max_new_tokens, entry.prefix)
+            restored_partition = None
+            if self.cache.tiering is not None:
+                restored_partition = await self.cache.tiering.restore(
+                    request, requirements["prefix_block_hashes"], prompt_tokens,
+                    maximum=prompt_tokens, groups=requirements["shareable_group_names"], partitions=partitions,
+                    cancelled=lambda: entry.cancelled or not self.is_ready())
+                if restored_partition is not None:
+                    # Waiting for LOAD may have changed both the slot and page budgets.
+                    partitions = self._decode_partitions(excluded)
+                    if not partitions:
+                        break
+                    if restored_partition not in partitions:
+                        excluded.add(restored_partition)
+                        continue
+            try:
+                reservation = self.cache.reserve_group_cache(
+                    request, request, preferred_partition=restored_partition, partitions=partitions, **requirements)
+            except KVCacheCapacityError as exc:
+                raise CapacityExhausted(str(exc), stage=DECODE_RESERVATION) from exc
+            entry.reservation = reservation
+            entry.state_task = asyncio.create_task(self.worker("reserve_state", dict(
+                request=request, partition=reservation.partition, prompt_len=prompt_tokens)))
+            slots = await asyncio.shield(entry.state_task)
+            if entry.cancelled:
+                raise ValueError("request cancelled during state reservation")
+            if not self.is_ready():
+                raise NodeUnavailable("PD node is unavailable")
+            if slots != {"capacity_exhausted": True}:
+                if not isinstance(slots, dict) or not slots:
+                    raise RuntimeError("Worker returned an invalid state reservation")
+                entry.state_slots = slots
+                return reservation
+            # The Worker explicitly confirmed no lease was taken. No source
+            # has received this allocation or been authorized to write to it.
+            self.cache.release_group_cache(request)
+            self.cache.retire_group_cache_reservation(request)
+            entry.reservation = entry.state_task = None
+            excluded.add(reservation.partition)
+        raise CapacityExhausted("Decode has no eligible reservation group. Retry later.", stage=DECODE_RESERVATION)
 
     async def connect(self, node):
         endpoint = self.config.endpoint("decode", node.node_id)
@@ -276,6 +344,8 @@ class Service:
                     reply = dict(id=message["id"], error=str(exc))
                     if isinstance(exc, CapacityExhausted):
                         reply["code"] = "capacity_exhausted"
+                        if exc.stage is not None:
+                            reply["stage"] = exc.stage
                 async with write_lock:
                     await send(writer, reply)
             while True:
@@ -333,35 +403,14 @@ class Service:
             continuation = decode(payload["continuation"], Continuation)
             config = GenerateConfig(**continuation.config)
             self.adapter.validate(config)
-            prefix = self.adapter.prefix_spec(continuation.tokens, self.cache)
             if not continuation.tokens or config.max_new_tokens <= 0:
                 raise ValueError("invalid continuation tokens or generation limit")
             if len(continuation.tokens) + config.max_new_tokens > self.core.config.runtime_config.max_seq_len:
                 raise ValueError("request exceeds model context capacity")
             entry.continuation = continuation
-            entry.prefix = prefix
-            entry.normalized_digest = digest(continuation)
             try:
-                requirements = self.admission.requirements(len(continuation.tokens), config.max_new_tokens, prefix)
-                restored_partition = None
-                if self.cache.tiering is not None:
-                    restored_partition = await self.cache.tiering.restore(
-                        request, requirements["prefix_block_hashes"], len(continuation.tokens),
-                        maximum=len(continuation.tokens), groups=requirements["shareable_group_names"],
-                        cancelled=lambda: entry.cancelled or not self.is_ready())
-                if not self.is_ready():
-                    raise NodeUnavailable("PD node is unavailable")
-                if not self.admission.accepts(sum(r.reservation is not None for r in self.requests.values()),
-                                              self.core.config.max_num_running_reqs):
-                    raise CapacityExhausted("Decode active reservation capacity exhausted. Retry later.")
-                reservation = self.cache.reserve_group_cache(
-                    request, request, preferred_partition=restored_partition, **requirements)
-                entry.reservation = reservation
-                entry.state_task = asyncio.create_task(self.worker("reserve_state", dict(
-                    request=request, partition=reservation.partition, prompt_len=len(continuation.tokens))))
-                entry.state_slots = await asyncio.shield(entry.state_task)
-                if entry.cancelled:
-                    raise ValueError("request cancelled during state reservation")
+                reservation = await self._reserve_decode(entry, len(continuation.tokens), config.max_new_tokens)
+                entry.normalized_digest = digest(continuation)
                 entry.prepared.set()
                 self.observe("reservation", entry, state=reservation.state.value,
                              partition=reservation.partition, d_hit=reservation.prefix_hit_tokens)

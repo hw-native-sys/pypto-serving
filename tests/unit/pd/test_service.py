@@ -23,11 +23,11 @@ import pytest
 
 from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
 from pypto_serving.pd.worker import Progress, ProgressServer, WorkerRuntime, WorkerSettings
-from pypto_serving.pd.adapter import CACHE_COMPONENTS, COMPONENTS, DeepSeekDSpark
+from pypto_serving.pd.adapter import CACHE_COMPONENTS, COMPONENTS, DSparkExtension, DeepSeekDSpark
 from pypto_serving.pd.config import Config, Endpoint
 from pypto_serving.pd.integration import Chunk
 from pypto_serving.pd.planner import Geometry, plan_chunk, rank_mapping
-from pypto_serving.pd.protocol import Binding, CapacityExhausted, Component, Completion, Continuation, Contract, Copy, Node, Placement, Plan, Topology, digest
+from pypto_serving.pd.protocol import DECODE_RESERVATION, Binding, CapacityExhausted, Component, Completion, Continuation, Contract, Copy, Node, Placement, Plan, Topology, digest
 from pypto_serving.pd.service import Service
 from pypto_serving.pd.transfer import Mooncake, Region, TransferError
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
@@ -250,6 +250,7 @@ def service():
     core = SimpleNamespace(kv_cache_manager=cache, scheduler=SimpleNamespace(requests={}), is_ready=lambda: True)
     result = Service(config, config.endpoint("decode"), "decode", None, core, None)
     result.node = d
+    result.drafter_capacity = 64
     return result, p, d
 
 
@@ -285,9 +286,83 @@ def test_active_handoff_capacity_uses_the_retryable_error():
     s, p, d = service()
     s.config = replace(s.config, capacity=1)
     s.entry(Binding.create(p, d, {}), create=True)
-    with pytest.raises(CapacityExhausted):
+    with pytest.raises(CapacityExhausted) as error:
         s.entry(Binding.create(p, d, {}), create=True)
+    assert error.value.stage == DECODE_RESERVATION
     assert len(s.requests) == 1
+
+
+@pytest.mark.parametrize("blocked_by", [None, "lease", "pages", "race", "all", "all_pages", "invalid"])
+def test_decode_places_longest_prefix_with_pages_and_a_worker_lease(blocked_by):
+    async def run():
+        node, p, d = service()
+        tokens = tuple(range(1025))
+        node.cache = node.core.kv_cache_manager = cache(len(tokens), partitions=2, slots=2)
+        node.core.config = SimpleNamespace(max_num_running_reqs=4, runtime_config=SimpleNamespace(max_seq_len=4096))
+        node.adapter = DeepSeekDSpark()
+        node.drafter_capacity = node.adapter.drafter_capacity((Geometry("bootstrap_hidden", (0,), 1, 128, 64, "uint8"),))
+        for partition, hit in enumerate((896, 384)):
+            warm(node.cache, tokens, hit, partition, ("cmp_c128", "cmp_c4", "idx"))
+
+        async def worker(operation, payload):
+            if operation == "reserve_state":
+                assert not node.cache.group_cache_reservation(payload["request"]).write_authorized
+                return ({"capacity_exhausted": True} if blocked_by == "race" and payload["partition"] == 0
+                        else {"bootstrap": 0})
+        node.worker = AsyncMock(side_effect=worker)
+        async def begin(entry, output=32):
+            return await node.control(p, (), "begin", {"binding": msgspec.to_builtins(entry.binding),
+                "continuation": msgspec.to_builtins(Continuation(tokens, {"max_new_tokens": output}, None, None))})
+        def new():
+            return node.register_http(Binding.create(p, d, {}), {})
+
+        if blocked_by in ("lease", "all"):
+            for group in range(2 if blocked_by == "all" else 1):
+                active = new()
+                assert (await begin(active)).partition == group
+        if blocked_by in ("pages", "all_pages"):
+            for group in range(2 if blocked_by == "all_pages" else 1):
+                for i in range(2):
+                    node.cache.ensure_group_blocks(f"busy-{group}-{i}", len(tokens), partition=group)
+            # Only a subset of the physical groups is exhausted.
+            assert node.cache.group_num_free_blocks("ori", 0) == 0
+            assert node.cache.group_num_free_blocks("cmp_c128", 0) > 0
+        node.worker.reset_mock()
+        entry = new()
+        if blocked_by in ("all", "all_pages"):
+            with pytest.raises(CapacityExhausted) as error:
+                await begin(entry)
+            assert error.value.stage == DECODE_RESERVATION
+            if blocked_by == "all":
+                assert entry.prefix is None  # Full leases bypass long prefix lookup.
+            node.worker.assert_not_awaited()
+        elif blocked_by == "invalid":
+            with pytest.raises(ValueError, match="logical generation limit"):
+                await begin(entry, output=1024)
+            node.worker.assert_not_awaited()
+        else:
+            placement = await begin(entry)
+            assert (placement.partition, placement.hit) == ((0, 896) if blocked_by is None else (1, 384))
+            assert [call.args[1]["partition"] for call in node.worker.await_args_list] == (
+                [0, 1] if blocked_by == "race" else [placement.partition])
+            assert all(entry.binding.request not in pool.request_partitions or
+                       pool.request_partitions[entry.binding.request] == placement.partition
+                       for pool in node.cache._group_pools.values())
+        entry.response_closed = True
+        await node.abort(entry, stopped=True)
+        assert node.cache.group_cache_reservation(entry.binding.request) is None
+        assert entry.binding.request not in node.requests
+    asyncio.run(run())
+
+
+def test_worker_reports_a_full_drafter_pool_without_taking_state():
+    extension = DSparkExtension.__new__(DSparkExtension)
+    extension.runner = SimpleNamespace(_drafter_free_leases={0: [], 1: [7]},
+        _reserve_drafter_state=Mock(return_value=SimpleNamespace(lease=7, prompt_len=128)))
+    payload = {"request": "r", "partition": 0, "prompt_len": 128}
+    assert extension.handle("reserve_state", payload) == {"capacity_exhausted": True}
+    extension.runner._reserve_drafter_state.assert_not_called()
+    assert extension.handle("reserve_state", dict(payload, partition=1)) == {"bootstrap": 7}
 
 
 def test_status_reads_current_lease_without_changing_cache():

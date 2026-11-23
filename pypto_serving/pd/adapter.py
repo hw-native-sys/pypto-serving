@@ -47,6 +47,7 @@ class ModelAdapter(Protocol):
     def prefix_spec(self, tokens, cache) -> Prefix: ...
     def state_ranges(self, groups, end): ...
     def contract(self, model, geometry) -> Contract: ...
+    def drafter_capacity(self, geometry) -> int: ...
     def worker_factory(self, **kwargs): ...
     def mapping(self, source_topology, destination_topology, source_partition, destination_partition): ...
 
@@ -65,6 +66,10 @@ TENSORS = dict(zip((c.name for c in CACHE_COMPONENTS), (
 
 
 class DeepSeekDSpark:
+    @staticmethod
+    def drafter_capacity(geometry):
+        return next(region.blocks for region in geometry if region.name == "bootstrap_hidden")
+
     @staticmethod
     def state_ranges(groups, end):
         """Logical state pages covering the terminal tail and its checkpoint.
@@ -277,6 +282,8 @@ class DSparkExtension:
 
     def handle(self, operation, value):
         if operation == "reserve_state":
+            if not self.runner._drafter_free_leases[value["partition"]]:
+                return {"capacity_exhausted": True}
             state = self.runner._reserve_drafter_state(value["request"], group=value["partition"],
                 prompt_len=value["prompt_len"], defer_device_clear=True)
             state.committed_count = state.prompt_len

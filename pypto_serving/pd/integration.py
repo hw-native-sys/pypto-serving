@@ -117,7 +117,10 @@ class Server(ServingServer):
 
     @staticmethod
     async def capacity_exhausted(request, exc):
-        return JSONResponse(dict(object="error", code="capacity_exhausted", message=str(exc)), status_code=503)
+        body = dict(object="error", code="capacity_exhausted", message=str(exc))
+        if exc.stage is not None:
+            body["stage"] = exc.stage
+        return JSONResponse(body, status_code=503)
 
     @staticmethod
     async def unavailable(request, exc):

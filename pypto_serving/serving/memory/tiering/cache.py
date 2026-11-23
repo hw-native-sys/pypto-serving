@@ -74,13 +74,14 @@ class TieredCache:
         self.tier.capture(key, source, self.backend.size(source), pin, charge=self.backend.footprint(source))
 
     async def restore(
-        self, request, hashes, tokens, *, maximum, groups=None, cancelled=lambda: False,
+        self, request, hashes, tokens, *, maximum, groups=None, partitions=None, cancelled=lambda: False,
     ) -> int | None:
         try:
             while True:
                 if cancelled():
                     raise ValueError("request cancelled during cache restore")
-                ready, destination = self.prepare(request, hashes, tokens, maximum=maximum, groups=groups)
+                ready, destination = self.prepare(
+                    request, hashes, tokens, maximum=maximum, groups=groups, partitions=partitions)
                 if ready:
                     return destination
                 pending = self.pending[request]
@@ -175,7 +176,7 @@ class TieredCache:
         resident = pool.hash_to_block.get((partition, value))
         return resident if resident is not None else self.tier.lookup((pool.spec.name, value))
 
-    def _restore_score(self, selected, tables, pressure, shared_cost=None):
+    def _restore_score(self, selected, tables, pressure, shared_cost=None, *, boundary=0, token_count=None):
         resident_free = Counter()
         if shared_cost is None:
             total = 0
@@ -186,21 +187,24 @@ class TieredCache:
                         total += page.size
                         if (selected, *page.key) not in self.loads:
                             fresh_pages[name] += 1
-                    elif page is not None and not page.ref_cnt:
+                    elif token_count is None and page is not None and not page.ref_cnt:
                         resident_free[name] += 1
         else:
             total, fresh_pages = shared_cost
-        if any(self.cache._group_pools[name].num_free_blocks_in(selected) <
-               count + resident_free[name] + 1 for name, count in fresh_pages.items()):
+        if token_count is not None:
+            if not self.cache.can_place_group_prefix(selected, tables, boundary, token_count, fresh_pages):
+                return None
+        elif any(self.cache._group_pools[name].num_free_blocks_in(selected) <
+                 count + resident_free[name] + 1 for name, count in fresh_pages.items()):
             return None
         return (
             total, sum(fresh_pages.values()), pressure[selected],
             (selected - self.cache._next_group_partition) % self.cache.group_partition_count,
         )
 
-    def _ddr_only_partitions(self, hashes, maximum):
+    def _ddr_only_partitions(self, hashes, maximum, partitions=None):
         """Identify destinations with identical logical tables from DDR alone."""
-        remaining = set(range(self.cache.group_partition_count))
+        remaining = set(range(self.cache.group_partition_count) if partitions is None else partitions)
         for name, values in hashes.items():
             pool = self.cache._group_pools[name]
             bound = min(len(values), maximum // pool.spec.spec.token_capacity)
@@ -217,30 +221,32 @@ class TieredCache:
                 break
         return remaining
 
-    def _select(self, hashes, maximum, groups, partition, boundaries):
+    def _select(self, hashes, maximum, groups, partition, boundaries, partitions, token_count):
         pressure = Counter(self.cache._group_request_partitions.values())
         pressure.update(value.partition for value in self.pending.values())
-        ddr_only = self._ddr_only_partitions(hashes, maximum) if partition is None else set()
+        ddr_only = self._ddr_only_partitions(hashes, maximum, partitions) if partition is None else set()
         loading = {key[0] for key in self.loads} if ddr_only else set()
         shared_cost = None
 
-        def score(selected, tables):
+        def score(selected, tables, boundary):
             nonlocal shared_cost
             if selected not in ddr_only or selected in loading:
-                return self._restore_score(selected, tables, pressure)
+                return self._restore_score(selected, tables, pressure, boundary=boundary, token_count=token_count)
             if shared_cost is None:
                 shared_cost = (sum(page.size for pages in tables.values() for page in pages if page is not None),
                                {name: sum(page is not None for page in pages)
                                 for name, pages in tables.items() if any(page is not None for page in pages)})
-            return self._restore_score(selected, tables, pressure, shared_cost)
+            return self._restore_score(selected, tables, pressure, shared_cost,
+                                       boundary=boundary, token_count=token_count)
 
         return self.cache.select_group_prefix_blocks(
             hashes, max_cache_hit_tokens=maximum, shareable_group_names=groups, partition=partition,
             lookup=self._lookup, shared_checkpoint_boundaries=boundaries, score=score,
-            equivalent_partitions=ddr_only,
+            equivalent_partitions=ddr_only, partitions=partitions,
         )
 
-    def prepare(self, request, hashes, tokens, *, maximum, groups=None, partition=None) -> tuple[bool, int | None]:
+    def prepare(self, request, hashes, tokens, *, maximum, groups=None, partition=None,
+                partitions=None) -> tuple[bool, int | None]:
         """Report readiness and the partition of a completed restore, if any."""
         started_ns = time.monotonic_ns() if self.trace is not None else 0
         if self.tier.error:
@@ -253,10 +259,13 @@ class TieredCache:
                                                  pending.partition, {}, pending.boundary)
             self.cancel(request, completed=True)
             return True, pending.partition
-        match = self.match_prefix(hashes, maximum, groups=groups, partition=partition)
-        return not self.start_restore(request, hashes, tokens, match, started_ns=started_ns), None
+        match = self.match_prefix(hashes, maximum, groups=groups, partition=partition,
+                                  partitions=partitions, token_count=tokens if partitions is not None else None)
+        return not self.start_restore(request, hashes, tokens, match, started_ns=started_ns,
+                                      headroom=int(partitions is None)), None
 
-    def match_prefix(self, hashes, maximum, *, groups=None, partition=None, score=True):
+    def match_prefix(self, hashes, maximum, *, groups=None, partition=None, score=True,
+                     partitions=None, token_count=None):
         """Read a candidate without changing page ownership or eviction order."""
         if maximum <= 0 or not self.tier.pages:
             return {}, 0, None
@@ -267,10 +276,10 @@ class TieredCache:
                 hashes[name][boundary // sizes[name] - 1] == value for name, value in identity)
         }
         if score:
-            return self._select(hashes, maximum, groups, partition, boundaries)
+            return self._select(hashes, maximum, groups, partition, boundaries, partitions, token_count)
         return self.cache.select_group_prefix_blocks(
             hashes, max_cache_hit_tokens=maximum, shareable_group_names=groups, partition=partition,
-            lookup=self._lookup, shared_checkpoint_boundaries=boundaries,
+            lookup=self._lookup, shared_checkpoint_boundaries=boundaries, partitions=partitions,
         )
 
     def restore_demand(self, tables, partition):
@@ -298,7 +307,7 @@ class TieredCache:
                 if page is not None:
                     self.tier.touch(page.key if isinstance(page, Page) else (name, page.block_hash))
 
-    def start_restore(self, request, hashes, tokens, match, *, reserve_step=None, started_ns=0):
+    def start_restore(self, request, hashes, tokens, match, *, reserve_step=None, started_ns=0, headroom=1):
         """Take destination/step pages before making a LOAD visible to the backend."""
         tables, boundary, selected = match
         if not boundary:
@@ -330,7 +339,8 @@ class TieredCache:
         try:
             if fresh:
                 targets, target_pin = self.cache.reserve_group_restore_pages(
-                    tuple((key[1], key[2]) for key in fresh), selected, headroom=int(reserve_step is None))
+                    tuple((key[1], key[2]) for key in fresh), selected,
+                    headroom=headroom if reserve_step is None else 0)
             if reserve_step is not None:
                 targets_for_step = {**{page.key: self.loads[key].block for key, page in missing.items()
                                        if key in self.loads}, **targets}

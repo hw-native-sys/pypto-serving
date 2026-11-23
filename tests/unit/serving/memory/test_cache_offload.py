@@ -238,7 +238,8 @@ def test_async_shared_restore_cancel_and_unknown(outcome):
 
 
 @pytest.mark.parametrize('cancelled', [False, True])
-def test_d_reserves_only_after_its_independent_history_restore(cancelled):
+@pytest.mark.parametrize('blocked_by', [None, 'lease', 'pages'])
+def test_d_reserves_only_after_its_independent_history_restore(cancelled, blocked_by):
     from pypto_serving.pd.adapter import DeepSeekDSpark
     from pypto_serving.pd.protocol import Binding, Continuation
     from tests.unit.pd.test_service import service
@@ -253,7 +254,16 @@ def test_d_reserves_only_after_its_independent_history_restore(cancelled):
         node.cache = node.core.kv_cache_manager = cache
         node.core.config = SimpleNamespace(max_num_running_reqs=8, runtime_config=SimpleNamespace(max_seq_len=655360))
         node.adapter, calls = DeepSeekDSpark(), []
+        if blocked_by == 'lease':
+            node.drafter_capacity = 1
+            active = node.register_http(Binding.create(source, destination, {}), {})
+            active.reservation = SimpleNamespace(partition=2)
+        elif blocked_by == 'pages':
+            for index in range(5):
+                cache.ensure_group_blocks(f"busy-{index}", 512, partition=2)
+            assert cache.group_num_free_blocks('ori', 2) == 0
         cache._next_group_partition = 2
+        target = 2 if blocked_by is None else 3
         async def worker(operation, payload):
             calls.append(operation)
             assert not tier.pending
@@ -264,7 +274,7 @@ def test_d_reserves_only_after_its_independent_history_restore(cancelled):
             continuation=msgspec.to_builtins(Continuation(tuple(tokens), {'max_new_tokens': 32}, None, None)))))
         await until(lambda: bool(tier.loads))
         assert entry.reservation is None and not calls
-        assert {partition for partition, _, _ in tier.loads} == {2}
+        assert {partition for partition, _, _ in tier.loads} == {target}
         assert all(name in ('cmp_c128', 'cmp_c4', 'idx') for _, name, _ in tier.loads)
         if cancelled:
             await node.abort(entry, stopped=True)
@@ -275,7 +285,7 @@ def test_d_reserves_only_after_its_independent_history_restore(cancelled):
         await until(lambda: not tier.loads)
         if not cancelled:
             placement = await task
-            assert (placement.hit, placement.partition) == (512, 2)
+            assert (placement.hit, placement.partition) == (512, target)
             assert calls == ['reserve_state']
             await node.abort(entry, stopped=True)
         await session.close()

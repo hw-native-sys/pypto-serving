@@ -871,6 +871,8 @@ class KvCacheManager:
         shareable_group_names: tuple[str, ...] | None = None,
         partition: int | None = None,
         preferred_partition: int | None = None,
+        partitions: Sequence[int] | None = None,
+        token_count: int | None = None,
     ) -> tuple[dict[str, list[int]], int, int | None]:
         if not self.enable_prefix_cache or not self._group_pools:
             return {}, 0, None
@@ -879,7 +881,9 @@ class KvCacheManager:
         best_blocks, best_hit_tokens, best_partition = self.select_group_prefix_blocks(
             block_hashes, max_cache_hit_tokens=max_cache_hit_tokens,
             shareable_group_names=shareable_group_names, partition=partition,
-            preferred_partition=preferred_partition)
+            preferred_partition=preferred_partition, partitions=partitions,
+            score=(lambda owner, blocks, hit: () if self.can_place_group_prefix(
+                owner, blocks, hit, token_count) else None) if token_count is not None else None)
         if best_partition is None or not best_hit_tokens:
             return {}, 0, None
         return self.claim_group_prefix_blocks(request_id, best_blocks, best_hit_tokens, best_partition)
@@ -906,7 +910,7 @@ class KvCacheManager:
     def select_group_prefix_blocks(
         self, block_hashes, *, max_cache_hit_tokens, shareable_group_names=None, partition=None,
         lookup=None, shared_checkpoint_boundaries=(), score=None, preferred_partition=None,
-        equivalent_partitions=(),
+        equivalent_partitions=(), partitions=None,
     ):
         """Select the longest complete grouped prefix without mutating ownership.
 
@@ -964,14 +968,12 @@ class KvCacheManager:
         best_blocks: dict[str, list[KVCacheBlock | None]] = {}
         best_score = ()
         equivalent_match = None
-        candidate_partitions = (
-            range(self.group_partition_count)
-            if partition is None
-            else (partition,)
-        )
+        candidate_partitions = range(self.group_partition_count) if partitions is None else partitions
         if partition is not None and not 0 <= partition < self.group_partition_count:
             raise ValueError(f"Invalid cache partition {partition}")
-        if partition is None and preferred_partition is not None:
+        if partition is not None:
+            candidate_partitions = (partition,) if partition in candidate_partitions else ()
+        elif preferred_partition is not None and preferred_partition in candidate_partitions:
             candidate_partitions = (preferred_partition, *(owner for owner in candidate_partitions
                                                            if owner != preferred_partition))
         request_limit = next(iter(self._group_pools.values())).spec.max_requests_per_partition
@@ -1065,7 +1067,7 @@ class KvCacheManager:
                     equivalent_match = candidate, candidate_blocks
 
             if candidate and candidate >= best_hit_tokens:
-                rank = score(candidate_partition, candidate_blocks) if score is not None else ()
+                rank = score(candidate_partition, candidate_blocks, candidate) if score is not None else ()
                 if rank is None or (candidate == best_hit_tokens and rank >= best_score):
                     continue
                 best_partition = candidate_partition
@@ -1529,19 +1531,19 @@ class KvCacheManager:
         table_size = min(target, pool.spec.max_blocks_per_seq)
         missing = max(0, table_size - len(owned))
         missing += sum(block is None for block in owned[:table_size])
-        shared_slots = set()
-        for logical_block in range(previous, target):
-            slot = (
-                logical_block
-                if logical_block < pool.spec.max_blocks_per_seq
-                else logical_block % pool.spec.max_blocks_per_seq
-            )
+        if not owned:
+            return missing
+        # A complete ring traversal already covers every possible COW slot.
+        ring = pool.spec.max_blocks_per_seq
+        shared_slots = 0
+        for logical_block in range(previous, min(target, previous + ring)):
+            slot = logical_block % ring
             if slot >= len(owned):
                 continue
             block = owned[slot]
             if block is not None and (pinned or block.ref_cnt > 1):
-                shared_slots.add(slot)
-        return missing + len(shared_slots)
+                shared_slots += 1
+        return missing + shared_slots
 
     def can_place_group_prefix(self, partition, blocks, boundary, token_count, fresh=None):
         """Check a prefix plus its first write in every pool without taking references."""
@@ -1783,12 +1785,13 @@ class KvCacheManager:
         prefix_block_hashes: dict[str, list[bytes]] | None = None,
         shareable_group_names: tuple[str, ...] = (),
         preferred_partition: int | None = None,
+        partitions: Sequence[int] | None = None,
     ) -> GroupCacheReservation:
         return self.reservations.reserve_group_cache(
             reservation_id, request_id, token_capacity, partition=partition,
             prompt_token_count=prompt_token_count, prefix_block_hashes=prefix_block_hashes,
             shareable_group_names=shareable_group_names,
-            preferred_partition=preferred_partition,
+            preferred_partition=preferred_partition, partitions=partitions,
         )
 
     def group_cache_reservation(self, reservation_id: str) -> GroupCacheReservation | None:

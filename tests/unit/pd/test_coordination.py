@@ -18,7 +18,8 @@ import msgspec
 import pytest
 from starlette.requests import Request
 
-from pypto_serving.pd.protocol import Binding, Component, Contract, Node, Topology
+from pypto_serving.pd.protocol import DECODE_RESERVATION, Binding, Component, Contract, Node, Topology
+from pypto_serving.pd.reservation_queue import ReservationQueue, ReservationWaiter
 from pypto_serving.router.app import ServingRouter
 from pypto_serving.router.config import ReplicaSpec, RouterConfig
 
@@ -30,9 +31,15 @@ def config(p=1, d=1):
         observability={"enabled": False}, health_interval_seconds=60)
 
 
-def request(payload):
+def request(payload, disconnect=None):
+    body = json.dumps(payload).encode()
     async def receive():
-        return {"type": "http.request", "body": json.dumps(payload).encode()}
+        nonlocal body
+        if body is not None:
+            message, body = {"type": "http.request", "body": body}, None
+            return message
+        await (disconnect if disconnect is not None else asyncio.Event()).wait()
+        return {"type": "http.disconnect"}
     return Request({"type": "http", "method": "POST", "path": "/v1/completions",
                     "headers": [(b"x-session-id", b"conversation")]}, receive)
 
@@ -79,6 +86,155 @@ class Peers:
 def assert_idle(router):
     assert not router.proxy.active
     assert all(s.outstanding == 0 for s in router.registry.states)
+
+
+class ReservationPeers(Peers):
+    def __init__(self, cfg, *, rejects=1, stage=DECODE_RESERVATION, source="d0"):
+        super().__init__(cfg)
+        self.rejects, self.stage, self.source = rejects, stage, source
+        self.replies, self.aborts, self.placed, self.attempts = {}, {}, set(), []
+        self.release_output = asyncio.Event()
+        self.abort_status = 200
+
+    async def handle(self, req):
+        path, name = req.url.path, req.url.host
+        if path.endswith("descriptor"):
+            return await super().handle(req)
+        if path.endswith("abort"):
+            binding = json.loads(req.content)["request"]
+            self.aborts.setdefault(binding, asyncio.Event()).set()
+            return httpx.Response(self.abort_status)
+        if "/requests/" in path:
+            binding = path.rsplit("/", 1)[1]
+            return httpx.Response(200, json=dict(request=binding, node=msgspec.to_builtins(self.nodes[name]),
+                reservation={"state": "CONSTRUCTING"}, worker={"state_reservation_confirmed": binding in self.placed}))
+        binding = json.loads(req.headers["x-pd-context"])["binding"]["request"]
+        reply = self.replies.setdefault(binding, asyncio.get_running_loop().create_future())
+        if name == "d0":
+            self.attempts.append(binding)
+            rejected = len(self.attempts) <= self.rejects
+            reply.set_result(rejected)
+            if not rejected:
+                self.placed.add(binding)
+        if await reply:
+            if name != self.source:
+                await self.aborts.setdefault(binding, asyncio.Event()).wait()
+            return httpx.Response(503, json={"code": "capacity_exhausted", "stage": self.stage})
+        if json.loads(req.content).get("prompt") == "held":
+            await self.release_output.wait()
+        return await super().handle(req)
+
+
+async def until(predicate):
+    async def check():
+        while not predicate():
+            await asyncio.sleep(0.001)
+    await asyncio.wait_for(check(), 1)
+
+
+@pytest.mark.parametrize("stream,source", [(True, "d0"), (False, "p0")])
+def test_decode_capacity_retries_only_after_old_attempt_retires(stream, source):
+    async def run():
+        cfg = config()
+        peers = ReservationPeers(cfg, source=source)
+        router = peers.router(cfg)
+        async with router.app.router.lifespan_context(router.app):
+            task = asyncio.create_task(router.proxy.forward(request({"stream": stream}), "/v1/completions"))
+            await until(lambda: router.proxy.reservations.pending)
+            assert len(peers.attempts) == 1 and peers.aborts[peers.attempts[0]].is_set()
+            assert all(state.outstanding == 0 for state in router.registry.states)
+            router.proxy.reservations.released()
+            response = await task
+            assert response.status_code == 200 and len(set(peers.attempts)) == 2
+            if stream:
+                assert "answer" in "".join([part async for part in response.body_iterator])
+            assert_idle(router)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("reason", ["cancel", "timeout", "retry_timeout", "unstaged", "unconfirmed"])
+def test_waiting_and_failed_retirement_do_not_submit_another_request(reason):
+    async def run():
+        cfg = config()
+        cfg.pd_options.update(handoff_timeout=0.06, request_timeout=0.25 if reason == "retry_timeout" else 0.08)
+        peers = ReservationPeers(cfg, rejects=2 if reason == "retry_timeout" else 1,
+                                 stage=None if reason == "unstaged" else DECODE_RESERVATION)
+        if reason == "unconfirmed":
+            peers.abort_status = 503
+        router = peers.router(cfg)
+        disconnect = asyncio.Event()
+        async with router.app.router.lifespan_context(router.app):
+            task = asyncio.create_task(router.proxy.forward(request({}, disconnect), "/v1/completions"))
+            if reason == "cancel":
+                await until(lambda: router.proxy.reservations.pending)
+                disconnect.set()
+            if reason == "retry_timeout":
+                await until(lambda: router.proxy.reservations.pending)
+                assert router.proxy.reservations.pending[0].position == 5
+                router.proxy.reservations.released()
+                await until(lambda: len(peers.attempts) == 2 and router.proxy.reservations.pending)
+                assert router.proxy.reservations.pending[0].position == 4
+            result = await task
+            assert result.status_code == (499 if reason == "cancel" else 503)
+            if reason in ("timeout", "retry_timeout"):
+                assert "Timed out waiting for Decode" in json.loads(result.body)["message"]
+            if reason == "unconfirmed":
+                assert json.loads(result.body)["code"] == "pd_retirement_unconfirmed"
+            router.proxy.reservations.released()
+            assert len(peers.attempts) == (2 if reason == "retry_timeout" else 1)
+            assert not router.proxy.reservations
+            assert_idle(router)
+    asyncio.run(run())
+
+
+def test_protected_json_releases_queue_on_reservation_before_output(monkeypatch):
+    monkeypatch.setattr("pypto_serving.pd.coordinator.RETRY_INTERVAL", 0.02)
+    async def run():
+        cfg = config()
+        cfg.pd_options.update(capacity=3, reservation_retry_position=1)
+        peers = ReservationPeers(cfg)
+        router = peers.router(cfg)
+        async with router.app.router.lifespan_context(router.app):
+            held = asyncio.create_task(router.proxy.forward(request({"prompt": "held"}), "/v1/completions"))
+            await until(lambda: router.proxy.reservations.pending)
+            router.proxy.reservations.released()
+            await until(lambda: bool(peers.placed))
+            assert router.proxy.reservations.protected is not None
+            response = await router.proxy.forward(request({}), "/v1/completions")
+            assert response.status_code == 200 and not held.done()
+            peers.release_output.set()
+            assert (await held).status_code == 200
+            assert_idle(router)
+    asyncio.run(run())
+
+
+def test_retry_priority_advances_and_protects_the_first_level_one_waiter():
+    async def run():
+        queue = ReservationQueue(8, 5)
+        primary, other = ReservationWaiter(), ReservationWaiter(position=2)
+        for position in (5, 4, 3, 2, 1):
+            ahead = [ReservationWaiter() for _ in range(5)]
+            for waiter in ahead:
+                queue.put(waiter)
+            queue.put(primary, generation=queue.generation, rejected=True)
+            assert queue.pending[position - 1] is primary and primary.position == position
+            for waiter in ahead:
+                queue.leave(waiter)
+            assert not queue.take(primary)
+            queue.released()
+            assert queue.take(primary)
+        queue.put(other, generation=queue.generation, rejected=True)
+        queue.released()
+        assert not queue.take(other)
+        queue.put(primary, generation=queue.generation, rejected=True)
+        assert list(queue.pending) == [primary, other] and not queue.take(other)
+        queue.released()
+        assert queue.take(primary)
+        queue.leave(primary)
+        assert queue.take(other)
+        queue.leave(other)
+        assert not queue
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -131,13 +287,15 @@ def test_pool_rotation_health_and_new_boot():
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("prefill_error", [False, True])
+@pytest.mark.parametrize("prefill_error", [False, True, "capacity"])
 def test_sse_error_keeps_stream_boundary(prefill_error):
     async def run():
         cfg = config()
         peers = Peers(cfg)
         peers.p_hold = asyncio.Event()
-        if prefill_error:
+        if prefill_error == "capacity":
+            peers.errors["p0"] = httpx.Response(503, json={"code": "capacity_exhausted", "stage": DECODE_RESERVATION})
+        elif prefill_error:
             peers.errors["p0"] = httpx.Response(422, json={"detail": "prefill failed"})
         else:
             peers.stream_body = 'data: {"error":{"message":"decode failed"}}\n\ndata: [DONE]\n\n'
@@ -151,6 +309,7 @@ def test_sse_error_keeps_stream_boundary(prefill_error):
             errors = [json.loads(line[6:])["error"] for line in body.splitlines()
                       if line.startswith("data: {") and "error" in json.loads(line[6:])]
             assert len(errors) == 1 and body.endswith("data: [DONE]\n\n")
+            assert len(peers.requests) == 2
             if prefill_error:
                 assert errors[0]["source"] == "upstream"
             else:
