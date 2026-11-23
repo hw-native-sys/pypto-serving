@@ -132,7 +132,9 @@ class EngineConfig:
         return min_tokens if self.sampling_capabilities().honor_min_tokens else 0
 
     def validate_generate_config(self, config, *, constraint_spec=None):
-        self.execution_policy().validate_generate_config(config,constraint_spec=constraint_spec)
+        if self.sampling_capabilities().greedy_only and not config.temperature <= 0:
+            raise ValueError("V4.1 K5 DSpark supports greedy sampling only; set temperature=0 or use K0")
+        self.execution_policy().validate_generate_config(config, constraint_spec=constraint_spec)
 
     def sampling_capabilities(self) -> SamplingCapabilities:
         return sampling_capabilities(
@@ -142,15 +144,20 @@ class EngineConfig:
     def resolve_runtime_config(self) -> RuntimeConfig:
         """Return runtime settings with executor requirements resolved."""
         runtime = self.runtime_config or RuntimeConfig()
+        if runtime.chip_runtime != "tensormap_and_ringbuffer" and self.executor_cls != "PyptoQwen14BExecutor":
+            raise ValueError("host_build_graph serving currently requires PyptoQwen14BExecutor")
         is_deepseek_v4 = self.executor_cls == "PyptoDeepSeekV4Executor"
         homogeneous_prefill_decode = (
             runtime.requires_homogeneous_prefill_decode or is_deepseek_v4
         )
-        if runtime.requires_homogeneous_prefill_decode == homogeneous_prefill_decode:
+        retention_interval = runtime.prefix_cache_retention_interval if self.enable_prefix_cache else 0
+        if (runtime.requires_homogeneous_prefill_decode == homogeneous_prefill_decode
+                and runtime.prefix_cache_retention_interval == retention_interval):
             return runtime
         return replace(
             runtime,
             requires_homogeneous_prefill_decode=homogeneous_prefill_decode,
+            prefix_cache_retention_interval=retention_interval,
         )
 
     def worker_device_ids(self) -> tuple[int, ...]:
@@ -258,12 +265,20 @@ class ReplicaEngineCore:
             block_size=block_size,
             enable_prefix_cache=self.config.enable_prefix_cache,
         )
+        self._cache_tiering = None
+        if runtime.kv_offload_bytes < 0:
+            raise ValueError("DDR offload capacity must not be negative")
+        if runtime.kv_offload_bytes:
+            from pypto_serving.serving.memory.tiering.integration import Session
+            self._cache_tiering = Session(self)
+            self.config = self._cache_tiering.configure(self.config)
         self._async_scheduling = self.config.resolve_async_scheduling()
         scheduler_config = SchedulerConfig(
             max_num_running_reqs=self.config.max_num_running_reqs,
             max_num_scheduled_tokens=self.config.max_num_scheduled_tokens,
             long_prefill_token_threshold=self.config.long_prefill_token_threshold,
             max_prefill_tokens_per_request=runtime.max_prefill_tokens_per_request,
+            prefill_chunk_alignment=runtime.prefill_chunk_alignment,
             prefill_chunk_size_choices=runtime.prefill_chunk_size_choices,
             max_seq_len=runtime.max_seq_len,
             enable_prefix_cache=self.config.enable_prefix_cache,
@@ -273,6 +288,8 @@ class ReplicaEngineCore:
                 runtime.supports_chunked_prefill_with_speculation
             ),
             speculative_prefix_cache_replay_tokens=runtime.speculative_prefix_cache_replay_tokens,
+            prefix_cache_replay_before_hit=runtime.prefix_cache_replay_before_hit,
+            prefix_cache_retention_interval=runtime.prefix_cache_retention_interval,
             requires_homogeneous_prefill_decode=(
                 runtime.requires_homogeneous_prefill_decode
             ),
@@ -366,6 +383,8 @@ class ReplicaEngineCore:
     async def start(self) -> None:
         """Start worker process and engine loop."""
         with profile_span("AsyncLLMEngine.start", cat="serving"):
+            worker_options = ({"on_starting": self._cache_tiering.worker_starting}
+                              if self._cache_tiering is not None else {})
             (
                 process,
                 input_q,
@@ -373,7 +392,7 @@ class ReplicaEngineCore:
                 profile_output_q,
                 ready_event,
                 cache_capacity,
-            ) = self._worker_factory(self.config)
+            ) = self._worker_factory(self.config, **worker_options)
             self._worker_process = process
             self._input_queue = input_q
             self._output_queue = output_q
@@ -418,6 +437,8 @@ class ReplicaEngineCore:
                     self._runtime.page_size,
                 )
 
+        if self._cache_tiering is not None:
+            await self._cache_tiering.start()
         # The KV-cache block pool, scheduler tables and tokenizer are now
         # resident. Freeze the engine-process heap so the GC won't rescan them
         # during serving (see gc_utils). Per-process: the worker freezes its
@@ -453,6 +474,15 @@ class ReplicaEngineCore:
         """
         self._running = False
         await self._drain_loop_task()
+        try:
+            if self._cache_tiering is not None:
+                await self._cache_tiering.close()
+        except BaseException:
+            try:
+                await asyncio.to_thread(self._shutdown_worker, timeout=30)
+            except Exception:
+                logger.exception("Worker shutdown failed after DDR close failed; mappings remain retained")
+            raise
         reaped = await asyncio.to_thread(self._shutdown_worker, timeout=30)
         if reaped:
             logger.info("ReplicaEngineCore stopped")
@@ -562,7 +592,7 @@ class ReplicaEngineCore:
         for request in self.scheduler.requests.values():
             if request.status.is_finished:
                 continue
-            prompt_remaining = max(0, request.num_prompt_tokens - request.num_computed_tokens)
+            prompt_remaining = max(0, request.num_prefill_tokens - request.num_computed_tokens)
             generation_remaining = max(0, request.max_new_tokens - len(request.output_token_ids))
             load += prompt_remaining + generation_remaining
         return load
@@ -593,6 +623,7 @@ class ReplicaEngineCore:
                 arrival_time=time.time(),
                 stop_strings=tuple(config.stop) if config.stop else (),
                 eos_token_id=self.tokenizer.eos_token_id,
+                eos_token_ids=getattr(self.tokenizer, "eos_token_ids", ()),
                 ignore_eos=config.ignore_eos,
                 temperature=config.temperature,
                 top_p=config.top_p,
@@ -648,8 +679,10 @@ class ReplicaEngineCore:
                 output: TokenOutput = queued
                 if output.finished:
                     try:
+                        tiering = getattr(self, "_cache_tiering", None)
                         await asyncio.wait_for(
-                            ctx.worker_release_done.wait(),
+                            tiering.wait_worker_release(ctx.worker_release_done) if tiering is not None
+                            else ctx.worker_release_done.wait(),
                             timeout=self._step_timeout,
                         )
                     except TimeoutError as exc:
@@ -876,10 +909,17 @@ class ReplicaEngineCore:
             cat="scheduler",
             args={"scheduled": len(scheduler_output.scheduled_requests)},
         ):
-            step_cmd = self._build_step_command(
-                scheduler_output, finished_ids, step_id=self._step_counter
-            )
-            self._input_queue.put(encode_command(step_cmd))
+            try:
+                step_cmd = self._build_step_command(
+                    scheduler_output, finished_ids, step_id=self._step_counter
+                )
+                encoded = encode_command(step_cmd)
+            except Exception:
+                # Nothing reached the worker: release pre-dispatch read pins.
+                for scheduled in scheduler_output.scheduled_requests:
+                    self.scheduler.discard_scheduled_request(scheduled)
+                raise
+            self._input_queue.put(encoded)
         reregistered_ids = {
             request.request_id for request in step_cmd.new_requests
         }
@@ -997,8 +1037,8 @@ class ReplicaEngineCore:
     ) -> StepCommand:
         """Build a lightweight StepCommand from the scheduler output.
 
-        Prompt tokens for requests that the worker has not yet seen are shipped
-        as ``NewRequestData`` entries exactly once; subsequent steps carry only
+        Prefill tokens for each worker registration, including committed tokens
+        after preemption, are shipped once as ``NewRequestData``. Later steps carry only
         per-request deltas (~1 KB total at batch 16).
 
         In async mode a decode input token for step N+1 may not be sampled yet
@@ -1033,13 +1073,14 @@ class ReplicaEngineCore:
                     receipt.clear()
                 new_requests.append(NewRequestData(
                     request_id=req_id,
-                    prompt_token_ids=list(req.prompt_token_ids),
+                    prompt_token_ids=list(req.prefill_token_ids),
                     temperature=req.temperature,
                     top_p=req.top_p,
                     top_k=req.top_k,
                     seed=req.seed,
                     min_tokens=req.min_tokens,
                     eos_token_id=req.eos_token_id,
+                    eos_token_ids=req.eos_token_ids,
                     initial_output_tokens=len(req.output_token_ids),
                     max_output_tokens=req.max_new_tokens,
                     execution_generation=req.execution_generation,
@@ -1055,7 +1096,7 @@ class ReplicaEngineCore:
             if sr.is_prefill:
                 num_computed = sr.num_computed_tokens
                 num_new = sr.num_new_tokens
-                chunk_tokens = req.prompt_token_ids[num_computed: num_computed + num_new]
+                chunk_tokens = req.prefill_token_ids[num_computed: num_computed + num_new]
                 prefill_requests.append(PrefillRequest(
                     request_id=req_id,
                     chunk_tokens=list(chunk_tokens),
@@ -1068,6 +1109,11 @@ class ReplicaEngineCore:
                     cache_partition=sr.cache_partition,
                     model_extension=self._policy().prefill_metadata(
                         sr,is_new=any(r.request_id==req_id for r in new_requests),cache=self.kv_cache_manager),
+                    prefix_cache_hit_tokens=req.prefix_cache_hit_tokens,
+                    read_block_ids_by_group=sr.read_block_ids_by_group,
+                    checkpoint_ends=sr.checkpoint_plan.boundaries if sr.checkpoint_plan else (),
+                    state_write_block_ids_by_group=sr.checkpoint_plan.write_blocks if sr.checkpoint_plan else {},
+                    checkpoint_block_ids_by_group=sr.checkpoint_plan.publication_blocks if sr.checkpoint_plan else {},
                 ))
             else:
                 output_ids = req.output_token_ids
@@ -1885,6 +1931,7 @@ class AsyncLLMEngine:
         output_parser_spec: OutputParserSpec | None = None,
         constraint_spec: ConstraintSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
+        self.validate_generate_config(config, constraint_spec=constraint_spec)
         arrival_monotonic = time.monotonic()
         replica_idx = self._select_replica()
         prompt_token_ids = self._tokenize_prompt(prompt)

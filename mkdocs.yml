@@ -96,12 +96,15 @@ nav:
           - Online Serving: user-guide/online-serving.md
           - Tool Calling: user-guide/tool-calling.md
           - PD Disaggregation: user-guide/pd-disaggregation.md
+          - DDR Prefix Cache: user-guide/kv-cache-offload.md
           - Parallelism and Scaling: user-guide/parallel.md
           - Multi-Node Routing: user-guide/multi-node-routing.md
           - Troubleshooting: user-guide/troubleshooting.md
   - Models:
       - Overview: models/index.md
       - Qwen3-14B: models/qwen3-14b.md
+      - GLM-5.3-Flash: models/glm53.md
+      - GLM-5.3-Flash Optimization: models/glm53-optimization.md
       - DeepSeek V4:
           - Overview: models/deepseek-v4/index.md
           - MTP Deployment: models/deepseek-v4/mtp.md
@@ -118,6 +121,10 @@ nav:
   - Developer Guide:
       - Architecture: developer-guide/architecture.md
       - Profiling: developer-guide/profile.md
+      - Accuracy Debugging: developer-guide/accuracy-debugging.md
+      - Feature Development: developer-guide/feature-development.md
+      - V4.1 Cache Migration: developer-guide/v41-cache-migration.md
       - Model Integration: developer-guide/model-integration.md
       - Weight Staging: developer-guide/weight-staging.md
+      - V4.1 Engram and Decode Optimization: developer-guide/v41-engram-decode-optimization.md
       - JIT Cache: developer-guide/jit-cache.md

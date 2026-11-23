@@ -46,7 +46,7 @@ class NewRequestData(msgspec.Struct):
     """Full request data sent when a request is scheduled or restarted.
 
     The worker caches this and references it by ``request_id`` for the lifetime
-    of the registration. ``prompt_token_ids`` are not re-sent until a restart.
+    of the registration. ``prompt_token_ids`` includes committed tokens on a recompute restart.
     """
 
     request_id: str
@@ -57,6 +57,7 @@ class NewRequestData(msgspec.Struct):
     seed: int | None = None
     min_tokens: int = 0
     eos_token_id: int | None = None
+    eos_token_ids: tuple[int, ...] | None = None
     initial_output_tokens: int = 0
     constraint_spec: dict[str, Any] | None = None
     # The target cache was adopted from a preinitialized cache lease.  This is
@@ -85,6 +86,12 @@ class PrefillRequest(msgspec.Struct):
     # Model-specific grouped cache tables and their stable rank partition.
     block_ids_by_group: dict[str, list[int]] = msgspec.field(default_factory=dict)
     cache_partition: int | None = None
+    # Absolute logical page -> retained physical page, only for entry history.
+    read_block_ids_by_group: dict[str, dict[int, int]] = msgspec.field(default_factory=dict)
+    checkpoint_ends: tuple[int, ...] = ()
+    state_write_block_ids_by_group: dict[str, list[int]] = msgspec.field(default_factory=dict)
+    checkpoint_block_ids_by_group: dict[str, dict[int, int]] = msgspec.field(default_factory=dict)
+    prefix_cache_hit_tokens: int = 0
     model_extension: bytes = b""
 
 

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import dataclasses
+from contextlib import contextmanager
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -21,6 +22,50 @@ if TYPE_CHECKING:
     from pypto.runtime import RunConfig
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _runtime_compile_config(config: "RunConfig"):
+    """Align codegen/cache runtime with metadata without replacing caller policy."""
+    from pypto.pypto_core import passes
+
+    runtime = passes.runtime_kind_from_name(config.distributed_config.runtime)
+    outer = passes.PassContext.current()
+    if outer is not None:
+        if outer.get_runtime() != runtime:
+            raise ValueError(
+                f"Active PassContext runtime {passes.runtime_kind_to_name(outer.get_runtime())!r} "
+                f"conflicts with configured chip runtime {config.distributed_config.runtime!r}"
+            )
+        # Let JIT retain its existing explicit-option conflict checks and every
+        # ambient instrument, diagnostic, planner and future context option.
+        yield config
+        return
+
+    options = {
+        "runtime": runtime,
+        "verification_level": passes.get_default_verification_level(),
+        "diagnostic_phase": passes.get_default_diagnostic_phase(),
+    }
+    projected = {}
+    for field in ("memory_planner", "diagnostic_phase", "enable_software_pipeline"):
+        value = getattr(config, field, None)
+        if value is not None:
+            options[field] = value
+            projected[field] = None
+    if options.get("enable_software_pipeline") is not None:
+        options["enable_buffer_ir"] = not options["enable_software_pipeline"]
+    if config.disabled_diagnostics is not None:
+        options["disabled_diagnostics"] = config.disabled_diagnostics
+    context = passes.PassContext([], **options)
+    if config.diagnostic_phase is not None and config.disabled_diagnostics is None:
+        # Explicit diagnostics force JIT to run even when equal to defaults.
+        # This existing non-conflicting option keeps that bypass and the same
+        # effective suppression set after diagnostic_phase moves into context.
+        projected["disabled_diagnostics"] = context.get_disabled_diagnostics()
+    neutral_config = dataclasses.replace(config, **projected)
+    with context:
+        yield neutral_config
 
 
 class KernelCompiler:
@@ -72,7 +117,8 @@ class KernelCompiler:
         # Worded so log-marker contracts (e.g. the DSpark K=7 one-L2 guard)
         # keep matching: PyPTO itself decides compile vs. validated restore.
         logger.info("[kernel-compile] compiling %s through PyPTO JIT", name)
-        compiled = jit_fn.compile(config=run_config, **compile_kwargs)
+        with _runtime_compile_config(run_config) as compile_config:
+            compiled = jit_fn.compile(config=compile_config, **compile_kwargs)
         if not isinstance(compiled, DistributedCompiledProgram):
             raise TypeError(
                 f"{name} did not compile to DistributedCompiledProgram; "

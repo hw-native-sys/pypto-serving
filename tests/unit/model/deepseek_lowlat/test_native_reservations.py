@@ -95,8 +95,8 @@ def test_eos_or_abort_discards_and_retires_the_already_accepted_successor(termin
     instance.update_from_output(b, {"r": [20, 21]})
     assert request.output_token_ids == before
     assert not instance._pending_reservations
-    assert not a.scheduled_requests[0].group_blocks_retained
-    assert not b.scheduled_requests[0].group_blocks_retained
+    assert a.scheduled_requests[0].group_block_snapshot is None
+    assert b.scheduled_requests[0].group_block_snapshot is None
 
 
 def test_wire_round_trip_preserves_generation_cycle_budget_range_and_frame():

@@ -63,3 +63,27 @@ Worker responsibilities:
 `ModelExecutor` defines the worker-facing capabilities and prefill/decode methods. `ModelRunner` defines `init_kv_cache()`, `run_prefill()`, and `run_decode()`; model implementations may also support split prepare/dispatch/reclaim methods for asynchronous execution. Qwen, DeepSeek V4 MTP, and DSpark have separate executors and runners because their kernel ABIs, cache layouts, and parallel contracts differ. The [Model Integration](model-integration.md) guide maps these interfaces to the steps for adding a model.
 
 Changes to request scheduling or cache allocation should include focused unit tests under `tests/unit/serving/` and NPU validation when model behavior or device dispatch is affected.
+
+### Qwen Program chip runtime
+
+For Qwen3-14B Program execution, `EngineConfig(runtime_config=RuntimeConfig(chip_runtime="host_build_graph"))` selects HBG. The default is `"tensormap_and_ringbuffer"`. This is the chip scheduler policy, independent of the compiler backend and onboard/simulation execution mode. Other model executors currently reject HBG configuration at engine construction.
+
+The existing replica configuration, worker model loader and `RuntimeModel.runtime` carry this value. Qwen configures its shared compiler from the loaded model before compiling all three stages; the shared run-config builder passes the selection into `DistributedConfig.runtime`. The existing compiled-program worker consumes that configuration. No additional engine, executor or process environment selection is involved.
+
+HBG prefill uses the `qwen3_prefill_hbg_host` entry from pypto-lib, which takes separate HOST control tensors. Set `PYPTO_LIB_ROOT` to a checkout with that entry if the bundled Lib revision predates it.
+
+For Qwen3-14B on one A3, use chunked prefill and set both `RuntimeConfig.max_num_batched_tokens` and `EngineConfig.max_num_scheduled_tokens` to 80 for the validated long-prompt setup. The worker partitions prefill into single-request calls to bound graph scratch. Decode continues to use the configured batch size.
+
+The Qwen serving CI guard runs the same single-request, multi-batch, chunked-prefill and prefix-cache cases for both runtimes. The HBG invocation sets `PYPTO_QWEN3_RUNTIME=host_build_graph` for the test harness and selects a pinned Lib checkout through `PYPTO_LIB_ROOT`.
+
+The shared `KernelCompiler` activates the selected chip runtime through PyPTO's
+public `PassContext` before JIT cache lookup and code generation. The same value
+remains in `DistributedConfig` for artifact metadata. A conflicting ambient
+runtime is rejected; a matching ambient context retains its instruments and
+options, including the existing explicit-option conflict checks. Without an
+ambient context, explicit planner/diagnostic options are projected into the
+context and the compile configuration is cloned with only those fields neutralized.
+Explicit diagnostic requests still force compiler execution. Runtime selection
+therefore applies to generated chip and collective configurations as well as the
+wrapper metadata. CPU JIT/codegen tests run in the existing unit-tests CI job;
+they do not execute SDK/device code or validate model numerics.

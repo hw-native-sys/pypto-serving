@@ -10,26 +10,32 @@
 
 import asyncio
 import math
+import socket
+import threading
+from concurrent.futures import Future
 from types import SimpleNamespace
+from dataclasses import replace
 
 import msgspec
 import pytest
 
 from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
+from pypto_serving.pd.worker import Progress, ProgressServer, WorkerRuntime
 from pypto_serving.pd.adapter import CACHE_COMPONENTS, COMPONENTS, DeepSeekDSpark
 from pypto_serving.pd.config import Config, Endpoint
 from pypto_serving.pd.integration import Chunk
 from pypto_serving.pd.planner import Geometry, plan_chunk, rank_mapping
-from pypto_serving.pd.protocol import Binding, Component, Completion, Continuation, Contract, Copy, Node, Placement, Plan, Topology, digest
+from pypto_serving.pd.protocol import Binding, CapacityExhausted, Component, Completion, Continuation, Contract, Copy, Node, Placement, Plan, Topology, digest
 from pypto_serving.pd.service import Service
 from pypto_serving.pd.transfer import Mooncake, Region, TransferError
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from tests.unit.serving.test_grouped_prefix_cache import GEOMETRY
 
-def cache(length, partitions=1, enabled=True, ori_blocks=9, slots=4):
+def cache(length, partitions=1, enabled=True, ori_blocks=9, slots=4, state_pages=None):
+    state_pages = state_pages or {}
     groups = tuple(KVCacheGroupSpec(name, (0,), KVCacheSpec(page, page // ratio, ratio),
-        ori_blocks if name == "ori" else (math.ceil((length + 512) / page) if window is None else blocks),
-        num_blocks=max(slots * blocks if window is not None else slots * math.ceil((length + 512) / page), 32)
+        ori_blocks if name == "ori" else (math.ceil((length + 512) / page) if window is None else state_pages.get(name, blocks)),
+        num_blocks=max(slots * state_pages.get(name, blocks) if window is not None else slots * math.ceil((length + 512) / page), 32)
         if name != "ori" else slots * ori_blocks,
         num_partitions=partitions, sliding_window=window)
         for name, page, ratio, blocks, window in GEOMETRY)
@@ -44,17 +50,19 @@ def geometries(cache):
             Geometry("bootstrap_hidden", (0,), 64, 128, 64, "uint8"),)
 
 
-def warm(cache, tokens, length, partition=0):
+def warm(cache, tokens, length, partition=0, group_names=None):
     if length:
         cache.ensure_group_blocks("warm", length, partition=partition)
-        cache.cache_group_blocks("warm", cache.compute_group_block_hashes(tokens), length, {})
+        cache.cache_group_blocks("warm", cache.compute_group_block_hashes(tokens, group_names=group_names), length, {})
         cache.release_all_group_requests("warm")
 
-def handoff(length, p_hit=0, d_hit=0, p_tp=4, d_tp=1, ori_blocks=9, enabled=True):
+def handoff(length, p_hit=0, d_hit=0, p_tp=4, d_tp=1, ori_blocks=9, enabled=True, compact=False):
     tokens = (1000000,) + tuple(range(1, length))
-    p, d = cache(length, 16 // p_tp, enabled, ori_blocks), cache(length, 16 // d_tp, enabled, ori_blocks)
+    names = ("hca_state", "csa_state", "csa_inner_state")
+    p = cache(length, 16 // p_tp, enabled, ori_blocks, state_pages=dict(zip(names, (145, 517, 517))) if compact else None)
+    d = cache(length, 16 // d_tp, enabled, ori_blocks, state_pages=dict(zip(names, (35, 77, 77))) if compact else None)
     warm(p, tokens, p_hit)
-    warm(d, tokens, d_hit)
+    warm(d, tokens, d_hit, group_names=("cmp_c128", "cmp_c4", "idx"))
     adapter = DeepSeekDSpark()
     pg, dg = geometries(p), geometries(d)
     nodes = tuple(Node(name, role, name + "-boot", adapter.contract("model", geometry), name + "-registry",
@@ -88,7 +96,8 @@ def handoff(length, p_hit=0, d_hit=0, p_tp=4, d_tp=1, ori_blocks=9, enabled=True
         chunk = Chunk(request, number, start, end, end == length, 7 if end == length else None,
                       {k: tuple(v) for k, v in tables.items()}, 0, {"bootstrap": 0})
         plan = plan_chunk(binding, chunk, placement, nodes[0].contract, p.group_specs, pg, dg, p_hit,
-            rank_mapping(nodes[0].topology, nodes[1].topology, 0, reservation.partition), entry.normalized_digest)
+            rank_mapping(nodes[0].topology, nodes[1].topology, 0, reservation.partition), entry.normalized_digest,
+            adapter.state_ranges(p.group_specs, end) if chunk.final else {})
         destination.validate_plan(entry, plan, pg, p_hit, nodes[0].topology)
         entry.chunk, entry.end = number + 1, end
         plans.append(plan)
@@ -96,19 +105,35 @@ def handoff(length, p_hit=0, d_hit=0, p_tp=4, d_tp=1, ori_blocks=9, enabled=True
                            source_geometry=pg, nodes=nodes, p_hit=p_hit, source_request=source_request)
 
 @pytest.mark.parametrize("p_tp,d_tp,p_hit,d_hit", [(4, 4, 0, 8192), (4, 1, 8192, 4096)])
-def test_suffix_handoff_preserves_shared_prefix_and_final_state(p_tp, d_tp, p_hit, d_hit):
-    case = handoff(8320, p_hit, d_hit, p_tp, d_tp)
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("length", [8205, 8320])
+def test_suffix_handoff_preserves_shared_prefix_and_final_state(p_tp, d_tp, p_hit, d_hit, compact, length):
+    case = handoff(length, p_hit, d_hit, p_tp, d_tp, compact=compact)
     final = case.plans[-1]
-    assert final.valid_from == {"ori": max(8064, d_hit)}
+    assert final.valid_from == {"ori": max(0, (length - 1) // 128 * 128 - 128)}
     assert {"hca_state", "csa_state", "csa_inner_state", "bootstrap_hidden"} <= {c.component for c in final.copies}
     assert all(c.component != "ori" for plan in case.plans[:-1] for c in plan.copies)
     geometry = {g.name: g for g in geometries(case.d)}
     groups = {g.name: g for g in case.d.group_specs}
     components = {c.name: c for c in COMPONENTS}
     for plan in case.plans:
-        Completion(digest(plan), plan.units).check(plan)
+        Completion(digest(plan), plan.units).check(digest(plan), plan.units)
         for copy in plan.copies:
             group = components[copy.component].group
+            if group.endswith("state"):
+                source, target = case.p._group_pools[group], case.d._group_pools[group]
+                a = tuple(source.local_block_id(block) if block is not None else -1
+                          for block in source.request_blocks[case.source_request])
+                b = case.entry.reservation.block_ids_by_group[group]
+                page = groups[group].spec.token_capacity
+                first = max(0, (length - 1) // 128 * 128 - groups[group].sliding_window) // page
+                logical = {a[q % len(a)]: q for q in range(first, math.ceil(length / page))}
+                sg = next(g for g in case.source_geometry if g.name == copy.component)
+                dg = geometry[copy.component]
+                for offset in range(0, copy.length, sg.page_bytes):
+                    sp = (copy.source_offset + offset) // sg.page_bytes % sg.blocks
+                    dp = (copy.destination_offset + offset) // dg.page_bytes % dg.blocks
+                    assert dp == b[logical[sp] % len(b)]
             if group not in ("cmp_c128", "cmp_c4", "idx"):
                 continue
             geo = geometry[copy.component]
@@ -116,7 +141,7 @@ def test_suffix_handoff_preserves_shared_prefix_and_final_state(p_tp, d_tp, p_hi
             assert all((copy.destination_offset + offset) // geo.page_bytes % geo.blocks in writable
                        for offset in range(0, copy.length, geo.page_bytes))
     with pytest.raises(ValueError):
-        Completion(digest(final), final.units[:-1]).check(final)
+        Completion(digest(final), final.units[:-1]).check(digest(final), final.units)
 
 
 def test_owner_rejects_out_of_bounds_and_retains_unknown_registration():
@@ -156,6 +181,15 @@ def service():
     return result, p, d
 
 
+def test_active_handoff_capacity_uses_the_retryable_error():
+    s, p, d = service()
+    s.config = replace(s.config, capacity=1)
+    s.entry(Binding.create(p, d, {}), create=True)
+    with pytest.raises(CapacityExhausted):
+        s.entry(Binding.create(p, d, {}), create=True)
+    assert len(s.requests) == 1
+
+
 def test_status_reads_current_lease_without_changing_cache():
     s, p, d = service()
     binding = Binding.create(p, d, {})
@@ -184,6 +218,7 @@ def test_cancel_and_unknown_cannot_release_unconfirmed_native_writes():
         entry.reservation = s.cache.reserve_group_cache(binding.request, binding.request, 256, prompt_token_count=128)
         s.cache.authorize_group_cache_write(binding.request)
         entry.pending = Plan(binding, "continuation", 0, 0, 128, True, ((0, 0),), (), ((0, "kv"),))
+        entry.pending_digest = digest(entry.pending)
         s.fail(entry, TransferError("native result unknown", uncertain=True))
         await s.abort(entry)
         status = s.status(binding.request)
@@ -193,4 +228,58 @@ def test_cancel_and_unknown_cannot_release_unconfirmed_native_writes():
             s.cache.release_group_cache(binding.request)
         await s.control(p, (), "abort", {"binding": msgspec.to_builtins(binding), "stopped": True})
         assert s.status(binding.request)["reservation"] == {"present": False, "state": None}
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('shutdown', [None, 'drain', 'timeout'])
+def test_cancelled_submit_ack_is_observed_until_native_completion(shutdown):
+    async def run():
+        plan = handoff(128).plans[-1]
+        job, native = digest(plan), Future()
+        runtime = WorkerRuntime.__new__(WorkerRuntime)
+        runtime.lock, runtime.jobs, runtime.uncertain = threading.RLock(), {}, False
+        parent, child = socket.socketpair()
+        accepted, reply = threading.Event(), threading.Event()
+        def handle(operation, payload):
+            if operation == 'submit':
+                runtime.jobs[job] = (plan, (native,))
+                accepted.set()
+                assert reply.wait(2)
+                return msgspec.msgpack.encode(dict(job=job))
+            return msgspec.msgpack.encode(runtime.poll(msgspec.msgpack.decode(payload)))
+        server, progress = ProgressServer(child, handle, 2), Progress(parent, 2, 1)
+        task = asyncio.create_task(progress.call('submit', b'plan'))
+        closing = None
+        try:
+            assert await asyncio.to_thread(accepted.wait, 2)
+            task.cancel()
+            if shutdown == 'drain':
+                closing = asyncio.create_task(progress.close())
+                await asyncio.sleep(0)
+                with pytest.raises(TransferError, match='closing'):
+                    await progress.call('submit', b'rejected')
+            reply.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert job in runtime.jobs and job in progress.pending
+            if shutdown == 'timeout':
+                progress.timeout = .05
+                with pytest.raises(TransferError, match='drain deadline') as error:
+                    await progress.close()
+                assert error.value.uncertain and job in runtime.jobs
+                return
+            if closing is not None:
+                assert not closing.done()
+            native.set_result(None)
+            for _ in range(100):
+                if not runtime.jobs and not progress.pending:
+                    break
+                await asyncio.sleep(.01)
+            assert not runtime.jobs and not progress.pending
+            if closing is not None:
+                await closing
+        finally:
+            reply.set()
+            await progress.close()
+            server.close()
     asyncio.run(run())

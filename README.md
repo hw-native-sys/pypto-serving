@@ -7,10 +7,12 @@ PyPTO Serving is a small local inference stack for running Qwen3-14B and DeepSee
 The external documentation lives under [`docs/`](docs/index.md). Start with:
 
 - [Installation](docs/get-started/installation.md)
+- [DDR prefix-cache offload](docs/user-guide/kv-cache-offload.md)
 - [Quickstart](docs/get-started/quickstart.md)
 - [Online Serving](docs/user-guide/online-serving.md)
 - [CLI Reference](docs/cli-reference/pypto-serving.md)
 - [Models](docs/models/index.md)
+- [GLM-5.3-Flash](docs/models/glm53.md)
 
 ## Layout
 

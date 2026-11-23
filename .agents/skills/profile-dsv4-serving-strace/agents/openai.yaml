@@ -1,4 +1,0 @@
-interface:
-  display_name: "Profile DSV4 Serving"
-  short_description: "Capture DSV4 serving and Simpler host swimlanes"
-  default_prompt: "Use $profile-dsv4-serving-strace to run a portable 20-token DSV4 serving profile with SA_PROFILE and Simpler host STRACE."

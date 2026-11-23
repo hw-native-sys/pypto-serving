@@ -9,6 +9,7 @@
 """Real scheduler, allocator, IPC and page-copy ownership regressions."""
 
 import pytest
+from unittest.mock import Mock
 
 from pypto_serving.serving.memory.protocol import CachePublicationProof
 from pypto_serving.model.deepseek_lowlat.execution_policy import (
@@ -146,7 +147,7 @@ def test_resume_and_completion_proofs_survive_real_ipc_roundtrip():
         [],
         step.block_ids_by_group,
         0,
-        msgspec.msgpack.encode(
+        model_extension=msgspec.msgpack.encode(
             LowlatPrefillMetadata(manager.group_page_identities(step.block_ids_by_group, 0))
         ),
     )
@@ -170,6 +171,16 @@ def test_resume_and_completion_proofs_survive_real_ipc_roundtrip():
     scheduler.abort_request("hot")
     scheduler.discard_scheduled_request(step)
     assert all(b.ref_cnt == 0 for p in manager._group_pools.values() for b in p.blocks)
+
+
+def test_explicit_publication_bypasses_generic_checkpoint_writer():
+    manager, scheduler = setup()
+    manager.checkpoint_writer.prepare = Mock(side_effect=AssertionError("duplicate checkpoint writer"))
+    tokens = list(range(1536))
+    finish_prompt(manager, scheduler, "cold", tokens)
+    _, starts, _ = finish_prompt(manager, scheduler, "hot", tokens)
+    assert starts[0] == 1408
+    manager.checkpoint_writer.prepare.assert_not_called()
 
 
 def test_aborted_restore_releases_pins_and_checkpoint_reservations():

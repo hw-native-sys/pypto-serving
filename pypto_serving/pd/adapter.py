@@ -8,18 +8,24 @@
 # -----------------------------------------------------------------------------------------------------------
 """Model-specific transfer semantics; generic PD code only consumes this interface."""
 
-from dataclasses import replace
-from math import prod
+from dataclasses import dataclass, replace
+import logging
+from math import lcm, prod
+import threading
 from typing import Protocol
 
+from pypto_serving.tools.observe import record, span
 from pypto_serving.tools.profile import profile_span
 from .planner import Geometry, rank_mapping
 from .protocol import Component, Contract, Prefix, digest
 from .worker import WorkerRuntime
 
+logger = logging.getLogger(__name__)
+
 
 class ModelAdapter(Protocol):
     def prefix_spec(self, tokens, cache) -> Prefix: ...
+    def state_ranges(self, groups, end): ...
     def contract(self, model, geometry) -> Contract: ...
     def worker_factory(self, **kwargs): ...
     def mapping(self, source_topology, destination_topology, source_partition, destination_partition): ...
@@ -40,6 +46,20 @@ TENSORS = dict(zip((c.name for c in CACHE_COMPONENTS), (
 
 class DeepSeekDSpark:
     @staticmethod
+    def state_ranges(groups, end):
+        """Logical state pages covering the terminal tail and its checkpoint.
+
+        These pages are request-local even when all target KV is shared. Ring
+        storage beyond this range is working capacity, not transferable state.
+        """
+        alignment = lcm(*(g.spec.token_capacity for g in groups))
+        boundary = max(0, end - 1) // alignment * alignment
+        names = {c.group for c in CACHE_COMPONENTS if c.final}
+        return {g.name: (max(0, boundary - g.sliding_window) // g.spec.token_capacity,
+                         (end + g.spec.token_capacity - 1) // g.spec.token_capacity)
+                for g in groups if g.name in names}
+
+    @staticmethod
     def mapping(source_topology, destination_topology, source_partition, destination_partition):
         return rank_mapping(source_topology, destination_topology, source_partition, destination_partition)
 
@@ -58,11 +78,12 @@ class DeepSeekDSpark:
         a, b = geometry["idx_k"], geometry["idx_scale"]
         if (a.layers, a.blocks, a.rows) != (b.layers, b.blocks, b.rows):
             raise ValueError("index K/scale geometry mismatch")
-        layout = digest(tuple(geometry[c.name].layout for c in COMPONENTS))
+        # Pair only peers that agree on terminal-state coverage as well as bytes.
+        layout = digest(("history-prefix-state-tail", tuple(geometry[c.name].layout for c in COMPONENTS)))
         return Contract("deepseek-v4-dspark-k7", model, layout, COMPONENTS)
 
     def prefix_spec(self, tokens, cache):
-        groups = tuple(dict.fromkeys(c.group for c in COMPONENTS if not c.final))
+        groups = tuple(g.name for g in cache.group_specs if g.sliding_window is None)
         hashes = (cache.compute_group_block_hashes(list(tokens), group_names=groups)
                   if cache.enable_prefix_cache else {})
         return Prefix(len(tokens), cache.group_prefix_cache_alignment,
@@ -88,6 +109,13 @@ def select_adapter(executor):
         raise ValueError(f"no PD model adapter for {executor}") from None
 
 
+@dataclass(frozen=True)
+class SourceState:
+    lease: int
+    generation: int
+    error: str = ""
+
+
 class DSparkExtension:
     def __init__(self, *, settings, runner, progress_channel=None):
         self.runner, self.compiled = runner, runner._compiled
@@ -100,6 +128,10 @@ class DSparkExtension:
         ):
             raise ValueError("PD requires device prompt-tail capture and Decode bootstrap")
         self.transfer = WorkerRuntime(settings, self, progress_channel)
+        self.source_states = {}
+        self.source_lock = threading.Lock()
+        if not runner.speculative:
+            runner.release_finished_requests = self.wrap_release(runner.release_finished_requests)
 
     def regions(self):
         cache = self.cache()
@@ -137,6 +169,11 @@ class DSparkExtension:
 
     def worker_ready(self):
         self.transfer.worker_ready()
+        # The base is otherwise lazy and can race with HIXL's first peer link.
+        # DistributedWorker exposes it only through its native Worker today;
+        # keep this SDK ABI dependency inside the model's PD adapter.
+        with span(logger, "pd.compute_communication.initialize"):
+            self.worker()._w._ensure_comm_base()
 
     def wrap_capture(self, capture):
         if self.runner.speculative:
@@ -147,8 +184,55 @@ class DSparkExtension:
             # collective intact when any packed request overlaps that window.
             if any(row.chunk_start < row.prompt_len and row.chunk_end > max(0, row.prompt_len - window)
                    for row in inputs.descriptors):
-                return capture(batch, inputs, **kwargs)
+                result = capture(batch, inputs, **kwargs)
+                for request, row in zip(inputs.request_ids, inputs.descriptors, strict=True):
+                    if row.chunk_end == row.prompt_len:
+                        self.publish_source_state(request)
+                return result
         return retain
+
+    def publish_source_state(self, request):
+        """Publish only on the compute lane, after final device capture returns."""
+        import torch
+        with span(logger, "pd.source.ready", log=False, request=request):
+            state = self.draft_states[request]
+            window = self.compiled.layout.sliding_window
+            expected = torch.arange(max(0, state.prompt_len - window), state.prompt_len, dtype=torch.int64)
+            error = ("handoff requires the complete prompt tail"
+                     if state.prefill_tail_positions is None or not torch.equal(state.prefill_tail_positions, expected)
+                     else "")
+            with self.source_lock:
+                previous = self.source_states.get(request)
+                if previous is not None and (previous.lease, previous.generation) != (state.lease, state.generation):
+                    error = "source lease changed before retirement"
+                if previous is None and len(self.source_states) >= self.transfer.settings.capacity:
+                    error = "source state capacity exceeded"
+                else:
+                    self.source_states[request] = SourceState(state.lease, state.generation, error)
+            if error:
+                # A per-request metadata rejection must not fail the shared
+                # compute step. The final query rejects only this handoff.
+                record(logger, "source.rejected", request=request, reason=error)
+
+    def source_state(self, request):
+        # The progress thread reads an immutable result, never runner state.
+        with span(logger, "pd.source.read", log=False, request=request):
+            with self.source_lock:
+                value = self.source_states.get(request)
+                if value is None:
+                    raise ValueError("source final state is not ready")
+                if value.error:
+                    raise ValueError(value.error)
+                return {"bootstrap": value.lease}
+
+    def wrap_release(self, release):
+        def retire(requests):
+            requests = tuple(requests)
+            with self.source_lock:
+                for request in requests:
+                    self.source_states.pop(request, None)
+            return release(requests)
+        return retire
 
     def wrap_prepare(self, prepare):
         def build(batch, *, buffer_slot):
@@ -174,14 +258,6 @@ class DSparkExtension:
                 prompt_len=value["prompt_len"], defer_device_clear=True)
             state.committed_count = state.prompt_len
             return {"bootstrap": state.lease}
-        if operation == "source_state":
-            import torch
-            state = self.draft_states[value]
-            window = self.compiled.layout.sliding_window
-            expected = torch.arange(max(0, state.prompt_len - window), state.prompt_len, dtype=torch.int64)
-            if state.prefill_tail_positions is None or not torch.equal(state.prefill_tail_positions, expected):
-                raise RuntimeError("handoff requires the complete prompt tail")
-            return {"bootstrap": state.lease}
         if operation == "discard_state":
             self.runner.release_finished_requests((value,))
             return None
@@ -201,7 +277,8 @@ class DSparkExtension:
         runner = self.runner
         if self.compiled.bootstrap_metadata is None:
             raise RuntimeError("PD continuation requires device prefill bootstrap")
-        runner._wait_for_pending_decode_dispatches()
+        with profile_span("pd.dspark.bootstrap.wait", cat="pd", args={"requests": len(fresh)}):
+            runner._wait_for_pending_decode_dispatches()
         requests = [batch.request_ids[i] for i in fresh]
         # Scrub reused draft KV, never the received target cache or hidden tail.
         for request in requests:
@@ -238,7 +315,8 @@ class DSparkExtension:
                     size = source.numel() * source.element_size()
                     self.worker().copy_to(target.shards[rank].data_ptr, source.data_ptr(), size,
                                           dst_offset=slot * size, worker_id=target.worker_ids[rank])
-        runner._bootstrap_prefill_requests(requests, [0] * len(requests))
+        with profile_span("pd.dspark.bootstrap.execute", cat="pd", args={"requests": len(fresh)}):
+            runner._bootstrap_prefill_requests(requests, [0] * len(requests))
 
     def set_profile_active(self, active):
         for owner in self.transfer.owners:
@@ -246,3 +324,5 @@ class DSparkExtension:
 
     def close(self):
         self.transfer.close()
+        with self.source_lock:
+            self.source_states.clear()

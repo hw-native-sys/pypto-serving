@@ -237,6 +237,9 @@ class WorkerProcess:
             else:
                 raise RuntimeError("Executor has no register_model method")
 
+            if self.config.resolve_runtime_config().kv_offload_bytes:
+                from pypto_serving.serving.memory.tiering.integration import initialize_loaded
+                initialize_loaded(self.executor)
             if self._services_factory is not None:
                 self._services = self._services_factory(
                     self.executor.runtime_extensions(), self._req_cache.__getitem__,
@@ -268,6 +271,10 @@ class WorkerProcess:
             )
 
             return DeepSeekV4DSparkPyptoExecutor
+        if self.config.executor_cls == "PyptoGlm53Executor":
+            from pypto_serving.model.glm53.npu_executor import Glm53PyptoExecutor
+
+            return Glm53PyptoExecutor
         from pypto_serving.model.common.executor.executor import ModelExecutor
 
         return ModelExecutor
@@ -513,6 +520,10 @@ class WorkerProcess:
             if self._can_split_decode_output(cmd, prepared):
                 assert prepared is not None and prepared.batch is not None
                 try:
+                    if self.executor.prepared_decode_requires_token(prepared.prepared):
+                        self._wait_for_pending_decode_reclaims(
+                            [request.request_id for request in cmd.decode_requests]
+                        )
                     with profile_span(
                         "WorkerProcess.dispatch_decode",
                         cat="worker",
@@ -1057,12 +1068,17 @@ class WorkerProcess:
             token_chunks=[pr.chunk_tokens for pr in scheduled],
             seq_lens=[pr.num_computed_tokens + len(pr.chunk_tokens) for pr in scheduled],
             prompt_lens=[len(self._req_cache[pr.request_id].prompt_token_ids) for pr in scheduled],
+            prefix_cache_hit_tokens=[pr.prefix_cache_hit_tokens for pr in scheduled],
             chunk_starts=[pr.num_computed_tokens for pr in scheduled],
             device=device, embedding_lookup=embedding_lookup,
             allow_device_greedy_sampling=self._allow_device_sampled_ids(terminal, phase="prefill"),
             allow_device_topk_sampling=self._allow_device_topk_sampling(terminal, phase="prefill"),
             block_ids=[pr.block_ids for pr in scheduled],
             block_ids_by_group=[pr.block_ids_by_group for pr in scheduled],
+            read_block_ids_by_group=[pr.read_block_ids_by_group for pr in scheduled],
+            checkpoint_ends=[pr.checkpoint_ends for pr in scheduled],
+            state_write_block_ids_by_group=[pr.state_write_block_ids_by_group for pr in scheduled],
+            checkpoint_block_ids_by_group=[pr.checkpoint_block_ids_by_group for pr in scheduled],
             cache_partitions=[pr.cache_partition for pr in scheduled],
         )
         batch.model_extensions = {
@@ -1081,6 +1097,19 @@ class WorkerProcess:
             if (mask := self._stop_token_mask(pr.request_id)) is not None
         }
         return batch
+
+    @staticmethod
+    def _require_v41_dspark_stages(runtime_model, batch, *, phase: str) -> None:
+        """Reject V4.1 speculative work before it falls back to target-only dispatch."""
+        extra = getattr(runtime_model, "extra", {})
+        runtime = getattr(runtime_model, "runtime", None)
+        if (isinstance(extra, dict) and extra.get("family") == "deepseek_v41"
+                and getattr(runtime, "num_speculative_tokens", 0) == 5
+                and batch.dspark_stages is None):
+            raise RuntimeError(
+                f"V4.1 DSpark {phase} requires lowered dspark_stages; "
+                "ordinary target-only dispatch is not a valid fallback"
+            )
 
     def _batch_prefill(
         self,
@@ -1145,6 +1174,24 @@ class WorkerProcess:
                     completed_token_ids,
                     completed_sampling_params,
                 )
+                if (isinstance(getattr(runtime_model, "extra", None), dict)
+                        and runtime_model.extra.get("family") == "deepseek_v41"
+                        and getattr(runtime_model.runtime, "num_speculative_tokens", 0) == 5):
+                    lower = getattr(self.executor, "lower_dspark_prefill_batch", None)
+                    if not callable(lower):
+                        self._require_v41_dspark_stages(runtime_model, batch, phase="prefill")
+                    for request_id, token_id in zip(
+                        completed_request_ids, completed_token_ids, strict=True
+                    ):
+                        dispatch = lower(
+                            runtime_model,
+                            batch,
+                            request_ids=(request_id,),
+                            sampled_token_ids=(token_id,),
+                        )
+                        self.executor.run_dspark_prefill_batch(
+                            replace(batch, dspark_stages=dispatch)
+                        )
 
     def _resolve_decode_token(self, dr: DecodeRequest) -> int:
         """Return the decode input token, substituting from cache on placeholder.
@@ -1315,9 +1362,20 @@ class WorkerProcess:
                 allow_device_greedy_sampling=allow_device_greedy_sampling,
                 allow_device_topk_sampling=allow_device_topk_sampling,
             )
+            if (isinstance(getattr(runtime_model, "extra", None), dict)
+                    and runtime_model.extra.get("family") == "deepseek_v41"
+                    and getattr(runtime_model.runtime, "num_speculative_tokens", 0) == 5):
+                lower = getattr(self.executor, "lower_dspark_decode_batch", None)
+                if not callable(lower):
+                    self._require_v41_dspark_stages(runtime_model, batch, phase="decode")
+                batch.dspark_stages = lower(runtime_model, batch)
+            self._require_v41_dspark_stages(runtime_model, batch, phase="decode")
             if prepared_decode is None:
                 started_ns = self._decode_metrics.start() if self._decode_metrics else 0
-                decode_result = self.executor.run_decode(runtime_model, batch)
+                if batch.dspark_stages is None:
+                    decode_result = self.executor.run_decode(runtime_model, batch)
+                else:
+                    decode_result = self.executor.run_dspark_decode_batch(batch)
             else:
                 if prepared_decode.error is not None:
                     raise RuntimeError(prepared_decode.error)
@@ -1332,11 +1390,17 @@ class WorkerProcess:
                         buffer_slot=prepared_decode.buffer_slot,
                     )
                 started_ns = self._decode_metrics.start() if self._decode_metrics else 0
-                decode_result = self.executor.run_prepared_decode(
-                    runtime_model,
-                    batch,
-                    prepared,
-                )
+                if batch.dspark_stages is None:
+                    decode_result = self.executor.run_prepared_decode(
+                        runtime_model,
+                        batch,
+                        prepared,
+                    )
+                else:
+                    raise RuntimeError(
+                        "DSpark decode batches cannot use the generic prepared-decode lane; "
+                        "provide a DSpark-specific prepared/reclaim contract"
+                    )
             num_draft_tokens = self._consume_decode_result(scheduled, decode_result, new_tokens, batch=batch)
             if self._decode_metrics:
                 self._decode_metrics.record(
@@ -1455,11 +1519,12 @@ class WorkerProcess:
 
     @staticmethod
     def _min_tokens_mask_active(cached: NewRequestData, accepted_count: int) -> bool:
-        return cached.eos_token_id is not None and accepted_count < cached.min_tokens
+        has_eos = cached.eos_token_id is not None or bool(cached.eos_token_ids)
+        return has_eos and accepted_count < cached.min_tokens
 
     def _stop_token_mask(self, request_id: str) -> StopTokenMask | None:
         cached = self._req_cache[request_id]
-        if cached.min_tokens <= 0 or cached.eos_token_id is None:
+        if cached.min_tokens <= 0 or (cached.eos_token_id is None and not cached.eos_token_ids):
             return None
         lengths = getattr(self, "_accepted_output_lengths", {})
         if request_id not in lengths:
@@ -1467,7 +1532,9 @@ class WorkerProcess:
         if not self._min_tokens_mask_active(cached, lengths[request_id]):
             return None
         remaining = cached.min_tokens - lengths[request_id]
-        stop_ids = blocked_token_ids((cached.eos_token_id,), remaining)
+        primary = () if cached.eos_token_id is None else (cached.eos_token_id,)
+        all_eos = tuple(dict.fromkeys(primary + (cached.eos_token_ids or ())))
+        stop_ids = blocked_token_ids(all_eos, remaining)
         return StopTokenMask(stop_ids, remaining) if stop_ids else None
 
     def _sampling_params(self, request_id: str) -> SamplingParams:
@@ -1486,8 +1553,12 @@ class WorkerProcess:
         capabilities = getattr(self, "_sampling_capabilities", _DEFAULT_SAMPLING_CAPABILITIES)
         if capabilities.stop_mask_on_device(phase):
             return False
+        # Early preparation can precede FIFO registration; assume zero output until then.
+        lengths = getattr(self, "_accepted_output_lengths", {})
         return any(
-            self._stop_token_mask(item.request_id) is not None
+            self._min_tokens_mask_active(
+                self._req_cache[item.request_id], lengths.get(item.request_id, 0)
+            )
             for item in scheduled
         )
 
@@ -1586,7 +1657,7 @@ def _worker_entry(
         get_profiler(initially_active=False).stop()
 
 
-def spawn_worker(config: EngineConfig, *, services_factory=None):
+def spawn_worker(config: EngineConfig, *, services_factory=None, on_starting=None):
     """Spawn a worker process and return its process, queues, and ready state.
 
     ``cache_capacity`` reports primary and optional per-group physical counts
@@ -1614,6 +1685,10 @@ def spawn_worker(config: EngineConfig, *, services_factory=None):
         ),
         daemon=False,
     )
+    # Setup failures above prove that no process borrowed owner resources.
+    # Once start() is attempted, failure remains on the acknowledgement path.
+    if on_starting is not None:
+        on_starting()
     process.start()
     return (
         process,

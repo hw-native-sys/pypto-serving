@@ -141,9 +141,15 @@ class LowlatSchedulingPolicy(SchedulingPolicy):
                     }
                 )
             # Generic snapshot pins keep copy endpoints live through cancellation.
-            for snapshot in auxiliary:
-                manager.retain_group_block_snapshot(snapshot, scheduled.cache_partition)
-            scheduled.cache_aux_snapshots = tuple(auxiliary)
+            leases = []
+            try:
+                for snapshot in auxiliary:
+                    leases.append(manager.retain_group_block_snapshot(snapshot, scheduled.cache_partition))
+            except BaseException:
+                for lease in leases:
+                    manager.release_group_block_snapshot(lease)
+                raise
+            scheduled.cache_aux_snapshots = tuple(leases)
 
     def limit_prefill(self, request, limit):
         boundary = request.group_checkpoint_boundary or 0

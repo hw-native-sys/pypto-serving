@@ -144,7 +144,7 @@ def test_ordinary_dispatch_reuses_immutable_device_defaults() -> None:
 
     runner = DSparkModelRunner.__new__(DSparkModelRunner)
     runner._default_grammar_args = {}
-    runner._compiled = SimpleNamespace(layout=SimpleNamespace(ranks=1))
+    runner._compiled = SimpleNamespace(layout=SimpleNamespace(ranks=1, decode_batch=64))
     runner._ensure_shared_host_allocation_before_worker = lambda _name: None
     runner._prepare_default_grammar_args()
     defaults = runner._default_grammar_args

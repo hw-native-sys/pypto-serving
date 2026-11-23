@@ -12,7 +12,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
-from .protocol import receive, send
+from .protocol import CapacityExhausted, receive, send
 
 
 class Session:
@@ -37,7 +37,8 @@ class Session:
                 if future is None or future.done():
                     raise ValueError("unexpected control reply")
                 if "error" in reply:
-                    future.set_exception(RuntimeError(reply["error"]))
+                    error_type = CapacityExhausted if reply.get("code") == "capacity_exhausted" else RuntimeError
+                    future.set_exception(error_type(reply["error"]))
                 else:
                     future.set_result(reply["result"])
         except (Exception, asyncio.CancelledError) as exc:

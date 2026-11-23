@@ -118,8 +118,8 @@ _PREFILL_ORDER = (
 )
 
 
-def prefill_task_args(runner: Qwen314BModelRunner) -> TaskArgs:
-    """Build the ``TaskArgs`` for the single ``qwen3_prefill_host`` dispatch.
+def prefill_task_args(runner: Qwen314BModelRunner, *, hbg: bool = False) -> TaskArgs:
+    """Build the ``TaskArgs`` for the selected Qwen3 prefill dispatch.
 
     Host-shared I/O buffers are slots (allocated here); static weights are eager
     ``StaticDeviceTensor`` markers; the KV-cache handles are lazy sources
@@ -127,10 +127,15 @@ def prefill_task_args(runner: Qwen314BModelRunner) -> TaskArgs:
     ``slot_mapping`` slices into the built tuple.
     """
     slot_specs = _prefill_slot_specs(runner._compiled.layout)
+    order = _PREFILL_ORDER
+    if hbg:
+        slot_specs["host_chunk_lens"] = slot_specs["chunk_lens"]
+        slot_specs["host_chunk_offsets"] = slot_specs["chunk_offsets"]
+        order += ("host_chunk_lens", "host_chunk_offsets")
     static_weights = set(_STATIC_WEIGHT_ACCESSORS)
 
     ta = TaskArgs(stacked=False)
-    for name in _PREFILL_ORDER:
+    for name in order:
         if name in slot_specs:
             dtype, shape = slot_specs[name]
             ta.add_slot(Slot(name, Placement.HOST_SHARED, dtype, lambda _, s=shape: s))

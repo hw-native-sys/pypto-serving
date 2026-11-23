@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 import torch
 
-from pypto_serving.config.types import GenerateConfig, StopTokenMask
+from pypto_serving.config.types import GenerateConfig, RuntimeConfig, StopTokenMask
 from pypto_serving.model.common.executor.sampler import Sampler
 from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_DECODE_BATCH,
@@ -28,6 +28,7 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSparkModelRunner,
 )
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.serving.engine.async_engine import EngineConfig
 from pypto_serving.serving.sched.scheduler import (
     Request,
     RequestStatus,
@@ -43,6 +44,20 @@ from pypto_serving.serving.server.serving_worker import WorkerProcess
 
 def _chat_request(**fields) -> ChatCompletionRequest:
     return ChatCompletionRequest(messages=[ChatMessage(role="user", content="Go")], **fields)
+
+
+@pytest.mark.parametrize("speculative_tokens", [0, 5])
+def test_v41_sampling_admission_preserves_k0_and_k5_capabilities(speculative_tokens):
+    config = EngineConfig(
+        executor_cls="PyptoDeepSeekV41Executor",
+        runtime_config=RuntimeConfig(num_speculative_tokens=speculative_tokens),
+    )
+    config.validate_generate_config(GenerateConfig(temperature=0))
+    if speculative_tokens == 5:
+        with pytest.raises(ValueError, match="greedy sampling only"):
+            config.validate_generate_config(GenerateConfig(temperature=0.7))
+    else:
+        config.validate_generate_config(GenerateConfig(temperature=0.7))
 
 
 @pytest.mark.parametrize("fields,expected", [
@@ -115,6 +130,21 @@ def test_ignore_eos_and_min_tokens_combinations(ignore_eos, min_tokens):
     assert [output.num_output_tokens for output in outputs] == list(
         range(1, len(request.output_token_ids) + 1)
     )
+
+
+def test_all_eos_ids_are_masked_before_min_tokens():
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker._req_cache = {"r": NewRequestData(
+        request_id="r", prompt_token_ids=[3], temperature=0.0,
+        top_p=1.0, top_k=None, min_tokens=2, eos_token_id=1,
+        eos_token_ids=(1, 2),
+    )}
+    worker._accepted_output_lengths = {"r": 0}
+    params = worker._sampling_params("r")
+    assert params.forbidden_token_ids == (1, 2)
+    assert Sampler().sample(torch.tensor([1.0, 10.0, 9.0]), params) == 0
+    worker._accept_output_tokens("r", 2)
+    assert worker._sampling_params("r").forbidden_token_ids == ()
 
 
 def test_dspark_stages_eos_mask_for_prefill_and_k7_decode():
