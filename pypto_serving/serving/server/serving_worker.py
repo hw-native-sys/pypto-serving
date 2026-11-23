@@ -249,6 +249,10 @@ class WorkerProcess:
             return num_pages
 
     def _resolve_executor_cls(self):
+        if self.config.executor_cls == "PyptoDeepSeekV4LowlatExecutor":
+            from pypto_serving.model.deepseek_lowlat.npu_executor import DeepSeekV4LowlatPyptoExecutor
+
+            return DeepSeekV4LowlatPyptoExecutor
         if self.config.executor_cls == "PyptoDeepSeekV41Executor":
             from pypto_serving.model.deepseek_v41.npu_executor import DeepSeekV41PyptoExecutor
 
@@ -293,7 +297,7 @@ class WorkerProcess:
         config = getattr(self, "config", None)
         executor = getattr(self, "executor", None)
         async_enabled = bool(config is not None and config.resolve_async_scheduling())
-        if async_enabled and executor is not None and executor.supports_async_decode_prepare:
+        if async_enabled and executor is not None and self.executor.supports_async_decode_prepare:
             self._pipelined_busy_loop()
         else:
             self._serial_busy_loop()
@@ -393,7 +397,7 @@ class WorkerProcess:
                 if (
                     isinstance(cmd, StepCommand)
                     and (cmd.decode_requests or (cmd.prefill_requests and
-                         getattr(self.executor, "supports_async_prefill_reclaim", False)))
+                         self.executor.supports_async_prefill_reclaim))
                     and self.executor.supports_device_decode_embedding
                 ):
                     # Every writer must own its slot, including the decode
@@ -677,7 +681,7 @@ class WorkerProcess:
             prepared is not None and prepared.error is None
             and prepared.prefill_prepared is not None and prepared.prefill_batch is not None
             and cmd.prefill_requests and not cmd.decode_requests
-            and bool(getattr(self.executor, "supports_async_prefill_reclaim", False))
+            and bool(self.executor.supports_async_prefill_reclaim)
         )
 
     def _reclaim_pending_prefill(self, work: _PendingPrefillOutput) -> StepResult:
@@ -704,7 +708,7 @@ class WorkerProcess:
             and cmd.decode_requests
             and not cmd.prefill_requests
             and not cmd.new_requests
-            and bool(getattr(self.executor, "supports_async_decode_reclaim", False))
+            and bool(self.executor.supports_async_decode_reclaim)
         )
 
     def _reclaim_pending_decode(self, work: _PendingDecodeOutput) -> StepResult:
@@ -730,7 +734,8 @@ class WorkerProcess:
                     num_draft_tokens=num_draft_tokens, mode="async",
                 )
             return StepResult(
-                new_tokens=new_tokens, step_id=work.cmd.step_id, num_draft_tokens=num_draft_tokens
+                new_tokens=new_tokens, step_id=work.cmd.step_id, num_draft_tokens=num_draft_tokens,
+                model_extension=decode_result.model_extension,
             )
         except Exception as exc:
             logger.error("Worker decode reclaim failed: %s", exc, exc_info=True)
@@ -863,6 +868,16 @@ class WorkerProcess:
             cmd.finished_request_ids,
             expected_cache_entries=expected_cache_entries,
         )
+        if getattr(self.executor, "uses_request_execution_context", False) is True:
+            from pypto_serving.serving.model_extension import RequestExecutionContext
+
+            contexts = [RequestExecutionContext(r.request_id, len(r.prompt_token_ids),
+                                                r.max_output_tokens, r.initial_output_tokens, r.execution_generation)
+                        for r in cmd.new_requests]
+            self.executor.prepare_request_contexts(self.model_record.runtime_model, contexts)
+            prepare_metadata=getattr(self.executor,"prepare_request_metadata",None)
+            if callable(prepare_metadata):
+                prepare_metadata(self.model_record.runtime_model,cmd.new_requests)
         for new_request in cmd.new_requests:
             previous_state = self._constraint_states.pop(new_request.request_id, None)
             if previous_state is not None:
@@ -928,6 +943,7 @@ class WorkerProcess:
         runtime_model = self.model_record.runtime_model
         new_tokens: dict[str, list[int]] = {}
         num_draft_tokens: dict[str, int] = {}
+        model_extension = b""
 
         with profile_span(
             "WorkerProcess.execute_step",
@@ -937,7 +953,7 @@ class WorkerProcess:
             if cmd.prefill_requests:
                 max_prefill_batch = self.executor.max_prefill_batch_size
                 if max_prefill_batch is None:
-                    if prepared_decode is not None and getattr(self.executor, "supports_async_prefill_reclaim", False):
+                    if prepared_decode is not None and self.executor.supports_async_prefill_reclaim:
                         self._batch_prefill(cmd.prefill_requests, runtime_model, new_tokens,
                                             prefill_slot=prepared_decode.buffer_slot)
                     else:
@@ -955,13 +971,13 @@ class WorkerProcess:
                             self.executor, "max_prefill_tokens_per_partition", None
                         ),
                     ):
-                        if prepared_decode is not None and getattr(self.executor, "supports_async_prefill_reclaim", False):
+                        if prepared_decode is not None and self.executor.supports_async_prefill_reclaim:
                             self._batch_prefill(chunk, runtime_model, new_tokens,
                                                 prefill_slot=prepared_decode.buffer_slot)
                         else:
                             self._batch_prefill(chunk, runtime_model, new_tokens)
             if cmd.decode_requests:
-                num_draft_tokens = self._batch_decode(
+                num_draft_tokens, model_extension = self._batch_decode(
                     cmd.decode_requests,
                     runtime_model,
                     new_tokens,
@@ -976,7 +992,10 @@ class WorkerProcess:
             if tokens:
                 self._record_last_tokens(req_id, tokens)
 
-        return StepResult(new_tokens=new_tokens, step_id=cmd.step_id, num_draft_tokens=num_draft_tokens)
+        return StepResult(new_tokens=new_tokens, step_id=cmd.step_id, num_draft_tokens=num_draft_tokens,
+                          model_extension=model_extension,
+                          cache_publications=(self.executor.take_cache_publications(runtime_model)
+                              if callable(getattr(self.executor,"take_cache_publications",None)) else ()))
 
     def _record_last_tokens(self, request_id: str, tokens: list[int]) -> None:
         """Remember the latest sampled token for async placeholder resolution."""
@@ -1062,6 +1081,11 @@ class WorkerProcess:
             checkpoint_block_ids_by_group=[pr.checkpoint_block_ids_by_group for pr in scheduled],
             cache_partitions=[pr.cache_partition for pr in scheduled],
         )
+        batch.model_extensions = {
+            pr.request_id: pr.model_extension
+            for pr in scheduled
+            if pr.model_extension
+        }
         batch.constraint_states = {
             pr.request_id: state
             for pr in terminal
@@ -1102,7 +1126,7 @@ class WorkerProcess:
             batch = self._make_prefill_batch(scheduled, runtime_model)
             allow_device_greedy_sampling = batch.allow_device_greedy_sampling
             allow_device_topk_sampling = batch.allow_device_topk_sampling
-            if prefill_slot is not None and getattr(self.executor, "supports_async_prefill_reclaim", False):
+            if prefill_slot is not None and self.executor.supports_async_prefill_reclaim:
                 prefill_result = self.executor.run_prefill_in_slot(
                     runtime_model, batch, buffer_slot=prefill_slot,
                 )
@@ -1118,11 +1142,9 @@ class WorkerProcess:
                 # num_prompt_tokens is len(prompt_token_ids), which we have in cache.
                 will_be_computed = pr.num_computed_tokens + len(pr.chunk_tokens)
                 if will_be_computed >= len(cached.prompt_token_ids):
-                    logits = (
-                        prefill_result.logits[i]
-                        if prefill_result.logits.dim() > 1
-                        else prefill_result.logits
-                    )
+                    logits = prefill_result.logits
+                    if logits is not None and logits.dim() > 1:
+                        logits = logits[i]
                     params = self._sampling_params(pr.request_id)
                     token_id = self._sample_result_row(
                         prefill_result,
@@ -1303,6 +1325,7 @@ class WorkerProcess:
             block_ids=[dr.block_ids for dr in scheduled],
             block_ids_by_group=[dr.block_ids_by_group for dr in scheduled],
             cache_partitions=[dr.cache_partition for dr in scheduled],
+            model_extensions=tuple(dr.model_extension or None for dr in scheduled),
             constraint_states={
                 dr.request_id: state
                 for dr in scheduled
@@ -1323,7 +1346,7 @@ class WorkerProcess:
         prepared_decode: _PreparedDecodeWork | None = None,
         step_id: int = 0,
         prefill_requests: int = 0,
-    ) -> dict[str, int]:
+    ) -> tuple[dict[str, int], bytes]:
         with profile_span(
             "WorkerProcess.batch_decode",
             cat="worker",
@@ -1387,7 +1410,7 @@ class WorkerProcess:
                     mode="sync_prepared" if prepared_decode is not None else "sync_unprepared",
                     prefill_requests=prefill_requests,
                 )
-            return num_draft_tokens
+            return num_draft_tokens, decode_result.model_extension
 
     def _consume_decode_result(
         self,
@@ -1571,7 +1594,7 @@ class WorkerProcess:
         return all(
             request.temperature <= 0.0
             or (
-                getattr(self.executor, "supports_device_stochastic_sampling", False)
+                self.executor.supports_device_stochastic_sampling
                 and request.top_p >= 1.0
             )
             for request in requests

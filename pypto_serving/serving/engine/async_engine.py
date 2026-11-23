@@ -116,24 +116,30 @@ class EngineConfig:
     # tokens per step and subtracts the shortfall once the worker replies.
     async_scheduling: bool | None = None
 
+    def execution_policy(self):
+        from pypto_serving.model.execution_policy import execution_policy
+        policy = getattr(self, "_execution_policy_cache", None)
+        if policy is None:
+            policy = execution_policy(self)
+            self._execution_policy_cache = policy
+        return policy
+
     def resolve_async_scheduling(self) -> bool:
-        """Resolve the async-scheduling flag (default on for all executors)."""
-        if self.async_scheduling is not None:
-            return self.async_scheduling
-        return True
+        return self.execution_policy().resolve_async_scheduling()
 
     def resolve_min_tokens(self, min_tokens: int) -> int:
-        """Return the minimum length supported by the selected decode path."""
+        self.execution_policy().validate_min_tokens(min_tokens)
         return min_tokens if self.sampling_capabilities().honor_min_tokens else 0
+
+    def validate_generate_config(self, config, *, constraint_spec=None):
+        if self.sampling_capabilities().greedy_only and not config.temperature <= 0:
+            raise ValueError("V4.1 K5 DSpark supports greedy sampling only; set temperature=0 or use K0")
+        self.execution_policy().validate_generate_config(config, constraint_spec=constraint_spec)
 
     def sampling_capabilities(self) -> SamplingCapabilities:
         return sampling_capabilities(
             self.executor_cls, self.resolve_runtime_config().num_speculative_tokens
         )
-
-    def validate_generate_config(self, config) -> None:
-        if self.sampling_capabilities().greedy_only and not config.temperature <= 0:
-            raise ValueError("V4.1 K5 DSpark supports greedy sampling only; set temperature=0 or use K0")
 
     def resolve_runtime_config(self) -> RuntimeConfig:
         """Return runtime settings with executor requirements resolved."""
@@ -247,6 +253,7 @@ class ReplicaEngineCore:
         self._worker_factory = worker_factory
         runtime = config.resolve_runtime_config()
         self.config = replace(config, runtime_config=runtime)
+        self._execution_policy = self.config.execution_policy()
         self.tokenizer = tokenizer
         block_size = runtime.page_size
         self._runtime = runtime
@@ -287,6 +294,7 @@ class ReplicaEngineCore:
                 runtime.requires_homogeneous_prefill_decode
             ),
             async_scheduling=self._async_scheduling,
+            **self._policy().scheduler_options(),
         )
         # Validate before worker startup, while the manager's pools are still lazy.
         scheduler_config.validate_cache_groups(runtime.kv_cache_groups)
@@ -338,6 +346,14 @@ class ReplicaEngineCore:
         self._step_timeout = worker_step_timeout_seconds()
         self._stat_logger: InMemoryStatLogger | None = None
         self._engine_index = int(config.dp_rank)
+
+    def _policy(self):
+        """Return the core's cached model execution policy."""
+        policy = getattr(self, "_execution_policy", None)
+        if policy is None:
+            policy = self.config.execution_policy()
+            self._execution_policy = policy
+        return policy
 
     def set_stat_logger(
         self,
@@ -593,7 +609,7 @@ class ReplicaEngineCore:
         constraint_spec: ConstraintSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
-        self.config.validate_generate_config(config)
+        self.config.validate_generate_config(config, constraint_spec=constraint_spec)
         with profile_span(
             "ReplicaEngineCore.add_request",
             cat="serving",
@@ -616,6 +632,7 @@ class ReplicaEngineCore:
                 constraint_spec=constraint_spec,
             )
 
+            self._policy().validate_request_budget(len(request.prompt_token_ids),request.max_new_tokens)
             if request_id in self._request_contexts:
                 raise ValueError(f"request {request_id!r} is already active")
             ctx = _RequestContext(
@@ -973,6 +990,12 @@ class ReplicaEngineCore:
             self._handle_step_error(step_id, scheduler_output, result_pending=False, finished_ids=finished_ids)
             return False
 
+        try:
+            self._policy().confirm_step(scheduler_output,step_result,self.kv_cache_manager)
+        except (ValueError,TypeError,RuntimeError):
+            logger.exception("Execution policy rejected step completion receipts")
+            self._handle_step_error(step_id,scheduler_output,result_pending=False,finished_ids=finished_ids)
+            return False
         self._acknowledge_worker_frees(finished_ids)
 
         # Unwrap list[int] values back to int | list[int] for update_from_output.
@@ -1059,6 +1082,9 @@ class ReplicaEngineCore:
                     eos_token_id=req.eos_token_id,
                     eos_token_ids=req.eos_token_ids,
                     initial_output_tokens=len(req.output_token_ids),
+                    max_output_tokens=req.max_new_tokens,
+                    execution_generation=req.execution_generation,
+                    model_extension=self._policy().request_metadata(req),
                     constraint_spec=req.constraint_spec.to_wire() if req.constraint_spec else None,
                     initialize_from_cache=req.requires_initial_step,
                     initial_output_token_ids=(
@@ -1081,6 +1107,8 @@ class ReplicaEngineCore:
                         for name, block_ids in sr.block_ids_by_group.items()
                     },
                     cache_partition=sr.cache_partition,
+                    model_extension=self._policy().prefill_metadata(
+                        sr,is_new=any(r.request_id==req_id for r in new_requests),cache=self.kv_cache_manager),
                     prefix_cache_hit_tokens=req.prefix_cache_hit_tokens,
                     read_block_ids_by_group=sr.read_block_ids_by_group,
                     checkpoint_ends=sr.checkpoint_plan.boundaries if sr.checkpoint_plan else (),
@@ -1099,7 +1127,9 @@ class ReplicaEngineCore:
                     last_token = PLACEHOLDER_TOKEN
                 else:
                     last_token = output_ids[-1] if output_ids else prompt_ids[-1]
+                reservation = sr.model_execution_plan
                 decode_requests.append(DecodeRequest(
+                    model_extension=(msgspec.msgpack.encode(vars(reservation)) if reservation else b""),
                     request_id=req_id,
                     last_token=last_token,
                     # Context length for THIS step, snapshotted at schedule time:
@@ -1710,6 +1740,7 @@ class AsyncLLMEngine:
             config = replace(config, parallel_config=parallel)
 
         self.config = config
+        self._execution_policy = self.config.execution_policy()
         self.tokenizer = tokenizer
         assert self.tokenizer is not None
         self.eos_token_id = tokenizer.eos_token_id
@@ -1813,6 +1844,18 @@ class AsyncLLMEngine:
         self._request_counter += 1
         return f"serving-req-{self._request_counter}"
 
+    def validate_generate_config(self, config, *, constraint_spec=None):
+        self.config.validate_generate_config(config, constraint_spec=constraint_spec)
+
+    def validate_request_budget(self, prompt, config):
+        policy = getattr(self, "_execution_policy", None)
+        if policy is None:
+            policy = self.config.execution_policy()
+            self._execution_policy = policy
+        if policy.requires_token_budget:
+            tokens=self._tokenize_prompt(prompt)
+            policy.validate_request_budget(len(tokens),config.max_new_tokens)
+
     def pending_token_load(self) -> int:
         return sum(core.pending_token_load() for core in self._cores)
 
@@ -1879,10 +1922,6 @@ class AsyncLLMEngine:
     def kv_cache_manager(self) -> KvCacheManager:
         return self.single_core().kv_cache_manager
 
-    def validate_generate_config(self, config) -> None:
-        """Validate sampling before admission or HTTP streaming headers."""
-        self.config.validate_generate_config(config)
-
     async def add_request(
         self,
         request_id: str,
@@ -1892,7 +1931,7 @@ class AsyncLLMEngine:
         output_parser_spec: OutputParserSpec | None = None,
         constraint_spec: ConstraintSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
-        self.validate_generate_config(config)
+        self.validate_generate_config(config, constraint_spec=constraint_spec)
         arrival_monotonic = time.monotonic()
         replica_idx = self._select_replica()
         prompt_token_ids = self._tokenize_prompt(prompt)

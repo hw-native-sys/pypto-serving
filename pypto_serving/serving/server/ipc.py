@@ -28,6 +28,8 @@ from typing import Any, Union
 
 import msgspec
 
+from pypto_serving.serving.memory.protocol import CachePublicationProof
+
 # Sentinel for a decode input token the worker must resolve from its own cache.
 # Under async (pipelined) scheduling the engine builds step N+1 before step N's
 # sampled token is known, so it sends this placeholder and the worker substitutes
@@ -63,6 +65,12 @@ class NewRequestData(msgspec.Struct):
     initialize_from_cache: bool = False
     # Tokens committed before this worker request was registered (PD adoption).
     initial_output_token_ids: tuple[int, ...] = ()
+    # Effective limit after scheduler admission/clamping. Optional for legacy senders.
+    max_output_tokens: int | None = None
+    execution_generation: int = 0
+    # Opaque, versioned model-owned request extension. The common IPC layer
+    # carries bytes but never interprets lowlat metadata.
+    model_extension: bytes = b""
 
 
 class PrefillRequest(msgspec.Struct):
@@ -84,6 +92,7 @@ class PrefillRequest(msgspec.Struct):
     state_write_block_ids_by_group: dict[str, list[int]] = msgspec.field(default_factory=dict)
     checkpoint_block_ids_by_group: dict[str, dict[int, int]] = msgspec.field(default_factory=dict)
     prefix_cache_hit_tokens: int = 0
+    model_extension: bytes = b""
 
 
 class DecodeRequest(msgspec.Struct):
@@ -106,6 +115,7 @@ class DecodeRequest(msgspec.Struct):
     # Model-specific grouped cache tables and their stable rank partition.
     block_ids_by_group: dict[str, list[int]] = msgspec.field(default_factory=dict)
     cache_partition: int | None = None
+    model_extension: bytes = b""
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +183,8 @@ class StepResult(msgspec.Struct):
     # Echoes the originating StepCommand.step_id (pipeline ordering guard).
     step_id: int = 0
     num_draft_tokens: dict[str, int] = msgspec.field(default_factory=dict)
+    cache_publications: tuple[CachePublicationProof, ...] = ()
+    model_extension: bytes = b""
 
 
 class ProfileResult(msgspec.Struct, tag="profile"):

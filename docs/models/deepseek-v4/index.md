@@ -6,8 +6,9 @@ PyPTO Serving runs DeepSeek V4 Flash from a converted W8A8 checkpoint. Choose th
 | --- | --- | --- | --- |
 | [MTP](mtp.md) | 8 | `--dp 8 --ep 8 --tp 1` | Autoregressive or MTP speculative decoding. |
 | [DSpark](dspark.md) | 8 or 16 | TP4, with `--dp 2 --ep 8` or `--dp 4 --ep 16` | Target-only K=0 or DSpark speculative K=7. |
+| [Lowlat](lowlat.md) | 8 | `--dp 1 --tp 8 --ep 1 --lm-head-tp 8`, B1 | Single-batch K=5 DSpark-compatible optimization; CP8 prefill attention and TP8 decode attention. |
 
-Both paths use the [checkpoint conversion](mtp.md#checkpoint-conversion). The optional prepacked sidecar described in the MTP guide is specific to that path; DSpark loads its own weight layout. For the client workflow, see [Tool Calling](../../user-guide/tool-calling.md); for structural constraints on DSpark K=7, see [Tool Constraints](tool-constraints.md).
+These paths use the [checkpoint conversion](mtp.md#checkpoint-conversion). The optional prepacked sidecar described in the MTP guide is specific to that path; DSpark and lowlat each load their own weight layouts. For the client workflow, see [Tool Calling](../../user-guide/tool-calling.md); for structural constraints on DSpark K=7, see [Tool Constraints](tool-constraints.md). Lowlat rejects tool constraints and nonzero `min_tokens`.
 
 ## Function Tool Format
 

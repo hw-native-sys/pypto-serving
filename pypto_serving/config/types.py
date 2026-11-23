@@ -379,6 +379,7 @@ class PrefillBatch:
     # Optional serving-owned DSpark stage arguments.  The V4.1 adapter accepts
     # only already-bound lib composite arguments; it never rebuilds operators.
     dspark_stages: object | None = None
+    model_extensions: dict[str, bytes] = field(default_factory=dict)
 
 
 @dataclass
@@ -386,7 +387,7 @@ class PrefillResult:
     """Outputs from prompt prefill."""
 
     last_hidden: torch.Tensor | None
-    logits: torch.Tensor
+    logits: torch.Tensor | None
     sampled_token_ids: torch.Tensor | None = None
     sampling_candidates: SamplingCandidates | None = None
     next_hidden_states: torch.Tensor | None = None
@@ -424,6 +425,7 @@ class DecodeBatch:
     # Optional serving-owned DSpark stage arguments for one complete target ->
     # accept -> drafter -> Markov -> commit round.
     dspark_stages: object | None = None
+    model_extensions: tuple[bytes | None, ...] = ()
 
 
 @dataclass
@@ -441,6 +443,7 @@ class DecodeResult:
     # Actual verified drafts per request, before scheduler output truncation.
     # None disables speculation metrics; zero denotes a target-only fallback.
     num_draft_tokens: list[int] | None = None
+    model_extension: bytes = b""
 
 
 @dataclass

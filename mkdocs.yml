@@ -109,6 +109,7 @@ nav:
           - Overview: models/deepseek-v4/index.md
           - MTP Deployment: models/deepseek-v4/mtp.md
           - DSpark Deployment: models/deepseek-v4/dspark.md
+          - Lowlat Deployment: models/deepseek-v4/lowlat.md
           - DSpark Tool Constraints: models/deepseek-v4/tool-constraints.md
           - Internals:
               - MTP: models/deepseek-v4/mtp-internals.md

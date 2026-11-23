@@ -187,23 +187,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--num-speculative-tokens",
-        type=int,
-        default=None,
-        help=(
-            "Maximum DeepSeek V4 MTP draft tokens per iteration. "
-            "Any positive value enables MTP; 0 disables it (default: 0)."
-        ),
-    )
-    parser.add_argument(
         "--speculative-config",
         type=_parse_speculative_config,
         default=None,
         metavar="JSON",
         help=(
             "Speculative decoding configuration as JSON. DeepSeek V4 supports "
-            "method='mtp' with a positive num_speculative_tokens, and "
-            "method='dspark' with its model-specific fixed draft width."
+            "method='mtp' with a positive num_speculative_tokens, or "
+            "method='dspark' with num_speculative_tokens 0, 5, or 7. "
+            "K=5 selects the single-batch lowlat path."
         ),
     )
 
@@ -317,11 +309,20 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         executor_kwargs["num_speculative_tokens"] = num_speculative_tokens
     elif num_speculative_tokens or model_variant:
         raise ValueError(
-            "--speculative-config/--num-speculative-tokens is only supported for DeepSeek V4"
+            "--speculative-config is only supported for DeepSeek V4"
         )
     # DSpark's attention DP/TP are model-local; the executor owns one EP-wide
     # worker group, with a replicated cache partition per attention group.
     dspark_variant = model_family == "deepseek_v4" and model_variant == "dspark"
+    lowlat_variant = model_family == "deepseek_v4" and model_variant == "lowlat"
+    if lowlat_variant:
+        # K=5 is the single stable lowlat configuration.  Its B1 native
+        # pipeline and rolling cache are model contract, not public CLI knobs.
+        executor_kwargs.update(
+            target_tp_size=8,
+            lm_head_tp_size=8,
+            cache_initialization="on-demand",
+        )
     if dspark_variant:
         # The dspark world size is flag-driven: --ep is the rank count and the
         # executor freezes the kernel layout (import arguments, cache
@@ -336,7 +337,8 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         enable_expert_parallel=args.expert_parallel_size > 1,
         devices=devices,
         data_parallel_routing=args.data_parallel_routing,
-        placement_mode="overlapped" if model_family in ("deepseek_v4", "glm53") else "replica",
+        placement_mode=("overlapped" if model_family in ("deepseek_v4", "glm53")
+                        and not lowlat_variant else "replica"),
     )
     _validate_model_topology(
         model_family,
@@ -345,13 +347,18 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         config_data=model_config_data,
         variant=model_variant,
     )
+    if lowlat_variant and args.enable_prefix_caching:
+        from pypto_serving.model.deepseek_lowlat.prefix import cache_namespace
+
+        executor_kwargs["prefix_cache_namespace"]=cache_namespace(args.model,context=args.max_model_len,
+            chunk=min(8192,args.max_num_batched_tokens,args.long_prefill_token_threshold))
     first_group = parallel_config.replica_device_groups[0]
     worker_device_ids = first_group if parallel_config.num_replicas == 1 else ()
     # DSpark rebuilds its private drafter context from a prefilled suffix.
     # Arbitrary-depth MTP still lacks a grouped prefix-cache contract.
     enable_prefix_cache = args.enable_prefix_caching
     if model_family == "deepseek_v4" and (
-        num_speculative_tokens > 1 and model_variant != "dspark"
+        num_speculative_tokens > 1 and model_variant not in ("dspark", "lowlat")
     ):
         enable_prefix_cache = False
     return EngineConfig(
@@ -374,6 +381,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         long_prefill_token_threshold=args.long_prefill_token_threshold,
         enable_prefix_cache=enable_prefix_cache,
         enable_chunk_prefill=args.enable_chunked_prefill,
+        async_scheduling=True if lowlat_variant else None,
     )
 
 
@@ -494,7 +502,19 @@ def _build_runtime_config(
     supports_chunked_prefill_with_speculation = True
     speculative_prefix_cache_replay_tokens = 0
     requires_homogeneous_prefill_decode = False
-    if model_family == "deepseek_v4" and _resolve_model_variant(args) == "dspark":
+    if model_family == "deepseek_v4" and _resolve_model_variant(args) == "lowlat":
+        from pypto_serving.model.deepseek_lowlat.contract import build_lowlat_cache_group_specs
+
+        max_prefill_tokens_per_request = min(8192, args.max_num_batched_tokens,
+                                             args.long_prefill_token_threshold)
+        kv_cache_groups = build_lowlat_cache_group_specs(
+            max_seq_len=args.max_model_len, max_prefill_tokens=max_prefill_tokens_per_request,
+            layout="rolling",
+            prefix_cache=args.enable_prefix_caching)
+        if args.enable_prefix_caching:
+            speculative_prefix_cache_replay_tokens = 128
+        requires_homogeneous_prefill_decode = True
+    elif model_family == "deepseek_v4" and _resolve_model_variant(args) == "dspark":
         from pypto_serving.model.deepseek_dspark.npu_runner import (
             DSPARK_PREFILL_MAX_TOKENS,
             DSPARK_SLIDING_WINDOW,
@@ -591,57 +611,50 @@ def _build_runtime_config(
 
 
 def _resolve_model_variant(args: argparse.Namespace) -> str:
-    """Return the DeepSeek V4 serving variant selected by the speculative config."""
+    """Return the DeepSeek V4 variant selected by the public DSpark/MTP config."""
     speculative_config = getattr(args, "speculative_config", None)
     if speculative_config is None:
         return ""
     method = speculative_config.get("method")
-    if method in ("mtp", "dspark"):
-        return str(method)
+    if method == "mtp":
+        return method
+    if method == "dspark":
+        # K=5 is the single-batch lowlat implementation of the DSpark
+        # contract.  K=0 and the existing K=7 path remain regular DSpark.
+        return "lowlat" if _resolve_num_speculative_tokens(args) == 5 else "dspark"
     raise ValueError(
         "DeepSeek V4 --speculative-config requires method='mtp' or method='dspark'"
     )
 
 
 def _resolve_num_speculative_tokens(args: argparse.Namespace) -> int:
-    """Resolve the vLLM-style config and deprecated standalone alias."""
+    """Resolve the vLLM-style speculative configuration."""
     speculative_config = getattr(args, "speculative_config", None)
-    configured = getattr(args, "num_speculative_tokens", None)
-    if speculative_config is not None:
-        if configured is not None:
-            raise ValueError("--speculative-config cannot be combined with --num-speculative-tokens")
-        method = speculative_config.get("method")
-        if method == "dspark":
-            from pypto_serving.model.deepseek_dspark.npu_runner import (  # noqa: PLC0415
-                DSPARK_SPECULATIVE_TOKENS,
-            )
-
-            dspark_tokens = speculative_config.get("num_speculative_tokens", 0)
-            if dspark_tokens not in (0, DSPARK_SPECULATIVE_TOKENS):
-                raise ValueError(
-                    "DeepSeek V4 method='dspark' speculation is fixed at "
-                    f"num_speculative_tokens {DSPARK_SPECULATIVE_TOKENS} "
-                    "(DSPARK_QUERY_WIDTH); use 0 to serve the target model only"
-                )
-            return int(dspark_tokens)
-        if method != "mtp":
-            raise ValueError("DeepSeek V4 --speculative-config requires method='mtp'")
-        if "num_speculative_tokens" not in speculative_config:
-            raise ValueError(
-                "DeepSeek V4 --speculative-config requires num_speculative_tokens"
-            )
-        configured = speculative_config["num_speculative_tokens"]
-        if isinstance(configured, bool) or not isinstance(configured, int):
-            raise ValueError("num_speculative_tokens must be an integer")
-        if configured <= 0:
-            raise ValueError("num_speculative_tokens must be positive")
-        return configured
-
-    if configured is None:
+    if speculative_config is None:
         return 0
-    configured = int(configured)
-    if configured < 0:
-        raise ValueError("--num-speculative-tokens must be non-negative")
+    method = speculative_config.get("method")
+    if "num_speculative_tokens" not in speculative_config:
+        if method == "dspark":
+            return 0
+        raise ValueError("DeepSeek V4 --speculative-config requires num_speculative_tokens")
+    configured = speculative_config["num_speculative_tokens"]
+    if isinstance(configured, bool) or not isinstance(configured, int):
+        raise ValueError("num_speculative_tokens must be an integer")
+    if method == "dspark":
+        from pypto_serving.model.deepseek_dspark.npu_runner import (  # noqa: PLC0415
+            DSPARK_SPECULATIVE_TOKENS,
+        )
+
+        if configured not in (0, 5, DSPARK_SPECULATIVE_TOKENS):
+            raise ValueError(
+                "DeepSeek V4 method='dspark' supports num_speculative_tokens 0, 5, or "
+                f"{DSPARK_SPECULATIVE_TOKENS}"
+            )
+        return configured
+    if method != "mtp":
+        raise ValueError("DeepSeek V4 --speculative-config requires method='mtp' or method='dspark'")
+    if configured <= 0:
+        raise ValueError("num_speculative_tokens must be positive")
     return configured
 
 
@@ -786,6 +799,8 @@ def _executor_cls_for_model_family(model_family: str, *, variant: str = "") -> s
     if model_family == "glm53":
         return "PyptoGlm53Executor"
     if model_family == "deepseek_v4":
+        if variant == "lowlat":
+            return "PyptoDeepSeekV4LowlatExecutor"
         if variant == "dspark":
             return "PyptoDeepSeekV4DSparkExecutor"
         return "PyptoDeepSeekV4Executor"
@@ -799,7 +814,7 @@ def _validate_prefill_chunk_size(
     variant: str = "",
 ) -> None:
     """Reject unsupported user-configured DeepSeek prefill chunk sizes."""
-    if model_family != "deepseek_v4" or variant == "dspark":
+    if model_family != "deepseek_v4" or variant in ("dspark", "lowlat"):
         return
     if (
         not isinstance(chunk_size, int)
@@ -831,6 +846,12 @@ def _validate_model_topology(
         )
         return
     if model_family != "deepseek_v4":
+        return
+    if variant == "lowlat":
+        from pypto_serving.model.deepseek_lowlat.contract import LowlatServingContract
+
+        LowlatServingContract(num_speculative_tokens=_resolve_num_speculative_tokens(args)).validate_cli(
+            args, parse_device_ids(args.devices, default_device=args.device), config_data)
         return
     if variant == "dspark":
         _validate_dspark_topology(args)

@@ -18,6 +18,7 @@ import torch
 
 from pypto_serving.serving.engine.async_engine import (
     ReplicaEngineCore,
+    EngineConfig,
 )
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
@@ -49,6 +50,8 @@ from ..device_sampling_fakes import _FixedSampler, _ImmediateEosExecutor, _model
 
 def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.config=EngineConfig()
+    core.kv_cache_manager=KvCacheManager()
     core._request_contexts = {}
     core._worker_known_req_ids = {"req"}
     request = Request(
@@ -110,6 +113,8 @@ def test_worker_replays_committed_context_without_resampling_intermediate_chunks
     worker._req_cache = {}
     worker._last_tokens = {}
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.config = EngineConfig()
+    core.kv_cache_manager = manager
     core._request_contexts = {}
     core._worker_known_req_ids = set()
     request = Request("replay", [1, 2], max_new_tokens=2, min_tokens=2, eos_token_id=0)
@@ -852,6 +857,7 @@ def test_mixed_decode_does_not_overwrite_prepared_next_step():
     class Executor:
         supports_async_decode_prepare = True
         supports_async_decode_reclaim = False
+        supports_async_prefill_reclaim = False
         supports_device_decode_embedding = True
         supports_device_sampling = True
         device_topk_sampling_k = 0

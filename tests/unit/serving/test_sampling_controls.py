@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 import torch
 
-from pypto_serving.config.types import GenerateConfig, StopTokenMask
+from pypto_serving.config.types import GenerateConfig, RuntimeConfig, StopTokenMask
 from pypto_serving.model.common.executor.sampler import Sampler
 from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSPARK_DECODE_BATCH,
@@ -28,6 +28,7 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
     DSparkModelRunner,
 )
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.serving.engine.async_engine import EngineConfig
 from pypto_serving.serving.sched.scheduler import (
     Request,
     RequestStatus,
@@ -43,6 +44,20 @@ from pypto_serving.serving.server.serving_worker import WorkerProcess
 
 def _chat_request(**fields) -> ChatCompletionRequest:
     return ChatCompletionRequest(messages=[ChatMessage(role="user", content="Go")], **fields)
+
+
+@pytest.mark.parametrize("speculative_tokens", [0, 5])
+def test_v41_sampling_admission_preserves_k0_and_k5_capabilities(speculative_tokens):
+    config = EngineConfig(
+        executor_cls="PyptoDeepSeekV41Executor",
+        runtime_config=RuntimeConfig(num_speculative_tokens=speculative_tokens),
+    )
+    config.validate_generate_config(GenerateConfig(temperature=0))
+    if speculative_tokens == 5:
+        with pytest.raises(ValueError, match="greedy sampling only"):
+            config.validate_generate_config(GenerateConfig(temperature=0.7))
+    else:
+        config.validate_generate_config(GenerateConfig(temperature=0.7))
 
 
 @pytest.mark.parametrize("fields,expected", [

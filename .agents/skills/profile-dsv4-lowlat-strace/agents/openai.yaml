@@ -1,0 +1,4 @@
+interface:
+  display_name: "Profile DSV4 Lowlat"
+  short_description: "Capture a single-batch lowlat eight-lane Host trace"
+  default_prompt: "Use $profile-dsv4-lowlat-strace to capture and validate a lowlat B1 native-pipeline Perfetto trace."

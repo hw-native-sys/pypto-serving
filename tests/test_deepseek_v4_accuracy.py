@@ -171,8 +171,8 @@ def _server_command(
         "0.90",
         "--long-prefill-token-threshold",
         "1024",
-        "--num-speculative-tokens",
-        str(num_speculative_tokens),
+        "--speculative-config",
+        json.dumps({"method": "mtp", "num_speculative_tokens": num_speculative_tokens}),
         "--enable-prefix-caching" if enable_prefix_caching else "--no-enable-prefix-caching",
         "--ring-dep-pool",
         "16384",
@@ -512,7 +512,7 @@ def test_server_command_uses_explicit_mtp_depth_and_serving_capacity(tmp_path) -
     command = _server_command(tmp_path, tuple(range(8)), 12345, 3)
 
     assert "--enable-mtp" not in command
-    assert command[command.index("--num-speculative-tokens") + 1] == "3"
+    assert command[command.index("--speculative-config") + 1] == '{"method": "mtp", "num_speculative_tokens": 3}'
     assert command[command.index("--max-num-seqs") + 1] == "8"
     assert command[command.index("--long-prefill-token-threshold") + 1] == "1024"
     assert command[command.index("--ring-dep-pool") + 1] == "16384"

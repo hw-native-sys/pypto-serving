@@ -993,7 +993,7 @@ def test_grouped_cache_preemption_removes_victim_from_running_queue():
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
 def test_preempted_request_replays_emitted_tokens_before_sampling_again(async_scheduling):
-    from pypto_serving.serving.engine.async_engine import ReplicaEngineCore
+    from pypto_serving.serving.engine.async_engine import EngineConfig, ReplicaEngineCore
 
     scheduler = _prefill_scheduler(
         num_blocks=8,
@@ -1013,6 +1013,8 @@ def test_preempted_request_replays_emitted_tokens_before_sampling_again(async_sc
     assert scheduler._preempt_lowest_priority(Request("other", [1], 1), set(), {}, SchedulerOutput())
 
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
+    core.config = EngineConfig()
+    core.kv_cache_manager = scheduler.kv_cache_manager
     core._request_contexts = {}
     core._worker_known_req_ids = {request.request_id}
     first = scheduler.schedule()

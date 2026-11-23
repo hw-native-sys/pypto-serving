@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+from .execution import SchedulingPolicy, RequestPolicyState, StepPolicyState
+
 import logging
 import math
 import time
@@ -68,8 +70,10 @@ class SchedulerConfig:
     async_scheduling: bool = False
     # Prefill-only execution retains cache until explicitly finished.
     stop_after_prefill: bool = False
+    execution_policy: SchedulingPolicy = field(default_factory=SchedulingPolicy)
 
     def __post_init__(self) -> None:
+        self.execution_policy.validate_config(self)
         interval = self.prefix_cache_retention_interval
         if type(interval) is not int or interval < 0:
             raise ValueError("prefix_cache_retention_interval must be a nonnegative integer")
@@ -164,11 +168,13 @@ class Request:
     # Earliest valid KV position after a model skips the beginning of a
     # prefill chunk. Keep this across decode so partial pages stay unpublished.
     group_cache_valid_from: dict[str, int] = field(default_factory=dict)
+    execution_state: RequestPolicyState | None = None
     prefix_cache_metrics_recorded: bool = False
     # Async scheduling: tokens scheduled optimistically but not yet sampled.
     # Stands in for output tokens still in flight so the next schedule() advances
     # correctly; decremented as real tokens are applied in update_from_output.
     num_output_placeholders: int = 0
+    execution_generation: int = 0
     # Async scheduling must not turn a terminal prefill into a decode wave until
     # the worker has initialized request-local decode state and confirmed the
     # prefill result.  This is a per-request barrier, so unrelated ready requests
@@ -228,6 +234,12 @@ class ScheduledRequest:
     read_block_ids_by_group: dict[str, dict[int, int]] = field(default_factory=dict)
     group_read_snapshot: GroupBlockSnapshot | None = field(default=None, repr=False, compare=False)
     checkpoint_plan: object | None = field(default=None, repr=False, compare=False)
+    # Opaque model execution plan. The common scheduler never interprets its
+    # cycle/frame fields; the selected model policy owns the payload.
+    model_execution_plan: object | None = None
+    confirmed_input_end: int | None = None
+    execution_plan: StepPolicyState | None = None
+    cache_aux_snapshots: tuple = ()
 
 
 @dataclass
@@ -262,15 +274,30 @@ class Scheduler:
     def __init__(self, config: SchedulerConfig, kv_cache_manager: KvCacheManager) -> None:
         self.config = config
         self.kv_cache_manager = kv_cache_manager
+        self.policy=config.execution_policy
         self.config.validate_cache_groups(self.kv_cache_manager.group_specs)
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
         self.requests: dict[str, Request] = {}
+        self._execution_generation = 0
+        self._reservation_id = 0
+        self._pending_reservations = {}
         # Kernels with a homogeneous P/D contract keep each external dispatch
         # in one phase. Rotate the preferred phase so a long
         # chunked prefill cannot starve already-ready decode work (and vice
         # versa). Decode goes first when both kinds of work initially coexist.
         self._next_grouped_cache_phase = "decode"
+
+    def next_execution_generation(self):
+        self._execution_generation += 1
+        return self._execution_generation
+
+    def next_reservation_id(self):
+        self._reservation_id += 1
+        return self._reservation_id
+
+    def pending_reservations(self, request_id):
+        return tuple(self._pending_reservations.get(request_id, ()))
 
     def add_request(self, request: Request) -> None:
         prompt_len = len(request.prompt_token_ids)
@@ -324,6 +351,7 @@ class Scheduler:
                 request.block_hashes = self.kv_cache_manager.compute_block_hashes(
                     request.prompt_token_ids
                 )
+        self.policy.admit(self,request)
         request.status = RequestStatus.WAITING
         self.waiting.append(request)
         self.requests[request.request_id] = request
@@ -512,6 +540,13 @@ class Scheduler:
                 if not is_prefill and request.temperature <= 0.0
                 else 0
             )
+            reservation = None
+            if self.policy.uses_model_execution_plan and not is_prefill:
+                reservation=self.policy.reserve_execution_plan(self,request)
+                if reservation is None:
+                    running_to_keep.append(request)
+                    continue
+                speculative_tokens=reservation.max_output_tokens-num_new
             scheduled_tokens = num_new + speculative_tokens
             if scheduled_tokens > token_budget:
                 running_to_keep.append(request)
@@ -543,6 +578,7 @@ class Scheduler:
                 name: list(block_ids) for name, block_ids in request.allocated_group_block_ids.items()
             }
             scheduled.cache_partition = request.cache_partition
+            scheduled.model_execution_plan = reservation
             output.scheduled_requests.append(scheduled)
             scheduled_req_ids.add(request.request_id)
             num_scheduled_tokens[request.request_id] = scheduled_tokens
@@ -643,6 +679,7 @@ class Scheduler:
                                 0, request.num_computed_tokens
                                 - self.config.speculative_prefix_cache_replay_tokens,
                             )
+                    self.policy.adopt_prefix(self,request)
                     cached_blocks = []
                 else:
                     cached_blocks = self.kv_cache_manager.get_computed_blocks(
@@ -747,6 +784,7 @@ class Scheduler:
         remaining_waiting.extend(self.waiting)
         self.waiting = remaining_waiting
 
+        self.policy.prepare_steps(self,output)
         return output
 
     def _release_waiting_prefix_blocks(self, request: Request) -> None:
@@ -755,6 +793,7 @@ class Scheduler:
         request.num_computed_tokens = 0
         request.num_blocks_cached = 0
         request.num_group_blocks_cached = {}
+        self.policy.reset_waiting(request)
 
     def _prefill_chunk_limit(self) -> int | None:
         """Return the configured per-request prefill limit before step budget."""
@@ -830,6 +869,7 @@ class Scheduler:
             chunk_limit = self._prefill_chunk_limit()
             if chunk_limit is not None:
                 limit = min(limit, chunk_limit)
+            limit=self.policy.limit_prefill(request,limit)
             if self._requires_single_prefill_dispatch() and needed > limit:
                 return 0
         scheduled = max(0, min(needed, limit, self.config.max_seq_len - request.num_computed_tokens))
@@ -904,6 +944,8 @@ class Scheduler:
             return
         for scheduled in scheduler_output.scheduled_requests:
             request = scheduled.request
+            if scheduled.model_execution_plan is not None:
+                self._pending_reservations.setdefault(request.request_id, []).append(scheduled.model_execution_plan)
             if scheduled.block_ids_by_group:
                 if scheduled.cache_partition is None:
                     raise RuntimeError("Grouped async step has no cache partition")
@@ -915,6 +957,8 @@ class Scheduler:
                 request.num_computed_tokens + scheduled.num_new_tokens
                 >= request.num_prefill_tokens
             )
+            if self.policy.serial_prefill and scheduled.is_prefill:
+                request.terminal_prefill_in_flight=True
             request.num_computed_tokens += scheduled.num_new_tokens
             # Do NOT publish prefix-cache blocks here: this runs at dispatch,
             # before the worker confirms the KV was computed. A failed/timed-out
@@ -948,6 +992,8 @@ class Scheduler:
         Mirrors the accounting ``schedule()`` uses when allocating blocks: only
         greedy decode steps get speculative capacity.
         """
+        if scheduled.model_execution_plan is not None:
+            return scheduled.model_execution_plan.max_output_tokens-1
         if scheduled.is_prefill or request.temperature > 0.0:
             return 0
         # Use the dispatch snapshot: async advancement may already have changed
@@ -976,7 +1022,11 @@ class Scheduler:
         outputs: list[RequestOutput] = []
 
         for scheduled in scheduler_output.scheduled_requests:
+            self._retire_model_execution_plan(scheduled)
             request = scheduled.request
+            self._release_aux_snapshots(scheduled)
+            if scheduled.is_prefill:
+                self.policy.confirmed_prefill(self,request)
             # Async pipelining: a request that finished (EOS/length/stop), was
             # aborted, or was preempted at step N may still have step N+1 in
             # flight. Discard that stale result — the request has left `running`
@@ -1135,9 +1185,10 @@ class Scheduler:
         # Publish confirmed blocks through the exact physical table used by this
         # step. A newer in-flight chunk may already have advanced the request's
         # rolling table, so consulting current manager state here is incorrect.
-        confirmed_tokens = scheduled.num_computed_tokens + scheduled.num_new_tokens
+        confirmed_tokens = (scheduled.confirmed_input_end if scheduled.confirmed_input_end is not None
+                            else scheduled.num_computed_tokens + scheduled.num_new_tokens)
         try:
-            if self.kv_cache_manager.has_groups:
+            if self.kv_cache_manager.has_groups and not self.policy.explicit_cache_publication:
                 if scheduled.cache_partition is None:
                     raise RuntimeError("Grouped async step has no cache partition")
                 request.num_group_blocks_cached = (
@@ -1183,7 +1234,13 @@ class Scheduler:
             accepted_speculative = max(0, retained_tokens - 1)
             request.num_computed_tokens += accepted_speculative - (reserved - 1)
 
+    def _release_aux_snapshots(self, scheduled):
+        for snapshot in scheduled.cache_aux_snapshots:
+            self.kv_cache_manager.release_group_block_snapshot(snapshot)
+        scheduled.cache_aux_snapshots=()
+
     def _release_scheduled_group_blocks(self, scheduled: ScheduledRequest) -> None:
+        self._release_aux_snapshots(scheduled)
         if scheduled.checkpoint_plan is not None:
             self.kv_cache_manager.release_group_block_snapshot(scheduled.checkpoint_plan.snapshot)
             scheduled.checkpoint_plan = None
@@ -1193,13 +1250,26 @@ class Scheduler:
                 self.kv_cache_manager.release_group_block_snapshot(snapshot)
                 setattr(scheduled, name, None)
 
+    def _retire_model_execution_plan(self, scheduled):
+        reservation = scheduled.model_execution_plan
+        if reservation is None:
+            return
+        pending = self._pending_reservations.get(reservation.request_id, [])
+        if not pending or pending[0] != reservation:
+            raise RuntimeError("native reservation retirement is not FIFO")
+        pending.pop(0)
+        if not pending:
+            self._pending_reservations.pop(reservation.request_id, None)
+
     def discard_scheduled_request(self, scheduled: ScheduledRequest) -> None:
         """Drop one failed/stale async step without publishing its KV hashes."""
+        self._retire_model_execution_plan(scheduled)
         self._release_scheduled_group_blocks(scheduled)
 
     def _prepare_checkpoint(self, scheduled, num_new, output) -> bool:
         request = scheduled.request
-        if not self.kv_cache_manager.has_groups or request.group_checkpoint_boundary is None:
+        if (self.policy.explicit_cache_publication or not self.kv_cache_manager.has_groups
+                or request.group_checkpoint_boundary is None):
             return True
         try:
             scheduled.checkpoint_plan = self.kv_cache_manager.checkpoint_writer.prepare(
@@ -1254,6 +1324,7 @@ class Scheduler:
         """Grow either grouped or generic cache blocks for one scheduling step."""
         if self.kv_cache_manager.has_groups:
             total_tokens = request.num_computed_tokens + num_new_tokens
+            total_tokens=self.policy.allocation_extent(self.config,request,total_tokens)
             read_blocks, read_snapshot = ({}, None)
             if scheduled is not None and scheduled.is_prefill:
                 read_blocks, read_snapshot = self.kv_cache_manager.retain_group_prefill_history(
@@ -1377,7 +1448,7 @@ class Scheduler:
         num_computed_tokens: int | None = None,
     ) -> None:
         """Register completed blocks in the prefix cache."""
-        if not self.config.enable_prefix_cache:
+        if not self.config.enable_prefix_cache or self.policy.explicit_cache_publication:
             return
         confirmed_tokens = (
             request.num_computed_tokens

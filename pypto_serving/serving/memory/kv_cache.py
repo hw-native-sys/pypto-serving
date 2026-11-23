@@ -17,6 +17,8 @@ from dataclasses import dataclass, field, replace
 
 import torch
 
+from pypto_serving.serving.memory.protocol import (CachePageIdentity, CachePublicationProof, GroupPageRange,
+                                        GroupCacheCopyPlan)
 from pypto_serving.config.types import KVCacheGroupSpec, KvAllocation, ModelConfig, RuntimeConfig
 from pypto_serving.tools.profile import profile_span
 from .checkpoint import GroupCheckpointWriter, GroupPrefixCheckpoints
@@ -50,6 +52,7 @@ class KVCacheBlock:
 
     block_id: int
     ref_cnt: int = 0
+    allocation_epoch: int = 0
     block_hash: bytes | None = None
     prev_free: "KVCacheBlock | None" = field(default=None, repr=False)
     next_free: "KVCacheBlock | None" = field(default=None, repr=False)
@@ -1018,6 +1021,187 @@ class KvCacheManager:
 
         return best_blocks, best_hit_tokens, best_partition
 
+    def group_checkpoint_ranges(self, boundary):
+        return tuple(
+            GroupPageRange(
+                name,
+                max(
+                    0,
+                    boundary // p.spec.spec.token_capacity
+                    - p.spec.sliding_window // p.spec.spec.token_capacity,
+                )
+                if p.spec.sliding_window
+                else 0,
+                boundary // p.spec.spec.token_capacity,
+            )
+            for name, p in self._group_pools.items()
+        )
+
+    def detach_prefix_ring(self, request_id):
+        """Pin the immutable hit before replacing its writable rolling tables."""
+        partition = self._group_request_partitions[request_id]
+        tables = {
+            name: tuple(
+                pool.local_block_id(b) if b is not None else -1 for b in pool.request_blocks[request_id]
+            )
+            for name, pool in self._group_pools.items()
+        }
+        compact = {name: [p for p in ids if p >= 0] for name, ids in tables.items()}
+        pages = self.group_page_identities(compact, partition)
+        lease = self.retain_group_block_snapshot(compact, partition)
+        pins = getattr(self, "_prefix_resume_pins", {})
+        if request_id in pins:
+            self.release_group_block_snapshot(lease)
+            raise ValueError("Prefix request already has restore pins")
+        pins[request_id] = lease
+        self._prefix_resume_pins = pins
+        for pool in self._group_pools.values():
+            if pool.spec.sliding_window is None:
+                continue
+            for block in pool.request_blocks[request_id]:
+                if block is not None:
+                    block.ref_cnt -= 1  # Restore pins keep every source alive.
+            pool.request_blocks[request_id] = []
+            pool.request_logical_blocks[request_id] = 0
+        return tables, pages
+
+    def release_prefix_resume_pins(self, request_id):
+        lease = getattr(self, "_prefix_resume_pins", {}).pop(request_id, None)
+        if lease is not None:
+            self.release_group_block_snapshot(lease)
+
+    def reserve_prefix_checkpoint(self, request_id, *, generation, boundary, snapshot):
+        """Reserve separate rolling storage; copy completion precedes hash publication."""
+        if (type(generation) is not int or generation<=0 or type(boundary) is not int
+                or boundary<=0 or boundary%self.group_prefix_cache_alignment):
+            raise ValueError("Group checkpoint generation/boundary must be positive and aligned")
+        partition = self._group_request_partitions[request_id]
+        sources = self.group_page_identities(snapshot,partition)
+        complete_ranges = self.group_checkpoint_ranges(boundary)
+        leases = getattr(self, "_prefix_checkpoint_leases", {})
+        if request_id in leases:
+            raise ValueError("Prefix checkpoint is already reserved")
+        for name, pool in self._group_pools.items():
+            if pool.spec.sliding_window and pool.num_free_blocks_in(partition) < len(snapshot[name]):
+                raise KVCacheCapacityError("Insufficient exclusive checkpoint pages")
+        destination = {name: tuple(ids) for name, ids in snapshot.items()}
+        allocated = {}
+        try:
+            for name, pool in self._group_pools.items():
+                if pool.spec.sliding_window:
+                    blocks = []
+                    allocated[name] = blocks
+                    for _ in snapshot[name]:
+                        blocks.append(self._take_group_block(pool, partition))
+                    destination[name] = tuple(pool.local_block_id(b) for b in blocks)
+            destinations = self.group_page_identities(destination, partition)
+        except Exception:
+            for name, blocks in allocated.items():
+                for block in blocks:
+                    block.ref_cnt -= 1
+                    self._group_pools[name].free_queues[partition].append(block)
+            raise
+        leases[request_id] = allocated, partition
+        self._prefix_checkpoint_leases = leases
+        return GroupCacheCopyPlan(
+            request_id,
+            generation,
+            1,
+            boundary,
+            {name: tuple(ids) for name, ids in snapshot.items()},
+            destination,
+            sources,
+            destinations,
+            complete_ranges,
+        )
+
+    def release_prefix_checkpoint(self, request_id):
+        lease = getattr(self, "_prefix_checkpoint_leases", {}).pop(request_id, None)
+        if lease is None:
+            return
+        allocated, partition = lease
+        for name, blocks in allocated.items():
+            for block in blocks:
+                if block.ref_cnt <= 0:
+                    raise RuntimeError("Checkpoint lease lost its page reference")
+                block.ref_cnt -= 1
+                if block.ref_cnt == 0:
+                    self._group_pools[name].free_queues[partition].append(block)
+
+    def group_page_identities(self, snapshot, partition):
+        """Describe allocated epochs without exposing device addresses."""
+        if set(snapshot) != set(self._group_pools):
+            raise ValueError("Grouped identity snapshot does not match cache groups")
+        result = []
+        for name, ids in snapshot.items():
+            pool = self._group_pools[name]
+            if len(ids) != len(set(ids)):
+                raise ValueError("Grouped identity snapshot contains duplicates")
+            for page_id in ids:
+                block = pool.block_from_local_id(partition, page_id)
+                if block.ref_cnt <= 0 or block.allocation_epoch <= 0:
+                    raise ValueError("Grouped identity snapshot contains an unowned page")
+                result.append(CachePageIdentity(name, partition, page_id, block.allocation_epoch))
+        return tuple(result)
+
+    def publish_group_page_proof(
+        self, proof, *, request_id, generation, mapping_version, snapshot, partition, block_hashes, validate_only=False
+    ):
+        """Validate a whole-step proof before publishing any bounded page range.
+
+        This path intentionally has no contiguous already-cached counter:
+        rolling compressor states may only materialize a short valid suffix.
+        """
+        if not self.enable_prefix_cache:
+            raise ValueError("Explicit publication requires prefix caching")
+        if not isinstance(proof, CachePublicationProof):
+            raise TypeError("A typed cache publication proof is required")
+        proof.__post_init__()
+        if (
+            proof.request_id != request_id
+            or proof.generation != generation
+            or proof.mapping_version != mapping_version
+            or proof.checkpoint_boundary != proof.confirmed_input_end
+            or proof.checkpoint_boundary % self.group_prefix_cache_alignment
+        ):
+            raise ValueError("Cache proof differs from the scheduled request boundary")
+        actual = self.group_page_identities(snapshot, partition)
+        if set(actual) != set(proof.page_identities) or len(actual) != len(proof.page_identities):
+            raise ValueError("Cache proof contains stale or incomplete page identities")
+        if set(block_hashes) != set(self._group_pools):
+            raise ValueError("Cache proof hashes do not match cache groups")
+        ranges = {item.group: item for item in proof.complete_logical_pages}
+        if len(ranges) != len(proof.complete_logical_pages) or set(ranges) != set(self._group_pools):
+            raise ValueError("Cache proof must cover every group exactly once")
+        pending = []
+        for name, pool in self._group_pools.items():
+            item = ranges[name]
+            item.__post_init__()
+            capacity = pool.spec.spec.token_capacity
+            end = proof.checkpoint_boundary // capacity
+            start = (
+                max(0, end - pool.spec.sliding_window // capacity)
+                if pool.spec.sliding_window is not None
+                else 0
+            )
+            if (item.start, item.end) != (start, end) or end > len(block_hashes[name]):
+                raise ValueError("Cache proof does not cover the complete joint checkpoint")
+            ids = snapshot[name]
+            if not ids or (pool.spec.sliding_window is None and end > len(ids)):
+                raise ValueError("Cache proof exceeds its scheduled table")
+            for index in range(item.start, item.end):
+                slot = index if pool.spec.sliding_window is None else index % len(ids)
+                block = pool.block_from_local_id(partition, ids[slot])
+                pending.append((pool, block, block_hashes[name][index]))
+        if validate_only:
+            return
+        # Every identity/range has passed before the first hash is mutated.
+        for pool, block, digest in pending:
+            self._cache_group_block(pool, partition, block, digest)
+        self._protect_group_checkpoint(
+            request_id, block_hashes, proof.checkpoint_boundary, partition, None, proof.checkpoint_boundary
+        )
+
     def group_cache_valid_from_after_prefill(
         self,
         num_computed_tokens: int,
@@ -1386,6 +1570,7 @@ class KvCacheManager:
         queue.remove(block)
         self._invalidate_group_block(pool, partition, block)
         block.ref_cnt = 1
+        block.allocation_epoch += 1
         return block
 
     @staticmethod
@@ -1617,6 +1802,8 @@ class KvCacheManager:
 
     def release_all_group_requests(self, request_id: str) -> None:
         """Release every grouped block owned by a request."""
+        self.release_prefix_resume_pins(request_id)
+        self.release_prefix_checkpoint(request_id)
         if self._group_checkpoints is not None:
             self._group_checkpoints.release(request_id)
         for pool in self._group_pools.values():
