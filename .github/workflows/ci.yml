@@ -90,8 +90,9 @@ jobs:
           checkout-path: dist-checkout
           needs-device: 'true'
           runtime-platform: a2a3
-          # Match the Lib's explicit AIV shards and external-call specialization.
-          pypto-revision: 7302cd7ffeb552b3bec7c0e5bd92f164ba9fbd4b
+          # DeepSeek DSpark HC-pre uses the compact-accumulator lowering
+          # introduced by PyPTO PR #3489. This revision also pins PTOAS 0.74.
+          pypto-revision: b943b5fc672ebf6d2d715d8db27abf71b07a9278
           toolchain: bundle
           # CI_CACHE_ROOT is shared with pypto and pypto-lib, whose jobs already
           # claim `serving` / `pip-serving`. Name both after this repo so the two
