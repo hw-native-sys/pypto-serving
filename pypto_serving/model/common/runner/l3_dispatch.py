@@ -55,6 +55,7 @@ class PendingL3Dispatch:
     uploaded: tuple[Any, ...]
     name: str
     invocation: DispatchInvocation | None = None
+    profile_args: dict[str, Any] = field(default_factory=dict)
     _released: bool = False
     _error: BaseException | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -72,7 +73,10 @@ class PendingL3Dispatch:
                     f"{self.name}.worker_wait",
                     cat="kernel",
                     level="kernel",
-                    args=(self.invocation.as_profile_args() if self.invocation else {}),
+                    args=(
+                        self.profile_args
+                        or (self.invocation.as_profile_args() if self.invocation else {})
+                    ),
                 ):
                     self.handle.result()
             except BaseException as exc:
@@ -117,6 +121,28 @@ class L3DispatchMixin:
             return {}
         return context.as_profile_args()
 
+    @staticmethod
+    def _semantic_span_args(callable_spec: Any) -> dict[str, Any]:
+        """Return explicit compiler metadata for runtime timing joins."""
+        args: dict[str, Any] = {}
+        scope = getattr(callable_spec, "semantic_scope", None)
+        if scope is not None:
+            args["semantic_scope"] = scope
+        attention_kinds = tuple(getattr(callable_spec, "attention_kinds", ()))
+        if attention_kinds:
+            args["attention_kinds"] = list(attention_kinds)
+        layer_ids = tuple(getattr(callable_spec, "layer_ids", ()))
+        if layer_ids:
+            args["layer_ids"] = list(layer_ids)
+        return args
+
+    def _callable_span_args(self, callable_spec: Any) -> dict[str, Any]:
+        return {
+            "aicpu_thread_num": callable_spec.aicpu_thread_num,
+            **self._invocation_span_args(),
+            **self._semantic_span_args(callable_spec),
+        }
+
     def _configure_l3_rings(self, runtime: RuntimeConfig) -> None:
         """Install the per-dispatch simpler ring sizing for L3 dispatches.
 
@@ -157,10 +183,7 @@ class L3DispatchMixin:
         programs with different ring requirements passes each program's config
         here instead of resizing process-wide state.
         """
-        span_args: dict[str, Any] = {
-            "aicpu_thread_num": callable_spec.aicpu_thread_num,
-            **self._invocation_span_args(),
-        }
+        span_args = self._callable_span_args(callable_spec)
         if callable_spec.block_dim is not None:
             span_args["block_dim"] = callable_spec.block_dim
         run_config = self._l3_run_config if config is None else config
@@ -204,10 +227,7 @@ class L3DispatchMixin:
         hand the per-dispatch uploads to the pending handle so they are freed
         only after ``wait()`` reclaims the outputs.
         """
-        span_args: dict[str, Any] = {
-            "aicpu_thread_num": callable_spec.aicpu_thread_num,
-            **self._invocation_span_args(),
-        }
+        span_args = self._callable_span_args(callable_spec)
         if callable_spec.block_dim is not None:
             span_args["block_dim"] = callable_spec.block_dim
         run_config = self._l3_run_config if config is None else config
@@ -244,6 +264,7 @@ class L3DispatchMixin:
             uploaded=tuple(uploaded),
             name=callable_spec.name,
             invocation=getattr(self, "_invocation_context", None),
+            profile_args=dict(span_args),
         )
 
     def _reset_l3_dispatch(self) -> None:

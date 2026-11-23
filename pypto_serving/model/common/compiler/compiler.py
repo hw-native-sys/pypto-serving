@@ -96,6 +96,10 @@ class KernelCompiler:
         self,
         name: str,
         jit_fn: object,
+        *,
+        semantic_scope: str | None = None,
+        attention_kinds: tuple[str, ...] = (),
+        layer_ids: tuple[int, ...] = (),
         **compile_kwargs: Any,
     ) -> L3Callable:
         """Compile in signature mode and retain runtime scalar keyword arguments.
@@ -128,4 +132,7 @@ class KernelCompiler:
             compiled=compiled,
             name=name,
             aicpu_thread_num=run_config.distributed_config.aicpu_thread_num,
+            semantic_scope=semantic_scope,
+            attention_kinds=tuple(attention_kinds),
+            layer_ids=tuple(layer_ids),
         )

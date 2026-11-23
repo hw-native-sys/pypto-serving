@@ -95,3 +95,85 @@
 
 - 将 M4 P1 timing adapter 接入一次真实融合调用，补齐 runtime rank、clock domain 和 coverage 关联。
 - 在此基础上实现 M3 分析报告，再开展完整设备 timing、DFX 开销和 DPLB off/on 收益实验。
+
+## 2026-11-20（M4 P2：真实 fused L3 语义关联）
+
+### 已完成
+
+- 为真实 fused L3 编译 handle 增加显式 `attention_block_v1`、attention 类型和覆盖层号元数据。
+- 将语义元数据与 `invocation_id`、Step、执行槽位和复用代次一起写入同步 run、异步 submit、worker wait 的 profile span。
+- 将 M4 P1 timing adapter 接入 Serving invocation manifest，校验 runtime rank、dispatch identity、rank-local clock 和 coverage，再汇总逻辑 DP 组的 rank duration。
+- 新增 14 项 timing adapter 单测；`zm_pypto` 环境下 Serving 相关 583 项、DeepSeek/Qwen executor 116 项测试通过。
+
+### 当前效果
+
+- 已建立 `Serving Step → fused L3 invocation → semantic scope → runtime rank/task → attention raw task` 的可验证数据合同，并在一次 8 卡 Serving 调用中完成 rank/task join。
+- adapter 保留原始任务、时钟域和覆盖状态。缺失或不完整时输出 `partial` 或 `observed`，不会把未知时间当成零。
+- 真实 raw records 已回收并输出 `observed`，`timing` 配置仍保持不可用；通信、等待和 full-step 仍为空。
+
+### 下一步
+
+- 修正请求超时和 profile 收尾后，再运行一次开启 chip-swimlane 的 Serving fused 调用，补齐完整 profile trace。
+- 基于已生成的 invocation manifest 补 M3 慢组、rank skew 和覆盖报告。
+- 完成真实采集后再评估双执行影响、DFX 开销和 DPLB off/on 收益。
+
+## 2026-11-20（M4 P2 补充更新：8 卡 Serving NPU raw join）
+
+### 已完成
+
+- 提交 8 卡最小 Serving fused 调用，服务完成模型加载、KV 初始化和单次 completion 请求。
+- 回收 8 个 rank 的 `chip_swimlane_records.json`、`dispatch_identity` 和 `dispatch_program` sidecar，使用 run 5 identity 组成一次逻辑 DP 组 manifest。
+- 离线 adapter 完成真实 raw records 的 rank、dispatch identity、clock domain 和逻辑 DP 组汇总。
+
+### 当前效果
+
+- 真实 NPU 结果为 `observed`，8 rank 的 `attention_busy_union_max_us` 为 92081.88，`attention_envelope_max_us` 为 121479.96。
+- raw 文件没有 retained-run coverage envelope，通信、MoE、等待和 full-step 时间继续保持不可用，结果不能升级为 `complete`。
+- 请求客户端在 DFX 输出落盘后因 30 秒超时退出，没有生成完整 profile trace 和 response 文件；这属于实验脚本收尾问题。
+
+### 下一步
+
+- 将 completion 请求超时提高并补齐 profile stop 收尾，重新采集完整 trace。
+- 基于已验证的 invocation manifest 进入 M3，输出慢组、rank skew 和 coverage 报告。
+
+## 2026-11-20（M4 P2 补充更新：完整 profile trace NPU 重跑）
+
+### 已完成
+
+- 任务 `task_20261120_123742_305833311126` 在 8 卡 NPU 上以 exit=0 完成。completion 请求返回 HTTP 200，prompt 4、输出 2，服务端记录 e2e 367.84 秒。
+- `/start_profile` 和 `/stop_profile` 均成功，profile stop 合并 69 个事件，生成完整 `trace.json` 和 `response.json`。Host trace 包含 3 个 invocation，fused span 带有 `attention_block_v1`、43 个 layer id 以及 SWA/CSA/HCA 语义。
+- runtime 侧 8 个 rank 均生成 d2 dispatch 的 identity/program sidecar 和 AICore raw records。50 MHz rank-local clock 下原始记录全部有效，两个逻辑 DP 组均可汇总。
+
+### 当前效果
+
+- 本次重跑解决了上一轮 30 秒客户端超时导致的 trace 缺失问题，已完成“Serving 请求 → Host invocation/profile → runtime rank/task”的实机 smoke 验证。
+- raw timing 仍为 `observed`。group 0 的 busy union 最大值为 82987.64µs、envelope 最大值为 115684.08µs，group 1 分别为 24745.44µs、103015.92µs。
+- runtime raw 文件没有 retained-run coverage envelope，通信、MoE、等待和 full-step 时间继续保持不可用。profile manifest 仍显示 1 个 open request，进程退出时有 8 个 shared memory 泄漏警告。
+
+### 下一步
+
+- 将本次 invocation 和 8 rank raw records 固化为 M3 慢组、rank skew、coverage 报告。
+- 补齐 runtime coverage 和请求释放事件，再验证完整设备计时。
+- 单独测量 profile、load 和 timing 的 DFX 开销，最后进行 DPLB off/on 受控收益对比。
+
+## 2026-11-20（M3 首版离线分析报告）
+
+### 已完成
+
+- 基于任务 `task_20261120_123742_305833311126` 的 profile trace、scheduled-load JSONL、8 个 rank raw records 和 sidecar，生成 M3 JSON/Markdown 报告。
+- 报告串联了请求、3 个 invocation、Prefill/Decode 阶段、placement 选择、逻辑 DP 组、rank-local AICore 时间和 coverage 状态。
+- 输出 group 0、group 1 的 busy union、envelope、均值和 rank skew，保留 raw records、时钟频率和不可用指标说明。
+
+### 当前效果
+
+- 报告状态为 `observed`。8 个 rank 共读取 862688 条 raw records，全部有效。
+- group 0 的 busy union max/mean/skew 为 82987.64/79483.05/7089.92µs，group 1 为 24745.44/24329.78/806.62µs。
+- coverage 仍为 unavailable，通信、MoE、等待和 full-step 暂不可计算。报告记录了 `open_request_count=1` 和 8 个 shared memory 泄漏警告。
+
+### 下一步
+
+- 补 runtime coverage metadata 和请求释放事件，完成 M4 P2 收尾。
+- 在此报告基础上增加 idle/wait 和完整 coverage 指标。
+- 进入 DFX off/load/timing 开销对照。
+
+报告文件位于 `artifacts/dplb-m4-p2/20261120-serving-fused-r6/m3-report/`。

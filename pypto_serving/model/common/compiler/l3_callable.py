@@ -33,3 +33,10 @@ class L3Callable:
     aicpu_thread_num: int = 4
     block_dim: int | None = None
     dispatch_args: tuple[Any, ...] = ()
+    # Explicit semantic metadata for DPLB timing joins.  These fields are
+    # carried alongside the compiled handle and never participate in the
+    # compiler cache key.  A fused program may cover several layers, so the
+    # layer list is retained instead of inventing one representative layer.
+    semantic_scope: str | None = None
+    attention_kinds: tuple[str, ...] = ()
+    layer_ids: tuple[int, ...] = ()

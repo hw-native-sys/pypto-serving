@@ -410,11 +410,14 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         freqs_cos = freqs_sin = None
         if self._compile_kernels:
             modules = self._load_kernel_modules(layout)
+            attention_kinds = tuple(layer.attention_kind for layer in layer_plan)
+            layer_ids = tuple(layer.layer_id for layer in layer_plan)
             prefill = self._compile_l3_callable(
                 "deepseek_v4_prefill",
                 modules["prefill_fwd"].l3_prefill_fwd,
                 layout=layout,
             )
+            self._mark_attention_semantics(prefill, attention_kinds, layer_ids)
             use_fused_mtp = self._num_speculative_tokens == 1
             decode = self._compile_l3_callable(
                 "deepseek_v4_decode_mtp_fused" if use_fused_mtp else "deepseek_v4_decode",
@@ -428,6 +431,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                     frozenset({"mtp_num_tokens"}) if use_fused_mtp else None
                 ),
             )
+            self._mark_attention_semantics(decode, attention_kinds, layer_ids)
             if self._num_speculative_tokens:
                 mtp_prefill = self._compile_l3_callable(
                     "deepseek_v4_mtp_prefill",
@@ -530,6 +534,9 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         *,
         layout: DeepSeekV4CacheLayout,
         runtime_scalar_names: frozenset[str] | None = None,
+        semantic_scope: str | None = None,
+        attention_kinds: tuple[str, ...] = (),
+        layer_ids: tuple[int, ...] = (),
     ) -> DeepSeekV4L3Callable:
         """Compile one fully annotated DeepSeekV4 HOST wrapper.
 
@@ -551,7 +558,25 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             else {}
         )
         with profile_span(f"DeepSeekV4PyptoExecutor.compile.{name}", cat="executor"):
-            return self._compiler.compile(name, jit_fn, **runtime_scalars)
+            metadata = {}
+            if semantic_scope is not None:
+                metadata["semantic_scope"] = semantic_scope
+            if attention_kinds:
+                metadata["attention_kinds"] = attention_kinds
+            if layer_ids:
+                metadata["layer_ids"] = layer_ids
+            return self._compiler.compile(name, jit_fn, **metadata, **runtime_scalars)
+
+    @staticmethod
+    def _mark_attention_semantics(
+        callable_spec: DeepSeekV4L3Callable,
+        attention_kinds: tuple[str, ...],
+        layer_ids: tuple[int, ...],
+    ) -> None:
+        """Attach the explicit fused attention boundary to a compiled handle."""
+        callable_spec.semantic_scope = "attention_block_v1"
+        callable_spec.attention_kinds = attention_kinds
+        callable_spec.layer_ids = layer_ids
 
     def _build_rope_tables(
         self,
