@@ -95,6 +95,9 @@ inputs:
       Simpler runtime to build: a2a3, a5, a2a3sim, or a5sim. Select the
       job's NPU target explicitly; the CPU architecture does not identify it.
     required: true
+  pypto-repository:
+    description: GitHub repository to fetch the PyPTO revision from.
+    default: hw-native-sys/pypto
   pypto-revision:
     description: PyPTO commit to build. HEAD follows the upstream default branch.
     required: false
@@ -253,6 +256,8 @@ runs:
       continue-on-error: true
       uses: actions/checkout@v4
       with:
+        repository: ${{ job.workflow_repository }}
+        ref: ${{ job.workflow_sha }}
         path: ${{ inputs.checkout-path }}
         # pypto-lib only. Its kernels are consumed as source from the checkout.
         submodules: true
@@ -268,6 +273,8 @@ runs:
       if: steps.checkout.outcome == 'failure'
       uses: actions/checkout@v4
       with:
+        repository: ${{ job.workflow_repository }}
+        ref: ${{ job.workflow_sha }}
         path: ${{ inputs.checkout-path }}
         submodules: true
         persist-credentials: false
@@ -279,6 +286,7 @@ runs:
       # its runtime submodule (runtime/pto_isa.pin); read both.
       shell: bash
       env:
+        PYPTO_REPOSITORY: ${{ inputs.pypto-repository }}
         PYPTO_REVISION: ${{ inputs.pypto-revision }}
       run: |
         # $PYPTO_SRC is the per-job build tree exported by the loader step.
@@ -304,7 +312,9 @@ runs:
         if [ ! -d "$PYPTO_SRC/.git" ]; then
           echo "Cache miss — initializing pypto"
           git init -q "$PYPTO_SRC"
-          git -C "$PYPTO_SRC" remote add origin https://github.com/hw-native-sys/pypto.git
+          git -C "$PYPTO_SRC" remote add origin "https://github.com/$PYPTO_REPOSITORY.git"
+        else
+          git -C "$PYPTO_SRC" remote set-url origin "https://github.com/$PYPTO_REPOSITORY.git"
         fi
         pypto_commit="$PYPTO_REVISION"
         if [ "$PYPTO_REVISION" = HEAD ] || ! git -C "$PYPTO_SRC" cat-file -e "${PYPTO_REVISION}^{commit}" 2>/dev/null; then

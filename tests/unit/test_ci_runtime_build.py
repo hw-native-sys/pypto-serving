@@ -26,8 +26,8 @@ BUILD = next(step for step in ACTION["runs"]["steps"]
 CHECK = next(step for step in ACTION["runs"]["steps"]
              if step.get("name") == "Check runner config and derive cache paths")
 EXPECTED = {
-    ("ci.yml", "unit-tests"): "a2a3",
-    ("ci.yml", "v41-a5-smoke"): "a5",
+    ("serving-guard-a2a3.yml", "guard"): "a2a3",
+    ("serving-guard-a5.yml", "guard"): "a5",
     ("daily_ci.yml", "dspark-performance"): "a2a3",
     ("daily_v41_a5.yml", "v41-performance"): "a5",
 }
@@ -36,7 +36,7 @@ CALLERS = {
     for path in (ROOT / ".github/workflows").glob("*.yml")
     for job_name, job in yaml.safe_load(path.read_text())["jobs"].items()
     for step in job.get("steps", [])
-    if step.get("uses") == "./.github/actions/setup-ci-job"
+    if step.get("uses", "").endswith("/.github/actions/setup-ci-job")
 }
 
 
@@ -86,6 +86,27 @@ if name == "pip" and os.environ["PYPTO_SRC"] + "/runtime" in sys.argv[1:]:
 
 def test_all_shared_setup_callers_have_platform_coverage():
     assert CALLERS.keys() == EXPECTED.keys()
+
+
+@pytest.mark.parametrize("platform,ci_job", [("a2a3", "unit-tests"), ("a5", "v41-a5-smoke")])
+def test_serving_ci_calls_the_same_guard_as_downstream(platform, ci_job):
+    workflows = ROOT / ".github/workflows"
+    caller = yaml.safe_load((workflows / "ci.yml").read_text())["jobs"][ci_job]
+    filename = f"serving-guard-{platform}.yml"
+    assert caller["uses"] == f"./.github/workflows/{filename}"
+    guard = yaml.safe_load((workflows / filename).read_text())["jobs"]["guard"]
+    setup = CALLERS[(filename, "guard")]["with"]
+    assert setup["pypto-revision"] == "${{ inputs.pypto-revision }}"
+    assert setup["pypto-repository"] == "${{ inputs.pypto-repository }}"
+    # A cross-repository call has the PyPTO caller in github.repository.
+    # The action bootstrap and both serving checkout attempts need the callee.
+    checkout_steps = [
+        step for step in ACTION["runs"]["steps"] if step.get("uses", "").startswith("actions/checkout@")
+    ]
+    assert len(checkout_steps) == 2
+    for checkout in [guard["steps"][0], *checkout_steps]:
+        assert checkout["with"]["repository"] == "${{ job.workflow_repository }}"
+        assert checkout["with"]["ref"] == "${{ job.workflow_sha }}"
 
 
 @pytest.mark.parametrize("caller_key,platform", EXPECTED.items())

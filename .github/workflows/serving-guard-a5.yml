@@ -1,0 +1,102 @@
+name: Serving guard A5
+
+on:
+  workflow_call:
+    inputs:
+      pypto-revision:
+        description: PyPTO commit whose compiler, runtime and PTOAS pin are under test
+        type: string
+        required: true
+      pypto-repository:
+        description: Repository containing the PyPTO commit
+        type: string
+        default: hw-native-sys/pypto
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    # The A5 runner must provide PYPTO_DSV41_MODEL_DIR.
+    # It may also provide PYPTO_V41_PREPACKED_WEIGHTS for the same DP4 checkpoint.
+    runs-on: [self-hosted, linux, npu-a5]
+    timeout-minutes: 180
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
+      PTO_ISA_ROOT: ${{ github.workspace }}/dist-checkout/pto-isa
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      CCACHE_UMASK: '000'
+
+    steps:
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: serving-ci
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Resolve V4.1 model directory
+        run: |
+          if [ -z "${PYPTO_DSV41_MODEL_DIR:-}" ] || [ ! -d "$PYPTO_DSV41_MODEL_DIR" ]; then
+            echo "::error::PYPTO_DSV41_MODEL_DIR must point to the V4.1 checkpoint on this A5 runner"
+            exit 1
+          fi
+
+      - name: Resolve duplicated CANN root for this job
+        # Remove after the A5 runner CANN_ROOT values are repaired.
+        run: |
+          root="${CANN_ROOT:-}"
+          parent="${root%/*}"
+          if [ ! -d "$root" ] && [ -n "$parent" ] && \
+             [ "${root##*/}" = "${parent##*/}" ] && [ -f "$parent/set_env.sh" ]; then
+            printf 'Using installed CANN root for this job: %s\n' "$parent"
+            printf 'CANN_ROOT=%s\n' "$parent" >> "$GITHUB_ENV"
+          fi
+
+      - name: Setup CI job
+        uses: ./serving-ci/.github/actions/setup-ci-job
+        with:
+          checkout-path: dist-checkout
+          needs-device: 'true'
+          runtime-platform: a5
+          pypto-revision: ${{ inputs.pypto-revision }}
+          pypto-repository: ${{ inputs.pypto-repository }}
+          toolchain: bundle
+          build-namespace: pypto-serving-v41-a5
+          pip-cache-name: pip-pypto-serving-v41-a5
+
+      - name: Run V4.1 DSpark HTTP guard (K=5, one 4-card server)
+        env:
+          # Cold K5 startup compiles the draft programs and stages real weights.
+          PYPTO_WORKER_INIT_TIMEOUT: '3600'
+        run: |
+          source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
+          # A warm kernel compiled by another assembler would bypass the guard.
+          pypto_commit=$(git -C "$PYPTO_SRC" rev-parse HEAD)
+          printf -v cache_dir '%q' "$CI_CACHE_ROOT/jit-pypto-serving-v41-$RUNNER_NAME/$pypto_commit"
+          run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
+          run_cmd="$run_cmd && source activate.sh"
+          run_cmd="$run_cmd && TASK_DEVICE=\$TASK_DEVICE"
+          run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout"
+          run_cmd="$run_cmd PYPTO_DSV41_MODEL_DIR=$PYPTO_DSV41_MODEL_DIR"
+          run_cmd="$run_cmd PYPTO_WORKER_INIT_TIMEOUT=$PYPTO_WORKER_INIT_TIMEOUT"
+          run_cmd="$run_cmd PYPTO_CACHE=1 PYPTO_CACHE_READONLY=0 PYPTO_CACHE_DIR=$cache_dir"
+          if [ -n "${PYPTO_V41_PREPACKED_WEIGHTS:-}" ]; then
+            printf -v sidecar '%q' "$PYPTO_V41_PREPACKED_WEIGHTS"
+            run_cmd="$run_cmd PYPTO_V41_PREPACKED_WEIGHTS=$sidecar"
+          fi
+          run_cmd="$run_cmd python -m pytest 'tests/test_deepseek_v41_serving.py::test_v41_dp4_http_answer[k5]' -q -s"
+          task-submit --device auto --device-num 4 \
+            --timeout 4500 --max-time 4500 --run "$run_cmd"
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./serving-ci/.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: dist-checkout
