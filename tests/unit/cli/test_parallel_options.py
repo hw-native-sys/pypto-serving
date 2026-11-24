@@ -19,6 +19,17 @@ def _parse_cli_args(argv: list[str]):
     return cli.build_parser().parse_args(argv)
 
 
+@pytest.mark.parametrize(("flags", "enabled"), [
+    ([], True), (["--bounded-decoder-replay"], True), (["--no-bounded-decoder-replay"], False),
+])
+def test_bounded_decoder_replay_reaches_runtime_config(flags, enabled):
+    args = _parse_cli_args(["--model", "model", "--max-num-seqs", "8",
+                            "--max-num-batched-tokens", "1024", *flags])
+    runtime = cli._build_runtime_config(args, model_family="deepseek_v41", num_speculative_tokens=5)
+    assert runtime.bounded_decoder_replay is enabled
+    assert runtime.num_speculative_tokens == 5
+
+
 @pytest.mark.parametrize(("role", "specified", "expected"), [
     (None, None, 16), ("prefill", None, 16), ("decode", None, 72),
     (None, 32, 32), ("prefill", 8, 8), ("decode", 16, 16),

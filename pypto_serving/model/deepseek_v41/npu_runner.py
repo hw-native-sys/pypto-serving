@@ -41,6 +41,7 @@ from .task_args import (
     RequestSlice,
     V41CacheGroups,
     build_cache_groups,
+    plan_decoder_replay_batch,
     validate_cache_groups,
 )
 from .engram import HostEngram
@@ -2104,7 +2105,8 @@ class PrefillMetadataResources:
 
     def __init__(self, topology, *, max_seq_len, max_requests, window_pages,
                  c2a_pages, c1a_pages, rope_tables, compressed_rope_tables,
-                 full_hidden_size=None, dspark_hidden_size=None, engram_k=6144):
+                 full_hidden_size=None, dspark_hidden_size=None, engram_k=6144,
+                 bounded_decoder_replay=False):
         if any(type(value) is not int or value <= 0 for value in
                (max_seq_len, max_requests, window_pages, c2a_pages, c1a_pages)):
             raise ValueError("prefill metadata capacities must be positive integers")
@@ -2127,6 +2129,9 @@ class PrefillMetadataResources:
                 type(dspark_hidden_size) is not int or dspark_hidden_size <= 0):
             raise ValueError("DSpark hidden size must be positive")
         self.dspark_hidden_size = dspark_hidden_size
+        if type(bounded_decoder_replay) is not bool:
+            raise ValueError("bounded decoder replay flag must be boolean")
+        self.bounded_decoder_replay = bounded_decoder_replay
 
         def shared(name, shape, dtype, fill=0):
             value = torch.empty(shape, dtype=dtype).share_memory_()
@@ -2272,27 +2277,95 @@ class PrefillMetadataResources:
             f["full_identity_rows"].fill_(-1)
             f["full_replay_rows"].fill_(-1)
             f["full_counts"].zero_()
+            replay_plan = None
+            if self.bounded_decoder_replay:
+                replay_plan = plan_decoder_replay_batch(step.requests, self.topology.dp)
+                _LOG.info(
+                    "V4.1 bounded prefill replay: encoder=%s decoder=%s rows=%s",
+                    replay_plan.encoder_counts, replay_plan.decoder_counts,
+                    replay_plan.replay_rows,
+                )
+            self.decoder_replay_plan = replay_plan
             for rank, count in enumerate(counts):
-                f["full_counts"][rank] = count
+                dp_rank = rank // self.topology.tp
+                decoder_count = (replay_plan.decoder_counts[dp_rank]
+                                 if replay_plan is not None else count)
+                f["full_counts"][rank] = torch.tensor((count, decoder_count), dtype=torch.int32)
                 f["full_identity_rows"][rank, :count] = torch.arange(count, dtype=torch.int32)
-                f["full_replay_rows"][rank, :count] = torch.arange(count, dtype=torch.int32)
+                rows = (replay_plan.replay_rows[dp_rank]
+                        if replay_plan is not None else tuple(range(count)))
+                if len(rows) != decoder_count:
+                    raise RuntimeError("decoder replay row count disagrees with stage metadata")
+                if rows:
+                    f["full_replay_rows"][rank, :decoder_count] = torch.tensor(rows, dtype=torch.int32)
             for stage, family in enumerate(("c2a", "c1a")):
                 f["full_position_ids"][:, stage].copy_(f[family + "_position_ids"])
                 f["full_window_slots"][:, stage].copy_(f["window_slots"])
                 f["full_window_indices"][:, stage].copy_(f["window_indices"])
                 f["full_token_requests"][:, stage].copy_(f[family + "_request_ids"])
                 f["full_query_starts"][:, stage].copy_(f[family + "_query_start_loc"])
+            if replay_plan is not None:
+                # Decoder metadata follows replay_rows, rather than the full
+                # current chunk. Keep per-request query boundaries packed in
+                # the same order as the scheduler's request list. The SWA
+                # window is clipped at each request's fixed replay origin.
+                f["full_position_ids"][:, 1].fill_(-1)
+                f["full_window_slots"][:, 1].fill_(-1)
+                f["full_window_indices"][:, 1].fill_(-1)
+                f["full_token_requests"][:, 1].fill_(-1)
+                f["full_query_starts"][:, 1].zero_()
+                encoder_offsets = [0] * self.topology.dp
+                decoder_offsets = [0] * self.topology.dp
+                for request_index, (request, request_plan) in enumerate(zip(
+                        step.requests, replay_plan.request_plans, strict=True)):
+                    dp_rank = request.partition
+                    source_rows = [encoder_offsets[dp_rank] + row
+                                   for row in request_plan.replay_rows]
+                    start = decoder_offsets[dp_rank]
+                    end = start + len(source_rows)
+                    for rank in range(dp_rank * self.topology.tp,
+                                      (dp_rank + 1) * self.topology.tp):
+                        if source_rows:
+                            source = torch.tensor(source_rows, dtype=torch.long)
+                            target = slice(start, end)
+                            f["full_position_ids"][rank, 1, target] = f["c1a_position_ids"][rank, source]
+                            f["full_window_slots"][rank, 1, target] = f["window_slots"][rank, source]
+                            f["full_token_requests"][rank, 1, target] = f["c1a_request_ids"][rank, source]
+                            for output_row, source_row in enumerate(source_rows, start=start):
+                                position = int(f["c1a_position_ids"][rank, source_row])
+                                window = f["window_indices"][rank, source_row]
+                                full_start = max(
+                                    0, request.shared_prefix_tokens - 128, position - 127)
+                                drop = max(0, request_plan.replay_start - full_start)
+                                valid = window[window >= 0]
+                                bounded = valid[drop:]
+                                f["full_window_indices"][rank, 1, output_row].fill_(-1)
+                                f["full_window_indices"][rank, 1, output_row, :bounded.numel()] = bounded
+                    decoder_offsets[dp_rank] = end
+                    encoder_offsets[dp_rank] += len(request.token_ids)
+                    for rank in range(dp_rank * self.topology.tp,
+                                      (dp_rank + 1) * self.topology.tp):
+                        # Query starts are local to each DP rank; derive the
+                        # request's ordinal within that rank from prior rows.
+                        ordinal = sum(1 for prior in step.requests[:request_index]
+                                      if prior.partition == dp_rank) + 1
+                        f["full_query_starts"][rank, 1, ordinal] = decoder_offsets[dp_rank]
             f["full_logit_rows"].fill_(-1)
             per_rank = [0] * self.topology.world
             rows_per_rank = [0] * self.topology.world
+            request_index = 0
             for request in step.requests:
                 rank = request.partition
                 slot = per_rank[rank]
                 if slot >= 16:
                     raise ValueError("full prefill supports at most 16 output requests per rank")
-                f["full_logit_rows"][rank, slot] = rows_per_rank[rank] + len(request.token_ids) - 1
-                rows_per_rank[rank] += len(request.token_ids)
+                plan = replay_plan.request_plans[request_index] if replay_plan is not None else None
+                count = plan.decoder_count if plan is not None else len(request.token_ids)
+                if count:
+                    f["full_logit_rows"][rank, slot] = rows_per_rank[rank] + count - 1
+                rows_per_rank[rank] += count
                 per_rank[rank] += 1
+                request_index += 1
             return counts
 
     def full_arguments(self):
@@ -3104,10 +3177,12 @@ class V41ResidentResources:
         capacity = min(DSPARK_WINDOW, retained.shape[1])
         progress = getattr(self, "_dspark_prefill_progress", {})
         offsets = [0] * resources.layout.dp_size
-        for request in step.requests:
+        replay_plan = getattr(self.prefill_host, "decoder_replay_plan", None)
+        for request_index, request in enumerate(step.requests):
             rank = request.partition
             offset = offsets[rank]
-            size = len(request.token_ids)
+            size = (replay_plan.request_plans[request_index].decoder_count
+                    if replay_plan is not None else len(request.token_ids))
             offsets[rank] += size
             previous_progress = progress.get(rank)
             if previous_progress is None or previous_progress[0] != request.request_id:
@@ -3893,8 +3968,13 @@ def make_production_bindings(
             # large three-layer draft bank is intentionally packed lazily by
             # the stage-argument provider and is never materialized here.
             dspark_weight_contract.validate_index()
+        # The scheduler budget may be larger than one request chunk. Compile
+        # the resident graph for the per-request chunk extent so a 4096-token
+        # batch made of four 1024-token requests does not force a 4096-row
+        # graph and its communication scope on every dispatch.
+        prefill_capacity = runtime.max_prefill_tokens_per_request or runtime.max_num_batched_tokens
         prefill_topology = SegmentTopology.for_prefill(
-            dp=topology.dp, max_tokens=min(runtime.max_num_batched_tokens, MAX_PREFILL_TOKENS_PER_DP))
+            dp=topology.dp, max_tokens=min(prefill_capacity, MAX_PREFILL_TOKENS_PER_DP))
         run_config = replace(
             build_pypto_run_config(
                 platform=options.platform,
@@ -3985,6 +4065,7 @@ def make_production_bindings(
             compressed_rope_tables=compressed_tables,
             engram_k=getattr(abi, "ENGRAM_K", 6144),
             dspark_hidden_size=getattr(abi, "DSPARK_MAIN_IN", None),
+            bounded_decoder_replay=runtime.bounded_decoder_replay,
         )
         decode_host = PrefillMetadataResources(topology, **host_kwargs)
         input_host = make_input_host_resources(prefill_topology, plan.weights.config.hidden_size)

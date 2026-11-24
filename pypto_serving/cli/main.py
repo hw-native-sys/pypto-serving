@@ -207,6 +207,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # V4.1 prefill
+    parser.add_argument(
+        "--bounded-decoder-replay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable bounded Decoder Prefill replay for DeepSeek V4.1 (default: True).",
+    )
     # Prefill/decode disaggregated serving
     parser.add_argument("--pd-role", choices=("prefill", "decode"), default=None)
     parser.add_argument("--pd-config", default=None, help="Shared PD deployment JSON.")
@@ -385,7 +392,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     """
     from pypto_serving.config.types import KVCacheGroupSpec
     from pypto_serving.model.deepseek_v41.npu_runner import (
-        MAX_PREFILL_TOKENS_PER_DP, MissingCompositeInterface, SegmentTopology, load_composite_bindings,
+        MAX_PREFILL_TOKENS_PER_DP, MissingCompositeInterface, load_composite_bindings,
     )
     from pypto_serving.model.deepseek_v41.encoding import V41TextConfig
     from pypto_serving.model.deepseek_v41.weight_loader import RankPlacement, plan_layers
@@ -434,9 +441,10 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     bindings.require(plan_layers(raw), RankPlacement(0, tp_size=1, dp_size=dp_size, ep_size=dp_size))
     if bindings.segment_topology is None:
         raise MissingCompositeInterface("V4.1 bindings must declare the selected lib decode capacity")
-    prefill_topology = SegmentTopology.for_prefill(
-        dp=topology[1], max_tokens=min(args.max_num_batched_tokens, MAX_PREFILL_TOKENS_PER_DP))
-    step_tokens = min(args.max_num_batched_tokens, prefill_topology.capacity)
+    step_tokens = min(args.max_num_batched_tokens, MAX_PREFILL_TOKENS_PER_DP)
+    prefill_tokens = step_tokens
+    if args.enable_chunked_prefill and args.long_prefill_token_threshold > 0:
+        prefill_tokens = min(prefill_tokens, args.long_prefill_token_threshold)
     groups = tuple(bindings.cache_groups)
     if not groups or any(not isinstance(group, KVCacheGroupSpec) for group in groups):
         raise MissingCompositeInterface("V4.1 bindings must provide concrete grouped cache specifications")
@@ -448,7 +456,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         _build_runtime_config(args, model_family="deepseek_v41", num_speculative_tokens=dspark_tokens),
         kv_cache_groups=groups,
         max_num_batched_tokens=step_tokens,
-        max_prefill_tokens_per_request=step_tokens,
+        max_prefill_tokens_per_request=prefill_tokens,
         requires_homogeneous_prefill_decode=True,
         supports_chunked_prefill_with_speculation=True,
         speculative_prefix_cache_replay_tokens=128,
@@ -567,6 +575,7 @@ def _build_runtime_config(
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_prefill_tokens_per_request=max_prefill_tokens_per_request,
         prefill_chunk_size_choices=prefill_chunk_size_choices,
+        bounded_decoder_replay=args.bounded_decoder_replay,
         supports_chunked_prefill_with_speculation=supports_chunked_prefill_with_speculation,
         speculative_prefix_cache_replay_tokens=speculative_prefix_cache_replay_tokens,
         prefix_cache_retention_interval=args.prefix_cache_retention_interval,

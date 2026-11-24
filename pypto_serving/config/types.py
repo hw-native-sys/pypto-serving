@@ -203,6 +203,8 @@ class RuntimeConfig:
     # User-selectable scheduler chunk sizes supported by this model. Empty
     # means that the shared scheduler imposes no model-specific allowlist.
     prefill_chunk_size_choices: tuple[int, ...] = ()
+    # V4.1: run Decoder Prefill only over the bounded final SWA replay interval.
+    bounded_decoder_replay: bool = True
     # Whether speculative decoding can safely consume a prompt produced by
     # more than one prefill dispatch.
     supports_chunked_prefill_with_speculation: bool = True
@@ -236,6 +238,8 @@ class RuntimeConfig:
     chip_runtime: Literal["tensormap_and_ringbuffer", "host_build_graph"] = "tensormap_and_ringbuffer"
 
     def __post_init__(self) -> None:
+        if type(self.bounded_decoder_replay) is not bool:
+            raise ValueError("bounded_decoder_replay must be boolean")
         if self.chip_runtime not in ("tensormap_and_ringbuffer", "host_build_graph"):
             raise ValueError(f"Unsupported chip runtime: {self.chip_runtime}")
         if type(self.prefix_cache_retention_interval) is not int or self.prefix_cache_retention_interval < 0:

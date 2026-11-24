@@ -147,6 +147,95 @@ class ForwardStep:
         return tuple(request.end == request.prompt_length for request in self.requests)
 
 
+@dataclass(frozen=True)
+class DecoderTailPlan:
+    """Describe the decoder rows needed to finish one prefill request.
+
+    ``replay_rows`` are indices into the request's current encoder chunk. The
+    final replay interval is split naturally across chunks; each invocation
+    contributes only its intersection with that interval.
+    """
+
+    terminal: bool
+    replay_start: int
+    positions: tuple[int, ...]
+    replay_rows: tuple[int, ...]
+    cross_chunk_positions: tuple[int, ...]
+
+    @property
+    def decoder_count(self) -> int:
+        return len(self.positions)
+
+    @property
+    def has_cross_chunk_prefix(self) -> bool:
+        """Whether earlier chunks contribute rows to this replay interval."""
+        return bool(self.cross_chunk_positions)
+
+
+def plan_decoder_tail(request: RequestSlice, *, window: int = 128) -> DecoderTailPlan:
+    """Build the absolute decoder tail for a request's current prefill chunk.
+
+    Each chunk contributes its overlap with the last ``window`` source
+    positions. Later chunks continue from the Decoder SWA state established
+    by earlier chunks in that interval.
+    """
+    if type(window) is not int or window <= 0:
+        raise ValueError("decoder tail window must be a positive integer")
+    if (request.start < 0 or request.end <= request.start or
+            request.prompt_length < request.end):
+        raise ValueError("request extent is invalid for decoder tail planning")
+    terminal = request.end == request.prompt_length
+    tail_start = max(0, request.prompt_length - window)
+    end = min(request.end, request.prompt_length)
+    start = max(request.start, tail_start)
+    positions = tuple(range(start, end)) if start < end else ()
+    replay_rows = tuple(position - request.start for position in positions)
+    cross_chunk = tuple(range(tail_start, min(request.start, end))) if request.start > tail_start else ()
+    return DecoderTailPlan(terminal, tail_start, positions, replay_rows, cross_chunk)
+
+
+@dataclass(frozen=True)
+class DecoderReplayBatchPlan:
+    """Packed per-rank decoder replay metadata for one forward step."""
+
+    encoder_counts: tuple[int, ...]
+    decoder_counts: tuple[int, ...]
+    replay_rows: tuple[tuple[int, ...], ...]
+    request_plans: tuple[DecoderTailPlan, ...]
+
+    @property
+    def has_cross_chunk_prefix(self) -> bool:
+        return any(plan.has_cross_chunk_prefix for plan in self.request_plans)
+
+
+def plan_decoder_replay_batch(
+    requests: tuple[RequestSlice, ...] | list[RequestSlice],
+    partitions: int,
+    *,
+    window: int = 128,
+) -> DecoderReplayBatchPlan:
+    """Pack tail rows in request order, preserving each DP partition's layout."""
+    if type(partitions) is not int or partitions <= 0:
+        raise ValueError("decoder replay partitions must be positive")
+    encoder_counts = [0] * partitions
+    decoder_counts = [0] * partitions
+    packed_rows = [[] for _ in range(partitions)]
+    plans = []
+    for request in requests:
+        if type(request.partition) is not int or not 0 <= request.partition < partitions:
+            raise ValueError("request partition is outside decoder replay layout")
+        offset = encoder_counts[request.partition]
+        plan = plan_decoder_tail(request, window=window)
+        plans.append(plan)
+        packed_rows[request.partition].extend(offset + row for row in plan.replay_rows)
+        encoder_counts[request.partition] += len(request.token_ids)
+        decoder_counts[request.partition] += plan.decoder_count
+    return DecoderReplayBatchPlan(
+        tuple(encoder_counts), tuple(decoder_counts),
+        tuple(tuple(rows) for rows in packed_rows), tuple(plans),
+    )
+
+
 @dataclass
 class RequestProgress:
     partition: int
