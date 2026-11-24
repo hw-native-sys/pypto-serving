@@ -18,7 +18,7 @@ class SamplingCapabilities:
     prefill_stop_mask: Literal["host", "device"] = "host"
     decode_stop_mask: Literal["host", "device"] = "host"
     honor_min_tokens: bool = True
-    prefill_top_p_on_device: bool = False
+    top_p_on_device: bool = False
     supports_stochastic_speculation: bool = False
 
     def stop_mask_on_device(self, phase: Literal["prefill", "decode"]) -> bool:
@@ -35,7 +35,7 @@ def sampling_capabilities(executor_cls: str, num_speculative_tokens: int) -> Sam
     if executor_cls == "PyptoDeepSeekV41Executor":
         return SamplingCapabilities(
             honor_min_tokens=num_speculative_tokens == 0,
-            prefill_top_p_on_device=num_speculative_tokens == 5,
+            top_p_on_device=True,
             supports_stochastic_speculation=num_speculative_tokens == 5,
         )
     if executor_cls in ("PyptoQwen14BExecutor", "PyptoGlm53Executor"):

@@ -33,7 +33,7 @@ import torch
 
 from pypto_serving.tools.profile import profile_span
 
-from pypto_serving.config.types import DecodeResult, KVCacheGroupSpec, PrefillResult
+from pypto_serving.config.types import DecodeResult, KVCacheGroupSpec, PrefillResult, SamplingParams
 from pypto_serving.model.common.runner.buffer_set import alloc_device_buffer
 
 from .task_args import (
@@ -586,7 +586,7 @@ class CompositeBindings:
 
     Entries consume (LayerPlan, LayerState, step, resources, weights) and return
     LayerState. initialize consumes (embeddings, step, resources); output consumes
-    (state, step, resources) and returns host logits or a PrefillResult in request order.
+    (state, step, resources) and returns host logits or a sampled result in request order.
     The adapter owns device uploads and lib ABI binding. Serving never expands
     packed FP4 or calls the sub-operators of a complete layer.
     allocate consumes (plan, device_ids, runtime, BuildOptions), including the
@@ -1491,6 +1491,8 @@ class V41ModelRunner:
             output = self.bindings.output(state, step, self.resources)
             with profile_span("v41.wait", cat="v41.host", level="verbose"):
                 self.bindings.wait(self.resources)
+            if isinstance(output, DecodeResult):
+                return output
             logits = output.logits if isinstance(output, PrefillResult) else output
             shape = (len(step.requests), self.plan.weights.config.vocab_size)
             if (not isinstance(logits, torch.Tensor) or logits.device.type != "cpu"
@@ -1514,7 +1516,12 @@ class V41ModelRunner:
             with self._lock:
                 ledger = self._request_ledger()
                 requests = decode_requests(batch, model.config, self.runtime, self.bindings.cache_groups)
-                step = ledger.begin_decode(requests)
+                sampling = {}
+                if (self.runtime.num_speculative_tokens == 0 and batch.allow_device_greedy_sampling
+                        and not batch.stop_token_masks and not batch.constraint_states):
+                    params = batch.sampling_params or (SamplingParams(temperature=0.0, top_p=1.0),) * len(requests)
+                    sampling = dict(zip(batch.request_ids, params, strict=True))
+                step = ledger.begin_decode(requests, sampling_params=sampling)
                 return self._run_transaction(step, batch.hidden_states)
 
     def release_finished_requests(self, request_ids):
@@ -2438,13 +2445,13 @@ def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
 
 
 class FinalOutputWeights:
-    """Keep output weights resident for the full lib forwards.
+    """Keep output weights and optional decode logits resident.
 
     The host resources must exist before the shared DistributedWorker forks.
     The caller owns and closes the worker after this runtime releases its tensors.
     """
 
-    def __init__(self, worker, topology: SegmentTopology, host: FinalOutputHostResources):
+    def __init__(self, worker, topology: SegmentTopology, host: FinalOutputHostResources, *, device_logits=False):
         if not isinstance(host, FinalOutputHostResources) or not isinstance(topology, SegmentTopology):
             raise ValueError("final output requires host resources and a segment topology")
         world = topology.world
@@ -2474,6 +2481,10 @@ class FinalOutputWeights:
             self._resident.append(self.norm_weight)
             self.head_weight = worker.alloc_stacked_tensor(host.head_weight)
             self._resident.append(self.head_weight)
+            self.device_logits = None
+            if device_logits:
+                self.device_logits = alloc_device_buffer(worker, host.logits.shape, host.logits.dtype, stacked=True)
+                self._resident.append(self.device_logits)
             self.sampling_temperatures = worker.alloc_stacked_tensor(host.sampling_temperatures)
             self._resident.append(self.sampling_temperatures)
             self.sampling_top_ks = worker.alloc_stacked_tensor(host.sampling_top_ks)
@@ -2954,7 +2965,9 @@ class V41ResidentResources:
             self.input = self._own(InputStateRuntime(self.worker, input_host))
             self.decode_input = (None if decode_input_host is None else
                                  self._own(InputStateRuntime(self.worker, decode_input_host)))
-            self.final = self._own(FinalOutputWeights(self.worker, topology, final_host))
+            self.final = self._own(FinalOutputWeights(
+                self.worker, topology, final_host, device_logits=not self.dspark_programs,
+            ))
             self._decode_head_arguments = {
                 "x_hc": None,
                 "pre_mix": None,
@@ -3413,7 +3426,8 @@ class V41ResidentResources:
                 inputs, self.final.host.logit_row_indices,
                 local_capacity=inputs.row_indices.shape[1],
             )
-            self.final.host.logits.zero_()
+            if step.phase != "decode" or not step.sampling_params:
+                self.final.host.logits.zero_()
             self.final.host.sampled_ids.fill_(-1)
             self._step, self._inputs = step, inputs
             self._group_counts = counts
@@ -3427,6 +3441,10 @@ class V41ResidentResources:
             return self._prefill_fwd.run()
         if not all(name in self._prefill_fwd.arguments for name in _SAMPLING_INPUTS):
             raise MissingCompositeInterface("V4.1 prefill requires the lib sampling inputs")
+        return self._prefill_fwd.run(sampling_inputs=self._stage_output_sampling(step))
+
+    def _stage_output_sampling(self, step):
+        """Stage controls at the LM-head output slots in absolute token positions."""
         vocab_size = self.final.host.logits.shape[-1]
         inputs = {name: getattr(self.final.host, name) for name in _SAMPLING_INPUTS}
         inputs["sampling_temperatures"].zero_()
@@ -3436,10 +3454,10 @@ class V41ResidentResources:
         inputs["sampling_positions"].zero_()
         for request, (rank, row) in zip(step.requests, self._output_rows.locations, strict=True):
             params = step.sampling_params.get(request.request_id)
-            if params is not None and request.end == request.prompt_length:
+            if params is not None:
                 _stage_sampling(inputs, rank, slice(row, row + 1), request.request_id, params,
                                 position=request.end, width=1, vocab_size=vocab_size)
-        return self._prefill_fwd.run(sampling_inputs=inputs)
+        return inputs
 
     def bind_decode_fwd(self, program, param_names, run_config, counts_are_tensor):
         if (self.closed or self._decode_binding is not None or self._step is not None
@@ -3487,6 +3505,8 @@ class V41ResidentResources:
             raise ValueError("full decode requires the active decode step")
         state = self._decode_fwd.run(state, group_counts=self._group_counts)
         head_arguments = dict(self._decode_head_arguments, x_hc=state.residual, pre_mix=state.pre_mix)
+        if step.sampling_params:
+            head_arguments.update(self._stage_output_sampling(step), logits=self.final.device_logits)
         self.worker.run(
             self._decode_head_program.compiled,
             *(head_arguments[name] for name in self._decode_head_param_names),
@@ -3822,17 +3842,19 @@ class V41ResidentResources:
             try:
                 if step.phase == "prefill" and self.dspark_host_resources is not None:
                     self._retain_dspark_prefill(step)
-                logits = collect_final_logits(self.final.host.logits, self._output_rows)
-                if step.phase == "prefill" and step.sampling_params:
+                if step.sampling_params:
                     sampled = torch.stack([
                         self.final.host.sampled_ids[rank, row, 0]
                         for rank, row in self._output_rows.locations
                     ])
-                    terminal = torch.tensor(step.terminal_prefill)
-                    if bool(((sampled[terminal] < 0) | (sampled[terminal] >= logits.shape[-1])).any()):
-                        raise ValueError("V4.1 prefill returned an invalid sampled token")
+                    active = sampled if step.phase == "decode" else sampled[torch.tensor(step.terminal_prefill)]
+                    if bool(((active < 0) | (active >= self.final.host.logits.shape[-1])).any()):
+                        raise ValueError(f"V4.1 {step.phase} returned an invalid sampled token")
+                    if step.phase == "decode":
+                        return DecodeResult(hidden_states=None, logits=None, sampled_token_ids=sampled)
+                    logits = collect_final_logits(self.final.host.logits, self._output_rows)
                     return PrefillResult(last_hidden=None, logits=logits, sampled_token_ids=sampled)
-                return logits
+                return collect_final_logits(self.final.host.logits, self._output_rows)
             finally:
                 self._step = self._inputs = self._group_counts = self._output_rows = None
 

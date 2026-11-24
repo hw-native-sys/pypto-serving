@@ -267,7 +267,7 @@ class RequestLedger:
                                    sampling_params=MappingProxyType(dict(sampling_params or {})))
         return self.pending
 
-    def begin_decode(self, requests, *, drafts=None):
+    def begin_decode(self, requests, *, drafts=None, sampling_params=None):
         if self.poisoned:
             raise RuntimeError("session requires recovery after device reset failure")
         if self.pending is not None:
@@ -288,7 +288,8 @@ class RequestLedger:
                                        MappingProxyType({name: tuple(ids) for name, ids in pages.items()}),
                                        owner.shared_prefix_tokens))
         self._validate_page_ownership(slices)
-        self.pending = ForwardStep("decode", tuple(slices), self.epoch)
+        self.pending = ForwardStep("decode", tuple(slices), self.epoch,
+                                   sampling_params=MappingProxyType(dict(sampling_params or {})))
         return self.pending
 
     def commit(self, step, *, accepted_counts=None):

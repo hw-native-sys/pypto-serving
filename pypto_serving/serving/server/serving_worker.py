@@ -1073,7 +1073,7 @@ class WorkerProcess:
             if (mask := self._stop_token_mask(pr.request_id)) is not None
         }
         capabilities = getattr(self, "_sampling_capabilities", _DEFAULT_SAMPLING_CAPABILITIES)
-        if capabilities.prefill_top_p_on_device and batch.allow_device_greedy_sampling:
+        if capabilities.top_p_on_device and batch.allow_device_greedy_sampling:
             batch.sampling_params = {
                 pr.request_id: self._sampling_params(pr.request_id) for pr in terminal
             }
@@ -1573,7 +1573,7 @@ class WorkerProcess:
         if self._needs_host_stop_token_mask(scheduled, phase):
             return False
         capabilities = getattr(self, "_sampling_capabilities", _DEFAULT_SAMPLING_CAPABILITIES)
-        if phase == "prefill" and capabilities.prefill_top_p_on_device:
+        if capabilities.top_p_on_device:
             constraints = getattr(self, "_constraint_states", {})
             return all(item.request_id not in constraints for item in scheduled)
         requests = [self._req_cache[item.request_id] for item in scheduled]
