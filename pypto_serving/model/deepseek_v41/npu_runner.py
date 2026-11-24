@@ -772,7 +772,7 @@ def lookup_token_embeddings(
 
 
 # metadata
-_MAX_REQUESTS_PER_DP = 12
+_MAX_REQUESTS_PER_DP = DSPARK_MAX_BATCH_PER_DP
 
 
 def _validate_dp_capacity(partitions, token_counts, *, phase, dp_size):
@@ -784,7 +784,7 @@ def _validate_dp_capacity(partitions, token_counts, *, phase, dp_size):
         requests[partition] += 1
         tokens[partition] += count
     if any(count > _MAX_REQUESTS_PER_DP for count in requests):
-        raise ValueError("V4.1 lib supports at most 12 requests per DP partition")
+        raise ValueError(f"V4.1 decode capacity is {_MAX_REQUESTS_PER_DP} requests per DP partition")
     if phase == "prefill" and any(count > MAX_PREFILL_TOKENS_PER_DP for count in tokens):
         raise ValueError("V4.1 lib supports at most 4096 prefill tokens per DP partition")
 
@@ -949,10 +949,10 @@ class SegmentTopology:
 
     @classmethod
     def for_decode(cls, *, tp: int = 1, dp: int = 8):
-        """Match the current lib's 12-request, six-row decode extent."""
+        """Match the selected lib's six-row decode extent."""
         if type(tp) is not int or tp not in (1, 2, 4, 8):
             raise ValueError("unsupported decode TP size")
-        decode_tokens = 12 * 6
+        decode_tokens = DSPARK_MAX_BATCH_PER_DP * DSPARK_ROWS_PER_REQUEST
         row_tile = 16
         local_rows = (decode_tokens + tp - 1) // tp
         return cls(tp=tp, dp=dp, local_capacity=(local_rows + row_tile - 1) // row_tile * row_tile)
@@ -1019,6 +1019,22 @@ def load_segment_modules(lib_root, topology):
             1, topology.tp, topology.world, topology.dp
         ):
             raise ValueError("lib CP/LM-head/EP/DP topology disagrees with the serving topology")
+        selected_batch = DSPARK_MAX_BATCH_PER_DP
+        configured_batch = getattr(config, "_serving_decode_batch", None)
+        if configured_batch is not None and configured_batch != selected_batch:
+            raise RuntimeError("V4.1 decode capacity changed after import; use a fresh worker")
+        if configured_batch is None and selected_batch != 12:
+            # Lib entries freeze these shared dimensions when imported.
+            if any(
+                    Path(module.__file__).resolve().parent == expected.parent
+                    for module in tuple(sys.modules.values())
+                    if module is not config and getattr(module, "__file__", None)):
+                raise RuntimeError("V4.1 decode entries are already imported; use a fresh worker")
+            config.DECODE_BATCH = selected_batch
+            config.DECODE_MAX_TOKENS = selected_batch * DSPARK_ROWS_PER_REQUEST
+            config.set_moe_tokens((config.DECODE_MAX_TOKENS + 15) // 16 * 16)
+            config.DECODE_INPUT_MAX_TOKENS = max(config.DECODE_MAX_TOKENS, config.MOE_TOKENS)
+            config._serving_decode_batch = selected_batch
         if not (root / "models/deepseek_v4_1_flash/moe.py").is_file():
             return None, None
         attention = importlib.import_module(package + ".prefill_swa")
@@ -4008,6 +4024,11 @@ def make_production_bindings(
         from pypto_serving.model.common.compiler.compiler import KernelCompiler
         from pypto_serving.model.common.executor.utils import build_pypto_run_config
 
+        if (DSPARK_MAX_BATCH_PER_DP != 12
+                and max((runtime.max_batch_size + topology.dp - 1) // topology.dp,
+                        request_slots) > DSPARK_MAX_BATCH_PER_DP):
+            raise ValueError(
+                "configured request capacity exceeds PYPTO_V41_DECODE_BATCH_PER_DP")
         if Path(plan.weights.model_dir).resolve() != model_dir or tuple(plan.layers) != layers:
             raise ValueError("V4.1 binding and execution plan refer to different checkpoints")
         if runtime.max_seq_len != max_seq_len or runtime.kv_cache_groups != groups:

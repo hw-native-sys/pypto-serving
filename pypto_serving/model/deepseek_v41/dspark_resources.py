@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+import os
 from typing import Any, Callable
 
 import torch
@@ -31,9 +32,11 @@ from .dspark_runtime import (
 )
 
 
-DSPARK_MAX_BATCH_PER_DP = 12
-DSPARK_PADDED_ROWS = 80
+DSPARK_MAX_BATCH_PER_DP = int(os.environ.get("PYPTO_V41_DECODE_BATCH_PER_DP", "12"))
+if not 1 <= DSPARK_MAX_BATCH_PER_DP <= 12:
+    raise ValueError("PYPTO_V41_DECODE_BATCH_PER_DP must be between 1 and 12")
 DSPARK_TARGET_ROWS = DSPARK_MAX_BATCH_PER_DP * DSPARK_ROWS_PER_REQUEST
+DSPARK_PADDED_ROWS = (DSPARK_TARGET_ROWS + 15) // 16 * 16
 DSPARK_MAIN_HIDDEN_SIZE = 15360
 DSPARK_HIDDEN_SIZE = 5120
 DSPARK_HC_MULT = 4
