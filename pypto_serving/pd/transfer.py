@@ -9,6 +9,7 @@
 """VMM imports in independent transfer processes; HTTP does not establish DMA completion."""
 
 from dataclasses import asdict
+from functools import partial
 import importlib
 import logging
 import multiprocessing
@@ -24,12 +25,14 @@ from typing import Protocol
 import msgspec
 
 from pypto_serving.serving.utils.native_buffers import DeviceContext
-from pypto_serving.tools.observe import span
+from pypto_serving.tools.observe import record, span
 from pypto_serving.tools.profile import configure_profiler, get_profiler
 from .config import PROVIDERS
 from .protocol import Copy, MAX_FRAME, decode
 
 logger = logging.getLogger(__name__)
+
+HIXL_SETUP_OPERATIONS = frozenset(("install", "connect_ranks", "prepare_link"))
 
 
 def configure_ports():
@@ -177,11 +180,21 @@ def provider_class(name):
     if name not in PROVIDERS:
         raise ValueError(f"unsupported transfer provider {name}")
     module, implementation = PROVIDERS[name]
-    return getattr(importlib.import_module(module), implementation)
+    provider = getattr(importlib.import_module(module), implementation)
+    return provider("rdma") if name == "hixl" else provider
 
 
-def provider_factory(name, hostname):
+def provider_factory(name, hostname, *, role=None, rank=0):
+    if name == "hixl":
+        return provider_class(name)(hostname, role, rank)
     return provider_class(name)(hostname)
+
+
+def host_copy(copy):
+    from simpler.transfer_domain import TransferCopy
+
+    return TransferCopy(copy.source_rank, copy.component, copy.source_offset,
+                        copy.destination_rank, copy.component, copy.destination_offset, copy.length)
 
 
 def _send(channel, value):
@@ -210,9 +223,10 @@ def _receive(channel):
 
 class TransferWorker:
     """Controller for one fixed transfer process and its allocation-owner leases."""
-    def __init__(self, boot, rank, hostname, provider="mooncake", factory=provider_factory):
+    def __init__(self, boot, rank, hostname, provider="mooncake", factory=provider_factory, *, role=None):
         self.boot, self.rank = boot, rank
-        self.hostname, self.provider, self.provider_factory = hostname, provider, factory
+        self.hostname, self.provider = hostname, provider
+        self.provider_factory = partial(factory, role=role, rank=rank) if provider == "hixl" else factory
         self.parent, self.child = socket.socketpair()
         self.parent.settimeout(45)
         self.lock = threading.Lock()
@@ -283,8 +297,11 @@ class TransferWorker:
             self.retained.append((runtime, error.exported))
             raise
         self.retained.append((runtime, exported))
-        return decode(self.call("register", exported=asdict(exported),
-                                name=name, extent=tensor.nbytes), Region)
+        region = decode(self.call("register", exported=asdict(exported),
+                                  name=name, extent=tensor.nbytes), Region)
+        record(logger, "vmm.registered", rank=self.rank, device=exported.device_id,
+               consumer_pid=self.process.pid, region=name, bytes=region.extent)
+        return region
 
     def release(self):
         self.call("release")
@@ -323,8 +340,10 @@ def _serve(channel, boot, rank, device_id, hostname, provider_name, factory, pro
     # Each TE is another HCCL process on the compute owner's device. Let the
     # OS reserve unused ports atomically instead of reusing HCCL's fixed 16666.
     configure_ports()
+    logging.basicConfig(level=logging.INFO)
     from simpler.buffer_export import BufferExport, BufferImportError, BufferMapping
 
+    hixl = provider_name == "hixl"
     mappings = []
     sequence = 0
     try:
@@ -336,7 +355,10 @@ def _serve(channel, boot, rank, device_id, hostname, provider_name, factory, pro
         def disconnect():
             nonlocal provider
             if provider is not None:
-                provider.release()
+                if hixl:
+                    provider.close()
+                else:
+                    provider.release()
                 provider = None
 
         while True:
@@ -370,7 +392,17 @@ def _serve(channel, boot, rank, device_id, hostname, provider_name, factory, pro
                     reply["result"] = provider.register(boot, rank, request["name"],
                                                         mapping.base, request["extent"])
                 elif op == "install":
-                    provider.install(tuple(decode(r, Region) for r in request["regions"]))
+                    regions = tuple(decode(r, Region) for r in request["regions"])
+                    if hixl:
+                        provider.install(regions, peer=tuple(request["peer"]))
+                    else:
+                        provider.install(regions)
+                elif op == "prepare_link" and hixl:
+                    provider.prepare()
+                elif op == "connect_ranks" and hixl:
+                    provider.connect(tuple(request["peer"]), request["ranks"])
+                elif op == "close_peer" and hixl:
+                    provider.close_peer(tuple(request["peer"]))
                 elif op == "write":
                     with span(logger, "pd.owner.decode", log=False, thread_cpu=True,
                               **request["observation"]):
@@ -378,7 +410,13 @@ def _serve(channel, boot, rank, device_id, hostname, provider_name, factory, pro
                     with span(logger, "pd.native.write", cat="native-transfer",
                               **request["observation"], bytes=sum(c.length for c in copies),
                               segments=len(copies)):
-                        provider.write(request["peer"], copies)
+                        if hixl:
+                            provider.put_sync_host(tuple(request["peer"]), tuple(host_copy(copy) for copy in copies))
+                        else:
+                            provider.write(request["peer"], copies)
+                    if hixl:
+                        record(logger, "hixl.batch_complete", **request["observation"],
+                               bytes=sum(c.length for c in copies), segments=len(copies))
                 elif op == "release":
                     disconnect()
                     while mappings:
@@ -407,8 +445,8 @@ def _serve(channel, boot, rank, device_id, hostname, provider_name, factory, pro
             except Exception as exc:
                 if isinstance(exc, BufferImportError):
                     mappings.append(exc.mapping)
-                reply.update(error=str(exc), uncertain=not isinstance(exc, (ValueError, BufferImportError))
-                             and (not isinstance(exc, TransferError) or exc.uncertain))
+                reply.update(error=str(exc), uncertain=getattr(
+                    exc, "uncertain", not isinstance(exc, (ValueError, BufferImportError))))
             _send(channel, reply)
             if stopped:
                 channel.close()

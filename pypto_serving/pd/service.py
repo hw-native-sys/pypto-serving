@@ -10,7 +10,7 @@
 
 import asyncio
 from collections import OrderedDict
-from contextlib import aclosing
+from contextlib import aclosing, suppress
 from dataclasses import dataclass, field, replace
 import logging
 
@@ -23,10 +23,10 @@ from pypto_serving.tools.observe import record, span
 from .admission import DFirst
 from .planner import (Geometry, SourcePins, merge_ranges, page_indices, page_ranges, physical,
                       plan_chunk, rolling_bounds)
-from .protocol import (Binding, CapacityExhausted, Completion, Continuation, Node, Placement, Plan, Topology,
+from .protocol import (Binding, CapacityExhausted, Completion, Continuation, Copy, Node, Placement, Plan, Topology,
                        decode, digest, receive, send)
-from .session import PeerPool, Session
-from .transfer import TransferError
+from .session import PeerPool, PeerTransferError, Session
+from .transfer import HIXL_SETUP_OPERATIONS, TransferError, host_copy
 
 logger = logging.getLogger(__name__)
 
@@ -92,18 +92,40 @@ class Service:
         self.listener = None
         self.connections = set()
         self.preflight = None
+        self.hixl_control = None
+        self.hixl_sessions = {}
+        self.hixl_senders = {}
+        self.hixl_retired = set()
+        self.hixl_open = {}
 
     async def worker(self, operation, value=None):
+        hixl_setup = operation in HIXL_SETUP_OPERATIONS and self.config.provider == "hixl"
+        if hixl_setup and self.gated:
+            raise TransferError("PD node is unavailable", uncertain=False)
         with span(logger, "pd.worker.encode", log=False, thread_cpu=True, operation=operation) as timing:
             payload = msgspec.msgpack.encode(value) if value is not None else b""
         with span(logger, "pd.worker." + operation, encode_ms=timing["duration_ms"],
                   encode_thread_cpu_ms=timing["thread_cpu_ms"]):
-            response = (await self.progress.call(operation, payload) if operation in ("submit", "source_state")
-                        else await self.core.call_worker(operation, payload))
-            result = msgspec.msgpack.decode(response)
-        if operation in ("submit", "source_state"):
-            if "error" in result:
-                raise TransferError(result["error"], uncertain=result["uncertain"])
+            try:
+                response = (await self.progress.call(operation, payload) if operation in ("submit", "source_state")
+                            else await self.core.call_worker(operation, payload))
+                result = msgspec.msgpack.decode(response)
+                if hixl_setup and result is not None and not (
+                    isinstance(result, dict) and isinstance(result.get("error"), str)
+                    and type(result.get("uncertain")) is bool
+                ):
+                    raise ValueError("invalid HIXL setup reply")
+            except (Exception, asyncio.CancelledError) as exc:
+                if not hixl_setup:
+                    raise
+                self.gate()
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise TransferError(str(exc), uncertain=True) from exc
+        if (hixl_setup or operation in ("submit", "source_state")) and isinstance(result, dict) and "error" in result:
+            if hixl_setup and result["uncertain"]:
+                self.gate()
+            raise TransferError(result["error"], uncertain=result["uncertain"])
         if operation == "submit":
             return result["job"]
         return result
@@ -121,6 +143,10 @@ class Service:
                          topology, self.config.provider, self.cache.enable_prefix_cache)
         if self.role == "decode":
             self.listener = await asyncio.start_server(self._accept, "0.0.0.0", self.endpoint.control_port)
+        elif self.config.provider == "hixl":
+            from simpler.worker import Worker
+            self.hixl_control = Worker(level=4)
+            self.hixl_control.init()
         logger.info("ready node=%s role=%s boot=%s prefix=%s", self.node.node_id, self.role,
                     boot, self.node.prefix)
 
@@ -187,6 +213,10 @@ class Service:
     def register_http(self, binding, payload):
         if digest(payload) != binding.input_digest:
             raise ValueError("HTTP input differs from routed request")
+        if self.role == "decode":
+            sender = self.hixl_senders.get(binding.prefill[0])
+            if sender is not None and (sender != binding.prefill or sender in self.hixl_retired):
+                raise ValueError("HIXL Prefill identity is retired or has changed")
         entry = self.entry(binding, create=True)
         if entry.cancelled:
             raise ValueError("request cancelled")
@@ -226,6 +256,35 @@ class Service:
                      if entry.reservation is not None else 0)
 
     async def connect(self, node):
+        reader, writer, registry = await self._connect_peer(node)
+        session = None
+        try:
+            geometry = tuple(decode(g, Geometry) for g in registry["geometry"])
+            if self.config.provider == "hixl":
+                existing = self.hixl_sessions.get(node.node_id)
+                if existing is not None and existing[0] != node.key:
+                    raise ValueError("HIXL Decode identity changed during this Prefill boot")
+                session = Session(reader, writer, self.config.capacity * 2)
+                self.bind_transfer_domain(session, node, registry)
+                # Track the peer before opening. A lost reply cannot prove that
+                # the receiver never admitted this sender.
+                self.hixl_sessions[node.node_id] = (node.key, session)
+                await asyncio.wait_for(session.call("open_link", node.registry), self.config.handoff_timeout)
+                await asyncio.wait_for(self.worker("install", dict(peer=node.key, registry=registry)),
+                                       self.config.handoff_timeout)
+            else:
+                await self.worker("install", registry)
+                session = Session(reader, writer, self.config.capacity * 2)
+            session.geometry = geometry
+            return session
+        except BaseException:
+            if session is not None:
+                await session.close()
+            else:
+                writer.transport.abort()  # Setup has not authorized any writes.
+            raise
+
+    async def _connect_peer(self, node):
         endpoint = self.config.endpoint("decode", node.node_id)
         writer = None
 
@@ -238,14 +297,11 @@ class Service:
         try:
             reader, hello = await asyncio.wait_for(exchange(), self.config.handoff_timeout)
             peer = decode(hello["node"], Node)
-            if (peer != node or not self.node.compatible(peer) or digest(hello["registry"]) != peer.registry
-                    or decode(hello["registry"]["topology"], Topology) != peer.topology):
+            registry = hello["registry"]
+            if (peer != node or not self.node.compatible(peer) or digest(registry) != peer.registry
+                    or decode(registry["topology"], Topology) != peer.topology):
                 raise ValueError("peer identity/contract changed before handshake")
-            geometry = tuple(decode(g, Geometry) for g in hello["registry"]["geometry"])
-            await self.worker("install", hello["registry"])
-            session = Session(reader, writer, self.config.capacity * 2)
-            session.geometry = geometry
-            return session
+            return reader, writer, registry
         except BaseException:
             if writer is not None:
                 writer.transport.abort()  # Setup has not authorized any writes.
@@ -256,6 +312,9 @@ class Service:
         tasks = set()
         write_lock = asyncio.Lock()
         slots = asyncio.Semaphore(self.config.capacity * 2)
+        hixl = self.config.provider == "hixl"
+        peer = None
+        opened = False
         try:
             hello = await asyncio.wait_for(receive(reader), self.config.handoff_timeout)
             peer = decode(hello["node"], Node)
@@ -268,14 +327,29 @@ class Service:
                 raise ValueError("peer registry fingerprint mismatch")
             await send(writer, dict(node=self.node, registry=self.registry))
             async def dispatch(message):
+                nonlocal opened
                 try:
+                    operation = message["op"]
                     async with slots:
-                        value = await self.control(peer, geometry, message["op"], message["payload"])
+                        if hixl:
+                            if not opened and operation not in ("open_link", "retire_link"):
+                                raise ValueError("HIXL control session is not open")
+                            # Let the previous session finish cleaning its requests before replacing it.
+                            if operation == "open_link" and self.hixl_open.get(peer.key, writer) is not writer:
+                                raise ValueError("previous HIXL control session is still active or closing")
+                            value = await self._hixl_request(peer, geometry, operation, message["payload"])
+                            if operation == "open_link":
+                                opened = True
+                                self.hixl_open[peer.key] = writer
+                        else:
+                            value = await self.control(peer, geometry, operation, message["payload"])
                     reply = dict(id=message["id"], result=value)
                 except Exception as exc:
                     reply = dict(id=message["id"], error=str(exc))
                     if isinstance(exc, CapacityExhausted):
                         reply["code"] = "capacity_exhausted"
+                    elif hixl:
+                        reply["uncertain"] = getattr(exc, "uncertain", not isinstance(exc, (ValueError, NodeUnavailable)))
                 async with write_lock:
                     await send(writer, reply)
             while True:
@@ -290,14 +364,111 @@ class Service:
         except Exception:
             logger.exception("PD control connection failed")
         finally:
-            await asyncio.gather(*tasks, return_exceptions=True)
-            # A connection close cannot prove that a remote native write stopped.
-            for entry in tuple(self.requests.values()):
-                if 'peer' in locals() and entry.binding.prefill == peer.key and not entry.source_done.is_set():
-                    self.fail(entry, TransferError("peer control lost", uncertain=True))
-            writer.close()
-            await writer.wait_closed()
-            self.connections.discard(writer)
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                if peer is not None and (not hixl or opened):
+                    await self._control_lost(peer, hixl)
+            finally:
+                if opened:
+                    self.hixl_open.pop(peer.key)
+                writer.close()
+                with suppress(ConnectionError):
+                    await writer.wait_closed()
+                self.connections.discard(writer)
+
+    async def _control_lost(self, peer, hixl):
+        for entry in tuple(self.requests.values()):
+            if entry.binding.prefill != peer.key or entry.source_done.is_set():
+                continue
+            if hixl:
+                reservation = self.cache.group_cache_reservation(entry.binding.request)
+                if reservation is None or not reservation.write_authorized:
+                    self.fail(entry, ConnectionError("peer control lost before write authorization"))
+                    await self.abort(entry, stopped=True)
+                    continue
+            # A connection close cannot prove that an authorized native write stopped.
+            self.fail(entry, TransferError("peer control lost", uncertain=True))
+
+    async def _hixl_request(self, peer, geometry, operation, payload):
+        sender = self.hixl_senders.get(peer.node_id)
+        if operation not in ("open_link", "retire_link"):
+            if sender != peer.key or sender in self.hixl_retired:
+                raise ValueError("HIXL sender is not active")
+            return await self.control(peer, geometry, operation, payload)
+        if payload != self.node.registry or sender not in (None, peer.key):
+            raise ValueError("HIXL link registry or peer boot mismatch")
+        if operation == "open_link":
+            if self.closing or peer.key in self.hixl_retired:
+                raise ValueError("HIXL receiver or sender is retiring")
+            if sender is None:
+                self.hixl_senders[peer.node_id] = peer.key
+                record(logger, "hixl.sender.open", node_id=self.node.node_id, sender=peer.node_id,
+                       sender_boot=peer.boot)
+        else:
+            if any(e.binding.prefill == peer.key and not e.source_done.is_set() for e in self.requests.values()):
+                raise ValueError("HIXL sender has active or unconfirmed handoffs")
+            # Record retirement even if the earlier open never arrived.
+            self.hixl_senders[peer.node_id] = peer.key
+            self.hixl_retired.add(peer.key)
+
+    def bind_transfer_domain(self, session, peer, registry):
+        from simpler.transfer_domain import TransferMember, TransferRegion
+
+        session.transfer_domain = self.hixl_control.bind_transfer_domain(
+            transport="rdma",
+            source=TransferMember(self.role, *self.node.key),
+            destination=TransferMember(peer.role, *peer.key),
+            source_regions=tuple(decode(region, TransferRegion) for region in self.registry["regions"]),
+            destination_regions=tuple(decode(region, TransferRegion) for region in registry["regions"]),
+            connect=lambda peer, pairs: self.worker("connect_ranks", dict(peer=peer, rank_pairs=pairs)),
+            release=lambda: self.retire_hixl_session(peer, session),
+        )
+
+    @staticmethod
+    def transfer_copies(domain, plan):
+        if domain.source.identity != plan.binding.prefill or domain.destination.identity != plan.binding.decode:
+            raise ValueError("plan refers to a different transfer domain")
+        return tuple(host_copy(copy) for copy in plan.copies)
+
+    async def connect_transfer_plan(self, session, plan, plan_digest):
+        if not self.is_ready():
+            raise NodeUnavailable("PD node is unavailable")
+        domain = session.transfer_domain
+        copies = self.transfer_copies(domain, plan)
+        domain.validate_copies(copies)
+        await asyncio.wait_for(domain.ensure_connected(
+            {(copy.source_rank, copy.destination_rank) for copy in copies},
+            prepare_destination=lambda _: session.call(
+                "prepare_hixl_plan", dict(binding=plan.binding, plan_digest=plan_digest)),
+        ), self.config.handoff_timeout)
+
+    async def put_transfer_plan(self, session, plan, plan_digest):
+        from simpler.transfer_domain import TransferDomainError
+
+        domain = session.transfer_domain
+        copies = self.transfer_copies(domain, plan)
+
+        async def submit(copies, transfer_id):
+            if not self.is_ready():
+                raise TransferError("PD node is unavailable", uncertain=False)
+            submitted = tuple(Copy(copy.source_region, copy.source_rank, copy.destination_rank,
+                                   copy.source_offset, copy.destination_offset, copy.length) for copy in copies)
+            if submitted != plan.copies or any(copy.destination_region != copy.source_region for copy in copies):
+                raise ValueError("Host transfer copies differ from the authorized plan")
+            job = await self.worker("submit", msgspec.structs.replace(plan, copies=submitted))
+            try:
+                (await self.progress.wait(job)).check(transfer_id, plan.units)
+            except ValueError as exc:
+                raise TransferError(str(exc), uncertain=True) from exc
+            return job
+
+        try:
+            completed = await domain.put_sync_host(copies, transfer_id=plan_digest, submit=submit)
+        except TransferDomainError as exc:
+            raise TransferError(str(exc), uncertain=exc.uncertain) from exc
+        except ValueError as exc:
+            raise TransferError(str(exc), uncertain=False) from exc
+        return Completion(completed, plan.units)
 
     async def control(self, peer, geometry, operation, payload):
         binding = decode(payload["binding"], Binding)
@@ -399,6 +570,16 @@ class Service:
                          plan_digest_ms=digest_timing["duration_ms"],
                          plan_digest_thread_cpu_ms=digest_timing["thread_cpu_ms"])
             return plan_digest
+        if operation == "prepare_hixl_plan" and self.config.provider == "hixl":
+            if not self.is_ready():
+                raise NodeUnavailable("PD node is unavailable")
+            plan = entry.pending
+            if (plan is None or not plan.copies or entry.pending_digest != payload["plan_digest"]
+                    or entry.cancelled or entry.error is not None or entry.source_done.is_set()):
+                raise ValueError("HIXL receivers require an active authorized plan")
+            ranks = sorted({copy.destination_rank for copy in plan.copies})
+            await self.worker("prepare_link", ranks)
+            return {}
         if operation == "complete":
             plan = entry.pending
             if plan is None:
@@ -529,14 +710,17 @@ class Service:
                 if actual != required[component.name]:
                     raise ValueError("copy plan does not cover the required destination pages")
 
+    def gate(self):
+        self.gated = True
+        if self.cache.tiering is not None:
+            self.cache.tiering.wake()
+
     def fail(self, entry, error):
         entry.error = error
         entry.prepared.set()
         entry.transferred.set()
-        if isinstance(error, TransferError) and error.uncertain:
-            self.gated = True
-            if self.cache.tiering is not None:
-                self.cache.tiering.wake()
+        if isinstance(error, TransferError) and error.uncertain and not isinstance(error, PeerTransferError):
+            self.gate()
             if entry.reservation is not None:
                 self.cache.quarantine_group_cache(entry.binding.request)
         self.observe("request.error", entry, error=type(error).__name__,
@@ -661,14 +845,23 @@ class Service:
                     if await call("plan", plan=plan, p_hit=p_hit) != plan_digest:
                         raise ValueError("destination acknowledged a different plan")
                     job = None
+                    rdma = bool(plan.copies) and self.config.provider == "hixl"
                     if plan.copies:
+                        if rdma:
+                            await self.connect_transfer_plan(session, plan, plan_digest)
                         submitted = True  # A lost independent-submit reply is still uncertain.
-                        job = await self.worker("submit", plan)
-                    async def settle(plan=plan, job=job, plan_digest=plan_digest, plan_timing=plan_timing):
+                        if not rdma:
+                            job = await self.worker("submit", plan)
+                    async def settle(plan=plan, job=job, rdma=rdma,
+                                     plan_digest=plan_digest, plan_timing=plan_timing):
                         nonlocal submitted
                         try:
-                            completion = (await self.progress.wait(job) if job is not None
-                                          else Completion(plan_digest, plan.units))
+                            if rdma:
+                                completion = await self.put_transfer_plan(session, plan, plan_digest)
+                            elif job is not None:
+                                completion = await self.progress.wait(job)
+                            else:
+                                completion = Completion(plan_digest, plan.units)
                         except TransferError as exc:
                             if not exc.uncertain:
                                 self.pins.release(request, plan.chunk)
@@ -676,10 +869,10 @@ class Service:
                         completion.check(plan_digest, plan.units)
                         submitted = False
                         entry.chunk, entry.end = plan.chunk + 1, plan.end
-                        entry.completion_source = "owner_completion" if job is not None else "empty_plan"
+                        entry.completion_source = "owner_completion" if plan.copies else "empty_plan"
                         self.pins.release(request, plan.chunk)
                         self.observe("completion", entry, plan_digest=completion.plan_digest, end=plan.end,
-                                     native_write=job is not None, plan_ms=plan_timing["duration_ms"],
+                                     native_write=bool(plan.copies), plan_ms=plan_timing["duration_ms"],
                                      plan_thread_cpu_ms=plan_timing["thread_cpu_ms"],
                                      plan_construct_ms=plan_timing["construct_ms"],
                                      plan_construct_thread_cpu_ms=plan_timing["construct_thread_cpu_ms"],
@@ -729,9 +922,7 @@ class Service:
                     await call("abort", stopped=not uncertain)
                 except Exception:
                     logger.exception("sender stop confirmation failed request=%s", request)
-                    self.gated = True
-                    if self.cache.tiering is not None:
-                        self.cache.tiering.wake()
+                    self.gate()
                 raise
             finally:
                 if request not in self.pins.active:
@@ -740,6 +931,7 @@ class Service:
     async def outputs(self, request, *args, **kwargs):
         entry = self.requests[request]
         terminal = False
+        observed_decode = False
         try:
             try:
                 await asyncio.wait_for(entry.transferred.wait(), self.config.request_timeout)
@@ -777,6 +969,12 @@ class Service:
                         # Router cannot admit a replacement into a live slot.
                         await outputs.aclose()
                         await self.close_output(entry, terminal)
+                    if (self.config.provider == "hixl" and not observed_decode
+                            and output.completion_tokens > 1):
+                        # The first token was sampled on Prefill. Later tokens require a Decode step.
+                        self.observe("decode.generated", entry, completion_tokens=output.completion_tokens,
+                                     token_id=output.token_id)
+                        observed_decode = True
                     yield output
         finally:
             await self.close_output(entry, terminal)
@@ -816,12 +1014,44 @@ class Service:
         if self.requests or self.pins.active or self.gated:
             raise RuntimeError("node has active/uncertain handoffs; retire it through external orchestration")
         if self.role == "prefill":
+            results = await asyncio.gather(*(session.transfer_domain.close()
+                                              for _, session in self.hixl_sessions.values()),
+                                             return_exceptions=True)
+            errors = [result for result in results if isinstance(result, BaseException)]
+            if errors:
+                raise RuntimeError("could not confirm HIXL retirement on every Decode peer") from errors[0]
             await self.worker("release")
-            # Session close tells D that every sender owner is unregistered.
+            # The HIXL receiver also requires the explicit retirement acknowledgement.
             await self.peers.close()
+            if self.hixl_control is not None:
+                self.hixl_control.close()
         else:
-            if self.connections:
+            if self.connections or any(sender not in self.hixl_retired for sender in self.hixl_senders.values()):
                 raise RuntimeError("stop Prefill senders before Decode receivers")
             await self.worker("release")
             self.listener.close()
             await self.listener.wait_closed()
+
+    async def retire_hixl_session(self, peer, session):
+        await self.worker("close_peer", peer.key)
+        timeout = self.config.handoff_timeout
+        try:
+            if not session.closed:
+                try:
+                    await asyncio.wait_for(session.call("retire_link", peer.registry), timeout)
+                    return
+                except (OSError, EOFError, asyncio.TimeoutError):
+                    pass
+        finally:
+            await session.close()
+
+        # Local writers have retired. Repeat only the acknowledgement against the same Decode.
+        try:
+            reader, writer, _ = await asyncio.wait_for(self._connect_peer(peer), timeout)
+            replacement = Session(reader, writer, self.config.capacity * 2)
+            try:
+                await asyncio.wait_for(replacement.call("retire_link", peer.registry), timeout)
+            finally:
+                await replacement.close()
+        except (OSError, EOFError, asyncio.TimeoutError) as exc:
+            raise TransferError(f"retirement acknowledgement unavailable: {exc}", uncertain=False) from exc

@@ -11,22 +11,29 @@
 """Basic configuration, routing and request lifecycle checks for PD."""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
+import threading
+from types import SimpleNamespace
 
 import httpx
 import msgspec
 import pytest
 from starlette.requests import Request
 
-from pypto_serving.pd.protocol import Binding, Component, Contract, Node, Topology
+from pypto_serving.pd.integration import Server
+from pypto_serving.pd.protocol import Binding, Component, Contract, Node, Topology, digest
+from pypto_serving.pd.service import Service
+from pypto_serving.pd.transfer import Region, TransferError
+from pypto_serving.pd.worker import WorkerRuntime
 from pypto_serving.router.app import ServingRouter
 from pypto_serving.router.config import ReplicaSpec, RouterConfig
 
 
-def config(p=1, d=1):
+def config(p=1, d=1, provider="mooncake"):
     return RouterConfig(replicas=tuple(ReplicaSpec(f"{role[0]}{i}", f"{role[0]}{i}", 8000, role=role)
         for role, count in (("prefill", p), ("decode", d)) for i in range(count)),
-        pd_options={"capacity": 1, "handoff_timeout": 0.04, "request_timeout": 1},
+        pd_options={"capacity": 1, "handoff_timeout": 0.04, "request_timeout": 1, "provider": provider},
         observability={"enabled": False}, health_interval_seconds=60)
 
 
@@ -41,7 +48,7 @@ class Peers:
     def __init__(self, cfg):
         contract = Contract("model", "model", "layout", (Component("kv", "kv", "kv"),))
         self.nodes = {r.name: Node(r.name, r.role, "boot-" + r.name, contract, "registry-" + r.name,
-                                  Topology.for_tp(4, 1)) for r in cfg.replicas}
+                                  Topology.for_tp(4, 1), cfg.pd_options["provider"]) for r in cfg.replicas}
         self.calls, self.requests, self.errors = [], [], {}
         self.p_hold = self.d_stream = self.stream_body = None
 
@@ -127,6 +134,76 @@ def test_pool_rotation_health_and_new_boot():
             peers.nodes["d0"] = msgspec.structs.replace(peers.nodes["d0"], healthy=False)
             await router.health.probe_once()
             assert all(d.node_id == "d1" for _, d in router.proxy.pairs())
+            assert_idle(router)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("operation", "node"), [
+    ("install", "p0"), ("connect_ranks", "p0"), ("prepare_link", "d0"),
+])
+def test_ordered_hixl_fault_withdraws_only_its_local_node(operation, node):
+    async def run():
+        cfg = config(2, 2, "hixl")
+        peers = Peers(cfg)
+        local = peers.nodes[node]
+        runtime = WorkerRuntime.__new__(WorkerRuntime)
+        runtime.settings = SimpleNamespace(provider="hixl", role=local.role, peer_capacity=2)
+        runtime.lock, runtime.uncertain, runtime.accepting = threading.Lock(), False, True
+        runtime.model = SimpleNamespace(ranks=1, tp=1, regions=lambda: {"kv": None})
+        runtime.peers, runtime.peer_identities = {}, {}
+
+        def fail_native(op, **payload):
+            assert op == operation
+            raise RuntimeError("injected native link fault")
+
+        runtime.owners = (SimpleNamespace(call=fail_native),)
+        region = Region("decode-boot", 0, "kv", 64, {})
+        registry = {"topology": Topology.for_tp(1, 1), "regions": [region]}
+        identity = ("d0", region.boot, digest(registry))
+        if operation == "connect_ranks":
+            runtime.peers[region.boot] = (region,)
+            runtime.peer_identities[region.boot] = identity
+        payload = {"install": dict(peer=identity, registry=registry),
+                   "connect_ranks": dict(peer=identity, rank_pairs=((0, 0),)), "prepare_link": [0]}[operation]
+
+        async def ordered_call(op, wire):
+            # The common ordered RPC only delivers bytes on success.
+            try:
+                return runtime.handle(op, wire)
+            except Exception as exc:
+                raise RuntimeError(str(exc)) from exc
+
+        core = SimpleNamespace(is_ready=lambda: True, call_worker=ordered_call,
+                               kv_cache_manager=SimpleNamespace(tiering=None))
+        endpoint = SimpleNamespace(node_id=node)
+        service = Service(SimpleNamespace(prefill=(0, 1), decode=(0, 1), provider="hixl"),
+                          endpoint, local.role, None, core, None)
+        service.node = local
+        server = SimpleNamespace(service=service)
+        handle = peers.handle
+
+        async def probe_real_service(req):
+            if req.url.host == node and req.url.path == "/internal/pd/descriptor":
+                response = await Server.descriptor(server)
+                return httpx.Response(response.status_code, content=response.body)
+            return await handle(req)
+
+        peers.handle = probe_real_service
+        router = peers.router(cfg)
+        async with router.app.router.lifespan_context(router.app):
+            assert len(router.proxy.pairs()) == 4 and (await Server._health(server)).status_code == 200
+            with ThreadPoolExecutor() as runtime.pool:
+                with pytest.raises(TransferError, match="injected native link fault") as error:
+                    await service.worker(operation, payload)
+            assert error.value.uncertain and runtime.uncertain and core.is_ready()
+            assert (await Server._health(server)).status_code == 503
+            assert json.loads((await Server.descriptor(server)).body)["healthy"] is False
+            await router.health.probe_once()
+            assert not router.registry.state(node).routable
+            assert len(router.proxy.pairs()) == 2
+            for _ in range(2):
+                assert (await router.proxy.forward(request({}), "/v1/completions")).status_code == 200
+            assert peers.requests and all(req.url.host != node for req in peers.requests)
             assert_idle(router)
     asyncio.run(run())
 

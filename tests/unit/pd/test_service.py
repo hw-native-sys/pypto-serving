@@ -11,27 +11,65 @@
 import asyncio
 import math
 import socket
+import sys
 import threading
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from unittest.mock import AsyncMock, Mock
 
 import msgspec
 import pytest
 
 from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
+from pypto_serving.model.deepseek_dspark.cache_offload import CacheOffloadExtension
 from pypto_serving.pd.worker import Progress, ProgressServer, WorkerRuntime, WorkerSettings
-from pypto_serving.pd.adapter import CACHE_COMPONENTS, COMPONENTS, DeepSeekDSpark
+from pypto_serving.pd.adapter import CACHE_COMPONENTS, COMPONENTS, DSparkExtension, DeepSeekDSpark
 from pypto_serving.pd.config import Config, Endpoint
 from pypto_serving.pd.integration import Chunk
 from pypto_serving.pd.planner import Geometry, plan_chunk, rank_mapping
 from pypto_serving.pd.protocol import Binding, CapacityExhausted, Component, Completion, Continuation, Contract, Copy, Node, Placement, Plan, Topology, digest
-from pypto_serving.pd.service import Service
-from pypto_serving.pd.transfer import Mooncake, Region, TransferError
+from pypto_serving.pd.service import Request, Service
+from pypto_serving.pd.session import Session
+from pypto_serving.pd.transfer import Mooncake, Region, TransferError, TransferWorker, _serve, host_copy
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.serving.memory.tiering.simpler import serve_copy
 from tests.unit.serving.test_grouped_prefix_cache import GEOMETRY
+
+
+def test_hixl_link_setup_covers_all_legal_rank_pairs():
+    runtime = WorkerRuntime.__new__(WorkerRuntime)
+    runtime.settings = SimpleNamespace(provider="hixl", peer_capacity=1)
+    runtime.model = SimpleNamespace(ranks=8, tp=4, regions=lambda: {"kv": None})
+    runtime.peers, runtime.peer_fingerprints, runtime.peer_regions = {}, {}, {}
+    runtime.peer_identities = {}
+    installed = {}
+
+    def install(rank, operation, *, regions, peer):
+        assert operation == "install"
+        assert peer == identity
+        assert rank not in installed
+        installed[rank] = {region.rank for region in regions}
+
+    runtime.owners = tuple(SimpleNamespace(call=lambda op, rank=rank, **kwargs: install(rank, op, **kwargs))
+                           for rank in range(8))
+    source = Topology.for_tp(8, 4)
+    target = Topology.for_tp(8, 2)
+    descriptor = msgspec.to_builtins(dict(topology=target, regions=[
+        Region("decode-boot", rank, "kv", 4096, {}) for rank in range(target.ranks)
+    ]))
+    identity = ("d", "decode-boot", digest(descriptor))
+    with ThreadPoolExecutor(max_workers=8) as runtime.pool:
+        runtime._install(descriptor, identity)
+        runtime._install(descriptor, identity)
+    expected = {rank: set() for rank in range(8)}
+    for p in range(len(source.groups)):
+        for d in range(len(target.groups)):
+            for source_rank, destination_rank in rank_mapping(source, target, p, d):
+                expected[source_rank].add(destination_rank)
+    assert installed == expected
+
 
 def cache(length, partitions=1, enabled=True, ori_blocks=9, slots=4, state_pages=None):
     state_pages = state_pages or {}
@@ -105,6 +143,423 @@ def handoff(length, p_hit=0, d_hit=0, p_tp=4, d_tp=1, ori_blocks=9, enabled=True
         plans.append(plan)
     return SimpleNamespace(p=p, d=d, destination=destination, entry=entry, plans=plans, tokens=tokens,
                            source_geometry=pg, nodes=nodes, p_hit=p_hit, source_request=source_request)
+
+
+def test_rdma_connects_only_requested_pairs_for_the_installed_member():
+    case = handoff(128, p_tp=2, d_tp=2)
+    plan = case.plans[-1]
+    p, d = case.nodes
+    runtime = WorkerRuntime.__new__(WorkerRuntime)
+    runtime.settings = SimpleNamespace(provider="hixl", role="prefill", boot=p.boot)
+    runtime.lock, runtime.uncertain, runtime.accepting = threading.Lock(), False, True
+    runtime.peer_identities = {d.boot: d.key}
+    runtime.peers = {d.boot: tuple(Region(d.boot, rank, "kv", 4096, {}) for rank in range(d.topology.ranks))}
+    connected = {}
+
+    def connect(rank, operation, *, peer, ranks):
+        assert operation == "connect_ranks"
+        assert peer == d.key
+        connected[rank] = tuple(ranks)
+
+    runtime.owners = tuple(SimpleNamespace(call=lambda op, rank=rank, **kwargs: connect(rank, op, **kwargs))
+                           for rank in range(p.topology.ranks))
+    request = dict(peer=d.key, rank_pairs=plan.mapping)
+    with ThreadPoolExecutor(max_workers=2) as runtime.pool:
+        for rejected, reason in ((dict(peer=("stale", *d.key[1:])), "identity"),
+                                 (dict(rank_pairs=((0, 1000),)), "rank pairs")):
+            result = msgspec.msgpack.decode(runtime.handle("connect_ranks", msgspec.msgpack.encode(
+                {**request, **rejected})))
+            assert reason in result["error"] and not result["uncertain"]
+        assert not connected
+        runtime.handle("connect_ranks", msgspec.msgpack.encode(request))
+    assert connected == {source: (destination,) for source, destination in plan.mapping}
+
+
+def test_hixl_receiver_prepares_only_ranks_in_the_authorized_plan():
+    async def run():
+        case = handoff(128, p_tp=2, d_tp=2)
+        service, entry, plan = case.destination, case.entry, case.plans[-1]
+        service.config.provider = "hixl"
+        entry.pending, entry.pending_digest = plan, digest(plan)
+        calls = []
+
+        async def worker(operation, ranks):
+            calls.append((operation, ranks))
+
+        service.worker = worker
+        payload = {"binding": msgspec.to_builtins(plan.binding), "plan_digest": "wrong-digest"}
+        with pytest.raises(ValueError, match="authorized plan"):
+            await service.control(case.nodes[0], case.source_geometry, "prepare_hixl_plan", payload)
+        assert not calls
+        payload["plan_digest"] = entry.pending_digest
+        await service.control(case.nodes[0], case.source_geometry, "prepare_hixl_plan", payload)
+        assert calls == [("prepare_link", sorted({copy.destination_rank for copy in plan.copies}))]
+
+    asyncio.run(run())
+
+
+@asynccontextmanager
+async def hixl_control_pair(case):
+    destination = case.destination
+    disconnected = asyncio.Event()
+
+    async def accept(reader, writer):
+        await destination._accept(reader, writer)
+        disconnected.set()
+
+    listener = await asyncio.start_server(accept, "127.0.0.1", 0)
+    port = listener.sockets[0].getsockname()[1]
+    p_endpoint = Endpoint("127.0.0.1", 20001, "p")
+    d_endpoint = Endpoint("127.0.0.1", 20002, "d", control_port=port)
+    config = Config((p_endpoint,), (d_endpoint,), provider="hixl", handoff_timeout=2)
+    destination.config, destination.endpoint = config, d_endpoint
+    destination.core.scheduler = SimpleNamespace(requests={})
+    prefill = Service(config, p_endpoint, "prefill", None,
+                      SimpleNamespace(kv_cache_manager=SimpleNamespace(tiering=None)), None)
+    for service, node, geometry in zip((prefill, destination), case.nodes,
+                                      (case.source_geometry, destination.geometry)):
+        service.registry = msgspec.to_builtins(dict(topology=node.topology, geometry=geometry))
+        service.node = msgspec.structs.replace(node, provider="hixl", registry=digest(service.registry))
+    case.entry.binding = msgspec.structs.replace(case.entry.binding, prefill=prefill.node.key,
+                                                decode=destination.node.key)
+    async with listener:
+        yield prefill, destination, disconnected
+
+
+@pytest.mark.parametrize("ipc_disconnect", [False, True])
+def test_hixl_prepare_uncertainty_survives_worker_and_control_round_trips(ipc_disconnect):
+    async def run():
+        case = handoff(128)
+        async with hixl_control_pair(case) as (prefill, destination, disconnected):
+            runtime = WorkerRuntime.__new__(WorkerRuntime)
+            runtime.settings = SimpleNamespace(provider="hixl", role="decode")
+            runtime.lock, runtime.uncertain, runtime.accepting = threading.Lock(), False, True
+            calls = []
+
+            def listen(operation):
+                assert operation == "prepare_link"
+                raise RuntimeError("listener failed after registering device memory")
+
+            runtime.owners = tuple(SimpleNamespace(call=listen) for _ in range(destination.node.topology.ranks))
+
+            async def call_worker(operation, payload):
+                ranks = msgspec.msgpack.decode(payload)
+                calls.append(ranks)
+                if ipc_disconnect and ranks != [-1]:
+                    raise ConnectionError("listener outcome unknown")
+                return runtime.handle(operation, payload)
+
+            destination.core.call_worker = call_worker
+            entry = case.entry
+            entry.pending = msgspec.structs.replace(case.plans[-1], binding=entry.binding)
+            entry.pending_digest = digest(entry.pending)
+            other = destination.register_http(Binding.create(prefill.node, destination.node, {}), {})
+            other.pending = msgspec.structs.replace(entry.pending, binding=other.binding)
+            other.pending_digest = digest(other.pending)
+            other_request = other.binding.request
+            other.reservation = case.d.reserve_group_cache(other_request, other_request, 256,
+                                                            prompt_token_count=128)
+            case.d.authorize_group_cache_write(entry.binding.request)
+            case.d.authorize_group_cache_write(other_request)
+            reader, writer, _ = await prefill._connect_peer(destination.node)
+            session = Session(reader, writer)
+            try:
+                await session.call("open_link", destination.node.registry)
+                payload = dict(binding=entry.binding, plan_digest="wrong-digest")
+                with ThreadPoolExecutor() as runtime.pool:
+                    with pytest.raises(TransferError, match="destination ranks") as bad_rank:
+                        await destination.worker("prepare_link", [-1])
+                    assert not bad_rank.value.uncertain
+
+                    with pytest.raises(TransferError, match="authorized plan") as rejected:
+                        await session.call("prepare_hixl_plan", payload)
+                    assert not rejected.value.uncertain and destination.is_ready()
+
+                    payload["plan_digest"] = entry.pending_digest
+                    with pytest.raises(TransferError, match="listener") as failed:
+                        await session.call("prepare_hixl_plan", payload)
+                    with pytest.raises(TransferError, match="node is unavailable") as blocked:
+                        await session.call("prepare_hixl_plan",
+                                           dict(binding=other.binding, plan_digest=other.pending_digest))
+                assert failed.value.uncertain and not blocked.value.uncertain
+                assert runtime.uncertain is not ipc_disconnect
+                assert len(calls) == 2
+                assert not destination.is_ready()
+                assert entry.error is None
+                prefill.fail(Request(entry.binding), failed.value)
+                assert not prefill.gated
+                await session.call("abort", dict(binding=entry.binding, stopped=True))
+                assert case.d.group_cache_reservation(entry.binding.request) is None
+                await destination.abort(other)
+                assert case.d.group_cache_reservation(other_request) is not None
+            finally:
+                await session.close()
+                await asyncio.wait_for(disconnected.wait(), 2)
+            assert case.d.group_cache_reservation(other_request).state.value == "QUARANTINED"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("lost_ack", ["open_link", "retire_link"])
+def test_hixl_retirement_recovers_after_lost_ack(monkeypatch, lost_ack):
+    from pypto_serving.pd import service as service_module
+
+    async def run():
+        case = handoff(128)
+        async with hixl_control_pair(case) as (prefill, destination, disconnected):
+            actions = []
+            original_send = service_module.send
+            dropped = False
+
+            async def send(writer, message):
+                nonlocal dropped
+                already_retired = prefill.node.key in destination.hixl_retired
+                if not dropped and "result" in message and (lost_ack == "open_link" or already_retired):
+                    dropped = True
+                    writer.close()
+                    return
+                await original_send(writer, message)
+
+            async def worker(operation, value=None):
+                actions.append(operation)
+
+            def bind_domain(session, peer, registry):
+                session.transfer_domain = SimpleNamespace(close=lambda: prefill.retire_hixl_session(peer, session))
+
+            monkeypatch.setattr(service_module, "send", send)
+            prefill.worker = worker
+            prefill.bind_transfer_domain = bind_domain
+            if lost_ack == "open_link":
+                case.entry.response_closed = True
+                with pytest.raises(ConnectionError, match="session lost"):
+                    await prefill.connect(destination.node)
+                await asyncio.wait_for(disconnected.wait(), 2)
+                assert case.entry.source_done.is_set() and not destination.requests
+                assert destination.is_ready()
+                assert actions == []
+            else:
+                case.entry.source_done.set()
+                destination.finish(case.entry)
+                await prefill.connect(destination.node)
+                assert actions == ["install"]
+
+            await prefill.close()
+            assert destination.hixl_retired == {prefill.node.key}
+            assert dropped
+            assert actions[-2:] == ["close_peer", "release"]
+            assert actions.count("install") == (lost_ack == "retire_link")
+
+    asyncio.run(run())
+
+
+def test_hixl_retirement_does_not_reconnect_to_a_different_decode_boot():
+    async def run():
+        case = handoff(128)
+        async with hixl_control_pair(case) as (prefill, destination, disconnected):
+            reader, writer, _ = await prefill._connect_peer(destination.node)
+            session = Session(reader, writer)
+            await session.close()
+            await asyncio.wait_for(disconnected.wait(), 2)
+            peer = destination.node
+            destination.node = msgspec.structs.replace(peer, boot="different")
+
+            async def worker(operation, key):
+                assert (operation, key) == ("close_peer", peer.key)
+
+            prefill.worker = worker
+            with pytest.raises(ValueError, match="identity/contract changed"):
+                await prefill.retire_hixl_session(peer, session)
+            assert not destination.hixl_retired
+
+    asyncio.run(run())
+
+
+def test_hixl_retirement_after_disconnect_rejects_unknown_authorized_writes():
+    async def run():
+        case = handoff(128)
+        async with hixl_control_pair(case) as (prefill, destination, disconnected):
+            async def connect():
+                reader, writer, _ = await prefill._connect_peer(destination.node)
+                return Session(reader, writer)
+
+            session = await connect()
+            await session.call("open_link", destination.node.registry)
+            destination.cache.authorize_group_cache_write(case.entry.binding.request)
+            await session.close()
+            await asyncio.wait_for(disconnected.wait(), 2)
+            assert destination.gated and not case.entry.source_done.is_set()
+
+            session = await connect()
+            try:
+                with pytest.raises(TransferError, match="unconfirmed handoffs") as failed:
+                    await session.call("retire_link", destination.node.registry)
+                assert not failed.value.uncertain
+                assert not destination.hixl_retired
+            finally:
+                await session.close()
+
+    asyncio.run(run())
+
+
+def test_rdma_probe_accepts_one_source_rank_replicated_to_two_decode_ranks():
+    from examples.pd_rdma_probe import CheckedCache, GUARDS, PAGE_BYTES, SOURCE_PAGES, source
+
+    buffers = [bytearray(GUARDS), bytearray(GUARDS)]
+    owners = tuple(SimpleNamespace(rank=rank, read=lambda memory=memory: bytes(memory))
+                   for rank, memory in enumerate(buffers))
+    cache = CheckedCache(owners, tp=2)
+    request = "probe"
+    lease = cache.reserve_group_cache(request, request, len(SOURCE_PAGES), prompt_token_count=len(SOURCE_PAGES))
+    cache.authorize_group_cache_write(request)
+    mapping = rank_mapping(Topology.for_tp(1, 1), Topology.for_tp(2, 2), 0, lease.partition)
+    cache.source_ranks[request] = {target: rank for rank, target in mapping}
+    cache.seeds[request] = 1
+    for rank, target in mapping:
+        contents = source(rank, cache.seeds[request])
+        for src, dst in zip(SOURCE_PAGES, lease.block_ids_by_group["kv"]):
+            src, dst = src * PAGE_BYTES, dst * PAGE_BYTES
+            buffers[target][dst:dst + PAGE_BYTES] = contents[src:src + PAGE_BYTES]
+    assert cache.commit_group_cache(request).state.value == "READY"
+
+
+def test_hixl_prefill_links_are_scoped_to_decode_boot_and_rank(monkeypatch):
+    native = pytest.importorskip("simpler.l4_pd_rdma")
+    Hixl = native.HixlTransferOwner
+    d1_key, d2_key = ("d1", "d1-boot", "registry1"), ("d2", "d2-boot", "registry2")
+    servers = {}
+    writes = []
+
+    class Link:
+        def __init__(self, device, host, port, *, peer=None):
+            self.key = host, port
+            self.regions = {}
+
+        def register(self, name, base, length):
+            assert name not in self.regions
+            self.regions[name] = base, length
+
+        def listen(self):
+            assert self.key not in servers
+            servers[self.key] = self
+
+        def connect(self):
+            self.remote = servers[self.key]
+
+        def remote_region(self, name):
+            return self.remote.regions[name]
+
+        def batch_put(self, segments):
+            writes.append((self.key, segments))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(native, "HixlDeviceLink", Link)
+    monkeypatch.setenv("PYPTO_HIXL_DEVICE_ENDPOINTS", '[["192.0.2.1", 0]]')
+    monkeypatch.setenv("PYPTO_HIXL_PORT", "23001")
+    d1 = Hixl("127.0.0.1", "decode")
+    d1_region = d1.register(d1_key[1], 0, "kv", 4096, 256)
+    d1.prepare()
+    d1.prepare()
+    monkeypatch.setenv("PYPTO_HIXL_PORT", "23002")
+    d2 = Hixl("127.0.0.1", "decode")
+    d2_region = d2.register(d2_key[1], 0, "kv", 8192, 256)
+    d2.prepare()
+    p1, p2 = (Hixl("127.0.0.1", "prefill") for _ in range(2))
+    p1.register("p1", 0, "kv", 12288, 256)
+    p2.register("p2", 0, "kv", 16384, 256)
+    p1.install((d1_region,), peer=d1_key)
+    p1.install((d2_region,), peer=d2_key)
+    p2.install((d1_region,), peer=d1_key)
+    p1.connect(d1_key, [0])
+    p1.connect(d2_key, [0])
+    p2.connect(d1_key, [0])
+    p1.put_sync_host(d1_key, (host_copy(Copy("kv", 0, 0, 0, 16, 8)),))
+    p1.close_peer(d1_key)
+    p2.put_sync_host(d1_key, (host_copy(Copy("kv", 0, 0, 0, 48, 8)),))
+    p1.put_sync_host(d2_key, (host_copy(Copy("kv", 0, 0, 0, 64, 8)),))
+    assert writes == [
+        (("127.0.0.1", 23001), [(12288, 4112, 8)]),
+        (("127.0.0.1", 23001), [(16384, 4144, 8)]),
+        (("127.0.0.1", 23002), [(12288, 8256, 8)]),
+    ]
+    assert servers["127.0.0.1", 23001].regions == {"kv": (4096, 256)}
+    with pytest.raises(ValueError, match="installed link"):
+        p2.put_sync_host(d2_key, (host_copy(Copy("kv", 0, 0, 0, 64, 8)),))
+    for peer in (p1, p2, d1, d2):
+        peer.close()
+
+
+def test_hixl_retirement_is_independent_for_each_prefill():
+    async def run():
+        case = handoff(128)
+        p1, d = case.nodes
+        p2 = msgspec.structs.replace(p1, node_id="p2", boot="p2-boot")
+        restarted = msgspec.structs.replace(p2, boot="new-boot")
+        service = case.destination
+        for peer in (p1, p2):
+            await service._hixl_request(peer, case.source_geometry, "open_link", d.registry)
+        with pytest.raises(ValueError, match="boot mismatch"):
+            await service._hixl_request(restarted, case.source_geometry, "open_link", d.registry)
+        p2_entry = service.register_http(Binding.create(p2, d, {}), {})
+        with pytest.raises(ValueError, match="active or unconfirmed"):
+            await service._hixl_request(p2, case.source_geometry, "retire_link", d.registry)
+        case.entry.source_done.set()
+        await service._hixl_request(p1, case.source_geometry, "retire_link", d.registry)
+        with pytest.raises(ValueError, match="retired"):
+            service.register_http(Binding.create(p1, d, {}), {})
+        with pytest.raises(ValueError, match="not active"):
+            await service._hixl_request(p1, case.source_geometry, "begin", {})
+        service.finish(case.entry)
+        p2_entry.source_done.set()
+        service.finish(p2_entry)
+        with pytest.raises(RuntimeError, match="stop Prefill senders"):
+            await service.close()
+        await service._hixl_request(p2, case.source_geometry, "retire_link", d.registry)
+        assert service.hixl_retired == {p1.key, p2.key}
+
+    asyncio.run(run())
+
+
+def test_hixl_prefill_retires_all_decode_peers_even_if_one_ack_fails():
+    async def run():
+        config = Config((Endpoint("127.0.0.1", 20001),),
+                        (Endpoint("127.0.0.1", 20002), Endpoint("127.0.0.1", 20003)), provider="hixl")
+        service = Service(config, config.prefill[0], "prefill", None,
+                          SimpleNamespace(kv_cache_manager=SimpleNamespace(tiering=None)), None)
+        actions = []
+
+        async def worker(op, value=None):
+            actions.append((op, value))
+
+        async def retire(op, registry):
+            assert op == "retire_link"
+            assert any(op == "close_peer" and key[2] == registry for op, key in actions)
+            actions.append((registry, None))
+            if registry == "registry1":
+                raise ConnectionError("no acknowledgement")
+
+        async def close():
+            actions.append(("session_closed", None))
+
+        async def reconnect(peer):
+            assert peer.registry == "registry1"
+            raise ConnectionError("still disconnected")
+
+        service.worker = worker
+        service._connect_peer = reconnect
+        for i, node in enumerate(config.decode, 1):
+            peer = Node(node.node_id, "decode", str(i), None, f"registry{i}", Topology.for_tp(1, 1))
+            session = SimpleNamespace(call=retire, close=close, closed=False)
+            session.transfer_domain = SimpleNamespace(
+                close=lambda peer=peer, session=session: service.retire_hixl_session(peer, session))
+            service.hixl_sessions[node.node_id] = peer.key, session
+        with pytest.raises(RuntimeError, match="every Decode peer"):
+            await service.close()
+        assert {op for op, _ in actions} == {"close_peer", "registry1", "registry2", "session_closed"}
+
+    asyncio.run(run())
+
 
 @pytest.mark.parametrize("p_tp,d_tp,p_hit,d_hit", [(4, 4, 0, 8192), (4, 1, 8192, 4096)])
 @pytest.mark.parametrize("compact", [False, True])
@@ -238,6 +693,98 @@ def test_probe_failure_retires_all_unregistered_owners(monkeypatch):
     processes[1].terminate.assert_called_once()
     rpc.assert_not_called()
     runtime.close()
+
+
+def test_hixl_and_ddr_start_distinct_consumers_for_the_same_device(monkeypatch):
+    from pypto_serving.pd import transfer, worker
+
+    get_context = Mock()
+    monkeypatch.setattr(transfer.multiprocessing, "get_context", get_context)
+    monkeypatch.setattr(TransferWorker, "ready", lambda self: None)
+    monkeypatch.setattr(worker, "provider_class", lambda name: SimpleNamespace(endpoints=lambda: (8,)))
+    runtime = SimpleNamespace(dc=SimpleNamespace(device_ids=(8,)))
+    runner = SimpleNamespace(_shared_l3_worker=lambda: runtime)
+    model = SimpleNamespace(ranks=1, worker=lambda: runtime)
+    pd = WorkerRuntime(WorkerSettings("boot", "host", "hixl", 1, 2, role="decode"), model)
+    endpoint = Mock()
+    extension = CacheOffloadExtension(runner, (endpoint,), Mock(), Mock(), previous=lambda **_: SimpleNamespace(
+        worker_ready=pd.worker_ready, allocation_options=DSparkExtension.allocation_options))
+    try:
+        extension.worker_ready()
+        pd_process, ddr_process = [call.kwargs for call in get_context.return_value.Process.call_args_list]
+        assert (pd_process["name"], pd_process["target"], pd_process["args"][3:6]) == (
+            "pd-transfer-0", _serve, (8, "host", "hixl"))
+        assert (ddr_process["name"], ddr_process["target"], ddr_process["args"][0]) == (
+            "cache-copy-0", serve_copy, 8)
+        assert pd_process["args"][6].keywords == dict(role="decode", rank=0)
+        assert extension.allocation_options("cache") == {"exportable": True}
+        assert extension.allocation_options("prefill_state", "hidden") == {"exportable": True}
+        endpoint.call.assert_called_once_with("ready")
+    finally:
+        for owner in pd.owners:
+            owner.parent.close()
+            owner.child.close()
+        pd.pool.shutdown()
+
+
+def test_vmm_owner_unmaps_after_unregistering_and_before_releasing_export(monkeypatch):
+    events = []
+
+    @dataclass
+    class Export:
+        device_id: int
+
+    class Mapping:
+        def __init__(self, exported):
+            assert exported.device_id == 8
+            self.base = 8192
+            self.descriptor = SimpleNamespace(nbytes=64)
+            events.append("import")
+
+        def close(self):
+            events.append("unmap")
+            if events.count("unmap") == 1:
+                raise RuntimeError("retry unmap")
+
+    monkeypatch.setitem(sys.modules, "simpler.buffer_export", SimpleNamespace(
+        BufferExport=Export, BufferExportError=RuntimeError, BufferImportError=RuntimeError, BufferMapping=Mapping))
+
+    class Runtime:
+        def export_buffer(self, tensor, *, worker_id):
+            assert tensor.nbytes == 64 and worker_id == 0
+            events.append("export")
+            return Export(8)
+
+        def release_export(self, exported):
+            assert exported == Export(8)
+            events.append("release_export")
+
+    class Provider:
+        def register(self, boot, rank, name, address, extent):
+            assert address == 8192 and extent == 64
+            events.append("register")
+            return Region(boot, rank, name, extent, {})
+
+        def close(self):
+            events.append("unregister")
+
+    monkeypatch.setattr("pypto_serving.pd.transfer.DeviceContext", lambda device: Mock())
+    owner = TransferWorker("boot", 0, "host", "hixl", role="decode")
+    owner.process = SimpleNamespace(pid=1234)
+    thread = threading.Thread(target=_serve, args=(owner.child, owner.boot, owner.rank, 8,
+        owner.hostname, owner.provider, lambda *_: Provider(), owner.profile_config), daemon=True)
+    thread.start()
+    try:
+        assert owner.register(Runtime(), SimpleNamespace(nbytes=64), "kv") == Region("boot", 0, "kv", 64, {})
+        owner.release()
+        owner.call("stop")
+        assert events == ["export", "import", "register", "unregister", "unmap", "unmap", "release_export"]
+        assert not owner.retained
+    finally:
+        owner.parent.close()
+        thread.join(2)
+        owner.child.close()
+    assert not thread.is_alive()
 
 
 def service():

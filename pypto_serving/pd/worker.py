@@ -9,7 +9,7 @@
 """Independent transfer submission and completion, shared by all peers."""
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import logging
 import select
@@ -22,7 +22,7 @@ import msgspec
 
 from pypto_serving.tools.observe import record, span
 from .protocol import Completion, MAX_FRAME, Plan, Topology, decode, digest
-from .transfer import Region, TransferError, TransferWorker
+from .transfer import HIXL_SETUP_OPERATIONS, Region, TransferError, TransferWorker, provider_class
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +67,12 @@ def _shutdown(channel):
 class WorkerRuntime:
     def __init__(self, settings, model, progress_channel=None):
         self.settings, self.model = settings, model
+        if settings.provider == "hixl" and (settings.role not in ("prefill", "decode")
+                or len(provider_class("hixl").endpoints()) != model.ranks):
+            raise ValueError("HIXL PD requires an explicit role and one device endpoint per model rank")
         self.owners = ()
         self.peers, self.peer_fingerprints, self.jobs = {}, {}, {}
+        self.peer_identities = {}
         self.registry = None
         self.registry_digest = None
         self.local_regions, self.peer_regions = {}, {}
@@ -85,8 +89,9 @@ class WorkerRuntime:
 
     def worker_ready(self):
         # Create consumer channels only after compute owners have forked.
-        self.owners = tuple(TransferWorker(self.settings.boot, i, self.settings.hostname, self.settings.provider)
-                            for i in range(self.model.ranks))
+        self.owners = tuple(TransferWorker(
+            self.settings.boot, rank, self.settings.hostname, self.settings.provider, role=self.settings.role)
+            for rank in range(self.model.ranks))
         try:
             devices = self.model.worker().dc.device_ids
             for owner, device in zip(self.owners, devices, strict=True):
@@ -113,12 +118,12 @@ class WorkerRuntime:
             self.local_regions = {(r.rank, r.name): r for r in regions}
         return self.registry
 
-    def install(self, value):
+    def install(self, value, identity=None):
         with self.lock:
             self._check_accepting()
-            self._install(value)
+            self._install(value, identity)
 
-    def _install(self, value):
+    def _install(self, value, identity=None):
         regions = tuple(decode(r, Region) for r in value["regions"])
         topology = decode(value["topology"], Topology)
         boots = {r.boot for r in regions}
@@ -126,8 +131,13 @@ class WorkerRuntime:
             raise ValueError("registry must belong to one node boot")
         peer = next(iter(boots))
         fingerprint = digest(value)
+        if self.settings.provider == "hixl" and (
+            identity is None or len(identity) != 3 or tuple(identity[1:]) != (peer, fingerprint)
+        ):
+            raise ValueError("transfer destination identity does not match its registry")
         if peer in self.peers:
-            if self.peer_fingerprints[peer] != fingerprint:
+            if (self.peer_fingerprints[peer] != fingerprint or
+                    (identity is not None and self.peer_identities[peer] != identity)):
                 raise ValueError("peer registry changed within boot")
             return
         if len(self.peers) >= self.settings.peer_capacity:
@@ -136,11 +146,36 @@ class WorkerRuntime:
         if ({(r.rank, r.name) for r in regions} != {(i, n) for i in range(topology.ranks) for n in names}
                 or len(regions) != len(names) * topology.ranks):
             raise ValueError("peer registry has missing or duplicate rank/region")
-        for owner in self.owners:
-            owner.call("install", regions=regions)
+        if self.settings.provider == "hixl":
+            local = Topology.for_tp(self.model.ranks, self.model.tp)
+            calls = []
+            for rank, owner in enumerate(self.owners):
+                group = local.groups[local.partition(rank)]
+                slot = group.index(rank)
+                targets = tuple(r for r in regions if r.rank % len(group) == slot)
+                if targets:
+                    calls.append((owner, {"regions": targets, "peer": identity}))
+            self._hixl_owner_calls("install", calls)
+            self.peer_identities[peer] = identity
+        else:
+            for owner in self.owners:
+                owner.call("install", regions=regions)
         self.peers[peer] = regions
         self.peer_fingerprints[peer] = fingerprint
         self.peer_regions[peer] = {(r.rank, r.name): r for r in regions}
+
+    def _hixl_owner_calls(self, operation, calls):
+        futures = []
+        try:
+            for owner, payload in calls:
+                futures.append(self.pool.submit(owner.call, operation, **payload))
+            wait(futures)
+            for future in futures:
+                future.result()
+        except BaseException as exc:
+            self.uncertain = True
+            wait(futures)
+            raise TransferError(f"HIXL {operation} failed across owners: {exc}", uncertain=True) from exc
 
     def _lower(self, plan):
         if (plan.binding.prefill[1] != self.settings.boot
@@ -173,6 +208,10 @@ class WorkerRuntime:
         job = digest(plan)
         observation = dict(request=plan.binding.request, plan_digest=job,
                            prefill=plan.binding.prefill, decode=plan.binding.decode)
+        if self.settings.provider == "hixl":
+            if self.peer_identities[peer] != plan.binding.decode:
+                raise ValueError("transfer destination identity has changed")
+            peer = plan.binding.decode
         return peer, batches, job, observation
 
     def submit(self, plan):
@@ -202,6 +241,15 @@ class WorkerRuntime:
         if self.uncertain or not self.accepting:
             raise TransferError("transfer worker is gated or closing", uncertain=self.uncertain)
 
+    def _prepare_link(self, ranks):
+        if (not isinstance(ranks, list) or not ranks
+                or any(type(rank) is not int or not 0 <= rank < len(self.owners) for rank in ranks)
+                or len(ranks) != len(set(ranks))):
+            raise ValueError("invalid HIXL destination ranks")
+        with self.lock:
+            self._check_accepting()
+            self._hixl_owner_calls("prepare_link", ((self.owners[rank], {}) for rank in ranks))
+
     def poll(self, jobs):
         """Take terminal results once; source pins outlive this bookkeeping.
 
@@ -228,10 +276,52 @@ class WorkerRuntime:
     def handle(self, operation, payload):
         with span(logger, "pd.worker.decode_message", log=False, thread_cpu=True, operation=operation):
             value = msgspec.msgpack.decode(payload) if payload else None
+        try:
+            result = self._handle(operation, value)
+        except (TransferError, ValueError) as exc:
+            if operation not in HIXL_SETUP_OPERATIONS or self.settings.provider != "hixl":
+                raise
+            # Keep the local transfer state inside the PD payload on the ordered lane.
+            result = dict(error=str(exc), uncertain=getattr(exc, "uncertain", False))
+        return msgspec.msgpack.encode(result)
+
+    def _handle(self, operation, value):
         if operation == "registry":
             result = self.prepare()
         elif operation == "install":
-            result = self.install(value)
+            result = (self.install(value["registry"], tuple(value["peer"])) if self.settings.provider == "hixl"
+                      else self.install(value))
+        elif operation == "prepare_link" and self.settings.provider == "hixl" and self.settings.role == "decode":
+            self._prepare_link(value)
+            result = None
+        elif operation == "connect_ranks" and self.settings.provider == "hixl" and self.settings.role == "prefill":
+            identity = tuple(value["peer"])
+            pairs = tuple(tuple(pair) for pair in value["rank_pairs"])
+            with self.lock:
+                self._check_accepting()
+                if len(identity) != 3 or self.peer_identities.get(identity[1]) != identity:
+                    raise ValueError("transfer destination identity has changed")
+                peer_ranks = {region.rank for region in self.peers[identity[1]]}
+                if not pairs or any(
+                    len(pair) != 2 or type(pair[0]) is not int or not 0 <= pair[0] < len(self.owners)
+                    or type(pair[1]) is not int or pair[1] not in peer_ranks
+                    for pair in pairs
+                ):
+                    raise ValueError("invalid transfer rank pairs")
+                destinations = {}
+                for source, destination in pairs:
+                    destinations.setdefault(source, []).append(destination)
+                self._hixl_owner_calls("connect_ranks", ((self.owners[rank], {"peer": identity, "ranks": ranks})
+                                                        for rank, ranks in destinations.items()))
+            result = None
+        elif operation == "close_peer" and self.settings.provider == "hixl" and self.settings.role == "prefill":
+            identity = tuple(value)
+            with self.lock:
+                self._check_accepting()
+                if any(plan.binding.decode == identity for plan, _ in self.jobs.values()):
+                    raise TransferError("cannot close a peer with outstanding transfers", uncertain=True)
+                self._hixl_owner_calls("close_peer", ((owner, {"peer": identity}) for owner in self.owners))
+            result = None
         elif operation == "release":
             with self.lock:
                 self.accepting = False
@@ -242,7 +332,7 @@ class WorkerRuntime:
             result = None
         else:
             result = self.model.handle(operation, value)
-        return msgspec.msgpack.encode(result)
+        return result
 
     def handle_progress(self, operation, payload):
         """Only these operations may run beside the compute command lane."""
@@ -290,6 +380,7 @@ class WorkerSettings:
     capacity: int
     peer_capacity: int
     handoff_timeout: float = 300.0
+    role: str | None = None
 
 
 class Services:
