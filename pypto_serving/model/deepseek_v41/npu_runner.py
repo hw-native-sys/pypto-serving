@@ -943,7 +943,7 @@ class SegmentTopology:
         """Keep prefill rows independent of the fixed decode ABI."""
         if type(max_tokens) is not int or not 0 < max_tokens <= MAX_PREFILL_TOKENS_PER_DP:
             raise ValueError("V4.1 prefill capacity must be between 1 and 4096 tokens")
-        # Shared MoE kernels retain decode's extent even for a smaller token budget.
+        # Keep the existing minimum graph capacity for small token budgets.
         return cls(tp=1, dp=dp, local_capacity=max(
             cls.for_decode(dp=dp).local_capacity, (max_tokens + 15) // 16 * 16))
 
@@ -1628,20 +1628,31 @@ def compile_prefill_fwd(compiler, lib_root, topology):
     """Compile the lib's complete CED prefill at the serving row capacity."""
     decode_topology = SegmentTopology.for_decode(tp=topology.tp, dp=topology.dp)
     load_segment_modules(lib_root, decode_topology)
-    previous_argv = sys.argv[:]
+    moe_tokens = min(topology.local_capacity, 512)
+    config = sys.modules["config"]
+    previous_tokens = config.MOE_TOKENS
+    # Lib captures the slab and routing strides when these siblings are imported.
+    # Keep the decode graph's bindings while prefill imports its own kernels.
+    siblings = ("gate", "expert_shared", "expert_routed", "prefill_moe") if moe_tokens != previous_tokens else ()
+    saved = {name: sys.modules.pop(name) for name in siblings if name in sys.modules}
+    previous_argv = sys.argv
     try:
         sys.argv = [previous_argv[0], "--tp", str(topology.tp), "--ep", str(topology.world),
                     "--dp", str(topology.dp), "--capacity", str(topology.local_capacity),
-                    "--moe-tokens", str(decode_topology.local_capacity)]
+                    "--moe-tokens", str(moe_tokens)]
         module = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd")
+        if (module.CAPACITY, module.RANKS, module.MOE_TOKENS) != (
+                topology.local_capacity, topology.world, moe_tokens):
+            raise ValueError("lib prefill_fwd was imported for another capacity, EP topology or MoE slab")
+        entry = module.l3_prefill_fwd
+        return compiler.compile("v41_prefill_fwd", entry), tuple(entry.param_names)
     finally:
         sys.argv = previous_argv
-    if (module.CAPACITY, module.RANKS) != (topology.local_capacity, topology.world):
-        raise ValueError("lib prefill_fwd was imported for another capacity or EP topology")
-    if module.MOE_TOKENS != decode_topology.local_capacity:
-        raise ValueError("lib prefill MoE extent disagrees with the shared decode kernels")
-    entry = module.l3_prefill_fwd
-    return compiler.compile("v41_prefill_fwd", entry), tuple(entry.param_names)
+        for name in siblings:
+            sys.modules.pop(name, None)
+        sys.modules.update(saved)
+        config.set_moe_tokens(previous_tokens)
+
 
 
 # segment_inputs
