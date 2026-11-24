@@ -52,3 +52,24 @@ Serving 通过 Lib 的标准入口 `l3_decode_fwd_dspark` 注册一张 recurrent
 组合实测取自压缩提交前的 Serving `c75ce52` 和 Lib `00deb150` 的验证头图。Prefill 与 bootstrap 使用 Serving 锁定的 Lib 图，测试适配器补齐验证头所需的 FP8 权重、scale 和采样输入。两轮均确认选中小头，逐题输出 token IDs、停止原因和逐轮草稿接受序列一致，每轮输出 1493 tokens。
 
 官方基线使用同节点的另一组四卡、完整预热 16 题，直接使用锁定的 Lib。表中两组测量的卡组、预热、ABI 适配和草稿接受率均有差异；要量化 1+4+5 的净收益，仍需在相同卡组、预热和适配器下做配对对照。
+
+
+## 2026-11-24 · 四卡串行 prefill 与 decode
+
+先合入 [Serving #355](https://github.com/hw-native-sys/pypto-serving/pull/355)，再审阅 [Serving #364](https://github.com/hw-native-sys/pypto-serving/pull/364) 与 [Lib #1951](https://github.com/hw-native-sys/pypto-lib/pull/1951)。下表用 PR 提交定位移植代码，用实验版本定位测量。两个 PR 独立跟踪；Serving 的 Lib gitlink 未随实验切换。
+
+四张 Ascend 950DT，同一卡组，TP1/DP4/EP4，DSpark K5，chunk 512，并发 1。每个正式进程预热同一批 16 题，再测 16 题。TTFT 为请求至首个非空输出的墙钟时间，TPOT 为每题首末输出的时间差除以输出 token 数减一，再取请求中位数。以下数据来自移植前的实验。各行有不同的直接父版本，不能相加；当前主线移植及八卡满载、P/D 分离需要分别验证。
+
+| 方向 | PR 提交 | 实验记录与取舍 |
+|---|---|---|
+| Prefill MoE 分块 | [Serving 5b4d1d4](https://github.com/hashiqiqixian/pypto-serving/commit/5b4d1d464079a97940fcd614ad366e2d15f61103) | 请求 chunk 固定 512，内部从 80 增至 256 行时，TTFT 714.35 → 430.30 ms；小 decode 图下，256 → 512 行为 431.75 → 380.99 ms。图内循环分别为 7、2、1 次。 |
+| 每 DP 分区的 decode 容量 | [Serving a39b997](https://github.com/hashiqiqixian/pypto-serving/commit/a39b9978adf3e597ee9ea1d893b366ab965f5417) | 实验 83934ee。每分区最大请求数 12 → 1，对齐后的 80 行缩至 16 行。相同 prefill 下 TPOT 18.00 → 16.23 ms/token，16/16 题变快。设置 PYPTO_V41_DECODE_BATCH_PER_DP=1 复现单请求配置；默认 12，满载时按目标并发选容量。 |
+| 跳过完整 prefill 不使用的分段输入上传 | [Serving 6fff69d](https://github.com/hashiqiqixian/pypto-serving/commit/6fff69dec1040b4da3e9500d4148c76e3da563ec) | 实验 0e3eb6b，TTFT 323.45 ms，TPOT 16.160 ms/token。完整图直接使用已绑定的 embedding，仍保留输出行映射。 |
+| 大图处理满块，192 行图处理短尾 | [Serving 2a9ecda](https://github.com/hashiqiqixian/pypto-serving/commit/2a9ecda70e3ae3ccc8b1fcac64ad2968edf2ed61) | 选图实验 7ed3e7e，组合 7408a80 使用 512/192 图。两次独立进程 TTFT 297.09 / 296.15 ms，TPOT 16.163 / 16.166 ms/token。组合还含其他主机侧改动，数字不能单独归因于短尾图。新增一张图及对应资源，按各分区实际行数的最大值选图。 |
+| 空闲 rank 跳过本地注意力 | [Lib c00891fd](https://github.com/hashiqiqixian/pypto-lib/commit/c00891fd8c8ad08f6fbf49891c3e924bc7518602) | 实验 a8f6654。保留每层专家通信。相同快速 prefill 下逐题 TPOT 配对差中位数为 −0.392 / −0.331 ms/token，两轮均 16/16 更快；组合 TPOT 为 13.357 / 13.423。满载各 rank 都有工作时没有空闲分支收益。 |
+| 16 行专家输出融合 HC 残差 | [Lib eca5aff5](https://github.com/hashiqiqixian/pypto-lib/commit/eca5aff536a2eca50d62038e9190d2ffd4c88f5e) | 实验 f4c4ce6。接在空闲 rank 优化之后，两轮 TTFT 301.17 / 297.02 ms，TPOT 13.0215 / 12.7914 ms/token。移植按当前融合专家的张量和通信参数布局绑定残差。 |
+| 16 行目标 decode 的逆 RoPE 量化融合 O-A | [Lib e21e25a3](https://github.com/hashiqiqixian/pypto-lib/commit/e21e25a3b3e6cf1e64bf8e0cb293c125c029fa43) | 实验 9322d542。叠加 HC 残差后单轮 TTFT 296.46 ms，TPOT 12.4218 ms/token。16/16 题的输出、停止原因和逐轮草稿计数均与固定对照一致。该最佳轮尚无独立复测。 |
+
+Lib 主线已有专家计数的缓存行读取优化和融合专家后端。原实验 60f02e51 的同卡 ABBA 中，TPOT 19.78 → 18.36 ms/token，TTFT 754.54 → 773.34 ms。固定 BF16 投影的拆分/融合专家对照为 17.127 → 13.934 ms/token。两个历史结果分别记录来源，后续 PR 复用主线实现。[计数读取所在提交 #1928](https://github.com/hw-native-sys/pypto-lib/pull/1928) · [融合专家后端 #1819](https://github.com/hw-native-sys/pypto-lib/pull/1819)
+
+同卡 DeepInfer 历史中位数为 298.95 ms TTFT、4.5629 ms/token TPOT。PyPTO 的 12.4218 是单请求、16 行图的最佳轮，不能用作八卡 AgentX 满载的性能预测。
