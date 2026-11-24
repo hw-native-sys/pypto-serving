@@ -1957,6 +1957,36 @@ def prepare_swa_window_metadata(
                 if position < start and position // 128 in read_pages:
                     return read_pages[position // 128] * 128 + position % 128
                 return pages[position // 128 % len(pages)] * 128 + position % 128
+            if scratch_base is not None and count > 1:
+                # The same cache address is visible to up to 128 consecutive queries.
+                # Construct the address stream once, then copy its causal windows.
+                section = slice(row, row + count)
+                current = torch.arange(start, start + count, dtype=torch.int64)
+                scratch = torch.arange(scratch_base * 128 + row,
+                                       scratch_base * 128 + row + count, dtype=torch.int64)
+                positions[group, section] = current
+                slots[group, section] = scratch
+                tail = min(count, 128)
+                restore[group, row + count - tail:row + count] = torch.tensor(
+                    [ring_slot(p) for p in range(start + count - tail, start + count)])
+                first = max(valid_from, start - 127)
+                history = [ring_slot(p) for p in range(first, start)]
+                stream = torch.cat((torch.tensor(history, dtype=torch.int32),
+                                    scratch[max(0, first - start):].int()))
+                left = max(0, first - start)
+                # Short windows at the start are left-aligned in the ABI.
+                short = min(count, max(left, first + 127 - start))
+                if short > left:
+                    n = short - left
+                    width = start + short - first
+                    cols = torch.arange(width)
+                    lengths = current[left:short] - first + 1
+                    indices[group, row + left:row + short, :width] = torch.where(
+                        cols < lengths[:, None], stream[:width], -1)
+                if short < count:
+                    offset = start + short - 127 - first
+                    indices[group, row + short:row + count] = stream[offset:].unfold(0, 128, 1)
+                continue
             for local in range(count):
                 position = start + local
                 positions[group, row + local] = position
@@ -3577,6 +3607,12 @@ class V41ResidentResources:
     def _dspark_decode_arguments(self, lowered):
         """Bind the Lib recurrent composite without rebuilding its device graph."""
         target = lowered.target_model
+        rope = lowered.rope_tables
+        # The provider's immutable RoPE tables were uploaded at worker startup.
+        if self.dspark_buffers is not None and all(
+                rope[name] is self.dspark_buffers.host.rope_tables[name]
+                for name in ("draft_cos", "draft_sin")):
+            rope = self.dspark_buffers.rope_tables
         arguments = dict(lowered.workspace)
         arguments.update({name: value for name, value in target.items() if name not in (
             "embedding_weight", "logit_row_indices", "attention_num_tokens", "moe_num_tokens",
@@ -3591,7 +3627,7 @@ class V41ResidentResources:
             c2a_index_block_table=lowered.cache_tables["target_c2a"],
             c1a_index_block_table=lowered.cache_tables["target_c1a"],
             draft_table=lowered.cache_tables["draft"],
-            draft_cos=lowered.rope_tables["draft_cos"], draft_sin=lowered.rope_tables["draft_sin"],
+            draft_cos=rope["draft_cos"], draft_sin=rope["draft_sin"],
             attention_num_tokens=target["attention_num_tokens"], moe_num_tokens=target["moe_num_tokens"],
             moe_epoch=lowered.moe_epoch, logits_epoch=lowered.logits_epoch,
         )
