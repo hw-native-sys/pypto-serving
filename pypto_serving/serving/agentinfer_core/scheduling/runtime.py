@@ -1,13 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
-# Modified by PyPTO Serving: adapt imports and integrate native KV observations and response lifecycle handling.
-"""Environment-neutral AgentInfer Scheduler with an embedded RequestPool.
-
-``ProgramScheduler`` owns request retention, request-to-Program bindings, mutable Program records, strategy
-sidecars, transition execution, and periodic scheduling. Host adapters supply normalized request identity and backend
-facts, then decide whether retained objects are coroutines, HTTP gates, or native engine requests. This synchronous
-runtime assumes its Adapter serializes calls under one mutation boundary.
-"""
+# Modified by PyPTO Serving: integrate native lifecycle and KV observations and share placement updates.
+"""Run admission and scheduling policy for retained requests in a serving replica."""
 
 from __future__ import annotations
 
@@ -18,12 +12,13 @@ import uuid
 from dataclasses import dataclass, replace
 from typing import Generic, Iterator
 
-from pypto_serving.serving.agentinfer_core.scheduling.admission_outcome import AdmissionDisposition
+from pypto_serving.serving.agentinfer_core.scheduling.admission_outcome import AdmissionDisposition, AdmissionOutcome
 from pypto_serving.serving.agentinfer_core.scheduling.backend import BackendInfo, BackendPoolInfo, DispatchTarget, DpRankInfo
 from pypto_serving.serving.agentinfer_core.scheduling.domain import (
     ProgramRef,
     ProgramState,
     ProgramStatus,
+    ProgramView,
     SharedPrefixAttribution,
     TokenObservationSource,
 )
@@ -184,6 +179,8 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         prompt_tokens: int,
         backend_pool_info: BackendPoolInfo,
         retained_request: RetainedRequestT,
+        *,
+        native_fallback: bool = False,
     ) -> bool:
         """Bind, retain, and run immediate Program-level admission."""
         if request_id in self._request_bindings:
@@ -232,12 +229,17 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                     ProgramStatus.REASONING,
                 )
             )
-        outcome = self.strategy.handle_admission(
-            self._snapshot(exclude_waiting_program=program.ref if created else None),
-            self.strategy_factors,
-            TransitionController(self._apply_transition),
-            program.ref,
-        )
+        if native_fallback:
+            reason = "native_queue_full"
+            self.admit_native_fallback(request_id, reason=reason)
+            outcome = AdmissionOutcome(AdmissionDisposition.ADMITTED, reason)
+        else:
+            outcome = self.strategy.handle_admission(
+                self._snapshot(exclude_waiting_program=program.ref if created else None),
+                self.strategy_factors,
+                TransitionController(self._apply_transition),
+                program.ref,
+            )
         self._next_lightweight_check_at_monotonic_s = self.strategy.next_lightweight_check_at(self.strategy_factors)
         admitted = outcome.disposition is not AdmissionDisposition.QUEUED
         if admitted:
@@ -263,6 +265,25 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                 self.retained_request_count,
             )
         return admitted
+
+    def admit_native_fallback(self, request_id: str, *, reason: str) -> bool:
+        """Commit native admission for a waiter while preserving its live Program binding."""
+        entry = self.request_pool.get(request_id)
+        if entry is None or entry.program is None or entry.status is not RequestPoolStatus.WAITING:
+            return False
+        program = self.registry.require(entry.program)
+        if program.state is ProgramState.PAUSED:
+            # A resume hands off every waiter for the Program. The resume policy
+            # only considers paused Programs, so leaving siblings behind would strand them.
+            result = self._apply_transition(
+                TransitionRequest(TransitionKind.RESUME, program.ref, reason, self._dispatch_target.backend_id)
+            )
+            if not result.applied:
+                raise RuntimeError(f"native admission fallback failed for {request_id}: {result.reason}")
+        else:
+            self.request_pool.admit(request_id, self._dispatch_target)
+        self._cycle_dirty = True
+        return True
 
     def schedule_cycle(self, backend_pool_info: BackendPoolInfo) -> None:
         """Run resume, capacity repair, and due TTL checks from fresh backend facts."""
@@ -530,53 +551,67 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         program = self.registry.get(request.program)
         if program is None:
             return TransitionResult(request.kind, request.program, False, "stale_program")
+        rejection = self._transition_rejection(program, request.kind)
+        if rejection is not None:
+            return TransitionResult(request.kind, request.program, False, rejection)
+
         previous_state = program.state
         previous_status = program.status
+        program.state, program.backend_id, program.marked_for_pause = self._placement_after(program, request)
         if request.kind in (TransitionKind.ADMIT, TransitionKind.RESUME):
-            if program.state is not ProgramState.PAUSED:
-                return TransitionResult(request.kind, request.program, False, f"{request.kind.value}_requires_paused")
-            program.state = ProgramState.ACTIVE
-            program.backend_id = request.backend_id
-            program.marked_for_pause = False
             self._admit_program_requests(program.ref)
-        elif request.kind is TransitionKind.QUEUE:
-            if program.state is not ProgramState.PAUSED:
-                return TransitionResult(request.kind, request.program, False, "queue_requires_paused")
         elif request.kind is TransitionKind.PAUSE:
-            if program.state is not ProgramState.ACTIVE or program.status is not ProgramStatus.ACTING:
-                return TransitionResult(request.kind, request.program, False, "pause_requires_active_acting")
-            program.state = ProgramState.PAUSED
-            program.backend_id = None
-            program.marked_for_pause = False
             self._restart_shared_prefix_freshness(program, time.monotonic())
-        elif request.kind is TransitionKind.MARK_FOR_PAUSE:
-            if program.state is not ProgramState.ACTIVE or program.status is not ProgramStatus.REASONING:
-                return TransitionResult(request.kind, request.program, False, "mark_requires_active_reasoning")
-            if program.marked_for_pause:
-                return TransitionResult(request.kind, request.program, False, "already_marked")
-            program.marked_for_pause = True
         elif request.kind is TransitionKind.RELEASE:
-            if self._program_requests.get(program.ref):
-                return TransitionResult(request.kind, request.program, False, "release_requires_idle")
             self.registry.release(program.ref)
             self._latest_response.pop(program.ref, None)
             self._last_request_finished_at.pop(program.ref, None)
             self._shared_prefix_freshness_anchor_at.pop(program.ref, None)
-        else:
-            return TransitionResult(request.kind, request.program, False, "unsupported_transition")
-        current_state = ProgramState.TERMINATED if request.kind is TransitionKind.RELEASE else program.state
+
         event = self._event(
             TRANSITION_EVENT_KINDS[request.kind],
             request.program,
             request.reason,
             previous_state,
-            current_state,
+            program.state,
             previous_status,
             program.status,
             fields=(("backend_id", request.backend_id), ("marked_for_pause", program.marked_for_pause)),
         )
         self._dispatch_event(event)
         return TransitionResult(request.kind, request.program, True, request.reason, event)
+
+    def _transition_rejection(self, program: RuntimeProgram, kind: TransitionKind) -> str | None:
+        if kind in (TransitionKind.ADMIT, TransitionKind.RESUME, TransitionKind.QUEUE):
+            if program.state is not ProgramState.PAUSED:
+                return f"{kind.value}_requires_paused"
+        elif kind is TransitionKind.PAUSE:
+            if program.state is not ProgramState.ACTIVE or program.status is not ProgramStatus.ACTING:
+                return "pause_requires_active_acting"
+        elif kind is TransitionKind.MARK_FOR_PAUSE:
+            if program.state is not ProgramState.ACTIVE or program.status is not ProgramStatus.REASONING:
+                return "mark_requires_active_reasoning"
+            if program.marked_for_pause:
+                return "already_marked"
+        elif kind is TransitionKind.RELEASE:
+            if self._program_requests.get(program.ref):
+                return "release_requires_idle"
+        else:
+            return "unsupported_transition"
+        return None
+
+    @staticmethod
+    def _placement_after(
+        program: RuntimeProgram | ProgramView,
+        request: TransitionRequest,
+    ) -> tuple[ProgramState, str | None, bool]:
+        """Return the state, backend, and pause flag for a validated transition."""
+        if request.kind in (TransitionKind.ADMIT, TransitionKind.RESUME):
+            return ProgramState.ACTIVE, request.backend_id, False
+        if request.kind is TransitionKind.PAUSE:
+            return ProgramState.PAUSED, None, False
+        marked_for_pause = program.marked_for_pause or request.kind is TransitionKind.MARK_FOR_PAUSE
+        return program.state, program.backend_id, marked_for_pause
 
     def _admit_program_requests(self, program: ProgramRef) -> None:
         for entry in self.request_pool.entries:
@@ -593,19 +628,16 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             return snapshot
         programs = {program.ref: program for program in snapshot.programs}
         for request in requests:
-            program = programs[request.program]
+            if request.kind is TransitionKind.QUEUE:
+                continue
             if request.kind is TransitionKind.RELEASE:
-                programs.pop(request.program)
-            elif request.kind in (TransitionKind.ADMIT, TransitionKind.RESUME):
+                del programs[request.program]
+            else:
+                program = programs[request.program]
+                state, backend_id, marked_for_pause = ProgramScheduler._placement_after(program, request)
                 programs[request.program] = replace(
-                    program, state=ProgramState.ACTIVE, backend_id=request.backend_id, marked_for_pause=False
+                    program, state=state, backend_id=backend_id, marked_for_pause=marked_for_pause,
                 )
-            elif request.kind is TransitionKind.PAUSE:
-                programs[request.program] = replace(
-                    program, state=ProgramState.PAUSED, backend_id=None, marked_for_pause=False
-                )
-            elif request.kind is TransitionKind.MARK_FOR_PAUSE:
-                programs[request.program] = replace(program, marked_for_pause=True)
         values = tuple(programs.values())
         return replace(
             snapshot,

@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
-# Modified by PyPTO Serving: internal imports use the bundled scheduling package.
-"""Reusable bounded rolling statistics for the Progress-TTL policy.
-
-This is the single shared implementation used by Router-hosted and engine-embedded Progress-TTL runtimes. It preserves
-the original PT request-window sizing, cold-start threshold, gradual eviction, sample sanitization, and pause window.
-"""
+# Modified by PyPTO Serving: share the accounting for adding and evicting request samples.
+"""Bounded request and continuity statistics used by the Progress-TTL policy."""
 
 from __future__ import annotations
 
@@ -108,6 +104,8 @@ class ProgressTTLGlobalFactors:
     _scheduler_queue_seconds_sum: float = field(default=0.0, init=False, repr=False)
     _rounds_since_ttl_pause_sum: int = field(default=0, init=False, repr=False)
     _cache_churn_token_sum: int = field(default=0, init=False, repr=False)
+    _input_token_growth_sum: int = field(default=0, init=False, repr=False)
+    _input_token_growth_count: int = field(default=0, init=False, repr=False)
     _ttl_pause_segment_rounds: deque[int] = field(default_factory=deque, init=False, repr=False)
     _ttl_pause_segment_rounds_sum: int = field(default=0, init=False, repr=False)
     _continuity_samples: deque[ContinuitySample] = field(default_factory=deque, init=False, repr=False)
@@ -184,8 +182,10 @@ class ProgressTTLGlobalFactors:
             decode_seconds=decode_seconds,
         )
         self.request_count += 1
-        self._append_request_sample(sample)
-        self._evict_request_samples_to_target()
+        self._request_samples.append(sample)
+        self._accumulate_request_sample(sample, weight=1)
+        while len(self._request_samples) > self.request_window_size:
+            self._accumulate_request_sample(self._request_samples.popleft(), weight=-1)
         self._refresh_request_averages_if_ready()
 
     def update_ttl_pause(self, *, served_rounds: int) -> None:
@@ -549,49 +549,28 @@ class ProgressTTLGlobalFactors:
             return input_token_growth
         return None
 
-    def _append_request_sample(self, sample: RequestStatSample) -> None:
-        self._request_samples.append(sample)
-        self._prompt_token_sum += sample.prompt_tokens
-        self._cached_prefix_token_sum += sample.cached_prefix_tokens
-        self._uncached_prompt_token_sum += sample.uncached_prompt_tokens
+    def _accumulate_request_sample(self, sample: RequestStatSample, *, weight: int) -> None:
+        """Add or subtract a sample's contribution to the request window."""
+        self._prompt_token_sum += weight * sample.prompt_tokens
+        self._cached_prefix_token_sum += weight * sample.cached_prefix_tokens
+        self._uncached_prompt_token_sum += weight * sample.uncached_prompt_tokens
+        self._total_token_sum += weight * sample.total_tokens
+        self._request_latency_sum += weight * sample.request_latency_seconds
+        self._active_program_sum += weight * sample.active_programs
+        self._waiting_program_sum += weight * sample.waiting_programs
+        self._inter_request_gap_sum += weight * sample.inter_request_gap_seconds
+        self._scheduler_queue_seconds_sum += weight * sample.scheduler_queue_seconds
+        self._rounds_since_ttl_pause_sum += weight * sample.rounds_since_ttl_pause
+        self._cache_churn_token_sum += weight * sample.cache_churn_tokens
         if sample.completion_tokens is not None:
-            self._completion_token_sum += sample.completion_tokens
-            self._completion_token_count += 1
-        self._total_token_sum += sample.total_tokens
-        self._request_latency_sum += sample.request_latency_seconds
+            self._completion_token_sum += weight * sample.completion_tokens
+            self._completion_token_count += weight
         if sample.decode_seconds is not None:
-            self._decode_seconds_sum += sample.decode_seconds
-            self._decode_seconds_count += 1
-        self._active_program_sum += sample.active_programs
-        self._waiting_program_sum += sample.waiting_programs
-        self._inter_request_gap_sum += sample.inter_request_gap_seconds
-        self._scheduler_queue_seconds_sum += sample.scheduler_queue_seconds
-        self._rounds_since_ttl_pause_sum += sample.rounds_since_ttl_pause
-        self._cache_churn_token_sum += sample.cache_churn_tokens
-
-    def _remove_request_sample(self) -> None:
-        sample = self._request_samples.popleft()
-        self._prompt_token_sum -= sample.prompt_tokens
-        self._cached_prefix_token_sum -= sample.cached_prefix_tokens
-        self._uncached_prompt_token_sum -= sample.uncached_prompt_tokens
-        if sample.completion_tokens is not None:
-            self._completion_token_sum -= sample.completion_tokens
-            self._completion_token_count -= 1
-        self._total_token_sum -= sample.total_tokens
-        self._request_latency_sum -= sample.request_latency_seconds
-        if sample.decode_seconds is not None:
-            self._decode_seconds_sum -= sample.decode_seconds
-            self._decode_seconds_count -= 1
-        self._active_program_sum -= sample.active_programs
-        self._waiting_program_sum -= sample.waiting_programs
-        self._inter_request_gap_sum -= sample.inter_request_gap_seconds
-        self._scheduler_queue_seconds_sum -= sample.scheduler_queue_seconds
-        self._rounds_since_ttl_pause_sum -= sample.rounds_since_ttl_pause
-        self._cache_churn_token_sum -= sample.cache_churn_tokens
-
-    def _evict_request_samples_to_target(self) -> None:
-        while len(self._request_samples) > self.request_window_size:
-            self._remove_request_sample()
+            self._decode_seconds_sum += weight * sample.decode_seconds
+            self._decode_seconds_count += weight
+        if sample.input_token_growth is not None:
+            self._input_token_growth_sum += weight * sample.input_token_growth
+            self._input_token_growth_count += weight
 
     def _refresh_request_averages_if_ready(self) -> None:
         sample_count = len(self._request_samples)
@@ -608,11 +587,8 @@ class ProgressTTLGlobalFactors:
             self.avg_decode_seconds = self._decode_seconds_sum / self._decode_seconds_count
         self.avg_active_programs = self._active_program_sum / sample_count
         self.avg_waiting_programs = self._waiting_program_sum / sample_count
-        growth_samples = [
-            sample.input_token_growth for sample in self._request_samples if sample.input_token_growth is not None
-        ]
-        if growth_samples:
-            self.avg_input_token_growth_per_round = sum(growth_samples) / len(growth_samples)
+        if self._input_token_growth_count > 0:
+            self.avg_input_token_growth_per_round = self._input_token_growth_sum / self._input_token_growth_count
         self.avg_cache_churn_tokens_per_round = self._cache_churn_token_sum / sample_count
         self.avg_inter_request_gap_seconds = self._inter_request_gap_sum / sample_count
         self.avg_scheduler_queue_seconds = self._scheduler_queue_seconds_sum / sample_count

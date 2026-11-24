@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
-# Modified by PyPTO Serving: adapt imports, account for native KV capacity, and bound victim selection.
+# Modified by PyPTO Serving: integrate native KV capacity and refactor resume and TTL expiry.
 """Progress-TTL strategy over the shared AgentInfer scheduling contracts.
 
 The strategy guarantees short consecutive service segments, retains acting Programs only while avoided cold-prefill
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from typing import Callable
 
@@ -391,14 +392,10 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
         self._reconcile_privileges(snapshot, strategy_factors)
         remaining = self._remaining_tokens(snapshot, self.config.resume_capacity_ratio)
         active = self._active_programs(snapshot)
-        waiting = [
-            program
-            for ref in snapshot.waiting_programs
-            if (program := snapshot.program(ref)) is not None
-            and program.state is ProgramState.PAUSED
-            and program.status is ProgramStatus.REASONING
-        ]
-        waiting.sort(key=lambda program: self._resume_key(program, strategy_factors, snapshot.observed_at_monotonic_s))
+        waiting = sorted(
+            self._waiting_for_resume(snapshot),
+            key=lambda program: self._resume_key(program, strategy_factors, snapshot.observed_at_monotonic_s),
+        )
         oldest_waiting = min(
             (
                 program for program in waiting
@@ -480,70 +477,23 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
                 continue
             if remaining is None:
                 continue
-            wait_started = sidecar.request_wait_started_at_monotonic_s
+            active_programs = tuple(active)
+            reserve = self._continuous_growth_reserve_tokens(active_programs, strategy_factors, candidate=program)
             if (
-                self.config.resume_wait_relax_seconds is not None
-                and oldest_waiting is not None
+                oldest_waiting is not None
                 and program.ref == oldest_waiting.ref
-                and wait_started is not None
-                and snapshot.observed_at_monotonic_s - wait_started >= self.config.resume_wait_relax_seconds
-                and (physical_remaining := self._physical_remaining_tokens(snapshot, remaining)) is not None
-                and physical_remaining >= required
+                and self._try_wait_capacity_resume(
+                    snapshot, transitions, program, active_programs, remaining, required, reserve,
+                    sidecar.request_wait_started_at_monotonic_s,
+                )
             ):
-                growth_reserve = self._continuous_growth_reserve_tokens(
-                    tuple(active), strategy_factors, candidate=program
-                )
-                protected_growth = math.ceil(
-                    growth_reserve * self.config.resume_wait_growth_reserve_fraction
-                )
-                uncached_free_head = snapshot.uncached_free_head_kv_tokens
-                cache_safe_remaining = (
-                    None if uncached_free_head is None else
-                    uncached_free_head - (snapshot.native_waiting_kv_tokens or 0)
-                    - sum(self._capacity_tokens(item) for item in active if item.status is ProgramStatus.ACTING)
-                )
-                if (physical_remaining >= required + protected_growth
-                        + self.config.resume_wait_extra_headroom_tokens
-                        and (not self.config.resume_wait_preserve_cached_blocks
-                             or (cache_safe_remaining is not None and cache_safe_remaining >= required))):
-                    self._require_applied(
-                        transitions.resume(
-                            program.ref,
-                            reason="progress_ttl_wait_capacity_relax",
-                            backend_id=snapshot.backend_id,
-                        )
-                    )
-                    logger.info(
-                        "Progress-TTL wait capacity relax program=%s generation=%d at_monotonic=%.6f "
-                        "waited_seconds=%.3f required_tokens=%d effective_remaining_tokens=%d "
-                        "physical_remaining_tokens=%d growth_reserve_tokens=%d "
-                        "protected_growth_tokens=%d extra_headroom_tokens=%d cache_safe_remaining_tokens=%s "
-                        "uncovered_reserve_tokens=%d "
-                        "native_used_kv_tokens=%s native_waiting_kv_tokens=%s active_count=%d",
-                        program.ref.program_id,
-                        program.ref.generation,
-                        snapshot.observed_at_monotonic_s,
-                        snapshot.observed_at_monotonic_s - wait_started,
-                        required,
-                        remaining,
-                        physical_remaining,
-                        growth_reserve,
-                        protected_growth,
-                        self.config.resume_wait_extra_headroom_tokens,
-                        cache_safe_remaining,
-                        max(0, required + growth_reserve - remaining),
-                        snapshot.native_used_kv_tokens,
-                        snapshot.native_waiting_kv_tokens,
-                        len(active),
-                    )
-                    remaining -= required
-                    active.append(program)
-                    continue
-            reserve = self._continuous_growth_reserve_tokens(tuple(active), strategy_factors, candidate=program)
+                remaining -= required
+                active.append(program)
+                continue
             required_with_reserve = required + reserve
             if remaining < required_with_reserve:
                 if remaining >= required and self._batch_gain_covers_recovery(
-                    tuple(active),
+                    active_programs,
                     strategy_factors,
                     program,
                     remaining,
@@ -559,24 +509,15 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
                     active.append(program)
                     continue
                 deficit = required_with_reserve - remaining
-                available = [victim for victim in victims if victim.ref not in used_victims]
-                selected = self._select_layered_capacity_fit(
-                    (
-                        [
-                            victim
-                            for victim in available
-                            if self._program_factors(strategy_factors, victim.ref).segment_served_rounds
-                            >= self.config.target_max_segment_rounds
-                        ],
-                        [
-                            victim
-                            for victim in available
-                            if self._program_factors(strategy_factors, victim.ref).segment_served_rounds
-                            < self.config.target_max_segment_rounds
-                        ],
-                    ),
-                    deficit,
-                )
+                long_segments: list[ProgramView] = []
+                short_segments: list[ProgramView] = []
+                for victim in victims:
+                    if victim.ref in used_victims:
+                        continue
+                    rounds = self._program_factors(strategy_factors, victim.ref).segment_served_rounds
+                    layer = long_segments if rounds >= self.config.target_max_segment_rounds else short_segments
+                    layer.append(victim)
+                selected = self._select_layered_capacity_fit((long_segments, short_segments), deficit)
                 if selected is None:
                     continue
                 selected_refs = {victim.ref for victim in selected}
@@ -594,6 +535,69 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
             )
             remaining -= required
             active.append(program)
+
+    def _try_wait_capacity_resume(
+        self,
+        snapshot: SchedulingSnapshot,
+        transitions: TransitionController,
+        program: ProgramView,
+        active: tuple[ProgramView, ...],
+        remaining: int,
+        required: int,
+        growth_reserve: int,
+        wait_started: float | None,
+    ) -> bool:
+        """Resume the oldest waiter if physical and cache headroom permit relaxing its growth reserve."""
+        relax_after = self.config.resume_wait_relax_seconds
+        if relax_after is None or wait_started is None:
+            return False
+        waited = snapshot.observed_at_monotonic_s - wait_started
+        if waited < relax_after:
+            return False
+
+        physical_remaining = self._physical_remaining_tokens(snapshot, remaining)
+        extra_headroom = self.config.resume_wait_extra_headroom_tokens
+        protected_growth = math.ceil(growth_reserve * self.config.resume_wait_growth_reserve_fraction)
+        if physical_remaining is None or physical_remaining < required + protected_growth + extra_headroom:
+            return False
+
+        cache_safe_remaining = snapshot.uncached_free_head_kv_tokens
+        if cache_safe_remaining is not None:
+            cache_safe_remaining -= (snapshot.native_waiting_kv_tokens or 0) + sum(
+                self._capacity_tokens(item) for item in active if item.status is ProgramStatus.ACTING
+            )
+        if self.config.resume_wait_preserve_cached_blocks and (
+            cache_safe_remaining is None or cache_safe_remaining < required
+        ):
+            return False
+
+        self._require_applied(
+            transitions.resume(program.ref, reason="progress_ttl_wait_capacity_relax", backend_id=snapshot.backend_id)
+        )
+        logger.info(
+            "Progress-TTL wait capacity relax program=%s generation=%d at_monotonic=%.6f "
+            "waited_seconds=%.3f required_tokens=%d effective_remaining_tokens=%d "
+            "physical_remaining_tokens=%d growth_reserve_tokens=%d "
+            "protected_growth_tokens=%d extra_headroom_tokens=%d cache_safe_remaining_tokens=%s "
+            "uncovered_reserve_tokens=%d "
+            "native_used_kv_tokens=%s native_waiting_kv_tokens=%s active_count=%d",
+            program.ref.program_id,
+            program.ref.generation,
+            snapshot.observed_at_monotonic_s,
+            waited,
+            required,
+            remaining,
+            physical_remaining,
+            growth_reserve,
+            protected_growth,
+            extra_headroom,
+            cache_safe_remaining,
+            max(0, required + growth_reserve - remaining),
+            snapshot.native_used_kv_tokens,
+            snapshot.native_waiting_kv_tokens,
+            len(active),
+        )
+        return True
 
     def repair_capacity(
         self,
@@ -674,23 +678,17 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
             or self._effective_segment_rounds(strategy_factors, completed) < self.config.target_max_segment_rounds
         ):
             return
-        waiting = [
-            candidate
-            for ref in snapshot.waiting_programs
-            if (candidate := snapshot.program(ref)) is not None
-            and candidate.state is ProgramState.PAUSED
-            and candidate.status is ProgramStatus.REASONING
-        ]
-        if not waiting:
-            return
         top = min(
-            waiting,
+            self._waiting_for_resume(snapshot),
             key=lambda candidate: self._resume_key(
                 candidate,
                 strategy_factors,
                 snapshot.observed_at_monotonic_s,
             ),
+            default=None,
         )
+        if top is None:
+            return
         future_paused = sum(
             self._capacity_tokens(candidate)
             for candidate in snapshot.programs
@@ -704,26 +702,19 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
 
     def next_check_at(self, strategy_factors: ProgressTTLFactors) -> float | None:
         """Return the earliest live acting TTL deadline."""
-        deadlines = (
-            deadline
-            for _, state in strategy_factors.program_factors
-            for deadline in (
-                (
-                    state.ttl_deadline_monotonic_s
-                    if self._transitions_enabled(strategy_factors) or not state.ttl_expiry_observed
-                    else None
-                ),
-                (
-                    state.acting_since_monotonic_s + self.config.ttl_max_seconds
-                    if state.acting_since_monotonic_s is not None
-                    and (self._transitions_enabled(strategy_factors) or not state.ttl_expiry_observed)
-                    else None
-                ),
-                state.release_deadline_monotonic_s,
-            )
-            if deadline is not None
-        )
-        return min(deadlines, default=None)
+        transitions_enabled = self._transitions_enabled(strategy_factors)
+
+        def deadlines() -> Iterator[float]:
+            for _, state in strategy_factors.program_factors:
+                if transitions_enabled or not state.ttl_expiry_observed:
+                    if state.ttl_deadline_monotonic_s is not None:
+                        yield state.ttl_deadline_monotonic_s
+                    if state.acting_since_monotonic_s is not None:
+                        yield state.acting_since_monotonic_s + self.config.ttl_max_seconds
+                if state.release_deadline_monotonic_s is not None:
+                    yield state.release_deadline_monotonic_s
+
+        return min(deadlines(), default=None)
 
     def next_lightweight_check_at(self, strategy_factors: ProgressTTLFactors) -> float | None:
         """Return the earliest privilege-only expiry without waking the full policy cycle."""
@@ -761,65 +752,83 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
         protected_targets: set[ProgramRef] = set()
         for program in snapshot.programs:
             sidecar = self._program_factors(strategy_factors, program.ref)
-            fallback_deadline = (
-                sidecar.acting_since_monotonic_s
-                + self._ttl_seconds(
-                    strategy_factors,
-                    sidecar.last_request_prompt_tokens or program.tokens.estimated_context_tokens,
-                    sidecar.segment_share_tokens,
-                )
-                if sidecar.acting_since_monotonic_s is not None
-                else None
-            )
-            acting_deadline_due = (
-                sidecar.ttl_deadline_monotonic_s is not None and sidecar.ttl_deadline_monotonic_s <= now
-            ) or (fallback_deadline is not None and fallback_deadline <= now)
-            invalid_acting_clock = (
-                program.state is ProgramState.ACTIVE
-                and program.status is ProgramStatus.ACTING
-                and sidecar.acting_since_monotonic_s is None
-            )
             if (
-                (acting_deadline_due or invalid_acting_clock)
-                and program.state is ProgramState.ACTIVE
-                and program.status is ProgramStatus.ACTING
-                and program.ref not in protected_targets
+                program.state is not ProgramState.ACTIVE
+                or program.status is not ProgramStatus.ACTING
+                or program.ref in protected_targets
             ):
-                if not self._transitions_enabled(strategy_factors):
-                    if not sidecar.ttl_expiry_observed:
-                        self._record_theoretical_ttl_expiry(strategy_factors, program.ref, now)
-                    protected_targets.add(program.ref)
-                    continue
-                target = self._same_task_ttl_privilege_target(snapshot, program) if sidecar.is_privileged else None
-                self._require_applied(transitions.pause(program.ref, reason="progress_ttl_expired"))
-                if target is None:
-                    continue
-                self._set_privileged(strategy_factors, program.ref, False, reason="ttl_handoff_source")
-                if target.state is ProgramState.PAUSED:
-                    self._require_applied(
-                        transitions.resume(
-                            target.ref,
-                            reason="progress_ttl_privilege_ttl_handoff",
-                            backend_id=snapshot.backend_id,
-                        )
-                    )
-                self._set_privileged(
-                    strategy_factors,
-                    target.ref,
-                    True,
-                    reason="ttl_handoff",
-                    now_monotonic_s=snapshot.observed_at_monotonic_s,
-                )
-                protected_targets.add(target.ref)
+                continue
+            if not self._acting_ttl_due(program, sidecar, strategy_factors, now):
+                continue
+            if not self._transitions_enabled(strategy_factors):
+                if not sidecar.ttl_expiry_observed:
+                    self._record_theoretical_ttl_expiry(strategy_factors, program.ref, now)
+                protected_targets.add(program.ref)
+                continue
+            target = self._pause_expired_program(
+                snapshot, strategy_factors, transitions, program, privileged=sidecar.is_privileged,
+            )
+            if target is not None:
+                protected_targets.add(target)
+
+        # Resolve retention after all handoffs, which can clear a paused program's deadline.
         for program in snapshot.programs:
-            sidecar = self._program_factors(strategy_factors, program.ref)
-            if (
-                program.state is ProgramState.PAUSED
-                and program.status is ProgramStatus.ACTING
-                and sidecar.release_deadline_monotonic_s is not None
-                and sidecar.release_deadline_monotonic_s <= now
-            ):
+            if program.state is not ProgramState.PAUSED or program.status is not ProgramStatus.ACTING:
+                continue
+            deadline = self._program_factors(strategy_factors, program.ref).release_deadline_monotonic_s
+            if deadline is not None and deadline <= now:
                 self._require_applied(transitions.release(program.ref, reason="progress_ttl_paused_retention_expired"))
+
+    def _acting_ttl_due(
+        self,
+        program: ProgramView,
+        sidecar: ProgressTTLProgramFactors,
+        strategy_factors: ProgressTTLFactors,
+        now: float,
+    ) -> bool:
+        since = sidecar.acting_since_monotonic_s
+        if since is None:
+            return True
+        if sidecar.ttl_deadline_monotonic_s is not None and sidecar.ttl_deadline_monotonic_s <= now:
+            return True
+        fallback_ttl = self._ttl_seconds(
+            strategy_factors,
+            sidecar.last_request_prompt_tokens or program.tokens.estimated_context_tokens,
+            sidecar.segment_share_tokens,
+        )
+        return since + fallback_ttl <= now
+
+    def _pause_expired_program(
+        self,
+        snapshot: SchedulingSnapshot,
+        strategy_factors: ProgressTTLFactors,
+        transitions: TransitionController,
+        program: ProgramView,
+        *,
+        privileged: bool,
+    ) -> ProgramRef | None:
+        """Pause expired work and return any program that inherits its privilege."""
+        target = self._same_task_ttl_privilege_target(snapshot, program) if privileged else None
+        self._require_applied(transitions.pause(program.ref, reason="progress_ttl_expired"))
+        if target is None:
+            return None
+        self._set_privileged(strategy_factors, program.ref, False, reason="ttl_handoff_source")
+        if target.state is ProgramState.PAUSED:
+            self._require_applied(
+                transitions.resume(
+                    target.ref,
+                    reason="progress_ttl_privilege_ttl_handoff",
+                    backend_id=snapshot.backend_id,
+                )
+            )
+        self._set_privileged(
+            strategy_factors,
+            target.ref,
+            True,
+            reason="ttl_handoff",
+            now_monotonic_s=snapshot.observed_at_monotonic_s,
+        )
+        return target.ref
 
     def on_request_pending(self, strategy_factors: ProgressTTLFactors, event: SchedulingEvent) -> None:
         """Freeze one request's adaptive force deadline and invalidate an acting TTL."""
@@ -1131,11 +1140,8 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
                 1.0,
                 target_rounds - float(self._effective_segment_rounds(state, program.ref)),
             )
-            for ref in snapshot.waiting_programs
-            if (program := snapshot.program(ref)) is not None
-            and program.state is ProgramState.PAUSED
-            and program.status is ProgramStatus.REASONING
-            and self._resume_key(program, state, snapshot.observed_at_monotonic_s) < candidate_key
+            for program in self._waiting_for_resume(snapshot)
+            if self._resume_key(program, state, snapshot.observed_at_monotonic_s) < candidate_key
         )
         raw_timeout = (
             self.config.force_resume_timeout_scale
@@ -1152,6 +1158,18 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
             pool_remaining_rounds=pool_remaining_rounds,
             request_throughput_per_second=request_throughput,
         )
+
+    @staticmethod
+    def _waiting_for_resume(snapshot: SchedulingSnapshot) -> Iterator[ProgramView]:
+        """Yield paused programs with pending inference in request pool order."""
+        for ref in snapshot.waiting_programs:
+            program = snapshot.program(ref)
+            if (
+                program is not None
+                and program.state is ProgramState.PAUSED
+                and program.status is ProgramStatus.REASONING
+            ):
+                yield program
 
     def _active_programs(self, snapshot: SchedulingSnapshot) -> list[ProgramView]:
         """Return Programs currently consuming logical capacity on this backend."""
@@ -1461,12 +1479,12 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
         Programs contribute only their remaining rounds. Admission and resume call this same projection so neither
         path can fill capacity with current contexts while omitting the near-term growth required by the policy.
         """
-        remaining_rounds = self._target_growth_rounds(strategy_factors)
+        target = self._target_growth_rounds(strategy_factors)
+        remaining_rounds = target
         for program in active_programs:
             if program.ref == candidate.ref:
                 continue
             served = self._program_factors(strategy_factors, program.ref).segment_served_rounds
-            target = self._target_growth_rounds(strategy_factors)
             remaining_rounds += max(0.0, target - float(served))
         growth = self._capacity_growth_per_round(strategy_factors)
         return math.ceil(growth * remaining_rounds)

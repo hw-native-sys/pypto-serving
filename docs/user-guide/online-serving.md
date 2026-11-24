@@ -48,7 +48,8 @@ curl --noproxy '*' http://127.0.0.1:8899/v1/chat/completions \
 
 Add `--agentinfer-mode enforce` to enable AgentInfer admission. The scheduling
 core is adapted from [AgentInfer](https://github.com/openJiuwen-ai/agent-infer)
-and integrated with PyPTO Serving's native scheduler and KV cache.
+under Apache-2.0 (see `third_party/agentinfer/LICENSE`) and integrated with PyPTO
+Serving's native scheduler and KV cache.
 It supports one serving replica with prefix caching: Qwen, standard DeepSeek V4
 MTP K=1, or DeepSeek V4 DSpark K=0/K=7. PD deployments, multiple replicas, and
 DeepSeek V4.1 are not supported. The default mode is `disabled`.

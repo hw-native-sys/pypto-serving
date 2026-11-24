@@ -51,7 +51,11 @@ def test_enforce_tracks_immediate_native_request_and_completion() -> None:
 def test_admission_receives_full_agent_lineage() -> None:
     admission = _admission()
     observed = []
-    admission.policy.on_request_arrival = lambda request_id, identity, *args: observed.append(identity) or True
+    def record_arrival(request_id, identity, *args, **kwargs):
+        observed.append(identity)
+        return True
+
+    admission.policy.on_request_arrival = record_arrival
     identity = AgentIdentity(
         program_id="run-a:worker", task_id="run-a", session_id="run-a",
         agent_id="worker", parent_program_id="run-a:lead", blocks_parent=True,
@@ -66,7 +70,7 @@ def test_retained_request_is_released_once_by_policy_cycle() -> None:
     admission = _admission()
     request = Request("held", [1, 2, 3], max_new_tokens=1)
     policy = SimpleNamespace(
-        on_request_arrival=lambda *args: False,
+        on_request_arrival=lambda *args, **kwargs: False,
         run_due_lightweight_checks=lambda *args: None,
         needs_schedule_cycle=lambda *args: True,
         schedule_cycle=lambda *args: None,
@@ -181,33 +185,49 @@ def test_medium_kv_pool_refreshes_warm_prefix_before_next_request() -> None:
     assert admission.policy.registry.views()[0].tokens.shared_prefix_tokens == 1152
 
 
-def test_retained_cancel_and_timeout_do_not_enter_native_queue(monkeypatch) -> None:
+def test_retained_cancel_removes_request_without_native_admission() -> None:
     admission = _admission()
-    cancelled: list[str] = []
-    admission.policy = SimpleNamespace(
-        on_request_arrival=lambda *args: False,
-        run_due_lightweight_checks=lambda *args: None,
-        needs_schedule_cycle=lambda *args: True,
-        schedule_cycle=lambda *args: None,
-        prefix_cache_candidates=lambda: (),
-        on_prefix_cache_observation=lambda *args: None,
-        consume_admitted_requests=lambda: (),
-        cancel_request=cancelled.append,
-    )
-    request = Request("cancelled", [1, 2], max_new_tokens=1)
+    request = Request("cancelled", list(range(1200)), max_new_tokens=1)
     assert not admission.arrive(request, "session-a")
     assert admission.cancel("cancelled")
     assert not admission.cancel("cancelled")
-    assert cancelled == ["cancelled"]
     assert not admission.native.requests
-
-    timeout = Request("timeout", [1, 2], max_new_tokens=1)
-    assert not admission.arrive(timeout, "session-a")
-    admission._retained["timeout"].arrived_at -= MAX_ADMISSION_WAIT_SECONDS + 1
-    assert admission.poll() == [timeout]
-    assert cancelled == ["cancelled", "timeout"]
     assert admission.retained_request_ids == ()
     assert admission._sessions == {}
+
+
+def test_admission_timeout_hands_off_program_waiters_with_their_bindings() -> None:
+    manager = KvCacheManager(num_blocks=16, block_size=128)
+    native = Scheduler(SchedulerConfig(max_seq_len=4096), manager)
+    admission = AgentInferAdmission(0, native, manager, AgentInferOptions(resume_capacity_ratio=0.85))
+    first = Request("first", list(range(1800)), max_new_tokens=1)
+    latest = Request("latest", list(range(1800)), max_new_tokens=1)
+    assert not admission.arrive(first, "session-a")
+    assert not admission.arrive(latest, "session-a")
+    ref = admission.policy.registry.current_ref("session-a")
+    assert ref is not None
+
+    admission._retained[first.request_id].arrived_at -= MAX_ADMISSION_WAIT_SECONDS + 1
+    released = admission.poll()
+    assert released == [first, latest]
+    assert admission.poll() == []
+    assert admission.retained_request_ids == ()
+    for request in released:
+        native.add_request(request)
+    assert admission.policy.registry.current_ref("session-a") == ref
+
+    native.abort_request(first.request_id)
+    assert not admission.cancel(first.request_id)
+    assert admission.policy.registry.current_ref("session-a") == ref
+    step = native.schedule()
+    scheduled, = step.scheduled_requests
+    admission.native_scheduled(scheduled)
+    output, = native.update_from_output(step, {latest.request_id: 42})
+    assert output.finished
+    admission.complete(latest)
+    assert admission.observe_lifecycle("session-a", latest.request_id, "terminal")
+    assert admission.policy.registry.current_ref("session-a") is None
+    assert not admission._sessions
 
 
 @pytest.mark.parametrize("state", ["admitted", "retained", "resumed"])
@@ -284,7 +304,6 @@ def test_configured_force_resume_uses_original_policy_before_fallback(monkeypatc
     now[0] = 103.1
     assert admission.poll() == [request]
     assert admission.poll() == []
-    # A policy resume keeps tracking, unlike the adapter's timeout cancellation.
     assert admission._sessions == {"held": "session-a"}
     assert admission.retained_request_ids == ()
     admission.cancel("held")
@@ -448,13 +467,44 @@ def test_invalid_admission_settings_are_rejected(values) -> None:
         AgentInferOptions.from_mapping(values)
 
 
-def test_full_admission_pool_uses_native_queue_without_binding(monkeypatch) -> None:
-    admission = _admission()
-    monkeypatch.setattr("pypto_serving.serving.agentinfer_admission.MAX_RETAINED_REQUESTS", 0)
-    request = Request("overflow", [1, 2], max_new_tokens=1)
-    assert admission.arrive(request, "session-a")
-    assert admission._sessions == {}
-    assert admission.retained_request_ids == ()
+def test_full_admission_pool_keeps_overlapping_native_request_bound(monkeypatch) -> None:
+    manager = KvCacheManager(num_blocks=16, block_size=128)
+    native = Scheduler(SchedulerConfig(max_seq_len=4096), manager)
+    admission = AgentInferAdmission(0, native, manager, AgentInferOptions(resume_capacity_ratio=0.85))
+    monkeypatch.setattr("pypto_serving.serving.agentinfer_admission.MAX_RETAINED_REQUESTS", 1)
+    earlier = Request("earlier", [1, 2], max_new_tokens=2)
+    latest = Request("latest", [1, 2], max_new_tokens=1)
+    for request in (earlier, latest):
+        assert admission.arrive(request, "session-a")
+        native.add_request(request)
+    ref = admission.policy.registry.current_ref("session-a")
+    assert ref is not None
+
+    held = Request("held", list(range(1800)), max_new_tokens=1)
+    assert not admission.arrive(held, "other-session")
+    overflow = Request("overflow", [1, 2], max_new_tokens=2)
+    assert admission.arrive(overflow, "session-a")
+    native.add_request(overflow)
+    assert admission.retained_request_ids == (held.request_id,)
+    assert admission.policy.retained_request_ids == (held.request_id,)
+
+    step = native.schedule()
+    outputs = native.update_from_output(step, {request.request_id: 42 for request in (earlier, latest, overflow)})
+    assert [out.request_id for out in outputs if out.finished] == [latest.request_id]
+    admission.complete(latest)
+    assert not admission.observe_lifecycle("session-a", latest.request_id, "terminal")
+
+    native.abort_request(earlier.request_id)
+    assert not admission.cancel(earlier.request_id)
+    assert overflow.request_id in native.requests
+    assert admission.policy.registry.current_ref("session-a") == ref
+
+    step = native.schedule()
+    output, = native.update_from_output(step, {overflow.request_id: 42})
+    assert output.finished
+    admission.complete(overflow)
+    assert admission.observe_lifecycle("session-a", overflow.request_id, "terminal")
+    assert admission.policy.registry.current_ref("session-a") is None
 
 
 def test_prefix_ownership_is_captured_before_each_request_acquires_references():
@@ -599,7 +649,7 @@ def test_enforce_requires_supported_model_and_prefix_cache() -> None:
         )
 
 
-def test_deepseek_k1_grouped_cache_reaches_agentinfer_policy() -> None:
+def test_deepseek_k1_grouped_cache_reaches_agentinfer_policy(monkeypatch) -> None:
     groups = (KVCacheGroupSpec(
         name="eagle", layer_indices=(0,),
         spec=KVCacheSpec(block_size=2, page_size_bytes=1),
@@ -621,9 +671,19 @@ def test_deepseek_k1_grouped_cache_reaches_agentinfer_policy() -> None:
     assert admission.arrive(request, "session-deepseek")
     assert admission.policy.strategy._capacity_cost(1) == 2
     core.scheduler.add_request(request)
+    selected = 0
+    select_group_prefix = core.kv_cache_manager.select_group_prefix_blocks
+
+    def count_prefix_selection(*args, **kwargs):
+        nonlocal selected
+        selected += 1
+        return select_group_prefix(*args, **kwargs)
+
+    monkeypatch.setattr(core.kv_cache_manager, "select_group_prefix_blocks", count_prefix_selection)
     scheduled = core.scheduler.schedule().scheduled_requests[0]
     admission.native_scheduled(scheduled)
     assert request.cache_partition is not None
+    assert selected == 1
 
     with pytest.raises(ValueError, match="MTP K=1"):
         ReplicaEngineCore(

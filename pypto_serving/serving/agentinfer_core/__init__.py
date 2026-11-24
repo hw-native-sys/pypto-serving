@@ -6,11 +6,4 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Agent session scheduling adapted from AgentInfer.
-
-Upstream: https://github.com/openJiuwen-ai/agent-infer
-
-PyPTO Serving integrates the scheduling core with native admission, KV cache
-capacity observations, and request lifecycle handling. The scheduling sources
-retain their Apache-2.0 license; see LICENSE-APACHE-2.0.
-"""
+"""Agent session scheduling for request admission, KV cache capacity, and lifecycle handling."""

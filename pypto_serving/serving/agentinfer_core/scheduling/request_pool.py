@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
-# Modified by PyPTO Serving: internal imports use the bundled scheduling package.
+# Modified by PyPTO Serving: share consumption logic between immediate and batched admissions.
 """Scheduler-owned request retention and admission-result storage.
 
 ``RequestPool`` contains no asyncio primitive and no engine type. host adapters may attach a Future as the retained
@@ -94,11 +94,9 @@ class RequestPool(Generic[RetainedRequestT]):
     def consume_admitted(self) -> tuple[tuple[RequestPoolEntry[RetainedRequestT], DispatchTarget], ...]:
         """Remove and return all newly admitted attempts in decision order."""
         admitted: list[tuple[RequestPoolEntry[RetainedRequestT], DispatchTarget]] = []
-        for request_id, target in tuple(self._recent_admit.items()):
-            entry = self._entries.pop(request_id, None)
-            self._recent_admit.pop(request_id, None)
-            if entry is not None:
-                admitted.append((entry, target))
+        for request_id in tuple(self._recent_admit):
+            if (decision := self.consume_admitted_request(request_id)) is not None:
+                admitted.append(decision)
         return tuple(admitted)
 
     def consume_admitted_request(

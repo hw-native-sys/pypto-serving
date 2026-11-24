@@ -249,15 +249,16 @@ class AgentInferAdmission:
         """Return whether the caller should immediately enqueue the request."""
         if request.request_id in self._sessions:
             raise ValueError(f"duplicate AgentInfer request: {request.request_id}")
-        if len(self._retained) >= MAX_RETAINED_REQUESTS:
+        native_fallback = len(self._retained) >= MAX_RETAINED_REQUESTS
+        if native_fallback:
             logger.warning("AgentInfer admission queue full; using native queue for %s", request.request_id)
-            return True
         metadata = (
             identity if isinstance(identity, AgentIdentity)
             else self._identity_type(program_id=identity, session_id=identity)
         )
         self._sessions[request.request_id] = metadata.program_id
-        request.observe_prefix_cache = True
+        # Grouped prefill reports the actual acquired prefix through native_scheduled.
+        request.observe_prefix_cache = not self.grouped
         try:
             admitted = self.policy.on_request_arrival(
                 request.request_id,
@@ -265,6 +266,7 @@ class AgentInferAdmission:
                 request.num_prompt_tokens,
                 self._backend_pool(),
                 request,
+                native_fallback=native_fallback,
             )
         except BaseException:
             self._sessions.pop(request.request_id, None)
@@ -289,6 +291,12 @@ class AgentInferAdmission:
             self._prefix_refresh_pending = self._next_prefix_refresh_at is not None
         if self.policy.needs_schedule_cycle(now):
             self.policy.schedule_cycle(self._backend_pool())
+        for request_id, retained in self._retained.items():
+            if (
+                now - retained.arrived_at >= MAX_ADMISSION_WAIT_SECONDS
+                and self.policy.admit_native_fallback(request_id, reason="native_admission_timeout")
+            ):
+                logger.warning("AgentInfer admission timeout for %s; using native queue", request_id)
         admitted = []
         for entry, _ in self.policy.consume_admitted_requests():
             retained = self._retained.pop(entry.request_id, None)
@@ -298,13 +306,6 @@ class AgentInferAdmission:
                     "AgentInfer admitted request %s after %.3fs",
                     entry.request_id, now - retained.arrived_at,
                 )
-        for request_id, retained in tuple(self._retained.items()):
-            if now - retained.arrived_at >= MAX_ADMISSION_WAIT_SECONDS:
-                self.policy.cancel_request(request_id)
-                self._retained.pop(request_id, None)
-                self._sessions.pop(request_id, None)
-                admitted.append(retained.request)
-                logger.warning("AgentInfer admission timeout for %s; using native queue", request_id)
         return admitted
 
     def _refresh_retained_prefix_cache(self) -> None:
