@@ -64,7 +64,7 @@ class CacheTier:
             raise RuntimeError("DDR tier is not accepting publications")
         if key in self.pages:
             self.release_pin(lease)
-            self.touch(key)
+            self.touch_many((key,))
             return
         charge = size if charge is None else charge
         if (type(size) is not int or type(charge) is not int
@@ -119,21 +119,33 @@ class CacheTier:
             return None
         return page
 
-    def touch(self, key):
-        page = self.lookup(key)
-        if page is not None:
-            for identity in page.units:
-                self.policy.on_access(("unit", identity), self.clock())
+    def touch_many(self, keys):
+        self._touch_pages(map(self.lookup, keys))
+
+    def _touch_pages(self, pages):
+        """Collapse consecutive accesses with identical checkpoint membership."""
+        now = self.clock()
+        units = ()
+        for page in pages:
+            if page is None:
+                continue
+            if units and units != page.units:
+                for identity in units:
+                    self.policy.on_access(("unit", identity), now)
             if not page.units:
-                self.policy.on_access(("page", page.handle), self.clock())
+                self.policy.on_access(("page", page.handle), now)
+            # Equal sets can iterate differently. Use the last page's order.
+            units = page.units
+        for identity in units:
+            self.policy.on_access(("unit", identity), now)
 
     def acquire(self, keys):
         pages = tuple(self.lookup(key) for key in dict.fromkeys(keys))
         if self.closing or self.error or any(page is None for page in pages):
             raise ValueError("DDR content is unavailable")
+        self._touch_pages(pages)
         for page in pages:
             page.readers += 1
-            self.touch(page.key)
         return pages
 
     def release(self, pages):

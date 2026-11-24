@@ -292,6 +292,36 @@ def test_d_reserves_only_after_its_independent_history_restore(cancelled, blocke
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("acquire", [False, True])
+def test_batched_lru_preserves_last_access_order_and_reader_counts(acquire):
+    tier = CacheTier(6, Backend(), lambda _: None)
+    keys = ("a", "b", "loose", "tail")
+    for key in (*keys, "old"):
+        tier.capture(key, key, 1, key)
+    tier.pump()
+    tier.pump()
+    tier.publish("left", ("a", "b"))
+    tier.publish("right", ("a", "b", "tail"))
+    tier.capture("pending", "pending", 1, "pending")
+
+    if acquire:
+        with pytest.raises(ValueError, match="DDR content is unavailable"):
+            tier.acquire((*keys, "pending"))
+        assert all(not page.readers for page in tier.pages.values())
+        readers = tier.acquire((*keys, "b"))
+        assert tuple(page.key for page in readers) == keys
+        assert all(page.readers == 1 for page in readers)
+        tier.release(readers)
+    else:
+        tier.touch_many(("a", "pending", "b", "loose", "tail", "missing"))
+
+    assert tuple(tier.policy.candidates(0)) == (
+        ("page", tier.pages["old"].handle), ("unit", "left"),
+        ("page", tier.pages["loose"].handle), ("unit", "right"),
+    )
+    assert all(not page.readers for page in tier.pages.values())
+
+
 def test_lru_reclaims_a_whole_checkpoint_after_last_reader():
     backend = Backend()
     tier = CacheTier(2, backend, lambda pin: None)

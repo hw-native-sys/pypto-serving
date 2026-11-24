@@ -264,17 +264,22 @@ class TieredCache:
         return not self.start_restore(request, hashes, tokens, match, started_ns=started_ns,
                                       headroom=int(partitions is None)), None
 
-    def match_prefix(self, hashes, maximum, *, groups=None, partition=None, score=True,
-                     partitions=None, token_count=None):
-        """Read a candidate without changing page ownership or eviction order."""
-        if maximum <= 0 or not self.tier.pages:
-            return {}, 0, None
+    def matching_checkpoint_boundaries(self, hashes, maximum):
+        """Read the DDR checkpoint boundaries shared by all destination partitions."""
         sizes = {name: self.cache._group_pools[name].spec.spec.token_capacity for name in hashes}
-        boundaries = {
+        return {
             boundary for boundary, identity in self.tier.units if boundary <= maximum and
             all(name in sizes and boundary // sizes[name] <= len(hashes[name]) and
                 hashes[name][boundary // sizes[name] - 1] == value for name, value in identity)
         }
+
+    def match_prefix(self, hashes, maximum, *, groups=None, partition=None, score=True,
+                     partitions=None, token_count=None, checkpoint_boundaries=None):
+        """Read a candidate, reusing DDR boundaries only within the same selection pass."""
+        if maximum <= 0 or not self.tier.pages:
+            return {}, 0, None
+        boundaries = (self.matching_checkpoint_boundaries(hashes, maximum)
+                      if checkpoint_boundaries is None else checkpoint_boundaries)
         if score:
             return self._select(hashes, maximum, groups, partition, boundaries, partitions, token_count)
         return self.cache.select_group_prefix_blocks(
@@ -302,10 +307,10 @@ class TieredCache:
         return int(load_queued) + int(store_queued)
 
     def touch_prefix(self, tables):
-        for name, values in tables.items():
-            for page in values:
-                if page is not None:
-                    self.tier.touch(page.key if isinstance(page, Page) else (name, page.block_hash))
+        self.tier.touch_many(
+            page.key if isinstance(page, Page) else (name, page.block_hash)
+            for name, values in tables.items() for page in values if page is not None
+        )
 
     def start_restore(self, request, hashes, tokens, match, *, reserve_step=None, started_ns=0, headroom=1):
         """Take destination/step pages before making a LOAD visible to the backend."""

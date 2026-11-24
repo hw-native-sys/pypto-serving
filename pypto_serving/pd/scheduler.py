@@ -120,12 +120,16 @@ class PrefillScheduler(Scheduler):
                                           / self._chunk)
 
         best, best_score = None, None
+        checkpoint_boundaries = None
         for partition in range(cache.group_partition_count):
             budget = self._group_budget(partition, token_budget)
             if budget <= 0 or (hit >= self._chunk and partition == origin):
                 continue
             if tiering is not None and boundary and tiering.tier.pages:
-                match = tiering.match_prefix(hashes, boundary, partition=partition, score=False)
+                if checkpoint_boundaries is None:
+                    checkpoint_boundaries = tiering.matching_checkpoint_boundaries(hashes, boundary)
+                match = tiering.match_prefix(hashes, boundary, partition=partition, score=False,
+                                             checkpoint_boundaries=checkpoint_boundaries)
             elif partition == origin:
                 match = local
             elif hit:

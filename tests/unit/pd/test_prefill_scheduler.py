@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 from dataclasses import replace
+from unittest.mock import Mock
 
 import pytest
 
@@ -82,20 +83,30 @@ def test_tail_slack_sets_the_new_requests_actual_first_chunk():
 
 
 @pytest.mark.parametrize("long", [False, True])
-def test_hot_group_waits_two_rounds_or_restores_on_another_group(long):
+def test_hot_group_waits_two_rounds_or_restores_on_another_group(monkeypatch, long):
     tokens = prompt(0, 513)
-    cache, tier, backend = fixture(2)
+    cache, tier, backend = fixture(4)
     hit = warm(cache, tokens)
     sched = scheduler(cache, asynchronous=True)
     old = running(sched, 1024 if long else 320)
     request = add(sched, "next", tokens)
+    name = "cmp_c128"
+    value = request.group_block_hashes[name][0]
+    pool = cache._group_pools[name]
+    # The mixed destination needs one fewer LOAD than the pure-DDR alternatives.
+    cache._cache_group_block(pool, 2, pool.block_from_local_id(2, 1), value)
+    scan = Mock(wraps=tier.matching_checkpoint_boundaries)
+    monkeypatch.setattr(tier, "matching_checkpoint_boundaries", scan)
     backend.hold = True
     output = sched.schedule()
     sched.advance_after_schedule(output)
     assert [item.request for item in output.scheduled_requests] == [old]
+    assert scan.call_count == int(long)
     assert (request.request_id in tier.pending) == long
     if long:
-        assert request.cache_partition == 1
+        assert request.cache_partition == 2
+        assert {(2, *key) for (end, _), keys in tier.tier.units.items() if end == hit
+                for key in keys if key != (name, value)} == set(tier.loads)
         reserved = request.allocated_group_block_ids
         for future in backend.waiting:
             future.set_result(dict(bytes=1, stopped=True, native_completed=True))
@@ -104,7 +115,7 @@ def test_hot_group_waits_two_rounds_or_restores_on_another_group(long):
         assert request.allocated_group_block_ids is reserved
         assert tier.pending[request.request_id].remaining == 0
         step, = [item for item in sched.schedule().scheduled_requests if item.request is request]
-        assert step.num_computed_tokens == hit and step.cache_partition == 1
+        assert step.num_computed_tokens == hit and step.cache_partition == 2
         assert request.allocated_group_block_ids is reserved
         sched.discard_scheduled_request(step)
     else:
@@ -116,6 +127,22 @@ def test_hot_group_waits_two_rounds_or_restores_on_another_group(long):
         assert step.num_computed_tokens == hit
         sched.discard_scheduled_request(step)
     sched.abort_request(request.request_id)
+    discard(sched, output)
+
+
+def test_empty_ddr_checkpoint_lookup_is_shared_across_groups(monkeypatch):
+    cache, tier, _ = fixture(4)
+    warm(cache, prompt(0, 513))
+    sched = scheduler(cache)
+    request = add(sched, "cold", prompt(1, 513))
+    scan = Mock(wraps=tier.matching_checkpoint_boundaries)
+    monkeypatch.setattr(tier, "matching_checkpoint_boundaries", scan)
+
+    output = sched.schedule()
+    step, = output.scheduled_requests
+    assert step.request is request and step.num_computed_tokens == 0
+    assert scan.call_count == 1
+    assert not tier.loads
     discard(sched, output)
 
 
