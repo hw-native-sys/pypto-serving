@@ -667,8 +667,7 @@ def test_async_reconciliation_matches_sync_end_state():
     assert async_tokens == sync_tokens == [10, 11, 12]
 
 
-def _mtp_scheduler(async_mode: bool, *, num_speculative_tokens: int = 1,
-                   supports_stochastic_speculation: bool = False):
+def _mtp_scheduler(async_mode: bool, *, num_speculative_tokens: int = 1):
     """Scheduler configured like an MTP (speculative) decoder."""
     manager = KvCacheManager(num_blocks=32, block_size=2, enable_prefix_cache=False)
     return Scheduler(
@@ -676,7 +675,6 @@ def _mtp_scheduler(async_mode: bool, *, num_speculative_tokens: int = 1,
             enable_prefix_cache=False,
             async_scheduling=async_mode,
             num_speculative_tokens=num_speculative_tokens,
-            supports_stochastic_speculation=supports_stochastic_speculation,
         ),
         manager,
     )
@@ -705,28 +703,6 @@ def test_async_mtp_reserves_max_tokens_per_step():
     assert request.num_output_placeholders == 2
     # computed advanced by num_new_tokens (1) + the extra speculative slot (1).
     assert request.num_computed_tokens == 4
-
-
-@pytest.mark.parametrize("supports_stochastic_speculation", [True, False])
-def test_stochastic_decode_reserves_and_reconciles_supported_drafts(supports_stochastic_speculation):
-    scheduler = _mtp_scheduler(
-        async_mode=True, num_speculative_tokens=5,
-        supports_stochastic_speculation=supports_stochastic_speculation,
-    )
-    request = _running_decode_request()
-    request.temperature = 0.7
-    scheduler.running.append(request)
-    scheduler.requests[request.request_id] = request
-
-    step = scheduler.schedule()
-    capacity = 6 if supports_stochastic_speculation else 1
-    assert step.num_decode_tokens == capacity
-    scheduler.advance_after_schedule(step)
-    assert request.num_output_placeholders == capacity
-    tokens = [10, 11, 12] if supports_stochastic_speculation else [10]
-    scheduler.update_from_output(step, {request.request_id: tokens})
-    assert request.output_token_ids == [99, *tokens]
-    assert request.num_output_placeholders == 0
 
 
 def test_async_mtp_matches_sync_when_all_tokens_accepted():
