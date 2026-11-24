@@ -179,6 +179,23 @@ def test_v41_dp4_http_answer(tmp_path, num_speculative_tokens):
             hits = re.findall(r"prefix_cache_hit_tokens=(\d+)", log_path.read_text(encoding="utf-8"))
             assert hits and max(map(int, hits)) >= 128, "repeated long prompts must reuse compressed prefix pages"
 
+            if num_speculative_tokens:
+                stochastic = dict(payload, temperature=0.7, top_p=0.9, top_k=32, seed=42)
+                sampled_request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    data=json.dumps(stochastic).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}, method="POST")
+                with OPENER.open(sampled_request, timeout=400) as response:
+                    sampled = json.load(response)
+                assert sampled["usage"]["completion_tokens"] > 1, sampled
+                assert any(
+                    item["request_id"] == sampled["id"] and item["proposed_drafts"] == num_speculative_tokens
+                    for path in metrics_dir.glob("decode-steps.*.jsonl")
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                    for item in json.loads(line)["requests"]
+                ), f"Stochastic request {sampled['id']} did not verify a K=5 draft block"
+                print("STOCHASTIC_K5", sampled["id"], sampled["usage"], flush=True)
+
             def concurrent_answer(index):
                 number = 20 + index
                 body = {"model": MODEL_NAME, "messages": [{"role": "user", "content":

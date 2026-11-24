@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Mapping
 
-from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
+from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec, SamplingParams
 
 from .weight_loader import LayerPlan
 
@@ -129,6 +129,7 @@ class ForwardStep:
     phase: str
     requests: tuple[RequestSlice, ...]
     epoch: int
+    sampling_params: Mapping[str, SamplingParams] = field(default_factory=dict)
 
     @property
     def token_ids(self):
@@ -206,7 +207,7 @@ class RequestLedger:
                             raise ValueError("cache page belongs to another live request")
                     occupied.setdefault(address, []).append((request.request_id, immutable, index))
 
-    def begin_prefill(self, requests, *, prefix_cache_hits=None):
+    def begin_prefill(self, requests, *, prefix_cache_hits=None, sampling_params=None):
         """Validate the complete batch before taking ownership of any new slot.
 
         Each item is (request_id, partition, start, token_ids, prompt_length, pages,
@@ -262,7 +263,8 @@ class RequestLedger:
         self._validate_page_ownership(slices)
         self.free = available
         self.owners.update(additions)
-        self.pending = ForwardStep("prefill", tuple(slices), self.epoch)
+        self.pending = ForwardStep("prefill", tuple(slices), self.epoch,
+                                   sampling_params=MappingProxyType(dict(sampling_params or {})))
         return self.pending
 
     def begin_decode(self, requests, *, drafts=None):

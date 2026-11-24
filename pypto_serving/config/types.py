@@ -379,6 +379,7 @@ class PrefillBatch:
     # Optional serving-owned DSpark stage arguments.  The V4.1 adapter accepts
     # only already-bound lib composite arguments; it never rebuilds operators.
     dspark_stages: object | None = None
+    sampling_params: dict[str, SamplingParams] = field(default_factory=dict)
 
 
 @dataclass

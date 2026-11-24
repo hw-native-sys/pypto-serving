@@ -586,7 +586,7 @@ class CompositeBindings:
 
     Entries consume (LayerPlan, LayerState, step, resources, weights) and return
     LayerState. initialize consumes (embeddings, step, resources); output consumes
-    (state, step, resources) and returns host logits in original request order.
+    (state, step, resources) and returns host logits or a PrefillResult in request order.
     The adapter owns device uploads and lib ABI binding. Serving never expands
     packed FP4 or calls the sub-operators of a complete layer.
     allocate consumes (plan, device_ids, runtime, BuildOptions), including the
@@ -1404,7 +1404,10 @@ class V41ModelRunner:
                 if hits and len(hits) != len(batch.request_ids):
                     raise ValueError("prefix boundaries must contain one entry per prefill request")
                 new_requests = tuple(key for key in batch.request_ids if key not in ledger.owners)
-                step = ledger.begin_prefill(requests, prefix_cache_hits=dict(zip(batch.request_ids, hits)))
+                step = ledger.begin_prefill(
+                    requests, prefix_cache_hits=dict(zip(batch.request_ids, hits)),
+                    sampling_params=batch.sampling_params,
+                )
                 return self._run_transaction(step, batch.input_embeddings, initialize_requests=new_requests)
 
     def _run_transaction(self, step, embeddings, *, initialize_requests=()):
@@ -1485,9 +1488,10 @@ class V41ModelRunner:
 
     def _finish_step(self, state, step):
         with profile_span('v41.V41ModelRunner._finish_step', cat='v41.host', level='verbose'):
-            logits = self.bindings.output(state, step, self.resources)
+            output = self.bindings.output(state, step, self.resources)
             with profile_span("v41.wait", cat="v41.host", level="verbose"):
                 self.bindings.wait(self.resources)
+            logits = output.logits if isinstance(output, PrefillResult) else output
             shape = (len(step.requests), self.plan.weights.config.vocab_size)
             if (not isinstance(logits, torch.Tensor) or logits.device.type != "cpu"
                     or tuple(logits.shape) != shape or logits.dtype not in (
@@ -1500,6 +1504,8 @@ class V41ModelRunner:
             with profile_span("v41.logits.clone", cat="v41.host", level="verbose"):
                 owned_logits = logits.detach().clone()
             if step.phase == "prefill":
+                if isinstance(output, PrefillResult):
+                    return replace(output, logits=owned_logits)
                 return PrefillResult(last_hidden=None, logits=owned_logits)
             return DecodeResult(hidden_states=None, logits=owned_logits)
 
@@ -1967,6 +1973,24 @@ def prepare_swa_window_metadata(
 
 
 # final_output
+_SAMPLING_INPUTS = (
+    "sampling_temperatures", "sampling_top_ks", "sampling_top_ps", "sampling_seeds", "sampling_positions",
+)
+
+
+def _stage_sampling(inputs, rank, rows, request_id, params, *, position, width, vocab_size):
+    """Bind the same policy and position-keyed draws for prefill and decode."""
+    if params.temperature <= 0.0:
+        return
+    seed = zlib.crc32(request_id.encode()) if params.seed is None else params.seed
+    top_k = params.top_k if params.top_k is not None and params.top_k > 0 else vocab_size
+    inputs["sampling_temperatures"][rank, rows].fill_(max(params.temperature, 1e-5))
+    inputs["sampling_top_ks"][rank, rows].fill_(min(top_k, vocab_size))
+    inputs["sampling_top_ps"][rank, rows].fill_(params.top_p)
+    inputs["sampling_seeds"][rank, rows].fill_(int(seed) & 0x3FFFFFFF)
+    inputs["sampling_positions"][rank, rows] = torch.arange(position, position + width, dtype=torch.int32)
+
+
 @dataclass(frozen=True)
 class FinalOutputRows:
     indices: torch.Tensor
@@ -2380,9 +2404,7 @@ def load_final_output_host_resources(model_dir, topology: SegmentTopology, *,
     logits = torch.zeros((topology.world, max_logit_rows, vocab), dtype=torch.float32).share_memory_()
     sampled = torch.full((topology.world, max_logit_rows, sampled_pad), -1,
                          dtype=torch.int32).share_memory_()
-    # The current pypto-lib generation head always owns sampling.  V4.1's
-    # serving path still reads logits on the host, so bind a deterministic
-    # greedy policy while keeping the new ABI complete.
+    # Default to greedy for rows without a request sampling policy.
     sampling_temperatures = torch.zeros((topology.world, max_logit_rows), dtype=torch.float32).share_memory_()
     sampling_top_ks = torch.full((topology.world, max_logit_rows), vocab, dtype=torch.int32).share_memory_()
     sampling_top_ps = torch.ones((topology.world, max_logit_rows), dtype=torch.float32).share_memory_()
@@ -2498,20 +2520,12 @@ class PrefillForwardSegment:
                 final_norm_weight=final.norm_weight, lm_head_weight=final.head_weight,
                 x_hc_out=self.residual, pre_mix_out=self.pre_mix,
                 logits=final.host.logits, sampled_ids=final.host.sampled_ids,
-                sampling_temperatures=final.sampling_temperatures,
-                sampling_top_ks=final.sampling_top_ks,
-                sampling_top_ps=final.sampling_top_ps,
-                sampling_seeds=final.sampling_seeds,
-                sampling_positions=final.sampling_positions,
             )
             # Keep the binding readable against one older cached prefill
             # artifact while the source tree tracks the current lib ABI.
-            for name in (
-                "sampling_temperatures", "sampling_top_ks", "sampling_top_ps",
-                "sampling_seeds", "sampling_positions",
-            ):
-                if name not in self.param_names:
-                    self.arguments.pop(name, None)
+            for name in _SAMPLING_INPUTS:
+                if name in self.param_names:
+                    self.arguments[name] = getattr(final, name)
             if engram is not None and "engram_lookup" in param_names:
                 self.arguments.update(engram_lookup=metadata.fields["engram_lookup"],
                                       engram_wkv=engram.wkv,
@@ -2525,7 +2539,7 @@ class PrefillForwardSegment:
             self.close()
             raise
 
-    def run(self):
+    def run(self, *, sampling_inputs=None):
         with profile_span('v41.PrefillForwardSegment.run', cat='v41.host', level='verbose'):
             if self.failed:
                 raise RuntimeError("full prefill failed; recreate the worker before reuse")
@@ -2536,9 +2550,10 @@ class PrefillForwardSegment:
             previous_reset = self.worker._reset_persistent_windows
             self.worker._reset_persistent_windows = False
             try:
+                arguments = self.arguments if sampling_inputs is None else {**self.arguments, **sampling_inputs}
                 with profile_span("v41.worker.run", cat="v41.host", level="verbose"):
                     self.worker.run(self.program.compiled,
-                                    *(self.arguments[name] for name in self.param_names),
+                                    *(arguments[name] for name in self.param_names),
                                     config=self.run_config)
             except BaseException:
                 self.failed = True
@@ -3155,21 +3170,13 @@ class V41ResidentResources:
                 workspace["target_positions"][rank, row, :width] = torch.arange(
                     int(positions[index]), int(positions[index]) + width,
                     dtype=torch.int32)
-                if sampling_params and sampling_params[index].temperature > 0.0:
-                    params = sampling_params[index]
+                if sampling_params:
                     start = row * DSPARK_ROWS_PER_REQUEST
-                    sample_rows = slice(start, start + width)
-                    seed = zlib.crc32(request_id.encode()) if params.seed is None else params.seed
-                    vocab_size = resources.layout.vocab_size
-                    top_k = params.top_k if params.top_k is not None and params.top_k > 0 else vocab_size
-                    workspace["sampling_temperatures"][rank, sample_rows].fill_(max(params.temperature, 1e-5))
-                    workspace["sampling_top_ks"][rank, sample_rows].fill_(min(top_k, vocab_size))
-                    workspace["sampling_top_ps"][rank, sample_rows].fill_(params.top_p)
-                    workspace["sampling_seeds"][rank, sample_rows].fill_(int(seed) & 0x3FFFFFFF)
                     # Key each draw by the predicted token position, including
                     # positions that the verifier may revisit after a mismatch.
-                    workspace["sampling_positions"][rank, sample_rows] = torch.arange(
-                        positions[index] + 1, positions[index] + width + 1, dtype=torch.int32
+                    _stage_sampling(
+                        workspace, rank, slice(start, start + width), request_id, sampling_params[index],
+                        position=positions[index] + 1, width=width, vocab_size=resources.layout.vocab_size,
                     )
                 workspace["active_widths"][rank, row] = width
                 workspace["zero_prefill_tokens"][rank, row] = 0
@@ -3416,7 +3423,23 @@ class V41ResidentResources:
         if (self.closed or step is not self._step or step.phase != "prefill"
                 or self._prefill_fwd is None):
             raise ValueError("full prefill requires the active prefill step")
-        return self._prefill_fwd.run()
+        if not step.sampling_params:
+            return self._prefill_fwd.run()
+        if not all(name in self._prefill_fwd.arguments for name in _SAMPLING_INPUTS):
+            raise MissingCompositeInterface("V4.1 prefill requires the lib sampling inputs")
+        vocab_size = self.final.host.logits.shape[-1]
+        inputs = {name: getattr(self.final.host, name) for name in _SAMPLING_INPUTS}
+        inputs["sampling_temperatures"].zero_()
+        inputs["sampling_top_ks"].fill_(vocab_size)
+        inputs["sampling_top_ps"].fill_(1.0)
+        inputs["sampling_seeds"].zero_()
+        inputs["sampling_positions"].zero_()
+        for request, (rank, row) in zip(step.requests, self._output_rows.locations, strict=True):
+            params = step.sampling_params.get(request.request_id)
+            if params is not None and request.end == request.prompt_length:
+                _stage_sampling(inputs, rank, slice(row, row + 1), request.request_id, params,
+                                position=request.end, width=1, vocab_size=vocab_size)
+        return self._prefill_fwd.run(sampling_inputs=inputs)
 
     def bind_decode_fwd(self, program, param_names, run_config, counts_are_tensor):
         if (self.closed or self._decode_binding is not None or self._step is not None
@@ -3799,7 +3822,17 @@ class V41ResidentResources:
             try:
                 if step.phase == "prefill" and self.dspark_host_resources is not None:
                     self._retain_dspark_prefill(step)
-                return collect_final_logits(self.final.host.logits, self._output_rows)
+                logits = collect_final_logits(self.final.host.logits, self._output_rows)
+                if step.phase == "prefill" and step.sampling_params:
+                    sampled = torch.stack([
+                        self.final.host.sampled_ids[rank, row, 0]
+                        for rank, row in self._output_rows.locations
+                    ])
+                    terminal = torch.tensor(step.terminal_prefill)
+                    if bool(((sampled[terminal] < 0) | (sampled[terminal] >= logits.shape[-1])).any()):
+                        raise ValueError("V4.1 prefill returned an invalid sampled token")
+                    return PrefillResult(last_hidden=None, logits=logits, sampled_token_ids=sampled)
+                return logits
             finally:
                 self._step = self._inputs = self._group_counts = self._output_rows = None
 
