@@ -277,6 +277,7 @@ class ReplicaEngineCore:
             enable_prefix_cache=self.config.enable_prefix_cache,
             enable_chunk_prefill=self.config.enable_chunk_prefill,
             num_speculative_tokens=runtime.num_speculative_tokens,
+            supports_stochastic_speculation=self.config.sampling_capabilities().supports_stochastic_speculation,
             supports_chunked_prefill_with_speculation=(
                 runtime.supports_chunked_prefill_with_speculation
             ),

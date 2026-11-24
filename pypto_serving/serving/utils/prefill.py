@@ -13,7 +13,7 @@ from collections.abc import Callable, Sequence
 
 import torch
 
-from pypto_serving.config.types import KvAllocation, PrefillBatch, SamplingParams
+from pypto_serving.config.types import KvAllocation, PrefillBatch
 
 
 def pack_prefill_batch(
@@ -25,7 +25,6 @@ def pack_prefill_batch(
     device: str | torch.device,
     prompt_lens: Sequence[int] = (),
     prefix_cache_hit_tokens: Sequence[int] = (),
-    sampling_params: Sequence[SamplingParams] = (),
     embedding_lookup: Callable[[torch.Tensor], torch.Tensor] | None = None,
     allow_device_greedy_sampling: bool = False,
     allow_device_topk_sampling: bool = False,
@@ -64,7 +63,6 @@ def pack_prefill_batch(
         chunk_starts=list(chunk_starts),
         prompt_lens=list(prompt_lens) if prompt_lens else list(seq_lens),
         prefix_cache_hit_tokens=list(prefix_cache_hit_tokens),
-        sampling_params=list(sampling_params),
         allow_device_greedy_sampling=allow_device_greedy_sampling,
         allow_device_topk_sampling=allow_device_topk_sampling,
         kv_allocations=list(kv_allocations),

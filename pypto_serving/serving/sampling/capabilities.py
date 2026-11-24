@@ -19,6 +19,7 @@ class SamplingCapabilities:
     decode_stop_mask: Literal["host", "device"] = "host"
     honor_min_tokens: bool = True
     greedy_only: bool = False
+    supports_stochastic_speculation: bool = False
 
     def stop_mask_on_device(self, phase: Literal["prefill", "decode"]) -> bool:
         return getattr(self, f"{phase}_stop_mask") == "device"
@@ -32,11 +33,10 @@ def sampling_capabilities(executor_cls: str, num_speculative_tokens: int) -> Sam
         # The V4 MTP fused sampler does not yet accept a stop-token mask.
         return SamplingCapabilities(honor_min_tokens=num_speculative_tokens == 0)
     if executor_cls == "PyptoDeepSeekV41Executor":
-        # K=5 keeps speculative verification for greedy requests.  Stochastic
-        # requests use the same target composite with one active row, so the
-        # target device sampler can honor their policy without comparing draft
-        # tokens generated from a different distribution.
-        return SamplingCapabilities(honor_min_tokens=num_speculative_tokens == 0)
+        return SamplingCapabilities(
+            honor_min_tokens=num_speculative_tokens == 0,
+            supports_stochastic_speculation=num_speculative_tokens == 5,
+        )
     if executor_cls in ("PyptoQwen14BExecutor", "PyptoGlm53Executor"):
         return SamplingCapabilities()
     raise ValueError(f"sampling capabilities are not declared for {executor_cls!r}")

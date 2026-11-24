@@ -58,6 +58,7 @@ class SchedulerConfig:
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
     num_speculative_tokens: int = 0
+    supports_stochastic_speculation: bool = False
     supports_chunked_prefill_with_speculation: bool = True
     speculative_prefix_cache_replay_tokens: int = 0
     prefix_cache_replay_before_hit: bool = False
@@ -502,23 +503,13 @@ class Scheduler:
                 continue
 
             is_prefill = request.is_prefill
-            # _limit_scheduled_tokens bounded num_new by the remaining context;
-            # after the positive check above, this remainder cannot be negative.
-            speculative_tokens = (
-                min(
-                    self.config.num_speculative_tokens,
-                    self.config.max_seq_len - request.num_computed_tokens - num_new,
-                )
-                if not is_prefill and request.temperature <= 0.0
-                else 0
-            )
-            scheduled_tokens = num_new + speculative_tokens
+            scheduled = ScheduledRequest(request, num_new, is_prefill,
+                                         num_computed_tokens=request.num_computed_tokens)
+            scheduled_tokens = num_new + self._speculative_tokens_for(request, scheduled)
             if scheduled_tokens > token_budget:
                 running_to_keep.append(request)
                 continue
 
-            scheduled = ScheduledRequest(request, num_new, is_prefill,
-                                         num_computed_tokens=request.num_computed_tokens)
             if not self._try_allocate_request_blocks(request, scheduled_tokens, scheduled=scheduled):
                 preempted = self._preempt_lowest_priority(
                     request, scheduled_req_ids, num_scheduled_tokens, output
@@ -945,10 +936,11 @@ class Scheduler:
     ) -> int:
         """Extra tokens beyond the first that a sampling step may emit.
 
-        Mirrors the accounting ``schedule()`` uses when allocating blocks: only
-        greedy decode steps get speculative capacity.
+        The same bound is used for cache allocation and async reconciliation.
         """
-        if scheduled.is_prefill or request.temperature > 0.0:
+        if scheduled.is_prefill or (
+            request.temperature > 0.0 and not self.config.supports_stochastic_speculation
+        ):
             return 0
         # Use the dispatch snapshot: async advancement may already have changed
         # the live request. Never reserve KV or placeholders beyond the ceiling.
