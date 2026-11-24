@@ -214,6 +214,10 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         return self.runners[model.config.model_id].run_prefill(model, batch)
 
     @property
+    def supports_device_sampling(self) -> bool:
+        return True
+
+    @property
     def max_prefill_batch_size(self) -> int | None:
         if any(runner.runtime.num_speculative_tokens == 5 for runner in self.runners.values()):
             return 1

@@ -344,9 +344,6 @@ class ServingServer:
                 else defaults.ignore_eos
             ),
         )
-        validate = getattr(self.engine, "validate_generate_config", None)
-        if callable(validate):
-            validate(config)
         return config
 
     def prepare_completion(self, request):
