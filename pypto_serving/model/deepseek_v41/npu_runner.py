@@ -2350,7 +2350,7 @@ class PrefillMetadataResources:
                 f["full_logit_rows"][rank, slot] = rows_per_rank[rank] + len(request.token_ids) - 1
                 rows_per_rank[rank] += len(request.token_ids)
                 per_rank[rank] += 1
-            return counts
+            return counts, packed
 
     def full_arguments(self):
         if self.full_hidden_size is None:
@@ -3439,13 +3439,17 @@ class V41ResidentResources:
                 for partition in padding_partitions:
                     self.cache.reset_padding(partition)
             host = self.prefill_host if step.phase == "prefill" else self.decode_host
-            counts = (host.stage_full(dispatch_step, embeddings, self.engram_host)
-                      if step.phase == "prefill" and self._prefill_fwd is not None else
-                      host.stage(dispatch_step, self.engram_host) if host is not None else None)
-            input_runtime = self.decode_input if step.phase == "decode" else self.input
-            if input_runtime is None:
-                raise ValueError("decode requires its own TP-local input capacity")
-            state, inputs = input_runtime.stage(embeddings, dispatch_step)
+            if step.phase == "prefill" and self._prefill_fwd is not None:
+                # Full prefill binds its own embedding. Only the row mapping is
+                # consumed here; segmented residual and pre-mix uploads are unused.
+                counts, inputs = host.stage_full(dispatch_step, embeddings, self.engram_host)
+                state = LayerState(inputs.residual, inputs.pre_mix, "tp_local_token")
+            else:
+                counts = host.stage(dispatch_step, self.engram_host) if host is not None else None
+                input_runtime = self.decode_input if step.phase == "decode" else self.input
+                if input_runtime is None:
+                    raise ValueError("decode requires its own TP-local input capacity")
+                state, inputs = input_runtime.stage(embeddings, dispatch_step)
             if dispatch_step is not step:
                 inputs = replace(inputs, request_last_rows=inputs.request_last_rows[:len(step.requests)])
             self._output_rows = prepare_final_output_rows(
