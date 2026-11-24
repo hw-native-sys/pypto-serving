@@ -115,6 +115,8 @@ jobs:
       - name: Run Serving scheduler and worker CPU guards
         env:
           TORCH_DEVICE_BACKEND_AUTOLOAD: '0'
+          # SSD direct-I/O probes require a disk filesystem; /tmp can be tmpfs.
+          TMPDIR: ${{ runner.temp }}
         run: |
           source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
           cd "$GITHUB_WORKSPACE/dist-checkout"

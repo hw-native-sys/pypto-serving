@@ -35,6 +35,10 @@ class KVCacheCapacityError(RuntimeError):
     """Raised when a cache allocation cannot fit in the physical pools."""
 
 
+class KVCacheRestoreError(RuntimeError):
+    """A stopped external read failed; the request may fail without poisoning the owner."""
+
+
 def hash_block_tokens(parent_hash: bytes, token_ids: tuple[int, ...]) -> bytes:
     """Return a stable chained digest suitable for cross-process identity."""
     digest = hashlib.sha256()
@@ -1363,6 +1367,8 @@ class KvCacheManager:
         key = (partition, block.block_hash)
         if pool.hash_to_block.get(key) is block:
             del pool.hash_to_block[key]
+        if self.tiering is not None:
+            self.tiering.evicted(pool.spec.name, partition, block.block_hash)
         block.block_hash = None
 
     def _take_group_block(

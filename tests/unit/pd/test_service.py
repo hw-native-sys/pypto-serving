@@ -231,8 +231,11 @@ def test_cancel_and_unknown_cannot_release_unconfirmed_native_writes():
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('shutdown', [None, 'drain', 'timeout'])
-def test_cancelled_submit_ack_is_observed_until_native_completion(shutdown):
+@pytest.mark.parametrize('shutdown,cancel', [
+    (None, 'submit'), ('drain', 'submit'), ('timeout', 'submit'),
+    (None, None), ('drain', None), ('drain', 'wait'),
+])
+def test_submit_ack_is_observed_until_native_completion(shutdown, cancel):
     async def run():
         plan = handoff(128).plans[-1]
         job, native = digest(plan), Future()
@@ -252,15 +255,25 @@ def test_cancelled_submit_ack_is_observed_until_native_completion(shutdown):
         closing = None
         try:
             assert await asyncio.to_thread(accepted.wait, 2)
-            task.cancel()
+            if cancel == 'submit':
+                task.cancel()
             if shutdown == 'drain':
                 closing = asyncio.create_task(progress.close())
                 await asyncio.sleep(0)
                 with pytest.raises(TransferError, match='closing'):
                     await progress.call('submit', b'rejected')
             reply.set()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            if cancel == 'submit':
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                assert msgspec.msgpack.decode(await task)['job'] == job
+                if cancel == 'wait':
+                    waiter = asyncio.create_task(progress.wait(job))
+                    await asyncio.sleep(0)
+                    waiter.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await waiter
             assert job in runtime.jobs and job in progress.pending
             if shutdown == 'timeout':
                 progress.timeout = .05
@@ -270,7 +283,16 @@ def test_cancelled_submit_ack_is_observed_until_native_completion(shutdown):
                 return
             if closing is not None:
                 assert not closing.done()
+            waiter = (asyncio.create_task(progress.wait(job))
+                      if cancel is None and closing is not None else None)
             native.set_result(None)
+            if cancel is None:
+                if waiter is None:
+                    await progress.task  # Completion can precede wait(job).
+                    completion = await progress.wait(job)
+                else:
+                    completion = await waiter
+                assert completion.plan_digest == job
             for _ in range(100):
                 if not runtime.jobs and not progress.pending:
                     break

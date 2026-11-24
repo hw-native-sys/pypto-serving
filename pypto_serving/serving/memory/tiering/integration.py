@@ -50,6 +50,7 @@ class Session:
         self.metadata = context.Queue(maxsize=1)
         self.cache = None
         self._worker_started = False
+        self._archive_start = None
         self.trace = None
         self._loop = None
         self._failure = None
@@ -86,11 +87,18 @@ class Session:
                 or set(geometry["groups"]) != set(manager.group_names)):
             raise RuntimeError("offload worker/cache-manager geometry mismatch")
         self.trace = OffloadTrace.from_env()
-        backend = SimplerBackend(self.owners, geometry, self.pool.nbytes, trace=self.trace)
+        backend = SimplerBackend(self.owners, geometry, self.pool.nbytes, pool=self.pool, trace=self.trace)
         self._loop = asyncio.get_running_loop()
         self._failure = self._loop.create_future()
         self.cache = TieredCache(manager, backend, self.pool.nbytes, trace=self.trace, notify=self._notify)
         backend.set_notify(self._notify)
+        runtime = self.core.config.runtime_config
+        if runtime.kv_ssd_bytes:
+            from .archive import SSDArchive
+            self._archive_start = asyncio.create_task(self._start_archive(SSDArchive, runtime))
+            archive = await asyncio.shield(self._archive_start)
+            logger.info("kv_ssd_ready capacity_bytes=%d work_bytes=%d window_bytes=%d",
+                        runtime.kv_ssd_bytes, archive.work_bytes, archive.window_bytes)
         manager.tiering = self.cache
         if self.trace is not None:
             self.trace.emit("ready", capacity_bytes=self.pool.nbytes, ranks=geometry["ranks"],
@@ -98,6 +106,12 @@ class Session:
             self.trace.snapshot(self.cache, force=True)
         logger.info("kv_offload_ready backend=simpler capacity_bytes=%d ranks=%d tp=%d",
                     self.cache.tier.capacity, geometry["ranks"], geometry["tp"])
+
+    async def _start_archive(self, factory, runtime):
+        archive = await asyncio.to_thread(
+            factory, self.cache.tier, self.pool, runtime.kv_ssd_path, runtime.kv_ssd_bytes)
+        self.cache.add_store(archive)
+        return archive
 
     def _notify(self):
         with self._notify_lock:
@@ -147,6 +161,13 @@ class Session:
                 self.trace.close()
 
     async def _close(self):
+        if self._archive_start is not None:
+            try:
+                await asyncio.shield(self._archive_start)
+            except Exception:
+                # Construction failure is already reported by start(); retire
+                # the existing backend without abandoning its pool.
+                logger.exception("SSD initialization failed; closing initialized cache resources")
         if self.cache is None:
             if self._worker_started:
                 await asyncio.gather(*(asyncio.to_thread(owner.call, "stop") for owner in self.owners
@@ -162,6 +183,8 @@ class Session:
             while not self.cache.close_ready():
                 tier = self.cache.tier
                 progress = tier.used, len(tier.inflight), len(tier.retiring), len(self.cache.loads)
+                for store in self.cache.sources[1:]:
+                    progress += store.progress_token()
                 now = time.monotonic()
                 if progress != previous:
                     previous, deadline = progress, now + 120
@@ -171,7 +194,7 @@ class Session:
             drained = True
         finally:
             try:
-                await asyncio.to_thread(self.cache.backend.close)
+                await asyncio.to_thread(self.cache.close_storage if drained else self.cache.backend.close)
             except BaseException as error:
                 if drained:
                     self.cache.tier.error = error

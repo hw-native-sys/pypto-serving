@@ -345,6 +345,7 @@ class Progress:
     def __init__(self, channel, timeout, capacity):
         self.channel, self.timeout, self.capacity = channel, timeout, capacity
         self.pending = {}
+        self.waiting = set()
         self.task = None
         self.lock = asyncio.Lock()
         self.sequence = self.calls = 0
@@ -382,6 +383,8 @@ class Progress:
                     raise self.error
                 if self.closed or (not self.accepting and operation != "poll"):
                     raise TransferError("transfer observer is closing", uncertain=False)
+                if operation == "submit" and len(self.pending) >= self.capacity:
+                    raise TransferError("completion observer capacity exceeded", uncertain=False)
                 packet = msgspec.msgpack.encode((sequence, operation, payload))
                 if len(packet) > MAX_FRAME:
                     raise TransferError("transfer command exceeds frame limit", uncertain=False)
@@ -407,11 +410,15 @@ class Progress:
                             elif operation == "submit" and not self.closed:
                                 reply = msgspec.msgpack.decode(response.result())
                                 if "job" in reply:
-                                    self._track(reply["job"])
+                                    self._track(reply["job"], detached=True)
                         raise
                     except Exception as exc:
                         self._fail_channel(exc)
                         raise self.error from exc
+                if operation == "submit":
+                    reply = msgspec.msgpack.decode(result)
+                    if "job" in reply:
+                        self._track(reply["job"])
                 return result
             finally:
                 self.lock.release()
@@ -420,13 +427,14 @@ class Progress:
         finally:
             self.calls -= counted
 
-    def _track(self, job):
+    def _track(self, job, *, detached=False):
         if self.closed or job in self.pending or len(self.pending) >= self.capacity:
             raise TransferError("completion observer closed, full or duplicate waiter", uncertain=True)
         future = asyncio.get_running_loop().create_future()
         self.pending[job] = future
         def consume(done):
-            self.pending.pop(job, None)
+            if detached:
+                self.pending.pop(job, None)
             if not done.cancelled():
                 done.exception()
         future.add_done_callback(consume)
@@ -435,16 +443,27 @@ class Progress:
         return future
 
     async def wait(self, job):
-        future = self._track(job)
+        if job not in self.pending or job in self.waiting:
+            raise TransferError("unknown transfer job or duplicate waiter", uncertain=True)
+        future = self.pending[job]
+        self.waiting.add(job)
         try:
             return await asyncio.wait_for(asyncio.shield(future), self.timeout)
         except asyncio.TimeoutError as exc:
             raise TransferError("native completion deadline", uncertain=True) from exc
+        finally:
+            self.waiting.remove(job)
+            if future.done():
+                self.pending.pop(job, None)
+            else:
+                future.add_done_callback(lambda _: self.pending.pop(job, None))
 
     async def _observe(self):
         try:
-            while self.pending:
-                jobs = tuple(self.pending)
+            while True:
+                jobs = tuple(job for job, future in self.pending.items() if not future.done())
+                if not jobs:
+                    return
                 values = msgspec.msgpack.decode(await self.call("poll", msgspec.msgpack.encode(jobs)))
                 if isinstance(values, dict) or len(values) != len(jobs):
                     raise TransferError("completion reply correlation mismatch", uncertain=True)
