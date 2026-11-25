@@ -15,15 +15,15 @@ import math
 import time
 from dataclasses import dataclass, replace
 
+from pypto_serving.serving.agent_capacity import ReplicaKVLoad
+from pypto_serving.serving.agent_identity import AgentIdentity
+from pypto_serving.serving.agent_policy import ProgressTTLStrategy
+from pypto_serving.serving.agent_policy_config import ProgressTTLConfig
+from pypto_serving.serving.agent_policy_state import ProgramLifecycle
+from pypto_serving.serving.agent_progress import ProgressTTLFactors
+from pypto_serving.serving.agent_scheduler import AgentReplicaScheduler
 from pypto_serving.serving.memory.kv_cache import KVCacheCapacityObservation, KvCacheManager
 from pypto_serving.serving.sched.scheduler import Request, ScheduledRequest, Scheduler
-from pypto_serving.serving.agentinfer_core.scheduling.backend import BackendInfo, BackendPoolInfo, DpRankInfo
-from pypto_serving.serving.agentinfer_core.scheduling.identity import AgentIdentity
-from pypto_serving.serving.agentinfer_core.scheduling.lifecycle import ProgramLifecycle
-from pypto_serving.serving.agentinfer_core.scheduling.progress_ttl import (
-    ProgressTTLConfig, ProgressTTLMode, build_progress_ttl_strategy,
-)
-from pypto_serving.serving.agentinfer_core.scheduling.runtime import ProgramScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +105,6 @@ class AgentInferAdmission:
         self, dp_rank: int, scheduler: Scheduler, kv_cache_manager: KvCacheManager,
         options: AgentInferOptions | None = None, *, executor_cls: str | None = None,
     ) -> None:
-        self._backend_types = (BackendInfo, BackendPoolInfo, DpRankInfo)
         self._identity_type = AgentIdentity
         self._unknown_lifecycle = ProgramLifecycle.UNKNOWN
         self._lifecycle_type = ProgramLifecycle
@@ -135,7 +134,7 @@ class AgentInferAdmission:
         self._prefix_refresh_pending = False
         self._next_prefix_refresh_at: float | None = None
         # Keep the Qwen NPU calibration separate from the grouped-cache path.
-        # DeepSeek uses the upstream defaults until device timing is available.
+        # The grouped cache path uses the general calibration.
         qwen_cost = dict(
             ttl_prefill_model_intercept_seconds=0.0135,
             ttl_prefill_model_linear_seconds_per_1k_tokens=0.351,
@@ -145,7 +144,6 @@ class AgentInferAdmission:
             decode_step_seconds_per_context_token=8.6e-7,
         ) if not self.grouped else {}
         config = ProgressTTLConfig(
-            mode=ProgressTTLMode.ON,
             **qwen_cost,
             resume_wait_relax_seconds=self.options.resume_wait_relax_seconds,
             resume_wait_growth_reserve_fraction=self.options.resume_wait_growth_reserve_fraction,
@@ -171,16 +169,13 @@ class AgentInferAdmission:
             )
         if self.options.resume_capacity_ratio is not None:
             config = replace(config, resume_capacity_ratio=self.options.resume_capacity_ratio)
-        components = build_progress_ttl_strategy(
-            config, capacity_cost=self._capacity_cost,
-        )
         schedule_interval = (
             FAST_ADMISSION_SCHEDULE_INTERVAL_SECONDS
             if reserve_tokens or capacity_tokens >= 2 * full_batch_tokens
             else PRESSURE_ADMISSION_SCHEDULE_INTERVAL_SECONDS
         )
-        self.policy = ProgramScheduler(
-            components.strategy, components.initial_factors, self._backend_pool(),
+        self.policy = AgentReplicaScheduler(
+            ProgressTTLStrategy(config, capacity_cost=self._capacity_cost), ProgressTTLFactors(), self._replica_load(),
             schedule_interval_seconds=schedule_interval,
         )
         logger.info(
@@ -217,32 +212,15 @@ class AgentInferAdmission:
             return self.kv_cache_manager.observe_group_uncached_free_head_tokens(self._max_seq_len)
         return self.kv_cache_manager.observe_uncached_free_head_tokens()
 
-    def _backend_pool(self):
-        BackendInfo, BackendPoolInfo, DpRankInfo = self._backend_types
-        capacity = self._observe_capacity()
-        # Match upstream waiting demand: current contexts, including tracked
-        # Programs, without reserving every queued request's future decode budget.
-        native_waiting = sum(self._capacity_cost(request.num_tokens) for request in self.native.waiting)
-        now = time.monotonic()
-        return BackendPoolInfo(
-            backends=(BackendInfo(
-                backend_id=f"pypto-replica-{self.dp_rank}",
-                backend_url=f"embedded://pypto/{self.dp_rank}",
-                healthy=True,
-                dp_ranks=(DpRankInfo(
-                    dp_rank=self.dp_rank,
-                    healthy=True,
-                    schedulable=True,
-                    running_requests=len(self.native.running),
-                    waiting_requests=len(self.native.waiting),
-                    total_hbm_kv_tokens=capacity.total_tokens,
-                    used_hbm_kv_tokens=capacity.used_tokens,
-                    waiting_hbm_kv_tokens=native_waiting,
-                    uncached_free_head_hbm_kv_tokens=self._observe_uncached_free_head(),
-                ),),
-                observed_at_monotonic_s=now,
-            ),),
-            observed_at_monotonic_s=now,
+    def _replica_load(self) -> ReplicaKVLoad:
+        # Waiting demand counts the current context of every native request.
+        waiting_tokens = sum(self._capacity_cost(request.num_tokens) for request in self.native.waiting)
+        return ReplicaKVLoad(
+            rank=self.dp_rank,
+            capacity=self._observe_capacity(),
+            waiting_tokens=waiting_tokens,
+            waiting_requests=len(self.native.waiting),
+            uncached_free_head_tokens=self._observe_uncached_free_head(),
         )
 
     def arrive(self, request: Request, identity: str | AgentIdentity) -> bool:
@@ -264,7 +242,7 @@ class AgentInferAdmission:
                 request.request_id,
                 metadata,
                 request.num_prompt_tokens,
-                self._backend_pool(),
+                self._replica_load(),
                 request,
                 native_fallback=native_fallback,
             )
@@ -290,7 +268,7 @@ class AgentInferAdmission:
             self._refresh_retained_prefix_cache()
             self._prefix_refresh_pending = self._next_prefix_refresh_at is not None
         if self.policy.needs_schedule_cycle(now):
-            self.policy.schedule_cycle(self._backend_pool())
+            self.policy.schedule_cycle(self._replica_load())
         for request_id, retained in self._retained.items():
             if (
                 now - retained.arrived_at >= MAX_ADMISSION_WAIT_SECONDS
@@ -309,7 +287,7 @@ class AgentInferAdmission:
         return admitted
 
     def _refresh_retained_prefix_cache(self) -> None:
-        """Mirror the upstream completion-triggered lookup without acquiring KV references."""
+        """Refresh prefix estimates after completion without acquiring KV references."""
         for request_id, request in self.policy.prefix_cache_candidates():
             self._observe_retained_prefix(request_id, request)
 
@@ -329,8 +307,7 @@ class AgentInferAdmission:
         except Exception:
             logger.exception("AgentInfer retained-prefix observation failed for %s", request_id)
             return
-        # Upstream uses all immediately reusable tokens for this segment estimate,
-        # without attributing residual self KV to a different Program.
+        # Retained requests can reuse any cached prefix and have no acquired KV references yet.
         self.policy.on_prefix_cache_observation(request_id, prefix.cached_tokens)
 
     def native_scheduled(self, scheduled: ScheduledRequest) -> None:

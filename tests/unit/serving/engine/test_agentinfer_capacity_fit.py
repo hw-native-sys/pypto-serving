@@ -12,13 +12,12 @@ from random import Random
 
 import pytest
 
-from pypto_serving.serving.agentinfer_core.scheduling import (
+from pypto_serving.serving import agent_policy as strategy_module
+from pypto_serving.serving.agent_policy import ProgressTTLStrategy
+from pypto_serving.serving.agent_policy_config import ProgressTTLConfig
+from pypto_serving.serving.agent_policy_state import (
     ProgramRef, ProgramState, ProgramStatus, ProgramTokenObservation, ProgramView,
 )
-from pypto_serving.serving.agentinfer_core.scheduling.progress_ttl import (
-    ProgressTTLConfig, build_progress_ttl_strategy,
-)
-from pypto_serving.serving.agentinfer_core.scheduling.progress_ttl import strategy as strategy_module
 
 
 def _program(name: str, tokens: int) -> ProgramView:
@@ -31,7 +30,7 @@ def _program(name: str, tokens: int) -> ProgramView:
 @pytest.mark.parametrize("seed", range(10))
 @pytest.mark.parametrize("extra_relief", [0, 5])
 def test_small_capacity_fits_preserve_exact_selection(seed, extra_relief):
-    strategy = build_progress_ttl_strategy(ProgressTTLConfig(decode_buffer_tokens=0)).strategy
+    strategy = ProgressTTLStrategy(ProgressTTLConfig(decode_buffer_tokens=0))
     rng = Random(seed)
     programs = [_program(f"program-{i}", rng.randrange(30)) for i in range(8)]
     deficit = rng.randrange(1, 150)
@@ -52,7 +51,7 @@ def test_small_capacity_fits_preserve_exact_selection(seed, extra_relief):
 @pytest.mark.parametrize("extra_relief", [0, 17])
 def test_large_capacity_fit_fallback_covers_deficit_deterministically(monkeypatch, extra_relief):
     monkeypatch.setattr(strategy_module, "_CAPACITY_FIT_SEARCH_STEPS", 0)
-    strategy = build_progress_ttl_strategy(ProgressTTLConfig(decode_buffer_tokens=0)).strategy
+    strategy = ProgressTTLStrategy(ProgressTTLConfig(decode_buffer_tokens=0))
     rng = Random(0)
     programs = [_program(f"program-{i:03}", rng.randrange(1000, 5000)) for i in range(128)]
     programs.append(_program("zero-relief", 0))
@@ -73,7 +72,7 @@ def test_large_capacity_fit_fallback_covers_deficit_deterministically(monkeypatc
 
 def test_capacity_fit_keeps_better_exact_cover_when_budget_runs_out(monkeypatch):
     monkeypatch.setattr(strategy_module, "_CAPACITY_FIT_SEARCH_STEPS", 1)
-    strategy = build_progress_ttl_strategy(ProgressTTLConfig(decode_buffer_tokens=0)).strategy
+    strategy = ProgressTTLStrategy(ProgressTTLConfig(decode_buffer_tokens=0))
     programs = [_program("a", 10), _program("b", 6), _program("c", 4)]
 
     assert strategy._select_capacity_fit(programs, 10) == (programs[0],)
@@ -83,7 +82,7 @@ def test_capacity_fit_keeps_better_exact_cover_when_budget_runs_out(monkeypatch)
 @pytest.mark.parametrize("deficit, expected", [(0, ()), (-1, ()), (10, None)])
 def test_capacity_fit_empty_and_insufficient_relief(monkeypatch, budget, deficit, expected):
     monkeypatch.setattr(strategy_module, "_CAPACITY_FIT_SEARCH_STEPS", budget)
-    strategy = build_progress_ttl_strategy(ProgressTTLConfig(decode_buffer_tokens=0)).strategy
+    strategy = ProgressTTLStrategy(ProgressTTLConfig(decode_buffer_tokens=0))
 
     assert strategy._select_capacity_fit([], deficit) == expected
     assert strategy._select_capacity_fit([_program("zero", 0), _program("small", 3)], deficit) == expected
@@ -91,7 +90,7 @@ def test_capacity_fit_empty_and_insufficient_relief(monkeypatch, budget, deficit
 
 def test_capacity_fit_fallback_preserves_pause_priority_layers(monkeypatch):
     monkeypatch.setattr(strategy_module, "_CAPACITY_FIT_SEARCH_STEPS", 0)
-    strategy = build_progress_ttl_strategy(ProgressTTLConfig(decode_buffer_tokens=0)).strategy
+    strategy = ProgressTTLStrategy(ProgressTTLConfig(decode_buffer_tokens=0))
     older = _program("older", 3)
     younger = [_program("large", 10), _program("exact", 7), _program("small", 3)]
 

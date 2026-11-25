@@ -19,9 +19,9 @@ from pypto_serving.config.types import GenerateConfig, KVCacheGroupSpec, KVCache
 from pypto_serving.serving.agentinfer_admission import (
     MAX_ADMISSION_WAIT_SECONDS, AgentInferAdmission, AgentInferOptions,
 )
-from pypto_serving.serving.agentinfer_core.scheduling.domain import ProgramStatus
-from pypto_serving.serving.agentinfer_core.scheduling.identity import AgentIdentity
-from pypto_serving.serving.agentinfer_core.scheduling.program_registry import ProgramRegistry
+from pypto_serving.serving.agent_policy_state import ProgramStatus
+from pypto_serving.serving.agent_identity import AgentIdentity
+from pypto_serving.serving.agent_sessions import AgentSessionRegistry
 from pypto_serving.serving.engine.async_engine import EngineConfig, ReplicaEngineCore
 from pypto_serving.serving.memory.kv_cache import KVCacheCapacityObservation, KvCacheManager
 from pypto_serving.serving.sched.scheduler import Request, Scheduler, SchedulerConfig
@@ -46,6 +46,27 @@ def test_enforce_tracks_immediate_native_request_and_completion() -> None:
     admission.complete(request)
     assert admission.policy.retained_request_count == 0
     assert admission._sessions == {}
+
+
+def test_direct_admission_privilege_expires_on_first_poll_after_ttl(monkeypatch) -> None:
+    now = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    admission = _admission()
+    identity = AgentIdentity(program_id="task-a:lead", task_id="task-a")
+    request = Request("first", list(range(64)), max_new_tokens=20)
+    assert admission.arrive(request, identity)
+    admission.native.add_request(request)
+
+    policy = admission.policy
+    ref = policy.registry.current_ref(identity.program_id)
+    assert policy.strategy_factors.for_program(ref).is_privileged
+
+    now[0] += policy.strategy.config.privileged_ttl_seconds
+    admission.poll()
+
+    factors = policy.strategy_factors.for_program(ref)
+    assert factors.privilege_ttl_expired
+    assert not factors.is_privileged
 
 
 def test_admission_receives_full_agent_lineage() -> None:
@@ -288,13 +309,14 @@ def test_prefix_observation_is_not_overwritten_by_decode_or_later_prefill() -> N
     assert admission._prefix_observed == set()
 
 
-def test_configured_force_resume_uses_original_policy_before_fallback(monkeypatch) -> None:
+def test_configured_force_resume_uses_original_policy_before_fallback(monkeypatch, caplog) -> None:
     now = [100.0]
     monkeypatch.setattr(time, "monotonic", lambda: now[0])
     manager = KvCacheManager(num_blocks=64, block_size=16)
     native = Scheduler(SchedulerConfig(), manager)
     admission = AgentInferAdmission(0, native, manager, AgentInferOptions(
         force_resume_timeout_min_seconds=1, force_resume_timeout_max_seconds=3,
+        resume_capacity_ratio=0.75,
     ))
     request = Request("held", list(range(1200)), max_new_tokens=16)
     assert not admission.arrive(request, "session-a")
@@ -303,6 +325,8 @@ def test_configured_force_resume_uses_original_policy_before_fallback(monkeypatc
     assert admission.poll() == []
     now[0] = 103.1
     assert admission.poll() == [request]
+    assert "waited_seconds=3.1" in caplog.text
+    assert "remaining_tokens=768 physical_remaining_tokens=1024" in caplog.text
     assert admission.poll() == []
     assert admission._sessions == {"held": "session-a"}
     assert admission.retained_request_ids == ()
@@ -610,8 +634,28 @@ def test_late_terminal_from_previous_round_cannot_release_completed_new_round():
     assert admission.policy.registry.current_ref("session-a") is None
 
 
+def test_reparented_session_blocks_only_its_current_parent():
+    registry = AgentSessionRegistry()
+    first, _ = registry.materialize(AgentIdentity(program_id="first"))
+    child, _ = registry.materialize(AgentIdentity(
+        program_id="child", parent_program_id="first", blocks_parent=True,
+    ))
+    assert first.blocked_on_child
+
+    registry.materialize(AgentIdentity(program_id="child", parent_program_id="second", blocks_parent=True))
+    assert not first.blocked_on_child
+    second, _ = registry.materialize(AgentIdentity(program_id="second"))
+    assert second.blocked_on_child
+
+    registry.release(first.ref)
+    assert child.parent_program_id == "second"
+    registry.release(second.ref)
+    assert child.parent_program_id is None
+    assert not child.blocks_parent
+
+
 def test_released_program_generations_do_not_accumulate_per_session():
-    registry = ProgramRegistry()
+    registry = AgentSessionRegistry()
     first, created = registry.materialize(AgentIdentity(program_id="session-0"))
     assert created
     assert registry.release(first.ref) is first
@@ -636,9 +680,9 @@ def test_native_waiting_demand_uses_current_context_without_future_decode_budget
     assert admission.arrive(tracked, "session-a")
     admission.native.add_request(tracked)
     admission.native.add_request(plain)
-    rank = admission._backend_pool().backends[0].dp_ranks[0]
-    assert rank.waiting_requests == 2
-    assert rank.waiting_hbm_kv_tokens == 6
+    load = admission._replica_load()
+    assert load.waiting_requests == 2
+    assert load.waiting_tokens == 6
 
 
 def test_enforce_requires_supported_model_and_prefix_cache() -> None:
@@ -665,8 +709,8 @@ def test_deepseek_k1_grouped_cache_reaches_agentinfer_policy(monkeypatch) -> Non
     core.kv_cache_manager.init_groups(groups, max_batch_size=2)
     admission = AgentInferAdmission(0, core.scheduler, core.kv_cache_manager)
     assert admission.grouped
-    rank = admission._backend_pool().backends[0].dp_ranks[0]
-    assert (rank.total_hbm_kv_tokens, rank.used_hbm_kv_tokens) == (32, 0)
+    load = admission._replica_load()
+    assert (load.capacity.total_tokens, load.capacity.used_tokens) == (32, 0)
     request = Request("deepseek", [1, 2, 3], max_new_tokens=1)
     assert admission.arrive(request, "session-deepseek")
     assert admission.policy.strategy._capacity_cost(1) == 2
@@ -741,13 +785,13 @@ def test_dspark_grouped_cache_reaches_agentinfer_policy(num_speculative_tokens: 
 
 
 def test_enforce_uses_bundled_scheduler_without_external_package() -> None:
-    from pypto_serving.serving.agentinfer_core.scheduling.runtime import ProgramScheduler
+    from pypto_serving.serving.agent_scheduler import AgentReplicaScheduler
 
     core = ReplicaEngineCore(
         EngineConfig(agentinfer_mode="enforce"),
         SimpleNamespace(eos_token_id=0),
     )
-    assert ProgramScheduler.__module__.startswith("pypto_serving.serving.agentinfer_core")
+    assert isinstance(_admission().policy, AgentReplicaScheduler)
     assert core._agentinfer_admission is None
 
 

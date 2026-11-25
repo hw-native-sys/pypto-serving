@@ -9,7 +9,6 @@ description = "Local inference serving with PyPTO kernels on Ascend NPUs"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "LicenseRef-CANN-2.0"
-license-files = ["third_party/agentinfer/LICENSE"]
 authors = [
   { name = "PyPTO Contributors" },
 ]

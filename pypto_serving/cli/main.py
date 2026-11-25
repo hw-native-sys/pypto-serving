@@ -260,7 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--agentinfer-mode",
         choices=("disabled", "enforce"),
         default="disabled",
-        help="AgentInfer mode (default: disabled). Enforce uses the bundled scheduling policy.",
+        help="AgentInfer mode (default: disabled). Enforce enables adaptive agent admission.",
     )
     parser.add_argument(
         "--agentinfer-config", type=json.loads, default={},

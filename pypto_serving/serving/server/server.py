@@ -21,7 +21,7 @@ from typing import Literal
 
 from pypto_serving.config.types import GenerateConfig
 from pypto_serving.model.model_family import read_model_config
-from pypto_serving.serving.agentinfer_core.scheduling.identity import AgentIdentity, MetadataError, parse_agent_identity
+from pypto_serving.serving.agent_identity import AgentIdentity, MetadataError, parse_agent_identity
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.constraints.provider import XGrammarProvider
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput

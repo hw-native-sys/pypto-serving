@@ -46,10 +46,9 @@ curl --noproxy '*' http://127.0.0.1:8899/v1/chat/completions \
 
 ## AgentInfer Admission
 
-Add `--agentinfer-mode enforce` to enable AgentInfer admission. The scheduling
-core is adapted from [AgentInfer](https://github.com/openJiuwen-ai/agent-infer)
-under Apache-2.0 (see `third_party/agentinfer/LICENSE`) and integrated with PyPTO
-Serving's native scheduler and KV cache.
+Add `--agentinfer-mode enforce` to enable adaptive agent admission in PyPTO
+Serving. The policy uses native KV cache observations to decide when to retain
+a session and when to resume queued work.
 It supports one serving replica with prefix caching: Qwen, standard DeepSeek V4
 MTP K=1, or DeepSeek V4 DSpark K=0/K=7. PD deployments, multiple replicas, and
 DeepSeek V4.1 are not supported. The default mode is `disabled`.

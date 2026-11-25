@@ -25,7 +25,7 @@ from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
 from pypto_serving.observability import InMemoryStatLogger, IterationStats, SchedulerStats
 from pypto_serving.serving.agentinfer_admission import AgentInferAdmission, AgentInferOptions
-from pypto_serving.serving.agentinfer_core.scheduling.identity import AgentIdentity
+from pypto_serving.serving.agent_identity import AgentIdentity
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.reasoning import (
