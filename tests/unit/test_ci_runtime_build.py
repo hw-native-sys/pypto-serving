@@ -7,14 +7,18 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Execute the shared build shell with pip/process leaves, without installing anything."""
+"""Exercise the shared CI setup steps in temporary job environments."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import re
+import shutil
 import subprocess
 import sys
+from zipfile import ZipFile
 
 import pytest
 import yaml
@@ -86,6 +90,54 @@ if name == "pip" and os.environ["PYPTO_SRC"] + "/runtime" in sys.argv[1:]:
 
 def test_all_shared_setup_callers_have_platform_coverage():
     assert CALLERS.keys() == EXPECTED.keys()
+
+
+def test_cached_ptoas_wheel_wins_over_same_version_on_pythonpath(tmp_path):
+    python = sys.executable if sys.version_info[:2] == (3, 10) else shutil.which("python3.10")
+    if not python:
+        pytest.skip("the CI wheel requires CPython 3.10")
+
+    version = "0.72"
+    info = f"ptoas-{version}.dist-info"
+    metadata = f"Metadata-Version: 2.1\nName: ptoas\nVersion: {version}\n"
+    cann = tmp_path / "cann"
+    (cann / info).mkdir(parents=True)
+    (cann / info / "METADATA").write_text(metadata)
+    (cann / "ptoas").mkdir()
+    (cann / "ptoas" / "__init__.py").write_text("")
+
+    arch = platform.machine()
+    tag = f"cp310-cp310-manylinux_2_34_{arch}"
+    wheel = tmp_path / f"ptoas-{version}-{tag}.whl"
+    with ZipFile(wheel, "w") as archive:
+        archive.writestr("ptoas/__init__.py", "def main():\n    print(__file__)\n")
+        archive.writestr(f"{info}/METADATA", metadata)
+        archive.writestr(f"{info}/WHEEL", f"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: {tag}\n")
+        archive.writestr(f"{info}/entry_points.txt", "[console_scripts]\nptoas = ptoas:main\n")
+        records = [*archive.namelist(), f"{info}/RECORD"]
+        archive.writestr(f"{info}/RECORD", "".join(f"{name},,\n" for name in records))
+
+    job = tmp_path / "job"
+    subprocess.run([python, "-I", "-m", "venv", "--without-pip", str(job)], check=True)
+    (tmp_path / "activate.sh").write_text(
+        'source job/bin/activate\nexport PYTHONPATH="$PWD/cann${PYTHONPATH:+:$PYTHONPATH}"\n'
+    )
+    root = tmp_path / "ptoas-bin"
+    install = next(step for step in ACTION["runs"]["steps"]
+                   if step.get("name") == "Install ptoas (local cache)")
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", install["run"]], cwd=tmp_path,
+        env={
+            "PATH": os.defpath, "HOME": str(tmp_path), "PIP_NO_INDEX": "1",
+            "PTOAS_ROOT": str(root), "PTOAS_CACHE_DIR": str(tmp_path),
+            "PTOAS_ARCH": arch, "PTOAS_VERSION": f"v{version}",
+            "PTOAS_SHA256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+        },
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    # The wheel's CLI prints the imported module path after CI re-sources activate.sh.
+    assert Path(result.stdout.splitlines()[-1]).is_relative_to(root)
 
 
 @pytest.mark.parametrize("platform,ci_job", [("a2a3", "unit-tests"), ("a5", "v41-a5-smoke")])
