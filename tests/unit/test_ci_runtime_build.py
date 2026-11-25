@@ -26,8 +26,8 @@ BUILD = next(step for step in ACTION["runs"]["steps"]
 CHECK = next(step for step in ACTION["runs"]["steps"]
              if step.get("name") == "Check runner config and derive cache paths")
 EXPECTED = {
-    ("serving-guard-a2a3.yml", "guard"): "a2a3",
-    ("serving-guard-a5.yml", "guard"): "a5",
+    ("ci.yml", "unit-tests"): "a2a3",
+    ("ci.yml", "v41-a5-smoke"): "a5",
     ("daily_ci.yml", "dspark-performance"): "a2a3",
     ("daily_v41_a5.yml", "v41-performance"): "a5",
 }
@@ -89,22 +89,25 @@ def test_all_shared_setup_callers_have_platform_coverage():
 
 
 @pytest.mark.parametrize("platform,ci_job", [("a2a3", "unit-tests"), ("a5", "v41-a5-smoke")])
-def test_serving_ci_calls_the_same_guard_as_downstream(platform, ci_job):
-    workflows = ROOT / ".github/workflows"
-    caller = yaml.safe_load((workflows / "ci.yml").read_text())["jobs"][ci_job]
-    filename = f"serving-guard-{platform}.yml"
-    assert caller["uses"] == f"./.github/workflows/{filename}"
-    guard = yaml.safe_load((workflows / filename).read_text())["jobs"]["guard"]
-    setup = CALLERS[(filename, "guard")]["with"]
-    assert setup["pypto-revision"] == "${{ inputs.pypto-revision }}"
-    assert setup["pypto-repository"] == "${{ inputs.pypto-repository }}"
+def test_external_platform_selection_preserves_native_job_names(platform, ci_job):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    jobs = workflow["jobs"]
+    assert set(jobs) == {"pre-commit", "unit-tests", "v41-a5-smoke"}
+    job = jobs[ci_job]
+    assert "name" not in job and "uses" not in job
+    assert jobs["pre-commit"]["if"] == "inputs.platform == ''"
+    assert job["if"] == f"inputs.platform == '' || inputs.platform == '{platform}'"
+    call = workflow[True]["workflow_call"]
+    assert call["outputs"][f"{platform}-result"]["value"] == "${{ jobs." + ci_job + ".result }}"
+    setup = CALLERS[("ci.yml", ci_job)]["with"]
+    assert re.fullmatch(r"\$\{\{ inputs.pypto-revision \|\| '[a-f0-9]{40}' \}\}", setup["pypto-revision"])
     # A cross-repository call has the PyPTO caller in github.repository.
     # The action bootstrap and both serving checkout attempts need the callee.
     checkout_steps = [
         step for step in ACTION["runs"]["steps"] if step.get("uses", "").startswith("actions/checkout@")
     ]
     assert len(checkout_steps) == 2
-    for checkout in [guard["steps"][0], *checkout_steps]:
+    for checkout in [job["steps"][0], *checkout_steps]:
         assert checkout["with"]["repository"] == "${{ job.workflow_repository }}"
         assert checkout["with"]["ref"] == "${{ job.workflow_sha }}"
 
