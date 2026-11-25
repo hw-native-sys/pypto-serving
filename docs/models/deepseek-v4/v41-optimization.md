@@ -1,54 +1,49 @@
-# DeepSeek V4.1-Flash 优化记录
+# DeepSeek V4.1-Flash prefill windows and drafter RoPE tables
 
-本页集中记录 V4.1 的优化方向、采用决定和实测结果。后续实验按日期追加，注明所测版本、工作负载、正确性检查以及采用或放弃的依据。早期 CPU Engram 与常驻 decode 缓冲区的设计见[开发者记录](../../developer-guide/v41-engram-decode-optimization.md)。
+## Sliding-window indices during prefill
 
-## 2026-11-23 · 四卡 DSpark K5
+For a prefill segment with scratch storage and more than one query token,
+`prepare_swa_window_metadata` builds one sequence of cache addresses. The
+sequence starts with the visible history in the ring and continues with the
+current tokens in scratch storage. Adjacent queries share most of these
+addresses in their 128-token causal windows.
 
-本轮保留方向 1、4、5。Serving 负责 prefill 元数据与 RoPE 绑定。配套使用 Lib #1916 时，TP1 直接使用动态行数验证头。[Serving #355](https://github.com/hw-native-sys/pypto-serving/pull/355) · [Lib #1916](https://github.com/hw-native-sys/pypto-lib/pull/1916)
+Short windows at the beginning are left-aligned and padded with `-1`.
+Once a full window is available, each subsequent query takes a 128-entry
+slice starting one position later. The final window of up to 128 scratch
+entries carries the destinations used to restore the ring. Single-token
+segments and segments without scratch storage use the existing per-query path.
 
-### 当前实现与 chunk 512 验证
+## Resident RoPE tables during DSpark decode
 
-Serving 通过 Lib 的标准入口 `l3_decode_fwd_dspark` 注册一张 recurrent decode 图。在 Lib #1916 中，TP1 默认且仅使用动态行数，无需环境开关。每个 rank 读取自己的 `attention_num_tokens`，按 16 行向上对齐后投影，再按有效行数采样。空 rank 保留一个占位采样行。K5 下，一个请求对应 6 个位置；同一 rank 上 1、2、3 个请求分别投影 16、16、32 行。Lib 独立入口在 TP>1 时取同一 TP 组内最大的有效行数，再按 16 行向上对齐，使各个词表分片使用相同的通信步长。采样仍使用各 rank 自己的有效行数。TP2 双卡验证中，两个 rank 的有效行数为 0、18 时，投影从固定 80 行缩至 32 行，有效输出与参考结果逐元素一致。Serving 的服务入口当前仅支持 TP1。下表使用改为唯一入口前的动态实现测得。
+The worker uploads the drafter's cosine and sine tables during initialization.
+When recurrent decode receives those same two host tensor objects, it binds
+the resident device tables directly. If either input is a custom tensor, or
+resident DSpark buffers are unavailable, decode binds both supplied inputs.
+Both optimizations are selected automatically when their conditions hold.
 
-以下均为四卡 TP1/DP4/EP4、固定 K5、chunk 512 的请求中位数。方向 1、4 在各组均开启，所有对照使用相同卡组和权重／采样 ABI 适配器。串行比较复用了同配置已有标杆，各版本完整预热 16 题后再测这 16 题。并发比较各启动一次，将相同的 9 个请求同时提交，包含批次内等待时间。
+## Performance and scope
 
-| 负载 | 验证头 | TTFT (ms) | TPOT (ms/token) |
-|---|---|---:|---:|
-| 单请求 | 完整头 | 753.78 | 19.46 |
-| 单请求 | 早期固定小头 | 748.41 | 19.12 |
-| 单请求 | 动态头 | 751.11 | 19.57 |
-| 9 请求并发 | 完整头 | 8283.98 | 59.43 |
-| 9 请求并发 | 动态头 | 8356.03 | 56.93 |
+On four Ascend 950DT devices with DSpark K5 and prefill chunk 128, reusing
+window addresses reduced median cumulative address preparation per request
+from 46.20 to 9.86 ms. Median time to first token (TTFT) fell from 970.05 to
+957.38 ms; 14 of 16 prompts had lower TTFT. All 288 CPU metadata comparisons
+matched the baseline.
 
-动态头的单请求 TPOT 比早期固定小头高 0.45 ms/token；与完整头的逐题配对差值区间跨零。9 请求并发时比完整头低 2.50 ms/token（4.2%），TTFT 高 72.05 ms。单请求 16/16、并发 9/9 的输入、输出 token IDs、停止原因和逐轮草稿计数分别与同负载的完整头一致。并发实测覆盖每 rank 最多 3 个请求。另一次 12 请求实验在 prefill 回放起点校验处失败，因此只报告完成的 9 请求对照。
+In a separate run, resident RoPE binding reduced median time per output token
+after the first (TPOT) from 27.13 to 26.48 ms/token. The paired median change
+was -0.15 ms/token, with a 95% interval from -1.31 to +1.05. This establishes
+that the binding avoids resupplying the original tables; the measurements
+leave the size and direction of its latency effect uncertain.
 
-### 五个方向与取舍（早期固定头实验）
+The dynamic verification head belongs to the companion Lib change. Both
+arms of its chunk-512 comparison used the Serving optimizations above.
+At nine concurrent requests, the dynamic head reduced median TPOT from
+59.43 to 56.93 ms/token and increased median TTFT from 8283.98 to
+8356.03 ms. For a deployment with both first-token and decode latency
+requirements, compare both metrics at its expected concurrency. A combined
+end-to-end gain for the two Serving changes has yet to be established under
+matched conditions.
 
-下表是 **chunk 128** 的独立实验。每行给出该实验基线与候选的请求中位数，单位依次为 ms 和 ms/token。第 1～4 项的 Serving 共同基线是 `37578bb`，第 5 项在同一版本上切换完整头与小头。
-
-| 方向 | 实现与决定 | TTFT 前 → 后 | TPOT 前 → 后 | 依据 |
-|---|---|---:|---:|---|
-| 1 · Prefill 滑动窗口地址 | **保留**。一次生成 cache 地址序列，让相邻 query 复用重叠的因果窗口。 | 970.05 → 957.38 | 26.27 → 26.11 | 地址准备累计耗时从 46.20 降至 9.86 ms。逐题配对的 TTFT 中位数快 31.42 ms，16 题中 14 题更快。288 组 CPU 元数据逐元素一致。 |
-| 2 · Prefill 压缩 KV 页地址 | **舍弃**。实验将 C1A/C2A 写地址和 RoPE 位置改为张量批量生成。 | 1001.26 → 999.02 | 26.13 → 26.61 | 地址准备从 8.95 降至 3.14 ms，576 组元数据一致，但端到端 TTFT、TPOT 的配对区间均跨零。局部节省不足以支持合入。 |
-| 3 · Prefill 复用 packed embedding | **舍弃**。实验让相同拓扑的元数据准备和输入上传共享一次打包。 | 996.39 → 994.05 | 26.05 → 26.88 | begin_step 的逐题配对中位数快 13.25 ms，但 TTFT、TPOT 的配对区间均跨零，未观察到稳定的整网收益。 |
-| 4 · Decode 复用 drafter RoPE 表 | **保留**。当 cos、sin 都是启动时上传的原始张量，直接绑定常驻设备表。自定义表沿用原有路径。 | 1026.73 → 1020.91 | 27.13 → 26.48 | 避免重复传入相同表，保留自定义输入语义。配对 TPOT 差值为 −0.15 ms/token，95% 区间为 −1.31 至 +1.05，独立收益仍有不确定性。 |
-| 5 · 单请求 K5 小验证头 | **早期方案，已改用动态头**。当时由 Serving 在完整图和固定小图之间选择。 | 1038.18 → 1085.35 | 31.40 → 28.20 | 合并样本的 TPOT 较低，但 ABBA 两对比较方向相反，TTFT 中位数升高。额外图增加启动和常驻开销，因此默认关闭。 |
-
-早期固定头实验使用 `PYPTO_V41_DSPARK_HEAD_BUCKET=1` 和当时的 Lib。TP1、K5 下，所有 DP rank 的第 1 行及以后均无活跃请求时可选小图，包含空 rank；第 0 行可引用任意有效 KV slot。任一 rank 的后续行活跃时，所有 rank 使用完整图。本次容量下，每 rank 的小图投影 16 个填充后的行、采样 6 行，完整图分别为 80 行和 72 行。
-
-另一次 **1+2+3** 的 prefill 组合实验测得 TTFT 1027.56 → 967.90 ms。它使用完整 decode 验证头，不能用于估计保留组合 **1+4+5** 的收益。
-
-### 早期固定小头组合的 chunk 512 整网结果
-
-四张 Ascend 950DT，TP1/DP4/EP4，单并发，固定 DSpark K5，greedy。两轮使用同一卡组，每轮独立启动，预热第一题，再运行相同的 16 道 GSM8K 题。输入 603～684 tokens，输出上限 256，关闭 prefix caching，Torch intra-op 为 1。TTFT 从请求开始计到首个非空流式输出，每题 TPOT =（末 token 到达时间 − 首 token 到达时间）/（输出 token 数 − 1）。下表均为正式请求中位数。
-
-| 版本与轮次 | 请求数 | TTFT (ms) | TPOT (ms/token) | 接受草稿 / 提出草稿 |
-|---|---:|---:|---:|---:|
-| 1+4+5 第一轮 | 16 | 717.77 | 19.28 | 1050 / 2235 |
-| 1+4+5 第二轮 | 16 | 737.02 | 19.35 | 1050 / 2235 |
-| 1+4+5 合并 | 32 | 730.84 | 19.31 | 2100 / 4470（46.98%） |
-| 官方历史基线，Serving `37578bb`、Lib `eac6fb1` | 32 | 760.46 | 19.61 | 2080 / 4510（46.12%） |
-
-组合实测取自压缩提交前的 Serving `c75ce52` 和 Lib `00deb150` 的验证头图。Prefill 与 bootstrap 使用 Serving 锁定的 Lib 图，测试适配器补齐验证头所需的 FP8 权重、scale 和采样输入。两轮均确认选中小头，逐题输出 token IDs、停止原因和逐轮草稿接受序列一致，每轮输出 1493 tokens。
-
-官方基线使用同节点的另一组四卡、完整预热 16 题，直接使用锁定的 Lib。表中两组测量的卡组、预热、ABI 适配和草稿接受率均有差异；要量化 1+4+5 的净收益，仍需在相同卡组、预热和适配器下做配对对照。
+[Experiment results and methodology](https://github.com/hw-native-sys/pypto-serving/issues/369)
+and [Lib verification head](https://github.com/hw-native-sys/pypto-lib/pull/1916).
