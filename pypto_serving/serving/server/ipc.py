@@ -131,8 +131,8 @@ class StepCommand(msgspec.Struct, tag="step"):
     # Cross-layer dispatch identity. Optional defaults preserve compatibility with
     # cleanup commands and older callers that construct positional commands.
     invocation_id: str = ""
-    execution_slot: int = 0
-    pipeline_generation: int = 0
+    planned_execution_slot: int = 0
+    planned_slot_generation: int = 0
 
 
 class ShutdownCommand(msgspec.Struct, tag="shutdown"):

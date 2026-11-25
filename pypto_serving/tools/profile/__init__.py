@@ -9,6 +9,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import TYPE_CHECKING
+
 from .env import ProfileConfig, create_profile_config
 from .recorder import (
     ProfileRecorder,
@@ -23,12 +28,40 @@ from .recorder import (
     stop_profile,
 )
 
+if TYPE_CHECKING:
+    from pypto_serving.config.types import DispatchInvocation
+
+_dispatch_invocation: ContextVar[DispatchInvocation | None] = ContextVar("dispatch_invocation", default=None)
+
+
+@contextmanager
+def dispatch_invocation_scope(invocation: DispatchInvocation | None) -> Iterator[None]:
+    """Bind the serving step to profile calls in this execution context."""
+    token = _dispatch_invocation.set(invocation)
+    try:
+        yield
+    finally:
+        _dispatch_invocation.reset(token)
+
+
+def get_dispatch_invocation() -> DispatchInvocation | None:
+    return _dispatch_invocation.get()
+
+
+def invocation_profile_args() -> dict[str, object]:
+    invocation = get_dispatch_invocation()
+    return invocation.as_profile_args() if invocation is not None else {}
+
+
 __all__ = [
     "ProfileConfig",
     "ProfileRecorder",
     "configure_profiler",
     "create_profile_config",
+    "dispatch_invocation_scope",
+    "get_dispatch_invocation",
     "get_profiler",
+    "invocation_profile_args",
     "is_enabled",
     "merge_profile",
     "profile_duration",

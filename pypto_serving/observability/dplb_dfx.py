@@ -233,6 +233,7 @@ class DplbDfxRecorder:
         self._lock = threading.RLock()
         self._timer: threading.Timer | None = None
         self._requests: dict[str, dict] = {}
+        self._in_flight_steps: set[int] = set()
         self._request_counter = 0
         self._decision_counter = 0
         self._sequence = 0
@@ -278,6 +279,8 @@ class DplbDfxRecorder:
                 clock_instance_id=self.clock_instance,
                 **metadata,
             )
+            if "in_flight_step_ids" in manifest:
+                manifest["in_flight_step_ids_at_start"] = manifest.pop("in_flight_step_ids")
             path = self.output / "dplb" / capture_id / f"engine-{self.replica}-{self.instance}.jsonl"
             self.sink = _Sink(path, self.config, manifest)
             self._active = True
@@ -297,7 +300,12 @@ class DplbDfxRecorder:
             if (not self.capturing
                     or (expected_capture_id is not None and expected_capture_id != self.capture_id)):
                 return False
-            return self._emit(event, **fields)
+            emitted = self._emit(event, **fields)
+            if emitted and event == "step_plan":
+                self._in_flight_steps.add(fields["step_id"])
+            elif emitted and event == "step_outcome":
+                self._in_flight_steps.discard(fields["step_id"])
+            return emitted
 
     def _emit(self, event: str, **fields) -> bool:
         self._sequence += 1
@@ -352,11 +360,14 @@ class DplbDfxRecorder:
                 self.emit("request_terminal", **self.request_fields(request_id), reason=reason)
             self._requests.pop(request_id, None)
 
-    def _end_collection(self, **fields) -> dict:
+    def _end_collection(self, reason: str, **fields) -> dict:
         self._active = False
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None
+        fields["in_flight_step_ids"] = sorted(self._in_flight_steps)
+        if not (self.sink.error or self.sink.stop_reason):
+            self._emit("capture_end", reason=reason, **fields)
         final_fields = dict(
             ended_ns=time.monotonic_ns(),
             untracked_requests=self._untracked_requests,
@@ -364,10 +375,11 @@ class DplbDfxRecorder:
             **fields,
         )
         self._requests.clear()
+        self._in_flight_steps.clear()
         return final_fields
 
     def _seal(self, reason: str, **fields) -> None:
-        final_fields = self._end_collection(**fields)
+        final_fields = self._end_collection(reason, **fields)
         if self._profile_start_pending:
             self._pending_end = (reason, final_fields)
         else:
@@ -378,7 +390,6 @@ class DplbDfxRecorder:
             if expected_capture_id is not None and expected_capture_id != self.capture_id:
                 return
             if self.capturing:
-                self._emit("capture_end", reason=reason, **fields)
                 self._seal(reason, **fields)
 
     def begin_profile_start(self) -> None:
@@ -399,8 +410,7 @@ class DplbDfxRecorder:
         """End Host collection now and defer the manifest until the worker reply."""
         with self._lock:
             if self.capturing:
-                self._emit("capture_end", reason="requested", **fields)
-                self._pending_end = ("requested", self._end_collection(**fields))
+                self._pending_end = ("requested", self._end_collection("requested", **fields))
 
     def finish_profile_stop(self, *, failed: bool = False) -> None:
         with self._lock:
@@ -415,5 +425,11 @@ class DplbDfxRecorder:
     def close(self, *, reason: str = "shutdown", timeout: float = 2.0) -> bool:
         with self._lock:
             self.stop(reason=reason)
+            sink = self.sink
+        return sink is None or sink.done.wait(timeout)
+
+    def wait_for_writer(self, timeout: float = 2.0) -> bool:
+        """Wait for the current writer to finish without stopping the capture."""
+        with self._lock:
             sink = self.sink
         return sink is None or sink.done.wait(timeout)

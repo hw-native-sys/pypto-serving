@@ -172,8 +172,8 @@ def test_step_snapshot_records_scheduled_load_and_worker_outcome(capture):
         finished_request_ids=[],
         step_id=7,
         invocation_id="engine-a:7",
-        execution_slot=1,
-        pipeline_generation=4,
+        planned_execution_slot=1,
+        planned_slot_generation=4,
     )
 
     core._emit_dfx_step_plan(scheduler_output, command, dispatch_ordinal=3)
@@ -189,8 +189,8 @@ def test_step_snapshot_records_scheduled_load_and_worker_outcome(capture):
     row = plan["requests"][0]
     assert plan["step_id"] == 7
     assert plan["invocation_id"] == "engine-a:7"
-    assert plan["execution_slot"] == 1
-    assert plan["pipeline_generation"] == 4
+    assert plan["planned_execution_slot"] == 1
+    assert plan["planned_slot_generation"] == 4
     assert plan["dispatch_ordinal"] == 3
     assert plan["active_count"] == 1
     assert plan["decode_tokens"] == 3
@@ -208,10 +208,43 @@ def test_step_snapshot_records_scheduled_load_and_worker_outcome(capture):
     outcome = next(event for event in events if event["event"] == "step_outcome")
     assert outcome["status"] == "completed"
     assert outcome["invocation_id"] == "engine-a:7"
-    assert outcome["execution_slot"] == 1
-    assert outcome["pipeline_generation"] == 4
+    assert outcome["planned_execution_slot"] == 1
+    assert outcome["planned_slot_generation"] == 4
     assert outcome["requests"][0]["returned_tokens"] == 2
     assert outcome["requests"][0]["speculative_accepted_tokens"] == 1
+
+
+def test_v41_dspark_dispatch_profiles_the_serving_invocation(tmp_path, monkeypatch):
+    from pypto_serving.config.types import DispatchInvocation
+    from pypto_serving.model.deepseek_v41 import npu_runner
+    from pypto_serving.model.deepseek_v41.npu_executor import DeepSeekV41PyptoExecutor
+    from pypto_serving.tools.profile import ProfileRecorder, create_profile_config, recorder
+
+    config = create_profile_config(enabled=True, output=tmp_path)
+    profiler = ProfileRecorder(config)
+    monkeypatch.setattr(recorder, "get_profiler", lambda: profiler)
+    resources = SimpleNamespace(
+        closed=False, failed=False, run_config=None, dspark_param_names={"target": ()},
+        dspark_programs={"target": SimpleNamespace(compiled=object())},
+        worker=SimpleNamespace(run=lambda *args, **kwargs: None),
+    )
+
+    def dispatch(_batch):
+        npu_runner.V41ResidentResources.dispatch_dspark(resources, "target", {})
+
+    executor = DeepSeekV41PyptoExecutor.__new__(DeepSeekV41PyptoExecutor)
+    executor.runners = {"model": SimpleNamespace(run_dspark_prefill_batch=dispatch)}
+    invocation = DispatchInvocation("replica:3", 3, 1, 2)
+    try:
+        executor.run_dspark_prefill_batch(SimpleNamespace(invocation=invocation))
+        dispatch(None)
+    finally:
+        profiler.stop()
+    recorded = []
+    for fragment in config.fragments_dir.glob("*.jsonl"):
+        events = (json.loads(line) for line in fragment.read_text().splitlines())
+        recorded.extend(event["args"] for event in events if event["name"] == "v41.worker.run")
+    assert recorded == [invocation.as_profile_args(), {}]
 
 
 def test_filtered_candidates_explain_capacity_and_request_limit(capture):
@@ -443,34 +476,37 @@ def test_bounded_queue_reports_loss_without_blocking_capture(tmp_path, monkeypat
     assert status["queued_bytes"] == 0
 
 
-def test_writer_drains_records_queued_after_get_timeout(tmp_path, monkeypatch):
+def test_writer_drains_records_enqueued_between_timeout_and_seal(tmp_path, monkeypatch):
     timed_out, release = threading.Event(), threading.Event()
 
-    class GatedQueue(queue.Queue):
+    class PausedQueue(queue.Queue):
         def get(self, block=True, timeout=None):
             try:
-                return super().get(block, timeout)
+                return super().get(block=block, timeout=timeout)
             except queue.Empty:
                 timed_out.set()
                 assert release.wait(5)
                 raise
 
-    monkeypatch.setattr(dplb_dfx, "queue", SimpleNamespace(Queue=GatedQueue, Empty=queue.Empty, Full=queue.Full))
+    monkeypatch.setattr(dplb_dfx, "queue", SimpleNamespace(Queue=PausedQueue, Empty=queue.Empty, Full=queue.Full))
     recorder = DplbDfxRecorder(DplbDfxConfig(level="load"), tmp_path)
     try:
         assert recorder.start("drain")
+        assert recorder.emit("step_plan", step_id=1)
         assert timed_out.wait(2)
-        assert recorder.emit("tail_event")
+        assert recorder.emit("step_outcome", step_id=1)
         recorder.stop()
     finally:
         release.set()
         assert recorder.close()
 
+    assert [event["event"] for event in records(recorder)] == [
+        "capture_start", "step_plan", "step_outcome", "capture_end",
+    ]
     status = manifest(recorder)
-    assert status["complete"]
     assert status["queued_bytes"] == 0
-    assert status["attempted"] == status["written"]
-    assert [event["event"] for event in records(recorder)] == ["capture_start", "tail_event", "capture_end"]
+    assert status["written"] == status["attempted"]
+    assert status["complete"]
 
 
 @pytest.mark.parametrize(
@@ -574,6 +610,74 @@ def test_profile_controls_keep_host_capture_and_worker_ack_separate(tmp_path):
     assert all(e["capture_id"] == "control" for e in events)
     assert "counters_start" in manifest(core._dplb_dfx)
     assert "counters_end" in manifest(core._dplb_dfx)
+
+
+def test_profile_restart_waits_for_previous_writer(tmp_path, monkeypatch):
+    from pypto_serving.serving.engine.async_engine import EngineConfig, ReplicaEngineCore
+    from pypto_serving.tools.profile import create_profile_config
+
+    release = threading.Event()
+    write = dplb_dfx._Sink._write
+
+    def gated(sink):
+        if sink.metadata["capture_id"] == "first":
+            assert release.wait(8)
+        write(sink)
+
+    monkeypatch.setattr(dplb_dfx._Sink, "_write", gated)
+    config = EngineConfig(
+        profile_config=create_profile_config(enabled=True, output=tmp_path),
+        dplb_dfx_config=DplbDfxConfig(level="load"),
+    )
+    core = ReplicaEngineCore(config, SimpleNamespace(eos_token_id=None))
+    recorder = core._dplb_dfx
+    calls = []
+
+    async def acknowledge(active):
+        calls.append(active)
+
+    core._set_worker_profile_active = acknowledge
+
+    async def run():
+        await core.start_profile("first")
+        recorder.stop(reason="duration")
+        first_sink = recorder.sink
+
+        with pytest.raises(RuntimeError, match="still finalizing"):
+            await core.start_profile("second")
+        assert recorder.sink is first_sink
+        assert not recorder.capturing
+        assert calls == [True]
+
+        waiting = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        wait = first_sink.done.wait
+
+        def notify_and_wait(timeout):
+            loop.call_soon_threadsafe(waiting.set)
+            return wait(timeout)
+
+        with monkeypatch.context() as writer_patch:
+            writer_patch.setattr(first_sink.done, "wait", notify_and_wait)
+            restart = asyncio.create_task(core.start_profile("second"))
+            try:
+                await asyncio.wait_for(waiting.wait(), timeout=1)
+                assert not restart.done()
+                assert calls == [True]
+            finally:
+                release.set()
+                await restart
+
+        assert first_sink.done.is_set()
+        assert recorder.capturing
+        assert recorder.capture_id == "second"
+        assert calls == [True, True]
+
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+        assert recorder.close()
 
 
 def test_profile_failure_seals_capture_and_can_restart(tmp_path):
@@ -705,8 +809,8 @@ def test_replica_budget_is_shared(tmp_path):
     assert [core.config.dplb_dfx_config.max_bytes for core in engine._cores] == [2, 2]
 
 
-@pytest.mark.parametrize("writer_blocked", [False, True])
-def test_repeated_profile_start_preserves_capture_across_replicas(tmp_path, monkeypatch, writer_blocked):
+@pytest.mark.parametrize("writer_timeout", [False, True])
+def test_replica_profile_restarts_as_one_window(tmp_path, monkeypatch, writer_timeout):
     from pypto_serving.config.parallel import ParallelConfig
     from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig
     from pypto_serving.tools.profile import create_profile_config
@@ -726,40 +830,43 @@ def test_repeated_profile_start_preserves_capture_across_replicas(tmp_path, monk
             assert release_writer.wait(5)
         write(sink)
 
-    if writer_blocked:
+    if writer_timeout:
         monkeypatch.setattr(dplb_dfx._Sink, "_write", gated_write)
 
+    calls = []
+
     async def acknowledge(active):
-        pass
+        calls.append(active)
 
     for core in engine._cores:
-        monkeypatch.setattr(core, "_set_worker_profile_active", acknowledge)
+        core._set_worker_profile_active = acknowledge
 
     async def run():
         try:
-            await engine.start_profile()
-            capture_id = first.capture_id
-            assert capture_id and capture_id == second.capture_id
-            first.stop(reason="duration", expected_capture_id=capture_id)
-            if not writer_blocked:
-                assert await asyncio.to_thread(first.close)
+            await asyncio.gather(engine.start_profile(), engine.start_profile())
+            old_id = first.capture_id
+            old_second_sink = second.sink
+            assert first.capturing and second.capturing
+            assert second.capture_id == old_id
+            assert calls == [True, True]
 
-            await engine.start_profile()
+            first.stop(reason="duration")
             assert not first.capturing and second.capturing
-            assert first.capture_id == second.capture_id == capture_id
-
-            if writer_blocked:
-                await engine._cores[1].stop_profile()
-                with pytest.raises(RuntimeError, match="still being written"):
+            if writer_timeout:
+                with pytest.raises(RuntimeError, match="still finalizing"):
                     await engine.start_profile()
-                assert first.capture_id == second.capture_id == capture_id
+                assert not first.capturing and not second.capturing
+                assert first.capture_id == second.capture_id == old_id
+                assert calls == [True, True]
                 release_writer.set()
-                assert await asyncio.to_thread(first.close)
-            else:
-                await engine.stop_profile()
+
             await engine.start_profile()
             assert first.capturing and second.capturing
-            assert first.capture_id == second.capture_id != capture_id
+            assert first.capture_id == second.capture_id != old_id
+            assert old_second_sink.done.is_set()
+            old_status = json.loads(old_second_sink.path.with_suffix(".manifest.json").read_text())
+            assert old_status["stop_reason"] == "restart"
+            assert calls == [True, True, True, True]
         finally:
             release_writer.set()
             await engine.stop_profile()

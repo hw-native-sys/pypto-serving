@@ -82,9 +82,7 @@ WORKER_KILL_GRACE_SECONDS = 5.0
 # twenty minutes by default -- so waiting it out would put the whole bounded
 # sequence behind an unbounded wait. Stopping the worker is what ends that read.
 LOOP_DRAIN_GRACE_SECONDS = 5.0
-# The worker's asynchronous decode lane owns two ping-pong device buffers. Keep
-# the identity contract aligned with that ownership even when scheduling is sync.
-_DISPATCH_EXECUTION_SLOTS = 2
+_PLANNED_EXECUTION_SLOTS = 2
 
 
 @dataclass
@@ -525,8 +523,8 @@ class ReplicaEngineCore:
             capture_id=capture_id,
             dispatch_ordinal=dispatch_ordinal,
             invocation_id=step_command.invocation_id,
-            execution_slot=step_command.execution_slot,
-            pipeline_generation=step_command.pipeline_generation,
+            planned_execution_slot=step_command.planned_execution_slot,
+            planned_slot_generation=step_command.planned_slot_generation,
             requests=[
                 {key: row[key] for key in (
                     "request_id", "request_uid", "admission_epoch", "identity_status", "cache_partition",
@@ -545,8 +543,8 @@ class ReplicaEngineCore:
             view="scheduler_planned",
             step_id=step_command.step_id,
             invocation_id=step_command.invocation_id,
-            execution_slot=step_command.execution_slot,
-            pipeline_generation=step_command.pipeline_generation,
+            planned_execution_slot=step_command.planned_execution_slot,
+            planned_slot_generation=step_command.planned_slot_generation,
             dispatch_ordinal=dispatch_ordinal,
             stage=next(iter(stages)) if len(stages) == 1 else "mixed",
             active_count=len(request_rows),
@@ -621,8 +619,8 @@ class ReplicaEngineCore:
             view="worker_returned_before_scheduler_apply",
             step_id=step_id,
             invocation_id=context["invocation_id"],
-            execution_slot=context["execution_slot"],
-            pipeline_generation=context["pipeline_generation"],
+            planned_execution_slot=context["planned_execution_slot"],
+            planned_slot_generation=context["planned_slot_generation"],
             dispatch_ordinal=context["dispatch_ordinal"],
             status=status,
             error=error,
@@ -759,17 +757,15 @@ class ReplicaEngineCore:
             return
         async with self._dfx_profile_lock:
             if active:
+                start_host = capture_host and not dfx.capturing
+                if start_host and not dfx.ready_for_capture:
+                    if not await asyncio.to_thread(dfx.wait_for_writer) or not dfx.ready_for_capture:
+                        raise RuntimeError("Previous DPLB DFX capture is still finalizing")
                 dfx.begin_profile_start()
             else:
-                dfx.begin_profile_stop(
-                    counters_end=self._dfx_counters(),
-                    in_flight_step_ids=sorted(
-                        sid for sid, context in self._dfx_step_contexts.items()
-                        if context["capture_id"] == dfx.capture_id
-                    ),
-                )
+                dfx.begin_profile_stop(counters_end=self._dfx_counters())
             try:
-                if active and capture_host:
+                if active and start_host:
                     self._start_host_capture(dfx, capture_id)
                 await self._set_worker_profile_active(active)
             except BaseException:
@@ -1302,12 +1298,15 @@ class ReplicaEngineCore:
         The worker is FIFO and emits exactly one result per command, so the
         oldest dispatched step is the next result off the output queue.
         """
-        step_id, scheduler_output = self._batch_queue.popleft()
+        step_id, scheduler_output = self._batch_queue[0]
         getattr(self, "_initialization_steps", set()).discard(step_id)
         pending = getattr(self, "_worker_free_ids_by_step", {})
         try:
-            with profile_span("scheduler.wait_worker_output", cat="scheduler"):
-                raw_output = await self._get_live_result()
+            try:
+                with profile_span("scheduler.wait_worker_output", cat="scheduler"):
+                    raw_output = await self._get_live_result()
+            finally:
+                self._batch_queue.popleft()
         except queue.Empty:
             logger.error(f"Worker response timed out ({self._step_timeout:g}s)")
             # Timeout: the failed step's own result is still in transit.
@@ -1491,13 +1490,13 @@ class ReplicaEngineCore:
                     cache_partition=sr.cache_partition,
                 ))
 
-        execution_slot = step_id % _DISPATCH_EXECUTION_SLOTS
+        planned_execution_slot = step_id % _PLANNED_EXECUTION_SLOTS
         generations = getattr(self, "_pipeline_slot_generations", None)
         if generations is None:
             generations = {}
             self._pipeline_slot_generations = generations
-        pipeline_generation = generations.get(execution_slot, 0) + 1
-        generations[execution_slot] = pipeline_generation
+        planned_slot_generation = generations.get(planned_execution_slot, 0) + 1
+        generations[planned_execution_slot] = planned_slot_generation
         instance_id = getattr(self, "_dispatch_instance_id", "legacy")
         return StepCommand(
             new_requests=new_requests,
@@ -1506,8 +1505,8 @@ class ReplicaEngineCore:
             finished_request_ids=finished_ids,
             step_id=step_id,
             invocation_id=f"{instance_id}:{step_id}",
-            execution_slot=execution_slot,
-            pipeline_generation=pipeline_generation,
+            planned_execution_slot=planned_execution_slot,
+            planned_slot_generation=planned_slot_generation,
         )
 
     async def _flush_pending_frees(self) -> None:
@@ -2202,16 +2201,23 @@ class AsyncLLMEngine:
             recorders = [
                 recorder for core in self._cores if (recorder := getattr(core, "_dplb_dfx", None)) is not None
             ]
-            capture_host = bool(recorders) and not any(recorder.capturing for recorder in recorders)
-            if capture_host and not all(recorder.ready_for_capture for recorder in recorders):
-                raise RuntimeError("Previous DPLB Host capture is still being written; retry start_profile")
-            capture_id = uuid.uuid4().hex if capture_host else None
+            if len(recorders) > 1:
+                active_ids = [recorder.capture_id for recorder in recorders if recorder.capturing]
+                if len(active_ids) == len(recorders) and len(set(active_ids)) == 1:
+                    return
+                if active_ids:
+                    for recorder in recorders:
+                        recorder.stop(reason="restart")
+                finished = await asyncio.gather(
+                    *(asyncio.to_thread(recorder.wait_for_writer)
+                      for recorder in recorders if not recorder.ready_for_capture)
+                )
+                if not all(finished):
+                    raise RuntimeError("Previous DPLB DFX capture is still finalizing")
+            capture_id = uuid.uuid4().hex if recorders else None
             results = await asyncio.gather(
-                *(
-                    core.start_profile(capture_id, capture_host=capture_host)
-                    if getattr(core, "_dplb_dfx", None) is not None else core.start_profile()
-                    for core in self._cores
-                ),
+                *(core.start_profile(capture_id) if getattr(core, "_dplb_dfx", None) is not None
+                  else core.start_profile() for core in self._cores),
                 return_exceptions=True,
             )
             errors = [result for result in results if isinstance(result, BaseException)]

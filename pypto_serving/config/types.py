@@ -353,16 +353,16 @@ class DispatchInvocation:
 
     invocation_id: str
     step_id: int
-    execution_slot: int = 0
-    pipeline_generation: int = 0
+    planned_execution_slot: int = 0
+    planned_slot_generation: int = 0
 
     def as_profile_args(self) -> dict[str, object]:
         """Return scalar fields suitable for host profile span arguments."""
         return {
             "invocation_id": self.invocation_id,
             "step_id": self.step_id,
-            "execution_slot": self.execution_slot,
-            "pipeline_generation": self.pipeline_generation,
+            "planned_execution_slot": self.planned_execution_slot,
+            "planned_slot_generation": self.planned_slot_generation,
         }
 
 

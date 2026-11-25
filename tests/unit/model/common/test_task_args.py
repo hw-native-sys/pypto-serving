@@ -9,10 +9,17 @@
 # Unit tests for the TaskArgs L3 argument container.
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from threading import Event
+from types import SimpleNamespace
+
 import pytest
 import torch
 from pypto.runtime import DeviceTensor, StackedDeviceTensor
 
+from pypto_serving.config.types import DispatchInvocation
+from pypto_serving.model.common.runner import l3_dispatch
 from pypto_serving.model.common.runner.buffer_set import (
     ClearPolicy,
     Placement,
@@ -20,6 +27,50 @@ from pypto_serving.model.common.runner.buffer_set import (
     StaticDeviceTensor,
 )
 from pypto_serving.model.common.runner.task_args import TaskArgs
+from pypto_serving.tools.profile import dispatch_invocation_scope
+
+
+def test_l3_submit_and_wait_keep_the_dispatch_identity(monkeypatch):
+    submit_entered = Event()
+    next_prepare_entered = Event()
+    recorded = {}
+    first = DispatchInvocation("replica:1", 1, 1, 1)
+    second = DispatchInvocation("replica:2", 2, 0, 1)
+
+    @contextmanager
+    def span(name, **metadata):
+        recorded[name] = metadata["args"]
+        yield
+
+    def submit(*args, **kwargs):
+        submit_entered.set()
+        assert next_prepare_entered.wait(timeout=5)
+        return SimpleNamespace(result=lambda: None)
+
+    def prepare_next():
+        assert submit_entered.wait(timeout=5)
+        with dispatch_invocation_scope(second):
+            next_prepare_entered.set()
+            return first_pending.result(timeout=5)
+
+    def submit_first():
+        with dispatch_invocation_scope(first):
+            return runner._submit_l3(callable_spec)
+
+    monkeypatch.setattr(l3_dispatch, "profile_span", span)
+    runner = l3_dispatch.L3DispatchMixin()
+    runner._init_l3_dispatch(stacked=False)
+    monkeypatch.setattr(runner, "_shared_l3_worker", lambda: SimpleNamespace(submit=submit))
+    callable_spec = SimpleNamespace(
+        name="fused", aicpu_thread_num=1, block_dim=None, dispatch_args=(), compiled=object(),
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_pending = executor.submit(submit_first)
+        pending = executor.submit(prepare_next).result(timeout=5)
+    with dispatch_invocation_scope(second):
+        pending.wait()
+    assert recorded["fused.worker_submit"]["invocation_id"] == first.invocation_id
+    assert recorded["fused.worker_wait"] == first.as_profile_args()
 
 
 class _FakeAllocWorker:

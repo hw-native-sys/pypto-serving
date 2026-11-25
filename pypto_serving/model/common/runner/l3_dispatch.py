@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pypto_serving.config.types import DispatchInvocation, RuntimeConfig
-from pypto_serving.tools.profile import profile_span
+from pypto_serving.tools.profile import get_dispatch_invocation, invocation_profile_args, profile_span
 
 from .buffer_set import resolve_l3_arg
 
@@ -97,7 +97,6 @@ class L3DispatchMixin:
     _l3_static_tensors: dict[tuple, Any]
     _l3_stacked: bool
     _l3_run_config: Any | None
-    _invocation_context: DispatchInvocation | None
 
     def _init_l3_dispatch(self, *, stacked: bool) -> None:
         """Initialize the shared dispatch state. Call from the runner ``__init__``."""
@@ -105,17 +104,6 @@ class L3DispatchMixin:
         self._l3_static_tensors: dict[tuple, Any] = {}
         self._l3_stacked = stacked
         self._l3_run_config = None
-        self._invocation_context = None
-
-    def set_invocation_context(self, context: DispatchInvocation | None) -> None:
-        """Attach the serving step identity to subsequent L3 profile spans."""
-        self._invocation_context = context
-
-    def _invocation_span_args(self) -> dict[str, Any]:
-        context = getattr(self, "_invocation_context", None)
-        if context is None:
-            return {}
-        return context.as_profile_args()
 
     def _configure_l3_rings(self, runtime: RuntimeConfig) -> None:
         """Install the per-dispatch simpler ring sizing for L3 dispatches.
@@ -159,7 +147,7 @@ class L3DispatchMixin:
         """
         span_args: dict[str, Any] = {
             "aicpu_thread_num": callable_spec.aicpu_thread_num,
-            **self._invocation_span_args(),
+            **invocation_profile_args(),
         }
         if callable_spec.block_dim is not None:
             span_args["block_dim"] = callable_spec.block_dim
@@ -204,10 +192,10 @@ class L3DispatchMixin:
         hand the per-dispatch uploads to the pending handle so they are freed
         only after ``wait()`` reclaims the outputs.
         """
-        span_args: dict[str, Any] = {
-            "aicpu_thread_num": callable_spec.aicpu_thread_num,
-            **self._invocation_span_args(),
-        }
+        invocation = get_dispatch_invocation()
+        span_args: dict[str, Any] = {"aicpu_thread_num": callable_spec.aicpu_thread_num}
+        if invocation is not None:
+            span_args.update(invocation.as_profile_args())
         if callable_spec.block_dim is not None:
             span_args["block_dim"] = callable_spec.block_dim
         run_config = self._l3_run_config if config is None else config
@@ -243,7 +231,7 @@ class L3DispatchMixin:
             handle=handle,
             uploaded=tuple(uploaded),
             name=callable_spec.name,
-            invocation=getattr(self, "_invocation_context", None),
+            invocation=invocation,
         )
 
     def _reset_l3_dispatch(self) -> None:

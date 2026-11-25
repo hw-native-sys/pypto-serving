@@ -44,12 +44,16 @@ def validate_capture(
     path: Path, expected_groups: int, *, require_prefix_hit: bool = False, require_scheduled_load: bool = False,
 ) -> dict:
     manifests = sorted(path.glob("dplb/*/*.manifest.json"))
-    if len(manifests) != 2:
-        raise RuntimeError(f"expected two completed captures, found {len(manifests)}")
+    capture_dirs = {manifest.parent for manifest in manifests}
+    if len(capture_dirs) != 2 or len(manifests) != 2:
+        raise RuntimeError("expected two completed capture windows with one manifest each, "
+                           f"found {len(capture_dirs)} windows and {len(manifests)} manifests")
     summaries = []
     prefix_hits = 0
     for manifest_path in manifests:
         status = json.loads(manifest_path.read_text())
+        if status["capture_id"] != manifest_path.parent.name:
+            raise RuntimeError("manifest capture ID does not match its directory")
         data_path = manifest_path.with_name(manifest_path.name.removesuffix(".manifest.json") + ".jsonl")
         events = [json.loads(line) for line in data_path.read_text().splitlines()]
         if not status["complete"] or status["dropped"] or status["error"]:

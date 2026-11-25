@@ -12,6 +12,7 @@
 def validate_scheduled_load(events: list[dict], topology: list[dict]) -> dict:
     plans = {}
     outcomes = {}
+    invocation_ids: set[str] = set()
     boundary = set()
     returned_tokens = proposed_tokens = accepted_tokens = 0
     stages = set()
@@ -30,7 +31,15 @@ def validate_scheduled_load(events: list[dict], topology: list[dict]) -> dict:
                 raise RuntimeError("outcome without a matching submitted step")
             if event["status"] != "completed" or event["error"] is not None:
                 raise RuntimeError("worker step failed or was discarded")
-            plan_rows = plans[key]["requests"]
+            plan = plans[key]
+            slot_fields = ("planned_execution_slot", "planned_slot_generation")
+            if not any(field in record for record in (plan, event) for field in slot_fields):
+                slot_fields = ("execution_slot", "pipeline_generation")
+            if (plan["invocation_id"] != event.get("invocation_id")
+                    or any(type(record.get(field)) is not int for record in (plan, event) for field in slot_fields)
+                    or any(plan[field] != event[field] for field in slot_fields)):
+                raise RuntimeError("step outcome invocation identity mismatch")
+            plan_rows = plan["requests"]
             if len(plan_rows) != len(event["requests"]):
                 raise RuntimeError("step outcome membership mismatch")
             for planned, actual in zip(plan_rows, event["requests"]):
@@ -48,6 +57,12 @@ def validate_scheduled_load(events: list[dict], topology: list[dict]) -> dict:
                 accepted_tokens += accepted
             continue
 
+        invocation_id = event.get("invocation_id")
+        if not isinstance(invocation_id, str) or not invocation_id:
+            raise RuntimeError("missing or invalid scheduled invocation_id")
+        if invocation_id in invocation_ids:
+            raise RuntimeError("duplicate scheduled invocation_id")
+        invocation_ids.add(invocation_id)
         rows = event["requests"]
         if not rows or event["active_count"] != len(rows):
             raise RuntimeError("scheduled active count mismatch")
@@ -70,15 +85,17 @@ def validate_scheduled_load(events: list[dict], topology: list[dict]) -> dict:
                 raise RuntimeError("Host snapshot claims unobserved runner rows")
         if event["topology"] != topology:
             raise RuntimeError("scheduled topology mismatch")
-        group_ids = {group["group_id"] for group in event["groups"]}
-        if group_ids != {group["group_id"] for group in topology}:
+        groups = event["groups"]
+        group_ids = {group["group_id"] for group in groups}
+        if len(group_ids) != len(groups) or group_ids != {group["group_id"] for group in topology}:
             raise RuntimeError("scheduled group membership mismatch")
         if any(row["cache_partition"] not in group_ids for row in rows):
             raise RuntimeError("request has no logical DP group")
-        for group in event["groups"]:
+        for group in groups:
             members = [row for row in rows if row["cache_partition"] == group["group_id"]]
             if (group["participating_request_count"] != len(members)
                     or group["participating_request_ids"] != [row["request_id"] for row in members]
+                    or group["participating_logical_tokens"] != sum(row["logical_length_after"] for row in members)
                     or group["participating_prefill_tokens"] != sum(row["prefill_tokens"] for row in members)
                     or group["participating_decode_tokens"] != sum(row["decode_tokens"] for row in members)):
                 raise RuntimeError("scheduled group aggregate mismatch")
@@ -87,6 +104,8 @@ def validate_scheduled_load(events: list[dict], topology: list[dict]) -> dict:
     pending = set(plans) - set(outcomes)
     if not pending <= boundary:
         raise RuntimeError("scheduled step lacks outcome or boundary explanation")
+    if boundary - pending:
+        raise RuntimeError("capture end lists a step without a pending plan")
     if len({event["dispatch_ordinal"] for event in plans.values()}) != len(plans):
         raise RuntimeError("duplicate dispatch ordinal")
     return dict(

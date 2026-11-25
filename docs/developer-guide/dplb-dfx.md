@@ -39,8 +39,10 @@ Output lives beside the merged profile trace:
 
 For a JSON profile output path, this directory is under that file's parent.
 The coordinator shares one capture ID across replicas. Repeated starts preserve
-the current capture while any replica is still collecting. Once all replicas
-have stopped collecting, retry start if any previous writer is still finishing.
+the capture while it is active on all replicas. If a replica has already ended
+its capture, a restart seals any remaining active captures before starting a new
+window across all replicas. A new capture waits for previous writers to finish
+for up to two seconds. If the wait times out, the start fails.
 A new capture starts with a baseline of existing owners and requests.
 The Host window starts before the ordered worker profile command. An explicit
 stop ends Host observations before sending the stop command. If the Host window
@@ -180,13 +182,16 @@ frozen at submission, including cancelled and preempted requests. The plan's
 `speculative_proposed_tokens` and `speculative_accepted_tokens` come from the
 worker and must not be counted as client output. Late results never create new
 request identities or enter a different capture. Capture boundaries list
-in-flight step IDs so an unmatched plan at the boundary is explainable.
-No device timing is claimed.
-Execution-slot fields remain explicitly unavailable until the worker-side
-prepare/submit hooks are added.
+in-flight step IDs at the start and end of a capture, including when the
+duration limit is reached. The manifest stores these boundaries as
+`in_flight_step_ids_at_start` and `in_flight_step_ids`, respectively.
+`invocation_id` joins the step to its Host L3 spans, including asynchronous
+submit and wait. `planned_execution_slot` and `planned_slot_generation`
+describe the engine's logical dispatch sequence. Actual worker buffer
+ownership remains unobserved in the step snapshot.
 
-This increment still does not connect asynchronous L3 invocations, SWA/HCA/CSA
-task semantics, per-rank device cost, or a report generator. `--dplb-dfx-level
+This increment leaves SWA/HCA/CSA task semantics, per-rank device cost, and
+report generation to later work. `--dplb-dfx-level
 timing` fails explicitly. NPU smoke tests and measured overhead remain required
 before making performance claims. The next device prototype must verify runtime
 invocation identity, semantic coverage and clock domains on a matched, built

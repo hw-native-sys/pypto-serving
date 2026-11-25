@@ -42,8 +42,9 @@ from pypto_serving.serving.server.ipc import (
     decode_result,
     encode_command,
 )
-from pypto_serving.config.types import DecodeResult
+from pypto_serving.config.types import DecodeResult, DispatchInvocation
 from pypto_serving.serving.server.serving_worker import WorkerProcess
+from pypto_serving.tools.profile import get_dispatch_invocation
 
 from ..device_sampling_fakes import _FixedSampler, _ImmediateEosExecutor, _model
 
@@ -258,6 +259,38 @@ def test_worker_uses_executor_packed_prefill_limits():
         new_requests=[], prefill_requests=requests, decode_requests=[], finished_request_ids=[],
     ))
     assert dispatched == [requests]
+
+
+@pytest.mark.parametrize("max_prefill_batch_size", [None, 1])
+@pytest.mark.parametrize("internal_error", [False, True])
+def test_prefill_hook_keeps_owned_slot_and_runs_once(max_prefill_batch_size, internal_error):
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.model_record = SimpleNamespace(runtime_model=object())
+    worker.executor = SimpleNamespace(
+        max_prefill_batch_size=max_prefill_batch_size,
+        supports_async_prefill_reclaim=True,
+    )
+    calls = []
+
+    def prefill(_scheduled, _model, _tokens, *, prefill_slot=None):
+        calls.append((prefill_slot, get_dispatch_invocation()))
+        if internal_error:
+            raise TypeError("inner hook got an unexpected keyword argument 'invocation'")
+
+    worker._batch_prefill = prefill
+    command = StepCommand(
+        new_requests=[], prefill_requests=[PrefillRequest("request", [1], 0, [])],
+        decode_requests=[], finished_request_ids=[], step_id=3, invocation_id="replica:3",
+        planned_execution_slot=1, planned_slot_generation=2,
+    )
+    prepared = serving_worker._PreparedDecodeWork(prepared=None, buffer_slot=1)
+    if internal_error:
+        with pytest.raises(TypeError, match="inner hook got an unexpected keyword argument 'invocation'"):
+            worker._execute_step(command, prepared_decode=prepared)
+    else:
+        assert worker._execute_step(command, prepared_decode=prepared).error is None
+    assert calls == [(1, DispatchInvocation("replica:3", 3, 1, 2))]
+    assert get_dispatch_invocation() is None
 
 
 def test_worker_releases_preempted_state_before_same_command_reregistration():

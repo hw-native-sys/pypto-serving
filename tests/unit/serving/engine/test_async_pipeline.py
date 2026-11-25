@@ -360,9 +360,9 @@ def test_step_command_carries_stable_cross_layer_invocation_identity():
     )
     assert first.invocation_id.endswith(":1")
     assert second.invocation_id.endswith(":3")
-    assert first.execution_slot == second.execution_slot == 1
-    assert first.pipeline_generation == 1
-    assert second.pipeline_generation == 2
+    assert first.planned_execution_slot == second.planned_execution_slot == 1
+    assert first.planned_slot_generation == 1
+    assert second.planned_slot_generation == 2
 
 
 def test_async_pipeline_dispatches_two_steps_before_applying_first(monkeypatch):
@@ -743,7 +743,11 @@ def test_dfx_preemption_reuses_uid_and_preserves_original_epoch(observed_pipelin
     assert outcome["requests"][0]["result_disposition"] == "discarded"
 
 
-def test_dfx_stop_explains_step_already_waiting_for_worker(observed_pipeline):
+@pytest.mark.parametrize("stop", ["requested", "deadline_check", "timer"])
+def test_dfx_stop_explains_step_already_waiting_for_worker(observed_pipeline, stop):
+    import json
+    from unittest.mock import patch
+
     core, commands, recorder, _ = observed_pipeline
     core._dfx_profile_lock = asyncio.Lock()
 
@@ -763,14 +767,72 @@ def test_dfx_stop_explains_step_already_waiting_for_worker(observed_pipeline):
         assert core._try_dispatch_step()
         waiting = asyncio.create_task(core._await_and_apply_oldest())
         await entered.wait()
-        assert not core._batch_queue
-        await core.stop_profile()
+        assert [step_id for step_id, _ in core._batch_queue] == [commands[0].step_id]
+        if stop == "deadline_check":
+            deadline = recorder._started_ns + int(recorder.config.max_seconds * 1e9)
+            with patch("pypto_serving.observability.dplb_dfx.time.monotonic_ns", return_value=deadline):
+                assert not recorder.capturing
+        elif stop == "timer":
+            timer = recorder._timer
+            timer.function(**timer.kwargs)
+        else:
+            await core.stop_profile()
         release.set()
         assert await waiting
 
     asyncio.run(run())
     end = next(row for row in _dfx_rows(recorder) if row["event"] == "capture_end")
     assert end["in_flight_step_ids"] == [commands[0].step_id]
+    manifest = json.loads(recorder.sink.path.with_suffix(".manifest.json").read_text())
+    assert manifest["stop_reason"] == ("requested" if stop == "requested" else "duration")
+    assert manifest["in_flight_step_ids"] == end["in_flight_step_ids"]
+
+
+def test_dfx_start_lists_step_already_waiting_for_worker(observed_pipeline):
+    import json
+
+    core, commands, recorder, _ = observed_pipeline
+    assert recorder.close()
+    core._runtime = core.config.runtime_config
+    core._dfx_profile_lock = asyncio.Lock()
+
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+        get_live_result = core._get_live_result
+
+        async def held_result():
+            entered.set()
+            await release.wait()
+            return await get_live_result()
+
+        async def acknowledge(_active):
+            return None
+
+        core._get_live_result = held_result
+        core._set_worker_profile_active = acknowledge
+        assert core._try_dispatch_step()
+        assert core._try_dispatch_step()
+        waiting = asyncio.create_task(core._await_and_apply_oldest())
+        await entered.wait()
+        try:
+            await core.start_profile("midflight")
+        finally:
+            release.set()
+        assert await waiting
+        assert await core._await_and_apply_oldest()
+        assert core._try_dispatch_step()
+        await core.stop_profile()
+
+    asyncio.run(run())
+    rows = _dfx_rows(recorder)
+    start = next(row for row in rows if row["event"] == "capture_start")
+    end = next(row for row in rows if row["event"] == "capture_end")
+    assert start["in_flight_step_ids"] == [cmd.step_id for cmd in commands[:2]]
+    assert end["in_flight_step_ids"] == [commands[2].step_id]
+    assert not any(row["event"] == "step_outcome" for row in rows)
+    manifest = json.loads(recorder.sink.path.with_suffix(".manifest.json").read_text())
+    assert manifest["in_flight_step_ids_at_start"] == start["in_flight_step_ids"]
+    assert manifest["in_flight_step_ids"] == end["in_flight_step_ids"]
 
 
 def test_dfx_reused_request_id_does_not_relabel_old_result(observed_pipeline):
