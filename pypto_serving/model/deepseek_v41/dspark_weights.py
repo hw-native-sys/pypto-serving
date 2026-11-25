@@ -38,6 +38,7 @@ DSPARK_DRAFT_LAYERS = (0, 1, 2)
 # layers as draft weights.
 DSPARK_HEAD_SOURCE_TO_ABI = {
     "mtp.0.main_proj.weight": "main_proj_weight",
+    "mtp.0.main_proj.scale": "main_proj_scale",
     "mtp.0.main_norm.weight": "main_norm_weight",
     "mtp.2.norm.weight": "final_norm_weight",
     "mtp.2.markov_head.embed.weight": "markov_w1",
@@ -126,7 +127,7 @@ def dspark_v41_required_weight_names(n_routed_experts: int) -> tuple[str, ...]:
     """Return the deferred checkpoint names required by the K=5 DSpark path."""
     if type(n_routed_experts) is not int or n_routed_experts <= 0:
         raise ValueError("n_routed_experts must be a positive integer")
-    names = [*DSPARK_HEAD_SOURCE_TO_ABI, "mtp.0.main_proj.scale"]
+    names = list(DSPARK_HEAD_SOURCE_TO_ABI)
     for layer in DSPARK_DRAFT_LAYERS:
         names.extend(f"mtp.{layer}.{suffix}" for suffix in _LAYER_SUFFIXES)
         names.extend(
@@ -153,26 +154,6 @@ def dspark_v41_layer_weight_names(layer: int, n_routed_experts: int) -> tuple[st
 
 def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
-
-
-def _dequantize_main_projection(payload: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Decode checkpoint block32 FP8 directly into the input-major BF16 ABI."""
-    rows, cols = payload.shape
-    if scale.dtype != torch.float8_e8m0fnu or tuple(scale.shape) != (
-        _ceil_div(rows, 32), _ceil_div(cols, 32)
-    ):
-        raise ValueError("DSpark main_proj.scale must be the matching block32 E8M0 grid")
-    codes = scale.contiguous().view(torch.uint8)
-    if bool((codes == 255).any()):
-        raise ValueError("DSpark main_proj.scale must contain finite E8M0 scales")
-    output = torch.empty((cols, rows), dtype=torch.bfloat16)
-    # Keep FP32 temporaries to one 32-row block, not the full [D, 3D] matrix.
-    for start in range(0, rows, 32):
-        stop = min(start + 32, rows)
-        factors = torch.exp2(codes[start // 32].float() - 127).repeat_interleave(32)[:cols]
-        values = payload[start:stop].float() * factors
-        output[:, start:stop].copy_(values.T)
-    return output
 
 
 @dataclass(frozen=True)
@@ -279,9 +260,8 @@ class V41DSparkWeightContract:
     def load_heads(self) -> V41DSparkHeadWeights:
         """Load only the replicated head tensors and normalize main-proj layout.
 
-        The checkpoint stores ``main_proj`` as ``[D, 3D]`` while the lib ABI
-        consumes BF16 ``[3D, D]``. Quantized main-projection payloads use the
-        checkpoint's block32 E8M0 scales; the confidence ABI requires FP32.
+        The checkpoint stores ``main_proj`` as ``[D, 3D]`` while the current
+        lib ABI consumes NZ-packed FP8 ``[3D, D]`` plus block32 E8M0 scales.
         """
         values = self.loader.store.load_many(tuple(DSPARK_HEAD_SOURCE_TO_ABI))
         main_proj = values["mtp.0.main_proj.weight"]
@@ -319,15 +299,14 @@ class V41DSparkWeightContract:
             DSPARK_HEAD_SOURCE_TO_ABI[name]: value
             for name, value in values.items()
         }
-        if main_proj.dtype == torch.float8_e4m3fn:
-            scale_name = "mtp.0.main_proj.scale"
-            self.loader.store.require((scale_name,))
-            scale = self.loader.store.load_many((scale_name,))[scale_name]
-            result["main_proj_weight"] = _dequantize_main_projection(main_proj, scale)
-        elif main_proj.dtype == torch.bfloat16:
-            result["main_proj_weight"] = main_proj.transpose(0, 1).contiguous()
-        else:
-            raise ValueError("DSpark main_proj.weight must be BF16 or block32 FP8 E4M3")
+        if main_proj.dtype != torch.float8_e4m3fn:
+            raise ValueError("DSpark main_proj.weight must use FP8 E4M3")
+        scale = values["mtp.0.main_proj.scale"]
+        if scale.dtype != torch.float8_e8m0fnu or bool((scale.contiguous().view(torch.uint8) == 255).any()):
+            raise ValueError("DSpark main_proj.scale must contain finite E8M0 scales")
+        weight, packed_scale = fp8_input_major(main_proj, scale)
+        result["main_proj_weight"] = pack_nz(weight)
+        result["main_proj_scale"] = packed_scale
         result["confidence_weight"] = confidence.float().contiguous()
         return V41DSparkHeadWeights(result)
 

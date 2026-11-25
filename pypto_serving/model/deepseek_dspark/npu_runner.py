@@ -2271,7 +2271,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 self._drafter_block_table_staging = self._fused_drafter_block_tables[0]
                 self._drafter_rope_candidates = self._fused_drafter_rope_candidates[0]
         with profile_span("DSparkModelRunner.upload_resident_weights", cat="executor"):
+            logger.info("DSpark initializing device worker for resident weight upload")
             self._materialize_resident_weights()
+        logger.info("DSpark resident weights uploaded; allocating decode workspaces")
         # Decode preparation runs on the Host lane while the preceding mixed
         # prefill/decode step may still be executing.  Materialize every
         # decode workspace before the server becomes ready: TaskArgs binding
@@ -2428,6 +2430,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             if not host_weights:
                 raise RuntimeError("DSpark stacked Host weights are not retained")
             with profile_span("DSparkModelRunner.upload_resident_weights", cat="executor"):
+                logger.info("DSpark uploading target weights")
                 self._stacked_device_weights = self._upload_weight_group(worker, host_weights)
             self._stacked_host_weights = None
         if self._compiled.prefill is not None and self._stacked_prefill_device_weights is None:
@@ -2435,6 +2438,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             if not host_weights:
                 raise RuntimeError("DSpark prefill HC Host weights are not retained")
             with profile_span("DSparkModelRunner.upload_prefill_hc", cat="executor"):
+                logger.info("DSpark uploading prefill HC weights")
                 self._stacked_prefill_device_weights = self._upload_weight_group(
                     worker, host_weights
                 )
@@ -2444,6 +2448,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             if not host_weights:
                 raise RuntimeError("DSpark drafter host weights are not retained")
             with profile_span("DSparkModelRunner.upload_drafter_weights", cat="executor"):
+                logger.info("DSpark uploading drafter weights")
                 self._drafter_device_weights = self._upload_weight_group(worker, host_weights)
             self._drafter_host_weights = None
         self._materialize_embedding_device_weight()
@@ -2496,6 +2501,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         device_weights: dict[str, StackedDeviceTensor] = {}
         try:
             for name, tensor in host_weights.items():
+                if tensor.nbytes >= 1 << 30:
+                    logger.info("DSpark uploading %s (%.2f GiB across ranks)", name, tensor.nbytes / (1 << 30))
                 device_weights[name] = worker.alloc_stacked_tensor(tensor)
         except Exception:
             for tensor in device_weights.values():

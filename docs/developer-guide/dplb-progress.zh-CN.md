@@ -127,7 +127,7 @@
 
 ### 当前效果
 
-- 真实 NPU 结果为 `observed`，8 rank 的 `attention_busy_union_max_us` 为 92081.88，`attention_envelope_max_us` 为 121479.96。
+- 真实 NPU 结果为 `observed`，8 rank 的 `dispatch_busy_union_max_us` 为 92081.88，`dispatch_envelope_max_us` 为 121479.96。两个指标覆盖整次融合下发的 AICore 记录，attention 类型作为调用语义保留。
 - raw 文件没有 retained-run coverage envelope，通信、MoE、等待和 full-step 时间继续保持不可用，结果不能升级为 `complete`。
 - 请求客户端在 DFX 输出落盘后因 30 秒超时退出，没有生成完整 profile trace 和 response 文件；这属于实验脚本收尾问题。
 

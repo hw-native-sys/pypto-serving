@@ -18,15 +18,20 @@ import sys
 import threading
 import time
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 from .env import ProfileConfig, load_profile_config
 from .merge import merge_fragments
 
+if TYPE_CHECKING:
+    from pypto_serving.config.types import DispatchInvocation
+
 _MAIN_PID_ENV = "SA_PROFILE_MAIN_PID"
 _profiler: "ProfileRecorder | None" = None
 _profiler_pid: int | None = None
+_invocation_context: ContextVar[DispatchInvocation | None] = ContextVar("dispatch_invocation", default=None)
 
 
 class ProfileRecorder:
@@ -273,6 +278,22 @@ def configure_profiler(
 
 def is_enabled(level: str = "e2e") -> bool:
     return get_profiler().includes(level)
+
+
+@contextmanager
+def profile_invocation(invocation: DispatchInvocation | None) -> Iterator[None]:
+    """Bind the Serving identity for this call and restore it on exit."""
+    token = _invocation_context.set(invocation)
+    try:
+        yield
+    finally:
+        _invocation_context.reset(token)
+
+
+def invocation_profile_args() -> dict[str, object]:
+    """Return the current Serving identity for trace events."""
+    invocation = _invocation_context.get()
+    return invocation.as_profile_args() if invocation is not None else {}
 
 
 def profile_span(

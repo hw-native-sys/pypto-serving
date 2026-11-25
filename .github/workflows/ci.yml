@@ -6,13 +6,38 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      platform:
+        description: Serving CI platform to run (a2a3 or a5)
+        type: string
+        required: true
+      pypto-revision:
+        description: PyPTO commit under test
+        type: string
+        required: true
+      pypto-repository:
+        description: Repository containing the PyPTO commit
+        type: string
+        default: hw-native-sys/pypto
+    outputs:
+      a2a3-result:
+        description: Result of the A2A3 unit-tests job
+        value: ${{ jobs.unit-tests.result }}
+      a5-result:
+        description: Result of the A5 smoke job
+        value: ${{ jobs.v41-a5-smoke.result }}
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Downstream calls share a caller run and must not cancel either platform.
+  group: >-
+    ${{ inputs.platform && format('serving-ci-{0}-{1}', github.run_id, inputs.platform)
+        || format('ci-{0}-{1}', github.workflow, github.ref) }}
   cancel-in-progress: true
 
 jobs:
   pre-commit:
+    if: inputs.platform == ''
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -27,6 +52,7 @@ jobs:
           extra_args: --all-files
 
   unit-tests:
+    if: inputs.platform == '' || inputs.platform == 'a2a3'
     runs-on: [self-hosted, linux, arm64, npu]
     # Shared devices can stay occupied for more than an hour. Let Qwen guards
     # wait within this job budget, with separate 30-minute execution limits.
@@ -49,6 +75,9 @@ jobs:
       - name: Fetch composite action definitions
         uses: actions/checkout@v4
         with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: serving-ci
           sparse-checkout: .github/actions
           clean: false
           persist-credentials: false
@@ -85,13 +114,15 @@ jobs:
           echo "model dirs resolved from the runner config"
 
       - name: Setup CI job
-        uses: ./.github/actions/setup-ci-job
+        uses: ./serving-ci/.github/actions/setup-ci-job
         with:
           checkout-path: dist-checkout
           needs-device: 'true'
           runtime-platform: a2a3
-          # Match the Lib's explicit AIV shards and external-call specialization.
-          pypto-revision: 7302cd7ffeb552b3bec7c0e5bd92f164ba9fbd4b
+          # DeepSeek DSpark HC-pre uses the compact-accumulator lowering
+          # introduced by PyPTO PR #3489. This revision also pins PTOAS 0.74.
+          pypto-revision: ${{ inputs.pypto-revision || 'b943b5fc672ebf6d2d715d8db27abf71b07a9278' }}
+          pypto-repository: ${{ inputs.pypto-repository || 'hw-native-sys/pypto' }}
           toolchain: bundle
           # CI_CACHE_ROOT is shared with pypto and pypto-lib, whose jobs already
           # claim `serving` / `pip-serving`. Name both after this repo so the two
@@ -168,6 +199,10 @@ jobs:
 
       - name: Run DSpark HTTP guard (K=7, one 8-card server)
         env:
+          # Cold startup compiles the programs and stages weights on all eight ranks.
+          PYPTO_WORKER_INIT_TIMEOUT: '3600'
+          PYPTO_DSV4_STARTUP_TIMEOUT_SECONDS: '3900'
+          PYPTO_DSV4_OVERALL_TIMEOUT_SECONDS: '4500'
           PYPTO_RUNTIME_LOG: error
           PYPTO_DSPARK_EP_SIZE: '8'
           PYPTO_DSPARK_RING_HEAP: '1073741824,1073741824,2147483648,4294967296'
@@ -179,6 +214,9 @@ jobs:
           run_cmd="$run_cmd && TASK_DEVICE=\$TASK_DEVICE"
           run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout"
           run_cmd="$run_cmd PYPTO_DSV4_DSPARK_MODEL_DIR=$PYPTO_DSV4_DSPARK_MODEL_DIR"
+          run_cmd="$run_cmd PYPTO_WORKER_INIT_TIMEOUT=$PYPTO_WORKER_INIT_TIMEOUT"
+          run_cmd="$run_cmd PYPTO_DSV4_STARTUP_TIMEOUT_SECONDS=$PYPTO_DSV4_STARTUP_TIMEOUT_SECONDS"
+          run_cmd="$run_cmd PYPTO_DSV4_OVERALL_TIMEOUT_SECONDS=$PYPTO_DSV4_OVERALL_TIMEOUT_SECONDS"
           run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
           run_cmd="$run_cmd PYPTO_DSPARK_EP_SIZE=$PYPTO_DSPARK_EP_SIZE"
           run_cmd="$run_cmd PYPTO_DSPARK_RING_HEAP=$PYPTO_DSPARK_RING_HEAP"
@@ -195,11 +233,12 @@ jobs:
 
       - name: Kill orphaned task-submit tasks
         if: always()
-        uses: ./.github/actions/kill-orphaned-tasks
+        uses: ./serving-ci/.github/actions/kill-orphaned-tasks
         with:
           checkout-path: dist-checkout
 
   v41-a5-smoke:
+    if: inputs.platform == '' || inputs.platform == 'a5'
     # The A5 runner must provide PYPTO_DSV41_MODEL_DIR.
     # It may also provide PYPTO_V41_PREPACKED_WEIGHTS for the same DP4 checkpoint.
     runs-on: [self-hosted, linux, npu-a5]
@@ -217,6 +256,9 @@ jobs:
       - name: Fetch composite action definitions
         uses: actions/checkout@v4
         with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: serving-ci
           sparse-checkout: .github/actions
           clean: false
           persist-credentials: false
@@ -240,14 +282,14 @@ jobs:
           fi
 
       - name: Setup CI job
-        uses: ./.github/actions/setup-ci-job
+        uses: ./serving-ci/.github/actions/setup-ci-job
         with:
           checkout-path: dist-checkout
           needs-device: 'true'
           runtime-platform: a5
-          # The K5 guard passed with this compiler and the bundled Lib. Revisit
-          # after the V4.1 dynamic-shape bindings compile on PyPTO main.
-          pypto-revision: 7302cd7ffeb552b3bec7c0e5bd92f164ba9fbd4b
+          # Keep V4.1 on the compiler validated before PyPTO PR #3411.
+          pypto-revision: ${{ inputs.pypto-revision || '3db18db1286bdbb44266179e3aedae659174b711' }}
+          pypto-repository: ${{ inputs.pypto-repository || 'hw-native-sys/pypto' }}
           toolchain: bundle
           build-namespace: pypto-serving-v41-a5
           pip-cache-name: pip-pypto-serving-v41-a5
@@ -258,7 +300,9 @@ jobs:
           PYPTO_WORKER_INIT_TIMEOUT: '3600'
         run: |
           source "$GITHUB_WORKSPACE/dist-checkout/activate.sh"
-          printf -v cache_dir '%q' "$CI_CACHE_ROOT/jit-pypto-serving-v41-$RUNNER_NAME"
+          # Keep kernels from different compiler revisions in separate caches.
+          pypto_commit=$(git -C "$PYPTO_SRC" rev-parse HEAD)
+          printf -v cache_dir '%q' "$CI_CACHE_ROOT/jit-pypto-serving-v41-$RUNNER_NAME/$pypto_commit"
           run_cmd="cd $GITHUB_WORKSPACE/dist-checkout"
           run_cmd="$run_cmd && source activate.sh"
           run_cmd="$run_cmd && TASK_DEVICE=\$TASK_DEVICE"
@@ -276,7 +320,6 @@ jobs:
 
       - name: Kill orphaned task-submit tasks
         if: always()
-        uses: ./.github/actions/kill-orphaned-tasks
+        uses: ./serving-ci/.github/actions/kill-orphaned-tasks
         with:
           checkout-path: dist-checkout
-

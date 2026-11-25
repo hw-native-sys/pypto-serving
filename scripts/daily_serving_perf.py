@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Daily DSpark HTTP benchmark; run once inside a 16-device task-submit allocation."""
+"""Daily DSpark HTTP benchmark; run inside a task-submit allocation."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -35,18 +36,33 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = Path(__file__).with_name("daily_serving_perf_cases.json")
 MODEL_ID = "dsv4-flash-dspark-w8a8"
+V41_PROFILE = "v41-a5"
 WORDS = (" and", " the", " a", " to", " in", " of", " for", " with", " from", " on", " at", " is")
 HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def task_devices() -> tuple[int, ...]:
+def v41_case() -> tuple[dict, dict]:
+    manifest = json.loads(MANIFEST.with_name("daily_v41_perf_cases.json").read_text(encoding="utf-8"))
+    cases = manifest.get("cases", [])
+    if len(cases) != 1:
+        raise ValueError("daily V4.1 manifest must contain exactly one case")
+    case = cases[0]
+    prompts = manifest.get("prompts", [])
+    if len(prompts) != case.get("requests"):
+        raise ValueError(
+            f"case {case.get('id')!r} requests={case.get('requests')} but prompts={len(prompts)}"
+        )
+    return manifest, case
+
+
+def task_devices(counts: tuple[int, ...] = (16,)) -> tuple[int, ...]:
     raw = os.environ.get("TASK_DEVICE", "")
     try:
         devices = tuple(int(item) for item in raw.split(","))
     except ValueError as exc:
-        raise ValueError(f"TASK_DEVICE must contain 16 device IDs, got {raw!r}") from exc
-    if len(devices) != 16 or len(set(devices)) != 16 or any(device < 0 for device in devices):
-        raise ValueError(f"TASK_DEVICE must contain 16 distinct device IDs, got {raw!r}")
+        raise ValueError(f"TASK_DEVICE must contain device IDs, got {raw!r}") from exc
+    if len(devices) not in counts or len(set(devices)) != len(devices) or any(device < 0 for device in devices):
+        raise ValueError(f"TASK_DEVICE requires a distinct device count in {counts}, got {raw!r}")
     return devices
 
 
@@ -56,7 +72,27 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def server_command(model: Path, devices: tuple[int, ...], port: int) -> list[str]:
+def server_command(
+    model: Path, devices: tuple[int, ...], port: int, *, v41_a5: bool = False, case: dict | None = None
+) -> list[str]:
+    if v41_a5:
+        if case is None:
+            _, case = v41_case()
+        max_model_len = case["input_tokens"] + case["output_tokens"]
+        max_num_seqs = case["requests"]
+        max_num_batched_tokens = case.get("max_num_batched_tokens", 4096)
+        return [
+            sys.executable, "-m", "pypto_serving.cli", "--model", str(model),
+            "--served-model-name", case["model"], "--backend", "npu", "--platform", "a5",
+            "--devices", ",".join(map(str, devices)), "--tp", "1", "--dp", str(len(devices)),
+            "--ep", str(len(devices)), "--block-size", "128", "--max-model-len", str(max_model_len),
+            "--max-num-seqs", str(max_num_seqs), "--max-num-batched-tokens", str(max_num_batched_tokens),
+            "--enable-chunked-prefill", "--long-prefill-token-threshold", str(max_num_batched_tokens),
+            "--no-enable-prefix-caching", "--speculative-config",
+            '{"method":"dspark","num_speculative_tokens":5}',
+            "--generate-config", '{"temperature":0,"top_p":1,"seed":123}',
+            "--host", "127.0.0.1", "--port", str(port),
+        ]
     return [
         sys.executable,
         "-m",
@@ -137,19 +173,19 @@ def stop_server(process: subprocess.Popen) -> None:
         pass
 
 
-def build_prompt(tokenizer, target: int, seed: int) -> str:
+def build_prompt(tokenizer, target: int, seed: int, *, suffix: str = "") -> str:
     words = tuple(word for word in WORDS if len(tokenizer.encode(word)) == 1)
     if not words:
         raise ValueError("no single-token prompt words available")
     prefix = f"Benchmark request {seed}:"
     rng = random.Random(seed)
     pieces: list[str] = []
-    count = target - len(tokenizer.encode(prefix))
+    count = target - len(tokenizer.encode(prefix + suffix))
     for _ in range(12):
         if count < 0:
             raise ValueError(f"prompt prefix exceeds target of {target} tokens")
         pieces.extend(rng.choice(words) for _ in range(max(0, count - len(pieces))))
-        prompt = prefix + "".join(pieces[:count])
+        prompt = prefix + "".join(pieces[:count]) + suffix
         actual = len(tokenizer.encode(prompt))
         if actual == target:
             return prompt
@@ -159,6 +195,7 @@ def build_prompt(tokenizer, target: int, seed: int) -> str:
 
 def read_stream(response, request_start: float) -> dict:
     first_token = None
+    last_token = None
     usage = None
     finish_reason = None
     done = False
@@ -182,8 +219,10 @@ def read_stream(response, request_start: float) -> dict:
         if chunk.get("usage") is not None:
             usage = chunk["usage"]
         for choice in chunk.get("choices", []):
-            if choice.get("text") and first_token is None:
-                first_token = time.monotonic() - request_start
+            if choice.get("text"):
+                last_token = time.monotonic() - request_start
+                if first_token is None:
+                    first_token = last_token
             if choice.get("finish_reason") is not None:
                 finish_reason = choice["finish_reason"]
     if not done or usage is None or first_token is None:
@@ -191,16 +230,18 @@ def read_stream(response, request_start: float) -> dict:
     return {
         "ttft_s": first_token,
         "latency_s": time.monotonic() - request_start,
+        "last_token_s": last_token,
         "usage": usage,
         "finish_reason": finish_reason,
     }
 
 
 def request_one(
-    url: str, prompt: str, output_tokens: int, input_tokens: int, gate: threading.Barrier, timeout: int
+    url: str, prompt: str, output_tokens: int, input_tokens: int, gate: threading.Barrier, timeout: int,
+    model_id: str = MODEL_ID,
 ) -> dict:
     body = json.dumps(
-        {"model": MODEL_ID, "prompt": prompt, "max_tokens": output_tokens, "temperature": 0, "stream": True}
+        {"model": model_id, "prompt": prompt, "max_tokens": output_tokens, "temperature": 0, "stream": True}
     ).encode("utf-8")
     request = urllib.request.Request(url, body, {"Content-Type": "application/json"})
     gate.wait(timeout=120)
@@ -249,7 +290,8 @@ def run_round(url: str, prompts: list[str], case: dict, timeout: int) -> dict:
     with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
         futures = {
             pool.submit(
-                request_one, url, prompt, case["output_tokens"], case["input_tokens"], gate, timeout
+                request_one, url, prompt, case["output_tokens"], case["input_tokens"], gate, timeout,
+                case.get("model", MODEL_ID),
             ): i
             for i, prompt in enumerate(prompts)
         }
@@ -262,7 +304,7 @@ def run_round(url: str, prompts: list[str], case: dict, timeout: int) -> dict:
                 results.append(result)
             except Exception as exc:
                 errors.append(f"request {futures[future]}: {type(exc).__name__}: {exc}")
-    wall_s = time.monotonic() - started
+    wall_s = max(time.monotonic() - started, time.get_clock_info("monotonic").resolution)
     counters_after = speculation_counters(url)
     draft_tokens = counters_after["draft_tokens"] - counters_before["draft_tokens"]
     accepted_tokens = counters_after["accepted_tokens"] - counters_before["accepted_tokens"]
@@ -296,11 +338,12 @@ def run_round(url: str, prompts: list[str], case: dict, timeout: int) -> dict:
                     item["usage"]["prompt_tokens"] + item["usage"]["completion_tokens"] for item in results
                 ) / wall_s,
                 "acceptance_rate": accepted_tokens / draft_tokens if draft_tokens else None,
-                "tpot_p50_ms": statistics.median(
-                    1000 * (item["latency_s"] - item["ttft_s"]) / (case["output_tokens"] - 1)
-                    for item in results
-                ),
             }
+        )
+        end_key = "last_token_s" if case.get("token_event_tpot", False) else "latency_s"
+        result["tpot_p50_ms"] = statistics.median(
+            1000 * (item[end_key] - item["ttft_s"]) / max(1, item["usage"]["completion_tokens"] - 1)
+            for item in results
         )
     return result
 
@@ -316,6 +359,16 @@ def render_report(results: dict) -> str:
         "| Case | Round | Status | Requests | TTFT p50/p95 (s) | E2E p50/p95 (s) | TPOT p50 (ms) | Output tok/s | Total tok/s | Acceptance (%) |",
         "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
+    if results.get("profile") == "v41-a5":
+        workload = results["workload"]
+        lines[2] = (
+            f"A5 V4.1 K5, {workload['requests']} concurrent requests, {workload['input_tokens']} input tokens, "
+            f"{workload['output_tokens']} output tokens (completion API). "
+            f"max-num-seqs={workload['requests']}. max-num-batched-tokens={workload['max_num_batched_tokens']}. "
+            "Prefix caching disabled. "
+            "One complete warmup round precedes two measured rounds. TTFT includes bootstrap. "
+            "TPOT uses first/last nonempty output events and actual output tokens minus one."
+        )
     for item in results["rounds"]:
         fmt = lambda key: f"{item[key]:.2f}" if key in item else "-"
         acceptance = item.get("acceptance_rate")
@@ -344,9 +397,15 @@ def revision(path: Path) -> str:
 def run(args: argparse.Namespace) -> int:
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    v41_a5 = args.profile == "v41-a5"
+    manifest_path = MANIFEST.with_name("daily_v41_perf_cases.json") if v41_a5 else MANIFEST
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    v41_workload = None
+    if v41_a5:
+        manifest, v41_workload = v41_case()
     results = {
-        "model": MODEL_ID,
+        "model": v41_workload["model"] if v41_a5 else MODEL_ID,
+        "profile": args.profile,
         "model_dir": str(args.model),
         "prefix_caching": False,
         "seed": manifest["seed"],
@@ -355,6 +414,8 @@ def run(args: argparse.Namespace) -> int:
         "pypto_lib_commit": "unavailable",
         "pypto_commit": "unavailable",
         "rounds": [],
+        "warmups": [],
+        "workload": dict(v41_workload) if v41_a5 else {},
     }
 
     def publish() -> None:
@@ -364,40 +425,95 @@ def run(args: argparse.Namespace) -> int:
     publish()
     process = None
     try:
+        devices = task_devices((4, 8) if v41_a5 else (16,))
+        results["devices"] = devices
+        if args.expected_device_count is not None and len(devices) != args.expected_device_count:
+            raise ValueError(f"Expected {args.expected_device_count} devices, got {len(devices)} from TASK_DEVICE")
+
         from pypto_serving.model.tokenizer import load_tokenizer
 
         results["serving_commit"] = revision(ROOT)
         results["pypto_lib_commit"] = revision(ROOT / "pypto-lib")
         results["pypto_commit"] = revision(Path(os.environ["PYPTO_SRC"]))
-        devices = task_devices()
-        results["devices"] = devices
         if not args.model.is_dir():
             raise FileNotFoundError(f"model directory does not exist: {args.model}")
         tokenizer = load_tokenizer(args.model)
+        fixture = manifest.get("prompts", [])
+        if v41_a5 and len(fixture) != v41_workload["requests"]:
+            raise ValueError(f"case {v41_workload['id']!r} prompt count does not match requests")
         prompts = {}
         for case in manifest["cases"]:
             prompts[case["id"]] = [
-                build_prompt(tokenizer, case["input_tokens"], manifest["seed"] + i)
+                build_prompt(tokenizer, case["input_tokens"], manifest["seed"] + i,
+                             suffix="\n\n" + fixture[i] if fixture else "")
                 for i in range(case["requests"])
             ]
         results["prompt_sha256"] = {
             name: [hashlib.sha256(prompt.encode()).hexdigest() for prompt in items]
             for name, items in prompts.items()
         }
+        if v41_a5:
+            results["python_version"] = sys.version
+            results["package_versions"] = {}
+            for package in ("torch", "pypto", "simpler", "ptoas"):
+                try:
+                    results["package_versions"][package] = importlib.metadata.version(package)
+                except importlib.metadata.PackageNotFoundError:
+                    results["package_versions"][package] = "unavailable"
+            cann_root = os.environ.get("CANN_ROOT")
+            results["cann_root"] = cann_root or "unavailable"
+            if cann_root:
+                for path in (Path(cann_root) / "version.info", Path(cann_root).parent / "version.info"):
+                    if path.is_file():
+                        results["cann_version_info"] = path.read_text(encoding="utf-8")
+                        break
+            results["model_asset_sha256"] = {
+                name: hashlib.sha256((args.model / name).read_bytes()).hexdigest()
+                for name in ("config.json", "tokenizer.json", "tokenizer_config.json")
+                if (args.model / name).is_file()
+            }
+            inputs = {
+                name: [{"prompt": prompt, "input_ids": tokenizer.encode(prompt)} for prompt in items]
+                for name, items in prompts.items()
+            }
+            encoded = json.dumps(inputs, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            (output / "inputs.json").write_bytes(encoded)
+            results["inputs_sha256"] = hashlib.sha256(encoded).hexdigest()
+            results["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
         port = free_port()
-        results["server_command"] = server_command(args.model, devices, port)
+        results["server_command"] = server_command(
+            args.model, devices, port, v41_a5=v41_a5, case=v41_workload
+        )
+        server_env = os.environ.copy()
+        if v41_a5:
+            server_env["PYPTO_DSV41_DP_SIZE"] = str(len(devices))
+            # A runner's ordinary smoke-test sidecar may be packed for DP4.
+            dp_sidecar = os.environ.get(f"PYPTO_V41_DAILY_DP{len(devices)}_PREPACKED_WEIGHTS")
+            if dp_sidecar:
+                server_env["PYPTO_V41_PREPACKED_WEIGHTS"] = dp_sidecar
+            elif os.environ.get("PYPTO_V41_PREPACKED_WEIGHTS"):
+                server_env["PYPTO_V41_PREPACKED_WEIGHTS"] = os.environ["PYPTO_V41_PREPACKED_WEIGHTS"]
         with (output / "server.log").open("w", encoding="utf-8") as log:
+            startup_start = time.monotonic()
             process = subprocess.Popen(
                 results["server_command"],
                 cwd=ROOT,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                env=server_env,
             )
             try:
                 wait_for_health(process, port, args.startup_timeout)
+                results["startup_wait_s"] = time.monotonic() - startup_start
                 url = f"http://127.0.0.1:{port}/v1/completions"
                 for case in manifest["cases"]:
+                    for _ in range(manifest.get("warmup_rounds", 0)):
+                        warmup = run_round(url, prompts[case["id"]], case, args.request_timeout)
+                        results["warmups"].append(warmup)
+                        publish()
+                        if warmup["status"] != "pass":
+                            raise RuntimeError(f"warmup failed for {case['id']}: {warmup['errors']}")
                     for round_number in range(1, manifest["rounds"] + 1):
                         if process.poll() is not None:
                             raise RuntimeError(f"server exited before {case['id']} round {round_number}")
@@ -430,6 +546,8 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--startup-timeout", type=int, default=3600)
     parser.add_argument("--request-timeout", type=int, default=3600)
+    parser.add_argument("--profile", choices=("dspark", "v41-a5"), default="dspark")
+    parser.add_argument("--expected-device-count", type=int, choices=(4, 8, 16))
     return run(parser.parse_args())
 
 

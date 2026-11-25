@@ -169,10 +169,19 @@ class HostEngram:
         self.offsets = torch.tensor(np.array(offsets), dtype=torch.int64)
         self.multipliers = compute_hash_multipliers(self.layout.layer_ids, self.layout.max_ngram_size, vocab_size)
         self.history: dict[object, torch.Tensor] = {}
+        self.history_offsets: dict[object, int] = {}
         self.kv_out = (config["hc_mult"] + 1) * config["hidden_size"]
 
     def release_request(self, request_id) -> None:
         self.history.pop(request_id, None)
+        self.history_offsets.pop(request_id, None)
+
+    def begin_replay(self, request_id, start_pos: int) -> None:
+        """Begin a bounded replay with empty n-gram history at an absolute position."""
+        if type(start_pos) is not int or start_pos < 0 or request_id in self.history:
+            raise ValueError("Engram replay requires a fresh request and a nonnegative position")
+        self.history[request_id] = torch.empty(0, dtype=torch.int64)
+        self.history_offsets[request_id] = start_pos
 
     def hash_ids(self, token_ids, start_pos: int = 0, *, request_id=0) -> torch.Tensor:
         with profile_span("v41.HostEngram.hash_ids", cat="v41.engram", level="verbose"):
@@ -180,8 +189,10 @@ class HostEngram:
             if ids.ndim != 1 or bool(((ids < 0) | (ids >= self.token_map.numel())).any()):
                 raise ValueError("Engram requires a one-dimensional sequence of valid token IDs")
             history = self.history.get(request_id, torch.empty(0, dtype=torch.int64))
-            if isinstance(start_pos, bool) or not isinstance(start_pos, int) or not 0 <= start_pos <= history.numel():
+            offset = self.history_offsets.get(request_id, 0)
+            if (type(start_pos) is not int or not offset <= start_pos <= offset + history.numel()):
                 raise ValueError("Engram continuation requires all preceding token history")
+            start_pos -= offset
             compressed = torch.cat((history[:start_pos], self.token_map[ids]))
             positions = torch.arange(start_pos, compressed.numel(), dtype=torch.int64)
             lookback = []

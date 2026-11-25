@@ -58,8 +58,10 @@ class SchedulerConfig:
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
     num_speculative_tokens: int = 0
+    supports_stochastic_speculation: bool = False
     supports_chunked_prefill_with_speculation: bool = True
     speculative_prefix_cache_replay_tokens: int = 0
+    prefix_cache_replay_before_hit: bool = False
     prefix_cache_retention_interval: int = 8192
     requires_homogeneous_prefill_decode: bool = False
     # Async (pipelined) scheduling: schedule step N+1 before step N's sampled
@@ -159,6 +161,7 @@ class Request:
     # Externally populated requests keep their allocator-owned checkpoint policy.
     group_checkpoint_boundary: int | None = None
     group_shared_prefix_boundary: int = 0
+    prefix_cache_hit_tokens: int = 0
     # Earliest valid KV position after a model skips the beginning of a
     # prefill chunk. Keep this across decode so partial pages stay unpublished.
     group_cache_valid_from: dict[str, int] = field(default_factory=dict)
@@ -501,6 +504,9 @@ class Scheduler:
             if request.scheduling_held:
                 running_to_keep.append(request)
                 continue
+            if self._is_tail_held(request):
+                running_to_keep.append(request)
+                continue
             if grouped_phase is not None and request.is_prefill != (grouped_phase == "prefill"):
                 running_to_keep.append(request)
                 continue
@@ -516,28 +522,14 @@ class Scheduler:
                 continue
 
             is_prefill = request.is_prefill
-            # _limit_scheduled_tokens bounded num_new by the remaining context;
-            # after the positive check above, this remainder cannot be negative.
-            speculative_tokens = (
-                min(
-                    self.config.num_speculative_tokens,
-                    self.config.max_seq_len - request.num_computed_tokens - num_new,
-                )
-                if not is_prefill and request.temperature <= 0.0
-                else 0
-            )
-            scheduled_tokens = num_new + speculative_tokens
+            scheduled = ScheduledRequest(request, num_new, is_prefill,
+                                         num_computed_tokens=request.num_computed_tokens)
+            scheduled.num_speculative_tokens = self._speculative_tokens_for(request, scheduled)
+            scheduled_tokens = num_new + scheduled.num_speculative_tokens
             if scheduled_tokens > token_budget:
                 running_to_keep.append(request)
                 continue
 
-            scheduled = ScheduledRequest(
-                request,
-                num_new,
-                is_prefill,
-                num_computed_tokens=request.num_computed_tokens,
-                num_speculative_tokens=speculative_tokens,
-            )
             if not self._try_allocate_request_blocks(request, scheduled_tokens, scheduled=scheduled):
                 preempted = self._preempt_lowest_priority(
                     request, scheduled_req_ids, num_scheduled_tokens, output
@@ -657,6 +649,12 @@ class Scheduler:
                             request.request_id,
                             request.num_computed_tokens,
                         )
+                        request.prefix_cache_hit_tokens = request.num_computed_tokens
+                        if self.config.prefix_cache_replay_before_hit:
+                            request.num_computed_tokens = max(
+                                0, request.num_computed_tokens
+                                - self.config.speculative_prefix_cache_replay_tokens,
+                            )
                     cached_blocks = []
                 else:
                     cached_blocks = self.kv_cache_manager.get_computed_blocks(
@@ -673,7 +671,7 @@ class Scheduler:
                 cached_blocks = []
 
             grouped_prefix_hit = (
-                self.kv_cache_manager.has_groups and request.num_computed_tokens > 0
+                self.kv_cache_manager.has_groups and request.prefix_cache_hit_tokens > 0
             )
 
             rejection = self._single_prefill_rejection(request)
@@ -740,7 +738,8 @@ class Scheduler:
                 output.prefix_cache_query_tokens += request.num_prompt_tokens
                 output.prefix_cache_hits += min(
                     cacheable_tokens,
-                    request.num_computed_tokens,
+                    request.prefix_cache_hit_tokens if self.config.prefix_cache_replay_before_hit
+                    else request.num_computed_tokens,
                 )
                 request.prefix_cache_metrics_recorded = True
 
@@ -854,6 +853,22 @@ class Scheduler:
             scheduled -= scheduled % self.config.prefill_chunk_alignment
         return scheduled
 
+    def _is_tail_held(self, request: Request) -> bool:
+        """True when an in-flight base decode token already reaches max_new_tokens.
+
+        ``num_output_placeholders`` counts the guaranteed base output plus any
+        speculative slots that may all be rejected. Only the base token is
+        guaranteed, so a request is tail-held when the in-flight base output
+        alone reaches the limit; subtracting the speculative placeholders keeps
+        the pipeline full while drafts may still be rejected.
+        """
+        return (
+            not request.is_prefill
+            and request.num_output_placeholders > 0
+            and request.num_computed_tokens + 2 - request.num_output_placeholders
+            >= request.num_prompt_tokens + request.max_new_tokens
+        )
+
     def _grouped_cache_phase(self) -> str | None:
         """Choose one homogeneous kernel phase and rotate fairly."""
         if not self.config.requires_homogeneous_prefill_decode:
@@ -878,6 +893,7 @@ class Scheduler:
             and not request.scheduling_held
             and not request.is_prefill
             and request.num_new_tokens_needed > 0
+            and not self._is_tail_held(request)
             for request in self.running
         )
         if not has_prefill and not has_decode:
@@ -959,10 +975,11 @@ class Scheduler:
     ) -> int:
         """Extra tokens beyond the first that a sampling step may emit.
 
-        Mirrors the accounting ``schedule()`` uses when allocating blocks: only
-        greedy decode steps get speculative capacity.
+        The same bound is used for cache allocation and async reconciliation.
         """
-        if scheduled.is_prefill or request.temperature > 0.0:
+        if scheduled.is_prefill or (
+            request.temperature > 0.0 and not self.config.supports_stochastic_speculation
+        ):
             return 0
         # Use the dispatch snapshot: async advancement may already have changed
         # the live request. Never reserve KV or placeholders beyond the ceiling.
@@ -1316,6 +1333,7 @@ class Scheduler:
             for r in self.running
             if r.request_id != exclude.request_id and self._recompute_rejection(r) is None
             and not r.prefill_complete and not r.scheduling_held
+            and not self._is_tail_held(r)
         ]
         if self.kv_cache_manager.has_groups:
             # Grouped pools cannot borrow another partition's physical pages.
@@ -1357,6 +1375,7 @@ class Scheduler:
         victim.cache_partition = None
         victim.num_blocks_cached = 0
         victim.num_group_blocks_cached = {}
+        victim.prefix_cache_hit_tokens = 0
         # Async: drop any optimistic placeholder so the re-queued request restarts
         # from a clean prefill state (its in-flight step's result, if any, is
         # discarded engine-side since the request left `running`).
@@ -1384,6 +1403,7 @@ class Scheduler:
         request.cache_partition = None
         request.num_group_blocks_cached = {}
         request.group_cache_valid_from = {}
+        request.prefix_cache_hit_tokens = 0
         if request.status.is_finished:
             self.kv_cache_manager.dfx_terminal(request.request_id, reason)
 

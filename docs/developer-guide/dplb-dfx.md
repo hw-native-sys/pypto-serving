@@ -137,6 +137,15 @@ requests can still be open at the boundary. It does not certify full request
 execution, a complete model trace, or device timing. Use the manifest and
 sequence gaps before analyzing any subset of the JSONL.
 
+## Join device timing offline
+
+The offline adapter requires the Serving invocation ID, Step ID, execution slot,
+and pipeline generation from the matched Host trace. The manifest author pairs
+that trace with the runtime artifacts. For captures submitted individually in
+rank order, the adapter also requires matching `callable_digest` values from the
+runtime identity sidecars. A missing or mismatched digest leaves the group duration
+unavailable. A runtime-native submit group uses the group identity in its records.
+
 ## First-increment source baseline and validation
 
 The implementation was integrated against these source snapshots on

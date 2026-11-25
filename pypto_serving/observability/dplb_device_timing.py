@@ -1,18 +1,17 @@
 # Copyright (c) PyPTO Contributors.
-# This program is free software, you can redistribute it and/or modify it under the terms of
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, EXPRESS OR IMPLIED,
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """Join Serving invocation metadata with native per-rank device timing.
 
 The adapter consumes raw chip-swimlane records and the runtime identity
-sidecars written beside them.  It keeps rank-local clock domains separate and
-only reports durations after the dispatch identity, semantic scope and capture
-coverage have been checked.  The module deliberately does not infer attention
-meaning from kernel name substrings.
+sidecars written beside them. It keeps rank-local clock domains separate and
+reports durations for the whole dispatch, with semantic scope as descriptive
+metadata and an explicit coverage status.
 """
 
 from __future__ import annotations
@@ -54,13 +53,17 @@ def _invocation_fields(invocation: DispatchInvocation | Mapping[str, object]) ->
         }
     else:
         fields = {
-            "invocation_id": invocation.get("invocation_id"),
+            "invocation_id": invocation.get("invocation_id", invocation.get("prototype_invocation_id")),
             "serving_step_id": invocation.get("serving_step_id", invocation.get("step_id")),
-            "execution_slot": invocation.get("execution_slot", 0),
-            "pipeline_generation": invocation.get("pipeline_generation", 0),
+            "execution_slot": invocation.get("execution_slot"),
+            "pipeline_generation": invocation.get("pipeline_generation"),
         }
     if not isinstance(fields["invocation_id"], str) or not fields["invocation_id"]:
         raise ValueError("invocation_id must be a non-empty string")
+    if isinstance(invocation, Mapping):
+        alias = invocation.get("prototype_invocation_id", fields["invocation_id"])
+        if alias != fields["invocation_id"]:
+            raise ValueError("invocation_id disagrees with prototype_invocation_id")
     if type(fields["serving_step_id"]) is not int or fields["serving_step_id"] < 0:
         raise ValueError("serving_step_id must be a nonnegative integer")
     if type(fields["execution_slot"]) is not int or fields["execution_slot"] < 0:
@@ -81,7 +84,7 @@ def build_invocation_manifest(
     rank_to_device: Mapping[str, int] | None = None,
     provenance: Mapping[str, object] | None = None,
 ) -> dict:
-    """Create the join manifest emitted by a real Serving L3 invocation.
+    """Build an offline join manifest from Serving metadata and runtime captures.
 
     ``captures`` contains runtime-produced records and identity sidecars.  The
     builder only adds Serving and compiler metadata, so it cannot accidentally
@@ -230,8 +233,10 @@ def summarize_capture(raw: dict, identity: dict) -> dict:
 
 def analyze_invocation(manifest: dict, base_dir: Path) -> dict:
     """Summarize one Serving invocation and retain incomplete rank coverage."""
-    if manifest.get("schema_version") != 1 or not isinstance(manifest.get("scope"), str):
+    scope = manifest.get("scope")
+    if manifest.get("schema_version") != 1 or not isinstance(scope, str) or not scope:
         raise ValueError("unsupported invocation schema or semantic scope")
+    invocation = _invocation_fields(manifest)
     groups = manifest.get("logical_dp_groups")
     captures = manifest.get("captures")
     if not isinstance(groups, dict) or not isinstance(captures, list):
@@ -252,33 +257,56 @@ def analyze_invocation(manifest: dict, base_dir: Path) -> dict:
     for capture in captures:
         rank = capture["identity"].get("chip_rank")
         candidates.setdefault(rank, []).append(capture)
-    epochs = set()
-    for rank in expected:
+    native_runs = set()
+    dispatches = []
+    capture_files = set()
+    for rank in sorted(expected):
         entries = candidates.get(rank, [])
         if len(entries) != 1:
             ranks[str(rank)] = {"status": "missing" if not entries else "ambiguous"}
             continue
         entry = entries[0]
         try:
+            records_path = (base_dir / entry["records"]).resolve(strict=True)
+            stat = records_path.stat()
+            capture_file = (stat.st_dev, stat.st_ino)
+            if capture_file in capture_files:
+                raise ValueError("raw capture file is assigned to more than one rank")
+            capture_files.add(capture_file)
             if entry.get("program_sidecar") is not None:
                 marker = json.loads((base_dir / entry["program_sidecar"]).read_text())
                 expected_program = entry.get("program")
                 if expected_program is not None and marker.get("program") != expected_program:
                     raise ValueError("semantic program sidecar mismatch")
-            if entry.get("identity_sidecar") is not None:
-                sidecar = json.loads((base_dir / entry["identity_sidecar"]).read_text())
-                if sidecar != entry["identity"]:
-                    raise ValueError("manifest identity disagrees with the original sidecar")
-            raw = json.loads((base_dir / entry["records"]).read_text())
+            raw = json.loads(records_path.read_text())
             summary = summarize_capture(raw, entry["identity"])
-            epochs.add((entry["identity"]["owner_instance_id"], entry["identity"]["run_id"]))
+            sidecar_name = entry.get("identity_sidecar")
+            sidecar_path = (base_dir / sidecar_name).resolve(strict=True) if sidecar_name else None
+            adjacent_sidecar = records_path.with_name("dispatch_identity.json")
+            if summary["coverage_state"] == "unavailable":
+                if records_path.name != "chip_swimlane_records.json" or (
+                    sidecar_path is not None and sidecar_path != adjacent_sidecar
+                ) or adjacent_sidecar.is_symlink():
+                    raise ValueError("legacy raw capture requires its adjacent runtime identity sidecar")
+                sidecar_path = adjacent_sidecar
+            elif sidecar_path is None and records_path.name == "chip_swimlane_records.json" and adjacent_sidecar.is_file():
+                sidecar_path = adjacent_sidecar
+            sidecar_identity = json.loads(sidecar_path.read_text()) if sidecar_path is not None else {}
+            if sidecar_path is not None and sidecar_identity != entry["identity"]:
+                raise ValueError("manifest identity disagrees with the original sidecar")
+            identity = summary["identity"]
+            native_runs.add((identity["owner_instance_id"], identity["run_id"]))
+            dispatches.append({**identity, "callable_digest": sidecar_identity.get("callable_digest")})
             ranks[str(rank)] = {"records": entry["records"], **summary}
         except (OSError, ValueError, TypeError, KeyError) as error:
             ranks[str(rank)] = {"status": "unresolved", "error": str(error)}
     for rank in candidates:
         if rank not in expected:
             unresolved.append({"rank": rank, "reason": "unexpected rank"})
-    coherent = len(epochs) == 1
+    one_native_run = len(native_runs) == 1
+    coherent = one_native_run and len(dispatches) == len(expected) and _one_dispatch(dispatches)
+    if len(dispatches) == len(expected) and not coherent:
+        unresolved.append({"reason": "captures do not identify one runtime dispatch"})
     summaries = {}
     for group, members in groups.items():
         complete = coherent and not unresolved and all(
@@ -292,20 +320,17 @@ def analyze_invocation(manifest: dict, base_dir: Path) -> dict:
             "complete_ranks": sum(
                 ranks[str(rank)]["status"] == "complete" for rank in members
             ),
-            "attention_busy_union_max_us": max(
+            "dispatch_busy_union_max_us": max(
                 ranks[str(rank)]["busy_union_us"] for rank in members
             ) if complete else None,
-            "attention_envelope_max_us": max(
+            "dispatch_envelope_max_us": max(
                 ranks[str(rank)]["envelope_us"] for rank in members
             ) if complete else None,
         }
     return {
         "schema_version": 1,
-        "invocation_id": manifest.get("invocation_id", manifest.get("prototype_invocation_id")),
+        **invocation,
         "prototype_invocation_id": manifest.get("prototype_invocation_id"),
-        "serving_step_id": manifest.get("serving_step_id"),
-        "execution_slot": manifest.get("execution_slot"),
-        "pipeline_generation": manifest.get("pipeline_generation"),
         "scope": manifest["scope"],
         "model_layer_id": manifest.get("model_layer_id"),
         "semantic": manifest.get("semantic", {}),
@@ -313,7 +338,8 @@ def analyze_invocation(manifest: dict, base_dir: Path) -> dict:
             "observed" if all(group["status"] in ("complete", "observed") for group in summaries.values())
             else "partial"
         ),
-        "one_native_run": coherent,
+        "one_native_run": one_native_run,
+        "one_native_dispatch": coherent,
         "ranks": ranks,
         "logical_dp_groups": summaries,
         "unresolved": unresolved,
@@ -325,11 +351,35 @@ def analyze_invocation(manifest: dict, base_dir: Path) -> dict:
             "full_step_us": None,
         },
         "interpretation": (
-            "Per-rank interval union and envelope with group duration maximum. "
+            "Per-rank interval union and envelope for the whole dispatch, with group duration maximum. "
             "Raw rank-local clocks are retained; communication, MoE and wait "
             "remain unavailable until their semantic boundaries are published."
         ),
     }
+
+
+def _one_dispatch(dispatches: list[dict]) -> bool:
+    """Match a native submit group or an isolated rank-ordered PyPTO capture."""
+    group_sizes = {dispatch["group_size"] for dispatch in dispatches}
+    if group_sizes == {1}:
+        if len(dispatches) > 1:
+            digest = dispatches[0]["callable_digest"]
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+                or any(dispatch["callable_digest"] != digest for dispatch in dispatches[1:])
+            ):
+                return False
+        return (
+            len({dispatch["capture_index"] for dispatch in dispatches}) == 1
+            and len({dispatch["task_slot"] - index for index, dispatch in enumerate(dispatches)}) == 1
+        )
+    return (
+        group_sizes == {len(dispatches)}
+        and len({dispatch["task_slot"] for dispatch in dispatches}) == 1
+        and len({dispatch["group_index"] for dispatch in dispatches}) == len(dispatches)
+    )
 
 
 def main() -> None:
@@ -337,7 +387,10 @@ def main() -> None:
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    result = analyze_invocation(json.loads(args.manifest.read_text()), args.manifest.parent)
+    try:
+        result = analyze_invocation(json.loads(args.manifest.read_text()), args.manifest.parent)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(result["status"])
     if result["status"] not in ("complete", "observed"):

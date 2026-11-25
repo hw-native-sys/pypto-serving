@@ -19,6 +19,31 @@ The `.claude/skills` and `.codex/skills` paths are symlinks to
 the same skill definitions without duplicate files. When adding or updating a
 skill, edit `.agents/skills/<skill-name>/SKILL.md`.
 
+Shared portable skills (Git, PR, issue, taskboard, and profiling workflows)
+are published as plugins from `hw-native-sys/pypto-skills`; they are not
+vendored into this repository. Install the plugins needed for the current
+agent and scenario.
+
+Codex:
+
+```bash
+codex plugin marketplace add hw-native-sys/pypto-skills
+codex plugin add pypto-developer@pypto-skills
+codex plugin add pypto-user@pypto-skills
+```
+
+Claude Code:
+
+```bash
+claude plugin marketplace add hw-native-sys/pypto-skills
+claude plugin install pypto-developer@pypto-skills
+claude plugin install pypto-user@pypto-skills
+```
+
+Prefer repository-local skills for serving-specific workflows; use the
+installed `pypto-developer` or `pypto-user` plugin skills for shared
+cross-repository workflows.
+
 ## Development Commands
 
 Initialize submodules after cloning:

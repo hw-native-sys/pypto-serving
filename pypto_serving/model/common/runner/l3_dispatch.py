@@ -38,8 +38,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-from pypto_serving.config.types import DispatchInvocation, RuntimeConfig
-from pypto_serving.tools.profile import profile_span
+from pypto_serving.config.types import RuntimeConfig
+from pypto_serving.tools.profile import invocation_profile_args, profile_span
 
 from .buffer_set import resolve_l3_arg
 
@@ -54,7 +54,6 @@ class PendingL3Dispatch:
     handle: Any
     uploaded: tuple[Any, ...]
     name: str
-    invocation: DispatchInvocation | None = None
     profile_args: dict[str, Any] = field(default_factory=dict)
     _released: bool = False
     _error: BaseException | None = None
@@ -73,10 +72,7 @@ class PendingL3Dispatch:
                     f"{self.name}.worker_wait",
                     cat="kernel",
                     level="kernel",
-                    args=(
-                        self.profile_args
-                        or (self.invocation.as_profile_args() if self.invocation else {})
-                    ),
+                    args=self.profile_args,
                 ):
                     self.handle.result()
             except BaseException as exc:
@@ -101,7 +97,6 @@ class L3DispatchMixin:
     _l3_static_tensors: dict[tuple, Any]
     _l3_stacked: bool
     _l3_run_config: Any | None
-    _invocation_context: DispatchInvocation | None
 
     def _init_l3_dispatch(self, *, stacked: bool) -> None:
         """Initialize the shared dispatch state. Call from the runner ``__init__``."""
@@ -109,17 +104,6 @@ class L3DispatchMixin:
         self._l3_static_tensors: dict[tuple, Any] = {}
         self._l3_stacked = stacked
         self._l3_run_config = None
-        self._invocation_context = None
-
-    def set_invocation_context(self, context: DispatchInvocation | None) -> None:
-        """Attach the serving step identity to subsequent L3 profile spans."""
-        self._invocation_context = context
-
-    def _invocation_span_args(self) -> dict[str, Any]:
-        context = getattr(self, "_invocation_context", None)
-        if context is None:
-            return {}
-        return context.as_profile_args()
 
     @staticmethod
     def _semantic_span_args(callable_spec: Any) -> dict[str, Any]:
@@ -139,7 +123,7 @@ class L3DispatchMixin:
     def _callable_span_args(self, callable_spec: Any) -> dict[str, Any]:
         return {
             "aicpu_thread_num": callable_spec.aicpu_thread_num,
-            **self._invocation_span_args(),
+            **invocation_profile_args(),
             **self._semantic_span_args(callable_spec),
         }
 
@@ -263,7 +247,6 @@ class L3DispatchMixin:
             handle=handle,
             uploaded=tuple(uploaded),
             name=callable_spec.name,
-            invocation=getattr(self, "_invocation_context", None),
             profile_args=dict(span_args),
         )
 

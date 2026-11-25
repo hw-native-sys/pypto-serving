@@ -142,10 +142,6 @@ class EngineConfig:
             self.executor_cls, self.resolve_runtime_config().num_speculative_tokens
         )
 
-    def validate_generate_config(self, config) -> None:
-        if self.sampling_capabilities().greedy_only and not config.temperature <= 0:
-            raise ValueError("V4.1 K5 DSpark supports greedy sampling only; set temperature=0 or use K0")
-
     def resolve_runtime_config(self) -> RuntimeConfig:
         """Return runtime settings with executor requirements resolved."""
         runtime = self.runtime_config or RuntimeConfig()
@@ -298,10 +294,12 @@ class ReplicaEngineCore:
             enable_prefix_cache=self.config.enable_prefix_cache,
             enable_chunk_prefill=self.config.enable_chunk_prefill,
             num_speculative_tokens=runtime.num_speculative_tokens,
+            supports_stochastic_speculation=self.config.sampling_capabilities().supports_stochastic_speculation,
             supports_chunked_prefill_with_speculation=(
                 runtime.supports_chunked_prefill_with_speculation
             ),
             speculative_prefix_cache_replay_tokens=runtime.speculative_prefix_cache_replay_tokens,
+            prefix_cache_replay_before_hit=runtime.prefix_cache_replay_before_hit,
             prefix_cache_retention_interval=runtime.prefix_cache_retention_interval,
             requires_homogeneous_prefill_decode=(
                 runtime.requires_homogeneous_prefill_decode
@@ -922,7 +920,6 @@ class ReplicaEngineCore:
         constraint_spec: ConstraintSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
-        self.config.validate_generate_config(config)
         with profile_span(
             "ReplicaEngineCore.add_request",
             cat="serving",
@@ -1425,6 +1422,7 @@ class ReplicaEngineCore:
                         for name, block_ids in sr.block_ids_by_group.items()
                     },
                     cache_partition=sr.cache_partition,
+                    prefix_cache_hit_tokens=req.prefix_cache_hit_tokens,
                     read_block_ids_by_group=sr.read_block_ids_by_group,
                     checkpoint_ends=sr.checkpoint_plan.boundaries if sr.checkpoint_plan else (),
                     state_write_block_ids_by_group=sr.checkpoint_plan.write_blocks if sr.checkpoint_plan else {},
@@ -2259,10 +2257,6 @@ class AsyncLLMEngine:
     def kv_cache_manager(self) -> KvCacheManager:
         return self.single_core().kv_cache_manager
 
-    def validate_generate_config(self, config) -> None:
-        """Validate sampling before admission or HTTP streaming headers."""
-        self.config.validate_generate_config(config)
-
     async def add_request(
         self,
         request_id: str,
@@ -2272,7 +2266,6 @@ class AsyncLLMEngine:
         output_parser_spec: OutputParserSpec | None = None,
         constraint_spec: ConstraintSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
-        self.validate_generate_config(config)
         arrival_monotonic = time.monotonic()
         replica_idx = self._select_replica()
         prompt_token_ids = self._tokenize_prompt(prompt)
