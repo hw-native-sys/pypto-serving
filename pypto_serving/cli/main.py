@@ -108,6 +108,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kv-cache-dtype", default="bfloat16", help="KV cache data type. 'auto' follows --dtype (default: bfloat16).")
 
     # Runtime
+    parser.add_argument("--moe-offload-bytes", type=int, default=0, metavar="BYTES",
+                        help="HBM budget per rank for DeepSeek V4.1 routed expert weights. "
+                             "A positive budget enables mapped AIV supply; zero keeps resident weights.")
     parser.add_argument("--kv-offload-bytes", type=int, default=0,
                         help="Instance-wide DDR prefix-cache capacity in bytes; zero disables offload.")
     parser.add_argument("--kv-offload-backend", choices=("simpler",), default="simpler",
@@ -286,13 +289,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     _validate_backend(args.backend)
-    if args.max_num_seqs is None:
-        if args.pd_role:
-            from pypto_serving.pd.config import default_max_num_seqs
-
-            args.max_num_seqs = default_max_num_seqs(args.pd_role)
-        else:
-            args.max_num_seqs = 16
 
     from pypto_serving.serving.engine.async_engine import EngineConfig
 
@@ -301,10 +297,29 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
+    budget = getattr(args, "moe_offload_bytes", 0)
+    if budget:
+        _validate_expert_offload(args, model_family, budget)
+        executor_kwargs["expert_cache_bytes"] = budget
+    execution = None
+    if model_family == "deepseek_v41":
+        from pypto_serving.model.deepseek_v41.npu_runner import select_execution
+
+        execution = select_execution(budget)
+    if args.max_num_seqs is None:
+        default_capacity = execution.default_max_batch_size(args.data_parallel_size) if execution else None
+        if default_capacity is not None:
+            args.max_num_seqs = default_capacity
+        elif args.pd_role:
+            from pypto_serving.pd.config import default_max_num_seqs
+
+            args.max_num_seqs = default_max_num_seqs(args.pd_role)
+        else:
+            args.max_num_seqs = 16
     if args.max_num_batched_tokens is None:
         args.max_num_batched_tokens = 1024 if model_family == "deepseek_v41" else 4096
     if model_family == "deepseek_v41":
-        return _build_v41_engine_config(args, model_dir, model_config_data, devices)
+        return _build_v41_engine_config(args, model_dir, model_config_data, devices, executor_kwargs, execution)
     model_variant = _resolve_model_variant(args)
     _validate_prefill_chunk_size(
         model_family,
@@ -377,7 +392,14 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     )
 
 
-def _build_v41_engine_config(args, model_dir, raw, devices):
+def _validate_expert_offload(args, family: str, budget: int) -> None:
+    if budget < 0 or family != "deepseek_v41":
+        raise ValueError("--moe-offload-bytes requires a positive budget and a DeepSeek V4.1 model")
+    if _resolve_model_variant(args) or _resolve_num_speculative_tokens(args):
+        raise ValueError("MoE offload requires standalone inference without a speculative model")
+
+
+def _build_v41_engine_config(args, model_dir, raw, devices, executor_kwargs, execution):
     """Resolve the V4.1 worker boundary before starting any device resources.
 
     Like DSpark placement, TP/DP are internal to one overlapped EP worker.
@@ -406,11 +428,12 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
             raise ValueError("V4.1 DSpark requires num_speculative_tokens=5")
     if args.platform != "a5":
         raise ValueError("V4.1 M0 serving requires --platform a5")
+    allowed_sizes = execution.supported_dp_sizes
     topology = (args.tensor_parallel_size, args.data_parallel_size, args.expert_parallel_size)
     if (args.tensor_parallel_size != 1 or args.data_parallel_size != args.expert_parallel_size
-            or args.data_parallel_size not in (4, 8)
-            or len(devices) != args.data_parallel_size):
-        raise ValueError("V4.1 serving requires TP1 with matching DP/EP size 4 or 8")
+            or args.data_parallel_size not in allowed_sizes or len(devices) != args.data_parallel_size):
+        sizes = ", ".join(map(str, allowed_sizes[:-1])) + " or " + str(allowed_sizes[-1])
+        raise ValueError(f"V4.1 serving requires TP1 with matching DP/EP size {sizes}")
     dp_size = args.data_parallel_size
     if args.block_size != 128:
         raise ValueError("V4.1 serving requires --block-size 128")
@@ -421,7 +444,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
 
     parallel = ParallelConfig(
         data_parallel_size=1, tensor_parallel_size=1, expert_parallel_size=dp_size,
-        enable_expert_parallel=True, placement_mode="overlapped", devices=devices,
+        enable_expert_parallel=dp_size > 1, placement_mode="overlapped", devices=devices,
         data_parallel_routing=args.data_parallel_routing,
     )
     # This resolver intentionally raises while the lib adapter is missing.
@@ -430,7 +453,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         raise ValueError("V4.1 supports at most 12 requests per DP partition")
     request_slots = (args.max_num_seqs + dp_size - 1) // dp_size
     bindings = load_composite_bindings(
-        model_dir, args.max_model_len, dp_size=dp_size, request_slots=request_slots)
+        model_dir, args.max_model_len, dp_size=dp_size, request_slots=request_slots, **executor_kwargs)
     bindings.require(plan_layers(raw), RankPlacement(0, tp_size=1, dp_size=dp_size, ep_size=dp_size))
     if bindings.segment_topology is None:
         raise MissingCompositeInterface("V4.1 bindings must declare the selected lib decode capacity")
@@ -463,6 +486,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
         device_ids=devices,
         parallel_config=parallel,
         executor_cls=_executor_cls_for_model_family("deepseek_v41"),
+        executor_kwargs=executor_kwargs,
         runtime_config=runtime,
         profile_config=_build_profile_config(args),
         max_num_running_reqs=args.max_num_seqs,
