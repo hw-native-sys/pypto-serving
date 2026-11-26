@@ -1,5 +1,12 @@
 # Qwen3-14B
 
+The Qwen runner prepares decode metadata in two independent Host input slots.
+Preparation snapshots request registrations, row order, positions, page tables,
+sampling policy and worker step identity; the FIFO execution lane binds tokens
+after predecessor output is committed. A changed snapshot is rebuilt in the
+same owned slot, while stale or foreign tickets are rejected. A slot stays
+owned until its result has been published to the worker output queue.
+
 PyPTO Serving supports Qwen3-14B through the bundled Qwen model loader, NPU executor, and PyPTO kernels. Use this path for single-device validation, offline tensor-parallel runs, and HTTP serving with one or more data-parallel replicas.
 
 ## Checkpoint

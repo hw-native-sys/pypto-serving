@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -20,10 +21,10 @@ from pypto_serving.config.types import (
     PrefillBatch,
     RuntimeConfig,
     RuntimeModel,
+    SamplingParams,
 )
 from pypto_serving.model.qwen.npu_runner import (
     _CompiledKernels,
-    _DecodeKernelInputs,
     _L3Callable,
     Qwen314BModelRunner as ModelRunner,
     QwenLayout,
@@ -315,11 +316,6 @@ def test_decode_topk_selects_from_device_resident_logits(monkeypatch):
         aicpu_thread_num=1,
     )
     runner = ModelRunner(compiled=compiled)
-    host_logits = torch.zeros(1, model.config.vocab_size)
-    kernel_inputs = _DecodeKernelInputs(
-        actual_batch=1,
-        logits=host_logits,
-    )
     runner._kv_caches = {
         model.config.model_id: SimpleNamespace(
             key_pages=object(),
@@ -328,11 +324,6 @@ def test_decode_topk_selects_from_device_resident_logits(monkeypatch):
     }
     device_logits = object()
     device_next_hidden = object()
-    monkeypatch.setattr(
-        runner,
-        "_prepare_decode_inputs",
-        lambda _model, _batch: kernel_inputs,
-    )
     monkeypatch.setattr(runner, "_decode_logits_device_arg", lambda: device_logits)
     monkeypatch.setattr(
         runner,
@@ -382,6 +373,154 @@ def test_decode_kernel_inputs_reject_multi_token_rows():
                 block_ids=[[0]],
             ),
         )
+
+
+def _decode_batch(*, token=7, length=1, pages=None):
+    return DecodeBatch(
+        request_ids=["req"], token_ids=torch.tensor([[token]]), hidden_states=None,
+        seq_lens=torch.tensor([length], dtype=torch.int32),
+        block_ids=[[0] if pages is None else pages],
+    )
+
+
+@pytest.mark.parametrize("kernel_batch", [1, 16])
+def test_prepared_decode_overlaps_run_without_overwriting_inputs(monkeypatch, kernel_batch):
+    model = _model(max_batch_size=kernel_batch)
+    runner = ModelRunner(compiled=_compiled_kernels(model))
+    runner._kv_caches[model.config.model_id] = SimpleNamespace(key_pages=object(), value_pages=object())
+    running, finish = threading.Event(), threading.Event()
+    observed = []
+
+    def dispatch(_callable, *args):
+        observed.append(args[22].clone())
+        running.set()
+        assert finish.wait(timeout=5)
+        assert torch.equal(args[22], observed[0])
+        args[20].fill_(3)
+
+    monkeypatch.setattr(runner, "_run_l3", dispatch)
+    first = _decode_batch(token=10)
+    plan = runner.prepare_decode(model, first, buffer_slot=0)
+    result, errors = [], []
+
+    def execute():
+        try:
+            result.append(runner.run_prepared_decode(model, first, plan))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=execute)
+    thread.start()
+    try:
+        assert running.wait(timeout=5), errors
+        original = {k: v.clone() for k, v in runner._decode_slots[0].task_args.tensors.items()}
+        second = _decode_batch(token=-1, length=65, pages=[1, 2])
+        future = runner.prepare_decode(model, second, buffer_slot=1)
+        for name, tensor in runner._decode_slots[0].task_args.tensors.items():
+            # Outputs are uninitialized until dispatch completes.
+            if name in ("token_ids", "seq_lens", "block_table", "slot_mapping"):
+                assert torch.equal(tensor, original[name])
+            assert tensor.data_ptr() != runner._decode_slots[1].task_args.tensors[name].data_ptr()
+        assert runner._decode_slots[1].task_args.tensors["token_ids"].count_nonzero() == 0
+    finally:
+        finish.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive() and not errors
+    # The producer's committed token is only supplied after early preparation.
+    second.token_ids.fill_(11)
+    monkeypatch.setattr(runner, "_run_l3", lambda _callable, *args: observed.append(args[22].clone()))
+    runner.run_prepared_decode(model, second, future)
+    assert observed[1][:, 0].tolist() == [11] * kernel_batch
+    assert observed[1][:, 1:].count_nonzero() == 0
+    assert runner._decode_slots[1].task_args.tensors["slot_mapping"].tolist() == [128] * kernel_batch
+    assert not runner.supports_async_decode_reclaim
+
+
+@pytest.mark.parametrize("mutation", ["request", "position", "pages", "policy", "sampling", "registration", "step"])
+def test_prepared_decode_rejects_changed_snapshot(mutation):
+    model = _model(max_batch_size=1)
+    runner = ModelRunner(compiled=_compiled_kernels(model))
+    batch = _decode_batch()
+    batch.request_generations = (SimpleNamespace(request_id="req"),)
+    batch.sampling_params = [SamplingParams(temperature=0.0, top_p=1.0)]
+    batch.prepared_step_id = 3
+    plan = runner.prepare_decode(model, batch, buffer_slot=1)
+    if mutation == "request":
+        batch.request_ids[0] = "replacement"
+    elif mutation == "position":
+        batch.seq_lens.add_(1)
+    elif mutation == "pages":
+        batch.block_ids[0][0] = 1
+    elif mutation == "policy":
+        batch.allow_device_greedy_sampling = True
+    elif mutation == "sampling":
+        batch.sampling_params[0].seed = 42
+    elif mutation == "step":
+        batch.prepared_step_id += 2
+    else:
+        batch.request_generations = (SimpleNamespace(request_id="req"),)
+    with pytest.raises(ValueError, match="changed"):
+        runner.run_prepared_decode(model, batch, plan)
+    with pytest.raises(ValueError, match="stale"):
+        runner.run_prepared_decode(model, batch, plan)
+
+
+def test_prepared_decode_rejects_reused_slot_and_foreign_runner():
+    model = _model(max_batch_size=1)
+    runner = ModelRunner(compiled=_compiled_kernels(model))
+    other = ModelRunner(compiled=_compiled_kernels(model))
+    batch = _decode_batch()
+    plan = runner.prepare_decode(model, batch, buffer_slot=0)
+    runner.prepare_decode(model, batch, buffer_slot=0)
+    with pytest.raises(ValueError, match="stale"):
+        runner.run_prepared_decode(model, batch, plan)
+    with pytest.raises(ValueError, match="another runner"):
+        other.run_prepared_decode(model, batch, plan)
+    with pytest.raises(ValueError, match="Invalid"):
+        runner.prepare_decode(model, batch, buffer_slot=2)
+
+
+def test_prepared_decode_rejects_row_reorder_and_rebuilds_slot_cache(monkeypatch):
+    model = _model(max_batch_size=2)
+    runner = ModelRunner(compiled=_compiled_kernels(model))
+    runner._kv_caches[model.config.model_id] = SimpleNamespace(key_pages=object(), value_pages=object())
+    batch = DecodeBatch(
+        request_ids=["a", "b"], token_ids=torch.tensor([[7], [8]]), hidden_states=None,
+        seq_lens=torch.tensor([1, 2]), block_ids=[[0], [1]],
+    )
+    plan = runner.prepare_decode(model, batch, buffer_slot=1)
+    batch.request_ids.reverse()
+    batch.block_ids.reverse()
+    batch.seq_lens = batch.seq_lens.flip(0)
+    batch.token_ids = batch.token_ids.flip(0)
+    with pytest.raises(ValueError, match="changed"):
+        runner.run_prepared_decode(model, batch, plan)
+    plan = runner.prepare_decode(model, batch, buffer_slot=1)
+    dispatches = []
+    monkeypatch.setattr(runner, "_run_l3", lambda _callable, *args: dispatches.append(args))
+    runner.run_prepared_decode(model, batch, plan)
+    assert dispatches[0][7].reshape(2, -1).tolist() == [[1, -1], [0, -1]]
+    assert dispatches[0][8].tolist() == [65, 0]
+
+
+def test_failed_dispatch_consumes_ticket_and_allows_next_slot_use(monkeypatch):
+    model = _model(max_batch_size=1)
+    runner = ModelRunner(compiled=_compiled_kernels(model))
+    runner._kv_caches[model.config.model_id] = SimpleNamespace(key_pages=object(), value_pages=object())
+    batch = _decode_batch()
+    plan = runner.prepare_decode(model, batch, buffer_slot=0)
+
+    def fail(*_args):
+        raise RuntimeError("device failure")
+
+    monkeypatch.setattr(runner, "_run_l3", fail)
+    with pytest.raises(RuntimeError, match="device failure"):
+        runner.run_prepared_decode(model, batch, plan)
+    with pytest.raises(ValueError, match="stale"):
+        runner.run_prepared_decode(model, batch, plan)
+    next_plan = runner.prepare_decode(model, batch, buffer_slot=0)
+    monkeypatch.setattr(runner, "_run_l3", lambda *_args: None)
+    runner.run_prepared_decode(model, batch, next_plan)
 
 
 def test_compute_kv_cache_pages_takes_max_of_peak_and_simpler_committed():

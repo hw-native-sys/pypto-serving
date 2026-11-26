@@ -431,6 +431,14 @@ class DecodeBatch:
     # Optional serving-owned DSpark stage arguments for one complete target ->
     # accept -> drafter -> Markov -> commit round.
     dspark_stages: object | None = None
+    # Opaque registration identities retained by prepared execution. Holding the
+    # objects prevents identity reuse when a request ID is registered again.
+    request_generations: tuple[object, ...] = ()
+    prepared_step_id: int | None = None
+
+
+class StaleDecodeMetadata(ValueError):
+    """The current decode batch differs from its prepared metadata."""
 
 
 @dataclass
