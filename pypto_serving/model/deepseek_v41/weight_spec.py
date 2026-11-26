@@ -35,16 +35,17 @@ def pack_fp4_tiles(payload, tile=256):
     k = half_k * 2
     if k % tile or n % tile:
         raise ValueError("routed FP4 weights require complete 256x256 tiles")
-    output = torch.empty((n // tile, k // tile, tile, tile // 2), dtype=torch.uint8)
-    for nb in range(n // tile):
-        for kb in range(k // tile):
-            block = source[nb*tile:(nb+1)*tile, kb*(tile//2):(kb+1)*(tile//2)]
-            codes = torch.empty((tile, tile), dtype=torch.uint8)
-            codes[:, 0::2] = block & 15
-            codes[:, 1::2] = block >> 4
-            transposed = codes.T
-            output[nb, kb] = transposed[:, 0::2] | (transposed[:, 1::2] << 4)
-    return output.reshape(k * n // tile, tile // 2)
+    # Nibble-interleave, tile transpose and re-pack the whole tensor at once.
+    # The per-tile Python loop this replaces was GIL-bound (the expert thread
+    # pool scaled a fraction of its width) and ran ~5x slower in situ.
+    n_tiles, k_tiles = n // tile, k // tile
+    blocks = source.reshape(n_tiles, tile, k_tiles, tile // 2)
+    codes = torch.stack((blocks & 15, blocks >> 4), dim=-1).reshape(
+        n_tiles, tile, k_tiles, tile,
+    )
+    transposed = codes.permute(0, 2, 3, 1)  # [n_tiles, k_tiles, tile, tile]
+    packed = transposed[..., 0::2] | (transposed[..., 1::2] << 4)
+    return packed.contiguous().reshape(k * n // tile, tile // 2)
 
 
 def fp8_input_major(payload, scale):
