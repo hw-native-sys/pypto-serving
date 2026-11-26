@@ -20,6 +20,10 @@ on:
         description: Repository containing the PyPTO commit
         type: string
         default: hw-native-sys/pypto
+      runner-labels:
+        description: JSON array of runner labels for the selected platform (defaults to its native runner pool)
+        type: string
+        required: false
     outputs:
       a2a3-result:
         description: Result of the A2A3 unit-tests job
@@ -53,7 +57,7 @@ jobs:
 
   unit-tests:
     if: inputs.platform == '' || inputs.platform == 'a2a3'
-    runs-on: [self-hosted, linux, arm64, npu]
+    runs-on: ${{ fromJSON(inputs.runner-labels || '["self-hosted", "linux", "arm64", "npu"]') }}
     # Shared devices can stay occupied for more than an hour. Let Qwen guards
     # wait within this job budget, with separate 30-minute execution limits.
     # The always() cleanup cancels this job's tasks when the job times out.
@@ -241,7 +245,7 @@ jobs:
     if: inputs.platform == '' || inputs.platform == 'a5'
     # The A5 runner must provide PYPTO_DSV41_MODEL_DIR.
     # It may also provide PYPTO_V41_PREPACKED_WEIGHTS for the same DP4 checkpoint.
-    runs-on: [self-hosted, linux, npu-a5]
+    runs-on: ${{ fromJSON(inputs.runner-labels || '["self-hosted", "linux", "npu-a5"]') }}
     timeout-minutes: 180
     env:
       PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
