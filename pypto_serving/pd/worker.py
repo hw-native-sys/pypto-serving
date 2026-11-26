@@ -22,7 +22,7 @@ import msgspec
 
 from pypto_serving.tools.observe import record, span
 from .protocol import Completion, MAX_FRAME, Plan, Topology, decode, digest
-from .transfer import Owner, Region, TransferError, owner_factories
+from .transfer import Region, TransferError, TransferWorker
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +67,7 @@ def _shutdown(channel):
 class WorkerRuntime:
     def __init__(self, settings, model, progress_channel=None):
         self.settings, self.model = settings, model
-        self.owners = tuple(Owner(settings.boot, i, settings.hostname, settings.provider)
-                            for i in range(model.ranks))
+        self.owners = ()
         self.peers, self.peer_fingerprints, self.jobs = {}, {}, {}
         self.registry = None
         self.registry_digest = None
@@ -84,12 +83,22 @@ class WorkerRuntime:
         if self.progress_channel is not None:
             self.progress = ProgressServer(self.progress_channel, self.handle_progress, self.settings.handoff_timeout)
 
-    def worker_options(self):
-        return {"chip_service_factories": owner_factories(self.owners)}
-
     def worker_ready(self):
-        for owner in self.owners:
-            owner.ready()
+        # Create consumer channels only after compute owners have forked.
+        self.owners = tuple(TransferWorker(self.settings.boot, i, self.settings.hostname, self.settings.provider)
+                            for i in range(self.model.ranks))
+        try:
+            devices = self.model.worker().dc.device_ids
+            for owner, device in zip(self.owners, devices, strict=True):
+                owner.start(device)
+        except BaseException:
+            for owner in self.owners:
+                try:
+                    owner.close(startup_failed=True)
+                except Exception:
+                    self.uncertain = True
+                    logger.exception("failed to retire transfer rank %s during startup rollback", owner.rank)
+            raise
 
     def prepare(self):
         if self.registry is None:

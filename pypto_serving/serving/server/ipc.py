@@ -162,7 +162,7 @@ Command = Union[StepCommand, ShutdownCommand, ProfileCommand, ControlCommand]
 # Step result (worker → engine)
 # ---------------------------------------------------------------------------
 
-class StepResult(msgspec.Struct):
+class StepResult(msgspec.Struct, tag="step"):
     """Sampled tokens returned after executing one step.
 
     Values are always ``list[int]``:
@@ -178,6 +178,13 @@ class StepResult(msgspec.Struct):
     # Echoes the originating StepCommand.step_id (pipeline ordering guard).
     step_id: int = 0
     num_draft_tokens: dict[str, int] = msgspec.field(default_factory=dict)
+
+
+class ReleaseResult(msgspec.Struct, tag="release"):
+    """Confirmed request releases, independent of this command's forward result."""
+
+    request_ids: list[str]
+    step_id: int
 
 
 class ProfileResult(msgspec.Struct, tag="profile"):
@@ -203,7 +210,7 @@ class ControlResult(msgspec.Struct, tag="control"):
 _cmd_encoder: msgspec.msgpack.Encoder = msgspec.msgpack.Encoder()
 _cmd_decoder: msgspec.msgpack.Decoder = msgspec.msgpack.Decoder(Command)
 _result_encoder: msgspec.msgpack.Encoder = msgspec.msgpack.Encoder()
-_result_decoder: msgspec.msgpack.Decoder = msgspec.msgpack.Decoder(StepResult)
+_result_decoder: msgspec.msgpack.Decoder = msgspec.msgpack.Decoder(Union[StepResult, ReleaseResult])
 _profile_result_encoder: msgspec.msgpack.Encoder = msgspec.msgpack.Encoder()
 _profile_result_decoder: msgspec.msgpack.Decoder = msgspec.msgpack.Decoder(ProfileResult)
 _control_result_encoder: msgspec.msgpack.Encoder = msgspec.msgpack.Encoder()
@@ -220,12 +227,12 @@ def decode_command(data: bytes) -> Command:
     return _cmd_decoder.decode(data)
 
 
-def encode_result(result: StepResult) -> bytes:
+def encode_result(result: StepResult | ReleaseResult) -> bytes:
     """Encode a step result to bytes for queue transport."""
     return _result_encoder.encode(result)
 
 
-def decode_result(data: bytes) -> StepResult:
+def decode_result(data: bytes) -> StepResult | ReleaseResult:
     """Decode bytes from the output queue into a typed step result."""
     return _result_decoder.decode(data)
 

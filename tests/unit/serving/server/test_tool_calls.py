@@ -225,7 +225,10 @@ class _ReplayCore(ReplicaEngineCore):
         pass
 
     def drain_frees(self):
-        self._acknowledge_worker_frees(self._pending_free_ids)
+        for rid in self._pending_free_ids:
+            if (context := self._request_contexts.get(rid)) is not None:
+                context.worker_release_step = 1
+        self._acknowledge_worker_frees(self._pending_free_ids, 1)
         self.freed.extend(self._pending_free_ids)
         self._pending_free_ids.clear()
 

@@ -192,6 +192,13 @@ class TieredCache:
             lookup=self._lookup, checkpoint_keys=candidates)
         if not boundary:
             return True
+        # Selection returns physical ring slots. Freeze logical page order for
+        # delayed resident/restore pins before filtering holes or DDR entries.
+        for name, values in tables.items():
+            spec = self.cache._group_pools[name].spec
+            if spec.sliding_window is not None:
+                tables[name] = tuple(reversed(tuple(self.cache._group_tail(
+                    values, boundary // spec.spec.token_capacity))))
         for name, values in tables.items():
             for page in values:
                 if page is not None:

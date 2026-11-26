@@ -21,7 +21,7 @@ import pytest
 from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, RuntimeConfig
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig, ReplicaEngineCore
-from pypto_serving.serving.server.ipc import ShutdownCommand, StepResult, decode_command, encode_result
+from pypto_serving.serving.server.ipc import ReleaseResult, ShutdownCommand, StepResult, decode_command, encode_result
 
 CASE = Path(__file__).resolve().parents[4] / "examples"
 spec = importlib.util.spec_from_file_location("qwen_program_serving", CASE / "qwen3_program_acceptance.py")
@@ -384,6 +384,8 @@ class WorkerEndpoint:
         for request_id in command.finished_request_ids:
             self.active.pop(request_id)
             self.released.append(request_id)
+        if command.finished_request_ids:
+            self.responses.put(encode_result(ReleaseResult(command.finished_request_ids, command.step_id)))
         for request in command.new_requests:
             assert request.prompt_token_ids == [9, 8]
             self.admitted.append(request.request_id)

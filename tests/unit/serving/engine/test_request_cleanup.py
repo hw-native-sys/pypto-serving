@@ -96,7 +96,9 @@ def test_worker_step_error_queues_finished_ids_for_executor_release():
         assert token.finished is True
         assert token.finish_reason == "error"
         assert contexts[request_id].terminal_output_queued
-    core._acknowledge_worker_frees(("req-a", "req-b"))
+    for ctx in contexts.values():
+        ctx.worker_release_step = 8
+    core._acknowledge_worker_frees(("req-a", "req-b"), 8)
     assert all(ctx.worker_release_done.is_set() for ctx in contexts.values())
 
 
@@ -116,7 +118,8 @@ def test_abort_request_schedules_worker_cleanup():
     # The terminal consumer still needs its context to receive the release ACK.
     assert aborted == ["req-x"]
     context = core._request_contexts["req-x"]
-    core._acknowledge_worker_frees(("req-x",))
+    context.worker_release_step = 1
+    core._acknowledge_worker_frees(("req-x",), 1)
     assert context.worker_release_done.is_set()
     # The id is queued for worker release exactly once.
     assert core._pending_free_ids == ["req-x"]

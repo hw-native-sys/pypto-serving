@@ -252,6 +252,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="DSpark sparse checkpoint interval in source tokens (default: 8192; 0 disables periodic points).",
     )
     parser.add_argument(
+        "--async-scheduling", action=argparse.BooleanOptionalAction, default=None,
+        help="Overlap engine scheduling with execution (default: enabled for supported executors).",
+    )
+    parser.add_argument(
         "--enable-chunked-prefill",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -390,6 +394,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         enable_prefix_cache=enable_prefix_cache,
         enable_dplb=args.enable_dplb,
         enable_chunk_prefill=args.enable_chunked_prefill,
+        async_scheduling=args.async_scheduling,
     )
 
 
@@ -538,6 +543,7 @@ def _build_runtime_config(
             partitions=args.expert_parallel_size // args.tensor_parallel_size,
             decode_only=args.pd_role == "decode",
             prefill_only=args.pd_role == "prefill",
+            num_speculative_tokens=num_speculative_tokens,
         )
         if num_speculative_tokens:
             speculative_prefix_cache_replay_tokens = DSPARK_SLIDING_WINDOW
@@ -630,18 +636,10 @@ def _resolve_num_speculative_tokens(args: argparse.Namespace) -> int:
             raise ValueError("--speculative-config cannot be combined with --num-speculative-tokens")
         method = speculative_config.get("method")
         if method == "dspark":
-            from pypto_serving.model.deepseek_dspark.npu_runner import (  # noqa: PLC0415
-                DSPARK_SPECULATIVE_TOKENS,
-            )
-
             dspark_tokens = speculative_config.get("num_speculative_tokens", 0)
-            if dspark_tokens not in (0, DSPARK_SPECULATIVE_TOKENS):
-                raise ValueError(
-                    "DeepSeek V4 method='dspark' speculation is fixed at "
-                    f"num_speculative_tokens {DSPARK_SPECULATIVE_TOKENS} "
-                    "(DSPARK_QUERY_WIDTH); use 0 to serve the target model only"
-                )
-            return int(dspark_tokens)
+            if isinstance(dspark_tokens, bool) or not isinstance(dspark_tokens, int) or dspark_tokens < 0:
+                raise ValueError("DSpark num_speculative_tokens must be a non-negative integer")
+            return dspark_tokens
         if method != "mtp":
             raise ValueError("DeepSeek V4 --speculative-config requires method='mtp'")
         if "num_speculative_tokens" not in speculative_config:

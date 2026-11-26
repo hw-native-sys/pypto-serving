@@ -402,6 +402,12 @@ class PrefillBatch:
     # Serving step identity propagated to executor, runner, and L3 spans.
     invocation: DispatchInvocation | None = None
 
+    @property
+    def has_terminal_chunk(self) -> bool:
+        return not self.prompt_lens or any(
+            end >= prompt for end, prompt in zip(self.seq_lens, self.prompt_lens, strict=True)
+        )
+
 
 @dataclass
 class PrefillResult:

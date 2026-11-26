@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Joint eviction preference for immutable rolling cache/state checkpoints.
+"""Joint validity and eviction hints for immutable rolling cache/state checkpoints.
 
 These are allocator metadata, not extra allocations or ownership pins. Normal
 prefix lookup still validates every required group, including full-history KV.
@@ -19,7 +19,6 @@ from dataclasses import dataclass
 class CheckpointWritePlan:
     partition: int
     boundaries: tuple[int, ...]
-    preferred: tuple[int, ...]
     write_blocks: dict[str, list[int]]
     publication_blocks: dict[str, dict[int, int]]
     records: dict[int, dict[str, dict[int, int]]]
@@ -102,13 +101,20 @@ class GroupCheckpointWriter:
                 records[boundary] = members
             if not records:
                 return None
-            pinned = {name: [] for name in pools}
+            pinned = {name: {} for name in pools}
             for name in states:
-                pinned[name] = list(dict.fromkeys(original[name] + list(publications[name].values())))
+                page = pools[name].spec.spec.token_capacity
+                stop = (end + page - 1) // page
+                ring = original[name]
+                pinned[name] = {ring[q % len(ring)]: q for q in range(max(0, stop - len(ring)), stop)}
+                pinned[name].update((local, logical) for logical, local in publications[name].items())
             for members in records.values():
                 for name, pages in members.items():
-                    pinned[name] = list(dict.fromkeys(pinned[name] + list(pages.values())))
-            snapshot = manager.retain_group_block_snapshot(pinned, partition)
+                    pinned[name].update((local, logical) for logical, local in pages.items())
+            # Sparse publications can include several ring generations. Freeze
+            # their logical order here instead of treating them as one ring.
+            snapshot = manager.retain_group_block_snapshot(
+                {name: sorted(pages, key=pages.get) for name, pages in pinned.items()}, partition)
             for name, pages in publications.items():
                 pool = pools[name]
                 page = pool.spec.spec.token_capacity
@@ -124,18 +130,15 @@ class GroupCheckpointWriter:
                         continue
                     block.ref_cnt += 1
                     owned[slot] = block
-                    previous.ref_cnt -= 1
-                    if previous.ref_cnt == 0:
-                        pool.free_queues[partition].append(previous)
+                    manager._release_group_blocks(pool, partition, (previous,))
                 tables[name] = [pool.local_block_id(block) for block in owned]
-            preferred = tuple(sorted(b for b in records if b in (replay_boundary, shared_boundary)))
-            return CheckpointWritePlan(partition, tuple(sorted(records)), preferred,
+            return CheckpointWritePlan(partition, tuple(sorted(records)),
                                        original, publications, records, snapshot)
         finally:
-            for pool, block in fresh:
-                block.ref_cnt -= 1
-                if block.ref_cnt == 0:
-                    pool.free_queues[partition].append(block)
+            for pool in states.values():
+                manager._release_group_blocks(pool, partition,
+                    (block for owner, block in reversed(fresh) if owner is pool))
+            manager._maintain_group_checkpoints()
 
     def complete(self, request, hashes, tokens, plan):
         if plan is None:
@@ -151,8 +154,7 @@ class GroupCheckpointWriter:
                 for logical, local in pages.items():
                     manager._cache_group_block(pool, partition, pool.block_from_local_id(partition, local),
                                                values[logical])
-            manager._protect_group_checkpoint(request, hashes, tokens, partition, {}, boundary,
-                                               preferred=boundary in plan.preferred)
+            manager._protect_group_checkpoint(request, hashes, tokens, partition, {}, boundary)
 
 
 class GroupPrefixCheckpoints:
@@ -161,10 +163,10 @@ class GroupPrefixCheckpoints:
         self.pages = {}
         self.owners = {}
         self.histories = {}
-        self.preferred = set()
+        self.orphans = {}
         self.history_changed = False
 
-    def publish(self, owner, pools, hashes, tokens, partition, boundary, valid_from, *, preferred=True):
+    def publish(self, owner, pools, hashes, tokens, partition, boundary, valid_from):
         if not 0 < boundary <= tokens:
             return
         members, identity, history = [], [], {}
@@ -193,8 +195,6 @@ class GroupPrefixCheckpoints:
         if not members:
             return
         key = partition, boundary, tuple(sorted(identity))
-        if preferred:
-            self.preferred.add(key)
         if owner is not None:
             self.owners.setdefault(owner, set()).add(key)
         if key not in self.checkpoints:
@@ -207,18 +207,6 @@ class GroupPrefixCheckpoints:
         # Healthy sparse boundaries remain evictable after request retirement.
         self.owners.pop(owner, None)
 
-    def victim(self, pool, queue):
-        block = queue.head
-        periodic = None
-        while block is not None:
-            keys = self.pages.get((pool.spec.name, block.block_id))
-            if not keys:
-                return block
-            if periodic is None and not self.preferred.intersection(keys):
-                periodic = block
-            block = block.next_free
-        return periodic or queue.head  # Bounded cache: checkpoints never prevent admission.
-
     def discard_page(self, pool, block):
         if pool.spec.sliding_window is None and block.block_hash is not None:
             self.history_changed = True
@@ -229,21 +217,37 @@ class GroupPrefixCheckpoints:
         # Batch full-history eviction checks at the allocator operation boundary,
         # not once per page taken. In-flight table/snapshot refs still own data.
         if self.history_changed:
+            checked, missing = {}, set()
             for key, history in tuple(self.histories.items()):
-                if any((key[0], values[index]) not in pools[name].hash_to_block
-                       for name, (values, end) in history.items() for index in range(end)):
+                valid = True
+                for name, (values, end) in history.items():
+                    # Sparse checkpoints share a request's hash sequence. Check
+                    # each prefix once per prune, without caching across evictions.
+                    identity = key[0], name, id(values)
+                    stop = checked.get(identity, 0)
+                    if identity not in missing:
+                        while stop < end:
+                            if (key[0], values[stop]) not in pools[name].hash_to_block:
+                                missing.add(identity)
+                                break
+                            stop += 1
+                        checked[identity] = stop
+                    if stop < end:
+                        valid = False
+                        break
+                if not valid:
                     self._discard(key)
             self.history_changed = False
 
     def _discard(self, key):
-        self.preferred.discard(key)
         self.histories.pop(key, None)
         for owner in tuple(self.owners):
             self.owners[owner].discard(key)
             if not self.owners[owner]:
                 del self.owners[owner]
-        for page in self.checkpoints.pop(key, ()):
+        for page in reversed(self.checkpoints.pop(key, ())):
             owners = self.pages[page]
             owners.remove(key)
             if not owners:
                 del self.pages[page]
+                self.orphans[page] = None  # A deduplicated hint, never a page reference/pin.

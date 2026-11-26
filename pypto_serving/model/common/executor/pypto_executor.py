@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from .executor import ModelExecutor
@@ -47,6 +47,10 @@ class _PendingRunnerPrefill:
     model_id: str
     pending: object
     invocation: DispatchInvocation | None
+
+    @property
+    def wait_for_scratch(self) -> Callable[[], None] | None:
+        return getattr(self.pending, "wait_for_scratch", None)
 
 
 class PyptoExecutor(ModelExecutor, ABC):
@@ -144,14 +148,14 @@ class PyptoExecutor(ModelExecutor, ABC):
             return runner.reclaim_prepared_prefill(pending.pending)
 
     def run_prefill_in_slot(
-        self, model: RuntimeModel, batch: PrefillBatch, *, buffer_slot: int,
+        self, model: RuntimeModel, batch: PrefillBatch, *, buffer_slot: int, prepared: object | None = None,
     ) -> PrefillResult:
         runner = self._runners[model.config.model_id]
         with profile_invocation(getattr(batch, "invocation", None)), profile_span(
             "PyptoExecutor.run_prefill", cat="executor",
             args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)},
         ):
-            return runner.run_prefill_in_slot(model, batch, buffer_slot=buffer_slot)
+            return runner.run_prefill_in_slot(model, batch, buffer_slot=buffer_slot, prepared=prepared)
 
     def finalize_prefill(
         self,

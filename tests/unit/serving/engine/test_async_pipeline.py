@@ -32,6 +32,7 @@ from pypto_serving.serving.sched.scheduler import (
 from pypto_serving.serving.server.ipc import (
     PLACEHOLDER_TOKEN,
     StepResult,
+    ReleaseResult,
     decode_command,
     encode_result,
 )
@@ -121,6 +122,8 @@ def _async_pipeline_core(*, num_speculative_tokens: int = 0):
             tok = 1000
             new_tokens[pr.request_id] = [tok]
             _fake_worker_last[pr.request_id] = tok
+        if cmd.finished_request_ids:
+            results.append(encode_result(ReleaseResult(cmd.finished_request_ids, cmd.step_id)))
         results.append(encode_result(StepResult(new_tokens=new_tokens, step_id=cmd.step_id)))
 
     def _get_result(timeout=None):
@@ -233,6 +236,7 @@ def test_constrained_step_error_cleans_up_before_next_request():
     def put(raw):
         command = decode_command(raw)
         dispatched.append(command)
+        results.append(encode_result(ReleaseResult(command.finished_request_ids, command.step_id)))
         results.append(encode_result(StepResult(new_tokens={}, step_id=command.step_id)))
 
     core._input_queue = SimpleNamespace(put=put)
