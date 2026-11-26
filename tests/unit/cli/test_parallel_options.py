@@ -261,3 +261,72 @@ def test_retention_validation_and_default(interval):
         config = SchedulerConfig(prefix_cache_retention_interval=interval)
         with pytest.raises(ValueError, match="retention_interval"):
             config.validate_cache_groups(build_dspark_cache_group_specs(43))
+
+
+def test_expert_budget_is_opt_in_and_model_specific(tmp_path):
+    config = cli.build_serving_engine_config(_parse_cli_args(["--model", str(tmp_path)]))
+    assert "expert_cache_bytes" not in config.executor_kwargs
+    args = _parse_cli_args(["--model", str(tmp_path), "--moe-offload-bytes", "4096"])
+    with pytest.raises(ValueError, match=r"DeepSeek V4\.1"):
+        cli.build_serving_engine_config(args)
+
+
+def test_v4_rejects_expert_offload(tmp_path):
+    (tmp_path / "config.json").write_text(
+        '{"model_type":"deepseek_v4","quantization_config":{"quant_method":"compressed-tensors"}}')
+    args = _parse_cli_args(["--model", str(tmp_path), "--moe-offload-bytes", str(8 << 30)])
+    with pytest.raises(ValueError, match=r"DeepSeek V4\.1 model"):
+        cli.build_serving_engine_config(args)
+
+
+@pytest.fixture
+def v41_model_dir(tmp_path, monkeypatch):
+    import json
+    from pathlib import Path
+
+    raw = {"model_type": "deepseek_v41", "text_config": {
+        "model_type": "deepseek_v41_text", "num_hidden_layers": 40, "hidden_size": 5120,
+        "moe_intermediate_size": 2304, "n_routed_experts": 384, "num_experts_per_tok": 6,
+        "vocab_size": 129280, "num_attention_heads": 80, "head_dim": 512, "hc_mult": 4,
+        "max_position_embeddings": 8192, "rms_norm_eps": 1e-6,
+        "compress_ratios": [0] * 2 + [2] * 18 + [1] * 20,
+        "kv_source_layer_ids": [2, 8, 14, 20], "index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36],
+        "candidate_source_layer_id": 20}}
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    monkeypatch.setenv("PYPTO_LIB_ROOT", str(Path(__file__).resolve().parents[3] / "pypto-lib"))
+    return tmp_path
+
+
+def _v41_topology_args(model_dir, world):
+    return ["--model", str(model_dir), "--platform", "a5", "--devices", ",".join(map(str, range(world))),
+            "--dp", str(world), "--ep", str(world)]
+
+
+@pytest.mark.parametrize("world", [1, 2, 4, 8])
+def test_v41_rank_local_expert_budget_reaches_the_worker(v41_model_dir, world):
+    args = [*_v41_topology_args(v41_model_dir, world), "--max-num-seqs", "1"]
+    if world <= 2:
+        with pytest.raises(ValueError, match="DP/EP size 4 or 8"):
+            cli.build_serving_engine_config(_parse_cli_args(args))
+    budget = 8 << 30
+    config = cli.build_serving_engine_config(_parse_cli_args([*args, "--moe-offload-bytes", str(budget)]))
+    assert config.executor_kwargs == {"expert_cache_bytes": budget}
+    assert config.parallel_config.expert_parallel_size == world
+    assert all(group.num_partitions == world for group in config.runtime_config.kv_cache_groups)
+
+
+@pytest.mark.parametrize(("world", "expected"), [(1, 12), (2, 16), (4, 16)])
+def test_v41_moe_offload_default_request_capacity(v41_model_dir, world, expected):
+    args = [*_v41_topology_args(v41_model_dir, world), "--moe-offload-bytes", str(8 << 30)]
+    config = cli.build_serving_engine_config(_parse_cli_args(args))
+
+    assert config.max_num_running_reqs == expected
+    assert config.runtime_config.max_batch_size == expected
+    assert all(group.max_requests_per_partition == (expected + world - 1) // world
+               for group in config.runtime_config.kv_cache_groups)
+
+
+def test_v41_moe_offload_rejects_explicit_request_capacity_above_ep1_limit(v41_model_dir):
+    args = [*_v41_topology_args(v41_model_dir, 1), "--moe-offload-bytes", str(8 << 30), "--max-num-seqs", "13"]
+    with pytest.raises(ValueError, match="at most 12 requests per DP partition"):
+        cli.build_serving_engine_config(_parse_cli_args(args))

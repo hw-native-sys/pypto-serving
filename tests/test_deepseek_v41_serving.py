@@ -64,6 +64,23 @@ def _stop_server(process):
 
 @pytest.mark.parametrize("num_speculative_tokens", [0, 5], ids=["k0", "k5"])
 def test_v41_dp4_http_answer(tmp_path, num_speculative_tokens):
+    _run_v41_http_answer(tmp_path, num_speculative_tokens)
+
+
+@pytest.fixture(scope="module")
+def resident_answers(tmp_path_factory):
+    return _run_v41_http_answer(tmp_path_factory.mktemp("resident"), 0)
+
+
+@pytest.mark.parametrize("world", [1, 2, 4], ids=["ep1", "ep2", "ep4"])
+@pytest.mark.skipif(not os.environ.get("PYPTO_DSV41_MAPPED_TEST_BYTES"),
+                    reason="requires a V4.1 checkpoint and four A5 devices")
+def test_v41_mapped_matches_resident_generation(tmp_path, world, resident_answers):
+    budget = int(os.environ["PYPTO_DSV41_MAPPED_TEST_BYTES"])
+    assert _run_v41_http_answer(tmp_path, 0, world=world, expert_cache_bytes=budget) == resident_answers
+
+
+def _run_v41_http_answer(tmp_path, num_speculative_tokens, *, world=4, expert_cache_bytes=0):
     model_path = os.environ.get("PYPTO_DSV41_MODEL_DIR")
     if not model_path or not Path(model_path).is_dir():
         pytest.fail("PYPTO_DSV41_MODEL_DIR is not set to a model directory")
@@ -75,6 +92,9 @@ def test_v41_dp4_http_answer(tmp_path, num_speculative_tokens):
     devices = tuple(part.strip() for part in os.environ.get("TASK_DEVICE", "").split(","))
     assert len(devices) == 4 and len(set(devices)) == 4 and all(part.isdecimal() for part in devices)
 
+    devices = devices[:world]
+    batch_size = 4 if world == 1 else 8
+
     from pypto_serving.model.tokenizer import load_tokenizer
 
     tokenizer = load_tokenizer(model_dir)
@@ -84,13 +104,17 @@ def test_v41_dp4_http_answer(tmp_path, num_speculative_tokens):
     command = [
         sys.executable, "-m", "pypto_serving.cli", "--model", str(model_dir),
         "--served-model-name", MODEL_NAME, "--backend", "npu", "--platform", "a5",
-        "--devices", ",".join(devices), "--tp", "1", "--dp", "4", "--ep", "4",
-        "--block-size", "128", "--max-model-len", "8320", "--max-num-seqs", "8",
+        "--devices", ",".join(devices), "--tp", "1", "--dp", str(world), "--ep", str(world),
+        "--block-size", "128", "--max-model-len", "8320", "--max-num-seqs", str(batch_size),
         "--max-num-batched-tokens", str(prefill_tokens), "--host", "127.0.0.1", "--port", str(port),
         "--enable-chunked-prefill", "--long-prefill-token-threshold", str(prefill_tokens),
         "--show-startup-logs",
     ]
+    if expert_cache_bytes:
+        command.extend(["--moe-offload-bytes", str(expert_cache_bytes)])
+    responses = []
     env = os.environ.copy()
+    env["PYPTO_DSV41_DP_SIZE"] = str(world)
     probe_dir = tmp_path / "prefix-probe"
     probe_dir.mkdir()
     (probe_dir / "sitecustomize.py").write_text(
@@ -106,6 +130,8 @@ def test_v41_dp4_http_answer(tmp_path, num_speculative_tokens):
             "--speculative-config",
             json.dumps({"method": "dspark", "num_speculative_tokens": num_speculative_tokens}),
         ])
+        env["PYPTO_SERVING_DECODE_METRICS_DIR"] = str(metrics_dir)
+    if world == 1:
         env["PYPTO_SERVING_DECODE_METRICS_DIR"] = str(metrics_dir)
     log_path = tmp_path / "server.log"
     started = time.monotonic()
@@ -145,6 +171,7 @@ def test_v41_dp4_http_answer(tmp_path, num_speculative_tokens):
             answer = choice["message"]["content"]
             print("ANSWER", json.dumps({"question": question, "answer": answer,
                 "usage": result["usage"], "finish_reason": choice["finish_reason"]}, ensure_ascii=False), flush=True)
+            responses.append((answer, result["usage"]["completion_tokens"]))
             assert choice["finish_reason"] == "stop", result
             assert re.search(r"\b323\b", answer), result
             assert prompt_tokens - 96 <= result["usage"]["prompt_tokens"] <= prompt_tokens
@@ -215,8 +242,10 @@ def test_v41_dp4_http_answer(tmp_path, num_speculative_tokens):
                 return result
 
             for wave in range(2):
-                with ThreadPoolExecutor(max_workers=8) as pool:
+                with ThreadPoolExecutor(max_workers=batch_size) as pool:
                     results = list(pool.map(concurrent_answer, range(wave * 8, (wave + 1) * 8)))
+                responses.extend((row["choices"][0]["message"]["content"], row["usage"]["completion_tokens"])
+                                 for row in results)
                 print("CONCURRENT_WAVE", wave, json.dumps(results, ensure_ascii=False), flush=True)
             records = [json.loads(line) for path in probe_dir.glob("pages.*.jsonl")
                        for line in path.read_text(encoding="utf-8").splitlines()]
@@ -249,3 +278,12 @@ def test_v41_dp4_http_answer(tmp_path, num_speculative_tokens):
             for line in path.read_text(encoding="utf-8").splitlines()
             for request in json.loads(line)["requests"]
         ), "The HTTP request did not verify any DSpark drafts"
+    if world == 1:
+        sizes = {
+            len(batch["requests"])
+            for path in metrics_dir.glob("decode-steps.*.jsonl")
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if not (batch := json.loads(line))["prefill_requests"]
+        }
+        assert 1 in sizes and any(size > 1 for size in sizes), sizes
+    return responses

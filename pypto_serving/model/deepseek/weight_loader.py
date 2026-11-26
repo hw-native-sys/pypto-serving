@@ -118,6 +118,8 @@ _PACKED_NP_DTYPE = {
     # reinterpreted with torch.Tensor.view below.
     "BF16": np.int16,
     "F16": np.int16,
+    "F8_E4M3": np.uint8,
+    "F8_E8M0": np.uint8,
 }
 _PACKED_VIEW_DTYPE = {"BF16": torch.bfloat16, "F16": torch.float16}
 
@@ -169,6 +171,10 @@ def _map_shared_prepacked_tensors(fd: int, names: Iterable[str]) -> dict[str, to
             tensor = torch.from_numpy(array)
         if dtype in _PACKED_VIEW_DTYPE:
             tensor = tensor.view(_PACKED_VIEW_DTYPE[dtype])
+        elif dtype == "F8_E4M3":
+            tensor = tensor.view(torch.float8_e4m3fn)
+        elif dtype == "F8_E8M0":
+            tensor = tensor.view(torch.float8_e8m0fnu)
         tensors[name] = tensor.reshape(shape)
     return tensors
 
