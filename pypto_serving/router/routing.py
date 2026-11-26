@@ -363,7 +363,7 @@ class ReplicaRegistry:
 
 
 class HealthMonitor:
-    """Polls each replica's /health and keeps the registry in step.
+    """Polls readiness and keeps the registry in step.
 
     A replica still loading refuses the connection outright (uvicorn binds only
     after the engine starts), while a 503 means the process is up but its worker
@@ -378,6 +378,7 @@ class HealthMonitor:
         self._client = client
         self._probe_callback = probe
         self._task: asyncio.Task | None = None
+        self._probes: dict[int, asyncio.Task] = {}
 
     async def start(self, *, probe_first: bool = False) -> None:
         if self._task is None:
@@ -387,11 +388,14 @@ class HealthMonitor:
 
     async def stop(self) -> None:
         task, self._task = self._task, None
-        if task is None:
-            return
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        probes = tuple(self._probes.values())
+        for probe in probes:
+            probe.cancel()
+        await asyncio.gather(*probes, return_exceptions=True)
 
     async def _loop(self, *, delay_first: bool = False) -> None:
         if delay_first:
@@ -408,8 +412,20 @@ class HealthMonitor:
 
     async def probe_once(self) -> None:
         await asyncio.gather(
-            *(self._probe(state) for state in self._registry.states), return_exceptions=True
+            *(asyncio.shield(self.probe_node(state)) for state in self._registry.states),
+            return_exceptions=True,
         )
+
+    def probe_node(self, state: ReplicaState) -> asyncio.Task:
+        """Share an in-flight probe round with the poller and request waiters."""
+        # A replacement can reuse the same replica name.
+        key = id(state)
+        task = self._probes.get(key)
+        if task is None:
+            task = asyncio.create_task(self._probe(state))
+            self._probes[key] = task
+            task.add_done_callback(lambda _: self._probes.pop(id(state)))
+        return task
 
     async def _probe(self, state: ReplicaState) -> None:
         healthy = False
@@ -434,6 +450,8 @@ class HealthMonitor:
                 return
             logger.debug("health probe of %s failed: %s", state.name, exc)
 
+        if self._registry.state(state.name) is not state:
+            return
         if healthy:
             state.failures = 0
             self._registry.set_ready(state.name, True)

@@ -42,6 +42,8 @@ class Session:
                 or config.runtime_config.kv_offload_backend != "simpler"
                 or not config.enable_prefix_cache):
             raise ValueError("DDR offload requires DSpark prefix caching and the simpler backend")
+        from pypto_serving.serving.utils.native_buffers import check_buffer_exports
+        check_buffer_exports()
         capacity = config.runtime_config.kv_offload_bytes // PAGESIZE * PAGESIZE
         if capacity <= 0:
             raise ValueError("DDR pool is smaller than one physical page")
@@ -149,7 +151,7 @@ class Session:
     async def _close(self):
         if self.cache is None:
             if self._worker_started:
-                await asyncio.gather(*(asyncio.to_thread(owner.call, "stop") for owner in self.owners
+                await asyncio.gather(*(asyncio.to_thread(owner.stop) for owner in self.owners
                                        if not owner.stopped.value))
             self.pool.close()
             self.copy_library.cleanup()

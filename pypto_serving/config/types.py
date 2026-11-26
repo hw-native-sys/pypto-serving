@@ -381,6 +381,12 @@ class PrefillBatch:
     dspark_stages: object | None = None
     sampling_params: dict[str, SamplingParams] = field(default_factory=dict)
 
+    @property
+    def has_terminal_chunk(self) -> bool:
+        return not self.prompt_lens or any(
+            end >= prompt for end, prompt in zip(self.seq_lens, self.prompt_lens, strict=True)
+        )
+
 
 @dataclass
 class PrefillResult:

@@ -213,10 +213,18 @@ class SourcePins:
         self.cache = cache
         self.active = {}
 
-    def retain(self, chunk):
-        if chunk.request in self.active:
-            raise RuntimeError("one transfer per request may be in flight")
-        self.active[chunk.request] = self.cache.retain_group_block_snapshot(chunk.blocks, chunk.partition)
+    def retain(self, chunk, *, snapshot=None):
+        """Adopt a dispatch pin, or retain the confirmed synchronous table."""
+        snapshots = self.active.get(chunk.request, {})
+        if chunk.chunk in snapshots:
+            raise RuntimeError("source snapshot already retained")
+        if snapshot is None:
+            snapshot = self.cache.retain_group_block_snapshot(chunk.blocks, chunk.partition, token_count=chunk.end)
+        self.active.setdefault(chunk.request, {})[chunk.chunk] = snapshot
 
-    def release(self, request):
-        self.cache.release_group_block_snapshot(self.active.pop(request))
+    def release(self, request, chunk=None):
+        snapshots = self.active[request]
+        for number in tuple(snapshots) if chunk is None else (chunk,):
+            self.cache.release_group_block_snapshot(snapshots.pop(number))
+        if not snapshots:
+            self.active.pop(request)

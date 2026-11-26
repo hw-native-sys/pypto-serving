@@ -6,13 +6,14 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DSpark cache byte geometry and composition with optional existing owner services."""
+"""DSpark cache geometry and native Buffer leases for independent copy processes."""
 
-from functools import partial
+from dataclasses import asdict
+import multiprocessing
 import logging
 from math import prod
 
-from pypto_serving.serving.memory.tiering.simpler import CopyService, descriptor_wire
+from pypto_serving.serving.memory.tiering.simpler import serve_copy
 
 logger = logging.getLogger(__name__)
 
@@ -24,41 +25,13 @@ COMPONENTS = {
 }
 
 
-class OwnerServices:
-    def __init__(self, services):
-        self.services = services
-
-    def close(self):
-        for service in reversed(self.services):
-            service.close()
-
-
-def owner_factory(endpoints, rank, previous, pool, context):
-    for index, endpoint in enumerate(endpoints):
-        endpoint.parent.close()
-        if index != rank:
-            endpoint.child.close()
-    services = []
-    if previous is not None:
-        services.append(previous(context))
-    try:
-        services.append(CopyService(context, endpoints[rank].child, pool, endpoints[rank].stopped))
-    except BaseException:
-        for service in reversed(services):
-            try:
-                service.close()
-            except BaseException:
-                logger.exception("previous owner service rollback failed; preserving copy initialization error")
-        raise
-    return OwnerServices(services)
-
-
 class CacheOffloadExtension:
     def __init__(self, runner, endpoints, metadata, pool, previous=None):
         self.runner, self.endpoints, self.metadata = runner, endpoints, metadata
         self.pool = pool
         self.previous = previous(runner=runner) if previous is not None else None
-        self.tokens = []
+        self.exports = []
+        self.processes = []
 
     def __getattr__(self, name):
         return getattr(self.previous, name)
@@ -72,17 +45,22 @@ class CacheOffloadExtension:
     def wrap_capture(self, capture):
         return self.previous.wrap_capture(capture) if self.previous is not None else capture
 
-    def worker_options(self):
-        options = self.previous.worker_options() if self.previous is not None else {}
-        previous = options.get("chip_service_factories", {})
-        options["chip_service_factories"] = {
-            rank: partial(owner_factory, self.endpoints, rank, previous.get(rank), self.pool)
-            for rank in range(len(self.endpoints))}
-        return options
+    def allocation_options(self, scope, name=""):
+        options = self.previous.allocation_options(scope, name) if self.previous is not None else {}
+        return {**options, "exportable": True} if scope == "cache" else options
 
     def worker_ready(self):
         if self.previous is not None:
             self.previous.worker_ready()
+        context = multiprocessing.get_context("spawn")
+        devices = self.runner._shared_l3_worker().dc.device_ids
+        for rank, (endpoint, device) in enumerate(zip(self.endpoints, devices, strict=True)):
+            process = context.Process(target=serve_copy, name=f"cache-copy-{rank}",
+                                      args=(device, endpoint.child, self.pool, endpoint.stopped))
+            process.start()
+            self.processes.append(process)
+            endpoint.child.close()
+            endpoint.call("ready")
 
     def model_ready(self):
         worker = self.runner._shared_l3_worker()
@@ -111,22 +89,37 @@ class CacheOffloadExtension:
                     raise ValueError("invalid DSpark offload extent")
                 regions.append((name, count, blocks, page_bytes))
                 for rank, endpoint in enumerate(self.endpoints):
-                    token, descriptor = worker.retain_service_tensor(tensor.shards[rank], worker_id=rank)
-                    self.tokens.append(token)
-                    endpoint.call("register", (name, token, descriptor_wire(descriptor)))
+                    from simpler.buffer_export import BufferExportError
+                    try:
+                        exported = worker.export_buffer(tensor.shards[rank], worker_id=rank)
+                    except BufferExportError as error:
+                        self.exports.append(error.exported)
+                        raise
+                    self.exports.append(exported)
+                    endpoint.call("register", (name, asdict(exported)))
             groups[group] = tuple(regions)
         self.metadata.put(dict(groups=groups, ranks=len(self.endpoints),
                                tp=self.runner._compiled.layout.tp_size))
 
     def close(self):
-        for endpoint in self.endpoints:
+        owners = tuple(zip(self.endpoints, self.processes))
+        for endpoint, process in owners:
             if not endpoint.stopped.value:
-                # Startup failures can leave registered regions but no DDR jobs.
-                # The owner still rejects stop if any allocation is in use.
-                endpoint.call("stop")
+                try:
+                    endpoint.stop()
+                except (RuntimeError, OSError, EOFError):
+                    # A failed startup may finish rolling back after the ready
+                    # deadline. It must publish retirement before exiting.
+                    process.join(10)
+                    if process.exitcode != 0 or not endpoint.stopped.value:
+                        raise
+        for endpoint, process in owners:
+            process.join(10)
+            if process.exitcode != 0 or not endpoint.stopped.value:
+                raise RuntimeError("cache copy process did not retire normally")
         worker = self.runner._shared_l3_worker()
-        for token in self.tokens:
-            worker.release_service_tensor(token)
-        self.tokens.clear()
+        while self.exports:
+            worker.release_export(self.exports[0])
+            self.exports.pop(0)
         if self.previous is not None:
             self.previous.close()

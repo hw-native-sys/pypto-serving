@@ -24,6 +24,9 @@ class Owner:
         self.failed, self.calls = failed, []
         self.parent = SimpleNamespace(close=lambda: None)
 
+    def stop(self):
+        self.call("stop")
+
     def call(self, operation, payload=None):
         self.calls.append((operation, payload))
         if operation == 'copy_batch':
@@ -87,10 +90,60 @@ def test_timeout_quarantines_endpoint_before_any_later_send():
     with pytest.raises(RuntimeError, match='response timeout'):
         endpoint.call('copy_batch')
     with pytest.raises(RuntimeError, match='quarantined'):
-        endpoint.call('stop')
+        endpoint.stop()
     assert len(sent) == 1 and not endpoint.stopped.value
     with pytest.raises(ValueError, match='largest page footprint'):
         SimplerBackend([], dict(tp=4, groups={'idx': (('k', 2, 7, 128),)}), PAGESIZE)
+
+
+@pytest.mark.parametrize("poisoned", [False, True])
+def test_registration_error_only_allows_confirmed_cleanup(poisoned):
+    sent = []
+    replies = iter(((1, False, ("partial import", poisoned)), (2, True, None)))
+    pipe = SimpleNamespace(send=sent.append, poll=lambda _: True, recv=lambda: next(replies))
+    endpoint = Endpoint(pipe, None, SimpleNamespace(value=0), threading.Lock(),
+                        SimpleNamespace(value=False), SimpleNamespace(value=False))
+    with pytest.raises(RuntimeError, match="partial import"):
+        endpoint.call("register")
+    with pytest.raises(RuntimeError, match="quarantined"):
+        endpoint.call("copy_batch")
+    if poisoned:
+        with pytest.raises(RuntimeError, match="quarantined"):
+            endpoint.call("stop")
+        assert len(sent) == 1 and not endpoint.stopped.value
+    else:
+        endpoint.call("stop")
+        assert len(sent) == 2 and endpoint.stopped.value
+
+
+@pytest.mark.parametrize("poisoned", [False, True])
+def test_export_is_released_only_after_cache_stop_ack(poisoned):
+    from pypto_serving.model.deepseek_dspark.cache_offload import CacheOffloadExtension
+
+    sent, released = [], []
+    replies = iter(((1, False, ("partial import", False)),
+                    (2, False, ("unmap failed", poisoned)), (3, True, None)))
+    pipe = SimpleNamespace(send=sent.append, poll=lambda _: True, recv=lambda: next(replies))
+    endpoint = Endpoint(pipe, None, SimpleNamespace(value=0), threading.Lock(),
+                        SimpleNamespace(value=False), SimpleNamespace(value=False))
+
+    def release(export):
+        assert endpoint.stopped.value
+        released.append(export)
+
+    worker = SimpleNamespace(release_export=release)
+    extension = CacheOffloadExtension(SimpleNamespace(_shared_l3_worker=lambda: worker), (endpoint,), None, None)
+    extension.exports.append("lease")
+    extension.processes.append(SimpleNamespace(join=lambda _: None, exitcode=0))
+    with pytest.raises(RuntimeError, match="partial import"):
+        endpoint.call("register")
+    if poisoned:
+        with pytest.raises(RuntimeError, match="unmap failed"):
+            extension.close()
+        assert len(sent) == 2 and not released and extension.exports == ["lease"]
+    else:
+        extension.close()
+        assert len(sent) == 3 and released == ["lease"] and not extension.exports
 
 
 @pytest.mark.parametrize('started,failed', [(False, False), (True, False), (True, True)])
@@ -103,7 +156,7 @@ def test_partial_startup_releases_pool_only_after_owner_ack(started, failed):
             if failed:
                 raise RuntimeError('stop unknown')
         session.cache, session._worker_started = None, started
-        session.owners = [SimpleNamespace(stopped=SimpleNamespace(value=False), call=stop)]
+        session.owners = [SimpleNamespace(stopped=SimpleNamespace(value=False), stop=stop)]
         session.pool.close = lambda: events.append('pool')
         session.copy_library.cleanup = lambda: events.append('helper')
         if failed:
@@ -139,22 +192,21 @@ def test_drain_failure_stops_progress_thread_and_retains_pool():
 def test_copy_owner_finishing_initialization_after_timeout_stops(monkeypatch):
     from pypto_serving.serving.memory.tiering import simpler
     release, closed = threading.Event(), []
-    def current_context(pointer):
-        ctypes.cast(pointer, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(1)
-        return 0
-    acl = SimpleNamespace(aclrtGetCurrentContext=current_context, aclrtSetCurrentContext=lambda _: 0)
-    monkeypatch.setattr(simpler.ctypes, 'CDLL', lambda _: acl)
+    retired = SimpleNamespace(value=False)
+    monkeypatch.setattr(simpler, 'DeviceContext', lambda _: SimpleNamespace(
+        bind=lambda: None, close=lambda: closed.append('context')))
     monkeypatch.setattr(simpler, 'NativeCopy', lambda _: SimpleNamespace(
         initialize_pool=lambda _: release.wait(2), close=lambda: closed.append(True)))
     monkeypatch.setenv('PYPTO_WORKER_INIT_TIMEOUT', '0')
-    service = simpler.CopyService.__new__(simpler.CopyService)
+    monkeypatch.setattr(simpler.logger, 'exception', lambda *_: release.set())
+    process_main = threading.Thread(target=simpler.serve_copy,
+        args=(None, SimpleNamespace(close=lambda: None), {}, retired), daemon=True)
+    process_main.start()
     try:
-        with pytest.raises(RuntimeError, match='initialization failed'):
-            service.__init__(None, SimpleNamespace(close=lambda: None), {}, SimpleNamespace(value=False))
+        process_main.join(2)
+        assert not process_main.is_alive() and retired.value and closed == [True, 'context']
     finally:
         release.set()
-        service.thread.join(2)
-    assert not service.thread.is_alive() and closed == [True]
 
 
 @pytest.mark.parametrize('stage,rollback_fails', [
@@ -165,18 +217,26 @@ def test_copy_owner_initialization_rolls_back_only_acquired_stages(monkeypatch, 
     from simpler import buffer
     from pypto_serving.serving.memory.tiering import simpler
     events, retired = [], SimpleNamespace(value=False)
+    def context(device):
+        events.append('context')
+        if stage == 'context':
+            raise RuntimeError('ACL context unavailable')
+        def bind():
+            events.append('attach')
+            if stage == 'attach':
+                raise RuntimeError('attach failed')
+        return SimpleNamespace(bind=bind, close=lambda: events.append('context-close'))
+    monkeypatch.setattr(simpler, 'DeviceContext', context)
     def call(name, *args):
         events.append(name)
-        if name in ('aclrtGetCurrentContext', 'aclrtCreateStream'):
+        if name == 'aclrtCreateStream':
             ctypes.cast(args[0], ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(1)
-        return int((stage == 'context' and name == 'aclrtGetCurrentContext')
-                   or (stage == 'attach' and name == 'aclrtSetCurrentContext')
-                   or (stage == 'stream' and name == 'aclrtCreateStream')
+        return int((stage == 'stream' and name == 'aclrtCreateStream')
                    or (stage == 'register' and name == 'aclrtHostRegisterV2')
                    or (rollback_fails and name == 'aclrtHostUnregister'))
     acl = SimpleNamespace(**{name: (lambda *args, n=name: call(n, *args)) for name in (
-        'aclrtGetCurrentContext', 'aclrtSetCurrentContext', 'aclrtCreateStream', 'aclrtDestroyStream',
-        'aclrtSynchronizeStream', 'aclrtHostRegisterV2', 'aclrtHostUnregister')})
+        'aclrtCreateStream', 'aclrtDestroyStream', 'aclrtSynchronizeStream',
+        'aclrtHostRegisterV2', 'aclrtHostUnregister')})
     def acquire(name):
         events.append(name)
         if stage == name:

@@ -22,8 +22,8 @@ separate host-memory headroom for weights and staging, runtime heaps, Python and
 checkpoint metadata, concurrent processes and the operating system; do not set
 the pool from `MemAvailable` alone or assume a container has a dedicated host.
 
-The backend requires Linux, the matching PyPTO/Simpler owner-service and retained
-tensor interfaces, CANN's Ascend asynchronous copy APIs and `aclrtHostRegisterV2`, and enough host memory
+The backend requires Linux, matching upstream PyPTO/Simpler leased VMM Buffer
+export/import interfaces, CANN's Ascend asynchronous copy APIs and `aclrtHostRegisterV2`, and enough host memory
 for the configured pool. On a host with multiple NUMA nodes, `libnuma.so.1` and permission
 to apply `mbind` to the pool mapping are required. The pool is interleaved across
 allowed memory nodes before first touch; other allocations keep their existing
@@ -85,9 +85,11 @@ their memberships; short intervals and long contexts increase that overhead.
 
 ## Execution and ownership
 
-One shared HOST backing is allocated per instance. Each rank owner imports and
-registers it once. DDR extents for different ranks and requests never overlap
-while live. Owner-local copy threads use a stream separate from computation;
+One shared HOST backing is allocated per instance. Each rank has a separate copy
+process with its own ACL context. It imports and registers the HOST pool once,
+and imports the compute Worker's exportable HBM buffers through native VMM leases.
+DDR extents for different ranks and requests never overlap while live. Copy
+threads use a stream separate from computation;
 neither the API thread nor the compute submission thread waits for native DMA.
 
 New immutable full-history pages enter a metadata queue with their source HBM
@@ -99,10 +101,11 @@ and 32768 compact component spans. Its command table is allocated once at startu
 layer rows are expanded and planned inside the native helper. There is one batch in flight per owner. A batch has one final native
 completion; a logical page becomes ready only after all required components and
 TP copies complete. An index page includes both index KV and scale data.
-The native planner compares layer rows within a page with regular runs across pages,
-using the plan with fewer two-dimensional copies. Contiguous ranges use asynchronous memcpy. This changes command
-grouping without changing page layout or copying gaps between authorized pages.
-There is no HBM staging buffer, data packing, or selectable legacy copy path.
+The native planner compares layer rows within a page with regular runs across
+pages, using the plan with fewer copy commands. STORE and LOAD both submit
+contiguous and strided spans through `aclrtMemcpy2dAsync`. Each command writes
+directly to its destination pages. Only the copy process waits for stream
+completion, once per batch, before reporting the native result.
 
 ### Batch limits and native execution
 
@@ -127,8 +130,8 @@ about 18 GB/s for a C++ loop on registered THP backing; the batch API was about
 2.8 GB/s on that layout. These are submission-path diagnostics, not model
 throughput or guaranteed bandwidth. Keeping expansion and ACL calls in one
 ctypes call also releases the GIL. This does not claim Python lacks async copy
-APIs. Simpler continues to own allocation/context lifetime; Serving validates
-model spans and copy proofs. Moving generic strided batch execution into a shared
+APIs. Simpler retains allocation ownership through its export leases; each copy
+process owns its importing ACL context. Serving validates model spans and copy proofs. Moving generic strided batch execution into a shared
 runtime is separate follow-up work, not an SDK modification in this feature.
 
 ### Ownership boundaries and pressure
@@ -176,8 +179,9 @@ their ranges until confirmed complete. There is no offload queue-length limit:
 under pressure, queued stores can retain HBM pages and delay allocation for new
 work. A finite DDR budget does not guarantee retention of every prefix.
 
-Shutdown drains native work, unregisters the pool inside each owner, and then
-closes the backing. An unknown completion keeps the corresponding ranges and
+Shutdown drains native work, unregisters each copy process's HOST pool, unmaps
+its device imports, and closes its context before releasing source export leases.
+The HOST backing closes after all copy acknowledgements. An unknown completion keeps the corresponding ranges and
 pins isolated; a timeout is not evidence that memory can be reused.
 
 ## Measurement

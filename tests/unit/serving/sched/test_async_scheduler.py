@@ -1386,6 +1386,46 @@ def test_grouped_prefix_hit_falls_back_to_an_idle_partition_when_suffix_does_not
     assert output.prefix_cache_hits == 0
 
 
+@pytest.mark.parametrize("busy, spare", [(False, True), (True, True), (True, False)])
+def test_pd_prefill_uses_idle_partition_when_prefix_partition_is_busy(busy, spare):
+    from pypto_serving.pd.scheduler import PrefillScheduler
+
+    cache = KvCacheManager(block_size=2, enable_prefix_cache=True)
+    cache.init_groups((KVCacheGroupSpec(
+        name="kv", layer_indices=(0,), spec=KVCacheSpec(block_size=2, page_size_bytes=1),
+        max_blocks_per_seq=8, num_blocks=12, num_partitions=2,
+    ),), max_batch_size=2)
+    prompt = [1, 2, 3, 4, 5, 6]
+    hashes = cache.compute_group_block_hashes(prompt)
+    cache.ensure_group_blocks("warm", 4, partition=0)
+    cache.cache_group_blocks("warm", hashes, 4, {})
+    cache.release_all_group_requests("warm")
+    scheduler = PrefillScheduler(config=SchedulerConfig(
+        max_num_scheduled_tokens=8, max_prefill_tokens_per_request=4, async_scheduling=True,
+        max_seq_len=16, enable_prefix_cache=True,
+    ), kv_cache_manager=cache)
+    if busy:
+        continuing = Request("continuing", list(range(10, 22)), max_new_tokens=1)
+        scheduler.add_request(continuing)
+        first = scheduler.schedule()
+        assert first.scheduled_requests[0].cache_partition == 0
+        scheduler.advance_after_schedule(first)
+    if not spare:
+        cache.ensure_group_blocks("held-1", 16, partition=1)
+        cache.ensure_group_blocks("held-2", 8, partition=1)
+    scheduler.add_request(Request("replay", prompt, max_new_tokens=1))
+    output = scheduler.schedule()
+    scheduled = [item for item in output.scheduled_requests if item.request.request_id == "replay"]
+    if spare:
+        replay, = scheduled
+        assert (replay.cache_partition, replay.num_computed_tokens) == ((1, 0) if busy else (0, 4))
+    else:
+        assert not scheduled and scheduler.waiting[0].request_id == "replay"
+        assert cache.group_request_partition("replay") is None
+    assert output.prefix_cache_hits == (0 if busy else 4)
+    assert cache.select_group_prefix_blocks(hashes, max_cache_hit_tokens=4, partition=0)[1] == 4
+
+
 def test_grouped_prefix_metrics_count_reused_tokens():
     manager = KvCacheManager(block_size=2, enable_prefix_cache=True)
     manager.init_groups((KVCacheGroupSpec(
