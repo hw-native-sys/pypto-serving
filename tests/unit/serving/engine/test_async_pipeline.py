@@ -653,6 +653,11 @@ def test_fatal_executor_stops_new_admission_but_preserves_cleanup_ack():
     def put(raw):
         command = decode_command(raw)
         dispatched.append(command)
+        # The worker publishes a release acknowledgement before the step result
+        # for the same command; the engine consumes the ack inside
+        # _get_live_result and then reads the StepResult.
+        if command.finished_request_ids:
+            results.append(encode_result(ReleaseResult(command.finished_request_ids, command.step_id)))
         results.append(encode_result(StepResult(new_tokens={}, step_id=command.step_id)))
     core._input_queue = SimpleNamespace(put=put)
     asyncio.run(core._flush_pending_frees())

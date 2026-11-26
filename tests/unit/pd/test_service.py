@@ -396,7 +396,15 @@ def test_prefill_failure_after_first_chunk_retires_decode_reservation():
         progress = SimpleNamespace(wait=AsyncMock(return_value=Completion(digest(first), first.units)))
         source = Service(config, config.endpoint("prefill"), "prefill", destination.adapter, core, progress)
         source.node, source.geometry = case.nodes[0], case.source_geometry
-        source.worker = AsyncMock(return_value="job")
+
+        async def source_worker(operation, payload=None):
+            if operation == "reserve_write":
+                return {"admitted": True}
+            if operation == "release_write":
+                return None
+            return "job"
+
+        source.worker = source_worker
 
         async def rpc(operation, payload):
             if operation == "begin":
@@ -420,7 +428,9 @@ def test_prefill_failure_after_first_chunk_retires_decode_reservation():
             await asyncio.wait_for(source.prefill(sending, entry.continuation, destination.node), 3)
         assert entry.source_done.is_set() and case.d.group_cache_reservation(request) is None
         assert not destination.requests and not source.requests and not source.pins.active
-        destination.worker.assert_awaited_once_with("discard_state", request)
+        discard_calls = [call for call in destination.worker.await_args_list
+                         if call.args == ("discard_state", request)]
+        assert len(discard_calls) == 1
     asyncio.run(run())
 
 
