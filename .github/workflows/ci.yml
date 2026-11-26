@@ -20,6 +20,10 @@ on:
         description: Repository containing the PyPTO commit
         type: string
         default: hw-native-sys/pypto
+      a2a3-runner-labels:
+        description: JSON array of runner labels for the A2/A3 unit-tests job
+        type: string
+        required: false
     outputs:
       a2a3-result:
         description: Result of the A2A3 unit-tests job
@@ -53,7 +57,8 @@ jobs:
 
   unit-tests:
     if: inputs.platform == '' || inputs.platform == 'a2a3'
-    runs-on: [self-hosted, linux, arm64, npu]
+    # Direct CI runs and callers that omit the input use the serving NPU pool.
+    runs-on: ${{ fromJSON(inputs.a2a3-runner-labels || '["self-hosted", "linux", "arm64", "npu"]') }}
     # Shared devices can stay occupied for more than an hour. Let Qwen guards
     # wait within this job budget, with separate 30-minute execution limits.
     # The always() cleanup cancels this job's tasks when the job times out.
