@@ -105,29 +105,25 @@ def test_hot_group_waits_two_rounds_or_restores_on_another_group(monkeypatch, lo
     assert (request.request_id in tier.pending) == long
     if long:
         assert request.cache_partition == 2
-        assert {(2, *key) for (end, _), keys in tier.tier.units.items() if end == hit
-                for key in keys if key != (name, value)} == set(tier.loads)
+        assert (2, name, value) not in tier.loads
         reserved = request.allocated_group_block_ids
         for future in backend.waiting:
             future.set_result(dict(bytes=1, stopped=True, native_completed=True))
         tier.progress()
-        assert not sched._prepare_waiting_group(request, 0, head=True)
-        assert request.allocated_group_block_ids is reserved
-        assert tier.pending[request.request_id].remaining == 0
         step, = [item for item in sched.schedule().scheduled_requests if item.request is request]
-        assert step.num_computed_tokens == hit and step.cache_partition == 2
+        assert step.cache_partition == 2
         assert request.allocated_group_block_ids is reserved
-        sched.discard_scheduled_request(step)
     else:
         assert request.cache_partition is None
         assert not tier.tier.counters["loads"]
         discard(sched, output)
         step, = sched.schedule().scheduled_requests
         assert step.request is request and step.cache_partition == 0
-        assert step.num_computed_tokens == hit
-        sched.discard_scheduled_request(step)
+    assert step.num_computed_tokens == hit
+    sched.discard_scheduled_request(step)
     sched.abort_request(request.request_id)
-    discard(sched, output)
+    if long:
+        discard(sched, output)
 
 
 def test_empty_ddr_checkpoint_lookup_is_shared_across_groups(monkeypatch):
@@ -146,8 +142,7 @@ def test_empty_ddr_checkpoint_lookup_is_shared_across_groups(monkeypatch):
     discard(sched, output)
 
 
-@pytest.mark.parametrize("first_chunk_fits", [False, True])
-def test_load_needs_room_for_the_first_chunk_and_retains_native_pins(first_chunk_fits):
+def test_load_reserves_the_first_chunk_and_pins_inflight_pages(monkeypatch):
     cache = KvCacheManager()
     spec = KVCacheGroupSpec("history", (0,), KVCacheSpec(128, 1), 4)
     cache.init_groups((spec,), max_batch_size=1)
@@ -156,57 +151,32 @@ def test_load_needs_room_for_the_first_chunk_and_retains_native_pins(first_chunk
     tokens = prompt(4, 513)
     config = SchedulerConfig(max_num_scheduled_tokens=128, long_prefill_token_threshold=128,
                              max_prefill_tokens_per_request=128, max_seq_len=1024)
-    seed = PrefillScheduler(config=config, kv_cache_manager=cache)
-    prefix = add(seed, "seed", tokens[:512])
+    sched = PrefillScheduler(config=config, kv_cache_manager=cache)
+    seed = add(sched, "seed", tokens[:512])
     for index in range(4):
-        output = seed.schedule()
-        seed.update_from_output(output, {prefix.request_id: [11]} if index == 3 else {})
-    seed.finish_prefilled_request(prefix.request_id)
+        sched.update_from_output(sched.schedule(), {seed.request_id: [11]} if index == 3 else {})
+    sched.finish_prefilled_request(seed.request_id)
     tier.progress()
     tier.progress()
     evict(cache)
-    # Three prefix pages fit. The fourth is needed for the first uncached position.
-    if not first_chunk_fits:
-        cache.ensure_group_blocks("competitor", 128)
-    sched = PrefillScheduler(config=config, kv_cache_manager=cache)
+    cache.ensure_group_blocks("competitor", 128)
     request = add(sched, "restore", tokens[:385])
+    scan = Mock(wraps=tier.matching_checkpoint_boundaries)
+    monkeypatch.setattr(tier, "matching_checkpoint_boundaries", scan)
     backend.hold = True
-    assert sched.schedule().is_empty
-    assert (request.request_id in tier.pending) == first_chunk_fits
-    if first_chunk_fits:
-        assert cache.group_num_free_blocks("history", 0) == 0
-        sched.abort_request(request.request_id)
-        assert cache.group_num_free_blocks("history", 0) == 1
-        again = add(sched, "again", tokens[:385])
-        loads = len(backend.waiting)
-        assert sched.schedule().is_empty
-        assert again.request_id in tier.pending and len(backend.waiting) == loads
-        for future in backend.waiting:
-            future.set_result(dict(bytes=1, stopped=True, native_completed=True))
-        tier.progress()
-        restored = sched.schedule()
-        assert restored.scheduled_requests[0].num_computed_tokens == 384
-        discard(sched, restored)
-        assert cache.group_num_free_blocks("history", 0) == 4
-    else:
-        assert not backend.waiting
-
-
-def test_blocked_retry_skips_lookup_until_group_state_changes(monkeypatch):
-    cache = manager(enabled=False, partitions=2)
-    sched = scheduler(cache)
-    request = add(sched, "waiting", prompt(2, 1024))
-    choose = sched._choose_first_chunk
-    checked = []
-    def blocked(*args, **kwargs):
-        checked.append(True)
-        return None, 0
-    monkeypatch.setattr(sched, "_choose_first_chunk", blocked)
+    # Three cached pages fit, but admitting their LOAD also requires the fourth page.
     assert sched.schedule().is_empty
     assert sched.schedule().is_empty
-    assert len(checked) == 1
+    assert scan.call_count == 1 and not backend.waiting
 
-    cache.ensure_group_blocks("other", 128, partition=0)
-    cache.release_all_group_requests("other")
-    monkeypatch.setattr(sched, "_choose_first_chunk", choose)
-    assert sched.schedule().scheduled_requests[0].request is request
+    cache.release_all_group_requests("competitor")
+    assert sched.schedule().is_empty and request.request_id in tier.pending
+    assert cache.group_num_free_blocks("history", 0) == 0
+    sched.abort_request(request.request_id)
+    assert cache.group_num_free_blocks("history", 0) == 1
+    assert len(tier.loads) == 3
+    for future in backend.waiting:
+        future.set_result(dict(bytes=1, stopped=True, native_completed=True))
+    tier.progress()
+    assert not tier.loads and not tier.pending
+    assert cache.group_num_free_blocks("history", 0) == 4

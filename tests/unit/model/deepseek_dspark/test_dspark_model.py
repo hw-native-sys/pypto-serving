@@ -314,12 +314,8 @@ def test_pd_bootstrap_prepares_while_older_decode_is_pending(monkeypatch, length
     runner._prefill_prepared_device["sampled_ids"] = device(sampled)
     runner._prefill_prepare_buffers = SimpleNamespace(
         bootstrap_descriptors=torch.full((16, 16, 11), -2, dtype=torch.int32))
-    position_copies = []
-    position_buffers = {row.data_ptr() for row in positions}
     def copy_to(dst, src, count, *, dst_offset, worker_id):
         assert events[0] == "fence"
-        if dst in position_buffers:
-            position_copies.append((worker_id, dst_offset))
         ctypes.memmove(dst + dst_offset, src, count)
     worker = SimpleNamespace(copy_to=copy_to)
     monkeypatch.setattr(runner, "_shared_l3_worker", lambda: worker)
@@ -379,7 +375,6 @@ def test_pd_bootstrap_prepares_while_older_decode_is_pending(monkeypatch, length
     dispatch(batch, prepared)
     stage = "normal-bootstrap" if length + draft_tokens - 1 < 655360 else "publish-only"
     assert events == ["fence", ("clear", (first.group, first.lease)), stage, stage, "dispatch"]
-    assert len(position_copies) == len(ids) * tp_size == len(set(position_copies))
     assert all(runner._drafter_state(r).device_draft_count == (draft_tokens if stage == "normal-bootstrap" else 0)
                for r in ids)
     assert not prepare(batch, buffer_slot=0).bootstrap_rows

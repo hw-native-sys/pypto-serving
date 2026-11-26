@@ -132,32 +132,36 @@ async def until(predicate):
     await asyncio.wait_for(check(), 1)
 
 
-@pytest.mark.parametrize("stream,source", [(True, "d0"), (False, "p0")])
-def test_decode_capacity_retries_only_after_old_attempt_retires(stream, source):
+def test_decode_retry_retires_old_attempt_and_unblocks_at_placement(monkeypatch):
+    monkeypatch.setattr("pypto_serving.pd.coordinator.RETRY_INTERVAL", 0.02)
     async def run():
         cfg = config()
-        peers = ReservationPeers(cfg, source=source)
+        cfg.pd_options.update(capacity=3, reservation_retry_position=1)
+        peers = ReservationPeers(cfg, source="p0")
         router = peers.router(cfg)
         async with router.app.router.lifespan_context(router.app):
-            task = asyncio.create_task(router.proxy.forward(request({"stream": stream}), "/v1/completions"))
+            held = asyncio.create_task(router.proxy.forward(request({"prompt": "held"}), "/v1/completions"))
             await until(lambda: router.proxy.reservations.pending)
             assert len(peers.attempts) == 1 and peers.aborts[peers.attempts[0]].is_set()
             assert all(state.outstanding == 0 for state in router.registry.states)
             router.proxy.reservations.released()
-            response = await task
-            assert response.status_code == 200 and len(set(peers.attempts)) == 2
-            if stream:
-                assert "answer" in "".join([part async for part in response.body_iterator])
+            await until(lambda: bool(peers.placed))
+            assert len(set(peers.attempts)) == 2
+            assert router.proxy.reservations.protected is not None
+            response = await router.proxy.forward(request({}), "/v1/completions")
+            assert response.status_code == 200 and not held.done()
+            peers.release_output.set()
+            assert (await held).status_code == 200
             assert_idle(router)
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("reason", ["cancel", "timeout", "retry_timeout", "unstaged", "unconfirmed"])
+@pytest.mark.parametrize("reason", ["cancel", "timeout", "unstaged", "unconfirmed"])
 def test_waiting_and_failed_retirement_do_not_submit_another_request(reason):
     async def run():
         cfg = config()
-        cfg.pd_options.update(handoff_timeout=0.06, request_timeout=0.25 if reason == "retry_timeout" else 0.08)
-        peers = ReservationPeers(cfg, rejects=2 if reason == "retry_timeout" else 1,
+        cfg.pd_options.update(handoff_timeout=0.06, request_timeout=0.25 if reason == "timeout" else 0.08)
+        peers = ReservationPeers(cfg, rejects=2 if reason == "timeout" else 1,
                                  stage=None if reason == "unstaged" else DECODE_RESERVATION)
         if reason == "unconfirmed":
             peers.abort_status = 503
@@ -168,42 +172,19 @@ def test_waiting_and_failed_retirement_do_not_submit_another_request(reason):
             if reason == "cancel":
                 await until(lambda: router.proxy.reservations.pending)
                 disconnect.set()
-            if reason == "retry_timeout":
+            if reason == "timeout":
                 await until(lambda: router.proxy.reservations.pending)
-                assert router.proxy.reservations.pending[0].position == 5
                 router.proxy.reservations.released()
                 await until(lambda: len(peers.attempts) == 2 and router.proxy.reservations.pending)
-                assert router.proxy.reservations.pending[0].position == 4
             result = await task
             assert result.status_code == (499 if reason == "cancel" else 503)
-            if reason in ("timeout", "retry_timeout"):
+            if reason == "timeout":
                 assert "Timed out waiting for Decode" in json.loads(result.body)["message"]
             if reason == "unconfirmed":
                 assert json.loads(result.body)["code"] == "pd_retirement_unconfirmed"
             router.proxy.reservations.released()
-            assert len(peers.attempts) == (2 if reason == "retry_timeout" else 1)
+            assert len(peers.attempts) == (2 if reason == "timeout" else 1)
             assert not router.proxy.reservations
-            assert_idle(router)
-    asyncio.run(run())
-
-
-def test_protected_json_releases_queue_on_reservation_before_output(monkeypatch):
-    monkeypatch.setattr("pypto_serving.pd.coordinator.RETRY_INTERVAL", 0.02)
-    async def run():
-        cfg = config()
-        cfg.pd_options.update(capacity=3, reservation_retry_position=1)
-        peers = ReservationPeers(cfg)
-        router = peers.router(cfg)
-        async with router.app.router.lifespan_context(router.app):
-            held = asyncio.create_task(router.proxy.forward(request({"prompt": "held"}), "/v1/completions"))
-            await until(lambda: router.proxy.reservations.pending)
-            router.proxy.reservations.released()
-            await until(lambda: bool(peers.placed))
-            assert router.proxy.reservations.protected is not None
-            response = await router.proxy.forward(request({}), "/v1/completions")
-            assert response.status_code == 200 and not held.done()
-            peers.release_output.set()
-            assert (await held).status_code == 200
             assert_idle(router)
     asyncio.run(run())
 

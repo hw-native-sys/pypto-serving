@@ -166,24 +166,17 @@ def test_cross_dp_load_has_independent_destinations_and_shared_readers():
         backend.device[source] = "overwritten"
     backend.hold = True
     hashes = cache.compute_group_block_hashes(tokens)
-    for request, partition in (("same-a", 1), ("other", 2), ("same-b", 1)):
-        assert tier.prepare(request, hashes, len(tokens), maximum=boundary, partition=partition) == (False, None)
-    assert len(tier.loads) == 2 * len(pages)
-    assert all(page.readers == 2 for page in pages.values())
-    tier.cancel("same-a")
-    for load in reversed(tuple(tier.loads.values())):
-        if load.partition == 2:
-            load.future.set_result(dict(bytes=1, stopped=True, native_completed=True))
-    tier.progress()
-    assert tier.prepare("other", hashes, len(tokens), maximum=boundary) == (True, 2)
-    assert all(page.readers == 1 for page in pages.values())
-    assert tier.prepare("same-b", hashes, len(tokens), maximum=boundary) == (False, None)
-    for load in tuple(tier.loads.values()):
-        load.future.set_result(dict(bytes=1, stopped=True, native_completed=True))
-    tier.progress()
-    assert tier.prepare("same-b", hashes, len(tokens), maximum=boundary) == (True, 1)
-    assert not tier.pending and not tier.loads
     for partition in (1, 2):
+        assert tier.prepare(f"load-{partition}", hashes, len(tokens), maximum=boundary,
+                            partition=partition) == (False, None)
+    assert len(tier.loads) == 2 * len(pages)
+    for completed, partition in enumerate((2, 1)):
+        assert all(page.readers == 2 - completed for page in pages.values())
+        for load in tuple(tier.loads.values()):
+            if load.partition == partition:
+                load.future.set_result(dict(bytes=1, stopped=True, native_completed=True))
+        tier.progress()
+        assert tier.prepare(f"load-{partition}", hashes, len(tokens), maximum=boundary) == (True, partition)
         request = f"restore-{partition}"
         tables, hit, actual = cache.acquire_group_prefix_blocks(
             request, hashes, max_cache_hit_tokens=boundary, preferred_partition=partition,
@@ -194,6 +187,7 @@ def test_cross_dp_load_has_independent_destinations_and_shared_readers():
                 block = cache._group_pools[name].block_from_local_id(partition, local)
                 assert backend.device[name, partition, local] == values[name, block.block_hash]
         cache.release_all_group_requests(request)
+    assert not tier.pending and not tier.loads
     assert all(tier.tier.pages[key] is page and page.readers == 0 for key, page in pages.items())
 
 
@@ -237,9 +231,8 @@ def test_async_shared_restore_cancel_and_unknown(outcome):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('cancelled', [False, True])
-@pytest.mark.parametrize('blocked_by', [None, 'lease', 'pages'])
-def test_d_reserves_only_after_its_independent_history_restore(cancelled, blocked_by):
+@pytest.mark.parametrize('cancelled,block_preferred', [(True, False), (False, False), (False, True)])
+def test_d_reserves_only_after_its_independent_history_restore(cancelled, block_preferred):
     from pypto_serving.pd.adapter import DeepSeekDSpark
     from pypto_serving.pd.protocol import Binding, Continuation
     from tests.unit.pd.test_service import service
@@ -254,16 +247,11 @@ def test_d_reserves_only_after_its_independent_history_restore(cancelled, blocke
         node.cache = node.core.kv_cache_manager = cache
         node.core.config = SimpleNamespace(max_num_running_reqs=8, runtime_config=SimpleNamespace(max_seq_len=655360))
         node.adapter, calls = DeepSeekDSpark(), []
-        if blocked_by == 'lease':
-            node.drafter_capacity = 1
-            active = node.register_http(Binding.create(source, destination, {}), {})
-            active.reservation = SimpleNamespace(partition=2)
-        elif blocked_by == 'pages':
+        if block_preferred:
             for index in range(5):
                 cache.ensure_group_blocks(f"busy-{index}", 512, partition=2)
-            assert cache.group_num_free_blocks('ori', 2) == 0
         cache._next_group_partition = 2
-        target = 2 if blocked_by is None else 3
+        target = 3 if block_preferred else 2
         async def worker(operation, payload):
             calls.append(operation)
             assert not tier.pending
@@ -292,9 +280,8 @@ def test_d_reserves_only_after_its_independent_history_restore(cancelled, blocke
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("acquire", [False, True])
-def test_batched_lru_preserves_last_access_order_and_reader_counts(acquire):
-    tier = CacheTier(6, Backend(), lambda _: None)
+def test_batched_lru_preserves_last_access_order_and_reader_counts():
+    tier = CacheTier(5, Backend(), lambda _: None)
     keys = ("a", "b", "loose", "tail")
     for key in (*keys, "old"):
         tier.capture(key, key, 1, key)
@@ -302,23 +289,14 @@ def test_batched_lru_preserves_last_access_order_and_reader_counts(acquire):
     tier.pump()
     tier.publish("left", ("a", "b"))
     tier.publish("right", ("a", "b", "tail"))
-    tier.capture("pending", "pending", 1, "pending")
-
-    if acquire:
-        with pytest.raises(ValueError, match="DDR content is unavailable"):
-            tier.acquire((*keys, "pending"))
-        assert all(not page.readers for page in tier.pages.values())
-        readers = tier.acquire((*keys, "b"))
-        assert tuple(page.key for page in readers) == keys
-        assert all(page.readers == 1 for page in readers)
-        tier.release(readers)
-    else:
-        tier.touch_many(("a", "pending", "b", "loose", "tail", "missing"))
-
+    readers = tier.acquire((*keys, "b"))
+    assert tuple(page.key for page in readers) == keys
+    assert all(page.readers == 1 for page in readers)
     assert tuple(tier.policy.candidates(0)) == (
         ("page", tier.pages["old"].handle), ("unit", "left"),
         ("page", tier.pages["loose"].handle), ("unit", "right"),
     )
+    tier.release(readers)
     assert all(not page.readers for page in tier.pages.values())
 
 

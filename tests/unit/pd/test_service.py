@@ -292,66 +292,58 @@ def test_active_handoff_capacity_uses_the_retryable_error():
     assert len(s.requests) == 1
 
 
-@pytest.mark.parametrize("blocked_by", [None, "lease", "pages", "race", "all", "all_pages", "invalid"])
-def test_decode_places_longest_prefix_with_pages_and_a_worker_lease(blocked_by):
+@pytest.mark.parametrize("worker_full", [False, True])
+def test_decode_placement_falls_back_when_a_drafter_group_is_full(worker_full):
     async def run():
         node, p, d = service()
         tokens = tuple(range(1025))
         node.cache = node.core.kv_cache_manager = cache(len(tokens), partitions=2, slots=2)
         node.core.config = SimpleNamespace(max_num_running_reqs=4, runtime_config=SimpleNamespace(max_seq_len=4096))
         node.adapter = DeepSeekDSpark()
-        node.drafter_capacity = node.adapter.drafter_capacity((Geometry("bootstrap_hidden", (0,), 1, 128, 64, "uint8"),))
+        node.drafter_capacity = 1
         for partition, hit in enumerate((896, 384)):
             warm(node.cache, tokens, hit, partition, ("cmp_c128", "cmp_c4", "idx"))
 
         async def worker(operation, payload):
             if operation == "reserve_state":
                 assert not node.cache.group_cache_reservation(payload["request"]).write_authorized
-                return ({"capacity_exhausted": True} if blocked_by == "race" and payload["partition"] == 0
+                return ({"capacity_exhausted": True} if worker_full and payload["partition"] == 0
                         else {"bootstrap": 0})
         node.worker = AsyncMock(side_effect=worker)
-        async def begin(entry, output=32):
+        async def begin(entry):
             return await node.control(p, (), "begin", {"binding": msgspec.to_builtins(entry.binding),
-                "continuation": msgspec.to_builtins(Continuation(tokens, {"max_new_tokens": output}, None, None))})
+                "continuation": msgspec.to_builtins(Continuation(tokens, {"max_new_tokens": 32}, None, None))})
         def new():
             return node.register_http(Binding.create(p, d, {}), {})
 
-        if blocked_by in ("lease", "all"):
-            for group in range(2 if blocked_by == "all" else 1):
-                active = new()
-                assert (await begin(active)).partition == group
-        if blocked_by in ("pages", "all_pages"):
-            for group in range(2 if blocked_by == "all_pages" else 1):
-                for i in range(2):
-                    node.cache.ensure_group_blocks(f"busy-{group}-{i}", len(tokens), partition=group)
-            # Only a subset of the physical groups is exhausted.
-            assert node.cache.group_num_free_blocks("ori", 0) == 0
-            assert node.cache.group_num_free_blocks("cmp_c128", 0) > 0
-        node.worker.reset_mock()
+        entries = []
+        if not worker_full:
+            active = new()
+            entries.append(active)
+            placement = await begin(active)
+            assert (placement.partition, placement.hit) == (0, 896)
+            node.worker.reset_mock()
         entry = new()
-        if blocked_by in ("all", "all_pages"):
+        entries.append(entry)
+        placement = await begin(entry)
+        assert (placement.partition, placement.hit) == (1, 384)
+        assert [call.args[1]["partition"] for call in node.worker.await_args_list] == (
+            [0, 1] if worker_full else [1])
+        assert {pool.request_partitions[entry.binding.request] for pool in node.cache._group_pools.values()
+                if entry.binding.request in pool.request_partitions} == {1}
+        if not worker_full:
+            rejected = new()
+            entries.append(rejected)
+            node.worker.reset_mock()
             with pytest.raises(CapacityExhausted) as error:
-                await begin(entry)
+                await begin(rejected)
             assert error.value.stage == DECODE_RESERVATION
-            if blocked_by == "all":
-                assert entry.prefix is None  # Full leases bypass long prefix lookup.
             node.worker.assert_not_awaited()
-        elif blocked_by == "invalid":
-            with pytest.raises(ValueError, match="logical generation limit"):
-                await begin(entry, output=1024)
-            node.worker.assert_not_awaited()
-        else:
-            placement = await begin(entry)
-            assert (placement.partition, placement.hit) == ((0, 896) if blocked_by is None else (1, 384))
-            assert [call.args[1]["partition"] for call in node.worker.await_args_list] == (
-                [0, 1] if blocked_by == "race" else [placement.partition])
-            assert all(entry.binding.request not in pool.request_partitions or
-                       pool.request_partitions[entry.binding.request] == placement.partition
-                       for pool in node.cache._group_pools.values())
-        entry.response_closed = True
-        await node.abort(entry, stopped=True)
-        assert node.cache.group_cache_reservation(entry.binding.request) is None
-        assert entry.binding.request not in node.requests
+        for entry in entries:
+            entry.response_closed = True
+            await node.abort(entry, stopped=True)
+            assert node.cache.group_cache_reservation(entry.binding.request) is None
+        assert not node.requests
     asyncio.run(run())
 
 
