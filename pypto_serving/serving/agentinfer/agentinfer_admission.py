@@ -15,13 +15,13 @@ import math
 import time
 from dataclasses import dataclass, replace
 
-from pypto_serving.serving.agent_capacity import ReplicaKVLoad
-from pypto_serving.serving.agent_identity import AgentIdentity
-from pypto_serving.serving.agent_policy import ProgressTTLStrategy
-from pypto_serving.serving.agent_policy_config import ProgressTTLConfig
-from pypto_serving.serving.agent_policy_state import ProgramLifecycle
-from pypto_serving.serving.agent_progress import ProgressTTLFactors
-from pypto_serving.serving.agent_scheduler import AgentReplicaScheduler
+from pypto_serving.serving.agentinfer.agent_capacity import ReplicaKVLoad
+from pypto_serving.serving.agentinfer.agent_identity import AgentIdentity
+from pypto_serving.serving.agentinfer.agent_policy import ProgressTTLStrategy
+from pypto_serving.serving.agentinfer.agent_policy_config import ProgressTTLConfig
+from pypto_serving.serving.agentinfer.agent_policy_state import ProgramLifecycle
+from pypto_serving.serving.agentinfer.agent_progress import ProgressTTLFactors
+from pypto_serving.serving.agentinfer.agent_scheduler import AgentReplicaScheduler
 from pypto_serving.serving.memory.kv_cache import KVCacheCapacityObservation, KvCacheManager
 from pypto_serving.serving.sched.scheduler import Request, ScheduledRequest, Scheduler
 

@@ -16,12 +16,12 @@ import time
 import pytest
 
 from pypto_serving.config.types import GenerateConfig, KVCacheGroupSpec, KVCacheSpec, RuntimeConfig
-from pypto_serving.serving.agentinfer_admission import (
+from pypto_serving.serving.agentinfer.agentinfer_admission import (
     MAX_ADMISSION_WAIT_SECONDS, AgentInferAdmission, AgentInferOptions,
 )
-from pypto_serving.serving.agent_policy_state import ProgramStatus
-from pypto_serving.serving.agent_identity import AgentIdentity
-from pypto_serving.serving.agent_sessions import AgentSessionRegistry
+from pypto_serving.serving.agentinfer.agent_policy_state import ProgramStatus
+from pypto_serving.serving.agentinfer.agent_identity import AgentIdentity
+from pypto_serving.serving.agentinfer.agent_sessions import AgentSessionRegistry
 from pypto_serving.serving.engine.async_engine import EngineConfig, ReplicaEngineCore
 from pypto_serving.serving.memory.kv_cache import KVCacheCapacityObservation, KvCacheManager
 from pypto_serving.serving.sched.scheduler import Request, Scheduler, SchedulerConfig
@@ -496,7 +496,7 @@ def test_full_admission_pool_keeps_overlapping_native_request_bound(monkeypatch)
     manager = KvCacheManager(num_blocks=16, block_size=128)
     native = Scheduler(SchedulerConfig(max_seq_len=4096), manager)
     admission = AgentInferAdmission(0, native, manager, AgentInferOptions(resume_capacity_ratio=0.85))
-    monkeypatch.setattr("pypto_serving.serving.agentinfer_admission.MAX_RETAINED_REQUESTS", 1)
+    monkeypatch.setattr("pypto_serving.serving.agentinfer.agentinfer_admission.MAX_RETAINED_REQUESTS", 1)
     earlier = Request("earlier", [1, 2], max_new_tokens=2)
     latest = Request("latest", [1, 2], max_new_tokens=1)
     for request in (earlier, latest):
@@ -809,7 +809,7 @@ def test_dspark_grouped_cache_reaches_agentinfer_policy(num_speculative_tokens: 
 
 
 def test_enforce_uses_bundled_scheduler_without_external_package() -> None:
-    from pypto_serving.serving.agent_scheduler import AgentReplicaScheduler
+    from pypto_serving.serving.agentinfer.agent_scheduler import AgentReplicaScheduler
 
     core = ReplicaEngineCore(
         EngineConfig(agentinfer_mode="enforce"),

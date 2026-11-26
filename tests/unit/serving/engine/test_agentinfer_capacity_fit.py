@@ -12,10 +12,10 @@ from random import Random
 
 import pytest
 
-from pypto_serving.serving import agent_policy as strategy_module
-from pypto_serving.serving.agent_policy import ProgressTTLStrategy
-from pypto_serving.serving.agent_policy_config import ProgressTTLConfig
-from pypto_serving.serving.agent_policy_state import (
+from pypto_serving.serving.agentinfer import agent_policy as strategy_module
+from pypto_serving.serving.agentinfer.agent_policy import ProgressTTLStrategy
+from pypto_serving.serving.agentinfer.agent_policy_config import ProgressTTLConfig
+from pypto_serving.serving.agentinfer.agent_policy_state import (
     ProgramRef, ProgramState, ProgramStatus, ProgramTokenObservation, ProgramView,
 )
 

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Generic, TypeVar
 
 if TYPE_CHECKING:
-    from pypto_serving.serving.agent_policy_state import ProgramRef
+    from pypto_serving.serving.agentinfer.agent_policy_state import ProgramRef
 
 RetainedRequestT = TypeVar("RetainedRequestT")
 

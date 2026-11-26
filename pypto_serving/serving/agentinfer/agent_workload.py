@@ -14,7 +14,7 @@ import math
 from dataclasses import dataclass
 from collections.abc import Callable
 
-from pypto_serving.serving.agent_ttl import AgentTTLStatistics
+from pypto_serving.serving.agentinfer.agent_ttl import AgentTTLStatistics
 
 
 @dataclass(frozen=True)

@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import pytest
 
-from pypto_serving.serving.agent_policy import ProgressTTLStrategy
-from pypto_serving.serving.agent_policy_config import ProgressTTLConfig
-from pypto_serving.serving.agent_policy_state import (
+from pypto_serving.serving.agentinfer.agent_policy import ProgressTTLStrategy
+from pypto_serving.serving.agentinfer.agent_policy_config import ProgressTTLConfig
+from pypto_serving.serving.agentinfer.agent_policy_state import (
     ProgramRef, ProgramState, ProgramStatus, ProgramTokenObservation, ProgramView,
     SchedulingSnapshot, TransitionController, TransitionKind, TransitionRequest, TransitionResult,
 )
-from pypto_serving.serving.agent_progress import ProgressTTLFactors, ProgressTTLProgramFactors
+from pypto_serving.serving.agentinfer.agent_progress import ProgressTTLFactors, ProgressTTLProgramFactors
 
 
 @pytest.mark.parametrize(

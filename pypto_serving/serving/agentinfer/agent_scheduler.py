@@ -16,10 +16,10 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Generic, Iterator
 
-from pypto_serving.serving.agent_capacity import ReplicaKVLoad
-from pypto_serving.serving.agent_identity import AgentIdentity
-from pypto_serving.serving.agent_policy import ProgressTTLStrategy
-from pypto_serving.serving.agent_policy_state import (
+from pypto_serving.serving.agentinfer.agent_capacity import ReplicaKVLoad
+from pypto_serving.serving.agentinfer.agent_identity import AgentIdentity
+from pypto_serving.serving.agentinfer.agent_policy import ProgressTTLStrategy
+from pypto_serving.serving.agentinfer.agent_policy_state import (
     AdmissionDisposition,
     DiagnosticValue,
     ProgramLifecycle,
@@ -39,9 +39,9 @@ from pypto_serving.serving.agent_policy_state import (
     TransitionRequest,
     TransitionResult,
 )
-from pypto_serving.serving.agent_progress import ProgressTTLFactors
-from pypto_serving.serving.agent_request_queue import AgentRequestQueue, QueuedRequest, RetainedRequestT
-from pypto_serving.serving.agent_sessions import AgentSession, AgentSessionRegistry
+from pypto_serving.serving.agentinfer.agent_progress import ProgressTTLFactors
+from pypto_serving.serving.agentinfer.agent_request_queue import AgentRequestQueue, QueuedRequest, RetainedRequestT
+from pypto_serving.serving.agentinfer.agent_sessions import AgentSession, AgentSessionRegistry
 
 logger = logging.getLogger(__name__)
 

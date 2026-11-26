@@ -15,7 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from pypto_serving.config.types import GenerateConfig
-from pypto_serving.serving.agentinfer_admission import AgentInferAdmission
+from pypto_serving.serving.agentinfer.agentinfer_admission import AgentInferAdmission
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig, TokenOutput
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.reasoning import ParsedToolCall

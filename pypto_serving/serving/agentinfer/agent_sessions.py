@@ -14,8 +14,8 @@ import time
 from dataclasses import dataclass, replace
 from itertools import count
 
-from pypto_serving.serving.agent_identity import AgentIdentity
-from pypto_serving.serving.agent_policy_state import (
+from pypto_serving.serving.agentinfer.agent_identity import AgentIdentity
+from pypto_serving.serving.agentinfer.agent_policy_state import (
     ProgramRef,
     ProgramState,
     ProgramStatus,

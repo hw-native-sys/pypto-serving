@@ -313,7 +313,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
             args.max_num_seqs = 16
 
     from pypto_serving.serving.engine.async_engine import EngineConfig
-    from pypto_serving.serving.agentinfer_admission import AgentInferOptions
+    from pypto_serving.serving.agentinfer.agentinfer_admission import AgentInferOptions
 
     agentinfer_config = AgentInferOptions.from_mapping(args.agentinfer_config)
     if args.agentinfer_config and args.agentinfer_mode != "enforce":

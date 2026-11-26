@@ -16,12 +16,12 @@ from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from typing import Callable
 
-from pypto_serving.serving.agent_policy_config import (
+from pypto_serving.serving.agentinfer.agent_policy_config import (
     ProgressTTLConfig,
     ProgressTTLMode,
     ProgressTTLResumeOrder,
 )
-from pypto_serving.serving.agent_policy_state import (
+from pypto_serving.serving.agentinfer.agent_policy_state import (
     AdmissionDisposition,
     AdmissionOutcome,
     ProgramRef,
@@ -35,10 +35,10 @@ from pypto_serving.serving.agent_policy_state import (
     TransitionController,
     TransitionResult,
 )
-from pypto_serving.serving.agent_progress import ProgressTTLFactors, ProgressTTLProgramFactors
-from pypto_serving.serving.agent_recovery import RecoveryBudget, recovery_order
-from pypto_serving.serving.agent_ttl import AgentTTLStatistics
-from pypto_serving.serving.agent_workload import AgentModelCosts, AgentRound, prefix_refresh_interval
+from pypto_serving.serving.agentinfer.agent_progress import ProgressTTLFactors, ProgressTTLProgramFactors
+from pypto_serving.serving.agentinfer.agent_recovery import RecoveryBudget, recovery_order
+from pypto_serving.serving.agentinfer.agent_ttl import AgentTTLStatistics
+from pypto_serving.serving.agentinfer.agent_workload import AgentModelCosts, AgentRound, prefix_refresh_interval
 
 logger = logging.getLogger(__name__)
 

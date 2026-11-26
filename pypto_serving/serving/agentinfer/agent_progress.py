@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from pypto_serving.serving.agent_policy_state import ProgramRef
-from pypto_serving.serving.agent_ttl import AgentTTLStatistics
+from pypto_serving.serving.agentinfer.agent_policy_state import ProgramRef
+from pypto_serving.serving.agentinfer.agent_ttl import AgentTTLStatistics
 
 
 @dataclass(frozen=True)
