@@ -62,6 +62,13 @@ def validate_capture(
             raise RuntimeError("capture byte accounting mismatch")
         if [event["event_seq"] for event in events] != list(range(1, len(events) + 1)):
             raise RuntimeError("capture has sequence gaps")
+        capture_end_indices = [
+            index for index, event in enumerate(events) if event.get("event") == "capture_end"
+        ]
+        if len(capture_end_indices) != 1:
+            raise RuntimeError("capture must contain exactly one capture_end")
+        if capture_end_indices[0] != len(events) - 1:
+            raise RuntimeError("capture_end must be the final event")
         if len(status["topology"]) != expected_groups:
             raise RuntimeError("unexpected grouped-cache topology")
         if any(event["capture_id"] != status["capture_id"] for event in events):

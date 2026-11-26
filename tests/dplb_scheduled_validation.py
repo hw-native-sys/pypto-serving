@@ -10,15 +10,20 @@
 
 
 def validate_scheduled_load(events: list[dict], topology: list[dict]) -> dict:
+    capture_end_indices = [index for index, event in enumerate(events) if event.get("event") == "capture_end"]
+    if len(capture_end_indices) != 1:
+        raise RuntimeError("scheduled evidence must contain exactly one capture_end")
+    if capture_end_indices[0] != len(events) - 1:
+        raise RuntimeError("capture_end must be the final event")
+
     plans = {}
     outcomes = {}
     invocation_ids: set[str] = set()
     boundary = set()
     returned_tokens = proposed_tokens = accepted_tokens = 0
     stages = set()
+    boundary.update(events[capture_end_indices[0]].get("in_flight_step_ids", []))
     for event in events:
-        if event["event"] == "capture_end":
-            boundary.update(event.get("in_flight_step_ids", []))
         if event["event"] not in {"step_plan", "step_outcome"}:
             continue
         key = event["step_id"]

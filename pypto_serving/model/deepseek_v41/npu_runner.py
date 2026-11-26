@@ -3507,11 +3507,12 @@ class V41ResidentResources:
         head_arguments = dict(self._decode_head_arguments, x_hc=state.residual, pre_mix=state.pre_mix)
         if step.sampling_params:
             head_arguments.update(self._stage_output_sampling(step), logits=self.final.device_logits)
-        self.worker.run(
-            self._decode_head_program.compiled,
-            *(head_arguments[name] for name in self._decode_head_param_names),
-            config=self.run_config,
-        )
+        with profile_span("v41.worker.run", cat="v41.host", level="kernel", args=invocation_profile_args()):
+            self.worker.run(
+                self._decode_head_program.compiled,
+                *(head_arguments[name] for name in self._decode_head_param_names),
+                config=self.run_config,
+            )
         return state
 
     def dispatch_dspark(self, stage, arguments):

@@ -86,6 +86,7 @@ def test_smoke_does_not_claim_prefix_coverage_without_a_hit(smoke, completed):
     "fault,reason",
     [
         ("loss", "incomplete capture"),
+        ("missing_capture_end", "capture must contain exactly one capture_end"),
         ("identity", "without an observed terminal"),
         ("load", "did not return to zero"),
         ("sequence", "sequence gaps"),
@@ -100,6 +101,8 @@ def test_smoke_rejects_incomplete_or_inconsistent_evidence(smoke, completed, fau
     events = [json.loads(line) for line in data_path.read_text().splitlines()]
     if fault == "loss":
         status.update(complete=False, dropped=dict(queue_full=1))
+    elif fault == "missing_capture_end":
+        events.pop()
     elif fault == "identity":
         for event in events:
             if event["event"] == "request_terminal":
@@ -112,7 +115,9 @@ def test_smoke_rejects_incomplete_or_inconsistent_evidence(smoke, completed, fau
     elif fault == "unflushed":
         status["queued_bytes"] = 1
     elif fault == "tail_missing":
-        status["written"].pop(events.pop()["event"])
+        status["written"].pop(events.pop(-2)["event"])
+        for event_seq, event in enumerate(events, 1):
+            event["event_seq"] = event_seq
     data_path.write_text("".join(json.dumps(event) + "\n" for event in events))
     status["bytes_written"] = data_path.stat().st_size
     status_path.write_text(json.dumps(status))
@@ -184,6 +189,25 @@ def test_m2_validator_accepts_legacy_slot_fields(smoke, scheduled_events):
             event["execution_slot"] = event.pop("planned_execution_slot")
             event["pipeline_generation"] = event.pop("planned_slot_generation")
     assert smoke["validate_scheduled_load"](events, topology)["paired_steps"] == 1
+
+
+@pytest.mark.parametrize(
+    "mutation,reason",
+    [
+        ("missing", "scheduled evidence must contain exactly one capture_end"),
+        ("duplicate", "scheduled evidence must contain exactly one capture_end"),
+        ("early", "capture_end must be the final event"),
+    ],
+)
+def test_m2_validator_requires_one_final_capture_end(smoke, scheduled_events, mutation, reason):
+    events, topology = scheduled_events
+    capture_end = events.pop()
+    if mutation == "duplicate":
+        events.extend([capture_end, dict(capture_end)])
+    elif mutation == "early":
+        events.insert(1, capture_end)
+    with pytest.raises(RuntimeError, match=reason):
+        smoke["validate_scheduled_load"](events, topology)
 
 
 @pytest.mark.parametrize("fault,reason", [

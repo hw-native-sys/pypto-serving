@@ -247,6 +247,48 @@ def test_v41_dspark_dispatch_profiles_the_serving_invocation(tmp_path, monkeypat
     assert recorded == [invocation.as_profile_args(), {}]
 
 
+def test_v41_decode_head_dispatch_profiles_the_serving_invocation(tmp_path, monkeypatch):
+    from pypto_serving.config.types import DispatchInvocation
+    from pypto_serving.model.deepseek_v41 import npu_runner
+    from pypto_serving.tools.profile import ProfileRecorder, create_profile_config, recorder
+    from pypto_serving.tools.profile import dispatch_invocation_scope, get_dispatch_invocation
+
+    config = create_profile_config(enabled=True, output=tmp_path)
+    profiler = ProfileRecorder(config)
+    dispatches = []
+    monkeypatch.setattr(recorder, "get_profiler", lambda: profiler)
+
+    def run(compiled, *args, **kwargs):
+        dispatches.append((compiled, get_dispatch_invocation().invocation_id))
+
+    step = SimpleNamespace(phase="decode", sampling_params={})
+    state = SimpleNamespace(residual=object(), pre_mix=object())
+    resources = SimpleNamespace(
+        closed=False,
+        _step=step,
+        _decode_fwd=SimpleNamespace(run=lambda value, group_counts: value),
+        _group_counts=(),
+        _decode_head_arguments={},
+        _decode_head_program=SimpleNamespace(compiled=object()),
+        _decode_head_param_names=("x_hc", "pre_mix"),
+        worker=SimpleNamespace(run=run),
+        run_config=None,
+    )
+    invocation = DispatchInvocation("replica:3", 3, 1, 2)
+    try:
+        with dispatch_invocation_scope(invocation):
+            assert npu_runner.V41ResidentResources.run_decode_fwd(resources, state, step) is state
+    finally:
+        profiler.stop()
+
+    assert dispatches == [(resources._decode_head_program.compiled, invocation.invocation_id)]
+    recorded = []
+    for fragment in config.fragments_dir.glob("*.jsonl"):
+        events = (json.loads(line) for line in fragment.read_text().splitlines())
+        recorded.extend(event["args"] for event in events if event["name"] == "v41.worker.run")
+    assert recorded == [invocation.as_profile_args()]
+
+
 def test_filtered_candidates_explain_capacity_and_request_limit(capture):
     manager = cache(request_limit=1)
     manager.ensure_group_blocks("full", 4096, partition=0)
