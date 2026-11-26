@@ -150,6 +150,8 @@ def test_external_platform_selection_preserves_native_job_names(platform, ci_job
     assert jobs["pre-commit"]["if"] == "inputs.platform == ''"
     assert job["if"] == f"inputs.platform == '' || inputs.platform == '{platform}'"
     call = workflow[True]["workflow_call"]
+    assert call["inputs"]["runner-labels"]["type"] == "string"
+    assert "inputs.runner-labels" in job["runs-on"]
     assert call["outputs"][f"{platform}-result"]["value"] == "${{ jobs." + ci_job + ".result }}"
     setup = CALLERS[("ci.yml", ci_job)]["with"]
     assert re.fullmatch(r"\$\{\{ inputs.pypto-revision \|\| '[a-f0-9]{40}' \}\}", setup["pypto-revision"])
