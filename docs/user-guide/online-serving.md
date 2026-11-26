@@ -60,6 +60,10 @@ pypto-serving --model /path/to/Qwen3-14B --agentinfer-mode enforce \
   --agentinfer-config '{"resume_capacity_ratio":0.85,"force_resume_timeout_min_seconds":15,"force_resume_timeout_max_seconds":15}'
 ```
 
+The force-resume bounds must satisfy `0 <= min <= max <= 300` seconds. A request
+still held by AgentInfer after 300 seconds moves to the native scheduler, where
+it may wait for capacity before generation starts.
+
 Requests with a stable agent identity share a Program across model calls.
 Requests without an identity use native admission. Completions and Chat can use
 session headers; Chat also accepts `agent_hint` or canonical

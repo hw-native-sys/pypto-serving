@@ -25,7 +25,6 @@ PY_HEADER = """\
 # -----------------------------------------------------------------------------------------------------------"""
 
 
-
 def get_git_tracked_files(root: Path) -> list[Path]:
     """Return git-tracked files under ``root``."""
     result = subprocess.run(
@@ -43,7 +42,7 @@ def get_git_tracked_files(root: Path) -> list[Path]:
 
 
 def check_header(path: Path) -> tuple[bool, str]:
-    """Check the project header on a Python source file."""
+    """Check that ``path`` starts with the project Python header."""
     expected_lines = PY_HEADER.split("\n")
     try:
         content = path.read_text(encoding="utf-8")

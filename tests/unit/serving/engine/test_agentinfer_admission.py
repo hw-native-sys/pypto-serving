@@ -478,6 +478,7 @@ def test_completion_refresh_waits_for_each_retained_prefix_freshness_deadline(mo
     {"resume_capacity_ratio": 0}, {"resume_capacity_ratio": float("nan")},
     {"resume_capacity_ratio": True}, {"force_resume_timeout_min_seconds": 4,
                                      "force_resume_timeout_max_seconds": 3},
+    {"force_resume_timeout_max_seconds": MAX_ADMISSION_WAIT_SECONDS + 1},
     {"resume_wait_relax_seconds": -1}, {"resume_wait_relax_seconds": True},
     {"resume_wait_growth_reserve_fraction": 1.1},
     {"resume_wait_growth_reserve_fraction": 0.06},
@@ -615,6 +616,29 @@ def test_new_arrival_invalidates_terminal_deferred_by_overlapping_request():
     assert admission.policy.registry.current_ref("session-a") == ref
     assert not admission.observe_lifecycle("session-a", latest.request_id, "terminal")
     assert admission.observe_lifecycle("session-a", new.request_id, "terminal")
+
+
+@pytest.mark.parametrize("finish_before_cancel", [False, True])
+def test_terminal_of_previous_round_can_release_after_newer_round_is_cancelled(finish_before_cancel):
+    admission = _admission()
+    older = Request("older", [1, 2], max_new_tokens=1)
+    completed = Request("completed", [1, 2], max_new_tokens=1)
+    cancelled = Request("cancelled", [1, 2], max_new_tokens=1)
+    for request in (older, completed, cancelled):
+        assert admission.arrive(request, "session-a")
+
+    if finish_before_cancel:
+        admission.complete(completed)
+        assert not admission.observe_lifecycle("session-a", completed.request_id, "terminal")
+    admission.cancel(cancelled.request_id)
+    if not finish_before_cancel:
+        admission.complete(completed)
+        admission.complete(older)
+        assert admission.observe_lifecycle("session-a", completed.request_id, "terminal")
+    else:
+        assert not admission.observe_lifecycle("session-a", completed.request_id, "terminal")
+        admission.complete(older)
+    assert not admission.policy.registry.has_programs
 
 
 def test_late_terminal_from_previous_round_cannot_release_completed_new_round():

@@ -43,7 +43,7 @@ class AgentInferOptions:
     resume_wait_extra_headroom_tokens: int = 0
     resume_wait_preserve_cached_blocks: bool = False
     force_resume_timeout_min_seconds: float = 30.0
-    force_resume_timeout_max_seconds: float = 300.0
+    force_resume_timeout_max_seconds: float = MAX_ADMISSION_WAIT_SECONDS
 
     def __post_init__(self) -> None:
         for name in (
@@ -79,8 +79,12 @@ class AgentInferOptions:
             raise ValueError("agentinfer_config.resume_wait_preserve_cached_blocks must be a boolean")
         if self.resume_wait_preserve_cached_blocks and self.resume_wait_relax_seconds is None:
             raise ValueError("agentinfer_config.resume_wait_preserve_cached_blocks requires resume_wait_relax_seconds")
-        if not 0 <= self.force_resume_timeout_min_seconds <= self.force_resume_timeout_max_seconds:
-            raise ValueError("agentinfer_config force-resume bounds must satisfy 0 <= min <= max")
+        minimum = self.force_resume_timeout_min_seconds
+        maximum = self.force_resume_timeout_max_seconds
+        if not 0 <= minimum <= maximum <= MAX_ADMISSION_WAIT_SECONDS:
+            raise ValueError(
+                f"agentinfer_config force-resume bounds must satisfy 0 <= min <= max <= {MAX_ADMISSION_WAIT_SECONDS:g}"
+            )
 
     @classmethod
     def from_mapping(cls, values: dict) -> AgentInferOptions:
@@ -105,9 +109,6 @@ class AgentInferAdmission:
         self, dp_rank: int, scheduler: Scheduler, kv_cache_manager: KvCacheManager,
         options: AgentInferOptions | None = None, *, executor_cls: str | None = None,
     ) -> None:
-        self._identity_type = AgentIdentity
-        self._unknown_lifecycle = ProgramLifecycle.UNKNOWN
-        self._lifecycle_type = ProgramLifecycle
         self.dp_rank = dp_rank
         self.native = scheduler
         self.kv_cache_manager = kv_cache_manager
@@ -232,7 +233,7 @@ class AgentInferAdmission:
             logger.warning("AgentInfer admission queue full; using native queue for %s", request.request_id)
         metadata = (
             identity if isinstance(identity, AgentIdentity)
-            else self._identity_type(program_id=identity, session_id=identity)
+            else AgentIdentity(program_id=identity, session_id=identity)
         )
         self._sessions[request.request_id] = metadata.program_id
         # Grouped prefill reports the actual acquired prefix through native_scheduled.
@@ -333,7 +334,7 @@ class AgentInferAdmission:
 
     def observe_lifecycle(self, session_id: str, request_id: str, lifecycle: str) -> bool:
         """Forward a parsed response or client-confirmed fact to the original policy."""
-        released = self.policy.on_response_completion(session_id, request_id, self._lifecycle_type(lifecycle))
+        released = self.policy.on_response_completion(session_id, request_id, ProgramLifecycle(lifecycle))
         logger.info(
             "AgentInfer lifecycle session=%s request=%s lifecycle=%s released=%s",
             session_id, request_id, lifecycle, released,
@@ -349,8 +350,7 @@ class AgentInferAdmission:
         # reuse, even though those requests have no AgentInfer binding.
         self._prefix_refresh_pending = True
         self._next_prefix_refresh_at = None
-        session_id = self._sessions.pop(request.request_id, None)
-        if session_id is None:
+        if self._sessions.pop(request.request_id, None) is None:
             return
         self._retained.pop(request.request_id, None)
         self._prefix_observed.discard(request.request_id)
@@ -358,7 +358,6 @@ class AgentInferAdmission:
         self.policy.on_request_completion(
             request.request_id, request.num_prompt_tokens + len(request.output_token_ids),
         )
-        self.policy.on_response_completion(session_id, request.request_id, self._unknown_lifecycle)
 
     def cancel(self, request_id: str) -> bool:
         """Return True when the request was retained and never reached native scheduling."""

@@ -50,16 +50,29 @@ logger = logging.getLogger(__name__)
 class _Activity:
     prefix_anchor: float
     last_finished: float | None = None
-    inflight: set[str] = field(default_factory=set)
-    latest: str = ""
-    latest_finished: bool = False
+    inflight: dict[str, int] = field(default_factory=dict)
+    next_arrival: int = 0
+    latest_completed_id: str | None = None
+    latest_completed_arrival: int = -1
     terminal: bool = False
 
     def register(self, request_id: str) -> None:
-        self.inflight.add(request_id)
-        self.latest = request_id
-        self.latest_finished = False
+        self.inflight[request_id] = self.next_arrival
+        self.next_arrival += 1
         self.terminal = False
+
+    def finish(self, request_id: str, now: float) -> None:
+        arrival = self.inflight.pop(request_id)
+        self.last_finished = now
+        if arrival > self.latest_completed_arrival:
+            self.latest_completed_arrival = arrival
+            self.latest_completed_id = request_id
+
+    def accepts_terminal(self, request_id: str) -> bool:
+        if request_id != self.latest_completed_id:
+            return False
+        # A newer pending round supersedes this signal until it is cancelled.
+        return not self.inflight or next(reversed(self.inflight.values())) < self.latest_completed_arrival
 
 
 @dataclass
@@ -502,11 +515,8 @@ class AgentReplicaScheduler(Generic[RetainedRequestT]):
         self._dirty = True
         session = attempt.session
         activity = self._activity[session.ref]
-        activity.inflight.remove(request_id)
         now = time.monotonic()
-        activity.last_finished = now
-        if activity.latest == request_id:
-            activity.latest_finished = True
+        activity.finish(request_id, now)
         prior_status = self.registry.record_completion(session.ref, total_tokens=total_tokens)
         if activity.inflight:
             session.status = ProgramStatus.REASONING
@@ -545,7 +555,7 @@ class AgentReplicaScheduler(Generic[RetainedRequestT]):
         if ref is None:
             return False
         activity = self._activity[ref]
-        if activity.latest != request_id or not activity.latest_finished:
+        if not activity.accepts_terminal(request_id):
             return False
         activity.terminal = True
         return self._release_terminal(self.registry.require(ref), activity)
@@ -559,7 +569,7 @@ class AgentReplicaScheduler(Generic[RetainedRequestT]):
             return queued
         session = attempt.session
         activity = self._activity[session.ref]
-        activity.inflight.discard(request_id)
+        activity.inflight.pop(request_id, None)
         if not activity.inflight:
             prior = session.status
             session.status = ProgramStatus.ACTING
