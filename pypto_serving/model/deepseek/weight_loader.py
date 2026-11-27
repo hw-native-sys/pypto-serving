@@ -25,6 +25,7 @@ from typing import ContextManager
 import numpy as np
 import torch
 
+from pypto_serving.model.common.moe_offload import ExpertBacking
 from pypto_serving.model.common.weights.store import LazySafetensorsStore, SafeOpenFn, SafeTensorReader
 
 logger = logging.getLogger(__name__)
@@ -285,16 +286,11 @@ _DEEPSEEK_V4_RANK_REPLICATED_WEIGHT_NAMES = frozenset(
         *DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES,
     }
 )
-_DEEPSEEK_V4_EP_SHARDED_WEIGHT_NAMES = frozenset(
-    {
-        "routed_w1",
-        "routed_w1_scale",
-        "routed_w2",
-        "routed_w2_scale",
-        "routed_w3",
-        "routed_w3_scale",
-    }
+# AIV descriptor pairs are gate, down, up.
+ROUTED_EXPERT_FIELDS = (
+    "routed_w1", "routed_w1_scale", "routed_w2", "routed_w2_scale", "routed_w3", "routed_w3_scale",
 )
+_DEEPSEEK_V4_EP_SHARDED_WEIGHT_NAMES = frozenset(ROUTED_EXPERT_FIELDS)
 _DEEPSEEK_V4_PACKED_WEIGHT_NAMES = (
     _DEEPSEEK_V4_RANK_REPLICATED_WEIGHT_NAMES | _DEEPSEEK_V4_EP_SHARDED_WEIGHT_NAMES
 )
@@ -385,6 +381,22 @@ class DeepSeekV4StackedLayerWeights:
         if missing:
             raise KeyError(f"Stacked DeepSeekV4 weights are missing tensors: {', '.join(missing)}")
         return tuple(self.tensors[name] for name in names)
+
+
+def routed_expert_backing(
+    weights: DeepSeekV4StackedLayerWeights, layers: int, budget_bytes: int,
+) -> ExpertBacking:
+    """Expose layer and expert axes on each rank's packed W8A8 fields."""
+    tensors = weights.tensors
+    ranks, rows = tensors[ROUTED_EXPERT_FIELDS[0]].shape[:2]
+    local_experts = rows // layers
+    return ExpertBacking(tuple(
+        {
+            name: tensors[name][rank].view(layers, local_experts, *tensors[name].shape[2:])
+            for name in ROUTED_EXPERT_FIELDS
+        }
+        for rank in range(ranks)
+    ), budget_bytes)
 
 
 @dataclass(frozen=True)

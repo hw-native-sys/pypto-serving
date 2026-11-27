@@ -527,12 +527,13 @@ def prefill_task_args(
     """Build the ``TaskArgs`` for the single packed ``l3_prefill_fwd`` dispatch.
 
     Args are registered in ``_PREFILL_FWD_TENSOR_ORDER`` (the kernel's positional
-    contract). Stacked layer weights come from ``runner._require_stacked_weights``
-    (everything not classified as a slot / static weight / cache pool); cache
-    pools and the stacked weights are lazy so they resolve to device handles at
-    ``build()`` time (post-fork, post-resident-upload).
+    contract). The mapped ABI appends the expert state and descriptors after
+    these tensors. Weight and cache handles resolve lazily at ``build()`` time.
     """
+    from pypto_serving.model.deepseek.weight_loader import ROUTED_EXPERT_FIELDS
+
     layout = runner._compiled.layout
+    mapped = runner._compiled.expert_cache_bytes > 0
     slot_specs = _prefill_slot_specs(
         layout,
         hidden,
@@ -551,10 +552,15 @@ def prefill_task_args(
             ta.add_arg(name, _static_weight_source(runner, name))
         elif name in cache_pools:
             ta.add_arg(name, lambda n=name: runner._device_cache_values()[n])
+        elif mapped and name in ROUTED_EXPERT_FIELDS:
+            ta.add_arg(name, lambda n=name: runner._expert_pool.banks[n])
         else:
             # stacked layer weight -- resolved lazily so construction does not
             # require the stacked weights to be loaded yet.
             ta.add_arg(name, lambda n=name: runner._require_stacked_weights().tensors[n])
+    if mapped:
+        ta.add_arg("expert_state", lambda: runner._expert_pool.state)
+        ta.add_arg("expert_descriptors", lambda: runner._expert_pool.descriptors)
     return ta
 
 
@@ -608,7 +614,10 @@ def decode_task_args(
     hidden/logits outputs device-resident; other modes retain host outputs for
     scheduler-visible decode results. The pre-HC output is always resident.
     """
+    from pypto_serving.model.deepseek.weight_loader import ROUTED_EXPERT_FIELDS
+
     layout = runner._compiled.layout
+    mapped = runner._compiled.expert_cache_bytes > 0
     slot_specs = _decode_slot_specs(layout, hidden, vocab)
     static_weights = set(_DECODE_STATIC_WEIGHTS)
     cache_pools = set(_DECODE_CACHE_POOLS)
@@ -645,8 +654,13 @@ def decode_task_args(
             ta.add_arg(name, _static_weight_source(runner, name))
         elif name in cache_pools:
             ta.add_arg(name, lambda n=name: runner._device_cache_values()[n])
+        elif mapped and name in ROUTED_EXPERT_FIELDS:
+            ta.add_arg(name, lambda n=name: runner._expert_pool.banks[n])
         else:
             ta.add_arg(name, lambda n=name: runner._require_stacked_weights().tensors[n])
+    if mapped:
+        ta.add_arg("expert_state", lambda: runner._expert_pool.state)
+        ta.add_arg("expert_descriptors", lambda: runner._expert_pool.descriptors)
     return ta
 
 

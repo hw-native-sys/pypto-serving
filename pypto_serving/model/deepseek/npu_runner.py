@@ -38,6 +38,7 @@ from pypto_serving.config.types import (
     RuntimeModel,
     SamplingParams,
 )
+from pypto_serving.model.common.moe_offload import ExpertPool
 from pypto_serving.model.common.runner.buffer_set import (
     copy_shared,
     share_cpu_tensor,
@@ -46,6 +47,8 @@ from pypto_serving.model.common.runner.buffer_set import (
 from pypto_serving.model.common.runner.l3_dispatch import L3DispatchMixin, PendingL3Dispatch
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.model.deepseek.weight_loader import (
+    ROUTED_EXPERT_FIELDS,
+    routed_expert_backing,
     DeepSeekV4GlobalWeights,
     DeepSeekV4MtpWeights,
     DeepSeekV4StackedLayerWeights,
@@ -65,6 +68,7 @@ class DeepSeekV4ServingContract(Protocol):
     max_prefill_tokens_per_request: int
     max_prefill_requests_per_partition: int
     requires_homogeneous_prefill_decode: bool
+    prefill_moe_tokens_per_rank: int
 
     def padded_prefill_tokens(self, active_tokens: int) -> int:
         """Return the kernel extent for one active prefill request."""
@@ -137,6 +141,7 @@ def build_deepseek_v4_cache_group_specs(
     num_hidden_layers: int,
     compress_ratios: Sequence[int] | None = None,
     *,
+    ranks: int = DEEPSEEK_V4_RANKS,
     decode_batch: int = DEEPSEEK_V4_DECODE_TOKENS,
     enable_mtp: bool = False,
     max_seq_len: int = DEEPSEEK_V4_MAX_SEQ_LEN,
@@ -254,7 +259,7 @@ def build_deepseek_v4_cache_group_specs(
             # Each request may address this many pages through its logical ring;
             # physical capacity across concurrent requests is runtime-sized.
             max_blocks_per_seq=blocks_per_request,
-            num_partitions=DEEPSEEK_V4_RANKS,
+            num_partitions=ranks,
             sliding_window=sliding_window,
             is_eagle_group=is_eagle_group,
             prefill_tail_tokens=DEEPSEEK_V4_PREFILL_SEQ if is_eagle_group else None,
@@ -434,6 +439,10 @@ class DeepSeekV4CacheLayout:
     decode_csa_state_table_blocks: int = DEEPSEEK_V4_DECODE_CSA_STATE_TABLE_BLOCKS
     decode_csa_inner_state_table_blocks: int = DEEPSEEK_V4_DECODE_CSA_INNER_STATE_TABLE_BLOCKS
 
+    @property
+    def lm_head_tp(self) -> int:
+        return min(self.ranks, DEEPSEEK_V4_LM_HEAD_TP_SIZE)
+
     def validate_runtime(self, config: ModelConfig, runtime: RuntimeConfig, device_ids: Sequence[int]) -> None:
         """Validate serving/runtime options against kernel-fixed dimensions."""
         if len(device_ids) != self.ranks:
@@ -477,7 +486,9 @@ class DeepSeekV4CacheLayout:
             raise ValueError("DeepSeekV4 W8A8 kernels require Flash shape: " + mismatch)
 
 
-def deepseek_v4_decode_layout(num_speculative_tokens: int) -> DeepSeekV4CacheLayout:
+def deepseek_v4_decode_layout(
+    num_speculative_tokens: int, *, ranks: int = DEEPSEEK_V4_RANKS,
+) -> DeepSeekV4CacheLayout:
     """Select an aggressive 16-row decode tile for one MTP chunk.
 
     Autoregressive decode retains the established eight-row tile. MTP doubles
@@ -502,6 +513,7 @@ def deepseek_v4_decode_layout(num_speculative_tokens: int) -> DeepSeekV4CacheLay
     else:
         decode_seq = 8
     return DeepSeekV4CacheLayout(
+        ranks=ranks,
         decode_batch=decode_tokens // decode_seq,
         decode_seq=decode_seq,
         decode_tokens=decode_tokens,
@@ -930,6 +942,7 @@ class DeepSeekV4CompiledKernels:
     num_hash_layers: int = 3
     embedding_weight: torch.Tensor | None = None
     num_speculative_tokens: int = 0
+    expert_cache_bytes: int = 0
 
     def l3_callables(self) -> tuple[DeepSeekV4L3Callable, ...]:
         """Return every compiled L3 program that the shared worker may run."""
@@ -1229,6 +1242,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         self._fused_mtp_args_cache: dict[int, tuple[Any, ...]] = {}
         self._stacked_host_weights: dict[str, torch.Tensor] | None = None
         self._stacked_device_weights: dict[str, StackedDeviceTensor] | None = None
+        self._expert_pool: ExpertPool | None = None
         self._embedding_device_weight: StackedDeviceTensor | None = None
         self._mtp_tail_pre_hc_pool: StackedDeviceTensor | None = None
         self._mtp_device_state_tokens: StackedDeviceTensor | None = None
@@ -1309,6 +1323,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         specs = runtime.kv_cache_groups or build_deepseek_v4_cache_group_specs(
             config.num_hidden_layers,
             self._compiled.compress_ratios,
+            ranks=self._compiled.layout.ranks,
             decode_batch=self._compiled.layout.decode_batch,
             enable_mtp=self._compiled.num_speculative_tokens == 1,
             max_seq_len=runtime.max_seq_len,
@@ -1519,7 +1534,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         """Load global tensors and shard the device LM head across its TP ranks."""
         if self._global_weights is None:
             loaded = self._compiled.weight_store.load_packed_global_weights(
-                ranks=DEEPSEEK_V4_LM_HEAD_TP_SIZE
+                ranks=self._compiled.layout.lm_head_tp
             )
             embed_weight = loaded.embed_weight.to(
                 device="cpu",
@@ -1843,7 +1858,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 self._reserve_mtp_request_state(request_id, rank)
         actual_batch = len(batch.request_ids)
         active_seq = self._compiled.layout.decode_seq if fused_mtp else 1
-        if not fused_mtp and max(assignment.per_rank_counts) > 1:
+        mapped_batch = self._compiled.expert_cache_bytes > 0 and self._compiled.layout.decode_seq == 1
+        if not fused_mtp and not mapped_batch and max(assignment.per_rank_counts) > 1:
             raise ValueError(
                 "DeepSeekV4 non-MTP decode supports at most one request per DP rank"
             )
@@ -4409,6 +4425,15 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             if not host_weights:
                 raise RuntimeError("DeepSeekV4 stacked Host weights are not retained")
             parent_host_bytes = sum(tensor.numel() * tensor.element_size() for tensor in host_weights.values())
+            if self._compiled.expert_cache_bytes:
+                if self._expert_pool is None:
+                    backing = routed_expert_backing(
+                        DeepSeekV4StackedLayerWeights(tensors=host_weights),
+                        len(self._compiled.layer_plan), self._compiled.expert_cache_bytes,
+                    )
+                    self._expert_pool = backing.bind(worker)
+                host_weights = {name: tensor for name, tensor in host_weights.items()
+                                if name not in ROUTED_EXPERT_FIELDS}
             with profile_span("DeepSeekV4ModelRunner.upload_resident_main_weights", cat="executor"):
                 self._stacked_device_weights = self._upload_weight_group(worker, host_weights)
             self._compiled.prepacked_layer_weights = None
@@ -4474,7 +4499,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         not fail loudly: copy-on-write leaves the child reading its pre-fork snapshot and the
         upload carries stale bytes.
         """
-        tensors = list(self._stacked_host_weights.values()) if self._stacked_host_weights else []
+        tensors = [tensor for name, tensor in (self._stacked_host_weights or {}).items()
+                   if not self._compiled.expert_cache_bytes or name not in ROUTED_EXPERT_FIELDS]
         global_weights = getattr(self, "_global_weights", None)
         if global_weights is not None:
             tensors.append(global_weights.embed_weight)
@@ -4775,12 +4801,17 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         worker = self._l3_worker
         try:
             if worker is not None:
-                worker.close()
+                try:
+                    if self._expert_pool is not None:
+                        self._expert_pool.close()
+                finally:
+                    worker.close()
         finally:
             self._l3_worker = None
             self._cache_group_num_blocks.clear()
             self._stacked_host_weights = None
             self._stacked_device_weights = None
+            self._expert_pool = None
             self._embedding_device_weight = None
             self._mtp_tail_pre_hc_pool = None
             self._mtp_device_state_tokens = None

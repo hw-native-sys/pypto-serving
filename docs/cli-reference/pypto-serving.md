@@ -71,6 +71,7 @@ Device count and the meaning of each parallel axis depend on the model's placeme
 | `--max-model-len` | `1024` | Maximum prompt plus generated token length. |
 | `--block-size` | `128` | KV cache block size. |
 | `--npu-memory-utilization` | `0.90` | Fraction of NPU memory available to the server. |
+| `--moe-offload-bytes` | `0` | Per-rank HBM expert-cache budget for [DeepSeek V4 expert offload](../models/deepseek-v4/offload.md). Zero uses resident experts. |
 | `--max-num-seqs` | `16`; PD decode: `72` | Maximum concurrent requests and cache-planning capacity. PD prefill defaults to `16`; explicit values override the default. |
 | `--max-num-batched-tokens` | `4096` | Maximum scheduled tokens per iteration. |
 | `--long-prefill-token-threshold` | `2048` | Chunked-prefill threshold in serving mode. |
