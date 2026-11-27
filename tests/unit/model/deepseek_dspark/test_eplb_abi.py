@@ -27,7 +27,7 @@ def modules_for(placement, *, speculative=True):
     modules = {
         "prefill_fwd": SimpleNamespace(**shape, l3_prefill_fwd_eplb=lambda: None),
         "decode_fwd": SimpleNamespace(**shape, l3_decode_fwd_eplb=lambda: None),
-        "eplb_transfer": SimpleNamespace(EPLB_ABI_VERSION=EPLB_ABI_VERSION, make_eplb_transfer=lambda: None),
+        "eplb": SimpleNamespace(EPLB_ABI_VERSION=EPLB_ABI_VERSION, make_eplb_transfer=lambda: None),
     }
     if speculative:
         modules["decode_fwd_dspark"] = SimpleNamespace(**shape, l3_decode_fwd_dspark_eplb=lambda: None)
@@ -41,7 +41,7 @@ def test_supported_kernel_exports_and_target_capacity(ranks, redundant, speculat
     validate_kernel_contract(modules_for(placement, speculative=speculative), placement)
 
 
-@pytest.mark.parametrize("name", ["prefill_fwd", "decode_fwd", "decode_fwd_dspark", "eplb_transfer"])
+@pytest.mark.parametrize("name", ["prefill_fwd", "decode_fwd", "decode_fwd_dspark", "eplb"])
 @pytest.mark.parametrize("version", [None, 0, 2, "1", True])
 def test_mixed_kernel_revision_is_rejected(name, version):
     placement = Placement.initial(layers=43, logical_experts=256, ranks=16, redundant_experts=16)
@@ -86,7 +86,7 @@ def test_executor_rejects_incompatible_exports_before_compiling_any_kernel(monke
 
     placement = Placement.initial(layers=43, logical_experts=256, ranks=16, redundant_experts=16)
     modules = modules_for(placement, speculative=False)
-    modules["eplb_transfer"].EPLB_ABI_VERSION = 0
+    modules["eplb"].EPLB_ABI_VERSION = 0
     monkeypatch.setattr(executor_module, "DSparkWeightStore", lambda **_kwargs: SimpleNamespace(
         validate_startup_contract=lambda **_kwargs: None,
     ))
@@ -109,5 +109,5 @@ def test_executor_rejects_incompatible_exports_before_compiling_any_kernel(monke
                "compress_ratios": (0,) * 44, "weight_map": {}, "model_dir": "unused",
                "config_data": {"n_routed_experts": 256, "moe_intermediate_size": 2048}},
     )
-    with pytest.raises(RuntimeError, match="ABI mismatch in eplb_transfer"):
+    with pytest.raises(RuntimeError, match="ABI mismatch in eplb"):
         executor._compile_model(model)

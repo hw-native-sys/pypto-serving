@@ -76,8 +76,7 @@ _DSPARK_IMPORT_MODULES = (
     "dspark_drafter",
     "dspark_markov",
     "expert_routed",
-    "eplb_routing",
-    "eplb_transfer",
+    "eplb",
     "expert_shared",
     "gate",
     "hc_head",
@@ -520,7 +519,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                     "dspark_decode", getattr(modules["decode_fwd"], "l3_decode_fwd" + suffix),
                 )
             if eplb_placement is not None:
-                transfer = modules["eplb_transfer"].make_eplb_transfer(
+                transfer = modules["eplb"].make_eplb_transfer(
                     ranks=layout.ranks, local_slots=eplb_placement.local_slots,
                     hidden_size=model.config.hidden_size,
                     intermediate_size=int(config_data["moe_intermediate_size"]),
@@ -654,7 +653,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                 "prefill_state": importlib.import_module("prefill_state"),
                 "prefill_bootstrap": importlib.import_module("prefill_bootstrap"),
                 "prefill_bootstrap_metadata": importlib.import_module("prefill_bootstrap_metadata"),
-                "eplb_transfer": importlib.import_module("eplb_transfer"),
+                "eplb": importlib.import_module("eplb"),
             }
             if speculative:
                 modules["prefill_bootstrap_one_l2"] = importlib.import_module("prefill_bootstrap_one_l2")

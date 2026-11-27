@@ -154,7 +154,8 @@ def test_k0_constraint_staging_uses_only_the_anchor_without_draft_buffers(reject
     runner = DSparkModelRunner.__new__(DSparkModelRunner)
     masks = torch.full((1, 3, DSPARK_GRAMMAR_SEGMENTS, DSPARK_GRAMMAR_SEGMENT_WORDS), -1,
                        dtype=torch.int16)
-    runner._compiled = SimpleNamespace(num_speculative_tokens=0, layout=SimpleNamespace(tp_size=1))
+    runner._compiled = SimpleNamespace(num_speculative_tokens=0,
+                                       layout=SimpleNamespace(tp_size=1, draft_tokens=0))
     runner._decode_task_args = [SimpleNamespace(tensors={"grammar_mask": masks})]
     runner._decode_grammar_rows = [{(0, 0)}]
     masks[0, 0].fill_(0)

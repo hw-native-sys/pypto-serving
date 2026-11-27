@@ -310,6 +310,8 @@ def test_runtime_does_not_run_zero_migration_transfer_during_startup(monkeypatch
                              run=lambda *_args, **_kwargs: calls.append("transfer"))
     runtime.prepare(worker, {}, SimpleNamespace(compiled=object()))
     assert calls == []
+    # The first real migration publishes one increment per peer on retained
+    # windows, so the per-call epoch starts at zero.
     assert runtime._epoch == 0
     assert runtime.controller is not None
     runtime.close()

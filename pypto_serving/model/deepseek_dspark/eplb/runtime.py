@@ -59,6 +59,10 @@ class EplbRuntime:
         self._next_reclaim = 1
         self._completed: dict[int, LoadSample | None] = {}
         self._inflight: set[int] = set()
+        # Serving dispatches every migrated layer on one persistent L3 worker
+        # whose retained CommDomain signal windows are not reset, so the
+        # notification counters accumulate across calls. Every transfer call
+        # increments this 1-based epoch and both barriers wait on it.
         self._epoch = 0
         self._failure: BaseException | None = None
         self._planner: ThreadPoolExecutor | None = None

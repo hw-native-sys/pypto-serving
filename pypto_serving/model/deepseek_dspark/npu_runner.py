@@ -3906,7 +3906,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         counts = task_args.tensors["valid_draft_counts"] if speculative_tokens > 0 else None
         previous = self._decode_grammar_rows[slot]
         self._decode_grammar_rows[slot] = set()
-        counts.fill_(self._compiled.layout.draft_tokens)
+        if counts is not None:
+            counts.fill_(self._compiled.layout.draft_tokens)
         active: set[tuple[int, int]] = set()
         limits = [self._compiled.layout.draft_tokens] * len(inputs.request_ids)
         layout = self._compiled.layout
@@ -3952,7 +3953,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         except Exception:
             for rank, row in previous | active:
                 masks[rank, row].fill_(-1)
-            counts.fill_(self._compiled.layout.draft_tokens)
+            if counts is not None:
+                counts.fill_(self._compiled.layout.draft_tokens)
             raise
         # Rows overwritten by the new plan need no intermediate all-allowed fill.
         for rank, row in previous - active:

@@ -19,7 +19,7 @@ def validate_kernel_contract(modules: dict[str, object], placement: Placement) -
     entries = {
         "prefill_fwd": "l3_prefill_fwd_eplb",
         "decode_fwd": "l3_decode_fwd_eplb",
-        "eplb_transfer": "make_eplb_transfer",
+        "eplb": "make_eplb_transfer",
     }
     if "decode_fwd_dspark" in modules:
         entries["decode_fwd_dspark"] = "l3_decode_fwd_dspark_eplb"
@@ -39,7 +39,7 @@ def validate_kernel_contract(modules: dict[str, object], placement: Placement) -
                                f"{EPLB_ABI_VERSION}, got {version!r}; update pypto-lib with serving")
         if not callable(getattr(module, entry, None)):
             raise RuntimeError(f"DSpark EPLB kernel export {name}.{entry} is missing or not callable")
-        if name == "eplb_transfer":
+        if name == "eplb":
             continue
         if getattr(module, "EPLB_ENABLED", None) is not True:
             raise RuntimeError(f"DSpark EPLB kernel {name} was imported without EPLB enabled")
