@@ -56,8 +56,9 @@ jobs:
           checkout-path: v41-perf-checkout
           needs-device: 'true'
           runtime-platform: a5
-          # Use the same compiler as the existing A5 K5 guard.
-          pypto-revision: 7302cd7ffeb552b3bec7c0e5bd92f164ba9fbd4b
+          # Use the same compiler as the existing A5 K5 guard; V4.1 kernels
+          # call `pl.reg_scope(auto_sync=...)` from PyPTO PR #3487.
+          pypto-revision: fc34410081095c544ec7788e4f2de0a5c9613fea
           toolchain: bundle
           build-namespace: pypto-serving-v41-daily
           pip-cache-name: pip-pypto-serving-v41-daily

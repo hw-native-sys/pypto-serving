@@ -62,7 +62,9 @@ The Serving development base is `bbdf096`; the Lib development base is
 including the complete migration and unified logical-block geometry. The rebase preserves the refactored DSpark metadata,
 initialization, and Markov paths. Serving binds the standalone generation head
 after the normal decode backbone and calls the recurrent DSpark composite
-directly. The V4.1 CI job pins PyPTO `3db18db1`, before PyPTO PR #3411.
+directly. The V4.1 CI job follows the DSpark guard's PyPTO revision because
+Lib's V4.1 kernels now call `pl.reg_scope(auto_sync=...)` (PyPTO PR #3487),
+superseding the earlier pre-#3411 pin.
 The four-card measurements below were collected before that rebase, with Lib
 `2cca3ea6`.
 Device development uses four-card jobs.
