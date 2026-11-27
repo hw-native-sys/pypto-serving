@@ -154,11 +154,14 @@ def harness():
             # Simpler ring sizing (per-dispatch RunConfig). The CI-era
             # PTO2_RING_* value 16384 exhausts the dep pool mid-run
             # ("raise runtime_env.ring_dep_pool"); 262144 is the Qwen
-            # serving-proven sizing. Heap stays 1 GiB so the float32-weight
-            # KV budget still fits.
+            # serving-proven sizing.
             ring_dep_pool=262144,
             ring_task_window=262144,
-            ring_heap=1073741824,
+            # HBG uses ring 0 for the entire graph heap. The 80-token
+            # prefill warmup needs about 4.46 GiB on newer Simpler,
+            # so use the next power of two allowed by RunConfig.
+            # TMR uses 1 GiB per ring to leave room for the KV cache.
+            ring_heap=[8 * 1024**3, 0, 0, 0] if CHIP_RUNTIME == "host_build_graph" else 1024**3,
         ),
         max_num_running_reqs=MAX_BATCH_SIZE,
         max_num_scheduled_tokens=PREFILL_BUDGET,
