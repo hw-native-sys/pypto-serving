@@ -38,6 +38,7 @@ from pypto.runtime import DeviceTensor, StackedDeviceTensor
 from pypto_serving.config.types import (
     DecodeBatch,
     DecodeResult,
+    EplbConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
     ModelConfig,
@@ -60,6 +61,7 @@ from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.model.deepseek_dspark.cache_capacity import cache_pool_bytes, plan_cache_pages
 from pypto_serving.model.deepseek_dspark.cache_tables import DecodeTableRows, DrafterTableRows
 from pypto_serving.model.deepseek_dspark.prefill_staging import PrefillEmbeddingSlot
+from pypto_serving.model.common.eplb.state import Placement as EplbPlacement
 from pypto_serving.model.deepseek_dspark.weight_loader import (
     DSparkStackedLayerWeights,
     DSparkWeightStore,
@@ -508,6 +510,7 @@ def build_dspark_cache_group_specs(
     max_seq_len: int = DSPARK_MAX_SEQ_LEN,
     max_prefill_tokens: int = DSPARK_PREFILL_MAX_TOKENS,
     partitions: int = DSPARK_CACHE_PARTITIONS,
+    max_requests_per_partition: int | None = None,
     decode_only: bool = False,
     prefill_only: bool = False,
     num_speculative_tokens: int = DSPARK_SPECULATIVE_TOKENS,
@@ -580,6 +583,7 @@ def build_dspark_cache_group_specs(
             ),
             max_blocks_per_seq=int(max_blocks_per_seq),
             num_partitions=partitions,
+            max_requests_per_partition=max_requests_per_partition,
             sliding_window=sliding_window,
             is_checkpoint_state=is_checkpoint_state,
             preserve_prefill_history=is_checkpoint_state and prefill_only,
@@ -1436,6 +1440,10 @@ class DSparkCompiledKernels:
     layer_plan: tuple[DSparkLayerPlan, ...]
     kernel_dir: str
     runtime_model: RuntimeModel | None = None
+    eplb_config: EplbConfig = field(default_factory=EplbConfig)
+    eplb_placement: EplbPlacement | None = None
+    eplb_transfer: Any | None = None
+    execution_role: str = "mixed"
     prefill: Any | None = None
     prefill_async: bool = False
     bootstrap_one_l2_enabled: bool = False
@@ -1485,6 +1493,7 @@ class DSparkCompiledKernels:
                 self.state_prepare,
                 self.state_accept,
                 self.state_commit,
+                self.eplb_transfer,
             )
             if program is not None
         )
@@ -1604,6 +1613,14 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._pending_prefill_dispatch_lock = threading.Lock()
         self._pending_prefill_dispatches: dict[int, PendingL3Dispatch] = {}
         self._l3_shared_buffers_ready = False
+        self._eplb = None
+        self._eplb_pending: dict[int, Any] = {}
+        self._eplb_pending_lock = threading.Lock()
+        if compiled.eplb_placement is not None:
+            from pypto_serving.model.common.eplb.runtime import EplbRuntime
+
+            self._eplb = EplbRuntime(compiled.eplb_placement, compiled.eplb_config,
+                                     execution_role=compiled.execution_role)
         self.runtime_extension = None
         self._needs_source_tail_capture = None
         self._plan_builder = self._prepare_decode_plan
@@ -1683,6 +1700,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 runtime.max_num_batched_tokens,
             ),
             partitions=self._compiled.layout.partitions,
+            max_requests_per_partition=math.ceil(runtime.max_batch_size / self._compiled.layout.partitions),
             decode_only=self._execution_role == "decode",
             prefill_only=self._execution_role == "prefill",
             num_speculative_tokens=self._compiled.num_speculative_tokens,
@@ -1709,6 +1727,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         )
         return next(spec.max_blocks_per_seq for spec in specs if spec.name == group_name)
 
+    @staticmethod
+    def _cache_budget_bytes(free_bytes: int, total_bytes: int, utilization: float,
+                            reserve_bytes: int = 0) -> int:
+        """Per-rank KV budget: utilization target minus current use and EPLB reserve."""
+        return int(total_bytes * utilization) - (total_bytes - free_bytes) - reserve_bytes
+
     def _compute_kv_cache_pages(self, runtime: RuntimeConfig) -> dict[str, int]:
         """Plan independent pools from the tightest post-resident rank budget."""
         if runtime.total_kv_pages is not None:
@@ -1716,10 +1740,15 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         layout = self._compiled.layout
         worker = self._shared_l3_worker()
         utilization = runtime.npu_memory_utilization
+        reserve_bytes = 0 if self._eplb is None else self._eplb.workspace_reserve_bytes
         budgets = []
         for worker_id in range(layout.ranks):
             free_bytes, total_bytes = worker.device_memory_info(worker_id)
-            budgets.append(int(total_bytes * utilization) - (total_bytes - free_bytes))
+            budgets.append(self._cache_budget_bytes(free_bytes, total_bytes, utilization, reserve_bytes))
+        if reserve_bytes and min(budgets) <= 0:
+            raise RuntimeError(
+                f"EPLB maintenance reserve {reserve_bytes} bytes leaves no KV budget on rank "
+                f"{budgets.index(min(budgets))}; lower npu_memory_utilization or maintenance_workspace_bytes")
         step = layout.decode_seq
         if self._compiled.prefill is not None:
             step = max(step, min(runtime.max_prefill_tokens_per_request or DSPARK_PREFILL_MAX_TOKENS,
@@ -1730,9 +1759,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             step_tokens=step, filler_pages=layout.decode_batch,
             retention_interval=runtime.prefix_cache_retention_interval if self._compiled.prefill is not None else 0,
         )
-        logger.info("DSpark cache budget=%d bytes, planned=%d bytes including filler/alignment",
-                    min(budgets), cache_pool_bytes(self._cache_group_specs, counts,
-                                                  filler_pages=layout.decode_batch))
+        logger.info("DSpark cache budget=%d bytes, eplb_reserve=%d bytes, planned=%d bytes including filler/alignment",
+                    min(budgets), reserve_bytes, cache_pool_bytes(self._cache_group_specs, counts,
+                                                                  filler_pages=layout.decode_batch))
         return counts
 
     def _check_memory_target(self, runtime: RuntimeConfig) -> None:
@@ -1861,6 +1890,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             n_routed_experts=self._compiled.n_routed_experts,
             compress_ratios=compress_ratios,
             num_hash_layers=self._compiled.num_hash_layers,
+            expert_placement=self._compiled.eplb_placement,
         )
 
     @property
@@ -2317,6 +2347,11 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             logger.info("DSpark initializing device worker for resident weight upload")
             self._materialize_resident_weights()
         logger.info("DSpark resident weights uploaded; allocating decode workspaces")
+        if self._eplb is not None:
+            self._eplb.prepare(
+                self._shared_l3_worker(), self._stacked_device_weights,
+                self._compiled.eplb_transfer,
+            )
         # Decode preparation runs on the Host lane while the preceding mixed
         # prefill/decode step may still be executing.  Materialize every
         # decode workspace before the server becomes ready: TaskArgs binding
@@ -2556,6 +2591,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
     def _inherited_host_weights(self) -> list[torch.Tensor]:
         """Return host weights that must be visible at worker fork."""
         tensors: list[torch.Tensor] = []
+        if self._eplb is not None:
+            tensors.extend(self._eplb.inherited_tensors())
         if self._stacked_host_weights:
             tensors.extend(self._stacked_host_weights.values())
         if self._stacked_prefill_host_weights:
@@ -2850,6 +2887,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 run_config = getattr(self, "_l3_run_config", None)
                 profiles = [run_config, getattr(self, "_decode_run_config", None),
                             getattr(self, "_drafter_run_config", None), getattr(self, "_markov_run_config", None)]
+                if self._eplb is not None:
+                    profiles.append(self._eplb.run_config)
                 heaps = []
                 for profile in profiles:
                     heap = getattr(profile, "ring_heap", None)
@@ -2869,6 +2908,72 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             if self.runtime_extension is not None:
                 self.runtime_extension.worker_ready()
         return worker
+
+    def _submit_l3(self, callable_spec, *args, config=None):
+        guard = getattr(self.runtime_extension, "before_compute", None)
+        if callable(guard):
+            guard()
+        context = None
+        if self._eplb is not None:
+            self._eplb.check_healthy()
+            if callable_spec is self._compiled.prefill or callable_spec is self._compiled.decode:
+                phase = "prefill" if callable_spec is self._compiled.prefill else "decode"
+                run_config = config if config is not None else self._l3_run_config
+                record = not bool(getattr(run_config, "enable_chip_swimlane", 0))
+                context = self._eplb.begin(phase, args[-2], args[-1], record=record)
+        try:
+            dispatch = super()._submit_l3(callable_spec, *args, config=config)
+        except BaseException:
+            if context is not None:
+                self._eplb.complete(context, success=False)
+            raise
+        if context is not None:
+            with self._eplb_pending_lock:
+                self._eplb_pending[id(dispatch)] = context
+        return dispatch
+
+    def _consume_eplb_dispatch(self, dispatch, *, success=True):
+        if self._eplb is None:
+            return
+        with self._eplb_pending_lock:
+            context = self._eplb_pending.pop(id(dispatch), None)
+        if context is not None:
+            self._eplb.complete(context, success=success)
+
+    def _run_l3(self, callable_spec, *args, config=None):
+        guard = getattr(self.runtime_extension, "before_compute", None)
+        if callable(guard):
+            guard()
+        if self._eplb is None:
+            return super()._run_l3(callable_spec, *args, config=config)
+        dispatch = self._submit_l3(callable_spec, *args, config=config)
+        try:
+            dispatch.wait()
+        except BaseException:
+            self._consume_eplb_dispatch(dispatch, success=False)
+            raise
+        self._consume_eplb_dispatch(dispatch)
+
+    def take_ready_eplb_plan(self):
+        return None if self._eplb is None else self._eplb.take_ready_plan()
+
+    def validate_eplb_plan(self, plan):
+        if self._eplb is None:
+            raise RuntimeError("EPLB is not enabled")
+        self._eplb.validate(plan)
+
+    def apply_eplb_plan(self, plan):
+        self.validate_eplb_plan(plan)
+        with self._eplb_pending_lock:
+            if self._eplb_pending:
+                raise RuntimeError("EPLB maintenance requires all target outputs to be reclaimed")
+        with self._pending_prefill_dispatch_lock, self._pending_decode_dispatch_lock:
+            if self._pending_prefill_dispatches or self._pending_decode_dispatches:
+                raise RuntimeError("EPLB maintenance encountered outstanding model dispatches")
+        with profile_span("DSparkModelRunner.eplb.maintenance", cat="eplb",
+                          args={"generation": plan.target.generation, "payload_bytes": plan.payload_bytes}):
+            self._eplb.apply(self._shared_l3_worker(), self._stacked_device_weights,
+                             self._compiled.eplb_transfer, plan)
 
     # ------------------------------------------------------------------
     # prefill
@@ -3006,8 +3111,10 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
     def reclaim_prepared_prefill(self, pending: _DSparkPendingPrefill) -> PrefillResult:
         if not isinstance(pending, _DSparkPendingPrefill):
             raise TypeError("DSpark async prefill received an unexpected ticket")
+        completed = False
         try:
             pending.dispatch.wait()
+            completed = True
             if self._compiled.prefill_capture is not None:
                 self._capture_prefill_tails(
                     pending.batch, pending.plan.inputs, descriptor_slot=pending.plan.buffer_slot,
@@ -3028,6 +3135,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 self._prefill_task_arg_slots[pending.plan.buffer_slot], pending.plan.inputs,
             )
         finally:
+            self._consume_eplb_dispatch(pending.dispatch, success=completed)
             self._forget_pending_prefill_dispatch(pending.plan.buffer_slot, pending.dispatch)
         sampled = self._prefill_task_arg_slots[pending.plan.buffer_slot].tensors["sampled_ids"]
         tokens = [int(sampled[rank, row, 0]) for rank, row in pending.plan.inputs.sampled_slots]
@@ -3794,10 +3902,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         slot = inputs.buffer_slot
         task_args = self._decode_task_args[slot]
         masks = task_args.tensors["grammar_mask"]
-        counts = task_args.tensors["valid_draft_counts"]
+        speculative_tokens = getattr(self._compiled, "num_speculative_tokens", DSPARK_DRAFTER_QUERY_WIDTH)
+        counts = task_args.tensors["valid_draft_counts"] if speculative_tokens > 0 else None
         previous = self._decode_grammar_rows[slot]
         self._decode_grammar_rows[slot] = set()
-        counts.fill_(self._compiled.layout.draft_tokens)
+        if counts is not None:
+            counts.fill_(self._compiled.layout.draft_tokens)
         active: set[tuple[int, int]] = set()
         limits = [self._compiled.layout.draft_tokens] * len(inputs.request_ids)
         layout = self._compiled.layout
@@ -3835,14 +3945,16 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 if mask is not None:
                     rows = rows.copy()
                     self._apply_stop_token_mask(rows, mask, preserve_nonempty=constraint is not None)
-                counts[group * layout.tp_size : (group + 1) * layout.tp_size, ordinal] = valid
+                if counts is not None:
+                    counts[group * layout.tp_size : (group + 1) * layout.tp_size, ordinal] = valid
                 limits[index] = valid
                 active.update((rank, row + offset) for offset in range(row_count))
                 self._copy_grammar_mask_rows(masks[rank, row:row + row_count], rows)
         except Exception:
             for rank, row in previous | active:
                 masks[rank, row].fill_(-1)
-            counts.fill_(self._compiled.layout.draft_tokens)
+            if counts is not None:
+                counts.fill_(self._compiled.layout.draft_tokens)
             raise
         # Rows overwritten by the new plan need no intermediate all-allowed fill.
         for rank, row in previous - active:
@@ -4073,20 +4185,23 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
     ) -> tuple[Any, ...]:
         """Bind every one-L2 argument while the prepared slot is Host-owned."""
         task_args = self._decode_task_args[inputs.buffer_slot]
+        bound_args = task_args.build()
         target_args = tuple(
             self._device_scratch.get((f"decode_pages_{inputs.buffer_slot}", name), value)
             for name, value in zip(
                 task_args.names,
-                task_args.build(),
+                bound_args,
                 strict=True,
             )
-            if name not in _DSPARK_FUSED_INTERNAL_PREPARE_NAMES
+            if name not in _DSPARK_FUSED_INTERNAL_PREPARE_NAMES and not name.startswith("eplb_")
         )
         return (
             *target_args,
             *self._fused_decode_device_state_args(inputs.buffer_slot),
             *self._fused_decode_prepare_args(inputs.buffer_slot),
             *self._fused_decode_drafter_args(inputs.buffer_slot),
+            *(value for name, value in zip(task_args.names, bound_args, strict=True)
+              if name.startswith("eplb_")),
         )
 
     def _launch_fused_decode(
@@ -4132,9 +4247,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
 
     def _reclaim_fused_decode(self, pending: _DSparkPendingDecode) -> DecodeResult:
         """Read ping-ponged acceptance and diagnostic draft outputs."""
+        completed = False
         try:
             pending.dispatch.wait()
+            completed = True
         finally:
+            self._consume_eplb_dispatch(pending.dispatch, success=completed)
             self._forget_pending_decode_dispatch(
                 pending.inputs.buffer_slot,
                 pending.dispatch,
@@ -7195,6 +7313,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 self._drafter_dirty_leases.add((state.group, state.lease))
 
     def close(self) -> None:
+        if self._eplb is not None:
+            self._eplb.close()
         worker = self._l3_worker
         if worker is not None and self.runtime_extension is not None:
             self.runtime_extension.close()

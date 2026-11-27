@@ -250,6 +250,7 @@ class DSparkExtension:
 
     def wrap_dispatch(self, dispatch):
         def submit(batch, inputs):
+            self.before_compute()
             fresh = [i for i, request in enumerate(batch.request_ids)
                      if request in batch.initial_request_ids
                      and not self.draft_states[request].device_state_initialized]
@@ -258,6 +259,13 @@ class DSparkExtension:
                     self.bootstrap(batch, fresh)
             return dispatch(batch, inputs)
         return submit
+
+    def before_compute(self):
+        gate = self.transfer.gate
+        with gate.condition:
+            gate.check_healthy()
+            if gate.maintenance:
+                raise RuntimeError("device compute attempted during PD maintenance")
 
     def handle(self, operation, value):
         if operation == "reserve_state":
@@ -282,6 +290,9 @@ class DSparkExtension:
         )
 
         runner = self.runner
+        self.before_compute()
+        if runner._eplb is not None:
+            runner._eplb.check_healthy()
         if self.compiled.bootstrap_metadata is None:
             raise RuntimeError("PD continuation requires device prefill bootstrap")
         with profile_span("pd.dspark.bootstrap.wait", cat="pd", args={"requests": len(fresh)}):

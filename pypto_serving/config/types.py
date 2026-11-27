@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Literal
 
 import torch
@@ -18,6 +19,118 @@ from pypto_serving.model.tokenizer import TokenizerAdapter
 
 
 PREFILL_CHUNK_SIZE_CHOICES = (1024, 2048, 4096, 8192)
+
+
+@dataclass(frozen=True)
+class EplbConfig:
+    """Engine-wide DSpark expert placement and maintenance limits."""
+
+    enabled: bool = False
+    num_redundant_experts: int = 0
+    window_size: int = 128
+    step_interval: int = 1024
+    # Select one load sample per N eligible phase dispatches. Window and
+    # planning intervals count selected samples, not skipped dispatches.
+    sample_stride: int = 1
+    # None preserves the distinction between an omitted phase and an explicit one.
+    load_collection_phase: str | None = None
+    policy: str = "temporal_greedy"
+    min_relative_gain: float = 0.05
+    max_layers_per_rebalance: int = 1
+    # Layer budget for the first rebalance only (generation 0). The initial
+    # layout is a naive identity plus redundant copies, so covering more layers
+    # once at cold start removes several follow-up maintenance pauses. Zero
+    # keeps the regular max_layers_per_rebalance budget.
+    first_rebalance_layers: int = 16
+    # Skip a layer for this many subsequent rebalance opportunities after it
+    # moved. Sampling noise can otherwise report a fresh gain every window and
+    # re-migrate the same layers indefinitely; zero disables the cooldown.
+    layer_cooldown_rebalances: int = 2
+    max_migration_bytes: int = 0
+    transfer_backend: str = "device_maintenance"
+    balance_drafter: bool = False
+    maintenance_timeout_seconds: float = 1.0
+    cooldown_seconds: float = 30.0
+    max_sample_age_seconds: float = 60.0
+    amortization_steps: int = 1024
+    maintenance_cost_margin: float = 1.25
+    max_rebalances: int = 0
+    # Per-rank HBM set aside for the transfer program's static gm_sm workspace.
+    # The arena is allocated on the first real migration, after the KV cache
+    # exists, so without a reserve the first migration can OOM at high memory
+    # utilization. Only counted when migrations are enabled (max_migration_bytes
+    # > 0). Measured need is ~2.5 GiB (decode) to >4.4 GiB (prefill) per rank.
+    maintenance_workspace_bytes: int = 5 << 30
+    # Hard safety ceiling on applied migrations per rank per minute, independent
+    # of the policy's cooldown. High-frequency maintenance has been observed to
+    # wedge the PD peer link after ~770-1000 migrations; 0 disables the ceiling.
+    max_maintenances_per_minute: int = 12
+
+    def __post_init__(self) -> None:
+        for name in ("enabled", "balance_drafter"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"EPLB {name} must be a boolean")
+        for name, minimum in (
+            ("num_redundant_experts", 0), ("window_size", 1), ("step_interval", 1),
+            ("sample_stride", 1),
+            ("max_layers_per_rebalance", 1), ("first_rebalance_layers", 0), ("max_migration_bytes", 0),
+            ("layer_cooldown_rebalances", 0),
+            ("amortization_steps", 1),
+            ("max_rebalances", 0),
+            ("maintenance_workspace_bytes", 0), ("max_maintenances_per_minute", 0),
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(f"EPLB {name} must be an integer >= {minimum}")
+        if self.step_interval < self.window_size:
+            raise ValueError("EPLB step_interval must be >= window_size")
+        for name, minimum in (("maintenance_timeout_seconds", 0), ("cooldown_seconds", 0),
+                              ("max_sample_age_seconds", 0), ("maintenance_cost_margin", 1)):
+            value = getattr(self, name)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < minimum):
+                raise ValueError(f"EPLB {name} must be finite and >= {minimum}")
+        if self.max_sample_age_seconds == 0:
+            raise ValueError("EPLB max_sample_age_seconds must be positive")
+        if self.load_collection_phase not in (None, "prefill", "decode"):
+            raise ValueError("EPLB load_collection_phase must be prefill or decode")
+        if self.policy not in ("temporal_greedy", "cumulative_greedy"):
+            raise ValueError("Unsupported EPLB policy")
+        if (
+            isinstance(self.min_relative_gain, bool)
+            or not isinstance(self.min_relative_gain, (int, float))
+            or not math.isfinite(self.min_relative_gain)
+            or not 0 <= self.min_relative_gain < 1
+        ):
+            raise ValueError("EPLB min_relative_gain must be finite and in [0, 1)")
+        if self.transfer_backend != "device_maintenance":
+            raise ValueError("EPLB only implements the device_maintenance backend")
+        if self.balance_drafter:
+            raise ValueError("EPLB drafter balancing is not supported")
+        if self.enabled and self.max_migration_bytes == 0:
+            raise ValueError("Enabled EPLB requires an explicit positive max_migration_bytes")
+
+    def phase_for_role(self, execution_role: str) -> str:
+        """Resolve a collection phase without sharing P/D controller state."""
+        if execution_role not in ("mixed", "prefill", "decode"):
+            raise ValueError("Unsupported EPLB execution role")
+        expected = None if execution_role == "mixed" else execution_role
+        phase = self.load_collection_phase or expected or "decode"
+        if expected is not None and phase != expected:
+            raise ValueError("EPLB collection phase conflicts with the execution role")
+        return phase
+
+    def validate_topology(self, *, logical_experts: int, ranks: int, tp_size: int,
+                          execution_role: str) -> int:
+        """Freeze physical capacity before compilation or device allocation."""
+        self.phase_for_role(execution_role)
+        supported_tp = (1, 4) if execution_role == "decode" else (4,)
+        if tp_size not in supported_tp or ranks not in (8, 16):
+            raise ValueError("EPLB requires EP8/EP16 with TP4, or TP1 on a PD Decode node")
+        physical = logical_experts + self.num_redundant_experts
+        if logical_experts <= 0 or physical % ranks or physical // ranks > logical_experts:
+            raise ValueError("Invalid EPLB physical expert capacity")
+        return physical // ranks
 
 
 @dataclass(frozen=True)

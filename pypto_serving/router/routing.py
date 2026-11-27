@@ -41,6 +41,12 @@ logger = logging.getLogger(__name__)
 # depin every session; recovery is immediate on the first success.
 UNHEALTHY_THRESHOLD = 2
 
+# Hard ceiling on one health cycle. A probe that never completes would otherwise
+# stop the single poller and leave every replica's readiness frozen until the
+# process exits. The per-probe HTTP timeouts are not a substitute: a stalled
+# client call can block the whole cycle before its own timeout fires.
+HEALTH_CYCLE_DEADLINE_SECONDS = 10.0
+
 # Session ids are client-supplied, so the directory is an unbounded map keyed by
 # untrusted input until its entries expire. Cap it and evict least-recently-used
 # pins: losing a pin costs one prefill, unbounded growth costs the process.
@@ -411,10 +417,19 @@ class HealthMonitor:
             await asyncio.sleep(self._config.health_interval_seconds)
 
     async def probe_once(self) -> None:
-        await asyncio.gather(
-            *(asyncio.shield(self.probe_node(state)) for state in self._registry.states),
-            return_exceptions=True,
-        )
+        deadline = max(HEALTH_CYCLE_DEADLINE_SECONDS, 2 * self._config.health_interval_seconds)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *(asyncio.shield(self.probe_node(state)) for state in self._registry.states),
+                    return_exceptions=True,
+                ),
+                timeout=deadline,
+            )
+        except asyncio.TimeoutError:
+            # Keep the last known state: one stuck probe says nothing about the
+            # other replicas, and the next cycle is the recovery path.
+            logger.warning("health poll cycle exceeded %.1fs; leaving replica states unchanged", deadline)
 
     def probe_node(self, state: ReplicaState) -> asyncio.Task:
         """Share an in-flight probe round with the poller and request waiters."""

@@ -22,6 +22,7 @@ import msgspec
 
 from pypto_serving.tools.observe import record, span
 from .protocol import Completion, MAX_FRAME, Plan, Topology, decode, digest
+from .maintenance import TransferGate
 from .transfer import Region, TransferError, TransferWorker
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,7 @@ class WorkerRuntime:
         self.local_regions, self.peer_regions = {}, {}
         self.uncertain = False
         self.accepting = True
+        self.gate = TransferGate(settings.capacity)
         self.pool = ThreadPoolExecutor(max_workers=model.ranks, thread_name_prefix="pd-write")
         self.lock = threading.Lock()
         self.progress_channel, self.progress = progress_channel, None
@@ -181,6 +183,7 @@ class WorkerRuntime:
             with span(logger, "pd.transfer.lower", log=False, thread_cpu=True,
                       request=plan.binding.request, chunk=plan.chunk) as timing:
                 peer, batches, job, observation = self._lower(plan)
+            self.gate.require("out:" + job)
             if len(self.jobs) >= self.settings.capacity or job in self.jobs:
                 raise ValueError("transfer capacity exceeded or duplicate submission")
             # Every rank was validated before the first native task is enqueued.
@@ -191,6 +194,7 @@ class WorkerRuntime:
                     for (rank, destination), copies in batches.items())
             except BaseException as exc:
                 self.uncertain = True
+                self.gate.leave(exc)
                 raise TransferError("partial rank submission", uncertain=True) from exc
             self.jobs[job] = (plan, futures)
         record(logger, "transfer.submit", **observation, bytes=sum(c.length for c in plan.copies),
@@ -199,6 +203,7 @@ class WorkerRuntime:
         return job
 
     def _check_accepting(self):
+        self.gate.check_healthy()
         if self.uncertain or not self.accepting:
             raise TransferError("transfer worker is gated or closing", uncertain=self.uncertain)
 
@@ -219,9 +224,13 @@ class WorkerRuntime:
                 if errors:
                     uncertain = any(not isinstance(e, TransferError) or e.uncertain for e in errors)
                     self.uncertain |= uncertain
+                    if uncertain:
+                        self.gate.leave(TransferError("rank transfer failed", uncertain=True))
                     result.append(dict(error="rank transfer failed", uncertain=uncertain))
                 else:
                     result.append(dict(completion=Completion(job, plan.units)))
+                if not errors or not uncertain:
+                    self.gate.release("out:" + job)
                 del self.jobs[job]
             return result
 
@@ -235,7 +244,7 @@ class WorkerRuntime:
         elif operation == "release":
             with self.lock:
                 self.accepting = False
-                if self.uncertain or self.jobs:
+                if self.uncertain or self.jobs or self.gate.permits:
                     raise TransferError("cannot unregister an unsafe or active owner", uncertain=True)
                 for owner in self.owners:
                     owner.release()
@@ -249,7 +258,23 @@ class WorkerRuntime:
         try:
             with span(logger, "pd.worker.decode_message", log=False, thread_cpu=True, operation=operation):
                 value = msgspec.msgpack.decode(payload)
-            if operation == "submit":
+            if operation == "reserve_write":
+                with self.lock:
+                    self._check_accepting()
+                    key = value["key"]
+                    kind, identity = key.split(":", 1)
+                    if (kind not in ("out", "in") or len(identity) != 64
+                            or any(c not in "0123456789abcdef" for c in identity)):
+                        raise ValueError("invalid transfer permit identity")
+                    result = dict(admitted=self.gate.reserve(key))
+            elif operation == "release_write":
+                key = value["key"]
+                with self.lock:
+                    if key.startswith("out:") and key[4:] in self.jobs:
+                        raise ValueError("native write must be confirmed before releasing its permit")
+                    self.gate.release(key)
+                result = None
+            elif operation == "submit":
                 with span(logger, "pd.worker.decode_plan", log=False, thread_cpu=True):
                     plan = decode(value, Plan)
                 result = dict(job=self.submit(plan))
@@ -267,13 +292,14 @@ class WorkerRuntime:
             if uncertain:
                 with self.lock:
                     self.uncertain = True
+                    self.gate.leave(exc)
             result = dict(error=str(exc), uncertain=uncertain)
         return msgspec.msgpack.encode(result)
 
     def close(self):
         with self.lock:
             self.accepting = False
-            if self.uncertain or self.jobs or any(o.retained for o in self.owners):
+            if self.uncertain or self.jobs or self.gate.permits or any(o.retained for o in self.owners):
                 raise RuntimeError("transfer must be safely drained before model shutdown")
         self.pool.shutdown(wait=True)
         if self.progress is not None:
@@ -312,6 +338,17 @@ class Services:
 
     def handle_command(self, operation, payload):
         return self.extension.transfer.handle(operation, payload)
+
+    def begin_maintenance(self, timeout):
+        transfer = self.extension.transfer
+        started = time.monotonic()
+        acquired = transfer.gate.enter(timeout)
+        logger.info("maintenance.admission boot=%s acquired=%s wait_ms=%.3f",
+                    transfer.settings.boot, acquired, (time.monotonic() - started) * 1000)
+        return acquired
+
+    def end_maintenance(self, error=None):
+        self.extension.transfer.gate.leave(error)
 
     def set_profile_active(self, active):
         # Owner transfer spans use the same on-demand profile lifecycle.

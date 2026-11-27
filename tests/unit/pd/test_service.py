@@ -22,6 +22,7 @@ import msgspec
 import pytest
 
 from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
+from pypto_serving.pd.maintenance import TransferGate
 from pypto_serving.pd.worker import Progress, ProgressServer, WorkerRuntime, WorkerSettings
 from pypto_serving.pd.adapter import CACHE_COMPONENTS, COMPONENTS, DeepSeekDSpark
 from pypto_serving.pd.config import Config, Endpoint
@@ -80,6 +81,14 @@ def handoff(length, p_hit=0, d_hit=0, p_tp=4, d_tp=1, ori_blocks=9, enabled=True
     core = SimpleNamespace(kv_cache_manager=d, is_ready=lambda: True)
     config = SimpleNamespace(prefill=(0,), decode=(0,), capacity=4)
     destination = Service(config, SimpleNamespace(node_id="d"), "decode", adapter, core, None)
+    from pypto_serving.pd.maintenance import TransferGate
+    gate = TransferGate(4)
+    async def permit(operation, payload):
+        value = msgspec.msgpack.decode(payload)
+        result = ({"admitted": gate.reserve(value["key"])} if operation == "reserve_write"
+                  else gate.release(value["key"]))
+        return msgspec.msgpack.encode(result)
+    destination.progress = SimpleNamespace(call=permit)
     destination.node, destination.geometry = nodes[1], dg
     entry = destination.register_http(binding, {})
     entry.continuation = Continuation(tokens, {"max_new_tokens": 512}, None, None)
@@ -387,7 +396,15 @@ def test_prefill_failure_after_first_chunk_retires_decode_reservation():
         progress = SimpleNamespace(wait=AsyncMock(return_value=Completion(digest(first), first.units)))
         source = Service(config, config.endpoint("prefill"), "prefill", destination.adapter, core, progress)
         source.node, source.geometry = case.nodes[0], case.source_geometry
-        source.worker = AsyncMock(return_value="job")
+
+        async def source_worker(operation, payload=None):
+            if operation == "reserve_write":
+                return {"admitted": True}
+            if operation == "release_write":
+                return None
+            return "job"
+
+        source.worker = source_worker
 
         async def rpc(operation, payload):
             if operation == "begin":
@@ -411,7 +428,9 @@ def test_prefill_failure_after_first_chunk_retires_decode_reservation():
             await asyncio.wait_for(source.prefill(sending, entry.continuation, destination.node), 3)
         assert entry.source_done.is_set() and case.d.group_cache_reservation(request) is None
         assert not destination.requests and not source.requests and not source.pins.active
-        destination.worker.assert_awaited_once_with("discard_state", request)
+        discard_calls = [call for call in destination.worker.await_args_list
+                         if call.args == ("discard_state", request)]
+        assert len(discard_calls) == 1
     asyncio.run(run())
 
 
@@ -422,6 +441,7 @@ def test_cancelled_submit_ack_is_observed_until_native_completion(shutdown):
         job, native = digest(plan), Future()
         runtime = WorkerRuntime.__new__(WorkerRuntime)
         runtime.lock, runtime.jobs, runtime.uncertain = threading.RLock(), {}, False
+        runtime.gate = TransferGate(1)
         parent, child = socket.socketpair()
         accepted, reply = threading.Event(), threading.Event()
         def handle(operation, payload):

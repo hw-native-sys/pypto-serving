@@ -32,6 +32,7 @@ artifacts/
 .vscode/
 .idea/
 .codex/
+.claude/settings.local.json
 .agents/*
 !.agents/skills/
 !.agents/skills/**

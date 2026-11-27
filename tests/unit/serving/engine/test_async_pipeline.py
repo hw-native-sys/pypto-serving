@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from pypto_serving.config.types import GenerateConfig, RuntimeConfig
+from pypto_serving.config.types import GenerateConfig, KVCacheGroupSpec, KVCacheSpec, RuntimeConfig
 from pypto_serving.observability import InMemoryStatLogger
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.engine.async_engine import (
@@ -339,6 +339,69 @@ def test_restarted_request_registers_committed_output_length(monkeypatch):
     assert not context.worker_release_done.is_set() and not context.worker_release_ack.is_set()
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("prefix_cache", [False, True])
+@pytest.mark.parametrize("grouped,speculative", [(False, 0), (True, 0), (True, 7)])
+def test_preempted_generation_replays_confirmed_outputs_before_sampling(
+    asynchronous, prefix_cache, grouped, speculative,
+):
+    core, _ = _async_pipeline_core()
+    manager = KvCacheManager(num_blocks=64, block_size=2, enable_prefix_cache=prefix_cache)
+    if grouped:
+        manager.init_groups((KVCacheGroupSpec(
+            name="kv", layer_indices=(0,), spec=KVCacheSpec(block_size=2, page_size_bytes=1),
+            max_blocks_per_seq=32, num_blocks=64,
+        ),), max_batch_size=4)
+    scheduler = Scheduler(SchedulerConfig(
+        enable_prefix_cache=prefix_cache, async_scheduling=asynchronous,
+        max_num_scheduled_tokens=16, long_prefill_token_threshold=2,
+        num_speculative_tokens=speculative, supports_chunked_prefill_with_speculation=True,
+        speculative_prefix_cache_replay_tokens=2,
+    ), manager)
+    core.scheduler = scheduler
+    core.kv_cache_manager = manager
+    request = Request("replay", [1, 2, 3, 4], max_new_tokens=6)
+    scheduler.add_request(request)
+    expected = []
+    for _ in range(6):
+        expected.append((sum(request.prompt_token_ids + expected) * 7 + 3) % 97)
+    registrations = {}
+    released = []
+    preempted_at = set()
+    for _ in range(40):
+        if len(request.output_token_ids) in (1, 3) and len(request.output_token_ids) not in preempted_at:
+            preempted_at.add(len(request.output_token_ids))
+            exclude = Request("capacity-pressure", [9], max_new_tokens=1, arrival_time=0)
+            assert scheduler._preempt_lowest_priority(exclude, set(), {}, SchedulerOutput()) is not None
+            released = [request.request_id]
+        output = scheduler.schedule()
+        assert not output.is_empty
+        command = core._build_step_command(output, released)
+        released = []
+        for registration in command.new_requests:
+            registrations[registration.request_id] = registration
+            assert registration.initial_output_tokens == len(request.output_token_ids)
+            assert registration.prompt_token_ids == request.prompt_token_ids + request.output_token_ids
+        sampled = {}
+        for prefill in command.prefill_requests:
+            context = registrations[prefill.request_id].prompt_token_ids
+            end = prefill.num_computed_tokens + len(prefill.chunk_tokens)
+            assert prefill.chunk_tokens == context[prefill.num_computed_tokens:end]
+            if end == len(context):
+                sampled[prefill.request_id] = [(sum(context) * 7 + 3) % 97]
+        for decode in command.decode_requests:
+            sampled[decode.request_id] = [(sum(request.all_token_ids) * 7 + 3) % 97]
+        scheduler.advance_after_schedule(output)
+        scheduler.update_from_output(output, sampled)
+        assert request.output_token_ids == expected[:len(request.output_token_ids)]
+        assert request.prompt_token_ids == [1, 2, 3, 4]
+        assert request.num_prompt_tokens == 4 and request.max_new_tokens == 6
+        if request.status.is_finished:
+            break
+    assert request.output_token_ids == expected
+    assert preempted_at == {1, 3}
+
+
 def test_async_pipeline_dispatches_two_steps_before_applying_first(monkeypatch):
     """Depth-2: the loop dispatches step N+1 while step N is still in flight,
     so two commands reach the worker before the first result is applied."""
@@ -569,3 +632,37 @@ def test_async_pipeline_drains_stale_result_after_error(monkeypatch):
     got = decode_result(asyncio.run(core._get_live_result()))
     assert got.step_id == 99
     assert core._discard_result_step_ids == set()
+
+
+def test_fatal_executor_stops_new_admission_but_preserves_cleanup_ack():
+    core, dispatched = _async_pipeline_core()
+    core._running = True
+    request = _running_decode_request()
+    core.scheduler.running.append(request)
+    core.scheduler.requests[request.request_id] = request
+    ctx = SimpleNamespace(queue=asyncio.Queue(), request=request, stream=True,
+                          worker_release_done=asyncio.Event())
+    core._request_contexts[request.request_id] = ctx
+    assert core._try_dispatch_step()
+    results = deque([encode_result(StepResult(new_tokens={}, error="EPLB installation failed",
+        executor_fatal=True, step_id=dispatched[0].step_id))])
+    core._output_queue = SimpleNamespace(get=lambda timeout=None: results.popleft())
+    assert asyncio.run(core._await_and_apply_oldest()) is False
+    assert ctx.queue.get_nowait().finish_reason == "error"
+    assert not core.is_ready() and not core._try_dispatch_step()
+    def put(raw):
+        command = decode_command(raw)
+        dispatched.append(command)
+        # The worker publishes a release acknowledgement before the step result
+        # for the same command; the engine consumes the ack inside
+        # _get_live_result and then reads the StepResult.
+        if command.finished_request_ids:
+            results.append(encode_result(ReleaseResult(command.finished_request_ids, command.step_id)))
+        results.append(encode_result(StepResult(new_tokens={}, step_id=command.step_id)))
+    core._input_queue = SimpleNamespace(put=put)
+    asyncio.run(core._flush_pending_frees())
+    assert ctx.worker_release_done.is_set() and not core._pending_free_ids
+    async def rejected():
+        with pytest.raises(RuntimeError, match="EPLB installation"):
+            await anext(core.add_request("later", "hello", GenerateConfig()))
+    asyncio.run(rejected())

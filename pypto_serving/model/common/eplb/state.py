@@ -1,0 +1,219 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Immutable logical/physical expert placement and dispatch-owned load samples."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+
+def immutable_ints(value, *, name: str) -> np.ndarray:
+    """Own integer data in a bytes-backed array that cannot be made writable."""
+    array = np.asarray(value)
+    if array.dtype.kind not in "iu" or (array.dtype.kind == "u" and np.any(array > np.iinfo(np.int64).max)):
+        raise ValueError(f"{name} must contain signed 64-bit representable integers")
+    return np.frombuffer(array.astype(np.int64).tobytes(), dtype=np.int64).reshape(array.shape)
+
+
+def _placement_tables(mapping: np.ndarray, experts: int, ranks: int) -> tuple[np.ndarray, np.ndarray]:
+    """Build canonical inverse rows with a stable sort over physical locations."""
+    layers, physical = mapping.shape
+    layer_ids = np.arange(layers)[:, None]
+    counts = np.zeros((layers, experts), dtype=np.int64)
+    np.add.at(counts, (layer_ids, mapping), 1)
+    if np.any(counts > ranks):
+        raise ValueError("Replica count exceeds rank count")
+    order = np.argsort(mapping, axis=1, kind="stable")
+    sorted_experts = np.take_along_axis(mapping, order, axis=1)
+    starts = np.cumsum(counts, axis=1) - counts
+    ordinal = np.arange(physical)[None, :] - np.take_along_axis(starts, sorted_experts, axis=1)
+    inverse = np.full((layers, experts, ranks), -1, dtype=np.int64)
+    inverse[layer_ids, sorted_experts, ordinal] = order
+    return inverse, counts
+
+
+@dataclass(frozen=True)
+class Placement:
+    generation: int
+    physical_to_logical: np.ndarray
+    logical_to_physical: np.ndarray
+    replica_count: np.ndarray
+
+    def __post_init__(self) -> None:
+        if isinstance(self.generation, bool) or not isinstance(self.generation, int) or self.generation < 0:
+            raise ValueError("Placement generation must be a non-negative integer")
+        for name in ("physical_to_logical", "logical_to_physical", "replica_count"):
+            object.__setattr__(self, name, immutable_ints(getattr(self, name), name=name))
+        mapping = self.physical_to_logical
+        inverse = self.logical_to_physical
+        counts = self.replica_count
+        if mapping.ndim != 2 or inverse.ndim != 3 or counts.ndim != 2:
+            raise ValueError("Invalid placement dimensions")
+        layers, experts, ranks = inverse.shape
+        if not layers or not experts or not ranks or counts.shape != (layers, experts):
+            raise ValueError("Invalid placement dimensions")
+        if mapping.shape[0] != layers or not mapping.shape[1] or mapping.shape[1] % ranks:
+            raise ValueError("Physical expert capacity must be divisible by ranks")
+        slots = mapping.shape[1] // ranks
+        if slots > experts or np.any(mapping < 0) or np.any(mapping >= experts):
+            raise ValueError("Invalid logical expert ID or local capacity")
+        local = np.sort(mapping.reshape(layers, ranks, slots), axis=2)
+        if np.any(local[:, :, 1:] == local[:, :, :-1]):
+            raise ValueError("A rank cannot hold duplicate logical experts")
+        expected_inverse, expected_counts = _placement_tables(mapping, experts, ranks)
+        if np.any(expected_counts == 0) or not np.array_equal(counts, expected_counts):
+            raise ValueError("Every logical expert must have its declared replicas")
+        if not np.array_equal(inverse, expected_inverse):
+            raise ValueError("Inconsistent logical-to-physical table")
+
+    @property
+    def ranks(self) -> int:
+        return self.logical_to_physical.shape[2]
+
+    @property
+    def local_slots(self) -> int:
+        return self.physical_to_logical.shape[1] // self.ranks
+
+    @property
+    def logical_experts(self) -> int:
+        return self.replica_count.shape[1]
+
+    @property
+    def layers(self) -> int:
+        return self.physical_to_logical.shape[0]
+
+    @classmethod
+    def from_map(cls, mapping, *, logical_experts: int, ranks: int, generation: int = 0) -> Placement:
+        mapping = immutable_ints(mapping, name="physical_to_logical")
+        if logical_experts <= 0 or ranks <= 0 or mapping.ndim != 2:
+            raise ValueError("Invalid placement dimensions")
+        if np.any(mapping < 0) or np.any(mapping >= logical_experts):
+            raise ValueError("Invalid logical expert ID")
+        inverse, counts = _placement_tables(mapping, logical_experts, ranks)
+        return cls(generation, mapping, inverse, counts)
+
+    @classmethod
+    def initial(cls, *, layers: int, logical_experts: int, ranks: int,
+                redundant_experts: int = 0) -> Placement:
+        if min(layers, logical_experts, ranks) <= 0 or redundant_experts < 0:
+            raise ValueError("Invalid initial placement capacity")
+        physical = logical_experts + redundant_experts
+        if physical % ranks or physical // ranks > logical_experts:
+            raise ValueError("Invalid initial physical expert capacity")
+        slots = physical // ranks
+        extra_per_rank = np.full(ranks, redundant_experts // ranks, dtype=np.int64)
+        extra_per_rank[: redundant_experts % ranks] += 1
+        # Keep one base copy of every expert and spread the redundant copies
+        # across ranks. Appending them after the base slots put every redundant
+        # slot on the last rank, so the replica traffic of the first experts
+        # concentrated there until the first rebalance replaced the layout.
+        mapping = np.empty((layers, physical), dtype=np.int64)
+        base_cursor = 0
+        extra_cursor = 0
+        for rank in range(ranks):
+            extra = int(extra_per_rank[rank])
+            base = slots - extra
+            start = rank * slots
+            base_experts = np.arange(base_cursor, base_cursor + base)
+            mapping[:, start:start + base] = base_experts[None, :]
+            base_cursor += base
+            rank_experts = set(base_experts.tolist())
+            for offset in range(extra):
+                while extra_cursor in rank_experts:
+                    extra_cursor = (extra_cursor + 1) % logical_experts
+                mapping[:, start + base + offset] = extra_cursor
+                rank_experts.add(extra_cursor)
+                extra_cursor = (extra_cursor + 1) % logical_experts
+        if base_cursor != logical_experts:
+            raise ValueError("Invalid initial placement coverage")
+        return cls.from_map(mapping, logical_experts=logical_experts, ranks=ranks)
+
+
+def bias_placement(placement: Placement, hot_experts, *, hot_rank: int = 0) -> Placement:
+    """Rebuild an initial layout so the given experts start on one rank.
+
+    Test-only helper for worst-case placement experiments. It starts from a
+    valid initial layout and swaps hot experts onto the target rank, keeping
+    one copy of every expert per rank; experts that cannot be moved without
+    creating a duplicate stay where they are.
+    """
+    hot = [int(expert) for expert in hot_experts]
+    if not hot or any(expert < 0 or expert >= placement.logical_experts for expert in hot):
+        raise ValueError("hot_experts must be non-empty valid logical expert ids")
+    if not 0 <= hot_rank < placement.ranks:
+        raise ValueError("hot_rank must be a valid rank")
+    mapping = np.array(placement.physical_to_logical, dtype=np.int64)
+    slots = placement.local_slots
+    rank_slots = [set(mapping[0, rank * slots:(rank + 1) * slots].tolist())
+                  for rank in range(placement.ranks)]
+    target_begin, target_end = hot_rank * slots, (hot_rank + 1) * slots
+    hot_set = set(hot)
+    for expert in hot:
+        if expert in rank_slots[hot_rank]:
+            continue
+        source = next((position for position in range(mapping.shape[1])
+                       if mapping[0, position] == expert and not target_begin <= position < target_end),
+                      None)
+        if source is None:
+            continue
+        source_rank = source // slots
+        target = next((position for position in range(target_begin, target_end)
+                       if mapping[0, position] not in hot_set
+                       and mapping[0, position] not in rank_slots[source_rank]), None)
+        if target is None:
+            continue
+        evicted = int(mapping[0, target])
+        mapping[:, [source, target]] = mapping[:, [target, source]]
+        rank_slots[source_rank].discard(expert)
+        rank_slots[source_rank].add(evicted)
+        rank_slots[hot_rank].discard(evicted)
+        rank_slots[hot_rank].add(expert)
+    mapping = np.tile(mapping[0], (placement.layers, 1))
+    return Placement.from_map(mapping, logical_experts=placement.logical_experts,
+                              ranks=placement.ranks, generation=placement.generation)
+
+
+@dataclass(frozen=True)
+class LoadSample:
+    dispatch_id: int
+    phase: str
+    placement: Placement
+    local_counts: np.ndarray
+
+    def __post_init__(self) -> None:
+        if isinstance(self.dispatch_id, bool) or not isinstance(self.dispatch_id, int) or self.dispatch_id < 0:
+            raise ValueError("Load sample dispatch_id must be a non-negative integer")
+        if self.phase not in ("prefill", "decode"):
+            raise ValueError("Invalid load sample phase")
+        counts = immutable_ints(self.local_counts, name="local_counts")
+        expected = (self.placement.ranks, self.placement.layers, self.placement.local_slots)
+        if counts.shape != expected or np.any(counts < 0):
+            raise ValueError("Invalid physical load sample shape or counts")
+        limit = np.iinfo(np.int64).max
+        # Real token counts are small enough that this bound proves the total
+        # cannot overflow. Reserve Python-integer summation for large inputs.
+        if counts.max() > limit // counts.size and counts.sum(dtype=object) > limit:
+            raise ValueError("Load sample count overflow")
+        object.__setattr__(self, "local_counts", counts)
+
+    def logical_counts(self) -> np.ndarray:
+        """Interpret counts using the layout captured at submission, never the latest one."""
+        if self.placement.physical_to_logical.shape[1] == self.placement.logical_experts:
+            # Coverage plus one physical slot per expert guarantees a permutation.
+            # Gather through the captured inverse even after a placement change.
+            physical = self.local_counts.transpose(1, 0, 2).reshape(self.placement.replica_count.shape)
+            return np.take_along_axis(physical, self.placement.logical_to_physical[:, :, 0], axis=1)
+        logical = np.zeros_like(self.placement.replica_count)
+        for layer in range(self.placement.layers):
+            np.add.at(logical[layer], self.placement.physical_to_logical[layer],
+                      self.local_counts[:, layer, :].reshape(-1))
+        return logical

@@ -127,3 +127,4 @@ nav:
       - Weight Staging: developer-guide/weight-staging.md
       - V4.1 Engram and Decode Optimization: developer-guide/v41-engram-decode-optimization.md
       - JIT Cache: developer-guide/jit-cache.md
+      - PD Expert Load Balancing: developer-guide/pd-eplb.md

@@ -11,6 +11,7 @@
 """Basic configuration, routing and request lifecycle checks for PD."""
 
 import asyncio
+from dataclasses import replace
 import json
 
 import httpx
@@ -43,11 +44,14 @@ class Peers:
         self.nodes = {r.name: Node(r.name, r.role, "boot-" + r.name, contract, "registry-" + r.name,
                                   Topology.for_tp(4, 1)) for r in cfg.replicas}
         self.calls, self.requests, self.errors = [], [], {}
+        self.timeouts = {}
         self.p_hold = self.d_stream = self.stream_body = None
 
     async def handle(self, req):
         name, path = req.url.host, req.url.path
         self.calls.append((name, path))
+        if name in self.timeouts:
+            raise self.timeouts[name]
         if path.endswith("descriptor"):
             return httpx.Response(200, json=msgspec.to_builtins(self.nodes[name]))
         if path.endswith("abort"):
@@ -81,6 +85,42 @@ def assert_idle(router):
     assert all(s.outstanding == 0 for s in router.registry.states)
 
 
+def test_default_pd_client_reaches_nodes_despite_ambient_proxy(monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+    from pypto_serving.router.app import default_client_factory
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            body = b'{"direct":true}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.setenv(name, "http://127.0.0.1:1")
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.setenv(name, "")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever)
+    thread.start()
+    async def run():
+        async with default_client_factory(config()) as client:
+            response = await client.post(f"http://127.0.0.1:{server.server_port}/v1/completions", json={})
+            assert response.status_code == 200 and response.json() == {"direct": True}
+    try:
+        asyncio.run(run())
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_json_and_sse_generation(stream):
     async def run():
@@ -102,6 +142,60 @@ def test_json_and_sse_generation(stream):
                 assert json.loads(response.body)["choices"][0]["text"] == "answer"
             assert_idle(router)
             assert not any(path.endswith("abort") for _, path in peers.calls)
+    asyncio.run(run())
+
+
+def test_busy_node_probe_read_timeout_keeps_the_last_good_snapshot():
+    async def run():
+        cfg = config()
+        peers = Peers(cfg)
+        router = peers.router(cfg)
+        async with router.app.router.lifespan_context(router.app):
+            peers.timeouts["p0"] = httpx.ReadTimeout("busy with a long-input burst")
+            await router.health.probe_once()
+            assert router.proxy.nodes.get("p0") is not None
+            assert any(p is not None and p.node_id == "p0" for p, _ in router.proxy.pairs())
+            # A refused connection is proof of death, not evidence of load.
+            peers.timeouts["p0"] = httpx.ConnectError("gone")
+            await router.health.probe_once()
+            assert router.proxy.nodes.get("p0") is None
+            assert not any(pair is not None for pair in router.proxy.pairs())
+    asyncio.run(run())
+
+
+def test_busy_node_is_evicted_once_the_grace_period_expires(monkeypatch):
+    from pypto_serving.pd import coordinator as coordinator_module
+
+    monkeypatch.setattr(coordinator_module, "PROBE_READ_TIMEOUT_GRACE_SECONDS", -1.0)
+
+    async def run():
+        cfg = config()
+        peers = Peers(cfg)
+        router = peers.router(cfg)
+        async with router.app.router.lifespan_context(router.app):
+            peers.timeouts["p0"] = httpx.ReadTimeout("busy")
+            await router.health.probe_once()
+            assert router.proxy.nodes.get("p0") is None
+    asyncio.run(run())
+
+
+def test_health_cycle_is_bounded_when_a_probe_hangs(monkeypatch):
+    from pypto_serving.router import routing
+
+    monkeypatch.setattr(routing, "HEALTH_CYCLE_DEADLINE_SECONDS", 0.05)
+    cfg = replace(config(), health_interval_seconds=0.01)
+    peers = Peers(cfg)
+    router = peers.router(cfg)
+
+    async def run():
+        async def hang(*_args):
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(router.health, "_probe", hang)
+        started = asyncio.get_event_loop().time()
+        await router.health.probe_once()
+        assert asyncio.get_event_loop().time() - started < 1.0
+
     asyncio.run(run())
 
 

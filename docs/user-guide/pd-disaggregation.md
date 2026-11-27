@@ -8,7 +8,7 @@ The adapter supports DeepSeek V4 Flash DSpark K5/K7, greedy sampling, identical 
 
 Use matching upstream PyPTO/Simpler builds with leased VMM Buffer exports (PyPTO #3397 and Simpler #3101). PyPTO must expose `alloc_tensor(exportable=True)`, `export_buffer`, and `release_export`; Simpler supplies `BufferMapping`. No owner-service SDK patch is required. `RunConfig` must support explicit `backend_type` and `execution_mode` fields.
 
-Control protocol version 3 separates the common replicated-page data contract from each node's local rank groups. All participants must use the same protocol version; older schemas are rejected. Every destination cache replica selects a complete source replica from the request's Prefill partition. Page/ring formats must remain compatible: this is replica mapping, not a general sharded-layout conversion.
+Control protocol version 4 adds source/destination write admission for EPLB maintenance and separates the common replicated-page data contract from each node's local rank groups. All participants must use the same protocol version; older schemas are rejected. Every destination cache replica selects a complete source replica from the request's Prefill partition. Page/ring formats must remain compatible: this is replica mapping, not a general sharded-layout conversion.
 
 Follow the SDK's normal source-build instructions with its matching runtime pin and required PTOAS version. The native Buffer integration requires PTOAS 0.74 with its matching SDK pin. Keep runtime revision checks enabled; a binary copied from another checkout is not a matching source installation.
 
@@ -26,7 +26,117 @@ export HCCL_NPU_SOCKET_PORT_RANGE=auto
 
 Automatic HCCL ports let the compute communicator coexist with the AscendDirect transfer process on each device. AscendDirect can use a rank-table device port, so check the actual listeners and complete a P-to-D request before sending production traffic. Buffer export and mapping are independent of the network transport.
 
+The PD Router connects directly to configured node endpoints, ignoring ambient
+HTTP proxy variables for its node clients. Health, generation and cancellation
+must all reach the same internal nodes.
+
 Install `python -m pip install -e '.[pd]'` in each environment. The Router only needs this extra, not PyPTO, model weights, or NPUs. Optional constrained tools use the ordinary [XGrammar deployment requirements](../models/deepseek-v4/tool-constraints.md).
+
+## Expert load balancing
+
+See the [PD EPLB design assessment](../developer-guide/pd-eplb.md) for the
+maintenance transaction, capacity policy and remaining acceptance gates.
+
+DSpark PD nodes can independently enable `--enable-eplb` and configure
+`--eplb-config`. Enabled P nodes use TP4 with EP8 or EP16. Enabled D nodes use TP1 or TP4
+with EP8 or EP16, retaining independent LM-head TP4. Both
+launchers still specify K7: P internally runs target-only Prefill, while D uses
+K7 Decode and its existing bootstrap. Drafter experts keep their fixed layout.
+
+For example, add the following options to the appropriate node command:
+
+```bash
+# P: extra expert slots, Prefill-only load collection.
+--enable-eplb --eplb-config '{"num_redundant_experts":8,"max_migration_bytes":17179869184}'
+
+# D: pure rearrangement, Decode-only load collection.
+--enable-eplb --eplb-config '{"num_redundant_experts":0,"max_migration_bytes":8589934592}'
+```
+
+These examples require EP8 on P. At EP16, a nonzero redundant count must also
+be divisible by 16. Omitted `load_collection_phase` resolves from the role;
+an explicit conflicting phase is rejected. Bootstrap does not contribute to D's
+normal Decode load window. Budgets, windows and generation counters remain local
+to each node. The common model/cache contract contains no expert placement or
+EPLB generation, and maintenance keeps registered cache/hidden backing stable.
+
+Every native transfer now reserves a source permit before destination plan
+admission. The destination closes admission during maintenance and returns a
+retry response without authorizing a write. P returns its source permit before
+retrying. Already accepted writes continue through the independent progress
+channel on both roles. Destination permits retire only on validated completion
+or confirmed source stop; disconnects, timeouts and unknown native completion do
+not retire them. This covers incoming writes from every connected Prefill node.
+
+Maintenance drains local compute/reclaim, then holds exclusive DMA admission
+through expert migration and mapping publication. The wait budget and cooldown
+are described in [DSpark deployment](../models/deepseek-v4/dspark.md#expert-load-balancing).
+Timeout before installation postpones the candidate. Installation failures stop
+new compute and DMA admission and make the engine unhealthy; confirmed cleanup
+remains available. Unknown transfers retain their existing pin/quarantine rules.
+This implementation serializes migration with KV DMA; it does not claim safe or
+profitable overlap of these two operations.
+
+Reserve additional HBM for expert replicas, maintenance receive windows, rings,
+provider resources and bootstrap buffers before sizing cache capacity. Resident
+expert tables and maintenance windows are prepared before the cache free-memory
+snapshot. Do not borrow space from registered or leased cache allocations.
+The current implementation retains the existing provider and owner-service APIs.
+
+A bounded local integration driver allocates two EP8 groups from sixteen task
+submit devices and defaults to P TP4 / D TP1. Use `--decode-tp 4` for the
+homogeneous layout, or `--ep-size 16` with 32 allocated devices for two EP16 groups. It records node logs, descriptors, responses, layout generations,
+and request wall times. Supply the normal source-built PD environment and run:
+
+```bash
+task-submit --device auto --device-num 16 --max-time 0 --timeout 0 --run \
+  'python examples/pd_eplb_check.py --devices "$TASK_DEVICE" \
+    --model /path/to/dsv4-flash-dspark-w8a8 --output /tmp/pd-eplb-check'
+```
+
+The default modes are disabled, P-only, D-only and both; later modes compare
+responses with the disabled baseline. `--modes both` runs only the combined check.
+The optional `frozen` mode stops after one learned placement on each node; this
+is a one-rebalance control, not an all-layer optimized layout. The driver uses
+aggressive windows and intervals to exercise maintenance, not production tuning
+parameters. Request wall times are diagnostics rather than a TTFT/TPOT benchmark.
+Full performance acceptance requires production traffic and includes maintenance
+pauses, handoff time, TTFT, TPOT tails, throughput and memory peaks.
+
+To reuse nodes on separate hosts, supply their URLs, shared PD configuration,
+and readable node logs. This mode starts only a Router and leaves both model
+processes running when the check finishes:
+
+```bash
+python examples/pd_eplb_check.py \
+  --prefill-url http://PREFILL_HOST:19111 --decode-url http://DECODE_HOST:19112 \
+  --pd-config /shared/pd.json \
+  --prefill-log /shared/prefill.log --decode-log /shared/decode.log \
+  --modes both --ep-size 16 --decode-tp 1 \
+  --requests 24 --concurrency 2 --exercise-lifecycle --collect-metrics \
+  --startup-timeout 7200 --output /shared/pd-eplb-check
+```
+
+The mode must match the existing nodes' configuration; the driver does not
+change it. Generation requirements count commits during this check, excluding
+older log entries. Use a fresh output directory for each run. Add
+`--reference-responses /shared/disabled/responses.json` to compare with a prior
+disabled run using the same prompts, token limit, model and sampling settings.
+`--exercise-lifecycle` checks streamed output, disconnect after the first
+nonempty chunk, source-pin/destination-reservation retirement, and recovery.
+Stream records include client TTFT and mean time per output token using the
+server's completion-token count. K7 can emit several tokens in a chunk, so these
+records do not measure individual token intervals. Latency summaries include
+sample counts, means and nearest-rank p50/p95/p99; TPOT percentiles summarize
+request means. The throughput field covers
+the main request loop, excluding startup and the cancellation/recovery probe.
+Optional metrics snapshots preserve the nodes' acceptance and latency counters;
+their cumulative values must be compared as deltas. Retain PD handoff logs and
+EPLB maintenance logs alongside the client results for a performance comparison.
+
+TP1 kernel ABI and host lifecycle tests cover the asymmetric configuration.
+Physical dual-node EPLB acceptance remains in progress; a passing host test or
+available launch option does not establish end-to-end correctness or speedup.
 
 ## Configure and start
 

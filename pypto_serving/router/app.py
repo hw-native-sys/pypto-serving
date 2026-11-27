@@ -94,7 +94,10 @@ def default_client_factory(config: RouterConfig):
     # the number suggests.
     limits = httpx.Limits(max_connections=config.max_connections,
                           max_keepalive_connections=config.max_keepalive_connections)
-    return httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=False)
+    # PD control and generation target the explicitly configured internal nodes.
+    # An ambient proxy can answer health probes yet reject their generation POSTs.
+    return httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=False,
+                             trust_env=not config.is_pd)
 
 
 class ServingRouter:
