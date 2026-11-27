@@ -773,7 +773,7 @@ def lookup_token_embeddings(
 
 
 # metadata
-_MAX_REQUESTS_PER_DP = 12
+_MAX_REQUESTS_PER_DP = DSPARK_MAX_BATCH_PER_DP
 
 
 def _validate_dp_capacity(partitions, token_counts, *, phase, dp_size):
@@ -785,7 +785,7 @@ def _validate_dp_capacity(partitions, token_counts, *, phase, dp_size):
         requests[partition] += 1
         tokens[partition] += count
     if any(count > _MAX_REQUESTS_PER_DP for count in requests):
-        raise ValueError("V4.1 lib supports at most 12 requests per DP partition")
+        raise ValueError(f"V4.1 decode capacity is {_MAX_REQUESTS_PER_DP} requests per DP partition")
     if phase == "prefill" and any(count > MAX_PREFILL_TOKENS_PER_DP for count in tokens):
         raise ValueError("V4.1 lib supports at most 4096 prefill tokens per DP partition")
 
@@ -944,16 +944,16 @@ class SegmentTopology:
         """Keep prefill rows independent of the fixed decode ABI."""
         if type(max_tokens) is not int or not 0 < max_tokens <= MAX_PREFILL_TOKENS_PER_DP:
             raise ValueError("V4.1 prefill capacity must be between 1 and 4096 tokens")
-        # Shared MoE kernels retain decode's extent even for a smaller token budget.
+        # Keep the existing minimum graph capacity for small token budgets.
         return cls(tp=1, dp=dp, local_capacity=max(
             cls.for_decode(dp=dp).local_capacity, (max_tokens + 15) // 16 * 16))
 
     @classmethod
     def for_decode(cls, *, tp: int = 1, dp: int = 8):
-        """Match the current lib's 12-request, six-row decode extent."""
+        """Match the selected lib's six-row decode extent."""
         if type(tp) is not int or tp not in (1, 2, 4, 8):
             raise ValueError("unsupported decode TP size")
-        decode_tokens = 12 * 6
+        decode_tokens = DSPARK_MAX_BATCH_PER_DP * DSPARK_ROWS_PER_REQUEST
         row_tile = 16
         local_rows = (decode_tokens + tp - 1) // tp
         return cls(tp=tp, dp=dp, local_capacity=(local_rows + row_tile - 1) // row_tile * row_tile)
@@ -1020,6 +1020,22 @@ def load_segment_modules(lib_root, topology):
             1, topology.tp, topology.world, topology.dp
         ):
             raise ValueError("lib CP/LM-head/EP/DP topology disagrees with the serving topology")
+        selected_batch = DSPARK_MAX_BATCH_PER_DP
+        configured_batch = getattr(config, "_serving_decode_batch", None)
+        if configured_batch is not None and configured_batch != selected_batch:
+            raise RuntimeError("V4.1 decode capacity changed after import; use a fresh worker")
+        if configured_batch is None and selected_batch != 12:
+            # Lib entries freeze these shared dimensions when imported.
+            if any(
+                    Path(module.__file__).resolve().parent == expected.parent
+                    for module in tuple(sys.modules.values())
+                    if module is not config and getattr(module, "__file__", None)):
+                raise RuntimeError("V4.1 decode entries are already imported; use a fresh worker")
+            config.DECODE_BATCH = selected_batch
+            config.DECODE_MAX_TOKENS = selected_batch * DSPARK_ROWS_PER_REQUEST
+            config.set_moe_tokens((config.DECODE_MAX_TOKENS + 15) // 16 * 16)
+            config.DECODE_INPUT_MAX_TOKENS = max(config.DECODE_MAX_TOKENS, config.MOE_TOKENS)
+            config._serving_decode_batch = selected_batch
         if not (root / "models/deepseek_v4_1_flash/moe.py").is_file():
             return None, None
         attention = importlib.import_module(package + ".prefill_swa")
@@ -1638,24 +1654,37 @@ class V41ModelRunner:
                 ledger.abort(step, self._reset_request)
                 raise
 
-def compile_prefill_fwd(compiler, lib_root, topology):
+def compile_prefill_fwd(compiler, lib_root, topology, *, short_tail=False):
     """Compile the lib's complete CED prefill at the serving row capacity."""
     decode_topology = SegmentTopology.for_decode(tp=topology.tp, dp=topology.dp)
     load_segment_modules(lib_root, decode_topology)
-    previous_argv = sys.argv[:]
+    moe_tokens = min(topology.local_capacity, 512)
+    config = sys.modules["config"]
+    previous_tokens = config.MOE_TOKENS
+    # Lib captures the slab and routing strides when these siblings are imported.
+    # Keep the decode graph's bindings while prefill imports its own kernels.
+    siblings = ("gate", "expert_shared", "expert_routed", "prefill_moe") if moe_tokens != previous_tokens else ()
+    saved = {name: sys.modules.pop(name) for name in siblings if name in sys.modules}
+    previous_argv = sys.argv
     try:
         sys.argv = [previous_argv[0], "--tp", str(topology.tp), "--ep", str(topology.world),
                     "--dp", str(topology.dp), "--capacity", str(topology.local_capacity),
-                    "--moe-tokens", str(decode_topology.local_capacity)]
-        module = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd")
+                    "--moe-tokens", str(moe_tokens)]
+        # The short entry has a separate import identity, so its static row
+        # constants cannot overwrite the full prefill or generation-head graph.
+        module = importlib.import_module("prefill_fwd" if short_tail else "models.deepseek_v4_1_flash.prefill_fwd")
+        if (module.CAPACITY, module.RANKS, module.MOE_TOKENS) != (
+                topology.local_capacity, topology.world, moe_tokens):
+            raise ValueError("lib prefill_fwd was imported for another capacity, EP topology or MoE slab")
+        entry = module.l3_prefill_fwd
+        return compiler.compile("v41_prefill_tail" if short_tail else "v41_prefill_fwd", entry), tuple(entry.param_names)
     finally:
         sys.argv = previous_argv
-    if (module.CAPACITY, module.RANKS) != (topology.local_capacity, topology.world):
-        raise ValueError("lib prefill_fwd was imported for another capacity or EP topology")
-    if module.MOE_TOKENS != decode_topology.local_capacity:
-        raise ValueError("lib prefill MoE extent disagrees with the shared decode kernels")
-    entry = module.l3_prefill_fwd
-    return compiler.compile("v41_prefill_fwd", entry), tuple(entry.param_names)
+        for name in siblings:
+            sys.modules.pop(name, None)
+        sys.modules.update(saved)
+        config.set_moe_tokens(previous_tokens)
+
 
 
 # segment_inputs
@@ -1960,6 +1989,36 @@ def prepare_swa_window_metadata(
                 if position < start and position // 128 in read_pages:
                     return read_pages[position // 128] * 128 + position % 128
                 return pages[position // 128 % len(pages)] * 128 + position % 128
+            if scratch_base is not None and count > 1:
+                # The same cache address is visible to up to 128 consecutive queries.
+                # Construct the address stream once, then copy its causal windows.
+                section = slice(row, row + count)
+                current = torch.arange(start, start + count, dtype=torch.int64)
+                scratch = torch.arange(scratch_base * 128 + row,
+                                       scratch_base * 128 + row + count, dtype=torch.int64)
+                positions[group, section] = current
+                slots[group, section] = scratch
+                tail = min(count, 128)
+                restore[group, row + count - tail:row + count] = torch.tensor(
+                    [ring_slot(p) for p in range(start + count - tail, start + count)])
+                first = max(valid_from, start - 127)
+                history = [ring_slot(p) for p in range(first, start)]
+                stream = torch.cat((torch.tensor(history, dtype=torch.int32),
+                                    scratch[max(0, first - start):].int()))
+                left = max(0, first - start)
+                # Short windows at the start are left-aligned in the ABI.
+                short = min(count, max(left, first + 127 - start))
+                if short > left:
+                    n = short - left
+                    width = start + short - first
+                    cols = torch.arange(width)
+                    lengths = current[left:short] - first + 1
+                    indices[group, row + left:row + short, :width] = torch.where(
+                        cols < lengths[:, None], stream[:width], -1)
+                if short < count:
+                    offset = start + short - 127 - first
+                    indices[group, row + short:row + count] = stream[offset:].unfold(0, 128, 1)
+                continue
             for local in range(count):
                 position = start + local
                 positions[group, row + local] = position
@@ -2325,7 +2384,7 @@ class PrefillMetadataResources:
                 f["full_logit_rows"][rank, slot] = rows_per_rank[rank] + len(request.token_ids) - 1
                 rows_per_rank[rank] += len(request.token_ids)
                 per_rank[rank] += 1
-            return counts
+            return counts, packed
 
     def full_arguments(self):
         if self.full_hidden_size is None:
@@ -2883,7 +2942,7 @@ class V41ResidentResources:
                  prefill_host, topology, decode_head_program, decode_head_param_names,
                  engram_host=None,
                  decode_input_host=None, decode_host=None, worker_factory=make_segment_worker,
-                 prefill_program=None, prefill_param_names=None,
+                 prefill_program=None, prefill_param_names=None, tail_program=None, tail_host=None,
                  dspark_programs=None, dspark_param_names=None, max_seq_len=None,
                  dspark_weight_contract=None, dspark_lowering_provider=None,
                  dspark_host_resources=None):
@@ -2894,6 +2953,7 @@ class V41ResidentResources:
         inherited = (input_host.inherited_host_tensors
                      + (() if decode_input_host is None else decode_input_host.inherited_host_tensors)
                      + prefill_host.inherited_host_tensors
+                     + (() if tail_host is None else tail_host.inherited_host_tensors)
                      + (() if decode_host is None else decode_host.inherited_host_tensors)
                      + (() if engram_host is None else engram_host.inherited_host_tensors)
                      + final_host.all_host_tensors
@@ -2916,6 +2976,7 @@ class V41ResidentResources:
         self.host_resources = (weight_bank, input_host, decode_input_host, prefill_host, decode_host,
                                final_host, dspark_host_resources, state_reset, page_resets)
         self.prefill_host = prefill_host
+        self._prefill_variants = ()
         self.engram_host = engram_host
         self.decode_host = decode_host
         self.dspark_host_resources = dspark_host_resources
@@ -3032,6 +3093,14 @@ class V41ResidentResources:
                 if prefill_param_names is None or prefill_host.full_hidden_size is None:
                     raise ValueError("full prefill binding requires its ABI and metadata")
                 self._activate_prefill()
+                if tail_host is not None:
+                    tail_host.window_pages = prefill_host.window_pages
+                    tail_host.window_scratch_base = prefill_host.window_scratch_base
+                    tail_host.compressed_pages = prefill_host.compressed_pages.copy()
+                    tail = self._own(PrefillForwardSegment(
+                        self.worker, tail_program, prefill_param_names, run_config, tail_host.topology,
+                        self.weights, tail_host, self.cache, self.final, self.engram))
+                    self._prefill_variants = ((prefill_host, self._prefill_fwd), (tail_host, tail))
             if decode_host is not None:
                 plan = cache.plan
                 if decode_host.max_requests < plan.physical_request_slots:
@@ -3404,6 +3473,12 @@ class V41ResidentResources:
                 raise RuntimeError("V4.1 worker is closed or a step is already active")
             if step.phase == "prefill" and self._prefill_binding[0] is not None:
                 self._activate_prefill()
+                if self._prefill_variants:
+                    full, tail = self._prefill_variants
+                    counts = [0] * tail[0].topology.dp
+                    for request in step.requests:
+                        counts[request.partition] += len(request.token_ids)
+                    self.prefill_host, self._prefill_fwd = tail if max(counts) <= tail[0].topology.capacity else full
             elif step.phase == "decode":
                 self._activate_decode()
             dispatch_step = step
@@ -3413,13 +3488,17 @@ class V41ResidentResources:
                 for partition in padding_partitions:
                     self.cache.reset_padding(partition)
             host = self.prefill_host if step.phase == "prefill" else self.decode_host
-            counts = (host.stage_full(dispatch_step, embeddings, self.engram_host)
-                      if step.phase == "prefill" and self._prefill_fwd is not None else
-                      host.stage(dispatch_step, self.engram_host) if host is not None else None)
-            input_runtime = self.decode_input if step.phase == "decode" else self.input
-            if input_runtime is None:
-                raise ValueError("decode requires its own TP-local input capacity")
-            state, inputs = input_runtime.stage(embeddings, dispatch_step)
+            if step.phase == "prefill" and self._prefill_fwd is not None:
+                # Full prefill binds its own embedding. Only the row mapping is
+                # consumed here; segmented residual and pre-mix uploads are unused.
+                counts, inputs = host.stage_full(dispatch_step, embeddings, self.engram_host)
+                state = LayerState(inputs.residual, inputs.pre_mix, "tp_local_token")
+            else:
+                counts = host.stage(dispatch_step, self.engram_host) if host is not None else None
+                input_runtime = self.decode_input if step.phase == "decode" else self.input
+                if input_runtime is None:
+                    raise ValueError("decode requires its own TP-local input capacity")
+                state, inputs = input_runtime.stage(embeddings, dispatch_step)
             if dispatch_step is not step:
                 inputs = replace(inputs, request_last_rows=inputs.request_last_rows[:len(step.requests)])
             self._output_rows = prepare_final_output_rows(
@@ -3620,6 +3699,12 @@ class V41ResidentResources:
     def _dspark_decode_arguments(self, lowered):
         """Bind the Lib recurrent composite without rebuilding its device graph."""
         target = lowered.target_model
+        rope = lowered.rope_tables
+        # The provider's immutable RoPE tables were uploaded at worker startup.
+        if self.dspark_buffers is not None and all(
+                rope[name] is self.dspark_buffers.host.rope_tables[name]
+                for name in ("draft_cos", "draft_sin")):
+            rope = self.dspark_buffers.rope_tables
         arguments = dict(lowered.workspace)
         arguments.update({name: value for name, value in target.items() if name not in (
             "embedding_weight", "logit_row_indices", "attention_num_tokens", "moe_num_tokens",
@@ -3634,7 +3719,7 @@ class V41ResidentResources:
             c2a_index_block_table=lowered.cache_tables["target_c2a"],
             c1a_index_block_table=lowered.cache_tables["target_c1a"],
             draft_table=lowered.cache_tables["draft"],
-            draft_cos=lowered.rope_tables["draft_cos"], draft_sin=lowered.rope_tables["draft_sin"],
+            draft_cos=rope["draft_cos"], draft_sin=rope["draft_sin"],
             attention_num_tokens=target["attention_num_tokens"], moe_num_tokens=target["moe_num_tokens"],
             moe_epoch=lowered.moe_epoch, logits_epoch=lowered.logits_epoch,
         )
@@ -3887,6 +3972,9 @@ class V41ResidentResources:
             return
         self._step = self._inputs = self._group_counts = self._output_rows = None
         try:
+            if self._prefill_variants:
+                self.prefill_host, self._prefill_fwd = self._prefill_variants[0]
+                self._prefill_variants = ()
             if self._prefill_fwd is not None:
                 self._prefill_fwd.close()
                 self._prefill_fwd = None
@@ -4027,6 +4115,11 @@ def make_production_bindings(
         from pypto_serving.model.common.compiler.compiler import KernelCompiler
         from pypto_serving.model.common.executor.utils import build_pypto_run_config
 
+        if (DSPARK_MAX_BATCH_PER_DP != 12
+                and max((runtime.max_batch_size + topology.dp - 1) // topology.dp,
+                        request_slots) > DSPARK_MAX_BATCH_PER_DP):
+            raise ValueError(
+                "configured request capacity exceeds PYPTO_V41_DECODE_BATCH_PER_DP")
         if Path(plan.weights.model_dir).resolve() != model_dir or tuple(plan.layers) != layers:
             raise ValueError("V4.1 binding and execution plan refer to different checkpoints")
         if runtime.max_seq_len != max_seq_len or runtime.kv_cache_groups != groups:
@@ -4070,6 +4163,13 @@ def make_production_bindings(
         else:
             dspark_programs, dspark_param_names = {}, {}
         prefill, prefill_names = compile_prefill_fwd(compiler, root, prefill_topology)
+        tail_topology = None
+        tail_program = None
+        if prefill_topology.capacity == 512:
+            tail_topology = SegmentTopology.for_prefill(dp=topology.dp, max_tokens=192)
+            tail_program, tail_names = compile_prefill_fwd(compiler, root, tail_topology, short_tail=True)
+            if tail_names != prefill_names:
+                raise MissingCompositeInterface("short and full prefill must share argument names")
         head_entry = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd").l3_generation_head
         decode_head_param_names = tuple(head_entry.param_names)
         decode_head = compiler.compile("v41_generation_head", head_entry)
@@ -4147,6 +4247,8 @@ def make_production_bindings(
         final_host = load_final_output_host_resources(model_dir, topology)
         prefill_host = PrefillMetadataResources(
             prefill_topology, **host_kwargs, full_hidden_size=plan.weights.config.hidden_size)
+        tail_host = None if tail_topology is None else PrefillMetadataResources(
+            tail_topology, **host_kwargs, full_hidden_size=plan.weights.config.hidden_size)
         engram_host = None
         if "engram_lookup" in set(decode_names) | set(prefill_names):
             tokenizer_adapter = tokenizer
@@ -4174,6 +4276,8 @@ def make_production_bindings(
         programs_by_id = {}
         for program in (prefill, decode, decode_head, *dspark_programs.values()):
             programs_by_id.setdefault(id(program.compiled), program)
+        if tail_program is not None:
+            programs_by_id[id(tail_program.compiled)] = tail_program
         programs = tuple(programs_by_id.values())
         resident_started = time.perf_counter()
         resident = V41ResidentResources(
@@ -4184,6 +4288,7 @@ def make_production_bindings(
             final_host=final_host,
             engram_host=engram_host,
             topology=topology, prefill_program=prefill, prefill_param_names=prefill_names,
+            tail_host=tail_host, tail_program=tail_program,
             dspark_programs=dspark_programs, dspark_param_names=dspark_param_names,
             max_seq_len=max_seq_len,
             dspark_weight_contract=dspark_weight_contract,
