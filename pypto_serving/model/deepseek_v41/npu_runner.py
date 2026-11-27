@@ -23,6 +23,7 @@ import sys
 import time
 import zlib
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
@@ -1179,14 +1180,10 @@ def prepare_compressed_metadata(
 
 
 # decode_backbone
-def compile_decode_fwd(compiler, lib_root, topology):
-    """Compile the complete 40-layer backbone from the selected lib revision."""
+def compile_decode_fwd(compiler, entry, topology):
+    """Compile the complete 40-layer backbone from its validated lib entry."""
     import pypto.language as pl
 
-    load_segment_modules(lib_root, topology)
-    module = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
-    validate_lib_cache_abi(module)
-    entry = module.l3_decode_fwd
     annotation = inspect.signature(entry._func).parameters["attention_num_tokens"].annotation
     shape = tuple(getattr(annotation, "shape", ()))
     if shape == (topology.world,):
@@ -1197,7 +1194,7 @@ def compile_decode_fwd(compiler, lib_root, topology):
         counts_are_tensor = False
     else:
         raise ValueError(f"unsupported decode attention_num_tokens shape: {shape}")
-    return program, tuple(entry.param_names), counts_are_tensor
+    return program, counts_are_tensor
 
 
 def compile_decode_fwd_dspark(compiler, lib_root, topology):
@@ -4002,6 +3999,43 @@ def prefill_ring_heap(capacity):
     return (2 << 30, attention_heap, 2 << 30, (6 << 30) - attention_heap)
 
 
+def _stage_decode_weight_bank(model_dir, layout, topology, decode_names):
+    bank_started = time.perf_counter()
+    bank = load_prepacked_bank(model_dir, layout, decode_names)
+    if bank is None:
+        bank = DecodeWeightBank(layout)
+        append_seconds = 0.0
+        layer_started = time.perf_counter()
+        parallel_experts = topology.dp in (4, 8)
+        previous_threads = torch.get_num_threads()
+        if parallel_experts and previous_threads < 8:
+            torch.set_num_threads(8)
+        try:
+            for item in iter_decode_weight_slices(
+                    model_dir, topology, parallel_experts=parallel_experts, bank=bank):
+                append_started = time.perf_counter()
+                bank.append(item)
+                append_seconds += time.perf_counter() - append_started
+                if item.name == "hc_attn_fn":
+                    now = time.perf_counter()
+                    _LOG.info("V4.1 checkpoint layer %d/%d loaded into shared weight bank (%.2fs)",
+                              item.slot + 1, layout.layers, now - layer_started)
+                    layer_started = now
+        finally:
+            if parallel_experts and previous_threads < 8:
+                torch.set_num_threads(previous_threads)
+        bank.finish(decode_names)
+        _LOG.info("V4.1 checkpoint staging %.2fs (bank copies %.2fs)",
+                  time.perf_counter() - bank_started, append_seconds)
+        peak_rss = peak_rss_bytes()
+        if peak_rss is not None:
+            _LOG.info("V4.1 checkpoint staging peak RSS %.1f GiB",
+                      peak_rss / (1 << 30))
+    _LOG.info("V4.1 shared weight bank ready: %.1f GiB",
+              bank.allocated_bytes / (1 << 30))
+    return bank
+
+
 def make_production_bindings(
     model_dir,
     max_seq_len,
@@ -4062,18 +4096,11 @@ def make_production_bindings(
                            ((16384, 16384, 32764, 16384) if topology.dp == 4 else None)),
         )
         compiler = KernelCompiler(run_config=run_config)
-        decode, decode_names, decode_counts_are_tensor = compile_decode_fwd(
-            compiler, root, topology)
-        if runtime.num_speculative_tokens:
-            dspark_programs, dspark_param_names = compile_decode_fwd_dspark(
-                compiler, root, topology)
-        else:
-            dspark_programs, dspark_param_names = {}, {}
-        prefill, prefill_names = compile_prefill_fwd(compiler, root, prefill_topology)
-        head_entry = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd").l3_generation_head
-        decode_head_param_names = tuple(head_entry.param_names)
-        decode_head = compiler.compile("v41_generation_head", head_entry)
+        load_segment_modules(root, topology)
         abi = importlib.import_module("models.deepseek_v4_1_flash.decode_fwd")
+        validate_lib_cache_abi(abi)
+        decode_entry = abi.l3_decode_fwd
+        decode_names = tuple(decode_entry.param_names)
         kv_sources, index_sources, c2a_sources = _sources(layers)
         layout = DecodeWeightLayout.from_lib(abi, tp_size=topology.tp)
         if (layout.layers, layout.kv_sources, layout.index_sources,
@@ -4082,39 +4109,27 @@ def make_production_bindings(
             raise ValueError("V4.1 checkpoint source axes disagree with the selected lib")
         DecodeWeightBank.validate_abi(decode_names)
 
-        bank_started = time.perf_counter()
-        bank = load_prepacked_bank(model_dir, layout, decode_names)
-        if bank is None:
-            bank = DecodeWeightBank(layout)
-            append_seconds = 0.0
-            layer_started = time.perf_counter()
-            parallel_experts = topology.dp in (4, 8)
-            previous_threads = torch.get_num_threads()
-            if parallel_experts and previous_threads < 8:
-                torch.set_num_threads(8)
-            try:
-                for item in iter_decode_weight_slices(
-                        model_dir, topology, parallel_experts=parallel_experts, bank=bank):
-                    append_started = time.perf_counter()
-                    bank.append(item)
-                    append_seconds += time.perf_counter() - append_started
-                    if item.name == "hc_attn_fn":
-                        now = time.perf_counter()
-                        _LOG.info("V4.1 checkpoint layer %d/%d loaded into shared weight bank (%.2fs)",
-                                  item.slot + 1, layout.layers, now - layer_started)
-                        layer_started = now
-            finally:
-                if parallel_experts and previous_threads < 8:
-                    torch.set_num_threads(previous_threads)
-            bank.finish(decode_names)
-            _LOG.info("V4.1 checkpoint staging %.2fs (bank copies %.2fs)",
-                      time.perf_counter() - bank_started, append_seconds)
-            peak_rss = peak_rss_bytes()
-            if peak_rss is not None:
-                _LOG.info("V4.1 checkpoint staging peak RSS %.1f GiB",
-                          peak_rss / (1 << 30))
-        _LOG.info("V4.1 shared weight bank ready: %.1f GiB",
-                  bank.allocated_bytes / (1 << 30))
+        # Keep JIT and its topology-specific imports on the worker's main
+        # thread. Staging needs only the checkpoint and the validated weight ABI.
+        startup_started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="v41-weights") as staging:
+            bank_future = staging.submit(_stage_decode_weight_bank, model_dir, layout, topology, decode_names)
+            decode, decode_counts_are_tensor = compile_decode_fwd(compiler, decode_entry, topology)
+            if runtime.num_speculative_tokens:
+                dspark_programs, dspark_param_names = compile_decode_fwd_dspark(
+                    compiler, root, topology)
+            else:
+                dspark_programs, dspark_param_names = {}, {}
+            prefill, prefill_names = compile_prefill_fwd(compiler, root, prefill_topology)
+            head_entry = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd").l3_generation_head
+            decode_head_param_names = tuple(head_entry.param_names)
+            decode_head = compiler.compile("v41_generation_head", head_entry)
+            compile_finished = time.perf_counter()
+            bank = bank_future.result()
+        startup_finished = time.perf_counter()
+        _LOG.info("V4.1 kernel preparation and checkpoint staging %.2fs (JIT %.2fs, wait for weights %.2fs)",
+                  startup_finished - startup_started, compile_finished - startup_started,
+                  startup_finished - compile_finished)
 
         rope = importlib.import_module("models.deepseek_v4_1_flash.rope_tables")
         swa_tables = rope.precompute_rope_tables(max_seq_len, False)
