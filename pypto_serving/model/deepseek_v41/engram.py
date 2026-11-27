@@ -19,7 +19,6 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import io
 import math
-import os
 
 import numpy as np
 import torch
@@ -225,7 +224,7 @@ class _EngramShardStream(io.RawIOBase):
 class EngramWindowSources:
     """Validate checkpoint spans and bind them to the kernel's Host windows."""
 
-    def __init__(self, store, layout, ranks, *, compiled_rows, program_count):
+    def __init__(self, store, layout, ranks, *, compiled_rows):
         self.ranks = ranks
         self.shard_rows = (max(layout.num_embeddings) + ranks - 1) // ranks
         if compiled_rows != self.shard_rows * ranks:
@@ -245,18 +244,9 @@ class EngramWindowSources:
                     raise ValueError(f"unsupported Engram checkpoint layout: {name}")
                 spans.append(span)
             self._bindings[key] = (spans, row_bytes)
-        self.host_bytes = program_count * compiled_rows * len(layout.layer_ids) * (
-            layout.head_dim + layout.head_dim // 32
-        )
 
     @contextmanager
     def open(self):
-        try:
-            available = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-        except (AttributeError, OSError, ValueError):
-            available = None
-        if available is not None and self.host_bytes > available:
-            raise MemoryError(f"Engram requires {self.host_bytes} Host table bytes, only {available} are available")
         with ExitStack() as files:
             yield {
                 key: tuple(

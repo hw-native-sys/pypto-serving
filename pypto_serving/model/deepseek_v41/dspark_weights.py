@@ -511,7 +511,7 @@ class V41DSparkWeightContract:
             ):
                 scale_suffix = suffix.removesuffix(".weight") + ".scale"
                 weight, scale = fp8_input_major(value, source(scale_suffix))
-                if suffix.startswith("attn."):
+                if suffix.startswith("attn.") or self.loader.native_moe:
                     weight = pack_nz(weight)
                 result[abi_name] = weight
                 result[abi_name + "_scale"] = scale
