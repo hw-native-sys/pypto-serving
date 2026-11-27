@@ -42,7 +42,7 @@ from pypto_serving.serving.server.ipc import (
     decode_result,
     encode_command,
 )
-from pypto_serving.config.types import DecodeResult
+from pypto_serving.config.types import DecodeResult, StaleDecodeMetadata
 from pypto_serving.serving.server.serving_worker import WorkerProcess
 
 from ..device_sampling_fakes import _FixedSampler, _ImmediateEosExecutor, _model
@@ -740,6 +740,7 @@ def test_decode_prepare_defers_stop_policy_until_fifo_registration():
     registration = NewRequestData("req", [1], 0.0, 1.0, None, eos_token_id=0, min_tokens=2)
     # The receive lane publishes metadata before the device lane applies lifecycle.
     worker._req_cache = {"req": registration}
+    worker._last_tokens = {}
     worker._accepted_output_lengths = {}
     command = StepCommand(
         new_requests=[], prefill_requests=[],
@@ -969,3 +970,137 @@ def test_worker_start_notification_does_not_authorize_uncreated_owners(monkeypat
         with pytest.raises(ValueError):
             serving_worker.spawn_worker(config, on_starting=lambda: events.append('starting'))
     assert events == ([] if stage == 'setup' else ['starting', 'start'])
+
+
+def test_sync_prepared_worker_waits_for_committed_tokens_and_slot_release(monkeypatch):
+    running, finish, second_prepared, third_prepared = (threading.Event() for _ in range(4))
+    publishing, publish, third_acquire = (threading.Event() for _ in range(3))
+    real_semaphore = threading.Semaphore
+
+    class ObservedSemaphore(real_semaphore):
+        acquisitions = 0
+
+        def acquire(self, *args, **kwargs):
+            ObservedSemaphore.acquisitions += 1
+            if ObservedSemaphore.acquisitions == 3:
+                third_acquire.set()
+            return super().acquire(*args, **kwargs)
+
+    monkeypatch.setattr(serving_worker.threading, "Semaphore", ObservedSemaphore)
+    prepared_slots, bound_tokens = [], []
+
+    class OutputQueue(Queue):
+        def put(self, item):
+            if not publishing.is_set():
+                publishing.set()
+                assert publish.wait(timeout=5)
+            super().put(item)
+
+    class Executor:
+        supports_async_decode_prepare = True
+        supports_async_decode_reclaim = False
+        supports_device_decode_embedding = True
+        supports_device_sampling = True
+        device_topk_sampling_k = 0
+
+        @staticmethod
+        def prepare_decode(_model, batch, *, buffer_slot):
+            prepared_slots.append(buffer_slot)
+            assert batch.token_ids.item() == 0
+            if len(prepared_slots) == 2:
+                second_prepared.set()
+            elif len(prepared_slots) == 3:
+                third_prepared.set()
+            return buffer_slot
+
+        @staticmethod
+        def run_prepared_decode(_model, batch, _prepared):
+            token = batch.token_ids.item()
+            bound_tokens.append(token)
+            if len(bound_tokens) == 1:
+                running.set()
+                assert finish.wait(timeout=5)
+            return DecodeResult(hidden_states=None, logits=None, accepted_token_ids=[[token + 1]])
+
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
+    worker.config = SimpleNamespace(resolve_async_scheduling=lambda: True)
+    worker.input_queue, worker.output_queue = Queue(), OutputQueue()
+    worker.profile_output_queue = None
+    worker.executor = Executor()
+    worker.sampler = _FixedSampler(token_id=0)
+    worker.model_record = SimpleNamespace(runtime_model=_model(max_batch_size=1, eos_token_id=0))
+    worker._req_cache = {"req": NewRequestData("req", [1], 0.0, 1.0, None)}
+    worker._last_tokens = {"req": [99]}
+    thread = threading.Thread(target=worker.busy_loop, daemon=True)
+    thread.start()
+    try:
+        for step in range(1, 4):
+            worker.input_queue.put(encode_command(StepCommand(
+                new_requests=[], prefill_requests=[],
+                decode_requests=[DecodeRequest("req", 10 if step == 1 else -1, step + 1, [])],
+                finished_request_ids=[], step_id=step,
+            )))
+        assert running.wait(timeout=5) and second_prepared.wait(timeout=5)
+        assert third_acquire.wait(timeout=5)
+        assert not third_prepared.is_set()
+        finish.set()
+        assert publishing.wait(timeout=5)
+        assert not third_prepared.is_set()
+        publish.set()
+        for expected in (11, 12, 13):
+            result = decode_result(worker.output_queue.get(timeout=5))
+            assert result.error is None
+            assert result.new_tokens == {"req": [expected]}
+        assert third_prepared.is_set()
+        assert prepared_slots == [1, 0, 1]
+        assert bound_tokens == [10, 11, 12]
+    finally:
+        finish.set()
+        publish.set()
+        worker.input_queue.put(encode_command(ShutdownCommand()))
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
+def test_stale_metadata_rebuild_preserves_slot_and_committed_token():
+    model = _model(max_batch_size=1)
+    registration = NewRequestData("req", [1], 0.0, 1.0, None)
+    rebuilt = []
+
+    class Executor:
+        supports_device_decode_embedding = True
+        supports_device_sampling = True
+        device_topk_sampling_k = 0
+
+        def prepare_decode(self, _model, batch, *, buffer_slot):
+            assert buffer_slot == 1
+            assert batch.prepared_step_id == 9
+            assert batch.request_generations == (registration,)
+            assert batch.token_ids.tolist() == [[12]]
+            rebuilt.append(object())
+            return rebuilt[-1]
+
+        def run_prepared_decode(self, _model, batch, plan):
+            if not rebuilt:
+                raise StaleDecodeMetadata("page snapshot changed")
+            assert plan is rebuilt[-1]
+            return DecodeResult(hidden_states=None, logits=None, accepted_token_ids=[[13]])
+
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker._services = None
+    worker._batch_builder = worker._make_decode_batch
+    worker.executor = Executor()
+    worker._req_cache = {"req": registration}
+    worker._last_tokens = {"req": [12]}
+    worker._accepted_output_lengths = {"req": 1}
+    worker._decode_metrics = None
+    output = {}
+    worker._batch_decode(
+        [DecodeRequest("req", -1, 3, [0])], model, output,
+        prepared_decode=serving_worker._PreparedDecodeWork(prepared=object(), buffer_slot=1),
+        step_id=9,
+    )
+    assert output == {"req": [13]}
+    assert len(rebuilt) == 1

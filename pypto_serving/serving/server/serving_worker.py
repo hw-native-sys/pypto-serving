@@ -26,6 +26,7 @@ from pypto_serving.config.types import (
     DecodeResult,
     PrefillBatch,
     SamplingParams,
+    StaleDecodeMetadata,
     StopTokenMask,
 )
 from pypto_serving.serving.constraints import ConstraintSpec
@@ -560,6 +561,8 @@ class WorkerProcess:
                 result = self._execute_step(cmd, prepared_decode=prepared)
             except Exception as exc:
                 logger.error("Worker step failed: %s", exc, exc_info=True)
+                for request in cmd.decode_requests:
+                    self._last_tokens.pop(request.request_id, None)
                 result = StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id)
             output_work_queue.put(
                 _CompletedStepOutput(
@@ -607,9 +610,11 @@ class WorkerProcess:
                 buffer_slot = work.buffer_slot
             else:
                 raise TypeError(f"unexpected output work item: {type(work).__name__}")
-            if buffer_slot is not None:
-                slot_ownership[buffer_slot].release()
-            self.output_queue.put(encode_result(result))
+            try:
+                self.output_queue.put(encode_result(result))
+            finally:
+                if buffer_slot is not None:
+                    slot_ownership[buffer_slot].release()
 
     def _track_pending_decode_requests(self, requests: list[DecodeRequest]) -> None:
         """Retain request lifecycle state until this decode is reclaimed."""
@@ -868,6 +873,7 @@ class WorkerProcess:
         if released:
             self.output_queue.put(encode_result(ReleaseResult(released, cmd.step_id)))
         for new_request in cmd.new_requests:
+            self._last_tokens.pop(new_request.request_id, None)
             previous_state = self._constraint_states.pop(new_request.request_id, None)
             if previous_state is not None:
                 previous_state.close()
@@ -1270,6 +1276,7 @@ class WorkerProcess:
             allow_device_topk_sampling=allow_device_topk_sampling,
             bind_policy=False,
         )
+        batch.prepared_step_id = cmd.step_id
         with profile_span(
             "WorkerProcess.prepare_decode",
             cat="worker",
@@ -1306,6 +1313,7 @@ class WorkerProcess:
             decode_embeddings = self.executor.lookup_embeddings(runtime_model, decode_token_tensor)
         return DecodeBatch(
             request_ids=[dr.request_id for dr in scheduled],
+            request_generations=tuple(self._req_cache[dr.request_id] for dr in scheduled),
             token_ids=decode_token_tensor.unsqueeze(1),
             hidden_states=decode_embeddings,
             seq_lens=torch.tensor(
@@ -1378,6 +1386,7 @@ class WorkerProcess:
             else:
                 if prepared_decode.error is not None:
                     raise RuntimeError(prepared_decode.error)
+                batch.prepared_step_id = step_id
                 prepared = prepared_decode.prepared
                 if prepared is None:
                     # Prefill has now completed. Stage the mixed command's
@@ -1390,11 +1399,13 @@ class WorkerProcess:
                     )
                 started_ns = self._decode_metrics.start() if self._decode_metrics else 0
                 if batch.dspark_stages is None:
-                    decode_result = self.executor.run_prepared_decode(
-                        runtime_model,
-                        batch,
-                        prepared,
-                    )
+                    try:
+                        decode_result = self.executor.run_prepared_decode(runtime_model, batch, prepared)
+                    except StaleDecodeMetadata:
+                        prepared = self.executor.prepare_decode(
+                            runtime_model, batch, buffer_slot=prepared_decode.buffer_slot,
+                        )
+                        decode_result = self.executor.run_prepared_decode(runtime_model, batch, prepared)
                 else:
                     raise RuntimeError(
                         "DSpark decode batches cannot use the generic prepared-decode lane; "

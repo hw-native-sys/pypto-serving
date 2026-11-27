@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -27,6 +27,7 @@ from pypto_serving.config.types import (
     RuntimeConfig,
     RuntimeModel,
     SamplingCandidates,
+    StaleDecodeMetadata,
 )
 from pypto_serving.model.common.runner.buffer_set import StaticDeviceTensor, resolve_l3_arg
 from pypto_serving.model.common.runner.l3_dispatch import L3DispatchMixin
@@ -108,6 +109,24 @@ class _DecodeKernelInputs:
 
 
 @dataclass
+class _DecodeSlot:
+    task_args: TaskArgs
+    row_pages: list[list[int] | None] = field(default_factory=list)
+    generation: int = 0
+
+
+@dataclass(frozen=True)
+class _PreparedDecode:
+    owner: object
+    model: RuntimeModel
+    buffer_slot: int
+    generation: int
+    inputs: _DecodeKernelInputs
+    snapshot: tuple
+    request_generations: tuple[object, ...]
+
+
+@dataclass
 class _StaticKernelArgs:
     """Static worker-resident kernel arguments reused across dispatches."""
 
@@ -137,6 +156,9 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         # Device-resident decode output scratch (greedy path): allocated directly on
         # the worker (no host copy) so the per-step memset + D2H copy-back of the
         # max-batch logits/next_hidden vanish.
+        # Only the FIFO synchronous execution lane touches this scratch or top-k
+        # buffers; metadata preparation uses its own host slots. Sampling results
+        # are cloned before this lane can start the next dispatch.
         self._decode_logits_dev_tensor: DeviceTensor | None = None
         self._decode_next_hidden_dev_tensor: DeviceTensor | None = None
         self._static_args: _StaticKernelArgs | None = None
@@ -144,8 +166,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         # Page IDs currently materialized in each row of the persistent decode
         # block-table buffer. A row is rewritten only when its page allocation
         # changes (or when a different row-0 value must be used for padding).
-        self._decode_block_table_row_pages: list[list[int] | None] = []
-        self._decode_token_padding_initialized = False
+        self._decode_slots: list[_DecodeSlot] = []
         self._prefill_metadata_arrays: tuple = ()
         self._prefill_slot_mapping_array: np.ndarray | None = None
         # Per-call length-total_tokens slices over the full prefill input_ids /
@@ -173,14 +194,18 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
             topk_select_task_args,
         )
         self._prefill_task_args = prefill_task_args(self, hbg=self._hbg_prefill)
-        self._decode_task_args = decode_task_args(self)
+        self._decode_slots = [_DecodeSlot(decode_task_args(self)) for _ in range(2)]
+        # Keep the default slot for warmup and device-scratch shape discovery.
+        self._decode_task_args = self._decode_slots[0].task_args
         self._topk_select_task_args = topk_select_task_args(self)
         for task_args in (
             self._prefill_task_args,
-            self._decode_task_args,
+            *(slot.task_args for slot in self._decode_slots),
             self._topk_select_task_args,
         ):
             task_args.allocate_host_shared(self._compiled.layout)
+        for slot in self._decode_slots:
+            slot.task_args.tensors["token_ids"].zero_()
         # Numpy views over the persistent prefill metadata slots (written via
         # numpy each step in _prepare_prefill_inputs).
         prefill_tensors = self._prefill_task_args.tensors
@@ -190,6 +215,10 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
             prefill_tensors["chunk_offsets"].numpy(),
         )
         self._prefill_slot_mapping_array = prefill_tensors["slot_mapping"].numpy()
+
+    @property
+    def _decode_block_table_row_pages(self) -> list[list[int] | None]:
+        return self._decode_slots[0].row_pages
 
     @property
     def _active_kv_cache(self) -> Any:
@@ -513,7 +542,6 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         # -- decode (full fixed batch, minimal seq) -------------------------
         decode = self._decode_task_args.tensors
         decode["token_ids"].zero_()
-        self._decode_token_padding_initialized = True
         decode["seq_lens"].zero_()
         decode["block_table"].fill_(0)     # all reads from page 0
         decode["slot_mapping"].fill_(-1)   # all writes to page 0
@@ -651,9 +679,66 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         (an idempotent, safe write), and their logits are trimmed off below. This
         avoids padded rows clobbering an unrelated request's physical page.
         """
+        prepared = self.prepare_decode(model, batch, buffer_slot=0)
+        return self.run_prepared_decode(model, batch, prepared)
+
+    # The device lane commits predecessor tokens before the next synchronous run.
+    supports_async_decode_reclaim = False
+
+    @staticmethod
+    def _decode_snapshot(batch: DecodeBatch) -> tuple:
+        pages = (
+            tuple(tuple(alloc.page_ids) for alloc in batch.kv_allocations)
+            if batch.kv_allocations else tuple(tuple(row) for row in batch.block_ids)
+        )
+        return (
+            batch.prepared_step_id, tuple(batch.request_ids), tuple(batch.seq_lens.reshape(-1).tolist()),
+            pages, tuple(id(alloc) for alloc in batch.kv_allocations),
+            tuple(id(registration) for registration in batch.request_generations),
+            tuple(batch.cache_partitions),
+            batch.allow_device_greedy_sampling, batch.allow_device_topk_sampling,
+            tuple((p.temperature, p.top_p, p.top_k, p.seed, p.forbidden_token_ids)
+                  for p in batch.sampling_params),
+        )
+
+    def prepare_decode(
+        self, model: RuntimeModel, batch: DecodeBatch, *, buffer_slot: int,
+    ) -> _PreparedDecode:
+        """Stage token-independent metadata in the worker-owned Serving slot."""
+        if buffer_slot not in range(len(self._decode_slots)):
+            raise ValueError(f"Invalid decode buffer slot {buffer_slot}")
+        slot = self._decode_slots[buffer_slot]
+        slot.generation += 1
+        snapshot = self._decode_snapshot(batch)
+        with profile_span("Qwen.prepare_decode_metadata", cat="runner",
+                          args={"buffer_slot": buffer_slot, "generation": slot.generation}):
+            inputs = self._prepare_decode_inputs(
+                model, batch, buffer_slot=buffer_slot, bind_tokens=False,
+            )
+        return _PreparedDecode(
+            self, model, buffer_slot, slot.generation, inputs, snapshot, batch.request_generations,
+        )
+
+    def run_prepared_decode(
+        self, model: RuntimeModel, batch: DecodeBatch, prepared: object,
+    ) -> DecodeResult:
+        """Bind committed tokens and execute a validated metadata snapshot."""
+        if not isinstance(prepared, _PreparedDecode) or prepared.owner is not self:
+            raise ValueError("Prepared decode belongs to another runner")
+        slot = self._decode_slots[prepared.buffer_slot]
+        if slot.generation != prepared.generation:
+            raise ValueError("Prepared decode slot generation is stale")
+        # Consume the ticket even when validation or dispatch fails.
+        slot.generation += 1
+        if prepared.model is not model:
+            raise ValueError("Prepared decode belongs to another model")
+        if prepared.snapshot != self._decode_snapshot(batch):
+            raise StaleDecodeMetadata("Prepared decode step, request, position, pages or policy changed")
+        kernel_inputs = prepared.inputs
+        task_args = slot.task_args
+        self._bind_decode_tokens(model, batch, task_args, kernel_inputs.actual_batch)
         compiled = self._compiled
         model_id = model.config.model_id
-        kernel_inputs = self._prepare_decode_inputs(model, batch)
 
         if self._kv_caches.get(model_id) is None:
             raise RuntimeError(f"KV cache for model {model_id!r} is not initialized")
@@ -666,12 +751,12 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         )
         self._run_l3(
             compiled.decode,
-            *self._decode_kernel_args(device_sampling=device_sampling),
+            *self._decode_kernel_args(device_sampling=device_sampling, task_args=task_args),
         )
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
         sampled_ids, next_hidden = self._integrated_sample_result(
-            self._decode_task_args.tensors["sampled_ids"],
+            task_args.tensors["sampled_ids"],
             # decode_fwd's next_hidden output is the embedding for sampled_ids_in
             # used by this decode step. The newly sampled token is embedded at the
             # start of the following decode_fwd call, so there is no next-step
@@ -803,7 +888,9 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         args[task_args.names.index("slot_mapping")] = inputs.slot_mapping
         return tuple(args)
 
-    def _decode_kernel_args(self, *, device_sampling: bool = False) -> tuple[Any, ...]:
+    def _decode_kernel_args(
+        self, *, device_sampling: bool = False, task_args: TaskArgs | None = None,
+    ) -> tuple[Any, ...]:
         """Return arguments in ``qwen3_decode_host`` signature order.
 
         Buffers and weights come from the decode TaskArgs (``build()``). Under
@@ -811,7 +898,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         to worker-resident device scratch (spliced in), so full-vocabulary
         logits are never staged/copied-back per step.
         """
-        task_args = self._decode_task_args
+        task_args = self._decode_task_args if task_args is None else task_args
         args = list(task_args.build())
         if device_sampling:
             args[task_args.names.index("logits")] = self._decode_logits_device_arg()
@@ -979,6 +1066,9 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         self,
         model: RuntimeModel,
         batch: DecodeBatch,
+        *,
+        buffer_slot: int = 0,
+        bind_tokens: bool = True,
     ) -> _DecodeKernelInputs:
         """Write active decode metadata directly into persistent kernel buffers.
 
@@ -987,7 +1077,8 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         Block-table rows persist across calls and are rewritten only when their
         page IDs change.
         """
-        buffers = self._decode_task_args.tensors
+        slot = self._decode_slots[buffer_slot]
+        buffers = slot.task_args.tensors
         batch_count = len(batch.kv_allocations) if batch.kv_allocations else int(batch.seq_lens.shape[0])
         actual_batch = self._validate_batch_size(model, batch_count)
         kernel_batch = model.runtime.max_batch_size
@@ -1001,22 +1092,8 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
                 f"{logits_buffer.shape[0]}"
             )
 
-        token_ids = buffers["token_ids"]
-        token_rows = token_ids.reshape(kernel_batch, -1)
-        active_token_rows = batch.token_ids.reshape(actual_batch, -1)
-        if active_token_rows.shape[1] != 1:
-            raise ValueError(
-                "decode token_ids must contain exactly one token per row, "
-                f"got shape {tuple(batch.token_ids.shape)}"
-            )
-        if token_rows.shape[1] < 1:
-            raise ValueError("compiled decode token buffer must have at least one column")
-        # The kernel ABI pads token rows to SAMPLED_IDS_PAD columns (8 for
-        # Qwen3-14B), but only column 0 carries the next token ID.
-        if not self._decode_token_padding_initialized:
-            token_rows[:, 1:].zero_()
-            self._decode_token_padding_initialized = True
-        token_rows[:actual_batch, :1].copy_(active_token_rows)
+        if bind_tokens:
+            self._bind_decode_tokens(model, batch, slot.task_args, actual_batch)
 
         seq_lens = buffers["seq_lens"]
         seq_lens_flat = seq_lens.reshape(-1)
@@ -1032,8 +1109,8 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         block_table_rows = block_table.reshape(kernel_batch, max_blocks)
         slot_mapping = buffers["slot_mapping"]
         slot_mapping_flat = slot_mapping.reshape(-1)
-        if len(self._decode_block_table_row_pages) != kernel_batch:
-            self._decode_block_table_row_pages = [None] * kernel_batch
+        if len(slot.row_pages) != kernel_batch:
+            slot.row_pages[:] = [None] * kernel_batch
 
         first_page_ids: list[int] | None = None
         for batch_idx in range(actual_batch):
@@ -1052,7 +1129,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
                 page_ids = batch.block_ids[batch_idx]
             else:
                 page_ids = []
-            self._write_cached_decode_block_table_row(block_table_rows, batch_idx, page_ids)
+            self._write_cached_decode_block_table_row(block_table_rows, batch_idx, page_ids, slot.row_pages)
             if batch_idx == 0:
                 first_page_ids = page_ids
 
@@ -1068,27 +1145,41 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
 
         if actual_batch < kernel_batch:
             inactive_rows = kernel_batch - actual_batch
-            token_rows[actual_batch:, :1].copy_(token_rows[0:1, :1].expand(inactive_rows, 1))
             seq_lens_flat[actual_batch:].copy_(seq_lens_flat[0:1].expand(inactive_rows))
             slot_mapping_flat[actual_batch:].copy_(slot_mapping_flat[0:1].expand(inactive_rows))
             if first_page_ids is None:
                 raise RuntimeError("decode batch is missing row-0 page IDs")
             for batch_idx in range(actual_batch, kernel_batch):
-                self._write_cached_decode_block_table_row(block_table_rows, batch_idx, first_page_ids)
+                self._write_cached_decode_block_table_row(block_table_rows, batch_idx, first_page_ids, slot.row_pages)
 
         return _DecodeKernelInputs(
             actual_batch=actual_batch,
             logits=logits_buffer,
         )
 
+    @staticmethod
+    def _bind_decode_tokens(
+        model: RuntimeModel, batch: DecodeBatch, task_args: TaskArgs, actual_batch: int,
+    ) -> None:
+        token_rows = task_args.tensors["token_ids"].reshape(model.runtime.max_batch_size, -1)
+        active = batch.token_ids.reshape(actual_batch, -1)
+        if active.shape[1] != 1:
+            raise ValueError(f"decode token_ids must contain exactly one token per row, got {tuple(batch.token_ids.shape)}")
+        if token_rows.shape[1] < 1:
+            raise ValueError("compiled decode token buffer must have at least one column")
+        token_rows[:actual_batch, :1].copy_(active)
+        if actual_batch < model.runtime.max_batch_size:
+            token_rows[actual_batch:, :1].copy_(token_rows[0:1, :1])
+
+    @staticmethod
     def _write_cached_decode_block_table_row(
-        self,
         block_table_rows: torch.Tensor,
         batch_idx: int,
         page_ids: list[int],
+        row_pages: list[list[int] | None],
     ) -> None:
         """Materialize one persistent decode block-table row when it changes."""
-        if self._decode_block_table_row_pages[batch_idx] == page_ids:
+        if row_pages[batch_idx] == page_ids:
             return
 
         row = block_table_rows[batch_idx]
@@ -1100,7 +1191,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         row.fill_(-1)
         if page_ids:
             row[: len(page_ids)].copy_(torch.tensor(page_ids, dtype=row.dtype))
-        self._decode_block_table_row_pages[batch_idx] = list(page_ids)
+        row_pages[batch_idx] = list(page_ids)
 
     @staticmethod
     def _write_slot_mapping(
