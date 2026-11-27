@@ -166,6 +166,56 @@ def test_scheduler_speculative_output_counts_only_tokens_retained_before_eos():
     assert [(output.new_token_id, output.finished) for output in outputs] == [(7, True)]
 
 
+def test_scheduler_reuses_prefix_page_hashes_for_a_long_warm_request(monkeypatch):
+    manager = KvCacheManager(num_blocks=400, block_size=128)
+    scheduler = Scheduler(SchedulerConfig(max_seq_len=65536), manager)
+    tokens = list(range(49000))
+    hashes = manager.compute_block_hashes(tokens[:48000])
+    blocks = manager.allocate_blocks(len(hashes))
+    assert blocks is not None
+    for block, digest in zip(blocks, hashes, strict=True):
+        manager.cache_block(block, digest)
+        manager.release(block)
+
+    request = Request("warm", tokens, max_new_tokens=128)
+    scheduler.add_request(request)
+    assert len(request.block_hashes) == len(tokens) // manager.block_size
+
+    def unexpected_rehash(token_ids):
+        pytest.fail("Warm prefix lookup recalculated the queued page hashes")
+
+    monkeypatch.setattr(manager, "_iter_block_hashes", unexpected_rehash)
+    scheduled = scheduler.schedule()
+    assert scheduled.prefix_cache_hits == 48000
+    assert scheduled.num_prefill_tokens == 1000
+    assert request.cached_block_ids == [block.block_id for block in blocks]
+    assert all(block.ref_cnt == 1 for block in blocks)
+
+
+def test_generic_precomputed_prefix_lookup_preserves_limits_and_first_miss():
+    manager = KvCacheManager(num_blocks=4, block_size=2)
+    tokens = list(range(6))
+    hashes = manager.compute_block_hashes(tokens)
+    blocks = manager.allocate_blocks(3)
+    assert blocks is not None
+    for block, digest in zip(blocks, hashes, strict=True):
+        manager.cache_block(block, digest)
+        manager.release(block)
+
+    for source in (hashes, hashes[:1], None):
+        hits = manager.get_computed_blocks(tokens, block_hashes=source)
+        assert hits == blocks[:2]
+        assert manager.num_free_blocks == 2
+        manager.release_cached_blocks(hits)
+        assert manager.num_free_blocks == 4
+
+    assert not manager.get_computed_blocks(tokens, max_cache_hit_tokens=0, block_hashes=hashes)
+    del manager.hash_to_block[hashes[1]]
+    hits = manager.get_computed_blocks(tokens, max_cache_hit_tokens=6, block_hashes=hashes)
+    assert hits == blocks[:1]
+    manager.release_cached_blocks(hits)
+
+
 def test_prefix_cache_metrics_count_cacheable_and_hit_tokens_once():
     manager = KvCacheManager(num_blocks=16, block_size=2, enable_prefix_cache=True)
     scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=True), manager)

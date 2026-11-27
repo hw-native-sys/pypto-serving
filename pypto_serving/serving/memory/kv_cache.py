@@ -482,8 +482,9 @@ class KvCacheManager:
         token_ids: list[int],
         *,
         max_cache_hit_tokens: int | None = None,
+        block_hashes: Sequence[bytes] | None = None,
     ) -> list[KVCacheBlock]:
-        """Find the longest full-block cached prefix for the token sequence."""
+        """Acquire the contiguous resident prefix. Optional hashes belong to these immutable prompt IDs."""
         if not self.enable_prefix_cache:
             return []
         if max_cache_hit_tokens is None:
@@ -492,9 +493,11 @@ class KvCacheManager:
             max_cache_hit_tokens = max(0, len(token_ids) - 1)
         max_hit_blocks = max(0, int(max_cache_hit_tokens)) // self.block_size
         hit_blocks: list[KVCacheBlock] = []
-        for _, block_hash in self._iter_block_hashes(token_ids):
-            if len(hit_blocks) >= max_hit_blocks:
-                break
+        if block_hashes is not None and len(block_hashes) == len(token_ids) // self.block_size:
+            hashes = iter(block_hashes)
+        else:
+            hashes = (digest for _, digest in self._iter_block_hashes(token_ids))
+        for _, block_hash in zip(range(max_hit_blocks), hashes):
             block = self.get_cached_block(block_hash)
             if block is None:
                 break
