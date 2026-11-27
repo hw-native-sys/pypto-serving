@@ -138,6 +138,50 @@ class Placement:
         return cls.from_map(mapping, logical_experts=logical_experts, ranks=ranks)
 
 
+def bias_placement(placement: Placement, hot_experts, *, hot_rank: int = 0) -> Placement:
+    """Rebuild an initial layout so the given experts start on one rank.
+
+    Test-only helper for worst-case placement experiments. It starts from a
+    valid initial layout and swaps hot experts onto the target rank, keeping
+    one copy of every expert per rank; experts that cannot be moved without
+    creating a duplicate stay where they are.
+    """
+    hot = [int(expert) for expert in hot_experts]
+    if not hot or any(expert < 0 or expert >= placement.logical_experts for expert in hot):
+        raise ValueError("hot_experts must be non-empty valid logical expert ids")
+    if not 0 <= hot_rank < placement.ranks:
+        raise ValueError("hot_rank must be a valid rank")
+    mapping = np.array(placement.physical_to_logical, dtype=np.int64)
+    slots = placement.local_slots
+    rank_slots = [set(mapping[0, rank * slots:(rank + 1) * slots].tolist())
+                  for rank in range(placement.ranks)]
+    target_begin, target_end = hot_rank * slots, (hot_rank + 1) * slots
+    hot_set = set(hot)
+    for expert in hot:
+        if expert in rank_slots[hot_rank]:
+            continue
+        source = next((position for position in range(mapping.shape[1])
+                       if mapping[0, position] == expert and not target_begin <= position < target_end),
+                      None)
+        if source is None:
+            continue
+        source_rank = source // slots
+        target = next((position for position in range(target_begin, target_end)
+                       if mapping[0, position] not in hot_set
+                       and mapping[0, position] not in rank_slots[source_rank]), None)
+        if target is None:
+            continue
+        evicted = int(mapping[0, target])
+        mapping[:, [source, target]] = mapping[:, [target, source]]
+        rank_slots[source_rank].discard(expert)
+        rank_slots[source_rank].add(evicted)
+        rank_slots[hot_rank].discard(evicted)
+        rank_slots[hot_rank].add(expert)
+    mapping = np.tile(mapping[0], (placement.layers, 1))
+    return Placement.from_map(mapping, logical_experts=placement.logical_experts,
+                              ranks=placement.ranks, generation=placement.generation)
+
+
 @dataclass(frozen=True)
 class LoadSample:
     dispatch_id: int

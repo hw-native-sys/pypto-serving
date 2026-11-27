@@ -83,9 +83,12 @@ class EplbController:
                 safe_means = np.where(means > 0, means, 1.0)
                 skew_l = np.where(totals > 0, per_layer.max(axis=1) / safe_means, 0.0)
                 top10_l = np.sort(per_layer, axis=1)[:, -10:].sum(axis=1) / np.where(totals > 0, totals, 1.0)
-                logger.info("[eplb] window phase=%s samples=%d skew=%.3f top10_share=%.3f",
+                aggregate = per_layer.sum(axis=0)
+                top_experts = np.argsort(aggregate)[-min(16, aggregate.size):][::-1]
+                logger.info("[eplb] window phase=%s samples=%d skew=%.3f top10_share=%.3f top_experts=%s",
                             self.phase, self._ready_history.shape[0],
-                            float(skew_l.mean()), float(top10_l.mean()))
+                            float(skew_l.mean()), float(top10_l.mean()),
+                            ",".join(str(int(expert)) for expert in top_experts))
             return True
 
     def take_ready_plan(self) -> RebalancePlan | None:

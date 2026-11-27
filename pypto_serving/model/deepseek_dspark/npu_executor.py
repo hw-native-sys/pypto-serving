@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import logging
 import os
 import sys
 from collections.abc import Iterable, Sequence
@@ -47,6 +48,8 @@ from pypto_serving.model.deepseek_dspark.npu_runner import (
 )
 from pypto_serving.model.deepseek_dspark.weight_loader import DSparkWeightStore
 from pypto_serving.tools.profile import profile_span
+
+logger = logging.getLogger(__name__)
 
 _DSPARK_KERNEL_DIRNAME = "deepseek_v4_flash_dspark"
 
@@ -412,7 +415,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         )
         eplb_placement = None
         if self._eplb_config.enabled:
-            from pypto_serving.model.deepseek_dspark.eplb.state import Placement
+            from pypto_serving.model.deepseek_dspark.eplb.state import Placement, bias_placement
 
             self._eplb_config.validate_topology(
                 logical_experts=n_routed_experts, ranks=layout.ranks,
@@ -422,6 +425,13 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                 layers=model.config.num_hidden_layers, logical_experts=n_routed_experts, ranks=layout.ranks,
                 redundant_experts=self._eplb_config.num_redundant_experts,
             )
+            hot_experts = os.environ.get("PYPTO_EPLB_HOT_EXPERTS", "").strip()
+            if hot_experts:
+                hot_ids = [int(part) for part in hot_experts.replace(",", " ").split()]
+                hot_rank = int(os.environ.get("PYPTO_EPLB_HOT_RANK", "0"))
+                eplb_placement = bias_placement(eplb_placement, hot_ids, hot_rank=hot_rank)
+                logger.info("[eplb] biased initial placement hot_experts=%d target_rank=%d rank0=%s",
+                            len(hot_ids), hot_rank, eplb_placement.physical_to_logical[0, :len(hot_ids)].tolist())
         num_hash_layers = (
             int(config_data.get("num_hash_layers", 3)) if isinstance(config_data, dict) else 3
         )

@@ -239,3 +239,41 @@ Short correctness probes and host fault injection do not establish these results
 No new public PyPTO/Simpler interface is required by this implementation. It
 continues to require the PD owner-service, allocation-retain and completion
 interfaces documented in the deployment guide.
+
+## Deferred optimizations
+
+The current port was measured on the skew dataset (4 loads x 512 requests, 16
+redundant experts, one-shot rebalance). The enabled configuration pays a 2.28%
+token-weighted static cost with no migration, and the rebalance recovers 2.74%
+in steady state, so the net steady-state gain is approximately zero; the first
+measured load additionally carries the 9 s maintenance pause. The following
+work is deferred and should be evaluated with the same A/B harness.
+
+1. **Static-cost reduction** (target: at most 1% token-weighted). The per-step
+   cost is the median TPOT increase of 0.43-1.38 ms. Components: metadata slots
+   padded from 17 to 32, a load-export task submitted every dispatch, a two-pass
+   route mapping, and the 3 GiB decode reserve. Each is independently
+   measurable through the enabled/static/disabled comparison.
+2. **Frozen placement before serving.** Calibrate with a representative
+   workload in a separate short-lived process, dump the committed mapping, and
+   start the serving engines with that mapping as the initial placement. Do not
+   warm up inside the measured session: retained prefix-cache blocks and decode
+   KV blocks reduce the KV headroom under the 3 GiB reserve, and repeated
+   prompts can turn later requests into prefix-cache hits. This requires a
+   committed-placement dump, a startup option to load an initial placement, and
+   a calibration entry separate from the measured run.
+3. **Placement quality.** The one-shot plan leaves `balance` at 0.831 (peak
+   rank load 1.20x the mean). A global or cross-layer placement solver, and a
+   zero-redundancy control that avoids the 17th slot, are the two directions to
+   compare against the current temporal greedy plus b-matching repair.
+4. **Rank-aligned concentration.** The skew dataset concentrates experts but
+   spreads them across ranks (pre-migration peak 2.84x the mean). A placement
+   experiment that concentrates the hot experts on one rank measures the
+   single-rank blocked case and the recovery available from replication.
+5. **Kernel-side EPLB path.** Skip inactive local slots in the dispatch and
+   expert loops, fold the logical-to-physical mapping into the dispatch route
+   scan, and vectorize the per-expert load export.
+6. **Measurement protocol.** Freeze the layout before the timed loads and
+   report the first load separately from the steady state. Verify that the
+   measured loads' KV metrics (`kv_cache_usage`, `prefix_cache_hits`,
+   `preemptions`) match the no-warm-up baseline before accepting a timing.
