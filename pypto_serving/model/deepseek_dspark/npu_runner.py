@@ -61,7 +61,7 @@ from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.model.deepseek_dspark.cache_capacity import cache_pool_bytes, plan_cache_pages
 from pypto_serving.model.deepseek_dspark.cache_tables import DecodeTableRows, DrafterTableRows
 from pypto_serving.model.deepseek_dspark.prefill_staging import PrefillEmbeddingSlot
-from pypto_serving.model.deepseek_dspark.eplb.state import Placement as EplbPlacement
+from pypto_serving.model.common.eplb.state import Placement as EplbPlacement
 from pypto_serving.model.deepseek_dspark.weight_loader import (
     DSparkStackedLayerWeights,
     DSparkWeightStore,
@@ -1617,7 +1617,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._eplb_pending: dict[int, Any] = {}
         self._eplb_pending_lock = threading.Lock()
         if compiled.eplb_placement is not None:
-            from pypto_serving.model.deepseek_dspark.eplb.runtime import EplbRuntime
+            from pypto_serving.model.common.eplb.runtime import EplbRuntime
 
             self._eplb = EplbRuntime(compiled.eplb_placement, compiled.eplb_config,
                                      execution_role=compiled.execution_role)

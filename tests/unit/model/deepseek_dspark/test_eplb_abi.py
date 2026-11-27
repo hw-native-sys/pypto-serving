@@ -13,8 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from pypto_serving.model.deepseek_dspark.eplb.abi import EPLB_ABI_VERSION, validate_kernel_contract
-from pypto_serving.model.deepseek_dspark.eplb.state import Placement
+from pypto_serving.model.deepseek_dspark.eplb_abi import EPLB_ABI_VERSION, validate_kernel_contract
+from pypto_serving.model.common.eplb.state import Placement
 
 
 def modules_for(placement, *, speculative=True):

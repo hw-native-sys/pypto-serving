@@ -20,12 +20,12 @@ import pytest
 import torch
 
 from pypto_serving.config.types import EplbConfig
-from pypto_serving.model.deepseek_dspark.eplb.controller import EplbController
-from pypto_serving.model.deepseek_dspark.eplb import controller as controller_module
-from pypto_serving.model.deepseek_dspark.eplb.policy import plan_rebalance
-from pypto_serving.model.deepseek_dspark.eplb.runtime import EplbRuntime
-from pypto_serving.model.deepseek_dspark.eplb.state import Placement
-from pypto_serving.model.deepseek_dspark.eplb.transfer import ExpertBankLayout
+from pypto_serving.model.common.eplb.controller import EplbController
+from pypto_serving.model.common.eplb import controller as controller_module
+from pypto_serving.model.common.eplb.policy import plan_rebalance
+from pypto_serving.model.common.eplb.runtime import EplbRuntime
+from pypto_serving.model.common.eplb.state import Placement
+from pypto_serving.model.common.eplb.transfer import ExpertBankLayout
 
 
 def runtime_fixture():
@@ -319,7 +319,7 @@ def test_runtime_does_not_run_zero_migration_transfer_during_startup(monkeypatch
 
 def test_plan_age_cooldown_and_measured_pause_gate_a_deferred_candidate(monkeypatch):
     from dataclasses import replace
-    from pypto_serving.model.deepseek_dspark.eplb import runtime as runtime_module
+    from pypto_serving.model.common.eplb import runtime as runtime_module
 
     runtime, _ = runtime_fixture()
     ready_window(runtime)
@@ -359,7 +359,7 @@ def test_workspace_reserve_counts_only_when_migrations_are_enabled():
 
 
 def test_maintenance_rate_limit_is_a_hard_per_minute_ceiling(monkeypatch):
-    from pypto_serving.model.deepseek_dspark.eplb import runtime as runtime_module
+    from pypto_serving.model.common.eplb import runtime as runtime_module
 
     runtime, _ = runtime_fixture()
     runtime.config = replace(runtime.config, max_maintenances_per_minute=2, cooldown_seconds=0)

@@ -19,10 +19,6 @@ import numpy as np
 
 from .state import Placement, immutable_ints
 
-EXPERT_TENSORS = (
-    "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale", "routed_w2", "routed_w2_scale",
-)
-
 
 @dataclass(frozen=True)
 class LayerMovePlan:

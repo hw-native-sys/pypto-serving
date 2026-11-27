@@ -19,13 +19,11 @@ import pytest
 import torch
 
 from pypto_serving.config.types import EplbConfig
-from pypto_serving.model.deepseek_dspark.eplb.controller import EplbController
-from pypto_serving.model.deepseek_dspark.eplb.plan import (
-    EXPERT_TENSORS, RebalancePlan, layer_move_plan, validate_plan,
-)
-from pypto_serving.model.deepseek_dspark.eplb.policy import balance_layer, objective, plan_rebalance
-from pypto_serving.model.deepseek_dspark.eplb.state import LoadSample, Placement
-from pypto_serving.model.deepseek_dspark.eplb.transfer import ExpertBankLayout
+from pypto_serving.model.common.eplb.controller import EplbController
+from pypto_serving.model.common.eplb.plan import RebalancePlan, layer_move_plan, validate_plan
+from pypto_serving.model.common.eplb.policy import balance_layer, objective, plan_rebalance
+from pypto_serving.model.common.eplb.state import LoadSample, Placement
+from pypto_serving.model.common.eplb.transfer import EXPERT_TENSORS, ExpertBankLayout
 from pypto_serving.model.deepseek_dspark.weight_spec import dspark_expert_parallel
 
 
@@ -68,7 +66,7 @@ def test_role_and_topology_contract():
 
 
 def test_balanced_layers_skip_search_when_the_gain_bound_cannot_pass(monkeypatch):
-    from pypto_serving.model.deepseek_dspark.eplb import policy
+    from pypto_serving.model.common.eplb import policy
 
     base = Placement.initial(layers=43, logical_experts=256, ranks=8)
     history = np.full((2, 43, 256), 8, dtype=np.float64)
@@ -354,7 +352,7 @@ def test_plan_reports_the_target_rank_balance():
     assert plan is not None
     assert plan.target_balance is not None and 0 < plan.target_balance <= 1
     # A balanced target must be at least as good as the initial placement.
-    from pypto_serving.model.deepseek_dspark.eplb.policy import objective
+    from pypto_serving.model.common.eplb.policy import objective
     before = sum(objective(history[:, layer], base.physical_to_logical[layer], base.ranks)
                  for layer in range(base.layers))
     after = sum(objective(history[:, layer], plan.target.physical_to_logical[layer], base.ranks)

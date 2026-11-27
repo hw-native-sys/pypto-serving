@@ -11,15 +11,52 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import math
 from typing import Any
 
 import torch
 
-from .plan import EXPERT_TENSORS, LayerMovePlan
+from .plan import LayerMovePlan
 from .state import Placement
+
+
+def _validate_w8a8_geometry(rows: tuple[int, ...]) -> None:
+    """W1/W3 share the intermediate rows and W2 packs the same byte count."""
+    if (len(rows) != 6 or rows[0] != rows[2] or rows[0] != rows[4]
+            or rows[1] != rows[3] or rows[0] != rows[1] * rows[5]):
+        raise ValueError("Inconsistent W8A8 expert weight and scale geometry")
+
+
+@dataclass(frozen=True)
+class ExpertBankSpec:
+    """Ordered resident expert tensors and the element dtype each one carries.
+
+    The transfer program copies every listed tensor slot by slot; scales ride
+    the same banks as the weights they scale. A family that renames or
+    requantizes its expert weights supplies its own spec instead of a new
+    runtime, and may attach a geometry check over the per-slot row sizes.
+    """
+
+    names: tuple[str, ...]
+    dtypes: tuple[torch.dtype, ...]
+    geometry: Callable[[tuple[int, ...]], None] | None = None
+
+    def __post_init__(self) -> None:
+        if not self.names or len(self.names) != len(self.dtypes):
+            raise ValueError("Expert bank spec needs one dtype per tensor")
+        if len(set(self.names)) != len(self.names):
+            raise ValueError("Expert bank spec tensor names must be unique")
+
+
+W8A8_EXPERT_BANK = ExpertBankSpec(
+    names=("routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale", "routed_w2", "routed_w2_scale"),
+    dtypes=(torch.int8, torch.float32, torch.int8, torch.float32, torch.int8, torch.float32),
+    geometry=_validate_w8a8_geometry,
+)
+# Ordered resident tensor names of the default bank, also used by plan fixtures.
+EXPERT_TENSORS = W8A8_EXPERT_BANK.names
 
 
 @dataclass(frozen=True)
@@ -29,6 +66,7 @@ class ExpertBankLayout:
     local_slots: int
     row_elements: tuple[int, ...]
     element_bytes: tuple[int, ...]
+    bank: ExpertBankSpec = W8A8_EXPERT_BANK
 
     @property
     def expert_bytes(self) -> int:
@@ -39,22 +77,23 @@ class ExpertBankLayout:
         return self.local_slots * self.expert_bytes
 
     @classmethod
-    def inspect(cls, banks: Mapping[str, Any], placement: Placement) -> ExpertBankLayout:
+    def inspect(cls, banks: Mapping[str, Any], placement: Placement,
+                bank: ExpertBankSpec | None = None) -> ExpertBankLayout:
+        spec = bank or W8A8_EXPERT_BANK
         rows = []
         sizes = []
-        for name in EXPERT_TENSORS:
-            bank = banks[name]
-            expected_dtype = torch.float32 if name.endswith("_scale") else torch.int8
-            shape = tuple(bank.full_shape)
+        for name, dtype in zip(spec.names, spec.dtypes):
+            resident = banks[name]
+            shape = tuple(resident.full_shape)
             if (len(shape) < 3 or shape[:2] != (placement.ranks, placement.layers * placement.local_slots)
-                    or tuple(bank.worker_ids) != tuple(range(placement.ranks))
-                    or bank.dtype != expected_dtype):
+                    or tuple(resident.worker_ids) != tuple(range(placement.ranks))
+                    or resident.dtype != dtype):
                 raise ValueError(f"Invalid resident EPLB weight bank: {name}")
             rows.append(math.prod(shape[2:]))
-            sizes.append(torch.empty((), dtype=expected_dtype).element_size())
-        if rows[0] != rows[2] or rows[0] != rows[4] or rows[1] != rows[3] or rows[0] != rows[1] * rows[5]:
-            raise ValueError("Inconsistent W8A8 expert weight and scale geometry")
-        return cls(placement.ranks, placement.layers, placement.local_slots, tuple(rows), tuple(sizes))
+            sizes.append(torch.empty((), dtype=dtype).element_size())
+        if spec.geometry is not None:
+            spec.geometry(tuple(rows))
+        return cls(placement.ranks, placement.layers, placement.local_slots, tuple(rows), tuple(sizes), spec)
 
     def layer_views(self, worker: Any, banks: Mapping[str, Any], layer: int) -> tuple[Any, ...]:
         """Create borrowed contiguous ND views; retain NZ weight bytes without repacking."""
@@ -63,7 +102,7 @@ class ExpertBankLayout:
         if not 0 <= layer < self.layers:
             raise ValueError("EPLB layer outside the resident bank")
         result = []
-        for name, elements, size in zip(EXPERT_TENSORS, self.row_elements, self.element_bytes):
+        for name, elements, size in zip(self.bank.names, self.row_elements, self.element_bytes):
             bank = banks[name]
             shape = (self.local_slots, elements)
             byte_offset = layer * self.local_slots * elements * size

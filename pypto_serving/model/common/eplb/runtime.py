@@ -27,7 +27,7 @@ from pypto_serving.model.common.runner.buffer_set import shared_empty
 from .controller import EplbController
 from .plan import RebalancePlan
 from .state import LoadSample, Placement
-from .transfer import ExpertBankLayout
+from .transfer import ExpertBankLayout, ExpertBankSpec
 
 logger = logging.getLogger(__name__)
 
@@ -45,10 +45,13 @@ class DispatchContext:
 class EplbRuntime:
     """One executor's expert tables; maintenance is serialized by its execution lane."""
 
-    def __init__(self, placement: Placement, config: EplbConfig, *, execution_role: str = "mixed"):
+    def __init__(self, placement: Placement, config: EplbConfig, *, execution_role: str = "mixed",
+                 bank: ExpertBankSpec | None = None):
         self.placement = placement
         self.config = config
         self.execution_role = execution_role
+        # None keeps the model family's default resident bank convention.
+        self.bank = bank
         config.phase_for_role(execution_role)
         self.controller: EplbController | None = None
         self.bank_layout: ExpertBankLayout | None = None
@@ -140,7 +143,7 @@ class EplbRuntime:
             return
         if transfer is None:
             raise RuntimeError("Enabled EPLB requires a compiled device maintenance program")
-        layout = ExpertBankLayout.inspect(banks, self.placement)
+        layout = ExpertBankLayout.inspect(banks, self.placement, self.bank)
         self.table(worker, "eplb_mapping")
         # Do not execute a zero-migration transfer during startup.  The transfer
         # program still allocates cross-rank windows and waits on barriers even when

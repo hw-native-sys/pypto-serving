@@ -158,7 +158,7 @@ def test_pd_and_ddr_use_the_same_group_components_and_tensor_names():
 
 def _runner(*, speculative: bool = False, max_position: int = 512, extension_factory=None,
             tp_size: int = 4, eplb: bool = False) -> DSparkModelRunner:
-    from pypto_serving.model.deepseek_dspark.eplb.state import Placement
+    from pypto_serving.model.common.eplb.state import Placement
 
     rows = torch.arange(max_position * 64, dtype=torch.float32).reshape(max_position, 64)
     rope = DSparkRopeTables(

@@ -228,7 +228,7 @@ Short correctness probes and host fault injection do not establish these results
 | Contract | Main implementation |
 | --- | --- |
 | Role, topology and independent cost limits | `config/types.py::EplbConfig` |
-| Snapshot ownership, age, cooldown and publication | `model/deepseek_dspark/eplb/{controller,runtime}.py` |
+| Snapshot ownership, age, cooldown and publication | `model/common/eplb/{controller,runtime}.py` |
 | Compute drain, maintenance deadline and fatal cleanup | `serving/server/serving_worker.py` |
 | Incoming/outgoing permits and exclusive DMA gate | `pd/maintenance.py::TransferGate` |
 | Permit reservation, native completion and owner lifetime | `pd/worker.py::WorkerRuntime` |

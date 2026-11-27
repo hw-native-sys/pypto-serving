@@ -415,7 +415,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         )
         eplb_placement = None
         if self._eplb_config.enabled:
-            from pypto_serving.model.deepseek_dspark.eplb.state import Placement, bias_placement
+            from pypto_serving.model.common.eplb.state import Placement, bias_placement
 
             self._eplb_config.validate_topology(
                 logical_experts=n_routed_experts, ranks=layout.ranks,
@@ -499,7 +499,7 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         if self._compile_kernels:
             modules = self._load_kernel_modules(layout, speculative=speculative)
             if eplb_placement is not None:
-                from pypto_serving.model.deepseek_dspark.eplb.abi import validate_kernel_contract
+                from pypto_serving.model.deepseek_dspark.eplb_abi import validate_kernel_contract
 
                 validate_kernel_contract(modules, eplb_placement)
             suffix = "_eplb" if self._eplb_config.enabled else ""

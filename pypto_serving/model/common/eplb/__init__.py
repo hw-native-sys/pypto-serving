@@ -7,4 +7,10 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""DSpark expert placement, load windows and device maintenance plans."""
+"""Model-family-neutral expert placement, load windows and device maintenance.
+
+A model family supplies three things: a frozen `EplbAbiSpec` for its kernel
+exports, an `ExpertBankSpec` for its resident weight tensors, and the executor
+and runner wiring that allocates the four EPLB tensors and submits the forward
+entries. Everything that plans, validates, or applies a migration lives here.
+"""
