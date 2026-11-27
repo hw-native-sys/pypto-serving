@@ -74,7 +74,7 @@ pypto-serving \
   --num-speculative-tokens 1
 ```
 
-Repeat `--prompt` for offline continuous batching. Add `--profile` to capture the generation window. DeepSeek V4 requires exactly eight devices with overlapped attention DP=8 and MoE EP=8.
+Repeat `--prompt` for offline continuous batching. Add `--profile` to capture the generation window. Resident DeepSeek V4 uses eight devices with overlapped attention DP=8 and MoE EP=8. [Expert offload](docs/models/deepseek-v4/offload.md) supports autoregressive inference on one, two, or four devices.
 
 ## HTTP Serving (OpenAI-compatible API)
 

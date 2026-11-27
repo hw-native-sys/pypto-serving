@@ -176,6 +176,17 @@ def test_deepseek_kernel_import_respecializes_moe_modules(tmp_path, monkeypatch,
     assert sys.modules[module_name] is stale_module
 
 
+@pytest.mark.parametrize("module_name", ["prefill_cp_exchange", "prefill_cp_zigzag"])
+def test_deepseek_context_parallel_import_tracks_expert_topology(module_name):
+    kernel_dir = npu_executor._find_pypto_lib_deepseek_v4_dir()
+    for ranks in (1, 4, 2):
+        with npu_executor._deepseek_v4_import_context(
+            kernel_dir, pypto_lib_root=kernel_dir.parents[1], ep=ranks,
+        ):
+            module = importlib.import_module(module_name)
+            assert module.CP_SIZE == ranks
+
+
 def _pypto_lib_l3_arg_names(module_name: str, function_name: str) -> tuple[str, ...]:
     kernel_file = (
         Path(__file__).resolve().parents[4]
@@ -192,7 +203,9 @@ def _pypto_lib_l3_arg_names(module_name: str, function_name: str) -> tuple[str, 
 
 
 def test_deepseek_decode_task_arg_orders_match_pypto_lib_abis():
-    assert _pypto_lib_l3_arg_names("decode_fwd", "l3_decode_fwd") == _DECODE_FWD_TENSOR_ORDER
+    assert _pypto_lib_l3_arg_names("decode_fwd", "l3_decode_fwd") == (
+        *_DECODE_FWD_TENSOR_ORDER, "expert_state", "expert_descriptors",
+    )
     assert _pypto_lib_l3_arg_names("decode_mtp", "l3_decode_mtp") == (
         *_MTP_DECODE_TENSOR_ORDER,
         "num_tokens",
@@ -812,6 +825,61 @@ def test_cli_keeps_deepseek_autoregressive_decode_when_mtp_is_disabled(tmp_path)
     assert config.runtime_config.max_prefill_tokens_per_request == contract.max_prefill_tokens_per_request
 
 
+@pytest.mark.parametrize("ranks", [1, 2, 4])
+def test_cli_configures_deepseek_offload_partitions(tmp_path, ranks):
+    model_dir = _write_deepseek_model_dir(tmp_path)
+    budget = 32 << 30
+    args = cli.build_parser().parse_args([
+        "--model", str(model_dir), "--platform", "a2a3",
+        "--devices", ",".join(str(i) for i in range(ranks)),
+        "--dp", str(ranks), "--ep", str(ranks), "--max-num-seqs", "8",
+        "--moe-offload-bytes", str(budget),
+    ])
+    config = cli.build_serving_engine_config(args)
+    assert config.executor_kwargs["expert_cache_bytes"] == budget
+    assert config.executor_kwargs["num_speculative_tokens"] == 0
+    assert config.parallel_config.expert_parallel_size == ranks
+    assert config.runtime_config.max_prefill_tokens_per_request == ranks * 1024
+    assert config.runtime_config.kv_cache_groups
+    assert all(group.num_partitions == ranks for group in config.runtime_config.kv_cache_groups)
+
+
+@pytest.mark.parametrize(("options", "message"), [
+    (["--moe-offload-bytes", "-1"], "positive budget"),
+    (["--platform", "a5"], "a2a3"),
+    (["--platform", "a2a3sim"], "mapped Host DDR"),
+    (["--ep", "8"], "--ep 1, 2 or 4"),
+    (["--num-speculative-tokens", "1"], "standalone inference"),
+])
+def test_cli_rejects_unsupported_deepseek_offload(tmp_path, options, message):
+    model_dir = _write_deepseek_model_dir(tmp_path)
+    args = cli.build_parser().parse_args([
+        "--model", str(model_dir), "--platform", "a2a3", "--devices", "6,7",
+        "--dp", "2", "--ep", "2", "--moe-offload-bytes", str(32 << 30), *options,
+    ])
+    with pytest.raises(ValueError, match=message):
+        cli.build_serving_engine_config(args)
+
+
+def test_deepseek_offload_backing_preserves_packed_rows():
+    ranks, layers, experts = 2, 3, 4
+    tensors = {}
+    for index, name in enumerate(weight_loader.ROUTED_EXPERT_FIELDS):
+        values = torch.arange(ranks * layers * experts * 32).reshape(ranks, layers * experts, 32)
+        tensors[name] = (values + index).to(torch.float32 if name.endswith("scale") else torch.int8)
+    packed = DeepSeekV4StackedLayerWeights(tensors=tensors)
+    backing = weight_loader.routed_expert_backing(packed, layers, budget_bytes=1000)
+    assert backing.capacity == 2
+    assert (backing.layers, backing.local_experts) == (layers, experts)
+    for rank, fields in enumerate(backing.by_rank):
+        assert tuple(fields) == weight_loader.ROUTED_EXPERT_FIELDS
+        for name, value in fields.items():
+            assert value.data_ptr() == tensors[name][rank].data_ptr()
+            for layer in range(layers):
+                for expert in range(experts):
+                    assert torch.equal(value[layer, expert], tensors[name][rank, layer * experts + expert])
+
+
 @pytest.mark.parametrize(
     ("config", "message"),
     [
@@ -978,7 +1046,7 @@ def test_deepseek_compile_selects_mtp_programs(
     monkeypatch.setattr(
         npu_executor.DeepSeekV4PyptoExecutor,
         "_load_kernel_modules",
-        lambda self, layout: {
+        lambda self, layout, *, expert_slots, n_routed_experts: {
             "config": object(),
             "prefill_fwd": prefill_fwd,
             "decode_fwd": decode_fwd,
@@ -1546,6 +1614,7 @@ def test_deepseek_worker_registers_main_and_mtp_weights_for_inheritance(monkeypa
         "Compiled",
         (),
         {
+            "expert_cache_bytes": 0,
             "l3_callables": lambda _self: (
                 DeepSeekV4L3Callable(
                     compiled_program,
@@ -1590,6 +1659,7 @@ def test_deepseek_resident_upload_releases_inherited_host_references():
     runner._mtp_buffers = type("MtpBuffers", (), {"weights": {"mtp": mtp_weight}})()
     runner._mtp_device_weights = None
     runner._compiled = SimpleNamespace(
+        expert_cache_bytes=0,
         prepacked_layer_weights=DeepSeekV4StackedLayerWeights(tensors={"main": main_weight})
     )
     runner._shared_l3_worker = lambda: worker
@@ -2200,6 +2270,33 @@ def test_deepseek_prepare_decode_inputs_rebuilds_slot_metadata():
     changed_rows[0]["ori"] = [1]
     prepare(130, changed_rows)
     assert counting_metadata.ring_table_calls == 3 * first_ring_table_calls
+
+
+@pytest.mark.parametrize(("ranks", "budget", "count", "accepted"), [
+    (8, 0, 1, True),
+    (8, 0, 2, False),
+    (2, 32 << 30, 2, True),
+])
+def test_deepseek_early_decode_batching_is_opt_in(ranks, budget, count, accepted):
+    runner, model = _runner_for_prepared_inputs(layout=deepseek_v4_decode_layout(0, ranks=ranks))
+    runner._compiled.expert_cache_bytes = budget
+    batch = DecodeBatch(
+        request_ids=[f"req-{i}" for i in range(count)],
+        token_ids=torch.full((count, 1), 99, dtype=torch.long),
+        hidden_states=None,
+        seq_lens=torch.full((count,), 128, dtype=torch.int32),
+        block_ids_by_group=[{name: [i] for name in runner._cache_group_num_blocks} for i in range(count)],
+        cache_partitions=[0] * count,
+    )
+
+    if not accepted:
+        with pytest.raises(ValueError, match="at most one request per DP rank"):
+            runner.prepare_decode(model, batch, buffer_slot=0)
+        return
+
+    prepared = runner.prepare_decode(model, batch, buffer_slot=0)
+    assert prepared.per_rank_counts == (count,) + (0,) * (ranks - 1)
+    assert prepared.local_rows == tuple(range(count))
 
 
 def test_deepseek_early_decode_prepare_uses_isolated_ping_pong_slots():
@@ -3464,11 +3561,12 @@ def _runtime_model_for_embeddings():
 def _runner_for_prepared_inputs(
     *,
     num_speculative_tokens: int = 0,
+    layout: DeepSeekV4CacheLayout | None = None,
 ) -> tuple[DeepSeekV4ModelRunner, object]:
     model = _runtime_model_for_embeddings()
     compiled = DeepSeekV4CompiledKernels(
         # Exercise the production MTP tile while keeping the tiny host-side model.
-        layout=DeepSeekV4CacheLayout(decode_batch=4, decode_seq=2, decode_tokens=8),
+        layout=layout or DeepSeekV4CacheLayout(decode_batch=4, decode_seq=2, decode_tokens=8),
         model_dir="",
         weight_map={},
         weight_store=None,
@@ -3692,6 +3790,7 @@ class _TaskArgsStubRunner:
 
         self._compiled = SimpleNamespace(
             layout=layout or DeepSeekV4CacheLayout(),
+            expert_cache_bytes=0,
             num_speculative_tokens=num_speculative_tokens,
         )
         layout = self._compiled.layout
@@ -3770,6 +3869,28 @@ def test_deepseek_task_args_builders_register_kernel_order():
     assert mtp_prefill_task_args(deep_mtp_runner, 4096).names == _MTP_PREFILL_TENSOR_ORDER
     assert mtp_decode_task_args(deep_mtp_runner, 4096).names == _MTP_DECODE_TENSOR_ORDER
     assert mtp_decode_task_args(fused_runner, 4096).names == _FUSED_MTP_DECODE_TENSOR_ORDER
+
+
+def test_deepseek_prefill_decode_share_offload_banks_and_state():
+    runner = _TaskArgsStubRunner(layout=deepseek_v4_decode_layout(0, ranks=2))
+    runner._compiled.expert_cache_bytes = 32 << 30
+    runner._expert_pool = SimpleNamespace(
+        banks={name: object() for name in weight_loader.ROUTED_EXPERT_FIELDS},
+        state=object(), descriptors=object(),
+    )
+    for name in weight_loader.ROUTED_EXPERT_FIELDS:
+        runner._stacked.pop(name)
+    for builder, order in ((prefill_task_args, _PREFILL_FWD_TENSOR_ORDER),
+                           (decode_task_args, _DECODE_FWD_TENSOR_ORDER)):
+        args = builder(runner, 4096, 64)
+        args.allocate_host_shared(None)
+        args.allocate_device(_task_args_alloc_worker(), None)
+        assert args.names == (*order, "expert_state", "expert_descriptors")
+        values = dict(zip(args.names, args.build()))
+        for name, bank in runner._expert_pool.banks.items():
+            assert values[name] is bank
+        assert values["expert_state"] is runner._expert_pool.state
+        assert values["expert_descriptors"] is runner._expert_pool.descriptors
 
 
 def test_deepseek_prefill_task_args_classifies_kinds_and_builds():

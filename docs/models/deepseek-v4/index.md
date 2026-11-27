@@ -5,9 +5,10 @@ PyPTO Serving runs DeepSeek V4 Flash from a converted W8A8 checkpoint. Choose th
 | Path | Devices | Parallelism | Decode |
 | --- | --- | --- | --- |
 | [MTP](mtp.md) | 8 | `--dp 8 --ep 8 --tp 1` | Autoregressive or MTP speculative decoding. |
+| [Expert offload](offload.md) | 1, 2 or 4 | DP = EP = device count, TP1 | Autoregressive decoding with routed experts in Host DDR. |
 | [DSpark](dspark.md) | 8 or 16 | TP4, with `--dp 2 --ep 8` or `--dp 4 --ep 16` | Target-only K=0 or DSpark speculative K=5/K=7. |
 
-Both paths use the [checkpoint conversion](mtp.md#checkpoint-conversion). The optional prepacked sidecar described in the MTP guide is specific to that path; DSpark loads its own weight layout. For the client workflow, see [Tool Calling](../../user-guide/tool-calling.md); for structural constraints on DSpark K=7, see [Tool Constraints](tool-constraints.md).
+All paths use the [checkpoint conversion](mtp.md#checkpoint-conversion). MTP and expert offload use the prepacked sidecar described in the MTP guide, built for the selected rank count; DSpark loads its own weight layout. For the client workflow, see [Tool Calling](../../user-guide/tool-calling.md); for structural constraints on DSpark K=7, see [Tool Constraints](tool-constraints.md).
 
 ## Function Tool Format
 

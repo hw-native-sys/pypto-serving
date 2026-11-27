@@ -108,6 +108,7 @@ nav:
       - DeepSeek V4:
           - Overview: models/deepseek-v4/index.md
           - MTP Deployment: models/deepseek-v4/mtp.md
+          - Expert Offload: models/deepseek-v4/offload.md
           - DSpark Deployment: models/deepseek-v4/dspark.md
           - DSpark Tool Constraints: models/deepseek-v4/tool-constraints.md
           - Internals:
