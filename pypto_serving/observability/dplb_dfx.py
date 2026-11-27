@@ -381,7 +381,7 @@ class DplbDfxRecorder:
                 self._seal(reason, **fields)
 
     def begin_profile_start(self) -> None:
-        """Defer the manifest if Host collection ends before the worker replies."""
+        """Defer the manifest until the profile start outcome is known."""
         with self._lock:
             self._profile_start_pending = True
 
@@ -389,8 +389,6 @@ class DplbDfxRecorder:
         with self._lock:
             if failed:
                 self.stop(reason="profile_control_failed")
-            else:
-                self.emit("profile_control_ack", active=True)
             self._profile_start_pending = False
             self._finish_pending_end(failed)
 

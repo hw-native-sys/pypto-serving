@@ -494,9 +494,12 @@ class ReplicaEngineCore:
             logger.info("ReplicaEngineCore stopped")
         return reaped
 
-    async def start_profile(self, capture_id: str | None = None, *, capture_host: bool = True) -> None:
+    async def start_profile(
+        self, capture_id: str | None = None, *, capture_host: bool = True, coordinated: bool = False,
+    ) -> None:
         """Start SA profiling in this replica's worker."""
-        await self._set_profile_active(True, capture_id=capture_id, capture_host=capture_host)
+        await self._set_profile_active(True, capture_id=capture_id, capture_host=capture_host,
+                                       coordinated=coordinated)
 
     async def stop_profile(self) -> None:
         """Flush and stop SA profiling in this replica's worker."""
@@ -504,6 +507,7 @@ class ReplicaEngineCore:
 
     async def _set_profile_active(
         self, active: bool, *, capture_id: str | None = None, capture_host: bool = True,
+        coordinated: bool = False,
     ) -> None:
         dfx = getattr(self, "_dplb_dfx", None)
         if dfx is None:
@@ -511,7 +515,8 @@ class ReplicaEngineCore:
             return
         async with self._dfx_profile_lock:
             if active:
-                dfx.begin_profile_start()
+                if not coordinated:
+                    dfx.begin_profile_start()
             else:
                 dfx.begin_profile_stop(counters_end=self._dfx_counters())
             try:
@@ -519,6 +524,8 @@ class ReplicaEngineCore:
                     self._start_host_capture(dfx, capture_id)
                 await self._set_worker_profile_active(active)
             except BaseException:
+                if coordinated:
+                    raise
                 if active:
                     dfx.finish_profile_start(failed=True)
                 else:
@@ -526,7 +533,9 @@ class ReplicaEngineCore:
                 await asyncio.to_thread(dfx.close)
                 raise
             if active:
-                dfx.finish_profile_start()
+                dfx.emit("profile_control_ack", active=True)
+                if not coordinated:
+                    dfx.finish_profile_start()
             else:
                 dfx.finish_profile_stop()
                 await asyncio.to_thread(dfx.close)
@@ -1911,21 +1920,30 @@ class AsyncLLMEngine:
             if capture_host and not all(recorder.ready_for_capture for recorder in recorders):
                 raise RuntimeError("Previous DPLB Host capture is still being written; retry start_profile")
             capture_id = uuid.uuid4().hex if capture_host else None
-            results = await asyncio.gather(
-                *(
-                    core.start_profile(capture_id, capture_host=capture_host)
-                    if getattr(core, "_dplb_dfx", None) is not None else core.start_profile()
-                    for core in self._cores
-                ),
-                return_exceptions=True,
-            )
-            errors = [result for result in results if isinstance(result, BaseException)]
-            if errors:
-                await asyncio.gather(
-                    *(core.stop_profile() for core in self._cores),
+            for recorder in recorders:
+                recorder.begin_profile_start()
+            failed = True
+            try:
+                results = await asyncio.gather(
+                    *(
+                        core.start_profile(capture_id, capture_host=capture_host, coordinated=True)
+                        if getattr(core, "_dplb_dfx", None) is not None else core.start_profile()
+                        for core in self._cores
+                    ),
                     return_exceptions=True,
                 )
-                raise RuntimeError(f"Failed to start profiling in a worker: {errors[0]}")
+                errors = [result for result in results if isinstance(result, BaseException)]
+                if errors:
+                    raise RuntimeError(f"Failed to start profiling in a worker: {errors[0]}") from errors[0]
+                failed = False
+            finally:
+                for recorder in recorders:
+                    recorder.finish_profile_start(failed=failed)
+                if failed:
+                    await asyncio.gather(
+                        *(core.stop_profile() for core in self._cores),
+                        return_exceptions=True,
+                    )
 
     async def stop_profile(self) -> None:
         """Flush and stop SA profiling in every replica worker."""

@@ -56,18 +56,13 @@ class PrefillScheduler(Scheduler):
         return super()._limit_scheduled_tokens(request, min(token_budget, available))
 
     def _try_allocate_request_blocks(self, request, num_new_tokens, *, scheduled=None):
-        cache = self.kv_cache_manager
-        if cache.has_groups and request.cache_partition is None:
-            candidates = [partition for partition, tokens in enumerate(self._remaining)
+        partitions = None
+        if self.kv_cache_manager.has_groups and request.cache_partition is None:
+            partitions = [partition for partition, tokens in enumerate(self._remaining)
                           if tokens >= num_new_tokens and self._can_admit_waiting_partition(partition)]
-            partition = cache.select_group_partition(
-                request.request_id, request.num_computed_tokens + num_new_tokens,
-                partitions=candidates, load_tokens=request.num_prompt_tokens,
-            )
-            if partition is None:
-                return False
-            request.cache_partition = partition
-        return super()._try_allocate_request_blocks(request, num_new_tokens, scheduled=scheduled)
+        return super()._try_allocate_request_blocks(
+            request, num_new_tokens, scheduled=scheduled, partitions=partitions,
+        )
 
     def _on_scheduled(self, scheduled):
         partition = scheduled.cache_partition if self.kv_cache_manager.has_groups else 0

@@ -1614,6 +1614,8 @@ class KvCacheManager:
     ) -> int | None:
         """Choose among capacity-qualified partitions, optionally restricted by the caller."""
         candidates = self._candidate_group_partitions(request_id, token_count, partitions)
+        if observation is not None:
+            observation["candidates"] = list(candidates)
         if not candidates:
             return None
         assigned = self._group_request_partitions.get(request_id)
@@ -1666,10 +1668,12 @@ class KvCacheManager:
         *,
         partition: int | None = None,
         load_tokens: int | None = None,
+        partitions: Sequence[int] | None = None,
     ) -> dict[str, list[int]]:
         if not self._group_pools or not self._dfx_active():
             return self._ensure_group_blocks(
                 request_id, token_count, partition=partition, load_tokens=load_tokens,
+                partitions=partitions,
             )
         dfx = self.dplb_dfx
         assigned = self._group_request_partitions.get(request_id)
@@ -1680,15 +1684,17 @@ class KvCacheManager:
             groups=self._dfx_groups(request_id, token_count), view="policy_logical",
             policy=self._dfx_policy(), rotation_start=self._next_group_partition,
         )
-        if partition is not None:
+        if partition is not None or partitions is not None:
+            allowed = (partition,) if partition is not None else partitions
+            exclusion = "explicit_partition" if partition is not None else "scheduler_partition_limit"
             for row in observation["groups"]:
-                if row["group_id"] != partition:
-                    row["exclusion_reasons"].append("explicit_partition")
+                if row["group_id"] not in allowed:
+                    row["exclusion_reasons"].append(exclusion)
                     row["feasible"] = False
         try:
             result = self._ensure_group_blocks(
                 request_id, token_count, partition=partition, load_tokens=load_tokens,
-                observation=observation,
+                partitions=partitions, observation=observation,
             )
         except Exception as exc:
             dfx.emit("placement_failed", **observation, reason=type(exc).__name__,
@@ -1707,7 +1713,8 @@ class KvCacheManager:
 
     def _ensure_group_blocks(
         self, request_id: str, token_count: int, *, partition: int | None = None,
-        load_tokens: int | None = None, observation: dict | None = None,
+        load_tokens: int | None = None, partitions: Sequence[int] | None = None,
+        observation: dict | None = None,
     ) -> dict[str, list[int]]:
         """Atomically grow all cache groups for a request and return block IDs."""
         if not self._group_pools:
@@ -1736,8 +1743,8 @@ class KvCacheManager:
         selected = (
             partition
             if partition is not None
-            else self.select_group_partition(request_id, token_count, load_tokens=load_tokens,
-                                             observation=observation)
+            else self.select_group_partition(request_id, token_count, partitions=partitions,
+                                             load_tokens=load_tokens, observation=observation)
         )
         if selected is None or not self.can_ensure_group_blocks(
             request_id,

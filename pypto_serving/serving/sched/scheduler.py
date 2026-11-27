@@ -1294,6 +1294,7 @@ class Scheduler:
 
     def _try_allocate_request_blocks(
         self, request: Request, num_new_tokens: int, *, scheduled: ScheduledRequest | None = None,
+        partitions: Sequence[int] | None = None,
     ) -> bool:
         """Grow either grouped or generic cache blocks for one scheduling step."""
         if self.kv_cache_manager.has_groups:
@@ -1309,6 +1310,7 @@ class Scheduler:
                     total_tokens,
                     partition=request.cache_partition,
                     load_tokens=request.num_prompt_tokens,
+                    partitions=partitions,
                 )
                 request.cache_partition = self.kv_cache_manager.group_request_partition(
                     request.request_id

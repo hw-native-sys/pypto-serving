@@ -105,6 +105,42 @@ def test_capture_preserves_choices_tables_and_rotation(capture, enabled):
     assert manifest(capture)["complete"]
 
 
+@pytest.mark.parametrize("enabled,selected", [(True, 1), (False, 0)])
+def test_pd_prefill_records_ranked_admission_and_scheduler_exclusions(capture, enabled, selected):
+    from pypto_serving.pd.scheduler import PrefillScheduler
+
+    manager = cache(enabled)
+    manager.ensure_group_blocks("long", 2048, partition=0)
+    manager.ensure_group_blocks("short", 32, partition=1)
+    manager.dplb_dfx = capture
+    scheduler = PrefillScheduler(config=SchedulerConfig(
+        max_num_scheduled_tokens=32, max_prefill_tokens_per_request=16,
+        max_seq_len=4096, enable_prefix_cache=False,
+    ), kv_cache_manager=manager)
+    scheduler.add_request(Request("incoming", list(range(1536)), max_new_tokens=1))
+    scheduler.add_request(Request("second", list(range(32)), max_new_tokens=1))
+
+    assert [item.cache_partition for item in scheduler.schedule().scheduled_requests] == [selected, 1 - selected]
+    commits = {event["request_id"]: event for event in records(capture) if event["event"] == "placement_commit"}
+    incoming = commits["incoming"]
+    assert incoming["requested_partition"] is None
+    assert incoming["reason"] == ("long_logical_load" if enabled else "request_count")
+    assert incoming["incoming_logical_tokens"] == 1536
+    assert incoming["rotation_start"] == 0
+    assert incoming["candidates"] == [0, 1]
+    assert incoming["ranked"] == [selected, 1 - selected]
+    assert incoming["scores"] == ({"0": [2048, 1, 0], "1": [32, 1, 1]} if enabled
+                                  else {"0": [1, 0, 0], "1": [1, 0, 1]})
+    assert incoming["selected_group"] == selected
+    second = commits["second"]
+    assert second["candidates"] == second["ranked"] == [1 - selected]
+    assert set(second["scores"]) == {str(1 - selected)}
+    excluded = second["groups"][selected]
+    assert not excluded["feasible"]
+    assert excluded["exclusion_reasons"] == ["scheduler_partition_limit"]
+    assert manifest(capture)["complete"]
+
+
 def test_full_prompt_max_reduction_and_empty_group(capture):
     manager = cache()
     manager.dplb_dfx = capture
@@ -611,6 +647,65 @@ def test_replica_budget_is_shared(tmp_path):
     )
     engine = AsyncLLMEngine(config, tokenizer=SimpleNamespace(eos_token_id=None, bos_token_id=None))
     assert [core.config.dplb_dfx_config.max_bytes for core in engine._cores] == [2, 2]
+
+
+@pytest.mark.parametrize("expire_before_failure", [False, True])
+def test_failed_coordinated_profile_start_marks_all_replicas_incomplete(tmp_path, monkeypatch, expire_before_failure):
+    from pypto_serving.config.parallel import ParallelConfig
+    from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig
+    from pypto_serving.tools.profile import create_profile_config
+
+    now = [0]
+    monkeypatch.setattr(dplb_dfx, "time", SimpleNamespace(monotonic_ns=lambda: now[0]))
+    config = EngineConfig(
+        profile_config=create_profile_config(enabled=True, output=tmp_path),
+        dplb_dfx_config=DplbDfxConfig(level="load", max_seconds=60),
+        parallel_config=ParallelConfig(data_parallel_size=2, devices=(0, 1)),
+    )
+    engine = AsyncLLMEngine(config, tokenizer=SimpleNamespace(eos_token_id=None, bos_token_id=None))
+    first, second = [core._dplb_dfx for core in engine._cores]
+    fail_start = True
+    calls = [[], []]
+
+    async def run():
+        first_started = asyncio.Event()
+
+        async def start_first(active):
+            calls[0].append(active)
+            if active:
+                first_started.set()
+
+        async def start_second(active):
+            calls[1].append(active)
+            if active and fail_start:
+                await first_started.wait()
+                if expire_before_failure:
+                    now[0] = 60_000_000_000
+                    first.stop(reason="duration", expected_capture_id=first.capture_id)
+                raise RuntimeError("second worker failed to start profiling")
+
+        monkeypatch.setattr(engine._cores[0], "_set_worker_profile_active", start_first)
+        monkeypatch.setattr(engine._cores[1], "_set_worker_profile_active", start_second)
+        with pytest.raises(RuntimeError, match="second worker failed to start profiling"):
+            await engine.start_profile()
+
+        assert calls == [[True, False], [True, False]]
+        first_status, second_status = manifest(first), manifest(second)
+        assert first_status["capture_id"] == second_status["capture_id"]
+        for status in (first_status, second_status):
+            assert status["stop_reason"] == "profile_control_failed"
+            assert not status["complete"]
+        if expire_before_failure:
+            assert first_status["ended_ns"] == 60_000_000_000
+
+        nonlocal fail_start
+        fail_start = False
+        await engine.start_profile()
+        await engine.stop_profile()
+        assert first.capture_id == second.capture_id != first_status["capture_id"]
+        assert all(manifest(recorder)["complete"] for recorder in (first, second))
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("writer_blocked", [False, True])

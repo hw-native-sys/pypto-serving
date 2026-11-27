@@ -45,9 +45,11 @@ A new capture starts with a baseline of existing owners and requests.
 The Host window starts before the ordered worker profile command. An explicit
 stop ends Host observations before sending the stop command. If the Host window
 ends while a start or stop command is pending, the manifest waits for the worker
-reply. A failed command sets `stop_reason=profile_control_failed` and
-`complete=false` in the pending manifest. `profile_control_ack` records a start
-acknowledgement received within the Host window.
+reply. For a coordinated start, it waits for all replicas. A failed start marks
+the coordinated capture's pending manifests with `stop_reason=profile_control_failed`
+and `complete=false`, including on replicas that acknowledged the start.
+A failed stop marks the affected replica's pending manifest the same way.
+`profile_control_ack` records a start acknowledgement received within the Host window.
 
 The duration limit stops only the Host collector, including when no requests
 arrive. Call `/stop_profile` to stop and merge ordinary profiling as usual.
@@ -88,8 +90,10 @@ growth bypass ranking; missing scores are not zero scores.
 Each `groups` row includes request count, sum and maximum logical lengths,
 request-slot limit, and a capacity entry per KV family: required/free/total
 blocks, tokens per block, and table limit. `feasible` and `exclusion_reasons`
-describe existing ownership, explicit partition constraints, request-slot
-limits, KV capacity, and table capacity. Prefix lookup has
+describe existing ownership, explicit partition constraints, scheduler partition
+limits, request-slot limits, KV capacity, and table capacity. PD Prefill uses
+`scheduler_partition_limit` for groups unavailable to the current step.
+`candidates` lists the groups eligible for allocation ranking. Prefix lookup has
 `feasibility_scope=prefix_request_limit_only`: cold-allocation capacity is
 evaluated when growing the chosen prefix ownership. `prefix_status` and
 `required_status` explicitly distinguish unexamined values from measured zero.
