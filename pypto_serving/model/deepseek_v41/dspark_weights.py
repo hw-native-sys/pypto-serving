@@ -25,7 +25,7 @@ import torch
 
 from pypto_serving.model.common.weights.nz import pack_nz
 
-from .weight_loader import merge_expert_scales
+from .weight_loader import pack_native_expert, stack_expert_scales
 from .weight_spec import fp8_input_major, pack_fp4_tiles, pack_grouped_wo_a
 
 
@@ -538,7 +538,13 @@ class V41DSparkWeightContract:
             expert_raw = self._load_expert_for_rank(layer, expert)
             for suffix, abi_name in DSPARK_EXPERT_SOURCE_TO_ABI.items():
                 value = expert_raw[f"mtp.{layer}.ffn.experts.{expert}.{suffix}"]
-                if suffix.endswith(".weight"):
+                if self.loader.native_moe:
+                    if suffix.endswith(".weight"):
+                        scale = expert_raw[f"mtp.{layer}.ffn.experts.{expert}.{suffix.removesuffix('.weight')}.scale"]
+                        packed, packed_scale = pack_native_expert(value, scale)
+                        routed_values[abi_name].append(packed)
+                        routed_values[abi_name + "_scale"].append(packed_scale)
+                elif suffix.endswith(".weight"):
                     packed = pack_fp4_tiles(value)
                     routed_values[abi_name].append(packed)
                 else:
@@ -553,7 +559,8 @@ class V41DSparkWeightContract:
         for name, values in routed_values.items():
             # MX_B_NN puts output blocks before expert/K-group, so packed
             # per-expert scales must be reordered when combining experts.
-            result[name] = (merge_expert_scales(values) if name.endswith("_scale")
+            result[name] = (stack_expert_scales(values, native_moe=self.loader.native_moe)
+                            if name.endswith("_scale")
                             else torch.stack(values, dim=0).contiguous())
 
         return V41DSparkLayerWeights(tensors=result, routed_experts={})

@@ -102,8 +102,7 @@ class _DirectSliceSession(ExitStack):
         self.store = store
         self.files = {}
 
-    def load_slice(self, name, ranges, *, shape, dtype):
-        path = self.store._slice_path(name, ranges, shape)
+    def tensor_span(self, name, path, *, shape=None, dtype=None):
         if path not in self.files:
             handle = self.enter_context(path.open("rb", buffering=0))
             size = os.fstat(handle.fileno()).st_size
@@ -117,18 +116,26 @@ class _DirectSliceSession(ExitStack):
             self.files[path] = handle, header, 8 + length, size
         handle, header, data_start, size = self.files[path]
         entry = header[name]
-        if tuple(entry["shape"]) != shape or entry["dtype"] != dtype:
+        actual_shape = tuple(entry["shape"])
+        if shape is not None and (actual_shape != shape or entry["dtype"] != dtype):
             raise ValueError(f"checkpoint shape/dtype mismatch: {name}")
+        start, end = entry["data_offsets"]
+        torch_dtype = _TORCH_DTYPES[entry["dtype"]]
+        if (not 0 <= start <= end <= size - data_start
+                or end - start != math.prod(actual_shape) * torch_dtype.itemsize):
+            raise ValueError(f"invalid safetensors tensor byte range: {name}")
+        return path, data_start + start, actual_shape, torch_dtype
+
+    def load_slice(self, name, ranges, *, shape, dtype):
+        path = self.store._slice_path(name, ranges, shape)
         if any(part.start != 0 or part.stop != dim for part, dim in zip(ranges, shape)):
             with self.store._safe_open_fn(path, self.store.device) as reader:
                 return self.store._checked_slice(reader, name, ranges, shape, dtype)
-        start, end = entry["data_offsets"]
-        torch_dtype = _TORCH_DTYPES[dtype]
-        if not 0 <= start <= end <= size - data_start or end - start != math.prod(shape) * torch_dtype.itemsize:
-            raise ValueError(f"invalid safetensors tensor byte range: {name}")
-        data = bytearray(end - start)
+        _, offset, _, torch_dtype = self.tensor_span(name, path, shape=shape, dtype=dtype)
+        handle = self.files[path][0]
+        data = bytearray(math.prod(shape) * torch_dtype.itemsize)
         view = memoryview(data)
-        handle.seek(data_start + start)
+        handle.seek(offset)
         filled = 0
         while filled < len(data):
             count = handle.readinto(view[filled:])
@@ -145,6 +152,10 @@ class _V41SafetensorsStore(LazySafetensorsStore):
 
     def slice_session(self):
         return _DirectSliceSession(self) if self._direct_reads else super().slice_session()
+
+    def tensor_span(self, name):
+        with _DirectSliceSession(self) as session:
+            return session.tensor_span(name, self.path_for(name))
 
 
 @dataclass(frozen=True)
@@ -168,7 +179,7 @@ class V41WeightLoader:
     """
 
     def __init__(self, model_dir, *, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0,
-                 max_load_bytes=256 << 20, safe_open_fn=None):
+                 max_load_bytes=256 << 20, safe_open_fn=None, native_moe=False):
         self.model_dir = Path(model_dir).resolve()
         raw = json.loads((self.model_dir / "config.json").read_text(encoding="utf-8"), object_pairs_hook=_unique)
         self.config = V41TextConfig.from_dict(raw)
@@ -180,6 +191,7 @@ class V41WeightLoader:
             if type(rank) is not int or not 0 <= rank < size:
                 raise ValueError(f"invalid {name}")
         self.tp_rank, self.ep_rank = tp_rank, ep_rank
+        self.native_moe = native_moe
         self.max_load_bytes = _positive(max_load_bytes, "max_load_bytes")
         if self.text["n_routed_experts"] % ep_size:
             raise ValueError("routed expert count must divide EP size")
@@ -331,7 +343,10 @@ class V41WeightLoader:
         estimate = self._estimate(requests)
         weight = self._read(name, ranges, session)
         scale = self._read(*requests[1], session=session) if quantized else None
-        if spec.dtype == "I8":
+        if spec.dtype == "I8" and self.native_moe:
+            weight, scale = pack_native_expert(weight, scale)
+            layout = "routed_fp4_zn;scale_dn"
+        elif spec.dtype == "I8":
             weight = pack_fp4_tiles(weight)
             scale = pack_mx_scale(scale.view(torch.uint8).T.contiguous()).view(torch.float8_e8m0fnu)
             layout = "routed_fp4_tiles_256;scale_mx_b_nn"
@@ -351,7 +366,8 @@ class V41WeightLoader:
                 layout = "input_major_dense"
             else:
                 layout = "checkpoint_dense"
-        if name.endswith(_NZ_PROJECTION_SUFFIXES):
+        if name.endswith(_NZ_PROJECTION_SUFFIXES) or (
+                self.native_moe and ".ffn.shared_experts." in name):
             weight = pack_nz(weight)
             layout += ";nz"
         return WeightBundle(weight, scale, layout, tuple(item[0] for item in requests),
@@ -504,6 +520,26 @@ def stack_bytes(values):
     return torch.stack([v.contiguous().view(torch.uint8) for v in values]).view(dtype)
 
 
+def pack_native_expert(weight, scale):
+    """Pack checkpoint FP4 as ZN bytes and E8M0 scales as DN bytes."""
+    n, half_k = weight.shape
+    packed = weight.contiguous().view(torch.uint8).unflatten(-1, (-1, 16))
+    packed = packed.transpose(-3, -2).contiguous().reshape(n * half_k // 128, 128)
+
+    # MegaMoE expands FP4 values divided by 64. Restore the exponent in the scale.
+    codes = scale.contiguous().view(torch.uint8)
+    if not bool(((codes <= 248) | (codes == 255)).all()):
+        raise ValueError("MegaMoE routed weight scale exponent must be 0..248 or 255")
+    scaled = torch.where(codes == 255, codes, codes + 6).view(scale.dtype)
+    return packed, scaled.reshape(2 * half_k // 32, n)
+
+
+def stack_expert_scales(scales, *, native_moe):
+    if native_moe:
+        return stack_bytes(scales).flatten(0, 1)
+    return merge_expert_scales(scales)
+
+
 def merge_expert_scales(scales):
     """Repack per-expert MX_B_NN into the lib's flattened expert/K-group ABI.
 
@@ -552,7 +588,7 @@ def _load_routed_projection(loader, layer_id, rank, ep_size, name):
                          for bundle in bundles for t in (bundle.weight, bundle.scale)
                          if t is not None)
         return (rank, name, stack_bytes([b.weight for b in bundles]),
-                merge_expert_scales([b.scale for b in bundles]), held_bytes)
+                stack_expert_scales([b.scale for b in bundles], native_moe=loader.native_moe), held_bytes)
 
 
 class _ByteBudget:
@@ -736,7 +772,9 @@ def _load_layer_weights(model_dir, layer_id, topology, max_bundle_bytes, *, swa_
                     bundles = [load(f"ffn.experts.{expert}.{name}.weight")
                                for expert in range(rank * count, (rank + 1) * count)]
                     m["routed_" + name] = stack_bytes([b.weight for b in bundles])
-                    m["routed_" + name + "_scale"] = merge_expert_scales([b.scale for b in bundles])
+                    m["routed_" + name + "_scale"] = stack_expert_scales(
+                        [b.scale for b in bundles], native_moe=loader.native_moe,
+                    )
                     del bundles
                 else:
                     packed, _retained = routed[rank]
@@ -835,6 +873,7 @@ def iter_decode_weight_slices(model_dir, topology, *, max_bundle_bytes=32 << 30,
     loaders = tuple(V41WeightLoader(
         model_dir, tp_size=topology.tp, tp_rank=rank % topology.tp,
         ep_size=topology.world, ep_rank=rank, max_load_bytes=512 << 20,
+        native_moe=bank is not None and bank.layout.native_moe,
     ) for rank in range(topology.world))
     for layer in layers:
         attention, moe = load_prefill_layer_weights(
@@ -915,6 +954,7 @@ class DecodeWeightLayout:
     c2a_sources: int
     world: int = 8
     tp_size: int = 1
+    native_moe: bool = False
 
     @classmethod
     def from_lib(cls, abi, *, tp_size=None):
@@ -924,7 +964,7 @@ class DecodeWeightLayout:
         if tp_size is None:
             tp_size = int(getattr(abi, "TP_SIZE", 1))
         return cls(abi.N_LAYERS, abi.KV_SOURCE_COUNT, abi.INDEX_SOURCE_COUNT,
-                   abi.C2A_SOURCE_COUNT, abi.EP_SIZE, tp_size)
+                   abi.C2A_SOURCE_COUNT, abi.EP_SIZE, tp_size, hasattr(abi, "WEIGHT_PANEL_BYTES"))
 
     def __post_init__(self):
         if any(type(n) is not int or n <= 0 for n in (
@@ -1226,9 +1266,12 @@ def source_fingerprint(model_dir, layout):
     for filename in sorted(set(weight_map.values())):
         source = (model_dir / filename).stat()
         source_files.append((filename, source.st_size, source.st_mtime_ns))
+    layout_fields = asdict(layout)
+    if not layout.native_moe:
+        layout_fields.pop("native_moe")
     payload = json.dumps({
         "format": _FORMAT,
-        "layout": asdict(layout),
+        "layout": layout_fields,
         "config_sha256": hashlib.sha256(config).hexdigest(),
         "index_sha256": hashlib.sha256(index).hexdigest(),
         "source_files": source_files,

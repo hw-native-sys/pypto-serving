@@ -291,8 +291,7 @@ jobs:
           checkout-path: dist-checkout
           needs-device: 'true'
           runtime-platform: a5
-          # Keep V4.1 on the compiler validated before PyPTO PR #3411.
-          pypto-revision: ${{ inputs.pypto-revision || '3db18db1286bdbb44266179e3aedae659174b711' }}
+          pypto-revision: ${{ inputs.pypto-revision || '707d1c35f5ef24801a73ccdc6b42be7416ea998d' }}
           pypto-repository: ${{ inputs.pypto-repository || 'hw-native-sys/pypto' }}
           toolchain: bundle
           build-namespace: pypto-serving-v41-a5

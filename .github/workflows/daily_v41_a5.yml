@@ -57,7 +57,7 @@ jobs:
           needs-device: 'true'
           runtime-platform: a5
           # Use the same compiler as the existing A5 K5 guard.
-          pypto-revision: 3db18db1286bdbb44266179e3aedae659174b711
+          pypto-revision: 707d1c35f5ef24801a73ccdc6b42be7416ea998d
           toolchain: bundle
           build-namespace: pypto-serving-v41-daily
           pip-cache-name: pip-pypto-serving-v41-daily
