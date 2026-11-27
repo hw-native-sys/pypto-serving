@@ -19,6 +19,7 @@ from pypto_serving.serving.memory.tiering.cache import TieredCache
 from pypto_serving.serving.memory.tiering.manager import CacheTier
 from pypto_serving.serving.memory.tiering.integration import Session
 from pypto_serving.serving.sched.scheduler import Request
+from tests.unit.serving.test_dplb import cache as dplb_cache
 from tests.unit.serving.test_grouped_prefix_cache import _finish_prefill, _prefill_scheduler, manager, prompt
 
 
@@ -146,6 +147,38 @@ def test_joint_checkpoint_restore_preserves_content_and_alignment(length):
             assert backend.device[name, 0, local] == expected[0, name, block.block_hash]
     cache.release_all_group_requests('restore')
     assert all(not b.ref_cnt for p in cache._group_pools.values() for b in p.blocks)
+
+
+def test_dplb_prefill_skips_ddr_restore_when_selected_prefix_is_resident():
+    cache, backend = dplb_cache(), Backend()
+    cache.tiering = tier = TieredCache(cache, backend, 200_000)
+    tokens = list(range(33))
+    hashes = cache.compute_group_block_hashes(tokens)
+    for partition in (0, 1):
+        seed = f'prefix-{partition}'
+        cache.ensure_group_blocks(seed, 32, partition=partition)
+        cache.cache_group_blocks(seed, hashes, 32, {})
+        cache.release_all_group_requests(seed)
+    tier.progress()
+    tier.progress()
+    pool = cache._group_pools['kv']
+    for value in hashes['kv']:
+        assert tier.tier.lookup((0, 'kv', value)) is not None
+        cache._invalidate_group_block(pool, 0, pool.hash_to_block[0, value])
+
+    cache.ensure_group_blocks('heavy', 48, partition=0)
+    cache.ensure_group_blocks('light', 16, partition=1)
+    scheduler = _prefill_scheduler(cache, replay=0)
+    scheduler.add_request(Request('incoming', tokens, max_new_tokens=1))
+    backend.hold = True
+
+    output = scheduler.schedule()
+
+    assert not tier.pending
+    assert not backend.waiting
+    step, = output.scheduled_requests
+    assert step.cache_partition == 1
+    assert step.num_computed_tokens == 32
 
 
 @pytest.mark.parametrize('outcome', ['shared', 'unknown'])

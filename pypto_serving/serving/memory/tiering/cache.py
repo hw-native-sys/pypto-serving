@@ -189,7 +189,7 @@ class TieredCache:
         candidates.update(self.tier.units)
         tables, boundary, selected = self.cache.select_group_prefix_blocks(
             hashes, max_cache_hit_tokens=maximum, shareable_group_names=groups, partition=partition,
-            lookup=self._lookup, checkpoint_keys=candidates)
+            lookup=self._lookup, checkpoint_keys=candidates, load_tokens=tokens)
         if not boundary:
             return True
         # Selection returns physical ring slots. Freeze logical page order for
