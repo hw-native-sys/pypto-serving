@@ -857,7 +857,7 @@ def bind_decode_layer_weights(layer, attention, moe, *, kv_sources, index_source
 
 
 def iter_decode_weight_slices(model_dir, topology, *, max_bundle_bytes=32 << 30,
-                              parallel_experts=False, bank=None):
+                              parallel_experts=False, native_moe=False):
     """Yield one layer at a time in checkpoint order for bounded staging."""
     raw = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
     layers = plan_layers(raw)
@@ -873,7 +873,7 @@ def iter_decode_weight_slices(model_dir, topology, *, max_bundle_bytes=32 << 30,
     loaders = tuple(V41WeightLoader(
         model_dir, tp_size=topology.tp, tp_rank=rank % topology.tp,
         ep_size=topology.world, ep_rank=rank, max_load_bytes=512 << 20,
-        native_moe=bank is not None and bank.layout.native_moe,
+        native_moe=native_moe,
     ) for rank in range(topology.world))
     for layer in layers:
         attention, moe = load_prefill_layer_weights(
@@ -884,9 +884,8 @@ def iter_decode_weight_slices(model_dir, topology, *, max_bundle_bytes=32 << 30,
             layer, attention, moe, kv_sources=kv_sources, index_sources=index_sources,
             c2a_sources=c2a_sources,
         )
-        if layer.layer_id == 0 and bank is not None:
-            bank.preallocate(slices)
         yield from slices
+        del attention, moe, slices
     # decode_fwd reserves one key/norm slot per index source, although only KV
     # producers have these checkpoint tensors. The trailing four slots are not
     # read by the current graph; initialize them deterministically nonetheless.
@@ -1006,6 +1005,11 @@ class DecodeWeightBank:
         self._seen = set()
         self.prepacked = False
         self.rank_major_uploads = {}
+
+    def iter_slices(self):
+        for name, host in self.tensors.items():
+            for slot in range(self.layout.slots(name)):
+                yield DecodeWeightSlice(name, slot, host if name in _SINGLE else host[slot])
 
     def preallocate(self, first_layer):
         """Allocate the first layer's shared fields concurrently after validating their geometry."""
@@ -1171,53 +1175,65 @@ class ResidentDecodeWeights:
 class ResidentFullDecodeWeights(ResidentDecodeWeights):
     """Upload contiguous per-rank banks and alias their layer slices for prefill."""
 
-    def __init__(self, worker, bank: DecodeWeightBank, parameter_names):
+    def __init__(self, worker, layout, parameter_names, slices):
         from pypto.runtime import StackedDeviceTensor
 
-        bank.finish(parameter_names)
+        DecodeWeightBank.validate_abi(parameter_names)
         self.worker = worker
-        self.layout = bank.layout
+        self.layout = layout
         self.tensors = {}
         self._full = {}
         self._slot_shapes = {}
-        self.layout_names = tuple(bank.tensors)
         self._stacked_tensor = StackedDeviceTensor
+        pending = {name: set(range(layout.slots(name))) for name in _ALL}
         try:
-            for name, host in bank.tensors.items():
-                if name in _SINGLE:
-                    self._full[name] = worker.alloc_stacked_tensor(host)
-                    continue
-                slots = self.layout.slots(name)
-                if host.shape[0:2] != (slots, self.layout.world):
-                    raise ValueError(f"{name} weight bank has the wrong slot/rank axes")
-                slot_shape = tuple(host.shape[2:])
-                self._slot_shapes[name] = slot_shape
-                full_shape = ((slots * slot_shape[0], *slot_shape[1:]) if name in
-                              (_FLAT_LAYER | _FLAT_KV | _FLAT_INDEX) else
-                              (slots, *slot_shape))
-                slot_bytes = host[0, 0].numel() * host.element_size()
-                shards = []
-                try:
-                    for rank in range(self.layout.world):
-                        base = worker.alloc_tensor(full_shape, host.dtype, worker_id=rank)
-                        shards.append(base)
-                        for slot in range(slots):
-                            source = host[slot, rank]
-                            if not source.is_contiguous():
-                                raise ValueError(f"{name} weight slice is not contiguous")
-                            worker.copy_to(
-                                base.data_ptr, source.data_ptr(), slot_bytes,
-                                dst_offset=slot * slot_bytes, worker_id=rank,
-                            )
-                except BaseException:
-                    for rank, shard in enumerate(shards):
-                        worker.free_tensor(shard, worker_id=rank)
-                    raise
-                self._full[name] = StackedDeviceTensor(
-                    shards, (self.layout.world, *full_shape), range(self.layout.world))
+            for item in slices:
+                self._upload_slice(item, pending)
+            missing = {name: sorted(slots) for name, slots in pending.items() if slots}
+            if missing:
+                raise ValueError(f"decode weight upload is missing slots: {missing}")
+            self.layout_names = tuple(self._full)
         except BaseException:
             self.close()
             raise
+
+    def _upload_slice(self, item, pending):
+        name, slot, host = item.name, item.slot, item.value
+        if slot not in pending.get(name, ()):
+            raise ValueError(f"unexpected or duplicate decode weight slice {name}[{slot}]")
+        if host.device.type != "cpu" or not host.is_contiguous():
+            raise ValueError(f"{name} weight slice must be contiguous CPU data")
+        if host.ndim < 2 or host.shape[0] != self.layout.world:
+            raise ValueError(f"{name} weight slice has the wrong rank axis")
+        if name in _SINGLE:
+            self._full[name] = self.worker.alloc_stacked_tensor(host)
+        else:
+            slot_shape = tuple(host.shape[1:])
+            if name not in self._full:
+                slots = self.layout.slots(name)
+                full_shape = ((slots * slot_shape[0], *slot_shape[1:]) if name in
+                              (_FLAT_LAYER | _FLAT_KV | _FLAT_INDEX) else (slots, *slot_shape))
+                ranks = range(self.layout.world)
+                shards = []
+                try:
+                    for rank in ranks:
+                        shards.append(self.worker.alloc_tensor(full_shape, host.dtype, worker_id=rank))
+                    self._full[name] = self._stacked_tensor(shards, (self.layout.world, *full_shape), ranks)
+                except BaseException:
+                    for rank, shard in enumerate(shards):
+                        self.worker.free_tensor(shard, worker_id=rank)
+                    raise
+                self._slot_shapes[name] = slot_shape
+            target = self._full[name]
+            if self._slot_shapes[name] != slot_shape or target.shards[0].dtype != host.dtype:
+                raise ValueError(f"{name} weight slices disagree on shape or dtype")
+            slot_bytes = host[0].nbytes
+            for rank, shard in enumerate(target.shards):
+                self.worker.copy_to(
+                    shard.data_ptr, host[rank].data_ptr(), slot_bytes,
+                    dst_offset=slot * slot_bytes, worker_id=rank,
+                )
+        pending[name].remove(slot)
 
     def full(self, name):
         return self._full[name]

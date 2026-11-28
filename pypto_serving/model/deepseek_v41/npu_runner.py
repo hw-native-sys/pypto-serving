@@ -23,8 +23,7 @@ import sys
 import time
 import zlib
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
@@ -2889,7 +2888,7 @@ class V41ResidentResources:
     argument and dispatch the compiled layer programs.
     """
 
-    def __init__(self, programs, run_config, *, weight_bank, weight_param_names,
+    def __init__(self, programs, run_config, *, weight_bank, weight_layout, weight_slices, weight_param_names,
                  cache_plan, state_reset, page_resets, input_host, final_host,
                  prefill_host, topology, decode_head_program, decode_head_param_names,
                  engram_host=None,
@@ -2898,7 +2897,6 @@ class V41ResidentResources:
                  dspark_programs=None, dspark_param_names=None, max_seq_len=None,
                  dspark_weight_contract=None, dspark_lowering_provider=None,
                  dspark_host_resources=None):
-        weight_bank.finish(weight_param_names)
         if decode_host is not None and (decode_input_host is None or
                 decode_host.topology != decode_input_host.topology):
             raise ValueError("decode metadata and input must share one TP-local topology")
@@ -2917,11 +2915,9 @@ class V41ResidentResources:
                      + (state_reset, *page_resets.values()))
         if any(not tensor.is_shared() for tensor in inherited):
             raise ValueError("all inherited V4.1 host buffers must be shared before worker creation")
-        if not getattr(weight_bank, "prepacked", False) and any(
-                not tensor.is_shared() for tensor in weight_bank.tensors.values()):
-            raise ValueError("all inherited V4.1 host buffers must be shared before worker creation")
-
-        inherited = tuple(weight_bank.tensors.values()) + inherited
+        if weight_bank is not None:
+            weight_bank.finish(weight_param_names)
+            inherited = tuple(weight_bank.tensors.values()) + inherited
         with ExitStack() as sources:
             worker_kwargs = {}
             if engram_host is not None:
@@ -2929,7 +2925,7 @@ class V41ResidentResources:
             self.worker = worker_factory(programs, run_config, inherited, **worker_kwargs)
             self._window_sources = sources.pop_all()
         self.run_config = run_config
-        self.host_resources = (weight_bank, input_host, decode_input_host, prefill_host, decode_host,
+        self.host_resources = (input_host, decode_input_host, prefill_host, decode_host,
                                final_host, dspark_host_resources, state_reset, page_resets)
         self.prefill_host = prefill_host
         self.engram_host = engram_host
@@ -2953,7 +2949,6 @@ class V41ResidentResources:
         self._first_dispatches = set()
         self._decode_head_program = decode_head_program
         self._decode_head_param_names = tuple(decode_head_param_names)
-        self._weight_bank = weight_bank
         self._weight_param_names = tuple(weight_param_names)
         self._prefill_binding = (prefill_program, prefill_param_names, run_config, prefill_host.topology)
         self.dspark_programs = dict(dspark_programs or {})
@@ -2977,8 +2972,10 @@ class V41ResidentResources:
         self.failed = False
         self.closed = False
         try:
-            self.weights = ResidentFullDecodeWeights(
-                self.worker, weight_bank, weight_param_names)
+            with closing(weight_slices):
+                self.weights = ResidentFullDecodeWeights(
+                    self.worker, weight_layout, weight_param_names, weight_slices)
+            _log_host_memory("backbone upload")
             self.input = self._own(InputStateRuntime(self.worker, input_host))
             self.decode_input = (None if decode_input_host is None else
                                  self._own(InputStateRuntime(self.worker, decode_input_host)))
@@ -3033,7 +3030,7 @@ class V41ResidentResources:
                     )
                 self.dspark_weights = self._own(
                     ResidentDSparkWeights(self.worker, dspark_weight_contract.loader.model_dir,
-                                          topology.world, native_moe=weight_bank.layout.native_moe)
+                                          topology.world, native_moe=weight_layout.native_moe)
                 )
                 self.dspark_embedding = self._own(
                     ResidentDSparkEmbedding(self.worker, dspark_weight_contract.loader.model_dir,
@@ -3059,6 +3056,8 @@ class V41ResidentResources:
                     group = getattr(plan.family_groups, family)
                     if decode_host.compressed_pages[family] < plan.physical_group_blocks[group]:
                         raise ValueError(f"decode {family} metadata must cover the filler page")
+            if weight_bank is not None:
+                self.worker.release_inherited_host_tensor_refs()
         except BaseException:
             self.close()
             raise
@@ -4053,42 +4052,27 @@ def prefill_ring_heap(capacity):
     return (2 << 30, attention_heap, 2 << 30, (6 << 30) - attention_heap)
 
 
-def _stage_decode_weight_bank(model_dir, layout, topology, decode_names):
-    bank_started = time.perf_counter()
-    bank = load_prepacked_bank(model_dir, layout, decode_names)
-    if bank is None:
-        bank = DecodeWeightBank(layout)
-        append_seconds = 0.0
-        layer_started = time.perf_counter()
-        parallel_experts = topology.dp in (4, 8)
-        previous_threads = torch.get_num_threads()
-        if parallel_experts and previous_threads < 8:
-            torch.set_num_threads(8)
-        try:
-            for item in iter_decode_weight_slices(
-                    model_dir, topology, parallel_experts=parallel_experts, bank=bank):
-                append_started = time.perf_counter()
-                bank.append(item)
-                append_seconds += time.perf_counter() - append_started
+def _stream_decode_weight_slices(model_dir, layout, topology):
+    started = time.perf_counter()
+    previous_threads = torch.get_num_threads()
+    if previous_threads < 8:
+        torch.set_num_threads(8)
+    try:
+        with closing(iter_decode_weight_slices(
+            model_dir, topology, parallel_experts=True, native_moe=layout.native_moe,
+        )) as slices:
+            for item in slices:
+                yield item
                 if item.name == "hc_attn_fn":
-                    now = time.perf_counter()
-                    _LOG.info("V4.1 checkpoint layer %d/%d loaded into shared weight bank (%.2fs)",
-                              item.slot + 1, layout.layers, now - layer_started)
-                    layer_started = now
-        finally:
-            if parallel_experts and previous_threads < 8:
-                torch.set_num_threads(previous_threads)
-        bank.finish(decode_names)
-        _LOG.info("V4.1 checkpoint staging %.2fs (bank copies %.2fs)",
-                  time.perf_counter() - bank_started, append_seconds)
-        peak_rss = peak_rss_bytes()
-        if peak_rss is not None:
-            _LOG.info("V4.1 checkpoint staging peak RSS %.1f GiB",
-                      peak_rss / (1 << 30))
-    _LOG.info("V4.1 shared weight bank ready: %.1f GiB",
-              bank.allocated_bytes / (1 << 30))
-    _log_host_memory("weight staging")
-    return bank
+                    _LOG.info("V4.1 checkpoint layer %d/%d uploaded", item.slot + 1, layout.layers)
+                del item
+    finally:
+        if previous_threads < 8:
+            torch.set_num_threads(previous_threads)
+    _LOG.info("V4.1 streamed backbone weight load and upload %.2fs", time.perf_counter() - started)
+    peak_rss = peak_rss_bytes()
+    if peak_rss is not None:
+        _LOG.info("V4.1 streamed backbone upload peak RSS %.1f GiB", peak_rss / (1 << 30))
 
 
 def make_production_bindings(
@@ -4164,30 +4148,20 @@ def make_production_bindings(
             raise ValueError("V4.1 checkpoint source axes disagree with the selected lib")
         DecodeWeightBank.validate_abi(decode_names)
 
-        # Keep JIT and its topology-specific imports on the worker's main
-        # thread. Staging needs only the checkpoint and the validated weight ABI.
         startup_started = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="v41-weights") as staging:
-            bank_future = staging.submit(_stage_decode_weight_bank, model_dir, layout, topology, decode_names)
-            if runtime.num_speculative_tokens:
-                decode = None
-                decode_counts_are_tensor = False
-                dspark_programs, dspark_param_names = compile_decode_fwd_dspark(
-                    compiler, root, topology)
-            else:
-                decode, decode_counts_are_tensor = compile_decode_fwd(compiler, decode_entry, topology)
-                dspark_programs, dspark_param_names = {}, {}
-            prefill, prefill_names = compile_prefill_fwd(compiler, root, prefill_topology)
-            head_entry = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd").l3_generation_head
-            decode_head_param_names = tuple(head_entry.param_names)
-            decode_head = compiler.compile("v41_generation_head", head_entry)
-            compile_finished = time.perf_counter()
-            _log_host_memory("JIT")
-            bank = bank_future.result()
-        startup_finished = time.perf_counter()
-        _LOG.info("V4.1 kernel preparation and checkpoint staging %.2fs (JIT %.2fs, wait for weights %.2fs)",
-                  startup_finished - startup_started, compile_finished - startup_started,
-                  startup_finished - compile_finished)
+        if runtime.num_speculative_tokens:
+            decode = None
+            decode_counts_are_tensor = False
+            dspark_programs, dspark_param_names = compile_decode_fwd_dspark(compiler, root, topology)
+        else:
+            decode, decode_counts_are_tensor = compile_decode_fwd(compiler, decode_entry, topology)
+            dspark_programs, dspark_param_names = {}, {}
+        prefill, prefill_names = compile_prefill_fwd(compiler, root, prefill_topology)
+        head_entry = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd").l3_generation_head
+        decode_head_param_names = tuple(head_entry.param_names)
+        decode_head = compiler.compile("v41_generation_head", head_entry)
+        _LOG.info("V4.1 kernel preparation %.2fs", time.perf_counter() - startup_started)
+        _log_host_memory("JIT")
 
         rope = importlib.import_module("models.deepseek_v4_1_flash.rope_tables")
         swa_tables = rope.precompute_rope_tables(max_seq_len, False)
@@ -4251,9 +4225,13 @@ def make_production_bindings(
             if program is not None:
                 programs_by_id.setdefault(id(program.compiled), program)
         programs = tuple(programs_by_id.values())
+        bank = load_prepacked_bank(model_dir, layout, decode_names)
+        weight_slices = (bank.iter_slices() if bank is not None
+                         else _stream_decode_weight_slices(model_dir, layout, topology))
         resident_started = time.perf_counter()
         resident = V41ResidentResources(
-            programs, run_config, weight_bank=bank, weight_param_names=decode_names,
+            programs, run_config, weight_bank=bank, weight_layout=layout,
+            weight_slices=weight_slices, weight_param_names=decode_names,
             cache_plan=cache_plan, state_reset=state_reset, page_resets=resets,
             input_host=input_host, decode_input_host=decode_input_host,
             prefill_host=prefill_host, decode_host=decode_host,
@@ -4268,6 +4246,7 @@ def make_production_bindings(
             decode_head_program=decode_head,
             decode_head_param_names=decode_head_param_names,
         )
+        del bank
         _LOG.info("V4.1 resident upload and allocation %.2fs",
                   time.perf_counter() - resident_started)
         _log_host_memory("resident upload")

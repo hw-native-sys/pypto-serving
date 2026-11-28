@@ -174,13 +174,17 @@ class RequestLedger:
     def _validate_page_ownership(self, slices):
         """Retain full-history pages even when their owner is absent this step.
 
-        There is no cache relocation/copy contract in this adapter. Continuations
-        may append pages, but cannot replace or drop their committed prefix.
-        Validate before reserving slots or exposing an in-flight transaction.
+        Continuations must preserve their committed full-history pages. For a
+        scheduled request, the scheduler may rotate its sliding window and
+        reassign a retired page within the same batch. Validate sliding-window
+        ownership against the new tables for scheduled requests.
         """
+        scheduled = {request.request_id for request in slices}
         occupied = {}
         for key, owner in self.owners.items():
             for group, pages in owner.pages.items():
+                if key in scheduled and group in self.sliding_groups:
+                    continue
                 for index, page in enumerate(pages):
                     immutable = group not in self.sliding_groups and (index + 1) * 128 <= max(owner.length, owner.shared_prefix_tokens)
                     occupied.setdefault((owner.partition, group, page), []).append((key, immutable, index))
