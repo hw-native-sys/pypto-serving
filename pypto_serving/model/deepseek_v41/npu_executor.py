@@ -30,6 +30,7 @@ from pypto_serving.model.common.executor.executor import ModelExecutor
 from pypto_serving.model.model_family import is_deepseek_v41_config, read_model_config
 from pypto_serving.model.model_loader import SafetensorsDirectoryLoader, _build_layer_specs
 from pypto_serving.model.tokenizer import load_tokenizer
+from pypto_serving.tools.profile import profile_invocation
 
 from .npu_runner import (
     MAX_PREFILL_TOKENS_PER_DP,
@@ -211,7 +212,8 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         return self.runners[model.config.model_id].lookup_embeddings(token_ids)
 
     def run_prefill(self, model, batch):
-        return self.runners[model.config.model_id].run_prefill(model, batch)
+        with profile_invocation(getattr(batch, "invocation", None)):
+            return self.runners[model.config.model_id].run_prefill(model, batch)
 
     @property
     def supports_device_sampling(self) -> bool:
@@ -224,7 +226,8 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
         return None
 
     def run_decode(self, model, batch):
-        return self.runners[model.config.model_id].run_decode(model, batch)
+        with profile_invocation(getattr(batch, "invocation", None)):
+            return self.runners[model.config.model_id].run_decode(model, batch)
 
     def run_dspark_prefill_batch(self, batch: PrefillBatch):
         """Dispatch serving-owned, already-lowered DSpark bootstrap stages."""
@@ -232,7 +235,8 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
             raise RuntimeError("V4.1 DSpark runner is not registered")
         if len(self.runners) != 1:
             raise RuntimeError("V4.1 DSpark batch dispatch requires one registered model")
-        return next(iter(self.runners.values())).run_dspark_prefill_batch(batch)
+        with profile_invocation(getattr(batch, "invocation", None)):
+            return next(iter(self.runners.values())).run_dspark_prefill_batch(batch)
 
     def lower_dspark_prefill_batch(
         self, model: RuntimeModel, batch: PrefillBatch, *,
@@ -255,7 +259,8 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
             raise RuntimeError("V4.1 DSpark runner is not registered")
         if len(self.runners) != 1:
             raise RuntimeError("V4.1 DSpark batch dispatch requires one registered model")
-        result = next(iter(self.runners.values())).run_dspark_decode_batch(batch)
+        with profile_invocation(getattr(batch, "invocation", None)):
+            result = next(iter(self.runners.values())).run_dspark_decode_batch(batch)
         if not isinstance(result, DecodeResult):
             raise TypeError("V4.1 DSpark runner must return DecodeResult")
         return result

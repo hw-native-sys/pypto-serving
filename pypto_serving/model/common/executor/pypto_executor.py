@@ -18,6 +18,7 @@ from .executor import ModelExecutor
 from pypto_serving.config.types import (
     DecodeBatch,
     DecodeResult,
+    DispatchInvocation,
     ModelRecord,
     PrefillBatch,
     PrefillResult,
@@ -26,7 +27,7 @@ from pypto_serving.config.types import (
 )
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
-from pypto_serving.tools.profile import profile_span
+from pypto_serving.tools.profile import profile_invocation, profile_span
 
 
 logger = logging.getLogger(__name__)
@@ -38,12 +39,14 @@ class _PendingRunnerDecode:
 
     model_id: str
     pending: object
+    invocation: DispatchInvocation | None
 
 
 @dataclass(frozen=True)
 class _PendingRunnerPrefill:
     model_id: str
     pending: object
+    invocation: DispatchInvocation | None
 
     @property
     def wait_for_scratch(self) -> Callable[[], None] | None:
@@ -101,12 +104,13 @@ class PyptoExecutor(ModelExecutor, ABC):
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         """Delegate prefill execution to the registered model runner."""
-        with profile_span(
+        runner = self._runners[model.config.model_id]
+        with profile_invocation(getattr(batch, "invocation", None)), profile_span(
             "PyptoExecutor.run_prefill",
             cat="executor",
             args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)},
         ):
-            return self._runners[model.config.model_id].run_prefill(model, batch)
+            return runner.run_prefill(model, batch)
 
     @property
     def supports_async_prefill_reclaim(self) -> bool:
@@ -122,27 +126,35 @@ class PyptoExecutor(ModelExecutor, ABC):
 
     def prepare_prefill(self, model: RuntimeModel, batch: PrefillBatch, *, buffer_slot: int) -> object:
         runner = self._runners[model.config.model_id]
-        with profile_span("PyptoExecutor.prepare_prefill", cat="executor"):
+        with profile_invocation(getattr(batch, "invocation", None)), profile_span(
+            "PyptoExecutor.prepare_prefill", cat="executor",
+        ):
             return runner.prepare_prefill(model, batch, buffer_slot=buffer_slot)
 
     def dispatch_prepared_prefill(self, model: RuntimeModel, batch: PrefillBatch, prepared: object) -> object:
         runner = self._runners[model.config.model_id]
-        with profile_span("PyptoExecutor.dispatch_prepared_prefill", cat="executor"):
-            return _PendingRunnerPrefill(model.config.model_id, runner.dispatch_prepared_prefill(model, batch, prepared))
+        invocation = getattr(batch, "invocation", None)
+        with profile_invocation(invocation), profile_span("PyptoExecutor.dispatch_prepared_prefill", cat="executor"):
+            pending = runner.dispatch_prepared_prefill(model, batch, prepared)
+            return _PendingRunnerPrefill(model.config.model_id, pending, invocation)
 
     def reclaim_prepared_prefill(self, pending: object) -> PrefillResult:
         if not isinstance(pending, _PendingRunnerPrefill):
             return super().reclaim_prepared_prefill(pending)
         runner = self._runners[pending.model_id]
-        with profile_span("PyptoExecutor.reclaim_prepared_prefill", cat="executor"):
+        with profile_invocation(pending.invocation), profile_span(
+            "PyptoExecutor.reclaim_prepared_prefill", cat="executor",
+        ):
             return runner.reclaim_prepared_prefill(pending.pending)
 
     def run_prefill_in_slot(
         self, model: RuntimeModel, batch: PrefillBatch, *, buffer_slot: int, prepared: object | None = None,
     ) -> PrefillResult:
         runner = self._runners[model.config.model_id]
-        with profile_span("PyptoExecutor.run_prefill", cat="executor",
-                          args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)}):
+        with profile_invocation(getattr(batch, "invocation", None)), profile_span(
+            "PyptoExecutor.run_prefill", cat="executor",
+            args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)},
+        ):
             return runner.run_prefill_in_slot(model, batch, buffer_slot=buffer_slot, prepared=prepared)
 
     def finalize_prefill(
@@ -165,12 +177,13 @@ class PyptoExecutor(ModelExecutor, ABC):
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
         """Delegate decode execution to the registered model runner."""
-        with profile_span(
+        runner = self._runners[model.config.model_id]
+        with profile_invocation(getattr(batch, "invocation", None)), profile_span(
             "PyptoExecutor.run_decode",
             cat="executor",
             args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)},
         ):
-            return self._runners[model.config.model_id].run_decode(model, batch)
+            return runner.run_decode(model, batch)
 
     @property
     def supports_async_decode_prepare(self) -> bool:
@@ -193,7 +206,7 @@ class PyptoExecutor(ModelExecutor, ABC):
         prepare = getattr(runner, "prepare_decode", None)
         if not callable(prepare):
             return super().prepare_decode(model, batch, buffer_slot=buffer_slot)
-        with profile_span(
+        with profile_invocation(getattr(batch, "invocation", None)), profile_span(
             "PyptoExecutor.prepare_decode",
             cat="executor",
             args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)},
@@ -211,7 +224,7 @@ class PyptoExecutor(ModelExecutor, ABC):
         execute = getattr(runner, "run_prepared_decode", None)
         if not callable(execute):
             return super().run_prepared_decode(model, batch, prepared)
-        with profile_span(
+        with profile_invocation(getattr(batch, "invocation", None)), profile_span(
             "PyptoExecutor.run_prepared_decode",
             cat="executor",
             args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)},
@@ -239,7 +252,8 @@ class PyptoExecutor(ModelExecutor, ABC):
         dispatch = getattr(runner, "dispatch_prepared_decode", None)
         if not callable(dispatch):
             return super().dispatch_prepared_decode(model, batch, prepared)
-        with profile_span(
+        invocation = getattr(batch, "invocation", None)
+        with profile_invocation(invocation), profile_span(
             "PyptoExecutor.dispatch_prepared_decode",
             cat="executor",
             args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)},
@@ -247,6 +261,7 @@ class PyptoExecutor(ModelExecutor, ABC):
             return _PendingRunnerDecode(
                 model_id=model.config.model_id,
                 pending=dispatch(model, batch, prepared),
+                invocation=invocation,
             )
 
     def reclaim_prepared_decode(self, pending: object) -> DecodeResult:
@@ -257,7 +272,7 @@ class PyptoExecutor(ModelExecutor, ABC):
         reclaim = getattr(runner, "reclaim_prepared_decode", None)
         if not callable(reclaim):
             return super().reclaim_prepared_decode(pending)
-        with profile_span(
+        with profile_invocation(pending.invocation), profile_span(
             "PyptoExecutor.reclaim_prepared_decode",
             cat="executor",
             args={"model_id": pending.model_id},

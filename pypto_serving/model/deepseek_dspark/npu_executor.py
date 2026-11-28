@@ -436,10 +436,13 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
         rope: DSparkRopeTables | None = None
         if self._compile_kernels:
             modules = self._load_kernel_modules(layout, speculative=speculative)
+            attention_kinds = tuple(layer.attention_kind for layer in layer_plan)
+            layer_ids = tuple(layer.layer_id for layer in layer_plan)
             if self._execution_role != "decode":
                 prefill = self._compile_l3_callable(
                     "dspark_prefill", modules["prefill_fwd"].l3_prefill_fwd,
                 )
+                self._mark_attention_semantics(prefill, attention_kinds, layer_ids)
             if prefill_device_tail:
                 prefill_capture = self._compile_l3_callable(
                     "dspark_prefill_capture", modules["prefill_state"].l3_capture_prefill_tail
@@ -457,10 +460,12 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                     "dspark_decode_one_l2",
                     modules["decode_fwd_dspark"].l3_decode_fwd_dspark,
                 )
+                self._mark_attention_semantics(decode, attention_kinds, layer_ids)
             elif self._execution_role != "prefill":
                 decode = self._compile_l3_callable(
-                    "dspark_decode", modules["decode_fwd"].l3_decode_fwd
+                    "dspark_decode", modules["decode_fwd"].l3_decode_fwd,
                 )
+                self._mark_attention_semantics(decode, attention_kinds, layer_ids)
             if device_bootstrap:
                 bootstrap_tokens = self._compile_l3_callable(
                     "dspark_bootstrap_tokens", modules["prefill_bootstrap"].l3_prepare_bootstrap_tokens
@@ -612,10 +617,36 @@ class DeepSeekV4DSparkPyptoExecutor(CorePyptoExecutor):
                     raise ValueError(f"DSpark Lib {name}={actual} does not match Serving capacity={expected}")
         return modules
 
-    def _compile_l3_callable(self, name: str, jit_fn: object):
+    def _compile_l3_callable(
+        self,
+        name: str,
+        jit_fn: object,
+        *,
+        semantic_scope: str | None = None,
+        attention_kinds: tuple[str, ...] = (),
+        layer_ids: tuple[int, ...] = (),
+    ):
         """Compile one fully annotated DSpark HOST wrapper."""
         with profile_span(f"DeepSeekV4DSparkPyptoExecutor.compile.{name}", cat="executor"):
-            return self._compiler.compile(name, jit_fn)
+            metadata = {}
+            if semantic_scope is not None:
+                metadata["semantic_scope"] = semantic_scope
+            if attention_kinds:
+                metadata["attention_kinds"] = attention_kinds
+            if layer_ids:
+                metadata["layer_ids"] = layer_ids
+            return self._compiler.compile(name, jit_fn, **metadata)
+
+    @staticmethod
+    def _mark_attention_semantics(
+        callable_spec,
+        attention_kinds: tuple[str, ...],
+        layer_ids: tuple[int, ...],
+    ) -> None:
+        """Attach the explicit fused attention boundary to a compiled handle."""
+        callable_spec.semantic_scope = "attention_block_v1"
+        callable_spec.attention_kinds = attention_kinds
+        callable_spec.layer_ids = layer_ids
 
     def _build_rope_tables(
         self,

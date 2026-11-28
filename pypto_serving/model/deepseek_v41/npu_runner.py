@@ -32,7 +32,7 @@ from typing import Callable
 
 import torch
 
-from pypto_serving.tools.profile import profile_span
+from pypto_serving.tools.profile import invocation_profile_args, profile_span
 
 from pypto_serving.config.types import DecodeResult, KVCacheGroupSpec, PrefillResult, SamplingParams
 from pypto_serving.model.common.runner.buffer_set import alloc_device_buffer
@@ -1296,7 +1296,9 @@ class DecodeForwardSegment:
             previous_reset = self.worker._reset_persistent_windows
             self.worker._reset_persistent_windows = False
             try:
-                with profile_span("v41.worker.run", cat="v41.host", level="verbose"):
+                with profile_span(
+                    "v41.worker.run", cat="v41.host", level="verbose", args=invocation_profile_args(),
+                ):
                     self.worker.run(self.program.compiled,
                                     *(bound[name] for name in self.param_names), config=self.run_config)
             except BaseException:
@@ -2559,7 +2561,9 @@ class PrefillForwardSegment:
             self.worker._reset_persistent_windows = False
             try:
                 arguments = self.arguments if sampling_inputs is None else {**self.arguments, **sampling_inputs}
-                with profile_span("v41.worker.run", cat="v41.host", level="verbose"):
+                with profile_span(
+                    "v41.worker.run", cat="v41.host", level="verbose", args=invocation_profile_args(),
+                ):
                     self.worker.run(self.program.compiled,
                                     *(arguments[name] for name in self.param_names),
                                     config=self.run_config)
@@ -3504,11 +3508,12 @@ class V41ResidentResources:
         head_arguments = dict(self._decode_head_arguments, x_hc=state.residual, pre_mix=state.pre_mix)
         if step.sampling_params:
             head_arguments.update(self._stage_output_sampling(step), logits=self.final.device_logits)
-        self.worker.run(
-            self._decode_head_program.compiled,
-            *(head_arguments[name] for name in self._decode_head_param_names),
-            config=self.run_config,
-        )
+        with profile_span("v41.worker.run", cat="v41.host", level="verbose", args=invocation_profile_args()):
+            self.worker.run(
+                self._decode_head_program.compiled,
+                *(head_arguments[name] for name in self._decode_head_param_names),
+                config=self.run_config,
+            )
         return state
 
     def dispatch_dspark(self, stage, arguments):
@@ -3563,7 +3568,9 @@ class V41ResidentResources:
                 previous_reset = self.worker._reset_persistent_windows
                 self.worker._reset_persistent_windows = True
             try:
-                with profile_span("v41.worker.run", cat="v41.host", level="verbose"):
+                with profile_span(
+                    "v41.worker.run", cat="v41.host", level="verbose", args=invocation_profile_args(),
+                ):
                     self.worker.run(program.compiled,
                                     *(bound[name] for name in param_names), config=self.run_config)
             finally:

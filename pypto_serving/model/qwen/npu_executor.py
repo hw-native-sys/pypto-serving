@@ -284,8 +284,14 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         sampled_ids_width = int(getattr(qwen3_decode_fwd, "SAMPLED_IDS_PAD", 1))
         page_size = model.runtime.page_size
         max_blocks_per_seq = (model.runtime.max_seq_len + page_size - 1) // page_size
-        prefill = self._compile_jit_fwd_callable("prefill_fwd", prefill_host)
-        decode = self._compile_jit_fwd_callable("decode_fwd", qwen3_decode_fwd.qwen3_decode_host)
+        layer_ids = tuple(range(model.config.num_hidden_layers))
+        prefill = self._compile_jit_fwd_callable(
+            "prefill_fwd", prefill_host, semantic_scope="attention_block_v1", layer_ids=layer_ids
+        )
+        decode = self._compile_jit_fwd_callable(
+            "decode_fwd", qwen3_decode_fwd.qwen3_decode_host,
+            semantic_scope="attention_block_v1", layer_ids=layer_ids,
+        )
         topk_select = self._compile_jit_fwd_callable(
             "topk_select_fwd", qwen3_topk_select.qwen3_topk_select_host
         )
@@ -346,6 +352,10 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         self,
         name: str,
         jit_fn: object,
+        *,
+        semantic_scope: str | None = None,
+        attention_kinds: tuple[str, ...] = (),
+        layer_ids: tuple[int, ...] = (),
     ) -> _L3Callable:
         """Compile a HOST wrapper into a PyPTO DistributedCompiledProgram.
 
@@ -354,7 +364,14 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         cache fast-path and the JIT compile are both handled by the shared
         :class:`KernelCompiler`.
         """
-        return self._compiler.compile(name, jit_fn)
+        metadata = {}
+        if semantic_scope is not None:
+            metadata["semantic_scope"] = semantic_scope
+        if attention_kinds:
+            metadata["attention_kinds"] = attention_kinds
+        if layer_ids:
+            metadata["layer_ids"] = layer_ids
+        return self._compiler.compile(name, jit_fn, **metadata)
 
     @classmethod
     def _stage_stacked_decode_weights(cls, model: RuntimeModel) -> dict[str, torch.Tensor]:
