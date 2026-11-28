@@ -135,3 +135,24 @@ def test_equal_prefix_loads_rotate_after_release():
         selected.append(partition)
         manager.release_all_group_requests("hit")
     assert selected == [0, 1, 0, 1]
+
+
+def test_decode_reservation_skips_prefix_without_suffix_capacity():
+    manager = KvCacheManager(enable_dplb=True)
+    manager.init_groups((KVCacheGroupSpec(
+        "kv", (0,), KVCacheSpec(16, 16, 1), 4, num_partitions=2, num_blocks=4,
+    ),), max_batch_size=1)
+    hashes = manager.compute_group_block_hashes(list(range(33)))
+    for partition, length in enumerate((48, 64)):
+        request = f"seed-{partition}"
+        allocate(manager, request, length, partition)
+        manager.cache_group_blocks(request, hashes, 32, {})
+    assert [manager.group_num_free_blocks("kv", group) for group in (0, 1)] == [1, 0]
+
+    reservation = manager.reserve_group_cache(
+        "incoming", "incoming", 34, prompt_token_count=33,
+        prefix_block_hashes=hashes, shareable_group_names=("kv",),
+    )
+
+    assert (reservation.partition, reservation.prefix_hit_tokens) == (0, 32)
+    assert len(reservation.block_ids_by_group["kv"]) == 3

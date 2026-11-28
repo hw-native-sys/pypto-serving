@@ -121,6 +121,7 @@ class GroupedCacheReservations:
                     shareable_group_names=shareable_group_names,
                     partition=partition,
                     load_tokens=prompt_tokens,
+                    allocation_tokens=prompt_tokens,
                 )
                 if prefix_hit_tokens:
                     # A cached page may otherwise have only this request as an

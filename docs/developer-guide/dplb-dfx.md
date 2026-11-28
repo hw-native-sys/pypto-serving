@@ -75,9 +75,10 @@ UIDs are not joins between independent captures.
 | `load_baseline`, `request_baseline` | Existing grouped load and scheduler requests at capture start. |
 | `request_arrived`, `request_terminal` | Scheduler arrival and final completion, cancellation, rejection, or reservation rollback. |
 | `prefix_lookup` | Results of the allocator's actual prefix search, including unexamined candidates. |
+| `prefix_restore` | Prefix selection that starts or joins a DDR LOAD, with the selected group and candidate restore sizes. |
 | `placement_commit` | Successful cache ownership; `commit_scope=cache_ownership` can precede scheduling or be rolled back. |
 | `placement_failed` | Allocation raised before a placement commit; follow release/rollback events if ownership was partially allocated. |
-| `owner_change` | Acquisition, growth, baseline ownership, or release, with the resulting group load. |
+| `owner_change` | Acquisition, baseline ownership, and release include group snapshots. Growth includes the owner group and previous and current logical lengths. |
 | `reservation_change` | Reserved, adopted, quarantined, or released reservation state. |
 | `profile_control_ack` | Worker acknowledged the existing ordered start-profile command. |
 
@@ -93,12 +94,18 @@ blocks, tokens per block, and table limit. `feasible` and `exclusion_reasons`
 describe existing ownership, explicit partition constraints, scheduler partition
 limits, request-slot limits, KV capacity, and table capacity. PD Prefill uses
 `scheduler_partition_limit` for groups unavailable to the current step.
-`candidates` lists the groups eligible for allocation ranking. Prefix lookup has
-`feasibility_scope=prefix_request_limit_only`: cold-allocation capacity is
-evaluated when growing the chosen prefix ownership. `prefix_status` and
+`candidates` lists the groups considered for ranking. Prefill prefix lookup uses
+`feasibility_scope=prefix_request_limit_only`. Decode reservation uses
+`feasibility_scope=prefix_allocation` and checks how many pages the prefix and
+remaining prompt need before acquiring ownership. `prefix_status` and
 `required_status` explicitly distinguish unexamined values from measured zero.
 Diagnostics reuse the policy's ranking and prefix lookup; they do not run a
 second prefix search.
+
+For equal-length prefix matches, tiered lookup prefers the match with the fewest
+bytes to restore and uses DPLB order for equal restore sizes. `prefix_restore`
+records that choice before acquisition. Join it to the later `prefix_lookup`
+using `request_uid` to see both decisions when load changes during the copy.
 
 Logical load is `max(allocation_tokens, full_prompt_tokens)` per owner. It
 includes a complete chunked-prefill prompt, then grows with the context.

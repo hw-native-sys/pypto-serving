@@ -75,6 +75,36 @@ def test_default_off_does_not_construct_collector_or_observations(monkeypatch):
     manager.release_all_group_requests("plain")
 
 
+def test_successful_growth_emits_owner_delta_without_snapshot(capture, monkeypatch):
+    manager = cache()
+    manager.dplb_dfx = capture
+    manager.ensure_group_blocks("incoming", 16, partition=1)
+    snapshots = []
+    group_snapshot = manager._dfx_groups
+
+    def track_snapshot(*args):
+        snapshots.append(args)
+        return group_snapshot(*args)
+
+    monkeypatch.setattr(manager, "_dfx_groups", track_snapshot)
+    manager.ensure_group_blocks("incoming", 32, partition=1)
+    assert not snapshots
+    with pytest.raises(KVCacheCapacityError):
+        manager.ensure_group_blocks("incoming", 4097, partition=1)
+    assert snapshots == [("incoming", 4097)]
+
+    events = records(capture)
+    growth, = [event for event in events if event.get("action") == "updated"]
+    assert growth["group_id"] == 1
+    assert growth["previous_logical_tokens"] == 16
+    assert growth["logical_tokens"] == 32
+    assert "groups" not in growth
+    failed, = [event for event in events if event["event"] == "placement_failed"]
+    assert failed["owner_present_on_failure"]
+    assert failed["groups"][1]["sum_logical_tokens"] == 32
+    assert growth["request_uid"] == failed["request_uid"]
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_capture_preserves_choices_tables_and_rotation(capture, enabled):
     observed, plain = cache(enabled), cache(enabled)
