@@ -12,24 +12,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, fields
-from enum import Enum
-
-
-class ProgressTTLMode(str, Enum):
-    OFF = "off"
-    ON = "on"
-    AUTO = "auto"
-
-
-class ProgressTTLResumeOrder(str, Enum):
-    FCFS = "fcfs"
-    MRU = "mru"
 
 
 @dataclass(frozen=True)
 class ProgressTTLConfig:
-    mode: ProgressTTLMode = ProgressTTLMode.ON
-    resume_order: ProgressTTLResumeOrder = ProgressTTLResumeOrder.MRU
     resume_reclaim_acting_programs: bool = True
     resume_capacity_ratio: float = 1.0
     pause_capacity_ratio: float = 1.0
@@ -55,9 +41,6 @@ class ProgressTTLConfig:
     decode_step_seconds_per_context_token: float = 2.2516e-7
     shared_prefix_freshness_kv_turnovers: float = 2.0
     shared_prefix_freshness_warmup_seconds: float = 100.0
-    auto_disable_utility_seconds: float = 5.0
-    auto_enable_utility_seconds: float = 20.0
-
     # Bounded queue latency and optional access to reserved headroom.
     force_resume_timeout_min_seconds: float = 30.0
     force_resume_timeout_max_seconds: float = 300.0
@@ -91,12 +74,12 @@ class ProgressTTLConfig:
             value = getattr(self, key)
             if value is None and key == "resume_wait_relax_seconds":
                 continue
-            if isinstance(default, (Enum, bool)) or type(default) is int:
+            if isinstance(default, bool) or type(default) is int:
                 if type(value) is not type(default):
                     raise ValueError(f"invalid type for {key}")
             elif isinstance(value, bool) or not isinstance(value, (float, int)):
                 raise ValueError(f"{key} must be a number")
-            if isinstance(value, (Enum, bool)):
+            if isinstance(value, bool):
                 continue
             if not math.isfinite(value) or value < 0 or (key in positive_fields and value == 0):
                 raise ValueError(f"invalid value for {key}")
@@ -105,7 +88,6 @@ class ProgressTTLConfig:
         for lower, upper in (
             ("ttl_min_seconds", "ttl_max_seconds"),
             ("force_resume_timeout_min_seconds", "force_resume_timeout_max_seconds"),
-            ("auto_disable_utility_seconds", "auto_enable_utility_seconds"),
         ):
             if getattr(self, lower) > getattr(self, upper):
                 raise ValueError(f"{lower} must not exceed {upper}")

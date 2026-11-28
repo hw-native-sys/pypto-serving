@@ -13,7 +13,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from math import isfinite
 
 
 class ProgramState(str, Enum):
@@ -142,23 +141,6 @@ class SchedulingEvent:
 
     def field(self, name: str) -> DiagnosticValue:
         return self.fields.get(name)
-
-
-@dataclass(frozen=True)
-class StrategyDiagnostic:
-    name: str
-    reason: str
-    fields: tuple[tuple[str, DiagnosticValue], ...]
-
-
-@dataclass(frozen=True)
-class SchedulerObservabilityConfig:
-    enabled: bool = False
-    log_interval_seconds: float = 5.0
-
-    def __post_init__(self) -> None:
-        if not isfinite(self.log_interval_seconds) or self.log_interval_seconds <= 0:
-            raise ValueError("the agent scheduler log interval must be positive and finite")
 
 
 class TransitionKind(str, Enum):

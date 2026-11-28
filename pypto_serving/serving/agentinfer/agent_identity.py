@@ -29,11 +29,9 @@ class AgentIdentity:
     blocks_parent: bool = False
     expected_resume: bool = True
     agent_role: str | None = None
-    spawn_reason: str | None = None
-    request_id: str | None = None
 
     def __post_init__(self) -> None:
-        for name in ("program_id", "task_id", "session_id", "agent_id", "parent_program_id", "request_id"):
+        for name in ("program_id", "task_id", "session_id", "agent_id", "parent_program_id"):
             value = getattr(self, name)
             if value is not None and not value.strip():
                 raise MetadataError(f"{name} must not be empty")
@@ -160,8 +158,6 @@ def _from_context(body: dict, client: dict[str, str]) -> AgentIdentity | None:
         blocks_parent=blocking,
         agent_role=role,
         expected_resume=_flag(body, "expected_resume", default=not (blocking and is_subagent)),
-        spawn_reason=_text(body, "spawn_reason", "subagent_type", "agent_type"),
-        request_id=_text(body, "request_id"),
     )
 
 

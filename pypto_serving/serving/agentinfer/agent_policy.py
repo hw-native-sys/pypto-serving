@@ -18,8 +18,6 @@ from typing import Callable
 
 from pypto_serving.serving.agentinfer.agent_policy_config import (
     ProgressTTLConfig,
-    ProgressTTLMode,
-    ProgressTTLResumeOrder,
 )
 from pypto_serving.serving.agentinfer.agent_policy_state import (
     AdmissionDisposition,
@@ -31,7 +29,6 @@ from pypto_serving.serving.agentinfer.agent_policy_state import (
     SchedulingEvent,
     SchedulingEventKind,
     SchedulingSnapshot,
-    StrategyDiagnostic,
     TransitionController,
     TransitionResult,
 )
@@ -96,58 +93,6 @@ class ProgressTTLStrategy:
             case SchedulingEventKind.PROGRAM_RELEASED:
                 self.on_program_released(factors, event)
 
-    def diagnostics(
-        self, snapshot: SchedulingSnapshot, factors: ProgressTTLFactors
-    ) -> tuple[StrategyDiagnostic, ...]:
-        active = self._active_programs(snapshot)
-        waiting = list(self._waiting_for_resume(snapshot))
-        stats = factors.global_factors
-        return (
-            StrategyDiagnostic(
-                "progress_ttl_capacity",
-                "schedule",
-                tuple(
-                    dict(
-                        active=len(active),
-                        waiting=len(waiting),
-                        remaining=self._remaining_tokens(snapshot, self.config.resume_capacity_ratio),
-                        request_throughput_per_second=stats.request_throughput_per_second,
-                        target_rounds=self._target_growth_rounds(factors),
-                    ).items()
-                ),
-            ),
-        )
-
-    def event_diagnostics(
-        self, event: SchedulingEvent, factors: ProgressTTLFactors
-    ) -> tuple[StrategyDiagnostic, ...]:
-        data = factors.for_program(event.program)
-        if data is None:
-            return ()
-        if event.kind is SchedulingEventKind.REQUEST_PENDING:
-            name = "progress_ttl_force_resume_armed"
-            facts = dict(
-                deadline=data.force_resume_deadline_monotonic_s,
-                timeout=data.force_resume_timeout_seconds,
-                active_rounds=data.force_resume_active_remaining_rounds,
-                queued_rounds=data.force_resume_pool_remaining_rounds,
-                requests_per_second=data.force_resume_request_throughput_per_second,
-            )
-        elif event.kind is SchedulingEventKind.REQUEST_FINISHED and data.ttl_deadline_monotonic_s is not None:
-            name = "progress_ttl_armed"
-            facts = dict(
-                deadline=data.ttl_deadline_monotonic_s,
-                ttl=data.previous_ttl_seconds,
-                reusable_tokens=data.segment_share_tokens,
-            )
-        else:
-            return ()
-        return (
-            StrategyDiagnostic(
-                name, event.reason, tuple(dict(program=event.program.program_id, **facts).items())
-            ),
-        )
-
     def shared_prefix_freshness_seconds(
         self,
         snapshot: SchedulingSnapshot,
@@ -174,8 +119,6 @@ class ProgressTTLStrategy:
         session = snapshot.program(candidate)
         if session is None:
             raise ValueError("missing session in admission snapshot")
-        if not self._transitions_enabled(factors):
-            return self._admit_without_pt(changes, session, snapshot.backend_id)
         self._reconcile_privileges(snapshot, factors)
         needed = self._required_tokens(session)
         active = tuple(self._active_programs(snapshot))
@@ -252,16 +195,7 @@ class ProgressTTLStrategy:
         strategy_factors: ProgressTTLFactors,
         transitions: TransitionController,
     ) -> None:
-        """Resume paused reasoning Programs while off, otherwise score-order reasoning Programs under capacity."""
-        if not self._transitions_enabled(strategy_factors):
-            # Paused sessions without a pending request remain subject to retention.
-            for session in snapshot.programs:
-                if (session.state, session.status) == (ProgramState.PAUSED, ProgramStatus.REASONING):
-                    result = transitions.resume(
-                        session.ref, backend_id=snapshot.backend_id, reason="progress_ttl_off_resume"
-                    )
-                    self._transition_applied(result)
-            return
+        """Resume paused reasoning Programs under the current capacity policy."""
         self._reconcile_privileges(snapshot, strategy_factors)
         remaining = self._remaining_tokens(snapshot, self.config.resume_capacity_ratio)
         active = self._active_programs(snapshot)
@@ -408,8 +342,6 @@ class ProgressTTLStrategy:
         state: ProgressTTLFactors,
         actions: TransitionController,
     ) -> None:
-        if not self._transitions_enabled(state):
-            return
         self._reconcile_privileges(snapshot, state)
         self._promote_progress_privileges(snapshot, state)
         available = self._remaining_tokens(snapshot, self.config.pause_capacity_ratio)
@@ -459,11 +391,7 @@ class ProgressTTLStrategy:
         completed: ProgramRef,
     ) -> None:
         session = snapshot.program(completed)
-        if (
-            not self._transitions_enabled(state)
-            or session is None
-            or session.status is not ProgramStatus.ACTING
-        ):
+        if session is None or session.status is not ProgramStatus.ACTING:
             return
         if session not in self._active_programs(snapshot):
             return
@@ -482,13 +410,10 @@ class ProgressTTLStrategy:
             self._require_applied(actions.pause(completed, reason="progress_ttl_max_round_queue_pressure"))
 
     def next_check_at(self, state: ProgressTTLFactors) -> float | None:
-        enabled = self._transitions_enabled(state)
         checks = []
         for _, timing in state.program_factors:
             if timing.release_deadline_monotonic_s is not None:
                 checks.append(timing.release_deadline_monotonic_s)
-            if not enabled and timing.ttl_expiry_observed:
-                continue
             if timing.acting_since_monotonic_s is not None:
                 checks.append(timing.acting_since_monotonic_s + self.config.ttl_max_seconds)
             if timing.ttl_deadline_monotonic_s is not None:
@@ -525,20 +450,11 @@ class ProgressTTLStrategy:
             reservation = self._program_factors(state, idle.ref)
             if not self._acting_ttl_due(idle, reservation, state, now):
                 continue
-            if self._transitions_enabled(state):
-                successor = self._expire_reservation(
-                    snapshot, state, actions, idle, reservation.is_privileged
-                )
-                if successor is not None:
-                    successors.add(successor)
-            elif not reservation.ttl_expiry_observed:
-                state.update(
-                    idle.ref,
-                    rounds_since_ttl_pause=0,
-                    ttl_expiry_observed=True,
-                    last_pause_at_monotonic_s=now,
-                    pause_reason="progress_ttl_theoretical_expired",
-                )
+            successor = self._expire_reservation(
+                snapshot, state, actions, idle, reservation.is_privileged
+            )
+            if successor is not None:
+                successors.add(successor)
         for waiting in snapshot.programs:
             if waiting.state is ProgramState.PAUSED and waiting.status is ProgramStatus.ACTING:
                 release_at = self._program_factors(state, waiting.ref).release_deadline_monotonic_s
@@ -666,10 +582,6 @@ class ProgressTTLStrategy:
                 maximum_seconds=self.config.ttl_max_seconds,
                 impact_ratio=self.config.ttl_max_cache_miss_impact_ratio,
             )
-        stats.update_continuity_mode(
-            enable_threshold_seconds=self.config.auto_enable_utility_seconds,
-            disable_threshold_seconds=self.config.auto_disable_utility_seconds,
-        )
 
     def on_program_paused(self, state: ProgressTTLFactors, event: SchedulingEvent) -> None:
         record = self._program_factors(state, event.program)
@@ -734,15 +646,13 @@ class ProgressTTLStrategy:
     def _resume_key(
         self, program: ProgramView, state: ProgressTTLFactors, now: float
     ) -> tuple[int, float, str, int]:
-        """Order forced and privileged waiters first, then apply the configured ordinary ordering."""
+        """Order forced and privileged waiters first, then prefer recently completed sessions."""
         factors = self._program_factors(state, program.ref)
         priority, time_key = recovery_order(
             forced=self._force_resume_due(program, state, now),
             privileged=factors.is_privileged,
             reasoning=program.status is ProgramStatus.REASONING,
             last_finished=factors.last_request_finished_at_monotonic_s,
-            wait_started=factors.request_wait_started_at_monotonic_s,
-            first_come_first_served=self.config.resume_order is ProgressTTLResumeOrder.FCFS,
         )
         return priority, time_key, program.ref.program_id, program.ref.generation
 
@@ -1024,28 +934,6 @@ class ProgressTTLStrategy:
             float(configured)
             if self.config.use_fixed_input_token_growth
             else max(0.0, state.global_factors.avg_input_token_growth_per_round)
-        )
-
-    def _transitions_enabled(self, state: ProgressTTLFactors) -> bool:
-        return {
-            ProgressTTLMode.ON: True,
-            ProgressTTLMode.OFF: False,
-            ProgressTTLMode.AUTO: state.global_factors.continuity_enabled,
-        }[self.config.mode]
-
-    def _admit_without_pt(
-        self, actions: TransitionController, session: ProgramView, backend: str
-    ) -> AdmissionOutcome:
-        demand = self._required_tokens(session)
-        if session.backend_id == backend and session.state is ProgramState.ACTIVE:
-            return AdmissionOutcome(AdmissionDisposition.ADMITTED, "progress_ttl_off_already_active", demand)
-        result = actions.admit(session.ref, backend_id=backend, reason="progress_ttl_off_direct")
-        if result.applied:
-            return AdmissionOutcome(
-                AdmissionDisposition.ADMITTED, result.reason, demand, transitioned_programs=(session.ref,)
-            )
-        return AdmissionOutcome(
-            AdmissionDisposition.QUEUED, "progress_ttl_off_direct_transition_rejected", demand
         )
 
     def _protected_min_segment_rounds(self, state: ProgressTTLFactors) -> int:

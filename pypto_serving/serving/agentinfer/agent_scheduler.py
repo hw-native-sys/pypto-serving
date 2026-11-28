@@ -27,12 +27,10 @@ from pypto_serving.serving.agentinfer.agent_policy_state import (
     ProgramState,
     ProgramStatus,
     ProgramView,
-    SchedulerObservabilityConfig,
     SchedulingEvent,
     SchedulingEventKind,
     SchedulingSnapshot,
     SharedPrefixAttribution,
-    StrategyDiagnostic,
     TokenObservationSource,
     TransitionController,
     TransitionKind,
@@ -138,7 +136,6 @@ class AgentReplicaScheduler(Generic[RetainedRequestT]):
         strategy_factors: ProgressTTLFactors,
         replica_load: ReplicaKVLoad,
         schedule_interval_seconds: float = 1.0,
-        observability: SchedulerObservabilityConfig | None = None,
     ) -> None:
         if not math.isfinite(schedule_interval_seconds) or schedule_interval_seconds <= 0:
             raise ValueError("schedule interval must be positive and finite")
@@ -153,8 +150,6 @@ class AgentReplicaScheduler(Generic[RetainedRequestT]):
         self._schedule_interval_seconds = schedule_interval_seconds
         self._periodic_at = 0.0
         self._dirty = False
-        self._observability = observability or SchedulerObservabilityConfig()
-        self._diagnostics_at = 0.0
         self._refresh_timers()
 
     @property
@@ -271,26 +266,7 @@ class AgentReplicaScheduler(Generic[RetainedRequestT]):
             current_status=session.status,
         )
         self.strategy.handle_scheduling_event(self.strategy_factors, event)
-        if self._observability.enabled:
-            logger.info(
-                "AgentInfer event kind=%s reason=%s program=%s facts=%s",
-                kind.value,
-                reason,
-                session.ref,
-                facts,
-            )
-            for diagnostic in self.strategy.event_diagnostics(event, self.strategy_factors):
-                self._write_diagnostic(diagnostic)
         self._refresh_timers()
-
-    @staticmethod
-    def _write_diagnostic(item: StrategyDiagnostic) -> None:
-        logger.info(
-            "AgentInfer diagnostic name=%s reason=%s %s",
-            item.name,
-            item.reason,
-            " ".join(f"{key}={value}" for key, value in item.fields),
-        )
 
     def _transition(self, action: TransitionRequest) -> TransitionResult:
         session = self.registry.get(action.program)
@@ -405,8 +381,6 @@ class AgentReplicaScheduler(Generic[RetainedRequestT]):
             )
             # The policy may grant privilege after the transition refreshes the timers.
             self._lightweight_at = self.strategy.next_lightweight_check_at(self.strategy_factors)
-            if self._observability.enabled:
-                logger.info("AgentInfer admission request=%s result=%s", request_id, result)
             if result.disposition is AdmissionDisposition.QUEUED:
                 return False
         self.request_pool.grant(request_id, self._replica_id)
@@ -438,10 +412,6 @@ class AgentReplicaScheduler(Generic[RetainedRequestT]):
         if not self.needs_schedule_cycle(now):
             return
         snapshots = self._snapshot()
-        if self._observability.enabled and self._diagnostics_at <= now:
-            for item in self.strategy.diagnostics(snapshots, self.strategy_factors):
-                self._write_diagnostic(item)
-            self._diagnostics_at = now + self._observability.log_interval_seconds
         changes = TransitionController(self._transition)
         self.strategy.schedule_resume(snapshots, self.strategy_factors, changes)
         after_resume = self._after_placement(snapshots, changes)

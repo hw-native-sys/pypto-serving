@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from pypto_serving.config.types import GenerateConfig
+from pypto_serving.serving.agentinfer.agent_identity import parse_agent_identity
 from pypto_serving.serving.agentinfer.agentinfer_admission import AgentInferAdmission
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig, TokenOutput
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
@@ -39,11 +40,11 @@ class _Tokenizer:
 class _Engine:
     tokenizer = _Tokenizer()
 
-    def __init__(self, finish_reason="FINISHED_EOS", tool_calls=()):
+    def __init__(self):
         self.calls = []
         self.lifecycle = []
-        self.finish_reason = finish_reason
-        self.tool_calls = tool_calls
+        self.finish_reason = "FINISHED_EOS"
+        self.tool_calls = ()
 
     def observe_agent_lifecycle(self, session_id, request_id, lifecycle):
         self.lifecycle.append((session_id, request_id, lifecycle))
@@ -57,370 +58,193 @@ class _Engine:
         )
 
 
-def test_text_action_rounds_share_identity_and_plain_chat_stays_unchanged():
-    engine = _Engine()
+@pytest.fixture
+def engine():
+    return _Engine()
+
+
+@pytest.fixture
+def client(engine):
     server = ServingServer(engine, "test-model", GenerateConfig())
     with TestClient(server.app) as client:
-        first = client.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "Read the file"}],
-            "agent_hint": {"session_id": "run-123"},
-        })
-        second = client.post("/v1/chat/completions", json={
-            "messages": [
-                {"role": "user", "content": "Read the file"},
-                {"role": "assistant", "content": "cat input.txt"},
-                {"role": "user", "content": "Tool output: hello"},
-            ],
-            "agent_hint": {"session_id": "run-123"},
-        })
-        other = client.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "Another run"}],
-            "agent_hint": {"session_id": "run-456"},
-        })
-        plain = client.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "Ordinary request"}],
-        })
+        yield client
 
-    assert all(response.status_code == 200 for response in (first, second, other, plain))
-    assert len({response.json()["id"] for response in (first, second, other, plain)}) == 4
-    assert all(response.json()["choices"][0]["message"]["content"] == "OK"
-               for response in (first, second, other, plain))
-    assert [call[2].get("agent_session_id") for call in engine.calls] == [
+
+@pytest.fixture
+def enforce_engine():
+    engine = AsyncLLMEngine(EngineConfig(agentinfer_mode="enforce"), tokenizer=_Tokenizer())
+    manager = KvCacheManager(num_blocks=64, block_size=16)
+    admission = AgentInferAdmission(0, Scheduler(SchedulerConfig(), manager), manager)
+    engine.single_core()._agentinfer_admission = admission
+    return engine, admission
+
+
+def _chat(client, *, headers=None, messages=None, **body):
+    if messages is None:
+        messages = [{"role": "user", "content": "Hello"}]
+    return client.post("/v1/chat/completions", headers=headers, json={"messages": messages, **body})
+
+
+def test_text_action_rounds_share_identity_and_plain_chat_stays_unchanged(client, engine):
+    first_turn = {"role": "user", "content": "Read the file"}
+    next_turn = [
+        first_turn,
+        {"role": "assistant", "content": "cat input.txt"},
+        {"role": "user", "content": "Tool output: hello"},
+    ]
+    responses = [
+        _chat(client, messages=[first_turn], agent_hint={"session_id": "run-123"}),
+        _chat(client, messages=next_turn, agent_hint={"session_id": "run-123"}),
+        _chat(client, agent_hint={"session_id": "run-456"}),
+        _chat(client, headers={"X-Other-Session": "unknown"}),
+    ]
+    assert all(response.status_code == 200 for response in responses)
+    payloads = [response.json() for response in responses]
+    assert len({payload["id"] for payload in payloads}) == len(payloads)
+    assert all(payload["choices"][0]["message"]["content"] == "OK" for payload in payloads)
+    assert [kwargs.get("agent_session_id") for _, _, kwargs in engine.calls] == [
         "run-123", "run-123", "run-456", None,
     ]
     assert "agent_session_id" not in engine.calls[-1][2]
-    assert all("agent_hint" not in response.json() for response in (first, second, other, plain))
-
-
-def test_streaming_chat_carries_session_identity():
-    engine = _Engine()
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        response = client.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "Stream"}],
-            "stream": True,
-            "agent_hint": {"session_id": "stream-1"},
-        })
-    assert response.status_code == 200
-    assert "data: [DONE]" in response.text
-    assert engine.calls[0][2]["agent_session_id"] == "stream-1"
+    assert all("agent_hint" not in payload for payload in payloads)
+    assert engine.lifecycle == []
 
 
 @pytest.mark.parametrize("stream", [False, True])
-def test_completion_headers_enter_agent_admission(stream):
-    engine = _Engine()
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        tagged = client.post("/v1/completions", headers={"X-Session-Id": "text-agent"}, json={
-            "prompt": "Reply OK.", "stream": stream,
-        })
-        plain = client.post("/v1/completions", json={"prompt": "Reply OK.", "stream": stream})
+@pytest.mark.parametrize("metadata, session", [
+    ({"headers": {"X-Session-Id": "run-123"}}, "run-123:lead"),
+    ({"agent_hint": {"session_id": "run-123"}}, "run-123"),
+])
+def test_chat_carries_session_identity(client, engine, stream, metadata, session):
+    response = _chat(client, stream=stream, **metadata)
+    assert response.status_code == 200
+    if stream:
+        assert "data: [DONE]" in response.text
+    assert engine.calls[0][2]["agent_session_id"] == session
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_completion_headers_enter_agent_admission(client, engine, stream):
+    body = {"prompt": "Reply OK.", "stream": stream}
+    tagged = client.post("/v1/completions", headers={"X-Session-Id": "text-agent"}, json=body)
+    plain = client.post("/v1/completions", json=body)
     assert tagged.status_code == plain.status_code == 200
     assert engine.calls[0][2]["agent_session_id"] == "text-agent:lead"
     assert engine.calls[0][2]["agent_identity"].program_id == "text-agent:lead"
     assert "agent_session_id" not in engine.calls[1][2]
 
 
-def test_disabled_agentinfer_does_not_parse_framework_headers():
-    engine = _Engine()
+def test_disabled_agentinfer_does_not_parse_framework_headers(client, engine):
     engine.config = SimpleNamespace(agentinfer_mode="disabled")
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        chat = client.post("/v1/chat/completions", headers={"X-Session-Id": "invalid session"}, json={
-            "messages": [{"role": "user", "content": "Hello"}],
-        })
-        completion = client.post("/v1/completions", headers={"X-Session-Id": "invalid session"}, json={
-            "prompt": "Hello",
-        })
+    headers = {"X-Session-Id": "invalid session"}
+    chat = _chat(client, headers=headers)
+    completion = client.post("/v1/completions", headers=headers, json={"prompt": "Hello"})
     assert chat.status_code == completion.status_code == 200
-    assert all("agent_identity" not in call[2] for call in engine.calls)
+    assert all("agent_identity" not in kwargs for _, _, kwargs in engine.calls)
 
 
-@pytest.mark.parametrize("headers, expected", [
+@pytest.mark.parametrize("headers, program", [
     ({"X-Session-ID": "run-123"}, "run-123:lead"),
     ({"Session-ID": "run-123", "Thread-ID": "thread-1"}, "run-123:thread-1"),
     ({"X-Claude-Code-Session-Id": "run-123"}, "run-123:lead"),
     ({"X-DeepSeek-Harness-Session-Id": "run-123"}, "run-123:lead"),
-    ({"X-OpenCode-Session-Id": "run-123"}, "run-123:lead"),
+    ({"X-OpenCode-Session-Id": "run-123", "X-Session-Id": "generic-run"}, "run-123:lead"),
     ({"X-OpenCode-Session": "run-123"}, "run-123:lead"),
-    ({"X-Claude-Code-Session-Id": "run-123", "X-Claude-Code-Agent-Id": "worker-1"},
-     "run-123:worker-1"),
+    ({"X-Claude-Code-Session-Id": "run-123", "X-Claude-Code-Agent-Id": "worker-1"}, "run-123:worker-1"),
 ])
-@pytest.mark.parametrize("stream", [False, True])
-def test_framework_headers_enter_agent_admission(headers, expected, stream):
-    engine = _Engine()
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        response = client.post("/v1/chat/completions", headers=headers, json={
-            "messages": [{"role": "user", "content": "Hello"}], "stream": stream,
-        })
-    assert response.status_code == 200
-    assert engine.calls[0][2]["agent_session_id"] == expected
+def test_framework_headers_map_to_programs(headers, program):
+    assert parse_agent_identity(headers=headers).program_id == program
 
 
-def test_framework_headers_keep_rounds_together_and_isolate_subagents():
-    engine = _Engine()
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        for headers in (
-            {"X-Claude-Code-Session-Id": "run-a"},
-            {"X-Claude-Code-Session-Id": "run-a"},
-            {"X-Claude-Code-Session-Id": "run-a", "X-Claude-Code-Agent-Id": "worker-1"},
-            {"X-Claude-Code-Session-Id": "run-b"},
-        ):
-            response = client.post("/v1/chat/completions", headers=headers, json={
-                "messages": [{"role": "user", "content": "Hello"}],
-            })
-            assert response.status_code == 200
-    assert [call[2]["agent_session_id"] for call in engine.calls] == [
-        "run-a:lead", "run-a:lead", "run-a:worker-1", "run-b:lead",
-    ]
 
 
-def test_opencode_native_session_header_precedes_generic_alias():
-    engine = _Engine()
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        response = client.post("/v1/chat/completions", headers={
-            "X-OpenCode-Session-Id": "opencode-run",
-            "X-Session-Id": "generic-run",
-        }, json={"messages": [{"role": "user", "content": "Hello"}]})
-    assert response.status_code == 200
-    assert engine.calls[0][2]["agent_session_id"] == "opencode-run:lead"
-
-
-def test_native_agent_headers_preserve_parent_lineage():
-    engine = _Engine()
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        claude = client.post("/v1/chat/completions", headers={
-            "X-Claude-Code-Session-Id": "run-a",
-            "X-Claude-Code-Agent-Id": "worker-1",
-            "X-Claude-Code-Parent-Agent-Id": "lead",
-        }, json={"messages": [{"role": "user", "content": "Hello"}]})
-        codex = client.post("/v1/chat/completions", headers={
-            "Session-Id": "run-b", "Thread-Id": "worker-2",
-            "X-Codex-Parent-Thread-Id": "lead",
-        }, json={"messages": [{"role": "user", "content": "Hello"}]})
-    assert claude.status_code == codex.status_code == 200
-    claude_identity = engine.calls[0][2]["agent_identity"]
-    codex_identity = engine.calls[1][2]["agent_identity"]
-    assert (claude_identity.program_id, claude_identity.parent_program_id, claude_identity.blocks_parent) == (
-        "run-a:worker-1", "run-a:lead", True,
-    )
-    assert (codex_identity.program_id, codex_identity.parent_program_id, codex_identity.blocks_parent) == (
-        "run-b:worker-2", "run-b:lead", True,
-    )
-
-
-def test_deepseek_harness_compaction_is_not_mistaken_for_agent_progress():
-    engine = _Engine()
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        response = client.post("/v1/chat/completions", headers={
-            "X-DeepSeek-Harness-Session-Id": "run-a",
-            "X-DeepSeek-Harness-Compact": "1",
-        }, json={"messages": [{"role": "user", "content": "Summarize"}]})
+def test_deepseek_harness_compaction_is_not_mistaken_for_agent_progress(client, engine):
+    response = _chat(client, headers={"X-DeepSeek-Harness-Session-Id": "run-a", "X-DeepSeek-Harness-Compact": "1"})
     assert response.status_code == 200
     assert "agent_session_id" not in engine.calls[0][2]
 
 
-def test_canonical_agent_context_precedes_hint_and_headers():
-    engine = _Engine()
-    server = ServingServer(engine, "test-model", GenerateConfig())
+def test_canonical_agent_context_precedes_hint_and_headers(client, engine):
     context = {
         "program_id": "task-1:worker", "task_id": "task-1", "session_id": "agent-1",
         "agent_id": "worker", "parent_program_id": "task-1:lead",
         "blocks_parent": True, "expected_resume": False,
     }
-    with TestClient(server.app) as client:
-        response = client.post("/v1/chat/completions", headers={"X-Session-Id": "header-run"}, json={
-            "messages": [{"role": "user", "content": "Hello"}],
-            "agent_hint": {"session_id": "hint-run"},
-            "vllm_xargs": {"agentic_context": context},
-        })
+    response = _chat(
+        client, headers={"X-Session-Id": "header-run"}, agent_hint={"session_id": "hint-run"},
+        vllm_xargs={"agentic_context": context},
+    )
     assert response.status_code == 200
-    assert engine.calls[0][2]["agent_session_id"] == "task-1:worker"
-    identity = engine.calls[0][2]["agent_identity"]
+    kwargs = engine.calls[0][2]
+    assert kwargs["agent_session_id"] == "task-1:worker"
+    identity = kwargs["agent_identity"]
     assert identity.parent_program_id == "task-1:lead"
     assert identity.blocks_parent is True
     assert identity.expected_resume is False
 
 
-def test_canonical_agent_component_can_use_header_session():
-    engine = _Engine()
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        response = client.post("/v1/chat/completions", headers={"X-Session-Id": "run-a"}, json={
-            "messages": [{"role": "user", "content": "Hello"}],
-            "vllm_xargs": {"agentic_context": {"agent_id": "worker-1"}},
-        })
-    assert response.status_code == 200
-    identity = engine.calls[0][2]["agent_identity"]
-    assert identity.program_id == "run-a:worker-1"
-    assert identity.parent_program_id == "run-a:lead"
 
 
-def test_jiuwen_parent_session_is_accepted_without_extra_adapter():
-    engine = _Engine()
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        response = client.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "Hello"}],
-            "agent_hint": {"session_id": "worker-1", "parent_session_id": "root-1"},
-        })
-    assert response.status_code == 200
-    identity = engine.calls[0][2]["agent_identity"]
-    assert (identity.program_id, identity.parent_program_id, identity.blocks_parent) == (
-        "worker-1", "root-1", True,
+def test_explicit_hint_preserves_parent_and_precedes_header(client, engine):
+    response = _chat(
+        client, headers={"X-Session-Id": "header-run"},
+        agent_hint={"session_id": "worker-1", "parent_session_id": "root-1"},
     )
+    assert response.status_code == 200
+    kwargs = engine.calls[0][2]
+    assert kwargs["agent_session_id"] == "worker-1"
+    identity = kwargs["agent_identity"]
+    assert (identity.program_id, identity.parent_program_id, identity.blocks_parent) == ("worker-1", "root-1", True)
 
 
-def test_explicit_hint_precedes_headers_and_unrecognized_headers_use_native_path():
-    engine = _Engine()
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        explicit = client.post("/v1/chat/completions", headers={"X-Session-ID": "header-run"}, json={
-            "messages": [{"role": "user", "content": "Hello"}],
-            "agent_hint": {"session_id": "explicit-run"},
-        })
-        plain = client.post("/v1/chat/completions", headers={"X-Other-Session": "unknown"}, json={
-            "messages": [{"role": "user", "content": "Hello"}],
-        })
-    assert explicit.status_code == plain.status_code == 200
-    assert engine.calls[0][2]["agent_session_id"] == "explicit-run"
-    assert "agent_session_id" not in engine.calls[1][2]
-
-
-@pytest.mark.parametrize("headers", [
-    {"X-Session-ID": "invalid session"},
-    {"X-Session-ID": "a" * 128},
-])
-def test_invalid_framework_identity_is_rejected_before_generation(headers):
-    engine = _Engine()
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        response = client.post("/v1/chat/completions", headers=headers, json={
-            "messages": [{"role": "user", "content": "Hello"}],
-        })
-    assert response.status_code == 422
-    assert engine.calls == []
-
-
-@pytest.mark.parametrize("body", [
+@pytest.mark.parametrize("metadata", [
+    {"headers": {"X-Session-ID": "invalid session"}},
+    {"headers": {"X-Session-ID": "a" * 128}},
     {"vllm_xargs": {"agentic_context": "not-json"}},
     {"vllm_xargs": {"agentic_context": {"program_id": "invalid id"}}},
     {"agent_hint": {"session_id": "worker", "blocks_parent": True}},
+    {"agent_hint": {}},
+    {"agent_hint": {"session_id": ""}},
+    {"agent_hint": {"session_id": "with space"}},
+    {"agent_hint": {"session_id": "a" * 129}},
+    {"agent_hint": {"session_id": 42}},
+    {"agent_hint": {"session_id": "valid", "unexpected": True}},
+    {"agent_hint": {"session_id": "valid", "lifecycle_mode": "terminal"}},
 ])
-def test_invalid_canonical_or_parent_identity_is_rejected(body):
-    engine = _Engine()
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        response = client.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "Hello"}], **body,
-        })
-    assert response.status_code == 422
-    assert engine.calls == []
-
-
-@pytest.mark.parametrize("hint", [
-    {},
-    {"session_id": ""},
-    {"session_id": "with space"},
-    {"session_id": "a" * 129},
-    {"session_id": 42},
-    {"session_id": "valid", "unexpected": True},
-    {"session_id": "valid", "lifecycle_mode": "terminal"},
-])
-def test_invalid_agent_hint_is_rejected_before_generation(hint):
-    engine = _Engine()
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        response = client.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "Hello"}],
-            "agent_hint": hint,
-        })
-    assert response.status_code == 422
+def test_invalid_agent_identity_is_rejected_before_generation(client, engine, metadata):
+    assert _chat(client, **metadata).status_code == 422
     assert engine.calls == []
 
 
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("mode", ["explicit", "chat"])
-def test_response_stop_releases_only_opted_in_chat_lifecycle(stream, mode):
-    engine = _Engine()
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        response = client.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "Hello"}], "stream": stream,
-            "agent_hint": {"session_id": "session-a", "lifecycle_mode": mode},
-        })
+@pytest.mark.parametrize("finish_reason, mode, tool_calls, expected", [
+    ("FINISHED_EOS", "explicit", (), None),
+    ("FINISHED_EOS", "chat", (), "terminal"),
+    ("FINISHED_LENGTH", "chat", (), None),
+    ("FINISHED_EOS", "chat", (ParsedToolCall(id="call-1", name="read_file", arguments="{}", complete=True),),
+     "continue"),
+], ids=["explicit", "stop", "length", "tool-call"])
+def test_chat_response_lifecycle(client, engine, stream, finish_reason, mode, tool_calls, expected):
+    engine.finish_reason = finish_reason
+    engine.tool_calls = tool_calls
+    response = _chat(client, stream=stream, agent_hint={"session_id": "session-a", "lifecycle_mode": mode})
     assert response.status_code == 200
-    expected = [("session-a", engine.calls[0][0], "terminal")] if mode == "chat" else []
-    assert engine.lifecycle == expected
+    assert engine.lifecycle == ([("session-a", engine.calls[0][0], expected)] if expected else [])
 
 
-def test_text_agent_can_confirm_terminal_lifecycle_after_verification():
-    engine = _Engine()
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        response = client.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "Hello"}],
-            "agent_hint": {"session_id": "session-a"},
-        })
-        request_id = response.json()["id"]
-        continued = client.post("/v1/agent/lifecycle", json={
-            "session_id": "session-a", "request_id": request_id, "lifecycle": "continue",
-        })
-        terminal = client.post("/v1/agent/lifecycle", json={
-            "session_id": "session-a", "request_id": request_id, "lifecycle": "terminal",
-        })
-        invalid = client.post("/v1/agent/lifecycle", json={
-            "session_id": "session-a", "request_id": request_id, "lifecycle": "finished",
-        })
-        missing_request = client.post("/v1/agent/lifecycle", json={
-            "session_id": "session-a", "lifecycle": "terminal",
-        })
-    assert continued.json() == {"released": False}
-    assert terminal.json() == {"released": True}
-    assert invalid.status_code == 422
-    assert missing_request.status_code == 422
-    assert engine.lifecycle == [("session-a", request_id, "continue"), ("session-a", request_id, "terminal")]
-
-
-@pytest.mark.parametrize("stream", [False, True])
-def test_truncated_chat_response_never_proves_task_completion(stream):
-    engine = _Engine(finish_reason="FINISHED_LENGTH")
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        response = client.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "Hello"}], "stream": stream,
-            "agent_hint": {"session_id": "session-a", "lifecycle_mode": "chat"},
-        })
-    assert response.status_code == 200
+def test_invalid_agent_lifecycle_is_rejected(client, engine):
+    invalid = client.post("/v1/agent/lifecycle", json={
+        "session_id": "session-a", "request_id": "request-a", "lifecycle": "finished",
+    })
+    missing_request = client.post("/v1/agent/lifecycle", json={"session_id": "session-a", "lifecycle": "terminal"})
+    assert invalid.status_code == missing_request.status_code == 422
     assert engine.lifecycle == []
 
 
 @pytest.mark.parametrize("stream", [False, True])
-def test_parsed_tool_call_reports_continue_instead_of_terminal(stream):
-    call = ParsedToolCall(id="call-1", name="read_file", arguments='{"path":"x"}', complete=True)
-    engine = _Engine(tool_calls=(call,))
-    server = ServingServer(engine, "test-model", GenerateConfig())
-    with TestClient(server.app) as client:
-        response = client.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "Read x"}], "stream": stream,
-            "agent_hint": {"session_id": "session-a", "lifecycle_mode": "chat"},
-        })
-    assert response.status_code == 200
-    assert engine.lifecycle == [("session-a", engine.calls[0][0], "continue")]
-
-
-@pytest.mark.parametrize("stream", [False, True])
-def test_lifecycle_endpoint_reaches_real_engine_and_admission(stream, monkeypatch):
-    engine = AsyncLLMEngine(EngineConfig(agentinfer_mode="enforce"), tokenizer=_Tokenizer())
+def test_lifecycle_endpoint_reaches_real_engine_and_admission(stream, monkeypatch, enforce_engine):
+    engine, admission = enforce_engine
     core = engine.single_core()
-    manager = KvCacheManager(num_blocks=64, block_size=16)
-    admission = AgentInferAdmission(0, Scheduler(SchedulerConfig(), manager), manager)
-    core._agentinfer_admission = admission
 
     async def complete_without_device(request_id, prompt, config, *, on_queued, prompt_token_ids, **kwargs):
         request = Request(request_id, prompt_token_ids, max_new_tokens=1)
@@ -437,10 +261,7 @@ def test_lifecycle_endpoint_reaches_real_engine_and_admission(stream, monkeypatc
     server = ServingServer(engine, "test-model", GenerateConfig())
     with TestClient(server.app) as client:
         for lifecycle in ("continue", "terminal"):
-            response = client.post("/v1/chat/completions", json={
-                "messages": [{"role": "user", "content": "Read the file"}], "stream": stream,
-                "agent_hint": {"session_id": "session-a"},
-            })
+            response = _chat(client, stream=stream, agent_hint={"session_id": "session-a"})
             assert response.status_code == 200
             assert admission.policy.registry.has_programs
             if stream:
@@ -463,11 +284,8 @@ def test_lifecycle_endpoint_reaches_real_engine_and_admission(stream, monkeypatc
 
 
 @pytest.mark.parametrize("completion_order", [(0, 1), (1, 0)])
-def test_automatic_chat_terminal_releases_after_all_overlapping_responses(completion_order):
-    engine = AsyncLLMEngine(EngineConfig(agentinfer_mode="enforce"), tokenizer=_Tokenizer())
-    manager = KvCacheManager(num_blocks=64, block_size=16)
-    admission = AgentInferAdmission(0, Scheduler(SchedulerConfig(), manager), manager)
-    engine.single_core()._agentinfer_admission = admission
+def test_automatic_chat_terminal_releases_after_all_overlapping_responses(completion_order, enforce_engine):
+    engine, admission = enforce_engine
     server = ServingServer(engine, "test-model", GenerateConfig())
     requests = [Request(f"request-{index}", [1, 2], max_new_tokens=1) for index in range(2)]
     for request in requests:

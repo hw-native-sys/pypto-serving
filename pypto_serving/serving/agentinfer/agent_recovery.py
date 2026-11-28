@@ -21,8 +21,6 @@ def recovery_order(
     privileged: bool,
     reasoning: bool,
     last_finished: float | None,
-    wait_started: float | None,
-    first_come_first_served: bool,
 ) -> tuple[int, float]:
     """Return the class and time key for a session waiting to run."""
     if forced:
@@ -33,8 +31,6 @@ def recovery_order(
         priority = 4
     else:
         priority = 2 if last_finished is not None else 3
-    if first_come_first_served:
-        return priority, wait_started if wait_started is not None else math.inf
     return priority, -last_finished if last_finished is not None else 0.0
 
 

@@ -30,11 +30,6 @@ class ReturnInterval:
     miss_cost: float
     reservation: float
 
-    @property
-    def utility_seconds(self) -> float:
-        saved = self.miss_cost if self.seconds <= self.reservation else 0.0
-        return saved - min(self.seconds, self.reservation)
-
 
 @dataclass(frozen=True)
 class _ReturnDistribution:
@@ -107,8 +102,6 @@ class AgentTTLStatistics:
         self._rounds_before_pause: deque[int] = deque(maxlen=request_window_size)
         self._return_intervals: deque[ReturnInterval] = deque(maxlen=request_window_size)
         self._return_distribution: _ReturnDistribution | None = None
-        self.continuity_enabled = False
-        self.continuity_utility_seconds = 0.0
         self.avg_ttl_pause_segment_rounds = 1.0
         self.request_count = 0
 
@@ -262,7 +255,6 @@ class AgentTTLStatistics:
         self._return_intervals.append(sample)
         if self.continuity_window_complete:
             self._return_distribution = _ReturnDistribution.fit(self._return_intervals)
-            self.continuity_utility_seconds = sum(entry.utility_seconds for entry in self._return_intervals)
         return sample
 
     def recalibrate_continuity_window(
@@ -284,19 +276,6 @@ class AgentTTLStatistics:
             )
             recalibrated.append(ReturnInterval(before.seconds, before.miss_cost, estimate.ttl_seconds))
         self._return_intervals = recalibrated
-        self.continuity_utility_seconds = sum(entry.utility_seconds for entry in recalibrated)
-
-    def update_continuity_mode(
-        self, *, enable_threshold_seconds: float, disable_threshold_seconds: float
-    ) -> bool:
-        if not self.continuity_window_complete:
-            return False
-        if not 0 <= disable_threshold_seconds <= enable_threshold_seconds:
-            raise ValueError("continuity thresholds must be non-negative and ordered")
-        before = self.continuity_enabled
-        threshold = disable_threshold_seconds if before else enable_threshold_seconds
-        self.continuity_enabled = self.continuity_utility_seconds >= threshold
-        return before != self.continuity_enabled
 
     def estimate_ttl(
         self,

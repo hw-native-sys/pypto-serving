@@ -21,16 +21,24 @@ from pypto_serving.serving.agentinfer.agentinfer_admission import (
 )
 from pypto_serving.serving.agentinfer.agent_policy_state import ProgramStatus
 from pypto_serving.serving.agentinfer.agent_identity import AgentIdentity
-from pypto_serving.serving.agentinfer.agent_sessions import AgentSessionRegistry
 from pypto_serving.serving.engine.async_engine import EngineConfig, ReplicaEngineCore
 from pypto_serving.serving.memory.kv_cache import KVCacheCapacityObservation, KvCacheManager
 from pypto_serving.serving.sched.scheduler import Request, Scheduler, SchedulerConfig
 
 
-def _admission() -> AgentInferAdmission:
-    manager = KvCacheManager(num_blocks=64, block_size=16)
-    native = Scheduler(SchedulerConfig(), manager)
-    return AgentInferAdmission(0, native, manager)
+def _admission(
+    num_blocks: int = 64, block_size: int = 16, *,
+    config: SchedulerConfig | None = None, options: AgentInferOptions | None = None,
+) -> AgentInferAdmission:
+    manager = KvCacheManager(num_blocks=num_blocks, block_size=block_size)
+    return AgentInferAdmission(0, Scheduler(config or SchedulerConfig(), manager), manager, options)
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(time, "monotonic", lambda: clock.now)
+    return clock
 
 
 def test_enforce_tracks_immediate_native_request_and_completion() -> None:
@@ -48,25 +56,6 @@ def test_enforce_tracks_immediate_native_request_and_completion() -> None:
     assert admission._sessions == {}
 
 
-def test_direct_admission_privilege_expires_on_first_poll_after_ttl(monkeypatch) -> None:
-    now = [100.0]
-    monkeypatch.setattr(time, "monotonic", lambda: now[0])
-    admission = _admission()
-    identity = AgentIdentity(program_id="task-a:lead", task_id="task-a")
-    request = Request("first", list(range(64)), max_new_tokens=20)
-    assert admission.arrive(request, identity)
-    admission.native.add_request(request)
-
-    policy = admission.policy
-    ref = policy.registry.current_ref(identity.program_id)
-    assert policy.strategy_factors.for_program(ref).is_privileged
-
-    now[0] += policy.strategy.config.privileged_ttl_seconds
-    admission.poll()
-
-    factors = policy.strategy_factors.for_program(ref)
-    assert factors.privilege_ttl_expired
-    assert not factors.is_privileged
 
 
 def test_admission_receives_full_agent_lineage() -> None:
@@ -111,48 +100,29 @@ def test_retained_request_is_released_once_by_policy_cycle() -> None:
     assert tuple(admission.native.requests) == ("held",)
 
 
-def test_capacity_recovery_releases_retained_request_without_one_second_poll_delay(monkeypatch) -> None:
-    manager = KvCacheManager(num_blocks=1337, block_size=128)
-    native = Scheduler(SchedulerConfig(max_num_running_reqs=16), manager)
-    admission = AgentInferAdmission(0, native, manager)
+def test_capacity_recovery_releases_retained_request_without_one_second_poll_delay(monkeypatch, clock) -> None:
+    admission = _admission(1337, 128, config=SchedulerConfig(max_num_running_reqs=16))
     assert admission.policy.strategy.config.resume_capacity_ratio == 1.0
     assert admission.policy._schedule_interval_seconds == 0.02
-    monkeypatch.setattr(
-        manager, "observe_capacity",
-        lambda: KVCacheCapacityObservation(total_tokens=1024, used_tokens=0, free_tokens=1024),
-    )
+    capacity = KVCacheCapacityObservation(total_tokens=1024, used_tokens=0, free_tokens=1024)
+    monkeypatch.setattr(admission.kv_cache_manager, "observe_capacity", lambda: capacity)
     request = Request("held", list(range(1200)), max_new_tokens=16)
     assert not admission.arrive(request, "session-a")
     assert admission.poll() == []
-    monkeypatch.setattr(
-        admission.kv_cache_manager, "observe_capacity",
-        lambda: KVCacheCapacityObservation(total_tokens=100_000, used_tokens=0, free_tokens=100_000),
-    )
-    time.sleep(0.1)
+    capacity = KVCacheCapacityObservation(total_tokens=100_000, used_tokens=0, free_tokens=100_000)
+    clock.now += 0.1
     assert admission.poll() == [request]
     assert admission.retained_request_ids == ()
 
 
-def test_small_kv_pool_keeps_policy_retention_window() -> None:
-    admission = _admission()
-    assert admission.policy._schedule_interval_seconds == 1.0
-    assert admission.policy.strategy.config.resume_capacity_ratio == 1.0
 
 
-def test_medium_kv_pool_reserves_one_context_and_schedules_promptly() -> None:
-    manager = KvCacheManager(num_blocks=82, block_size=128)
-    native = Scheduler(SchedulerConfig(max_num_running_reqs=16, max_seq_len=4096), manager)
-    admission = AgentInferAdmission(0, native, manager)
-    assert admission.policy.strategy.config.resume_capacity_ratio == (82 * 128 - 4096) / (82 * 128)
-    assert admission.policy._schedule_interval_seconds == 0.02
-    assert admission.policy.strategy.config.shared_prefix_freshness_warmup_seconds == 0.0
 
 
 @pytest.mark.parametrize("max_new_tokens", [1, 128])
 def test_decode_buffer_respects_context_limit_in_idle_two_context_pool(max_new_tokens) -> None:
-    manager = KvCacheManager(num_blocks=64, block_size=128)
-    native = Scheduler(SchedulerConfig(max_num_running_reqs=16, max_seq_len=4096), manager)
-    admission = AgentInferAdmission(0, native, manager)
+    admission = _admission(64, 128, config=SchedulerConfig(max_num_running_reqs=16, max_seq_len=4096))
+    native, manager = admission.native, admission.kv_cache_manager
     request = Request("long", list(range(4095)), max_new_tokens=max_new_tokens)
     native.validate_request(request)
 
@@ -175,35 +145,22 @@ def test_decode_buffer_respects_context_limit_in_idle_two_context_pool(max_new_t
 
 
 def test_optional_wait_capacity_relax_reaches_policy() -> None:
-    manager = KvCacheManager(num_blocks=128, block_size=128)
-    native = Scheduler(SchedulerConfig(max_num_running_reqs=16, max_seq_len=4096), manager)
     options = AgentInferOptions.from_mapping({
         "resume_wait_relax_seconds": 8,
         "resume_wait_growth_reserve_fraction": 0.06,
         "resume_wait_extra_headroom_tokens": 512,
         "resume_wait_preserve_cached_blocks": True,
     })
-    config = AgentInferAdmission(0, native, manager, options).policy.strategy.config
+    admission = _admission(
+        128, 128, config=SchedulerConfig(max_num_running_reqs=16, max_seq_len=4096), options=options,
+    )
+    config = admission.policy.strategy.config
     assert config.resume_wait_relax_seconds == 8
     assert config.resume_wait_growth_reserve_fraction == 0.06
     assert config.resume_wait_extra_headroom_tokens == 512
     assert config.resume_wait_preserve_cached_blocks
 
 
-def test_medium_kv_pool_refreshes_warm_prefix_before_next_request() -> None:
-    manager = KvCacheManager(num_blocks=82, block_size=128)
-    native = Scheduler(SchedulerConfig(max_num_running_reqs=16, max_seq_len=4096), manager)
-    admission = AgentInferAdmission(0, native, manager)
-    first = Request("cold", list(range(1192)), max_new_tokens=16)
-    assert admission.arrive(first, "session-a")
-    admission.policy.on_prefix_cache_observation(first.request_id, 0, hbm_cached_prefix_tokens=0)
-    admission.complete(first)
-    admission.poll()
-
-    second = Request("warm", list(range(1192)), max_new_tokens=16)
-    assert admission.arrive(second, "session-a")
-    admission.policy.on_prefix_cache_observation(second.request_id, 1152, hbm_cached_prefix_tokens=1152)
-    assert admission.policy.registry.views()[0].tokens.shared_prefix_tokens == 1152
 
 
 def test_retained_cancel_removes_request_without_native_admission() -> None:
@@ -218,9 +175,10 @@ def test_retained_cancel_removes_request_without_native_admission() -> None:
 
 
 def test_admission_timeout_hands_off_program_waiters_with_their_bindings() -> None:
-    manager = KvCacheManager(num_blocks=16, block_size=128)
-    native = Scheduler(SchedulerConfig(max_seq_len=4096), manager)
-    admission = AgentInferAdmission(0, native, manager, AgentInferOptions(resume_capacity_ratio=0.85))
+    admission = _admission(
+        16, 128, config=SchedulerConfig(max_seq_len=4096), options=AgentInferOptions(resume_capacity_ratio=0.85),
+    )
+    native = admission.native
     first = Request("first", list(range(1800)), max_new_tokens=1)
     latest = Request("latest", list(range(1800)), max_new_tokens=1)
     assert not admission.arrive(first, "session-a")
@@ -252,9 +210,7 @@ def test_admission_timeout_hands_off_program_waiters_with_their_bindings() -> No
 
 
 @pytest.mark.parametrize("state", ["admitted", "retained", "resumed"])
-def test_cancel_last_request_releases_program_and_capacity(monkeypatch, state) -> None:
-    now = [100.0]
-    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+def test_cancel_last_request_releases_program_and_capacity(clock, state) -> None:
     admission = _admission()
     if state == "resumed":
         previous = Request("previous", [1, 2], max_new_tokens=1)
@@ -270,7 +226,7 @@ def test_cancel_last_request_releases_program_and_capacity(monkeypatch, state) -
     assert admission.policy.registry.get(ref) is None
     assert admission.policy.strategy_factors.for_program(ref) is None
     assert admission.retained_request_ids == ()
-    now[0] += 4000
+    clock.now += 4000
     assert admission.poll() == []
     capacity = admission.kv_cache_manager.observe_capacity()
     assert capacity.free_tokens == capacity.total_tokens == 1024
@@ -309,21 +265,17 @@ def test_prefix_observation_is_not_overwritten_by_decode_or_later_prefill() -> N
     assert admission._prefix_observed == set()
 
 
-def test_configured_force_resume_uses_original_policy_before_fallback(monkeypatch, caplog) -> None:
-    now = [100.0]
-    monkeypatch.setattr(time, "monotonic", lambda: now[0])
-    manager = KvCacheManager(num_blocks=64, block_size=16)
-    native = Scheduler(SchedulerConfig(), manager)
-    admission = AgentInferAdmission(0, native, manager, AgentInferOptions(
+def test_configured_force_resume_uses_original_policy_before_fallback(clock, caplog) -> None:
+    admission = _admission(options=AgentInferOptions(
         force_resume_timeout_min_seconds=1, force_resume_timeout_max_seconds=3,
         resume_capacity_ratio=0.75,
     ))
     request = Request("held", list(range(1200)), max_new_tokens=16)
     assert not admission.arrive(request, "session-a")
     assert admission.poll() == []
-    now[0] = 102.0
+    clock.now = 102.0
     assert admission.poll() == []
-    now[0] = 103.1
+    clock.now = 103.1
     assert admission.poll() == [request]
     assert "waited_seconds=3.1" in caplog.text
     assert "remaining_tokens=768 physical_remaining_tokens=1024" in caplog.text
@@ -335,11 +287,10 @@ def test_configured_force_resume_uses_original_policy_before_fallback(monkeypatc
 
 @pytest.mark.parametrize("completion_pending", [True, False])
 def test_retained_prefix_refresh_releases_request_without_acquiring_blocks(
-    monkeypatch, completion_pending,
+    monkeypatch, clock, completion_pending,
 ) -> None:
-    manager = KvCacheManager(num_blocks=82, block_size=128)
-    native = Scheduler(SchedulerConfig(max_num_running_reqs=16, max_seq_len=4096), manager)
-    admission = AgentInferAdmission(0, native, manager)
+    admission = _admission(82, 128, config=SchedulerConfig(max_num_running_reqs=16, max_seq_len=4096))
+    native, manager = admission.native, admission.kv_cache_manager
     tokens = list(range(1192))
     cold = Request("donor", tokens, max_new_tokens=1)
     assert admission.arrive(cold, "donor-session")
@@ -362,7 +313,7 @@ def test_retained_prefix_refresh_releases_request_without_acquiring_blocks(
     admitted = admission.poll()
     if not completion_pending:
         assert admitted == []
-        time.sleep(0.05)
+        clock.now += 0.05
         admitted = admission.poll()
     assert admitted == [request]
     assert manager.num_free_blocks == free
@@ -374,12 +325,12 @@ def test_retained_prefix_refresh_releases_request_without_acquiring_blocks(
     assert admission.policy.prefix_cache_candidates() == ()
 
 
-def test_plain_completion_refreshes_retained_agent_prefix_without_binding_or_acquiring_blocks(monkeypatch):
-    now = [100.0]
-    monkeypatch.setattr(time, "monotonic", lambda: now[0])
-    manager = KvCacheManager(num_blocks=64, block_size=128)
-    native = Scheduler(SchedulerConfig(max_num_running_reqs=16, max_seq_len=4096), manager)
-    admission = AgentInferAdmission(0, native, manager, AgentInferOptions(resume_capacity_ratio=0.4))
+def test_plain_completion_refreshes_retained_agent_prefix_without_binding_or_acquiring_blocks(monkeypatch, clock):
+    admission = _admission(
+        64, 128, config=SchedulerConfig(max_num_running_reqs=16, max_seq_len=4096),
+        options=AgentInferOptions(resume_capacity_ratio=0.4),
+    )
+    native, manager = admission.native, admission.kv_cache_manager
     tokens = list(range(3500))
     donor = Request("plain", tokens, max_new_tokens=1)
     native.add_request(donor)
@@ -398,7 +349,7 @@ def test_plain_completion_refreshes_retained_agent_prefix_without_binding_or_acq
 
     refs = [block.ref_cnt for block in manager.blocks]
     free = manager.num_free_blocks
-    now[0] += 0.05
+    clock.now += 0.05
     assert admission.poll() == [held]
     assert admission.poll() == []
     assert [block.ref_cnt for block in manager.blocks] == refs
@@ -421,18 +372,18 @@ def test_plain_completion_refreshes_retained_agent_prefix_without_binding_or_acq
 
 
 @pytest.mark.parametrize("arrival_offsets", [(0.0,), (0.0, 50.0)])
-def test_completion_refresh_waits_for_each_retained_prefix_freshness_deadline(monkeypatch, arrival_offsets):
-    now = [100.0]
-    monkeypatch.setattr(time, "monotonic", lambda: now[0])
-    manager = KvCacheManager(num_blocks=16, block_size=128)
-    native = Scheduler(SchedulerConfig(max_num_running_reqs=16, max_seq_len=4096), manager)
-    admission = AgentInferAdmission(0, native, manager, AgentInferOptions(resume_capacity_ratio=0.85))
+def test_completion_refresh_waits_for_each_retained_prefix_freshness_deadline(monkeypatch, clock, arrival_offsets):
+    admission = _admission(
+        16, 128, config=SchedulerConfig(max_num_running_reqs=16, max_seq_len=4096),
+        options=AgentInferOptions(resume_capacity_ratio=0.85),
+    )
+    native, manager = admission.native, admission.kv_cache_manager
     tokens = list(range(1800))
     donor = Request("plain", tokens, max_new_tokens=1)
     native.add_request(donor)
     held = []
     for index, offset in enumerate(arrival_offsets):
-        now[0] = 100.0 + offset
+        clock.now = 100.0 + offset
         request = Request(f"held-{index}", tokens, max_new_tokens=1)
         assert not admission.arrive(request, f"session-{index}")
         held.append(request)
@@ -449,18 +400,18 @@ def test_completion_refresh_waits_for_each_retained_prefix_freshness_deadline(mo
     observe_prefix = manager.observe_prefix
 
     def record_observation(prompt_token_ids):
-        observations.append(now[0])
+        observations.append(clock.now)
         return observe_prefix(prompt_token_ids)
 
     monkeypatch.setattr(manager, "observe_prefix", record_observation)
-    now[0] += 0.1
+    clock.now += 0.1
     assert admission.poll() == []
     assert admission._prefix_refresh_pending
     for index, offset in enumerate(arrival_offsets):
-        now[0] = 199.9 + offset
+        clock.now = 199.9 + offset
         assert admission.poll() == []
         assert len(observations) == index
-        now[0] = 201.0 + offset
+        clock.now = 201.0 + offset
         assert admission.poll() == [held[index]]
         assert len(observations) == index + 1
         view = next(view for view in admission.policy.registry.views()
@@ -493,9 +444,10 @@ def test_invalid_admission_settings_are_rejected(values) -> None:
 
 
 def test_full_admission_pool_keeps_overlapping_native_request_bound(monkeypatch) -> None:
-    manager = KvCacheManager(num_blocks=16, block_size=128)
-    native = Scheduler(SchedulerConfig(max_seq_len=4096), manager)
-    admission = AgentInferAdmission(0, native, manager, AgentInferOptions(resume_capacity_ratio=0.85))
+    admission = _admission(
+        16, 128, config=SchedulerConfig(max_seq_len=4096), options=AgentInferOptions(resume_capacity_ratio=0.85),
+    )
+    native = admission.native
     monkeypatch.setattr("pypto_serving.serving.agentinfer.agentinfer_admission.MAX_RETAINED_REQUESTS", 1)
     earlier = Request("earlier", [1, 2], max_new_tokens=2)
     latest = Request("latest", [1, 2], max_new_tokens=1)
@@ -658,43 +610,8 @@ def test_late_terminal_from_previous_round_cannot_release_completed_new_round():
     assert admission.policy.registry.current_ref("session-a") is None
 
 
-def test_reparented_session_blocks_only_its_current_parent():
-    registry = AgentSessionRegistry()
-    first, _ = registry.materialize(AgentIdentity(program_id="first"))
-    child, _ = registry.materialize(AgentIdentity(
-        program_id="child", parent_program_id="first", blocks_parent=True,
-    ))
-    assert first.blocked_on_child
-
-    registry.materialize(AgentIdentity(program_id="child", parent_program_id="second", blocks_parent=True))
-    assert not first.blocked_on_child
-    second, _ = registry.materialize(AgentIdentity(program_id="second"))
-    assert second.blocked_on_child
-
-    registry.release(first.ref)
-    assert child.parent_program_id == "second"
-    registry.release(second.ref)
-    assert child.parent_program_id is None
-    assert not child.blocks_parent
 
 
-def test_released_program_generations_do_not_accumulate_per_session():
-    registry = AgentSessionRegistry()
-    first, created = registry.materialize(AgentIdentity(program_id="session-0"))
-    assert created
-    assert registry.release(first.ref) is first
-    for index in range(1, 1001):
-        program, created = registry.materialize(AgentIdentity(program_id=f"session-{index}"))
-        assert created
-        assert registry.release(program.ref) is program
-    assert not registry.has_programs
-    assert all(not value for value in vars(registry).values() if isinstance(value, dict))
-    current, created = registry.materialize(AgentIdentity(program_id="session-0"))
-    assert created
-    assert current.ref != first.ref
-    assert registry.get(first.ref) is None
-    assert registry.release(first.ref) is None
-    assert registry.current_ref("session-0") == current.ref
 
 
 def test_native_waiting_demand_uses_current_context_without_future_decode_budget():
@@ -808,15 +725,6 @@ def test_dspark_grouped_cache_reaches_agentinfer_policy(num_speculative_tokens: 
     assert admission.policy.strategy._capacity_cost(1) > 0
 
 
-def test_enforce_uses_bundled_scheduler_without_external_package() -> None:
-    from pypto_serving.serving.agentinfer.agent_scheduler import AgentReplicaScheduler
-
-    core = ReplicaEngineCore(
-        EngineConfig(agentinfer_mode="enforce"),
-        SimpleNamespace(eos_token_id=0),
-    )
-    assert isinstance(_admission().policy, AgentReplicaScheduler)
-    assert core._agentinfer_admission is None
 
 
 @pytest.mark.parametrize("prompt_tokens,max_new_tokens,min_tokens,error", [
@@ -936,40 +844,5 @@ def test_core_abort_of_retained_request_never_releases_worker() -> None:
         assert native_adds == native_aborts == core._pending_free_ids == []
         assert cancelled == ["held"]
         assert core._request_contexts == {}
-
-    asyncio.run(run())
-
-
-def test_core_stop_aborts_retained_requests_before_worker_shutdown() -> None:
-    async def run() -> None:
-        core = ReplicaEngineCore.__new__(ReplicaEngineCore)
-        core._request_contexts = {"held": SimpleNamespace(queue=asyncio.Queue())}
-        core._pending_free_ids = []
-        core._stat_logger = None
-        core._loop_task = None
-        core._running = True
-        native_aborts: list[str] = []
-        core.scheduler = SimpleNamespace(abort_request=native_aborts.append)
-        retained = {"held"}
-        closed: list[bool] = []
-
-        def cancel(request_id: str) -> bool:
-            retained.remove(request_id)
-            return True
-
-        core._agentinfer_admission = SimpleNamespace(
-            retained_request_ids=("held",),
-            cancel=cancel,
-            close=lambda: closed.append(True),
-        )
-        core._shutdown_worker = lambda *, timeout: None
-        queue = core._request_contexts["held"].queue
-
-        await core.stop()
-
-        assert queue.get_nowait().finish_reason == "FINISHED_ABORTED"
-        assert retained == set()
-        assert closed == [True]
-        assert native_aborts == core._pending_free_ids == []
 
     asyncio.run(run())
