@@ -15,7 +15,9 @@ pypto-lib is only used for the device Engram kernels and their ABI.
 
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+import io
 import math
 
 import numpy as np
@@ -146,6 +148,115 @@ class EngramLayout:
     @property
     def lookup_width(self) -> int:
         return self.hash_columns * self.head_dim
+
+
+class _EngramShardStream(io.RawIOBase):
+    """Expose each layer's rank-local checkpoint rows followed by zero padding."""
+
+    def __init__(self, spans, *, rank, shard_rows, row_bytes):
+        super().__init__()
+        self._files = ExitStack()
+        self._position = 0
+        self._layer_bytes = shard_rows * row_bytes
+        first_row = rank * shard_rows
+        try:
+            self._layers = []
+            for path, offset, shape, _ in spans:
+                rows = max(0, min(shard_rows, shape[0] - first_row))
+                file = self._files.enter_context(open(path, "rb", buffering=0)) if rows else None
+                self._layers.append((file, offset + first_row * row_bytes, rows * row_bytes))
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def _size(self):
+        return len(self._layers) * self._layer_bytes
+
+    def readable(self):
+        return not self.closed
+
+    def seekable(self):
+        return not self.closed
+
+    def tell(self):
+        if self.closed:
+            raise ValueError("Engram shard stream is closed")
+        return self._position
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        position = self.tell()
+        if whence == io.SEEK_CUR:
+            offset += position
+        elif whence == io.SEEK_END:
+            offset += self._size
+        elif whence != io.SEEK_SET:
+            raise ValueError("invalid Engram shard seek origin")
+        if offset < 0:
+            raise ValueError("negative Engram shard offset")
+        self._position = offset
+        return offset
+
+    def readinto(self, buffer):
+        position = self.tell()
+        if position >= self._size or not len(buffer):
+            return 0
+        layer, offset = divmod(position, self._layer_bytes)
+        file, start, data_bytes = self._layers[layer]
+        with memoryview(buffer).cast("B") as target:
+            if offset < data_bytes:
+                file.seek(start + offset)
+                with target[:data_bytes - offset] as chunk:
+                    count = file.readinto(chunk)
+                if not count:
+                    raise EOFError("truncated Engram checkpoint shard")
+            else:
+                count = min(len(target), self._layer_bytes - offset)
+                target[:count] = bytes(count)
+        self._position += count
+        return count
+
+    def close(self):
+        self._files.close()
+        super().close()
+
+
+class EngramWindowSources:
+    """Validate checkpoint spans and bind them to the kernel's Host windows."""
+
+    def __init__(self, store, layout, ranks, *, compiled_rows):
+        self.ranks = ranks
+        self.shard_rows = (max(layout.num_embeddings) + ranks - 1) // ranks
+        if compiled_rows != self.shard_rows * ranks:
+            raise ValueError("Engram table shape must match the forward compilation")
+        if len(layout.layer_ids) != len(layout.num_embeddings):
+            raise ValueError("Engram requires a table size for each layer")
+        self._bindings = {}
+        for key, field, row_bytes, dtype in (
+            ("engram_payload", "weight", layout.head_dim, torch.float8_e4m3fn),
+            ("engram_scale", "scale", layout.head_dim // 32, torch.float8_e8m0fnu),
+        ):
+            spans = []
+            for layer, rows in zip(layout.layer_ids, layout.num_embeddings, strict=True):
+                name = f"layers.{layer}.engram.embed.{field}"
+                span = store.tensor_span(name)
+                if span[2:] != ((rows, row_bytes), dtype):
+                    raise ValueError(f"unsupported Engram checkpoint layout: {name}")
+                spans.append(span)
+            self._bindings[key] = (spans, row_bytes)
+
+    @contextmanager
+    def open(self):
+        with ExitStack() as files:
+            yield {
+                key: tuple(
+                    files.enter_context(_EngramShardStream(
+                        spans, rank=rank, shard_rows=self.shard_rows, row_bytes=row_bytes,
+                    ))
+                    for rank in range(self.ranks)
+                )
+                for key, (spans, row_bytes) in self._bindings.items()
+            }
 
 
 class HostEngram:

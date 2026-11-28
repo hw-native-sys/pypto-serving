@@ -125,7 +125,7 @@ jobs:
           runtime-platform: a2a3
           # DeepSeek DSpark HC-pre uses the compact-accumulator lowering
           # introduced by PyPTO PR #3489. This revision also pins PTOAS 0.74.
-          pypto-revision: ${{ inputs.pypto-revision || 'b943b5fc672ebf6d2d715d8db27abf71b07a9278' }}
+          pypto-revision: ${{ inputs.pypto-revision || '707d1c35f5ef24801a73ccdc6b42be7416ea998d' }}
           pypto-repository: ${{ inputs.pypto-repository || 'hw-native-sys/pypto' }}
           toolchain: bundle
           # CI_CACHE_ROOT is shared with pypto and pypto-lib, whose jobs already
@@ -291,8 +291,7 @@ jobs:
           checkout-path: dist-checkout
           needs-device: 'true'
           runtime-platform: a5
-          # Keep V4.1 on the compiler validated before PyPTO PR #3411.
-          pypto-revision: ${{ inputs.pypto-revision || '3db18db1286bdbb44266179e3aedae659174b711' }}
+          pypto-revision: ${{ inputs.pypto-revision || '707d1c35f5ef24801a73ccdc6b42be7416ea998d' }}
           pypto-repository: ${{ inputs.pypto-repository || 'hw-native-sys/pypto' }}
           toolchain: bundle
           build-namespace: pypto-serving-v41-a5

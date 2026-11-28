@@ -136,7 +136,10 @@ def test_v41_dp4_http_answer(tmp_path, num_speculative_tokens):
                 f"http://127.0.0.1:{port}/v1/chat/completions",
                 data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"}, method="POST")
-            with OPENER.open(request, timeout=400) as response:
+            # The first K5 request initializes the prefill and verifier Engram
+            # Host windows from the checkpoint before returning any tokens.
+            cold_timeout = float(os.environ.get("PYPTO_DSV41_COLD_REQUEST_TIMEOUT", "1800"))
+            with OPENER.open(request, timeout=cold_timeout) as response:
                 assert response.status == 200
                 result = json.load(response)
             assert result["model"] == MODEL_NAME, result

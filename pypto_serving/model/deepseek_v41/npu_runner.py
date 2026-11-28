@@ -23,7 +23,7 @@ import sys
 import time
 import zlib
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, closing
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
@@ -45,7 +45,7 @@ from .task_args import (
     build_cache_groups,
     validate_cache_groups,
 )
-from .engram import HostEngram
+from .engram import EngramWindowSources, HostEngram
 from .dspark_resources import DSPARK_MAX_BATCH_PER_DP, DSPARK_WINDOW
 from .dspark_runtime import (
     DECODE_STAGE_ORDER,
@@ -1021,6 +1021,9 @@ def load_segment_modules(lib_root, topology):
             1, topology.tp, topology.world, topology.dp
         ):
             raise ValueError("lib CP/LM-head/EP/DP topology disagrees with the serving topology")
+        if (root / "models/deepseek_v4_1_flash/engram.py").is_file():
+            sys.argv.extend(("--engram-table-rows", str(max(config.FLASH.engram_num_embeddings))))
+            importlib.import_module("engram")
         if not (root / "models/deepseek_v4_1_flash/moe.py").is_file():
             return None, None
         attention = importlib.import_module(package + ".prefill_swa")
@@ -1032,7 +1035,7 @@ def load_segment_modules(lib_root, topology):
         sys.argv = old_argv
 
 
-def make_segment_worker(programs, run_config, inherited_host_tensors=()):
+def make_segment_worker(programs, run_config, inherited_host_tensors=(), *, window_sources=None):
     """Retain both programs' communication windows as in the V4 runner.
 
     Attention waits for (epoch - 1) * 2 before publishing the next phase.
@@ -1041,10 +1044,16 @@ def make_segment_worker(programs, run_config, inherited_host_tensors=()):
     """
     from pypto.runtime import DistributedWorker
 
-    return DistributedWorker(
+    class SegmentWorker(DistributedWorker):
+        def _reset_persistent_domains(self, orch, domains, reset_buffers):
+            # Preserve checkpoint-initialized host windows when resetting epochs.
+            scratch = {name: domain for name, domain in domains.items() if not domain[0][-1]}
+            super()._reset_persistent_domains(orch, scratch, reset_buffers)
+
+    return SegmentWorker(
         [program.compiled for program in programs], config=run_config,
         persistent=True, reset_persistent_windows=False,
-        inherited_host_tensors=inherited_host_tensors,
+        inherited_host_tensors=inherited_host_tensors, window_sources=window_sources,
     )
 
 
@@ -1239,7 +1248,7 @@ class DecodeForwardSegment:
         "c1a_index_block_table": "c1a_index_block_table",
         "query_start_loc": "c2a_query_start_loc",
         "state_block_table": "c2a_state_block_table",
-        "engram_lookup": "engram_lookup",
+        "engram_ids": "engram_ids",
         "dspark_target_hidden": "dspark_target_hidden",
     }
 
@@ -1251,21 +1260,27 @@ class DecodeForwardSegment:
         self.run_config, self.topology = run_config, topology
         self.counts_are_tensor = counts_are_tensor
         self.metadata = metadata
+        self.arguments = self.bind_arguments(param_names, weights, cache, metadata, engram,
+                                             counts_are_tensor=counts_are_tensor)
+        self.failed = False
+
+    @classmethod
+    def bind_arguments(cls, param_names, weights, cache, metadata, engram, *, counts_are_tensor=False):
         arguments = {name: weights.full(name) for name in weights.layout_names}
         arguments.update({name: cache.full(name) for name in cache._full})
         arguments.update({name: metadata.fields[source]
-                          for name, source in self._METADATA.items()})
+                          for name, source in cls._METADATA.items()})
         arguments.update({name: metadata.fields[name] for name in (
             "window_slots", "window_indices", "c2a_compressed_slots", "c1a_compressed_slots",
         )})
-        if engram is not None and "engram_lookup" in param_names:
-            arguments.update(engram_lookup=metadata.fields["engram_lookup"],
+        if engram is not None and "engram_ids" in param_names:
+            arguments.update(engram_ids=metadata.fields["engram_ids"],
                             engram_wkv=engram.wkv,
                             engram_wkv_scale=engram.wkv_scale,
                             engram_weight=engram.weight)
         arguments["moe_num_tokens"] = metadata.fields["moe_counts"]
         if counts_are_tensor:
-            if topology.tp != 1:
+            if metadata.topology.tp != 1:
                 raise ValueError("decode attention counts share MoE rows only at TP1")
             arguments["attention_num_tokens"] = metadata.fields["moe_counts"]
         missing = set(param_names) - set(arguments) - {
@@ -1273,8 +1288,7 @@ class DecodeForwardSegment:
         extra = set(arguments) - set(param_names)
         if missing or extra:
             raise ValueError(f"full decode ABI mismatch: missing={sorted(missing)} extra={sorted(extra)}")
-        self.arguments = arguments
-        self.failed = False
+        return arguments
 
     def run(self, state, *, group_counts):
         with profile_span('v41.DecodeForwardSegment.run', cat='v41.host', level='verbose'):
@@ -1747,16 +1761,19 @@ class SwaWindowMetadata:
 
 
 class HostEngramResources:
-    """Host hash lookup plus resident Engram projection weights."""
+    """Stage hash IDs and checkpoint sources for device-side Engram lookup."""
 
-    def __init__(self, model_dir, topology, tokenizer, *, capacity):
+    def __init__(self, model_dir, topology, tokenizer, *, compiled_rows):
         loader = V41WeightLoader(model_dir, tp_size=1, tp_rank=0,
                                  ep_size=topology.world, ep_rank=0,
                                  max_load_bytes=8 << 30)
         config = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))["text_config"]
-        # The adapter follows the official model's raw tokenizer ABI. It owns
-        # host hashing/history; pypto-lib contributes only device kernels.
+        # Keep the scheduler's per-request history and prefix replay on the host.
         self.host = HostEngram(loader, tokenizer, config)
+        self.window_sources = EngramWindowSources(
+            loader.store, self.host.layout, topology.world,
+            compiled_rows=compiled_rows,
+        )
         layers = self.host.layout.layer_ids
         if len(layers) != 2:
             raise ValueError("V4.1 serving currently requires two Engram layers")
@@ -1775,8 +1792,6 @@ class HostEngramResources:
             gate_values.append((q * k).to(torch.float32))
         def shared(value):
             return value.unsqueeze(0).expand(topology.world, *value.shape).contiguous().share_memory_()
-        self.lookup = torch.zeros((topology.world, 2, capacity, self.host.layout.lookup_width),
-                                  dtype=torch.bfloat16).share_memory_()
         self.wkv = shared(torch.stack(wkv_values))
         # The Engram ABI flattens the two layer scale matrices along the
         # group axis: [2 * (ENGRAM_K // 32), KV_OUT].  The weight and gate
@@ -1787,32 +1802,31 @@ class HostEngramResources:
 
     @property
     def inherited_host_tensors(self):
-        return self.lookup, self.wkv, self.wkv_scale, self.weight
+        return self.wkv, self.wkv_scale, self.weight
 
     def release_request(self, request_id):
         self.host.release_request(request_id)
 
-    def stage_lookup(self, target, step, topology, *, row_stride=None):
-        with profile_span('v41.HostEngramResources.stage_lookup', cat='v41.engram', level='verbose'):
-            if (target.shape[1] != self.lookup.shape[1] or target.shape[3] != self.lookup.shape[3]
-                    or target.shape[2] > self.lookup.shape[2]):
-                raise ValueError("Engram lookup capacity disagrees with the forward ABI")
-            target.zero_()
+    def stage_ids(self, target, step, topology, *, row_stride=None):
+        with profile_span('v41.HostEngramResources.stage_ids', cat='v41.engram', level='verbose'):
+            ids = target.view(topology.world, 2, topology.capacity, self.host.layout.hash_columns)
+            ids.fill_(-1)
             offsets = [0] * topology.dp
             for request in step.requests:
                 start = offsets[request.partition]
                 if request.shared_prefix_tokens and request.request_id not in self.host.history:
                     self.host.begin_replay(request.request_id, max(0, request.shared_prefix_tokens - 128))
                 count = len(request.token_ids)
-                if count > topology.capacity:
+                if start + count > topology.capacity:
                     raise ValueError("Engram rows must fit the current-token capacity")
                 if row_stride is not None and count > row_stride:
                     raise ValueError("Engram active rows exceed the request stride")
-                values = self.host.lookup(request.token_ids, topology.capacity, request.start,
-                                          request_id=request.request_id)
+                values = self.host.hash_ids(
+                    request.token_ids, request.start, request_id=request.request_id,
+                )
                 for tp_rank in range(topology.tp):
                     rank = request.partition * topology.tp + tp_rank
-                    target[rank, :, start:start + count].copy_(values[:, :count])
+                    ids[rank, :, start:start + count].copy_(values)
                 offsets[request.partition] += count if row_stride is None else row_stride
 
 
@@ -2164,9 +2178,9 @@ class PrefillMetadataResources:
             return value
 
         world, tokens, width = topology.world, topology.capacity, rope_tables[0].shape[1]
-        if type(engram_k) is not int or engram_k <= 0:
-            raise ValueError("Engram width must be positive")
-        shared("engram_lookup", (world, 2, tokens, engram_k), torch.bfloat16)
+        if type(engram_k) is not int or engram_k <= 0 or engram_k % 256:
+            raise ValueError("Engram width must be a positive multiple of the 256-wide hash head")
+        shared("engram_ids", (world, 2 * tokens * engram_k // 256, 1), torch.int32, -1)
         shared("attention_counts", (world, 1), torch.int32)
         shared("moe_counts", (world,), torch.int32)
         shared("window_slots", (world, tokens), torch.int64, -1)
@@ -2254,7 +2268,7 @@ class PrefillMetadataResources:
             self.fields["attention_counts"][:, 0].copy_(torch.tensor(attention, dtype=torch.int32))
             self.fields["moe_counts"].copy_(torch.tensor(moe, dtype=torch.int32))
             if engram is not None:
-                engram.stage_lookup(self.fields["engram_lookup"], step, self.topology)
+                engram.stage_ids(self.fields["engram_ids"], step, self.topology)
             for prefix, ratio in (("c2a", 2), ("c1a", 1)):
                 metadata = prepare_compressed_metadata(
                     step, self.topology, ratio=ratio, compressed_group=prefix,
@@ -2330,7 +2344,6 @@ class PrefillMetadataResources:
         f = self.fields
         names = {
             "embedding": "full_embedding", "embedding_ids": "full_embedding_ids",
-            "engram_lookup": "engram_lookup",
             "initial_pre": "full_initial_pre", "identity_rows": "full_identity_rows",
             "counts": "full_counts", "replay_rows": "full_replay_rows",
             "logit_rows": "full_logit_rows",
@@ -2346,7 +2359,7 @@ class PrefillMetadataResources:
             "c1a_compressed_slots": "c1a_compressed_slots",
             "state_block_table": "c2a_state_block_table",
         }
-        for name in ("engram_lookup", "dspark_target_hidden"):
+        for name in ("engram_ids", "dspark_target_hidden"):
             if name in f:
                 names[name] = name
         return {name: f[source] for name, source in names.items()}
@@ -2534,13 +2547,13 @@ class PrefillForwardSegment:
             for name in _SAMPLING_INPUTS:
                 if name in self.param_names:
                     self.arguments[name] = getattr(final, name)
-            if engram is not None and "engram_lookup" in param_names:
-                self.arguments.update(engram_lookup=metadata.fields["engram_lookup"],
+            if engram is not None and "engram_ids" in param_names:
+                self.arguments.update(engram_ids=metadata.fields["engram_ids"],
                                       engram_wkv=engram.wkv,
                                       engram_wkv_scale=engram.wkv_scale,
                                       engram_weight=engram.weight)
-            elif "engram_lookup" not in param_names:
-                self.arguments.pop("engram_lookup", None)
+            elif "engram_ids" not in param_names:
+                self.arguments.pop("engram_ids", None)
             if len(self.param_names) != len(set(self.param_names)) or set(self.param_names) != set(self.arguments):
                 raise ValueError("lib full prefill ABI differs from the serving binding")
         except BaseException:
@@ -2584,7 +2597,7 @@ class ResidentDSparkWeights:
     tensors while only one rank/layer temporary exists on the host.
     """
 
-    def __init__(self, worker, model_dir, world):
+    def __init__(self, worker, model_dir, world, *, native_moe=False):
         from pypto.runtime import StackedDeviceTensor
 
         from .dspark_weights import V41DSparkWeightContract
@@ -2596,7 +2609,7 @@ class ResidentDSparkWeights:
         contracts = [
             V41DSparkWeightContract(V41WeightLoader(
                 model_dir, tp_size=1, tp_rank=0, ep_size=world, ep_rank=rank,
-                max_load_bytes=512 << 20,
+                max_load_bytes=512 << 20, native_moe=native_moe,
             )) for rank in range(world)
         ]
         try:
@@ -2875,7 +2888,7 @@ class V41ResidentResources:
     argument and dispatch the compiled layer programs.
     """
 
-    def __init__(self, programs, run_config, *, weight_bank, weight_param_names,
+    def __init__(self, programs, run_config, *, weight_bank, weight_layout, weight_slices, weight_param_names,
                  cache_plan, state_reset, page_resets, input_host, final_host,
                  prefill_host, topology, decode_head_program, decode_head_param_names,
                  engram_host=None,
@@ -2884,7 +2897,6 @@ class V41ResidentResources:
                  dspark_programs=None, dspark_param_names=None, max_seq_len=None,
                  dspark_weight_contract=None, dspark_lowering_provider=None,
                  dspark_host_resources=None):
-        weight_bank.finish(weight_param_names)
         if decode_host is not None and (decode_input_host is None or
                 decode_host.topology != decode_input_host.topology):
             raise ValueError("decode metadata and input must share one TP-local topology")
@@ -2903,14 +2915,17 @@ class V41ResidentResources:
                      + (state_reset, *page_resets.values()))
         if any(not tensor.is_shared() for tensor in inherited):
             raise ValueError("all inherited V4.1 host buffers must be shared before worker creation")
-        if not getattr(weight_bank, "prepacked", False) and any(
-                not tensor.is_shared() for tensor in weight_bank.tensors.values()):
-            raise ValueError("all inherited V4.1 host buffers must be shared before worker creation")
-
-        self.worker = worker_factory(programs, run_config,
-                                     tuple(weight_bank.tensors.values()) + inherited)
+        if weight_bank is not None:
+            weight_bank.finish(weight_param_names)
+            inherited = tuple(weight_bank.tensors.values()) + inherited
+        with ExitStack() as sources:
+            worker_kwargs = {}
+            if engram_host is not None:
+                worker_kwargs["window_sources"] = sources.enter_context(engram_host.window_sources.open())
+            self.worker = worker_factory(programs, run_config, inherited, **worker_kwargs)
+            self._window_sources = sources.pop_all()
         self.run_config = run_config
-        self.host_resources = (weight_bank, input_host, decode_input_host, prefill_host, decode_host,
+        self.host_resources = (input_host, decode_input_host, prefill_host, decode_host,
                                final_host, dspark_host_resources, state_reset, page_resets)
         self.prefill_host = prefill_host
         self.engram_host = engram_host
@@ -2931,9 +2946,9 @@ class V41ResidentResources:
         self._prefill_fwd = None
         self._decode_fwd = None
         self._decode_binding = None
+        self._first_dispatches = set()
         self._decode_head_program = decode_head_program
         self._decode_head_param_names = tuple(decode_head_param_names)
-        self._weight_bank = weight_bank
         self._weight_param_names = tuple(weight_param_names)
         self._prefill_binding = (prefill_program, prefill_param_names, run_config, prefill_host.topology)
         self.dspark_programs = dict(dspark_programs or {})
@@ -2957,8 +2972,10 @@ class V41ResidentResources:
         self.failed = False
         self.closed = False
         try:
-            self.weights = ResidentFullDecodeWeights(
-                self.worker, weight_bank, weight_param_names)
+            with closing(weight_slices):
+                self.weights = ResidentFullDecodeWeights(
+                    self.worker, weight_layout, weight_param_names, weight_slices)
+            _log_host_memory("backbone upload")
             self.input = self._own(InputStateRuntime(self.worker, input_host))
             self.decode_input = (None if decode_input_host is None else
                                  self._own(InputStateRuntime(self.worker, decode_input_host)))
@@ -3013,7 +3030,7 @@ class V41ResidentResources:
                     )
                 self.dspark_weights = self._own(
                     ResidentDSparkWeights(self.worker, dspark_weight_contract.loader.model_dir,
-                                          topology.world)
+                                          topology.world, native_moe=weight_layout.native_moe)
                 )
                 self.dspark_embedding = self._own(
                     ResidentDSparkEmbedding(self.worker, dspark_weight_contract.loader.model_dir,
@@ -3039,6 +3056,8 @@ class V41ResidentResources:
                     group = getattr(plan.family_groups, family)
                     if decode_host.compressed_pages[family] < plan.physical_group_blocks[group]:
                         raise ValueError(f"decode {family} metadata must cover the filler page")
+            if weight_bank is not None:
+                self.worker.release_inherited_host_tensor_refs()
         except BaseException:
             self.close()
             raise
@@ -3054,9 +3073,10 @@ class V41ResidentResources:
     def _build_dspark_target_model(self, resources):
         from .dspark_resources import _TARGET_DYNAMIC_KEYS
 
-        if self._decode_fwd is None:
-            self._activate_decode()
-        target = {name: value for name, value in self._decode_fwd.arguments.items()
+        arguments = DecodeForwardSegment.bind_arguments(
+            self._weight_param_names, self.weights, self.cache, self.decode_host, self.engram,
+        )
+        target = {name: value for name, value in arguments.items()
                   if name not in _TARGET_DYNAMIC_KEYS}
         target["embedding_weight"] = self.dspark_embedding.tensor
         target.update(final_norm_weight=self.final.norm_weight, lm_head_weight=self.final.head_weight)
@@ -3201,8 +3221,8 @@ class V41ResidentResources:
                 ))
             self._stage_dspark_tables(resources, batch, partitions, request_rows)
             if self.engram_host is not None:
-                self.engram_host.stage_lookup(
-                    self.decode_host.fields["engram_lookup"],
+                self.engram_host.stage_ids(
+                    self.decode_host.fields["engram_ids"],
                     ForwardStep("decode", tuple(engram_requests), 0), self.decode_host.topology,
                     row_stride=DSPARK_ROWS_PER_REQUEST)
             return tuple(partitions), tuple(request_rows)
@@ -3434,11 +3454,19 @@ class V41ResidentResources:
         if (self.closed or step is not self._step or step.phase != "prefill"
                 or self._prefill_fwd is None):
             raise ValueError("full prefill requires the active prefill step")
-        if not step.sampling_params:
-            return self._prefill_fwd.run()
-        if not all(name in self._prefill_fwd.arguments for name in _SAMPLING_INPUTS):
-            raise MissingCompositeInterface("V4.1 prefill requires the lib sampling inputs")
-        return self._prefill_fwd.run(sampling_inputs=self._stage_output_sampling(step))
+        sampling_inputs = None
+        if step.sampling_params:
+            if not all(name in self._prefill_fwd.arguments for name in _SAMPLING_INPUTS):
+                raise MissingCompositeInterface("V4.1 prefill requires the lib sampling inputs")
+            sampling_inputs = self._stage_output_sampling(step)
+        state = self._prefill_fwd.run(sampling_inputs=sampling_inputs)
+        self._record_first_dispatch("prefill")
+        return state
+
+    def _record_first_dispatch(self, phase):
+        if phase not in self._first_dispatches:
+            _log_host_memory(f"first {phase}")
+            self._first_dispatches.add(phase)
 
     def _stage_output_sampling(self, step):
         """Stage controls at the LM-head output slots in absolute token positions."""
@@ -3501,6 +3529,7 @@ class V41ResidentResources:
                 or self._decode_fwd is None):
             raise ValueError("full decode requires the active decode step")
         state = self._decode_fwd.run(state, group_counts=self._group_counts)
+        self._record_first_dispatch("decode")
         head_arguments = dict(self._decode_head_arguments, x_hc=state.residual, pre_mix=state.pre_mix)
         if step.sampling_params:
             head_arguments.update(self._stage_output_sampling(step), logits=self.final.device_logits)
@@ -3780,6 +3809,7 @@ class V41ResidentResources:
             for request_id in request_ids:
                 self.dspark.states.get(request_id)
             self._run_dspark_orchestrator(lowered, phase="decode")
+            self._record_first_dispatch("DSpark decode")
             counts_tensor = self._read_dspark_output(lowered, "accepted_counts")
             accepted_tensor = self._read_dspark_output(lowered, "accepted_ids")
             sampled_tensor = self._read_dspark_output(lowered, "last_sampled")
@@ -3893,13 +3923,36 @@ class V41ResidentResources:
             for resource in reversed(self._owned):
                 resource.close()
         finally:
-            self.worker.close()
-            self.closed = True
-            self._owned.clear()
+            try:
+                self.worker.close()
+            finally:
+                self._window_sources.close()
+                self.closed = True
+                self._owned.clear()
 
 
 # production_binding
 _LOG = logging.getLogger(__name__)
+
+
+def _log_host_memory(phase):
+    def read_kib(path, field):
+        with open(path, encoding="utf-8") as info:
+            for line in info:
+                name, _, value = line.partition(":")
+                if name == field:
+                    return int(value.split()[0])
+        raise ValueError(f"{field} missing from {path}")
+
+    try:
+        rss = read_kib("/proc/self/status", "VmRSS")
+        available = read_kib("/proc/meminfo", "MemAvailable")
+        shm = os.statvfs("/dev/shm")
+    except (OSError, ValueError) as exc:
+        _LOG.debug("V4.1 host memory snapshot unavailable: %s", exc)
+        return
+    _LOG.info("V4.1 host memory after %s: RSS %.1f GiB, MemAvailable %.1f GiB, /dev/shm free %.1f GiB",
+              phase, rss / (1 << 20), available / (1 << 20), shm.f_bavail * shm.f_frsize / (1 << 30))
 
 
 def _lib_root():
@@ -3999,41 +4052,27 @@ def prefill_ring_heap(capacity):
     return (2 << 30, attention_heap, 2 << 30, (6 << 30) - attention_heap)
 
 
-def _stage_decode_weight_bank(model_dir, layout, topology, decode_names):
-    bank_started = time.perf_counter()
-    bank = load_prepacked_bank(model_dir, layout, decode_names)
-    if bank is None:
-        bank = DecodeWeightBank(layout)
-        append_seconds = 0.0
-        layer_started = time.perf_counter()
-        parallel_experts = topology.dp in (4, 8)
-        previous_threads = torch.get_num_threads()
-        if parallel_experts and previous_threads < 8:
-            torch.set_num_threads(8)
-        try:
-            for item in iter_decode_weight_slices(
-                    model_dir, topology, parallel_experts=parallel_experts, bank=bank):
-                append_started = time.perf_counter()
-                bank.append(item)
-                append_seconds += time.perf_counter() - append_started
+def _stream_decode_weight_slices(model_dir, layout, topology):
+    started = time.perf_counter()
+    previous_threads = torch.get_num_threads()
+    if previous_threads < 8:
+        torch.set_num_threads(8)
+    try:
+        with closing(iter_decode_weight_slices(
+            model_dir, topology, parallel_experts=True, native_moe=layout.native_moe,
+        )) as slices:
+            for item in slices:
+                yield item
                 if item.name == "hc_attn_fn":
-                    now = time.perf_counter()
-                    _LOG.info("V4.1 checkpoint layer %d/%d loaded into shared weight bank (%.2fs)",
-                              item.slot + 1, layout.layers, now - layer_started)
-                    layer_started = now
-        finally:
-            if parallel_experts and previous_threads < 8:
-                torch.set_num_threads(previous_threads)
-        bank.finish(decode_names)
-        _LOG.info("V4.1 checkpoint staging %.2fs (bank copies %.2fs)",
-                  time.perf_counter() - bank_started, append_seconds)
-        peak_rss = peak_rss_bytes()
-        if peak_rss is not None:
-            _LOG.info("V4.1 checkpoint staging peak RSS %.1f GiB",
-                      peak_rss / (1 << 30))
-    _LOG.info("V4.1 shared weight bank ready: %.1f GiB",
-              bank.allocated_bytes / (1 << 30))
-    return bank
+                    _LOG.info("V4.1 checkpoint layer %d/%d uploaded", item.slot + 1, layout.layers)
+                del item
+    finally:
+        if previous_threads < 8:
+            torch.set_num_threads(previous_threads)
+    _LOG.info("V4.1 streamed backbone weight load and upload %.2fs", time.perf_counter() - started)
+    peak_rss = peak_rss_bytes()
+    if peak_rss is not None:
+        _LOG.info("V4.1 streamed backbone upload peak RSS %.1f GiB", peak_rss / (1 << 30))
 
 
 def make_production_bindings(
@@ -4109,27 +4148,20 @@ def make_production_bindings(
             raise ValueError("V4.1 checkpoint source axes disagree with the selected lib")
         DecodeWeightBank.validate_abi(decode_names)
 
-        # Keep JIT and its topology-specific imports on the worker's main
-        # thread. Staging needs only the checkpoint and the validated weight ABI.
         startup_started = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="v41-weights") as staging:
-            bank_future = staging.submit(_stage_decode_weight_bank, model_dir, layout, topology, decode_names)
+        if runtime.num_speculative_tokens:
+            decode = None
+            decode_counts_are_tensor = False
+            dspark_programs, dspark_param_names = compile_decode_fwd_dspark(compiler, root, topology)
+        else:
             decode, decode_counts_are_tensor = compile_decode_fwd(compiler, decode_entry, topology)
-            if runtime.num_speculative_tokens:
-                dspark_programs, dspark_param_names = compile_decode_fwd_dspark(
-                    compiler, root, topology)
-            else:
-                dspark_programs, dspark_param_names = {}, {}
-            prefill, prefill_names = compile_prefill_fwd(compiler, root, prefill_topology)
-            head_entry = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd").l3_generation_head
-            decode_head_param_names = tuple(head_entry.param_names)
-            decode_head = compiler.compile("v41_generation_head", head_entry)
-            compile_finished = time.perf_counter()
-            bank = bank_future.result()
-        startup_finished = time.perf_counter()
-        _LOG.info("V4.1 kernel preparation and checkpoint staging %.2fs (JIT %.2fs, wait for weights %.2fs)",
-                  startup_finished - startup_started, compile_finished - startup_started,
-                  startup_finished - compile_finished)
+            dspark_programs, dspark_param_names = {}, {}
+        prefill, prefill_names = compile_prefill_fwd(compiler, root, prefill_topology)
+        head_entry = importlib.import_module("models.deepseek_v4_1_flash.prefill_fwd").l3_generation_head
+        decode_head_param_names = tuple(head_entry.param_names)
+        decode_head = compiler.compile("v41_generation_head", head_entry)
+        _LOG.info("V4.1 kernel preparation %.2fs", time.perf_counter() - startup_started)
+        _log_host_memory("JIT")
 
         rope = importlib.import_module("models.deepseek_v4_1_flash.rope_tables")
         swa_tables = rope.precompute_rope_tables(max_seq_len, False)
@@ -4163,7 +4195,7 @@ def make_production_bindings(
         prefill_host = PrefillMetadataResources(
             prefill_topology, **host_kwargs, full_hidden_size=plan.weights.config.hidden_size)
         engram_host = None
-        if "engram_lookup" in set(decode_names) | set(prefill_names):
+        if "engram_ids" in set(decode_names) | set(prefill_names):
             tokenizer_adapter = tokenizer
             if tokenizer_adapter is None:
                 from pypto_serving.model.tokenizer import load_tokenizer
@@ -4172,7 +4204,9 @@ def make_production_bindings(
             tokenizer_impl = getattr(tokenizer_adapter, "tokenizer", tokenizer_adapter)
             tokenizer_impl = getattr(tokenizer_impl, "_tokenizer", tokenizer_impl)
             engram_host = HostEngramResources(
-                model_dir, topology, tokenizer_impl, capacity=max(prefill_topology.capacity, topology.capacity))
+                model_dir, topology, tokenizer_impl,
+                compiled_rows=abi.ENGRAM_ROWS,
+            )
         dspark_host = None
         if runtime.num_speculative_tokens:
             from .dspark_resources import DSparkResourceLayout, allocate_dspark_host_resources
@@ -4188,11 +4222,16 @@ def make_production_bindings(
             dspark_host.rope_tables["draft_sin"].copy_(decode_host.fields["freqs_sin"])
         programs_by_id = {}
         for program in (prefill, decode, decode_head, *dspark_programs.values()):
-            programs_by_id.setdefault(id(program.compiled), program)
+            if program is not None:
+                programs_by_id.setdefault(id(program.compiled), program)
         programs = tuple(programs_by_id.values())
+        bank = load_prepacked_bank(model_dir, layout, decode_names)
+        weight_slices = (bank.iter_slices() if bank is not None
+                         else _stream_decode_weight_slices(model_dir, layout, topology))
         resident_started = time.perf_counter()
         resident = V41ResidentResources(
-            programs, run_config, weight_bank=bank, weight_param_names=decode_names,
+            programs, run_config, weight_bank=bank, weight_layout=layout,
+            weight_slices=weight_slices, weight_param_names=decode_names,
             cache_plan=cache_plan, state_reset=state_reset, page_resets=resets,
             input_host=input_host, decode_input_host=decode_input_host,
             prefill_host=prefill_host, decode_host=decode_host,
@@ -4207,11 +4246,13 @@ def make_production_bindings(
             decode_head_program=decode_head,
             decode_head_param_names=decode_head_param_names,
         )
+        del bank
         _LOG.info("V4.1 resident upload and allocation %.2fs",
                   time.perf_counter() - resident_started)
+        _log_host_memory("resident upload")
         try:
-            resident.bind_decode_fwd(
-                decode, decode_names, run_config, decode_counts_are_tensor)
+            if decode is not None:
+                resident.bind_decode_fwd(decode, decode_names, run_config, decode_counts_are_tensor)
             if dspark_host is not None and dspark_lowering_provider is None:
                 from .dspark_resources import V41DSparkLoweringProvider
 
