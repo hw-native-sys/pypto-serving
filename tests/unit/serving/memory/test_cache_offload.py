@@ -15,10 +15,15 @@ from types import SimpleNamespace
 import pytest
 import msgspec
 
+from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
+from pypto_serving.observability.dplb_dfx import DplbDfxConfig, DplbDfxRecorder
+from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.memory.tiering.cache import TieredCache
 from pypto_serving.serving.memory.tiering.manager import CacheTier
 from pypto_serving.serving.memory.tiering.integration import Session
 from pypto_serving.serving.sched.scheduler import Request
+from tests.unit.serving.test_dplb import cache as dplb_cache
+from tests.unit.serving.test_dplb_dfx import records
 from tests.unit.serving.test_grouped_prefix_cache import _finish_prefill, _prefill_scheduler, manager, prompt
 
 
@@ -148,6 +153,138 @@ def test_joint_checkpoint_restore_preserves_content_and_alignment(length):
     assert all(not b.ref_cnt for p in cache._group_pools.values() for b in p.blocks)
 
 
+def publish_prefix(cache, hashes, partition):
+    seed = f'prefix-{partition}'
+    cache.ensure_group_blocks(seed, 32, partition=partition)
+    cache.cache_group_blocks(seed, hashes, 32, {})
+    cache.release_all_group_requests(seed)
+
+
+def dplb_offload_fixture(offloaded):
+    cache, backend = dplb_cache(), Backend()
+    cache.tiering = tier = TieredCache(cache, backend, 200_000)
+    hashes = cache.compute_group_block_hashes(list(range(33)))
+    for partition in (0, 1):
+        publish_prefix(cache, hashes, partition)
+    tier.progress()
+    tier.progress()
+    pool = cache._group_pools['kv']
+    for partition in offloaded:
+        for value in hashes['kv']:
+            assert tier.tier.lookup((partition, 'kv', value)) is not None
+            cache._invalidate_group_block(pool, partition, pool.hash_to_block[partition, value])
+    cache.ensure_group_blocks('heavy', 48, partition=0)
+    cache.ensure_group_blocks('light', 16, partition=1)
+    scheduler = _prefill_scheduler(cache, replay=0)
+    backend.hold = True
+    return cache, tier, backend, scheduler
+
+
+@pytest.mark.parametrize('offloaded', [0, 1])
+def test_dplb_prefill_skips_ddr_restore_when_equal_prefix_is_resident(offloaded):
+    _, tier, backend, scheduler = dplb_offload_fixture((offloaded,))
+    scheduler.add_request(Request('incoming', list(range(33)), max_new_tokens=1))
+
+    output = scheduler.schedule()
+
+    assert not tier.pending
+    assert not backend.waiting
+    step, = output.scheduled_requests
+    assert step.cache_partition == 1 - offloaded
+    assert step.num_computed_tokens == 32
+
+
+def test_dfx_links_ddr_restore_and_later_hbm_placement(tmp_path):
+    cache, tier, backend, scheduler = dplb_offload_fixture((0, 1))
+    recorder = DplbDfxRecorder(DplbDfxConfig(level='load'), tmp_path)
+    assert recorder.start('restore')
+    cache.dplb_dfx = recorder
+    request = Request('incoming', list(range(33)), max_new_tokens=1)
+    scheduler.add_request(request)
+
+    assert not scheduler.schedule().scheduled_requests
+    assert not scheduler.schedule().scheduled_requests
+    assert tier.pending['incoming'].partition == 1
+    assert len(backend.waiting) == 2
+
+    cache.release_all_group_requests('heavy')
+    cache.release_all_group_requests('light')
+    cache.ensure_group_blocks('new-light', 16, partition=0)
+    cache.ensure_group_blocks('new-heavy', 48, partition=1)
+    publish_prefix(cache, request.group_block_hashes, 0)
+    for future in backend.waiting:
+        future.set_result(dict(bytes=1, stopped=True, native_completed=True))
+    tier.progress()
+    step, = scheduler.schedule().scheduled_requests
+    assert (step.cache_partition, step.num_computed_tokens) == (0, 32)
+
+    events = [event for event in records(recorder) if event.get('request_id') == 'incoming']
+    restore, = [event for event in events if event['event'] == 'prefix_restore']
+    assert restore['selected_group'] == 1
+    assert restore['hit_tokens'] == 32
+    assert restore['incoming_logical_tokens'] == 33
+    assert restore['candidates'] == [0, 1]
+    assert restore['ranked'] == [1, 0]
+    assert set(restore['scores']) == {'0', '1'}
+    assert restore['restore_pages'] == restore['new_pages'] == restore['restore_bytes'] == 2
+    lookup, = [event for event in events if event['event'] == 'prefix_lookup']
+    assert lookup['selected_group'] == 0
+    assert lookup['request_uid'] == restore['request_uid']
+    assert lookup['decision_id'] > restore['decision_id']
+
+
+def test_dplb_prefill_prefers_fewer_restore_bytes_for_equal_hits():
+    cache, tier, backend, scheduler = dplb_offload_fixture((1,))
+    hashes = cache.compute_group_block_hashes(list(range(33)))
+    pool = cache._group_pools['kv']
+    cache._invalidate_group_block(pool, 0, pool.hash_to_block[0, hashes['kv'][-1]])
+    scheduler.add_request(Request('incoming', list(range(33)), max_new_tokens=1))
+
+    assert not scheduler.schedule().scheduled_requests
+    assert tier.pending['incoming'].partition == 0
+    assert len(backend.waiting) == 1
+
+
+@pytest.mark.parametrize('decode', [False, True], ids=['prefill', 'decode'])
+def test_uses_feasible_ddr_prefix_when_equal_hbm_hit_cannot_grow(decode):
+    async def run():
+        cache, backend = KvCacheManager(enable_dplb=True), Backend()
+        cache.init_groups((KVCacheGroupSpec(
+            'kv', (0,), KVCacheSpec(16, 16, 1), 4, num_partitions=2, num_blocks=4,
+        ),), max_batch_size=1)
+        cache.tiering = tier = TieredCache(cache, backend, 200_000)
+        hashes = cache.compute_group_block_hashes(list(range(33)))
+        cache.ensure_group_blocks('full', 64, partition=0)
+        cache.cache_group_blocks('full', hashes, 32, {})
+        publish_prefix(cache, hashes, 1)
+        tier.progress()
+        tier.progress()
+        pool = cache._group_pools['kv']
+        for value in hashes['kv']:
+            cache._invalidate_group_block(pool, 1, pool.hash_to_block[1, value])
+        cache.ensure_group_blocks('light', 16, partition=1)
+        assert [pool.num_free_blocks_in(partition) for partition in (0, 1)] == [0, 3]
+        session = attach(tier)
+
+        if decode:
+            await asyncio.wait_for(tier.restore('incoming', hashes, 33, maximum=33), timeout=2)
+            reservation = cache.reserve_group_cache('incoming', 'incoming', 34, prompt_token_count=33,
+                prefix_block_hashes=hashes, shareable_group_names=('kv',))
+            assert (reservation.partition, reservation.prefix_hit_tokens) == (1, 32)
+        else:
+            scheduler = _prefill_scheduler(cache, replay=0)
+            scheduler.add_request(Request('incoming', list(range(33)), max_new_tokens=1))
+            assert not scheduler.schedule().scheduled_requests
+            assert tier.pending['incoming'].partition == 1
+            await until(lambda: tier.pending['incoming'].remaining == 0)
+            step, = scheduler.schedule().scheduled_requests
+            assert (step.cache_partition, step.num_computed_tokens, step.num_new_tokens) == (1, 32, 1)
+
+        assert tier.tier.counters['loads'] == 2
+        await session.close()
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize('outcome', ['shared', 'unknown'])
 def test_async_shared_restore_cancel_and_unknown(outcome):
     async def run():
@@ -189,7 +326,7 @@ def test_async_shared_restore_cancel_and_unknown(outcome):
 
 
 @pytest.mark.parametrize('cancelled', [False, True])
-def test_d_reserves_only_after_its_independent_history_restore(cancelled):
+def test_d_reserves_only_after_its_independent_history_restore(cancelled, tmp_path):
     from pypto_serving.pd.adapter import DeepSeekDSpark
     from pypto_serving.pd.protocol import Binding, Continuation
     from tests.unit.pd.test_service import service
@@ -200,6 +337,9 @@ def test_d_reserves_only_after_its_independent_history_restore(cancelled):
         evict(cache)
         backend.hold = True
         session = attach(tier)
+        recorder = DplbDfxRecorder(DplbDfxConfig(level='load'), tmp_path)
+        assert recorder.start('decode-restore')
+        cache.dplb_dfx = recorder
         node, source, destination = service()
         node.cache = node.core.kv_cache_manager = cache
         node.core.config = SimpleNamespace(max_num_running_reqs=8, runtime_config=SimpleNamespace(max_seq_len=655360))
@@ -225,7 +365,12 @@ def test_d_reserves_only_after_its_independent_history_restore(cancelled):
         if not cancelled:
             assert (await task).hit == 512 and calls == ['reserve_state']
             await node.abort(entry, stopped=True)
+        node.finish(entry)
         await session.close()
+        events = records(recorder)
+        restore, = [event for event in events if event['event'] == 'prefix_restore']
+        terminal, = [event for event in events if event['event'] == 'request_terminal']
+        assert terminal['request_uid'] == restore['request_uid']
     asyncio.run(run())
 
 

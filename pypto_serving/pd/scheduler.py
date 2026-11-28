@@ -43,8 +43,9 @@ class PrefillScheduler(Scheduler):
     def _can_admit_waiting_partition(self, partition):
         return self._remaining[partition] > 0 and self._rows[partition] > 0 and partition not in self._continuing
 
-    def _limit_scheduled_tokens(self, request, token_budget):
-        partition = request.cache_partition if self.kv_cache_manager.has_groups else 0
+    def _partition_token_budget(self, request, token_budget, partition):
+        if not self.kv_cache_manager.has_groups:
+            partition = 0
         if partition is None:
             available = max((tokens for partition, tokens in enumerate(self._remaining)
                              if self._can_admit_waiting_partition(partition)), default=0)
@@ -53,19 +54,16 @@ class PrefillScheduler(Scheduler):
             return 0
         else:
             available = self._remaining[partition]
-        return super()._limit_scheduled_tokens(request, min(token_budget, available))
+        return min(token_budget, available)
 
     def _try_allocate_request_blocks(self, request, num_new_tokens, *, scheduled=None):
-        cache = self.kv_cache_manager
-        if cache.has_groups and request.cache_partition is None:
-            candidates = [partition for partition, tokens in enumerate(self._remaining)
+        partitions = None
+        if self.kv_cache_manager.has_groups and request.cache_partition is None:
+            partitions = [partition for partition, tokens in enumerate(self._remaining)
                           if tokens >= num_new_tokens and self._can_admit_waiting_partition(partition)]
-            partition = cache.select_group_partition(request.request_id,
-                request.num_computed_tokens + num_new_tokens, partitions=candidates)
-            if partition is None:
-                return False
-            request.cache_partition = partition
-        return super()._try_allocate_request_blocks(request, num_new_tokens, scheduled=scheduled)
+        return super()._try_allocate_request_blocks(
+            request, num_new_tokens, scheduled=scheduled, partitions=partitions,
+        )
 
     def _on_scheduled(self, scheduled):
         partition = scheduled.cache_partition if self.kv_cache_manager.has_groups else 0

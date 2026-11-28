@@ -220,6 +220,8 @@ class Service:
         if self.requests.pop(entry.binding.request, None) is None:
             return
         self.chunks.pop(entry.binding.request, None)
+        if self.role == "decode" and entry.reservation is None:
+            self.cache.dfx_terminal(entry.binding.request, "pd_cancelled" if entry.cancelled else "pd_finished")
         self.remember_terminal(entry.binding)
         self.observe("finished", entry, cancelled=entry.cancelled, error=entry.error,
                      p_hit=entry.p_hit, d_hit=entry.reservation.prefix_hit_tokens

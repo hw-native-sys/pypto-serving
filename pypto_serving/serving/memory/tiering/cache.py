@@ -77,7 +77,8 @@ class TieredCache:
             while True:
                 if cancelled():
                     raise ValueError("request cancelled during cache restore")
-                if self.prepare(request, hashes, tokens, maximum=maximum, groups=groups):
+                if self.prepare(request, hashes, tokens, maximum=maximum, groups=groups,
+                                allocation_tokens=tokens):
                     return
                 pending = self.pending[request]
                 pending.changed.clear()
@@ -170,7 +171,15 @@ class TieredCache:
         resident = pool.hash_to_block.get((partition, value))
         return resident if resident is not None else self.tier.lookup((partition, pool.spec.name, value))
 
-    def prepare(self, request, hashes, tokens, *, maximum, groups=None, partition=None):
+    @staticmethod
+    def _restore_bytes(tables):
+        return sum(page.size for values in tables.values() for page in values if isinstance(page, Page))
+
+    def _page_needs_block(self, page):
+        return page.key not in self.loads if isinstance(page, Page) else page.ref_cnt == 0
+
+    def prepare(self, request, hashes, tokens, *, maximum, groups=None, partition=None,
+                allocation_tokens=None, prefill_target=None):
         started_ns = time.monotonic_ns() if self.trace is not None else 0
         if self.tier.error:
             raise RuntimeError("DDR work is quarantined") from self.tier.error
@@ -187,9 +196,14 @@ class TieredCache:
         checkpoints = self.cache._group_checkpoints
         candidates = set(checkpoints.checkpoints if checkpoints is not None else ())
         candidates.update(self.tier.units)
+        observation = self.cache._dfx_prefix_observation(
+            maximum, tokens, partition, allocation_tokens, prefill_target=prefill_target,
+        )
         tables, boundary, selected = self.cache.select_group_prefix_blocks(
             hashes, max_cache_hit_tokens=maximum, shareable_group_names=groups, partition=partition,
-            lookup=self._lookup, checkpoint_keys=candidates)
+            lookup=self._lookup, checkpoint_keys=candidates, load_tokens=tokens,
+            allocation_tokens=allocation_tokens, prefill_target=prefill_target, restore_bytes=self._restore_bytes,
+            page_needs_block=self._page_needs_block, observation=observation)
         if not boundary:
             return True
         # Selection returns physical ring slots. Freeze logical page order for
@@ -216,7 +230,8 @@ class TieredCache:
         try:
             if fresh:
                 targets, target_pin = self.cache.reserve_group_restore_pages(
-                    tuple((key[1], key[2]) for key in fresh), selected)
+                    tuple((key[1], key[2]) for key in fresh), selected,
+                    headroom=1 if allocation_tokens is None and prefill_target is None else 0)
                 readers = self.tier.acquire(fresh)
                 pins = RestorePins(target_pin, len(fresh))
                 for page in readers:
@@ -230,6 +245,11 @@ class TieredCache:
             self.pending[request] = PendingPrefix(hashes, tokens, boundary, selected, source_pin,
                 tuple(missing), started_ns=started_ns,
                 remaining=sum(not self.loads[key].ready for key in missing))
+            if observation is not None:
+                dfx = self.cache.dplb_dfx
+                dfx.emit("prefix_restore", **dfx.begin_decision(request), **observation,
+                         restore_pages=len(missing), new_pages=len(fresh),
+                         restore_bytes=observation["groups"][selected]["restore_bytes"])
             if self.trace is not None:
                 counts = {}
                 for key in missing:
