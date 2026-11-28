@@ -65,6 +65,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Backend and device
     parser.add_argument("--backend", default="npu", choices=sorted(_VALID_BACKENDS), help="Inference backend (default: npu).")
+    parser.add_argument(
+        "--chip-runtime", choices=("tensormap_and_ringbuffer", "host_build_graph"),
+        help="Chip scheduling policy. Defaults to host_build_graph for A5 V4.1 and tensormap_and_ringbuffer elsewhere.",
+    )
     parser.add_argument("--platform", default="a2a3", help="NPU platform (default: a2a3).")
     parser.add_argument("--device", type=int, default=0, help="NPU device ID (default: 0).")
     parser.add_argument(
@@ -561,6 +565,10 @@ def _build_runtime_config(
         )
 
     runtime = RuntimeConfig(
+        chip_runtime=args.chip_runtime or (
+            "host_build_graph" if model_family == "deepseek_v41" and args.platform == "a5"
+            else "tensormap_and_ringbuffer"
+        ),
         page_size=args.block_size,
         max_batch_size=args.max_num_seqs,
         max_seq_len=args.max_model_len,

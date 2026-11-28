@@ -134,9 +134,12 @@ class EngineConfig:
 
     def resolve_runtime_config(self) -> RuntimeConfig:
         """Return runtime settings with executor requirements resolved."""
-        runtime = self.runtime_config or RuntimeConfig()
-        if runtime.chip_runtime != "tensormap_and_ringbuffer" and self.executor_cls != "PyptoQwen14BExecutor":
-            raise ValueError("host_build_graph serving currently requires PyptoQwen14BExecutor")
+        a5_v41 = self.platform == "a5" and self.executor_cls == "PyptoDeepSeekV41Executor"
+        runtime = self.runtime_config or RuntimeConfig(
+            chip_runtime="host_build_graph" if a5_v41 else "tensormap_and_ringbuffer"
+        )
+        if runtime.chip_runtime == "host_build_graph" and not (a5_v41 or self.executor_cls == "PyptoQwen14BExecutor"):
+            raise ValueError("host_build_graph serving requires Qwen3-14B or A5 V4.1")
         is_deepseek_v4 = self.executor_cls == "PyptoDeepSeekV4Executor"
         homogeneous_prefill_decode = (
             runtime.requires_homogeneous_prefill_decode or is_deepseek_v4

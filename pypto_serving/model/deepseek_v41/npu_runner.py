@@ -4033,12 +4033,14 @@ def _sources(layers):
     )
 
 
-def _check_runtime_binaries(platform):
+def _check_runtime_binaries(platform, chip_runtime):
+    from pypto._target import runtime_implementation_name
+    from pypto.pypto_core import passes
     from simpler_setup.runtime_builder import RuntimeBuilder
 
     builder = RuntimeBuilder(platform=platform)
-    for runtime in ("host_build_graph", "tensormap_and_ringbuffer"):
-        builder.get_binaries(runtime)
+    kind = passes.runtime_kind_from_name(chip_runtime)
+    builder.get_binaries(runtime_implementation_name(kind, platform))
 
 
 def prefill_ring_heap(capacity):
@@ -4106,7 +4108,7 @@ def make_production_bindings(
             raise ValueError("V4.1 scheduler and resident cache contracts differ")
         if len(device_ids) != topology.dp or options.platform != "a5":
             raise ValueError(f"V4.1 production binding requires {topology.dp} A5 devices")
-        _check_runtime_binaries(options.platform)
+        _check_runtime_binaries(options.platform, runtime.chip_runtime)
         dspark_weight_contract = None
         if runtime.num_speculative_tokens:
             from .dspark_weights import V41DSparkWeightContract
@@ -4127,6 +4129,7 @@ def make_production_bindings(
                 platform=options.platform,
                 device_ids=device_ids,
                 pypto_build_dir=options.pypto_build_dir,
+                runtime=runtime.chip_runtime,
             ),
             ring_heap=(runtime.ring_heap if runtime.ring_heap is not None
                        else prefill_ring_heap(prefill_topology.capacity)),
