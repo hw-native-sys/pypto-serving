@@ -128,6 +128,11 @@ class StepCommand(msgspec.Struct, tag="step"):
     # Monotonic step counter, echoed back on StepResult. Cheap ordering guard for
     # the pipelined loop (the worker is FIFO, so results must return in order).
     step_id: int = 0
+    # Cross-layer dispatch identity. Optional defaults preserve compatibility with
+    # cleanup commands and older callers that construct positional commands.
+    invocation_id: str = ""
+    planned_execution_slot: int = 0
+    planned_slot_generation: int = 0
 
 
 class ShutdownCommand(msgspec.Struct, tag="shutdown"):

@@ -38,8 +38,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-from pypto_serving.config.types import RuntimeConfig
-from pypto_serving.tools.profile import profile_span
+from pypto_serving.config.types import DispatchInvocation, RuntimeConfig
+from pypto_serving.tools.profile import get_dispatch_invocation, invocation_profile_args, profile_span
 
 from .buffer_set import resolve_l3_arg
 
@@ -54,6 +54,7 @@ class PendingL3Dispatch:
     handle: Any
     uploaded: tuple[Any, ...]
     name: str
+    invocation: DispatchInvocation | None = None
     _released: bool = False
     _error: BaseException | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -71,6 +72,7 @@ class PendingL3Dispatch:
                     f"{self.name}.worker_wait",
                     cat="kernel",
                     level="kernel",
+                    args=(self.invocation.as_profile_args() if self.invocation else {}),
                 ):
                     self.handle.result()
             except BaseException as exc:
@@ -143,7 +145,10 @@ class L3DispatchMixin:
         programs with different ring requirements passes each program's config
         here instead of resizing process-wide state.
         """
-        span_args: dict[str, Any] = {"aicpu_thread_num": callable_spec.aicpu_thread_num}
+        span_args: dict[str, Any] = {
+            "aicpu_thread_num": callable_spec.aicpu_thread_num,
+            **invocation_profile_args(),
+        }
         if callable_spec.block_dim is not None:
             span_args["block_dim"] = callable_spec.block_dim
         run_config = self._l3_run_config if config is None else config
@@ -187,7 +192,10 @@ class L3DispatchMixin:
         hand the per-dispatch uploads to the pending handle so they are freed
         only after ``wait()`` reclaims the outputs.
         """
+        invocation = get_dispatch_invocation()
         span_args: dict[str, Any] = {"aicpu_thread_num": callable_spec.aicpu_thread_num}
+        if invocation is not None:
+            span_args.update(invocation.as_profile_args())
         if callable_spec.block_dim is not None:
             span_args["block_dim"] = callable_spec.block_dim
         run_config = self._l3_run_config if config is None else config
@@ -223,6 +231,7 @@ class L3DispatchMixin:
             handle=handle,
             uploaded=tuple(uploaded),
             name=callable_spec.name,
+            invocation=invocation,
         )
 
     def _reset_l3_dispatch(self) -> None:

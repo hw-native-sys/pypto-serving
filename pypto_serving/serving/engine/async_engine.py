@@ -14,6 +14,7 @@ import contextlib
 import logging
 import queue
 import time
+import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, field, replace
@@ -24,6 +25,7 @@ import msgspec
 from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, GenerateResult, RuntimeConfig
 from pypto_serving.observability import InMemoryStatLogger, IterationStats, SchedulerStats
+from pypto_serving.observability.dplb_dfx import DplbDfxConfig, DplbDfxRecorder
 from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.reasoning import (
@@ -80,6 +82,7 @@ WORKER_KILL_GRACE_SECONDS = 5.0
 # twenty minutes by default -- so waiting it out would put the whole bounded
 # sequence behind an unbounded wait. Stopping the worker is what ends that read.
 LOOP_DRAIN_GRACE_SECONDS = 5.0
+_PLANNED_EXECUTION_SLOTS = 2
 
 
 @dataclass
@@ -102,6 +105,7 @@ class EngineConfig:
     profile_config: ProfileConfig = field(
         default_factory=lambda: create_profile_config(enabled=False)
     )
+    dplb_dfx_config: DplbDfxConfig = field(default_factory=DplbDfxConfig)
 
     # Scheduler / serving
     max_num_running_reqs: int = 32
@@ -111,11 +115,16 @@ class EngineConfig:
 
     # Feature flags
     enable_prefix_cache: bool = True
+    enable_dplb: bool = False
     enable_chunk_prefill: bool = True
     # Async (pipelined) scheduling. None = auto (on). Speculative/MTP decoders
     # are supported: the scheduler optimistically reserves the upper bound of
     # tokens per step and subtracts the shortfall once the worker replies.
     async_scheduling: bool | None = None
+
+    def resolve_dplb(self) -> bool:
+        """Keep existing count balancing unless KV-aware admission is requested."""
+        return self.enable_dplb
 
     def resolve_async_scheduling(self) -> bool:
         """Resolve the async-scheduling flag (default on for all executors)."""
@@ -255,6 +264,7 @@ class ReplicaEngineCore:
             num_blocks=None,
             block_size=block_size,
             enable_prefix_cache=self.config.enable_prefix_cache,
+            enable_dplb=self.config.resolve_dplb(),
         )
         self._cache_tiering = None
         if runtime.kv_offload_bytes < 0:
@@ -263,6 +273,15 @@ class ReplicaEngineCore:
             from pypto_serving.serving.memory.tiering.integration import Session
             self._cache_tiering = Session(self)
             self.config = self._cache_tiering.configure(self.config)
+        self._dplb_dfx = None
+        if config.dplb_dfx_config.level != "off":
+            if not config.profile_config.enabled:
+                raise ValueError("DPLB DFX requires --profile")
+            self._dplb_dfx = DplbDfxRecorder(
+                config.dplb_dfx_config, config.profile_config.trace_file.parent, config.dp_rank,
+            )
+            self.kv_cache_manager.dplb_dfx = self._dplb_dfx
+            self._dfx_profile_lock = asyncio.Lock()
         self._async_scheduling = self.config.resolve_async_scheduling()
         scheduler_config = SchedulerConfig(
             max_num_running_reqs=self.config.max_num_running_reqs,
@@ -324,6 +343,11 @@ class ReplicaEngineCore:
         self._initialization_steps: set[int] = set()
         self._max_in_flight = 2 if self._async_scheduling else 1
         self._step_counter = 0
+        self._dispatch_instance_id = uuid.uuid4().hex[:12]
+        self._pipeline_slot_generations: dict[int, int] = {}
+        self._dfx_dispatch_ordinal = 0
+        self._dfx_dispatch_ordinals: dict[int, int] = {}
+        self._dfx_step_contexts: dict[int, dict] = {}
         # step_ids of dispatched steps whose worker StepResult has NOT yet been
         # consumed off _output_queue but whose batch was discarded (error/timeout
         # dropped the pipeline). The worker is FIFO and emits exactly one result
@@ -362,6 +386,246 @@ class ReplicaEngineCore:
                     num_preemptions=len(output.preempted_requests) if output else 0,
                 ),
             )
+
+    @staticmethod
+    def _dfx_length_distribution(values: list[int]) -> dict:
+        """Return a bounded summary while retaining the per-request lengths."""
+        return dict(
+            count=len(values),
+            sum=sum(values),
+            min=min(values) if values else 0,
+            max=max(values) if values else 0,
+            values=values,
+        )
+
+    def _dfx_group_snapshot(self, request_rows: list[dict]) -> list[dict]:
+        """Build the logical DP-group view for one submitted StepCommand.
+
+        The topology is known from the worker device layout.  The per-step
+        rows describe only requests participating in this command; the
+        ``policy_load`` field retains the allocator's complete logical owner
+        view when grouped DPLB is enabled.
+        """
+        topology = self._dfx_topology()
+        policy_groups = []
+        groups_fn = getattr(self.kv_cache_manager, "_dfx_groups", None)
+        if callable(groups_fn):
+            try:
+                policy_groups = groups_fn()
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                logger.debug("Unable to snapshot DPLB policy groups", exc_info=True)
+        policy_by_id = {row.get("group_id"): row for row in policy_groups}
+        known_partitions = {
+            row.get("cache_partition")
+            for row in request_rows
+            if row.get("cache_partition") is not None
+        }
+        if not topology and known_partitions:
+            topology = [
+                dict(
+                    group_id=partition,
+                    tp_ranks=None,
+                    devices=None,
+                    status="mapping_unavailable",
+                )
+                for partition in sorted(known_partitions)
+            ]
+
+        groups = []
+        for topology_row in topology:
+            group_id = topology_row.get("group_id")
+            members = [
+                row for row in request_rows
+                if row.get("cache_partition") == group_id
+            ]
+            groups.append(
+                dict(
+                    **topology_row,
+                    participating_request_ids=[row["request_id"] for row in members],
+                    participating_request_count=len(members),
+                    participating_logical_tokens=sum(
+                        row["logical_length_after"] for row in members
+                    ),
+                    participating_prefill_tokens=sum(
+                        row["prefill_tokens"] for row in members
+                    ),
+                    participating_decode_tokens=sum(
+                        row["decode_tokens"] for row in members
+                    ),
+                    policy_load=policy_by_id.get(group_id),
+                )
+            )
+        return groups
+
+    def _dfx_step_request_rows(self, scheduler_output: SchedulerOutput) -> list[dict]:
+        dfx = getattr(self, "_dplb_dfx", None)
+        if dfx is None:
+            return []
+        rows = []
+        for scheduled in scheduler_output.scheduled_requests:
+            request = scheduled.request
+            stage = "prefill" if scheduled.is_prefill else "decode"
+            planned_decode_tokens = (
+                scheduled.num_new_tokens + scheduled.num_speculative_tokens
+                if stage == "decode" else 0
+            )
+            identity = dfx.request_fields(request.request_id)
+            rows.append(
+                dict(
+                    **identity,
+                    stage=stage,
+                    is_prefill=scheduled.is_prefill,
+                    prompt_tokens=request.num_prompt_tokens,
+                    num_computed_tokens=scheduled.num_computed_tokens,
+                    num_new_tokens=scheduled.num_new_tokens,
+                    logical_length_before=scheduled.num_computed_tokens,
+                    logical_length_after=(
+                        scheduled.num_computed_tokens + scheduled.num_new_tokens
+                    ),
+                    optimistic_output_placeholders=request.num_output_placeholders,
+                    logical_length_status=(
+                        "includes_in_flight_placeholders"
+                        if request.num_output_placeholders
+                        else "committed_snapshot"
+                    ),
+                    prefill_tokens=scheduled.num_new_tokens if scheduled.is_prefill else 0,
+                    decode_tokens=planned_decode_tokens,
+                    speculative_budget_tokens=scheduled.num_speculative_tokens,
+                    cache_partition=scheduled.cache_partition,
+                    block_table_extents={
+                        name: len(block_ids)
+                        for name, block_ids in scheduled.block_ids_by_group.items()
+                    },
+                    row_extent=dict(
+                        valid_rows=None,
+                        padded_rows=None,
+                        status="unavailable",
+                        unavailable_reason="runner_prepare_not_observed",
+                    ),
+                )
+            )
+        return rows
+
+    def _emit_dfx_step_plan(
+        self,
+        scheduler_output: SchedulerOutput,
+        step_command: StepCommand,
+        *,
+        dispatch_ordinal: int,
+    ) -> None:
+        """Record the exact Host command submitted for one scheduling step."""
+        dfx = getattr(self, "_dplb_dfx", None)
+        if dfx is None or not dfx.capturing:
+            return
+        capture_id = dfx.capture_id
+        request_rows = self._dfx_step_request_rows(scheduler_output)
+        context = dict(
+            capture_id=capture_id,
+            dispatch_ordinal=dispatch_ordinal,
+            invocation_id=step_command.invocation_id,
+            planned_execution_slot=step_command.planned_execution_slot,
+            planned_slot_generation=step_command.planned_slot_generation,
+            requests=[
+                {key: row[key] for key in (
+                    "request_id", "request_uid", "admission_epoch", "identity_status", "cache_partition",
+                )} for row in request_rows
+            ],
+        )
+        if not hasattr(self, "_dfx_step_contexts"):
+            self._dfx_step_contexts = {}
+        self._dfx_step_contexts[step_command.step_id] = context
+        stages = {row["stage"] for row in request_rows}
+        prefill_lengths = [row["num_new_tokens"] for row in request_rows if row["is_prefill"]]
+        decode_lengths = [row["logical_length_after"] for row in request_rows if not row["is_prefill"]]
+        dfx.emit(
+            "step_plan",
+            expected_capture_id=capture_id,
+            view="scheduler_planned",
+            step_id=step_command.step_id,
+            invocation_id=step_command.invocation_id,
+            planned_execution_slot=step_command.planned_execution_slot,
+            planned_slot_generation=step_command.planned_slot_generation,
+            dispatch_ordinal=dispatch_ordinal,
+            stage=next(iter(stages)) if len(stages) == 1 else "mixed",
+            active_count=len(request_rows),
+            running_count=len(self.scheduler.running),
+            prefill_tokens=scheduler_output.num_prefill_tokens,
+            decode_tokens=scheduler_output.num_decode_tokens,
+            speculative_budget_tokens=sum(
+                row["speculative_budget_tokens"] for row in request_rows
+            ),
+            length_distribution=dict(
+                prefill=self._dfx_length_distribution(prefill_lengths),
+                decode=self._dfx_length_distribution(decode_lengths),
+            ),
+            command_shape=dict(
+                new_requests=len(step_command.new_requests),
+                prefill_requests=len(step_command.prefill_requests),
+                decode_requests=len(step_command.decode_requests),
+                finished_requests=len(step_command.finished_request_ids),
+            ),
+            finished_request_ids=list(step_command.finished_request_ids),
+            execution_slots=[],
+            execution_slot_status="worker_prepare_not_observed",
+            topology=self._dfx_topology(),
+            groups=self._dfx_group_snapshot(request_rows),
+            requests=request_rows,
+            submission_status="submitted",
+        )
+
+    def _emit_dfx_step_outcome(
+        self,
+        step_id: int,
+        scheduler_output: SchedulerOutput,
+        new_tokens: dict[str, int | list[int]],
+        num_draft_tokens: dict[str, int] | None = None,
+        *,
+        status: str = "completed",
+        error: str | None = None,
+    ) -> None:
+        """Record worker completion without claiming device-level timing."""
+        getattr(self, "_dfx_dispatch_ordinals", {}).pop(step_id, None)
+        context = getattr(self, "_dfx_step_contexts", {}).pop(step_id, None)
+        dfx = getattr(self, "_dplb_dfx", None)
+        if dfx is None or not dfx.capturing:
+            return
+        if context is None or context["capture_id"] != dfx.capture_id:
+            return
+        drafts = num_draft_tokens or {}
+        outcomes = []
+        for scheduled, identity in zip(scheduler_output.scheduled_requests, context["requests"]):
+            request_id = scheduled.request.request_id
+            value = new_tokens.get(request_id, ())
+            returned = len(value) if isinstance(value, (list, tuple)) else int(value is not None)
+            proposed = int(drafts.get(request_id, 0))
+            outcomes.append(
+                dict(
+                    **identity,
+                    result_disposition=(
+                        "discarded" if scheduled.request.status.is_finished
+                        or scheduled.request.status is RequestStatus.PREEMPTED
+                        or status != "completed" else "pending_scheduler_apply"
+                    ),
+                    returned_tokens=returned if status == "completed" else None,
+                    speculative_proposed_tokens=proposed if status == "completed" else None,
+                    speculative_accepted_tokens=(
+                        max(0, returned - 1) if proposed else 0
+                    ) if status == "completed" else None,
+                )
+            )
+        dfx.emit(
+            "step_outcome",
+            expected_capture_id=context["capture_id"],
+            view="worker_returned_before_scheduler_apply",
+            step_id=step_id,
+            invocation_id=context["invocation_id"],
+            planned_execution_slot=context["planned_execution_slot"],
+            planned_slot_generation=context["planned_slot_generation"],
+            dispatch_ordinal=context["dispatch_ordinal"],
+            status=status,
+            error=error,
+            requests=outcomes,
+        )
 
     async def start(self) -> None:
         """Start worker process and engine loop."""
@@ -458,28 +722,105 @@ class ReplicaEngineCore:
         self._running = False
         await self._drain_loop_task()
         try:
-            if self._cache_tiering is not None:
-                await self._cache_tiering.close()
-        except BaseException:
             try:
-                await asyncio.to_thread(self._shutdown_worker, timeout=30)
-            except Exception:
-                logger.exception("Worker shutdown failed after DDR close failed; mappings remain retained")
-            raise
-        reaped = await asyncio.to_thread(self._shutdown_worker, timeout=30)
+                if self._cache_tiering is not None:
+                    await self._cache_tiering.close()
+            except BaseException:
+                try:
+                    await asyncio.to_thread(self._shutdown_worker, timeout=30)
+                except Exception:
+                    logger.exception("Worker shutdown failed after DDR close failed; mappings remain retained")
+                raise
+            reaped = await asyncio.to_thread(self._shutdown_worker, timeout=30)
+        finally:
+            dfx = getattr(self, "_dplb_dfx", None)
+            if dfx is not None:
+                await asyncio.to_thread(dfx.close)
         if reaped:
             logger.info("ReplicaEngineCore stopped")
         return reaped
 
-    async def start_profile(self) -> None:
+    async def start_profile(self, capture_id: str | None = None, *, capture_host: bool = True) -> None:
         """Start SA profiling in this replica's worker."""
-        await self._set_profile_active(True)
+        await self._set_profile_active(True, capture_id=capture_id, capture_host=capture_host)
 
     async def stop_profile(self) -> None:
         """Flush and stop SA profiling in this replica's worker."""
         await self._set_profile_active(False)
 
-    async def _set_profile_active(self, active: bool) -> None:
+    async def _set_profile_active(
+        self, active: bool, *, capture_id: str | None = None, capture_host: bool = True,
+    ) -> None:
+        dfx = getattr(self, "_dplb_dfx", None)
+        if dfx is None:
+            await self._set_worker_profile_active(active)
+            return
+        async with self._dfx_profile_lock:
+            if active:
+                start_host = capture_host and not dfx.capturing
+                if start_host and not dfx.ready_for_capture:
+                    if not await asyncio.to_thread(dfx.wait_for_writer) or not dfx.ready_for_capture:
+                        raise RuntimeError("Previous DPLB DFX capture is still finalizing")
+                dfx.begin_profile_start()
+            else:
+                dfx.begin_profile_stop(counters_end=self._dfx_counters())
+            try:
+                if active and start_host:
+                    self._start_host_capture(dfx, capture_id)
+                await self._set_worker_profile_active(active)
+            except BaseException:
+                if active:
+                    dfx.finish_profile_start(failed=True)
+                else:
+                    dfx.finish_profile_stop(failed=True)
+                await asyncio.to_thread(dfx.close)
+                raise
+            if active:
+                dfx.finish_profile_start()
+            else:
+                dfx.finish_profile_stop()
+                await asyncio.to_thread(dfx.close)
+
+    def _start_host_capture(self, dfx: DplbDfxRecorder, capture_id: str | None) -> None:
+        started = dfx.start(
+            capture_id,
+            topology=self._dfx_topology(),
+            in_flight_step_ids=[sid for sid, _ in self._batch_queue],
+            policy=self.kv_cache_manager._dfx_policy(),
+            settings=dict(executor=self.config.executor_cls,
+                          max_model_len=self._runtime.max_seq_len,
+                          max_num_seqs=self.config.max_num_running_reqs,
+                          max_scheduled_tokens=self.config.max_num_scheduled_tokens,
+                          speculative_tokens=self._runtime.num_speculative_tokens,
+                          prefix_cache=self.config.enable_prefix_cache),
+            counters_start=self._dfx_counters(),
+        )
+        if started:
+            self.kv_cache_manager.dfx_baseline()
+            for request in self.scheduler.requests.values():
+                if not request.status.is_finished:
+                    dfx.emit("request_baseline",
+                             **dfx.request_fields(request.request_id, preexisting=True),
+                             status=request.status.name, prompt_tokens=request.num_prompt_tokens,
+                             group_id=request.cache_partition)
+
+    def _dfx_counters(self) -> dict | None:
+        stat_logger = getattr(self, "_stat_logger", None)
+        return stat_logger.snapshot() if stat_logger is not None else None
+
+    def _dfx_topology(self) -> list[dict]:
+        devices = self.config.worker_device_ids()
+        count = self.kv_cache_manager.group_partition_count
+        if not self.kv_cache_manager.has_groups:
+            return []
+        if len(devices) % count:
+            return [dict(group_id=p, tp_ranks=None, devices=None, status="mapping_unavailable")
+                    for p in range(count)]
+        width = len(devices) // count
+        return [dict(group_id=p, tp_ranks=list(range(p * width, (p + 1) * width)),
+                     devices=list(devices[p * width:(p + 1) * width])) for p in range(count)]
+
+    async def _set_worker_profile_active(self, active: bool) -> None:
         """Send an ordered worker profile command and wait for its acknowledgement."""
         result = await self._call_worker_command(ProfileCommand(active=active), decode_profile_result)
         if result.error:
@@ -909,6 +1250,15 @@ class ReplicaEngineCore:
                     self.scheduler.discard_scheduled_request(scheduled)
                 raise
             self._input_queue.put(encoded)
+        dfx = getattr(self, "_dplb_dfx", None)
+        if dfx is not None and dfx.capturing:
+            self._dfx_dispatch_ordinal = getattr(self, "_dfx_dispatch_ordinal", 0) + 1
+            self._dfx_dispatch_ordinals[self._step_counter] = self._dfx_dispatch_ordinal
+            self._emit_dfx_step_plan(
+                scheduler_output,
+                step_cmd,
+                dispatch_ordinal=self._dfx_dispatch_ordinal,
+            )
         reregistered_ids = {
             request.request_id for request in step_cmd.new_requests
         }
@@ -948,12 +1298,15 @@ class ReplicaEngineCore:
         The worker is FIFO and emits exactly one result per command, so the
         oldest dispatched step is the next result off the output queue.
         """
-        step_id, scheduler_output = self._batch_queue.popleft()
+        step_id, scheduler_output = self._batch_queue[0]
         getattr(self, "_initialization_steps", set()).discard(step_id)
         pending = getattr(self, "_worker_free_ids_by_step", {})
         try:
-            with profile_span("scheduler.wait_worker_output", cat="scheduler"):
-                raw_output = await self._get_live_result()
+            try:
+                with profile_span("scheduler.wait_worker_output", cat="scheduler"):
+                    raw_output = await self._get_live_result()
+            finally:
+                self._batch_queue.popleft()
         except queue.Empty:
             logger.error(f"Worker response timed out ({self._step_timeout:g}s)")
             # Timeout: the failed step's own result is still in transit.
@@ -984,6 +1337,12 @@ class ReplicaEngineCore:
             req_id: (tokens[0] if len(tokens) == 1 else tokens)
             for req_id, tokens in step_result.new_tokens.items()
         }
+        self._emit_dfx_step_outcome(
+            step_id,
+            scheduler_output,
+            new_tokens,
+            step_result.num_draft_tokens,
+        )
         with profile_span(
             "scheduler.process_step_output",
             cat="scheduler",
@@ -1131,12 +1490,23 @@ class ReplicaEngineCore:
                     cache_partition=sr.cache_partition,
                 ))
 
+        planned_execution_slot = step_id % _PLANNED_EXECUTION_SLOTS
+        generations = getattr(self, "_pipeline_slot_generations", None)
+        if generations is None:
+            generations = {}
+            self._pipeline_slot_generations = generations
+        planned_slot_generation = generations.get(planned_execution_slot, 0) + 1
+        generations[planned_execution_slot] = planned_slot_generation
+        instance_id = getattr(self, "_dispatch_instance_id", "legacy")
         return StepCommand(
             new_requests=new_requests,
             prefill_requests=prefill_requests,
             decode_requests=decode_requests,
             finished_request_ids=finished_ids,
             step_id=step_id,
+            invocation_id=f"{instance_id}:{step_id}",
+            planned_execution_slot=planned_execution_slot,
+            planned_slot_generation=planned_slot_generation,
         )
 
     async def _flush_pending_frees(self) -> None:
@@ -1218,6 +1588,13 @@ class ReplicaEngineCore:
         failed step's result is still coming.
         """
         failed_batches = [scheduler_output]
+        self._emit_dfx_step_outcome(
+            failed_step_id,
+            scheduler_output,
+            {},
+            status="error",
+            error="worker_timeout" if result_pending else "worker_step_error",
+        )
         for request_id in finished_ids:
             self._schedule_worker_free(request_id)
         if result_pending:
@@ -1227,6 +1604,13 @@ class ReplicaEngineCore:
         while self._batch_queue:
             sid, batch = self._batch_queue.popleft()
             getattr(self, "_initialization_steps", set()).discard(sid)
+            self._emit_dfx_step_outcome(
+                sid,
+                batch,
+                {},
+                status="discarded",
+                error="upstream_step_error",
+            )
             for request_id in getattr(self, "_worker_free_ids_by_step", {}).pop(sid, ()):
                 self._schedule_worker_free(request_id)
             self._discard_result_step_ids.add(sid)
@@ -1737,6 +2121,7 @@ class AsyncLLMEngine:
         self._route_extra_load = [0 for _ in parallel.replica_device_groups]
         self._cores: list[ReplicaEngineCore] = []
         self._core_records_metrics: list[bool] = []
+        self._dfx_profile_lock = asyncio.Lock()
         self.metrics = InMemoryStatLogger(
             config.model_id,
             list(range(len(parallel.replica_device_groups))),
@@ -1744,13 +2129,22 @@ class AsyncLLMEngine:
             num_speculative_tokens=config.runtime_config.num_speculative_tokens,
         )
 
+        if (config.dplb_dfx_config.level != "off"
+                and config.dplb_dfx_config.max_bytes < len(parallel.replica_device_groups)):
+            raise ValueError("DPLB DFX output budget must allow at least one byte per replica")
         for dp_rank, device_group in enumerate(parallel.replica_device_groups):
             replica_parallel = parallel.for_replica(device_group)
+            dfx_config = config.dplb_dfx_config
+            if dfx_config.level != "off":
+                dfx_config = replace(
+                    dfx_config, max_bytes=dfx_config.max_bytes // len(parallel.replica_device_groups),
+                )
             replica_config = replace(
                 config,
                 device_id=device_group[0],
                 parallel_config=replica_parallel,
                 dp_rank=dp_rank,
+                dplb_dfx_config=dfx_config,
             )
             core = core_factory(
                 config=replica_config,
@@ -1803,27 +2197,47 @@ class AsyncLLMEngine:
 
     async def start_profile(self) -> None:
         """Start SA profiling in every replica worker."""
-        results = await asyncio.gather(
-            *(core.start_profile() for core in self._cores),
-            return_exceptions=True,
-        )
-        errors = [result for result in results if isinstance(result, BaseException)]
-        if errors:
-            await asyncio.gather(
-                *(core.stop_profile() for core in self._cores),
+        async with self._dfx_profile_lock:
+            recorders = [
+                recorder for core in self._cores if (recorder := getattr(core, "_dplb_dfx", None)) is not None
+            ]
+            if len(recorders) > 1:
+                active_ids = [recorder.capture_id for recorder in recorders if recorder.capturing]
+                if len(active_ids) == len(recorders) and len(set(active_ids)) == 1:
+                    return
+                if active_ids:
+                    for recorder in recorders:
+                        recorder.stop(reason="restart")
+                finished = await asyncio.gather(
+                    *(asyncio.to_thread(recorder.wait_for_writer)
+                      for recorder in recorders if not recorder.ready_for_capture)
+                )
+                if not all(finished):
+                    raise RuntimeError("Previous DPLB DFX capture is still finalizing")
+            capture_id = uuid.uuid4().hex if recorders else None
+            results = await asyncio.gather(
+                *(core.start_profile(capture_id) if getattr(core, "_dplb_dfx", None) is not None
+                  else core.start_profile() for core in self._cores),
                 return_exceptions=True,
             )
-            raise RuntimeError(f"Failed to start profiling in a worker: {errors[0]}")
+            errors = [result for result in results if isinstance(result, BaseException)]
+            if errors:
+                await asyncio.gather(
+                    *(core.stop_profile() for core in self._cores),
+                    return_exceptions=True,
+                )
+                raise RuntimeError(f"Failed to start profiling in a worker: {errors[0]}")
 
     async def stop_profile(self) -> None:
         """Flush and stop SA profiling in every replica worker."""
-        results = await asyncio.gather(
-            *(core.stop_profile() for core in self._cores),
-            return_exceptions=True,
-        )
-        errors = [result for result in results if isinstance(result, BaseException)]
-        if errors:
-            raise RuntimeError(f"Failed to stop profiling in a worker: {errors[0]}")
+        async with self._dfx_profile_lock:
+            results = await asyncio.gather(
+                *(core.stop_profile() for core in self._cores),
+                return_exceptions=True,
+            )
+            errors = [result for result in results if isinstance(result, BaseException)]
+            if errors:
+                raise RuntimeError(f"Failed to stop profiling in a worker: {errors[0]}")
 
     def generate_request_id(self) -> str:
         self._request_counter += 1

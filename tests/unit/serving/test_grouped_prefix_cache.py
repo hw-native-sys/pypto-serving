@@ -8,11 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Real DSpark page/window geometry; metadata-only, no SDK/device allocation."""
 
+import json
 import pytest
 from dataclasses import replace
 
 from pypto_serving.serving.sched.scheduler import ScheduledRequest, SchedulerOutput, RequestStatus
 from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
+from pypto_serving.observability.dplb_dfx import DplbDfxConfig, DplbDfxRecorder
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.sched.scheduler import Request, Scheduler, SchedulerConfig
 
@@ -359,6 +361,43 @@ def test_checkpoint_prepare_rejects_one_request_and_preserves_the_queue(monkeypa
     assert [r.request_id for r in scheduler.waiting] == ['deferred'] and 'bad' not in scheduler.requests
     assert all('bad' not in p.request_blocks for p in cache._group_pools.values())
     scheduler.abort_request('good')
+
+
+def test_checkpoint_prepare_rejection_retires_dfx_identity(tmp_path, monkeypatch):
+    cache = manager(slots=4, partitions=1, checkpoint_state=True)
+    scheduler = _prefill_scheduler(cache)
+    recorder = DplbDfxRecorder(DplbDfxConfig(level="load", max_requests=1), tmp_path)
+    cache.dplb_dfx = recorder
+
+    def fail_prepare(*_args):
+        raise RuntimeError("injected checkpoint failure")
+
+    try:
+        assert recorder.start("checkpoint-rejection")
+        with monkeypatch.context() as patch:
+            patch.setattr(cache.checkpoint_writer, "prepare", fail_prepare)
+            bad = Request("bad", prompt(0, 513), max_new_tokens=16)
+            scheduler.add_request(bad)
+            assert "bad" in scheduler.schedule().rejected_requests
+            assert bad.status is RequestStatus.FINISHED_ABORTED
+            assert "bad" not in scheduler.requests
+
+        scheduler.add_request(Request("good", prompt(1, 513), max_new_tokens=16))
+        scheduled, = scheduler.schedule().scheduled_requests
+        assert scheduled.request.request_id == "good"
+        scheduler.abort_request("good")
+    finally:
+        assert recorder.close()
+
+    events = [json.loads(line) for line in recorder.sink.path.read_text().splitlines()]
+    arrivals = {event["request_id"]: event for event in events if event["event"] == "request_arrived"}
+    terminals = {event["request_id"]: event for event in events if event["event"] == "request_terminal"}
+    assert terminals["bad"]["reason"] == "checkpoint_prepare_failed"
+    assert terminals["bad"]["request_uid"] == arrivals["bad"]["request_uid"]
+    assert arrivals["good"]["identity_status"] == "captured"
+    status = json.loads(recorder.sink.path.with_suffix(".manifest.json").read_text())
+    assert status["open_request_count"] == status["untracked_requests"] == 0
+    assert status["complete"]
 
 
 def test_failed_output_releases_the_entire_batch_without_freeing_owned_pages():

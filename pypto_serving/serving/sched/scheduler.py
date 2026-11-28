@@ -221,6 +221,9 @@ class ScheduledRequest:
     num_new_tokens: int
     is_prefill: bool
     num_computed_tokens: int = 0
+    # Extra decode capacity reserved for speculative/MTP proposals.  This is
+    # a dispatch snapshot; accepted tokens are reported with the step outcome.
+    num_speculative_tokens: int = 0
     block_ids: list[int] = field(default_factory=list)
     block_ids_by_group: dict[str, list[int]] = field(default_factory=dict)
     cache_partition: int | None = None
@@ -274,6 +277,19 @@ class Scheduler:
         self._next_grouped_cache_phase = "decode"
 
     def add_request(self, request: Request) -> None:
+        dfx = self.kv_cache_manager.dplb_dfx
+        observe = dfx is not None and dfx.capturing and request.request_id not in self.requests
+        if observe:
+            dfx.emit("request_arrived", **dfx.request_fields(request.request_id),
+                     prompt_tokens=request.num_prompt_tokens)
+        try:
+            self._add_request(request)
+        except Exception:
+            if observe:
+                self.kv_cache_manager.dfx_terminal(request.request_id, "rejected")
+            raise
+
+    def _add_request(self, request: Request) -> None:
         prompt_len = len(request.prompt_token_ids)
         max_seq_len = self.config.max_seq_len
         if prompt_len > max_seq_len:
@@ -506,9 +522,14 @@ class Scheduler:
                 continue
 
             is_prefill = request.is_prefill
-            scheduled = ScheduledRequest(request, num_new, is_prefill,
-                                         num_computed_tokens=request.num_computed_tokens)
-            scheduled_tokens = num_new + self._speculative_tokens_for(request, scheduled)
+            scheduled = ScheduledRequest(
+                request,
+                num_new,
+                is_prefill,
+                num_computed_tokens=request.num_computed_tokens,
+            )
+            scheduled.num_speculative_tokens = self._speculative_tokens_for(request, scheduled)
+            scheduled_tokens = num_new + scheduled.num_speculative_tokens
             if scheduled_tokens > token_budget:
                 running_to_keep.append(request)
                 continue
@@ -615,6 +636,7 @@ class Scheduler:
                         request.request_id,
                         request.group_block_hashes,
                         max_cache_hit_tokens=request.group_checkpoint_boundary,
+                        load_tokens=request.num_prompt_tokens,
                     )
                     request.group_shared_prefix_boundary = self.kv_cache_manager.group_history_prefix_hit(
                         request.group_block_hashes, request.group_checkpoint_boundary,
@@ -661,6 +683,7 @@ class Scheduler:
             if rejection is not None:
                 self._release_waiting_prefix_blocks(request)
                 request.status = RequestStatus.FINISHED_ABORTED
+                self.kv_cache_manager.dfx_terminal(request.request_id, "prefill_rejected")
                 self.requests.pop(request.request_id, None)
                 output.rejected_requests[request.request_id] = rejection
                 continue
@@ -684,7 +707,7 @@ class Scheduler:
                 # cannot hold the suffix, release the hit and try an idle
                 # partition from the beginning of the prompt.
                 hit_partition = request.cache_partition
-                self._release_waiting_prefix_blocks(request)
+                self._release_waiting_prefix_blocks(request, reason="prefix_fallback")
                 cold_num_new = self._limit_scheduled_tokens(request, token_budget)
                 if cold_num_new > 0:
                     allocated = self._try_allocate_request_blocks(
@@ -753,9 +776,9 @@ class Scheduler:
     def _on_scheduled(self, scheduled: ScheduledRequest) -> None:
         pass
 
-    def _release_waiting_prefix_blocks(self, request: Request) -> None:
+    def _release_waiting_prefix_blocks(self, request: Request, *, reason: str = "waiting_retry") -> None:
         """Roll back prefix-cache references when a waiting request is deferred."""
-        self._free_request_blocks(request)
+        self._free_request_blocks(request, reason=reason)
         request.num_computed_tokens = 0
         request.num_blocks_cached = 0
         request.num_group_blocks_cached = {}
@@ -1239,8 +1262,8 @@ class Scheduler:
             )
         except Exception as error:
             self._release_scheduled_group_blocks(scheduled)
-            self._release_waiting_prefix_blocks(request)
             request.status = RequestStatus.FINISHED_ABORTED
+            self._release_waiting_prefix_blocks(request, reason="checkpoint_prepare_failed")
             self.requests.pop(request.request_id, None)
             output.rejected_requests[request.request_id] = f"Checkpoint preparation failed: {error}"
             return False
@@ -1293,6 +1316,7 @@ class Scheduler:
                     request.request_id,
                     total_tokens,
                     partition=request.cache_partition,
+                    load_tokens=request.num_prompt_tokens,
                 )
                 request.cache_partition = self.kv_cache_manager.group_request_partition(
                     request.request_id
@@ -1361,7 +1385,7 @@ class Scheduler:
             else:
                 output.num_decode_tokens -= returned_tokens
 
-        self._free_request_blocks(victim)
+        self._free_request_blocks(victim, reason="preempted")
         victim.status = RequestStatus.PREEMPTED
         # The committed output is part of the model context on restart.
         victim.num_replay_tokens = len(victim.output_token_ids)
@@ -1382,7 +1406,8 @@ class Scheduler:
         self.waiting.appendleft(victim)
         return {"request": victim, "returned_tokens": returned_tokens}
 
-    def _free_request_blocks(self, request: Request) -> None:
+    def _free_request_blocks(self, request: Request, *, reason: str | None = None) -> None:
+        reason = reason or request.status.name.lower()
         self.kv_cache_manager.release_blocks_by_ids(
             request.cached_block_ids,
             request.allocated_block_ids,
@@ -1391,15 +1416,17 @@ class Scheduler:
         request.allocated_block_ids = []
         if request.allocated_group_block_ids:
             if request.cache_reservation_id:
-                self.kv_cache_manager.release_group_cache(request.cache_reservation_id)
+                self.kv_cache_manager.release_group_cache(request.cache_reservation_id, reason=reason)
                 request.cache_reservation_id = ""
             else:
-                self.kv_cache_manager.release_all_group_requests(request.request_id)
+                self.kv_cache_manager.release_all_group_requests(request.request_id, reason=reason)
             request.allocated_group_block_ids = {}
         request.cache_partition = None
         request.num_group_blocks_cached = {}
         request.group_cache_valid_from = {}
         request.prefix_cache_hit_tokens = 0
+        if request.status.is_finished:
+            self.kv_cache_manager.dfx_terminal(request.request_id, reason)
 
     def _cache_completed_blocks(
         self,

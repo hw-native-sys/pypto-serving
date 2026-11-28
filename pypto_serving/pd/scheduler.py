@@ -60,8 +60,10 @@ class PrefillScheduler(Scheduler):
         if cache.has_groups and request.cache_partition is None:
             candidates = [partition for partition, tokens in enumerate(self._remaining)
                           if tokens >= num_new_tokens and self._can_admit_waiting_partition(partition)]
-            partition = cache.select_group_partition(request.request_id,
-                request.num_computed_tokens + num_new_tokens, partitions=candidates)
+            partition = cache.select_group_partition(
+                request.request_id, request.num_computed_tokens + num_new_tokens,
+                partitions=candidates, load_tokens=request.num_prompt_tokens,
+            )
             if partition is None:
                 return False
             request.cache_partition = partition

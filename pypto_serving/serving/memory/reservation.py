@@ -120,6 +120,7 @@ class GroupedCacheReservations:
                     max_cache_hit_tokens=prompt_tokens,
                     shareable_group_names=shareable_group_names,
                     partition=partition,
+                    load_tokens=prompt_tokens,
                 )
                 if prefix_hit_tokens:
                     # A cached page may otherwise have only this request as an
@@ -132,6 +133,7 @@ class GroupedCacheReservations:
                 self.manager.ensure_group_blocks(
                     request_id, prompt_tokens,
                     partition=(selected_prefix_partition if selected_prefix_partition is not None else partition),
+                    load_tokens=prompt_tokens,
                 )
                 selected = self.manager.group_request_partition(request_id)
                 if selected is None:
@@ -150,7 +152,7 @@ class GroupedCacheReservations:
                 # strand a request when cold capacity is available. No writer
                 # has been authorized: drop the read-only view and retry once
                 # through the normal allocator, never as a transfer retry.
-                self.manager.release_all_group_requests(request_id)
+                self.manager.release_all_group_requests(request_id, reason="prefix_fallback")
                 self.manager.release_group_block_snapshot(shared_snapshot)
                 shared_snapshot = None
                 shared_ids = {name: [] for name in self.manager._group_pools}
@@ -166,9 +168,10 @@ class GroupedCacheReservations:
             }
         except BaseException:
             if request_id in self.manager._group_request_partitions:
-                self.manager.release_all_group_requests(request_id)
+                self.manager.release_all_group_requests(request_id, reason="reservation_rollback")
             if shared_snapshot is not None:
                 self.manager.release_group_block_snapshot(shared_snapshot)
+            self.manager.dfx_terminal(request_id, "reservation_rollback")
             raise
 
         shared = {name: tuple(shared_ids.get(name, ())) for name in self.manager._group_pools}
@@ -199,6 +202,7 @@ class GroupedCacheReservations:
             shared_prefix_snapshot=shared_snapshot,
         )
         self._group_reservations[reservation_id] = reservation
+        self.manager.dfx_reservation(reservation, "reserved")
         return reservation
 
     def group_cache_reservation(self, reservation_id: str) -> GroupCacheReservation | None:
@@ -260,6 +264,7 @@ class GroupedCacheReservations:
             raise ValueError(f"cannot adopt a reservation in state {current.state.value}")
         current = replace(current, state=GroupReservationState.IN_USE)
         self._group_reservations[reservation_id] = current
+        self.manager.dfx_reservation(current, "adopted")
         return current
 
     def quarantine_group_cache(self, reservation_id: str) -> GroupCacheReservation:
@@ -279,6 +284,7 @@ class GroupedCacheReservations:
             quarantined_block_ids_by_group=current.writable_block_ids_by_group,
         )
         self._group_reservations[reservation_id] = current
+        self.manager.dfx_reservation(current, "quarantined")
         return current
 
     def release_group_cache(
@@ -286,6 +292,7 @@ class GroupedCacheReservations:
         reservation_id: str,
         *,
         confirmed_stopped: bool = False,
+        reason: str = "reservation_released",
     ) -> GroupCacheReservation:
         """Release through the normal group pools only when no writer can remain.
 
@@ -307,11 +314,14 @@ class GroupedCacheReservations:
         )
         if uncertain and not confirmed_stopped:
             raise RuntimeError("reservation may still have a native writer; keep it quarantined")
-        self.manager.release_all_group_requests(current.request_id)
+        self.manager.release_all_group_requests(current.request_id, reason=reason)
         if current.shared_prefix_snapshot is not None:
             self.manager.release_group_block_snapshot(current.shared_prefix_snapshot)
         current = replace(current, state=GroupReservationState.RELEASED, shared_prefix_snapshot=None)
         self._group_reservations[reservation_id] = current
+        self.manager.dfx_reservation(current, "released")
+        if reason not in {"preempted", "prefix_fallback", "waiting_retry"}:
+            self.manager.dfx_terminal(current.request_id, reason)
         return current
 
     def retire_group_cache_reservation(self, reservation_id: str) -> None:

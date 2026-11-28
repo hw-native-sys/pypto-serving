@@ -117,6 +117,7 @@ The HTTP completion path always ignores EOS. Chat requests can set `max_completi
 
 | Argument | Default | Description |
 | --- | --- | --- |
+| `--enable-dplb` / `--no-enable-dplb` | disabled | Balance grouped DP admission by request count and logical KV length; longest prefix-cache hits retain priority. |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | enabled | Enable or disable prefix caching for supported paths. |
 | `--enable-chunked-prefill` / `--no-enable-chunked-prefill` | enabled | Enable or disable chunked prefill. |
 | `--speculative-config JSON` | unset | Model-specific speculative decoding configuration; currently supported by DeepSeek V4. |
@@ -137,6 +138,11 @@ Prefix caching reuses KV cache state for repeated prompt prefixes when the model
 | `--profile` | off | Enable `/start_profile` and `/stop_profile`, or profile the offline generation window. |
 | `--profile-output PATH` | `./profile_out` | Profile output directory or JSON path. |
 | `--profile-level LEVELS` | `e2e,kernel` | Comma-separated profile levels. |
+| `--dplb-dfx-level LEVEL` | `off` | `load` records grouped placement decisions during a profile capture and requires `--profile`. `timing` is reserved and rejected. |
+| `--dplb-dfx-max-seconds SECONDS` | `60` | Positive, finite duration limit for Host DPLB diagnostics. |
+
+See [DPLB Host Diagnostics](../developer-guide/dplb-dfx.md) for the JSONL schema,
+resource bounds, and the distinction between logical load and device cost.
 
 ## Help Output
 

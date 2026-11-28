@@ -24,6 +24,7 @@ import torch
 from pypto_serving.config.types import (
     DecodeBatch,
     DecodeResult,
+    DispatchInvocation,
     PrefillBatch,
     SamplingParams,
     StopTokenMask,
@@ -54,7 +55,13 @@ from pypto_serving.serving.server.ipc import (
     encode_result,
 )
 from pypto_serving.serving.utils.prefill import pack_prefill_batch
-from pypto_serving.tools.profile import configure_profiler, get_profiler, profile_span
+from pypto_serving.tools.profile import (
+    configure_profiler,
+    dispatch_invocation_scope,
+    get_dispatch_invocation,
+    get_profiler,
+    profile_span,
+)
 
 if TYPE_CHECKING:
     from pypto_serving.serving.engine.async_engine import EngineConfig
@@ -851,6 +858,18 @@ class WorkerProcess:
             logger.error(f"Worker step failed: {e}", exc_info=True)
             return StepResult(new_tokens={}, error=str(e), step_id=cmd.step_id)
 
+    @staticmethod
+    def _command_invocation(cmd: StepCommand) -> DispatchInvocation | None:
+        """Translate IPC identity fields into the batch-level context object."""
+        if not cmd.invocation_id:
+            return None
+        return DispatchInvocation(
+            invocation_id=cmd.invocation_id,
+            step_id=cmd.step_id,
+            planned_execution_slot=cmd.planned_execution_slot,
+            planned_slot_generation=cmd.planned_slot_generation,
+        )
+
     def _apply_command_lifecycle(
         self,
         cmd: StepCommand,
@@ -936,7 +955,7 @@ class WorkerProcess:
         new_tokens: dict[str, list[int]] = {}
         num_draft_tokens: dict[str, int] = {}
 
-        with profile_span(
+        with dispatch_invocation_scope(self._command_invocation(cmd)), profile_span(
             "WorkerProcess.execute_step",
             cat="worker",
             args={"prefill": len(cmd.prefill_requests), "decode": len(cmd.decode_requests)},
@@ -951,8 +970,10 @@ class WorkerProcess:
                                         prefill_slot=prepared_decode.buffer_slot, prepared=prepared_decode)
                 elif max_prefill_batch is None:
                     if prepared_decode is not None and getattr(self.executor, "supports_async_prefill_reclaim", False):
-                        self._batch_prefill(cmd.prefill_requests, runtime_model, new_tokens,
-                                            prefill_slot=prepared_decode.buffer_slot)
+                        self._batch_prefill(
+                            cmd.prefill_requests, runtime_model, new_tokens,
+                            prefill_slot=prepared_decode.buffer_slot,
+                        )
                     else:
                         self._batch_prefill(cmd.prefill_requests, runtime_model, new_tokens)
                 else:
@@ -969,8 +990,10 @@ class WorkerProcess:
                         ),
                     ):
                         if prepared_decode is not None and getattr(self.executor, "supports_async_prefill_reclaim", False):
-                            self._batch_prefill(chunk, runtime_model, new_tokens,
-                                                prefill_slot=prepared_decode.buffer_slot)
+                            self._batch_prefill(
+                                chunk, runtime_model, new_tokens,
+                                prefill_slot=prepared_decode.buffer_slot,
+                            )
                         else:
                             self._batch_prefill(chunk, runtime_model, new_tokens)
             if cmd.decode_requests:
@@ -1120,6 +1143,7 @@ class WorkerProcess:
             batch = (prepared.prefill_batch if prepared is not None
                      else self._make_prefill_batch(scheduled, runtime_model))
             assert batch is not None
+            batch.invocation = get_dispatch_invocation()
             self._bind_prefill_sampling(batch, scheduled)
             allow_device_greedy_sampling = batch.allow_device_greedy_sampling
             allow_device_topk_sampling = batch.allow_device_topk_sampling
@@ -1237,6 +1261,7 @@ class WorkerProcess:
                     return _PreparedDecodeWork(prepared=None, buffer_slot=buffer_slot)
                 model = self.model_record.runtime_model
                 batch = self._make_prefill_batch(scheduled, model)
+                batch.invocation = self._command_invocation(cmd)
                 with profile_span("WorkerProcess.prepare_prefill", cat="worker",
                                   args={"step_id": cmd.step_id, "buffer_slot": buffer_slot}):
                     plan = self.executor.prepare_prefill(model, batch, buffer_slot=buffer_slot)
@@ -1270,6 +1295,7 @@ class WorkerProcess:
             allow_device_topk_sampling=allow_device_topk_sampling,
             bind_policy=False,
         )
+        batch.invocation = self._command_invocation(cmd)
         with profile_span(
             "WorkerProcess.prepare_decode",
             cat="worker",
@@ -1361,6 +1387,7 @@ class WorkerProcess:
                 allow_device_greedy_sampling=allow_device_greedy_sampling,
                 allow_device_topk_sampling=allow_device_topk_sampling,
             )
+            batch.invocation = get_dispatch_invocation()
             if (isinstance(getattr(runtime_model, "extra", None), dict)
                     and runtime_model.extra.get("family") == "deepseek_v41"
                     and getattr(runtime_model.runtime, "num_speculative_tokens", 0) == 5):
