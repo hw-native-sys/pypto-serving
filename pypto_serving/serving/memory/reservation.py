@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 if TYPE_CHECKING:
     from .kv_cache import GroupBlockSnapshot
@@ -67,6 +67,8 @@ class GroupedCacheReservations:
         prompt_token_count: int | None = None,
         prefix_block_hashes: dict[str, list[bytes]] | None = None,
         shareable_group_names: tuple[str, ...] = (),
+        preferred_partition: int | None = None,
+        partitions: Sequence[int] | None = None,
     ) -> GroupCacheReservation:
         """Atomically reserve every configured group through the existing allocator.
 
@@ -91,7 +93,7 @@ class GroupedCacheReservations:
         if any(pool.spec.sliding_window is None and
                token_capacity > pool.spec.max_blocks_per_seq * pool.spec.spec.token_capacity
                for pool in self.manager._group_pools.values()):
-            raise KVCacheCapacityError("logical generation limit exceeds full-history cache tables")
+            raise ValueError("logical generation limit exceeds full-history cache tables")
         prefix_hashes = prefix_block_hashes or {}
         if prefix_hashes and not shareable_group_names:
             raise ValueError("prefix hashes require explicit shareable cache groups")
@@ -120,6 +122,9 @@ class GroupedCacheReservations:
                     max_cache_hit_tokens=prompt_tokens,
                     shareable_group_names=shareable_group_names,
                     partition=partition,
+                    preferred_partition=preferred_partition,
+                    partitions=partitions,
+                    token_count=prompt_tokens if partitions is not None else None,
                 )
                 if prefix_hit_tokens:
                     # A cached page may otherwise have only this request as an
@@ -129,10 +134,12 @@ class GroupedCacheReservations:
                         {name: pool.request_blocks[request_id] for name, pool in self.manager._group_pools.items()},
                         selected_prefix_partition, token_count=prefix_hit_tokens)
             def allocate():
-                self.manager.ensure_group_blocks(
-                    request_id, prompt_tokens,
-                    partition=(selected_prefix_partition if selected_prefix_partition is not None else partition),
-                )
+                owner = selected_prefix_partition if selected_prefix_partition is not None else partition
+                if partitions is not None and owner is None:
+                    owner = self.manager.select_group_partition(request_id, prompt_tokens, partitions=partitions)
+                if partitions is not None and owner not in partitions:
+                    raise KVCacheCapacityError("no eligible group can hold the received prompt")
+                self.manager.ensure_group_blocks(request_id, prompt_tokens, partition=owner)
                 selected = self.manager.group_request_partition(request_id)
                 if selected is None:
                     raise RuntimeError("grouped reservation has no selected partition")
@@ -172,8 +179,9 @@ class GroupedCacheReservations:
             raise
 
         shared = {name: tuple(shared_ids.get(name, ())) for name in self.manager._group_pools}
+        shared_sets = {name: set(ids) for name, ids in shared.items()}
         writable = {
-            name: tuple(block_id for block_id in block_ids[name] if block_id not in set(shared[name]))
+            name: tuple(block_id for block_id in block_ids[name] if block_id not in shared_sets[name])
             for name in self.manager._group_pools
         }
         cached_counts = {

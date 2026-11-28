@@ -10,7 +10,7 @@
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 import select
 import socket
@@ -302,16 +302,23 @@ class Services:
 
     def wrap_batch(self, build):
         def batch(cmd, *args, **kwargs):
-            from dataclasses import replace
             value = build(cmd, *args, **kwargs)
             if value is None:
                 return value
-            initial = tuple(r for r in value.request_ids if self.lookup(r).initialize_from_cache)
-            return replace(value, initial_request_ids=initial)
+            first_tokens = tuple(
+                (request_id, registration.initial_output_token_ids[0])
+                for request_id in value.request_ids
+                if (registration := self.lookup(request_id)).initialize_from_cache
+            )
+            return replace(value, prefill_first_tokens=first_tokens) if first_tokens else value
         return batch
 
     def handle_command(self, operation, payload):
         return self.extension.transfer.handle(operation, payload)
+
+    def is_host_only_command(self, operation):
+        # Allocate in Worker order with lease release, without draining old output.
+        return operation == "reserve_state"
 
     def set_profile_active(self, active):
         # Owner transfer spans use the same on-demand profile lifecycle.

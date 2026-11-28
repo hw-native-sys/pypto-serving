@@ -18,10 +18,15 @@ import msgspec
 VERSION = 4
 MAX_FRAME = 16 * 1024 * 1024
 CLOSING_HEADER = "x-pypto-pd-closing"
+DECODE_RESERVATION = "decode_reservation"
 
 
 class CapacityExhausted(RuntimeError):
     """The receiver cannot reserve another active handoff or Decode request."""
+
+    def __init__(self, message, *, stage=None):
+        super().__init__(message)
+        self.stage = stage
 
 
 def digest(value):

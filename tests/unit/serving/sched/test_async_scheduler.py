@@ -1387,7 +1387,7 @@ def test_grouped_prefix_hit_falls_back_to_an_idle_partition_when_suffix_does_not
 
 
 @pytest.mark.parametrize("busy, spare", [(False, True), (True, True), (True, False)])
-def test_pd_prefill_uses_idle_partition_when_prefix_partition_is_busy(busy, spare):
+def test_pd_prefill_uses_idle_partition_when_short_prefix_partition_is_busy(busy, spare):
     from pypto_serving.pd.scheduler import PrefillScheduler
 
     cache = KvCacheManager(block_size=2, enable_prefix_cache=True)
@@ -1397,8 +1397,8 @@ def test_pd_prefill_uses_idle_partition_when_prefix_partition_is_busy(busy, spar
     ),), max_batch_size=2)
     prompt = [1, 2, 3, 4, 5, 6]
     hashes = cache.compute_group_block_hashes(prompt)
-    cache.ensure_group_blocks("warm", 4, partition=0)
-    cache.cache_group_blocks("warm", hashes, 4, {})
+    cache.ensure_group_blocks("warm", 2, partition=0)
+    cache.cache_group_blocks("warm", hashes, 2, {})
     cache.release_all_group_requests("warm")
     scheduler = PrefillScheduler(config=SchedulerConfig(
         max_num_scheduled_tokens=8, max_prefill_tokens_per_request=4, async_scheduling=True,
@@ -1418,12 +1418,12 @@ def test_pd_prefill_uses_idle_partition_when_prefix_partition_is_busy(busy, spar
     scheduled = [item for item in output.scheduled_requests if item.request.request_id == "replay"]
     if spare:
         replay, = scheduled
-        assert (replay.cache_partition, replay.num_computed_tokens) == ((1, 0) if busy else (0, 4))
+        assert (replay.cache_partition, replay.num_computed_tokens) == ((1, 0) if busy else (0, 2))
     else:
         assert not scheduled and scheduler.waiting[0].request_id == "replay"
         assert cache.group_request_partition("replay") is None
-    assert output.prefix_cache_hits == (0 if busy else 4)
-    assert cache.select_group_prefix_blocks(hashes, max_cache_hit_tokens=4, partition=0)[1] == 4
+    assert output.prefix_cache_hits == (0 if busy else 2)
+    assert cache.select_group_prefix_blocks(hashes, max_cache_hit_tokens=4, partition=0)[1] == 2
 
 
 def test_grouped_prefix_metrics_count_reused_tokens():

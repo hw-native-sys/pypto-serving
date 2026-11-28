@@ -39,8 +39,8 @@ before owners start and removed after they retire; disabled offload does not bui
 For each **unique** page in the union of the desired recovery sets, charge
 `TP * ceil(component_bytes_per_owner / system_page_size) * system_page_size`.
 Sum every component in the group before rounding: `idx` includes KV and scale.
-Within one partition, overlapping checkpoints and shared prefixes count their
-common pages once; TP replicas and copies in different partitions count separately.
+Within one instance, overlapping checkpoints and matching prefixes across DP
+partitions count their common DDR pages once. Each TP lane is charged separately.
 Full-history KV is a union, not one full-history copy per checkpoint. Rolling KV
 and state require the union of each retained checkpoint's complete windows.
 
@@ -63,7 +63,7 @@ This recovery-set union costs **551682048 bytes/owner (526.125 MiB)**,
 It assumes these checkpoints were complete and eligible for publication.
 Extra tail/output pages, additional prefixes and in-flight work need allowance;
 capacity pressure may retain fewer checkpoints. A shared 32768-token prefix
-reduces the charge only where its pages are actually shared in the same partition.
+reduces the charge for matching pages across the instance.
 Decode-only PD keeps shareable history, not P's rolling/state checkpoint set:
 the same 65536-token history is 390 MiB with TP1, before new Decode pages.
 Request-local final state and bootstrap still need HBM and arrive from P.
@@ -88,7 +88,9 @@ their memberships; short intervals and long contexts increase that overhead.
 One shared HOST backing is allocated per instance. Each rank has a separate copy
 process with its own ACL context. It imports and registers the HOST pool once,
 and imports the compute Worker's exportable HBM buffers through native VMM leases.
-DDR extents for different ranks and requests never overlap while live. Copy
+LOAD pairs each stored TP lane with its counterpart in the destination DP group.
+Distinct pages and TP lanes have separate extents. Concurrent LOAD jobs may read
+the same immutable DDR data while writing to independently reserved HBM pages. Copy
 threads use a stream separate from computation;
 neither the API thread nor the compute submission thread waits for native DMA.
 
@@ -113,7 +115,9 @@ The **256 MiB** payload cap is a software default per owner/batch, not a hardwar
 or SDK limit. It was selected from exploratory 1/4/16/64/256 MiB Ascend A3 DSpark
 page-layout sweeps as a useful large batch that amortizes RPC/submission work.
 It is the largest tested default in that sweep, not a global optimum. Owners
-submit currently available work immediately; they do not wait to fill 256 MiB.
+submit currently available work immediately. The pages of one restore are
+queued together once their source and destination are ready. Owners still use
+the normal batch limits and do not wait to fill 256 MiB.
 Validate again for different CANN versions, hardware, geometry and workloads.
 
 The **32768 compact spans** cap independently bounds command metadata. On the

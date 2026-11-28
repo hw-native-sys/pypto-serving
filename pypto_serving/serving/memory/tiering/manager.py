@@ -49,6 +49,7 @@ class CacheTier:
         self.by_handle, self.inflight = {}, {}
         self.queued = deque()
         self.retiring = {}
+        self.revision = 0
         self.sequence = count(1)
         self.used = 0
         self.error = None
@@ -63,7 +64,7 @@ class CacheTier:
             raise RuntimeError("DDR tier is not accepting publications")
         if key in self.pages:
             self.release_pin(lease)
-            self.touch(key)
+            self.touch_many((key,))
             return
         charge = size if charge is None else charge
         if (type(size) is not int or type(charge) is not int
@@ -105,6 +106,7 @@ class CacheTier:
         if identity in self.pending_units:
             self._forget_pending(identity)
         self.units[identity] = keys
+        self.revision += 1
         for key in keys:
             page = self.pages[key]
             self.policy.on_remove(("page", page.handle))
@@ -117,21 +119,33 @@ class CacheTier:
             return None
         return page
 
-    def touch(self, key):
-        page = self.lookup(key)
-        if page is not None:
-            for identity in page.units:
-                self.policy.on_access(("unit", identity), self.clock())
+    def touch_many(self, keys):
+        self._touch_pages(map(self.lookup, keys))
+
+    def _touch_pages(self, pages):
+        """Collapse consecutive accesses with identical checkpoint membership."""
+        now = self.clock()
+        units = ()
+        for page in pages:
+            if page is None:
+                continue
+            if units and units != page.units:
+                for identity in units:
+                    self.policy.on_access(("unit", identity), now)
             if not page.units:
-                self.policy.on_access(("page", page.handle), self.clock())
+                self.policy.on_access(("page", page.handle), now)
+            # Equal sets can iterate differently. Use the last page's order.
+            units = page.units
+        for identity in units:
+            self.policy.on_access(("unit", identity), now)
 
     def acquire(self, keys):
         pages = tuple(self.lookup(key) for key in dict.fromkeys(keys))
         if self.closing or self.error or any(page is None for page in pages):
             raise ValueError("DDR content is unavailable")
+        self._touch_pages(pages)
         for page in pages:
             page.readers += 1
-            self.touch(page.key)
         return pages
 
     def release(self, pages):
@@ -143,10 +157,13 @@ class CacheTier:
         if self.queued and self.notify is not None:
             self.notify()
 
-    def load(self, page, destination, *, request=None):
-        if self.pages.get(page.key) is not page or not page.ready or page.readers <= 0:
-            raise ValueError("LOAD requires a current DDR reader")
-        return self.backend.load(page.handle, destination, request=request)
+    def load(self, copies, *, request=None):
+        requests = []
+        for page, destination in copies:
+            if self.pages.get(page.key) is not page or not page.ready or page.readers <= 0:
+                raise ValueError("LOAD requires a current DDR reader")
+            requests.append((page.handle, destination))
+        return self.backend.load(requests, request=request)
 
     @staticmethod
     def completed(future, expected):
@@ -183,6 +200,7 @@ class CacheTier:
                 for page in pages:
                     page.units.remove(identity)
             self._retire(tuple(page for page in pages if not page.units))
+            self.revision += 1
             return True
         return False
 
@@ -207,6 +225,7 @@ class CacheTier:
                 page.future = None
                 del self.inflight[page.handle]
                 page.ready = True
+                self.revision += 1
                 self.release_pin(page.lease)
                 page.lease = page.source = None
                 self.counters["stored_bytes"] += page.size

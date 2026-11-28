@@ -154,7 +154,7 @@ def test_pd_and_ddr_use_the_same_group_components_and_tensor_names():
 
 
 def _runner(*, speculative: bool = False, max_position: int = 512, extension_factory=None,
-            tp_size: int = 4) -> DSparkModelRunner:
+            tp_size: int = 4, draft_tokens: int = 7) -> DSparkModelRunner:
     rows = torch.arange(max_position * 64, dtype=torch.float32).reshape(max_position, 64)
     rope = DSparkRopeTables(
         max_position=max_position,
@@ -169,7 +169,7 @@ def _runner(*, speculative: bool = False, max_position: int = 512, extension_fac
     )
     # Keep the production topology but shrink prefill's token and hidden axes.
     layout = replace(
-        DSparkCacheLayout.for_ranks(16, tp_size=tp_size),
+        DSparkCacheLayout.for_ranks(16, tp_size=tp_size, num_speculative_tokens=draft_tokens),
         prefill_tokens=128,
         prefill_local_tokens=128 // tp_size,
         prefill_requests=2,
@@ -185,7 +185,7 @@ def _runner(*, speculative: bool = False, max_position: int = 512, extension_fac
             layer_plan=(),
             kernel_dir="unused",
             rope=rope,
-            num_speculative_tokens=7 if speculative else 0,
+            num_speculative_tokens=draft_tokens if speculative else 0,
         ),
         extension_factory=extension_factory,
     )
@@ -288,11 +288,13 @@ def test_packed_prefill_executor_limits_follow_runtime(monkeypatch, max_batch_si
 
 
 @pytest.mark.parametrize("length", [1, 127, 128, 129, 512, 8064, 8192, 8193, 655359])
-@pytest.mark.parametrize("tp_size", [1, 4])
-def test_pd_bootstrap_reuses_normal_seed_with_local_generations(monkeypatch, length, tp_size):
+@pytest.mark.parametrize(("tp_size", "draft_tokens"), [(1, 5), (4, 7)])
+def test_pd_bootstrap_prepares_while_older_decode_is_pending(monkeypatch, length, tp_size, draft_tokens):
     from pypto_serving.pd.adapter import DSparkExtension
+    from pypto_serving.pd.worker import Services
+    from pypto_serving.serving.server.ipc import NewRequestData
 
-    runner = _runner(speculative=True, max_position=128, tp_size=tp_size)
+    runner = _runner(speculative=True, max_position=128, tp_size=tp_size, draft_tokens=draft_tokens)
     # Use the real context ceiling without constructing large RoPE tensors.
     monkeypatch.setattr(runner, "_require_rope_tables", lambda: SimpleNamespace(max_position=655360))
     runner._compiled.bootstrap_metadata = object()
@@ -311,18 +313,21 @@ def test_pd_bootstrap_reuses_normal_seed_with_local_generations(monkeypatch, len
     runner._dspark_device_state_meta = device(meta)
     runner._prefill_prepared_device["sampled_ids"] = device(sampled)
     runner._prefill_prepare_buffers = SimpleNamespace(
-        bootstrap_descriptors=torch.empty((16, 16, 11), dtype=torch.int32))
+        bootstrap_descriptors=torch.full((16, 16, 11), -2, dtype=torch.int32))
     def copy_to(dst, src, count, *, dst_offset, worker_id):
+        assert events[0] == "fence"
         ctypes.memmove(dst + dst_offset, src, count)
     worker = SimpleNamespace(copy_to=copy_to)
     monkeypatch.setattr(runner, "_shared_l3_worker", lambda: worker)
-    monkeypatch.setattr(runner, "_wait_for_pending_decode_dispatches", lambda: events.append("fence"))
+    previous = SimpleNamespace(wait=lambda: events.append("fence"))
+    runner._pending_decode_dispatches[0] = previous
     monkeypatch.setattr(runner, "_clear_drafter_lease", lambda *key: events.append(("clear", key)))
     extension = DSparkExtension.__new__(DSparkExtension)
     extension.runner, extension.compiled, extension.worker = runner, runner._compiled, lambda: worker
     extension.draft_states, extension.ranks, extension.tp = runner._drafter_states, 16, tp_size
-    ids = ["first", "same-group", "other-partition"]
-    for request, partition in zip(ids, (1, 1, 3)):
+    ids = [f"continuation-{i}" for i in range(6)]
+    first_tokens = dict(zip(ids, range(17, 23)))
+    for request, partition in zip(ids, (1, 1, 1, 1, 1, 3)):
         slot = extension.handle("reserve_state", dict(request=request, partition=partition, prompt_len=length))
         assert slot == {"bootstrap": runner._drafter_state(request).lease}
         # Model an already completed push into D's independently allocated lease.
@@ -331,43 +336,58 @@ def test_pd_bootstrap_reuses_normal_seed_with_local_generations(monkeypatch, len
         hidden[partition * tp_size:(partition + 1) * tp_size, state.lease] = payload
     first = runner._drafter_state(ids[0])
     runner._drafter_dirty_leases.add((first.group, first.lease))
-    batch = SimpleNamespace(request_ids=ids, initial_request_ids=tuple(ids),
-                            token_ids=[torch.tensor([token]) for token in (17, 23, 31)])
-    prepared = make_dataclass("Prepared", ["bootstrap_request_ids"])(())
-    assert extension.wrap_prepare(lambda *a, **kw: prepared)(batch, buffer_slot=1).bootstrap_request_ids == tuple(ids)
-    assert not events  # Host preparation must not touch the device or wait.
+    services = Services.__new__(Services)
+    registrations = {request: NewRequestData(request, [], 0, 1, None, initialize_from_cache=True,
+                     initial_output_token_ids=(token,)) for request, token in first_tokens.items()}
+    services.lookup = registrations.__getitem__
+    unseeded = DecodeBatch(ids, torch.zeros(len(ids), 1), None, torch.empty(len(ids)))
+    batch = services.wrap_batch(lambda _: unseeded)([])
+    empty_plan = make_dataclass("Prepared", ["bootstrap_rows"])(())
+    prepare = extension.wrap_prepare(lambda *a, **kw: empty_plan)
+    prepared = prepare(batch, buffer_slot=1)
+    assert [(row.request_id, row.sampled_row[0].item()) for row in prepared.bootstrap_rows] == list(first_tokens.items())
+    assert runner._pending_decode_dispatches == {0: previous} and not events
+    assert first.prefill_descriptor is None and torch.all(positions == -2)
+    assert torch.all(runner._prefill_prepare_buffers.bootstrap_descriptors == -2)
+
     def normal_bootstrap(requests, stage="normal-bootstrap"):
         events.append(stage)
-        for ordinal, request in enumerate(requests):
+        packed = runner._packed_host_prefix(runner._prefill_prepare_buffers.bootstrap_descriptors, 4)
+        for request in requests:
             state = runner._drafter_state(request)
-            assert state.current_token_id == (17, 23, 31)[ids.index(request)]
+            assert state.current_token_id == first_tokens[request]
             row = state.prefill_descriptor.block_table_row
             expected = torch.arange(max(0, length - 128), length, dtype=torch.int64)
             assert torch.equal(state.prefill_tail_positions, expected)
             for rank in range(state.group * tp_size, (state.group + 1) * tp_size):
                 assert torch.equal(positions[rank, state.lease, expected % 128], expected.to(torch.int32))
                 assert meta[rank, state.lease, 1].item() == state.generation
-                assert sampled[rank, row, 0].item() == (17, 23, 31)[ids.index(request)]
+                assert sampled[rank, row, 0].item() == first_tokens[request]
+                assert state.prefill_descriptor.to_row() in [tuple(item.tolist()) for item in packed[rank]]
                 payload = torch.arange(256, dtype=torch.bfloat16).reshape(128, 2) + ids.index(request)
                 assert torch.equal(hidden[rank, state.lease], payload)  # Grant/scrub must preserve the received tail.
             state.device_state_initialized = True
-            state.device_draft_count = 7 if state.prefill_descriptor.bootstrap_valid else 0
+            state.device_draft_count = draft_tokens if state.prefill_descriptor.bootstrap_valid else 0
     monkeypatch.setattr(runner, "_run_one_l2_bootstrap_wave", normal_bootstrap)
     monkeypatch.setattr(runner, "_publish_device_bootstrap",
                         lambda requests, batch: normal_bootstrap(requests, "publish-only"))
     dispatch = extension.wrap_dispatch(lambda *args: events.append("dispatch"))
-    dispatch(batch, None)
-    stage = "normal-bootstrap" if length + 6 < 655360 else "publish-only"
-    assert events == ["fence", ("clear", (first.group, first.lease)), stage, "dispatch"]
-    assert all(runner._drafter_state(r).device_draft_count == (7 if length + 6 < 655360 else 0) for r in ids)
-    dispatch(batch, None)
+    dispatch(batch, prepared)
+    stage = "normal-bootstrap" if length + draft_tokens - 1 < 655360 else "publish-only"
+    assert events == ["fence", ("clear", (first.group, first.lease)), stage, stage, "dispatch"]
+    assert all(runner._drafter_state(r).device_draft_count == (draft_tokens if stage == "normal-bootstrap" else 0)
+               for r in ids)
+    assert not prepare(batch, buffer_slot=0).bootstrap_rows
+    dispatch(batch, prepared)
     assert events[-2:] == ["dispatch", "dispatch"]  # No steady-state bootstrap or fence.
     old = first.generation
     extension.handle("discard_state", ids[0])
-    extension.handle("reserve_state", dict(request="reused", partition=1, prompt_len=length))
-    reused = runner._drafter_state("reused")
+    extension.handle("reserve_state", dict(request=ids[0], partition=1, prompt_len=length))
+    reused = runner._drafter_state(ids[0])
     assert reused.lease == first.lease and reused.generation == old + 1
     assert reused.prefill_tail_positions is None and not reused.device_state_initialized
+    with pytest.raises(RuntimeError, match="Stale PD bootstrap lease"):
+        dispatch(batch, prepared)
 
 
 def test_prefill_to_decode_staging_contract() -> None:

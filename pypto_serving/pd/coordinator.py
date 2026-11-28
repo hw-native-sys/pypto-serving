@@ -20,7 +20,8 @@ from pydantic import TypeAdapter
 from starlette.requests import ClientDisconnect
 
 from pypto_serving.tools.observe import record
-from .protocol import CLOSING_HEADER, Binding, MAX_FRAME, Node, VERSION, decode
+from .protocol import CLOSING_HEADER, DECODE_RESERVATION, Binding, MAX_FRAME, Node, VERSION, decode
+from .reservation_queue import RETRY_INTERVAL, ReservationQueue, ReservationWaiter
 from pypto_serving.router.http import (
     SESSION_HEADER, Retirement, RouterError, close_requests, error_response, failure,
     request_headers, response_headers, resolve_session_id, send, wait_for_disconnect,
@@ -31,6 +32,30 @@ logger = logging.getLogger(__name__)
 _STREAM = TypeAdapter(bool)
 PROBE_TIMEOUT_SECONDS = 5.0
 PROBE_ATTEMPTS = 3
+
+
+class _DecodeAtCapacity(RouterError):
+    pass
+
+
+class _RouterAtCapacity(RouterError):
+    pass
+
+
+def _reservation_timeout():
+    return RouterError(503, "capacity_exhausted", "Timed out waiting for Decode reservation capacity")
+
+
+def _upstream_error(response, *, before_placement):
+    if before_placement and response.status_code == 503:
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if (isinstance(body, dict) and body.get("code") == "capacity_exhausted"
+                and body.get("stage") == DECODE_RESERVATION):
+            return _DecodeAtCapacity(503, "capacity_exhausted", response.text, response)
+    return RouterError(response.status_code, "upstream_error", response.text, response)
 
 
 class PDCoordinator:
@@ -46,6 +71,7 @@ class PDCoordinator:
         self.pair_ids = tuple((p.node_id, config.decode[(i + offset) % len(config.decode)].node_id)
                               for offset in range(len(config.decode)) for i, p in enumerate(config.prefill))
         self.active = {}
+        self.reservations = ReservationQueue(config.capacity, config.reservation_retry_position)
         self.closing = False
 
     def _timeout(self, read, *, control=False):
@@ -126,7 +152,7 @@ class PDCoordinator:
         available = [pair if pair and all(self.registry.state(n.node_id).outstanding < self.config.capacity
                                           for n in pair) else None for pair in candidates]
         if not any(available):
-            raise RouterError(503, "capacity_exhausted", "All compatible P/D pairs are at capacity. Retry later.")
+            raise _RouterAtCapacity(503, "capacity_exhausted", "All compatible P/D pairs are at capacity. Retry later.")
         pair, reason = self.policy.select(available)
         if not any(pair is candidate for candidate in available):
             raise RuntimeError("policy selected an ineligible P/D pair")
@@ -139,10 +165,12 @@ class PDCoordinator:
                policy=self.config.policy, reason=reason, prefill_identity=p.key, decode_identity=d.key)
         return p, d, binding, endpoints, release
 
-    async def _wait_for_admission(self, request, payload):
+    async def _wait_for_admission(self, request, payload, *, expires=None):
         """Wait on health only; no binding or counts are held while waiting."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + PROBE_TIMEOUT_SECONDS * PROBE_ATTEMPTS
+        if expires is not None:
+            deadline = min(deadline, expires)
         probes = {}
         while True:
             remaining = deadline - loop.time()
@@ -168,11 +196,13 @@ class PDCoordinator:
             # Check for a queued close after releasing the listener and before binding.
             if await request.is_disconnected():
                 raise ClientDisconnect()
-            if not done:
+            if not done or (expires is not None and loop.time() >= expires):
                 break
             admission = self._admit(payload)
             if admission is not None:
                 return admission
+        if expires is not None and loop.time() >= expires:
+            raise _reservation_timeout()
         raise RouterError(503, "no_available_backend", "No compatible healthy P/D pair is available")
 
     async def close(self):
@@ -212,35 +242,131 @@ class PDCoordinator:
         results = await asyncio.gather(*(self.client.post(e.base_url + "/internal/pd/abort",
             json=msgspec.to_builtins(binding), timeout=self._timeout(5, control=True))
             for e in endpoints), return_exceptions=True)
+        clean = True
         for endpoint, result in zip(endpoints, results):
             if isinstance(result, BaseException) or result.status_code != 200:
                 logger.warning("HTTP abort not confirmed node=%s result=%s", endpoint.name, result)
+                clean = False
+        return clean
 
     async def _forward(self, request, path, owner, payload, session_id):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.config.request_timeout
+        queue = self.reservations
+        waiter = None
+        try:
+            if queue:
+                waiter = ReservationWaiter()
+                queue.put(waiter)
+            while True:
+                if waiter is not None:
+                    self.active[owner] = None
+                    await self._wait_for_reservation(request, waiter, deadline)
+                generation = queue.generation
+                try:
+                    return await self._attempt(request, path, owner, payload, session_id, waiter, deadline)
+                except _DecodeAtCapacity:
+                    if loop.time() >= deadline:
+                        raise _reservation_timeout() from None
+                    if waiter is None:
+                        waiter = ReservationWaiter()
+                    queue.put(waiter, generation=generation, rejected=True)
+                except _RouterAtCapacity:
+                    if waiter is None or not waiter.position:
+                        raise
+                    queue.put(waiter, generation=generation)
+        finally:
+            if waiter is not None:
+                queue.leave(waiter)
+
+    async def _wait_for_reservation(self, request, waiter, deadline):
+        loop = asyncio.get_running_loop()
+        while loop.time() < deadline:
+            if waiter.ready.is_set():
+                if await request.is_disconnected():
+                    raise ClientDisconnect()
+                if loop.time() >= deadline:
+                    break
+                if self.reservations.take(waiter):
+                    return
+                waiter.ready.clear()
+            available = asyncio.create_task(waiter.ready.wait())
+            disconnected = asyncio.create_task(wait_for_disconnect(request))
+            try:
+                done, _ = await asyncio.wait((available, disconnected), timeout=max(0, deadline - loop.time()),
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if disconnected in done:
+                    disconnected.result()
+                    raise ClientDisconnect()
+            finally:
+                for task in (available, disconnected):
+                    task.cancel()
+                await asyncio.gather(available, disconnected, return_exceptions=True)
+        raise _reservation_timeout()
+
+    async def _watch_reservation(self, endpoint, binding, waiter, deadline):
+        # Non-streaming responses have no response headers at reservation time.
+        # Read the existing status only for a protected head or at its deadline.
+        loop = asyncio.get_running_loop()
+        url = endpoint.base_url + "/internal/pd/requests/" + binding.request
+        while True:
+            remaining = deadline - loop.time()
+            delay = min(RETRY_INTERVAL, remaining) if self.reservations.protected is waiter else remaining
+            await asyncio.sleep(max(0, delay))
+            try:
+                reply = await asyncio.wait_for(
+                    self.probe_client.get(url, timeout=self._timeout(RETRY_INTERVAL, control=True)), RETRY_INTERVAL)
+                value = reply.json() if reply.is_success else None
+            except (ValueError, OSError, httpx.HTTPError, asyncio.TimeoutError):
+                value = None
+            if isinstance(value, dict) and value.get("request") == binding.request:
+                node, lease, worker = (value.get(field) for field in ("node", "reservation", "worker"))
+                if (all(isinstance(part, dict) for part in (node, lease, worker))
+                        and tuple(node.get(field) for field in ("node_id", "boot", "registry")) == binding.decode
+                        and lease.get("state") in ("CONSTRUCTING", "READY", "IN_USE")
+                        and worker.get("state_reservation_confirmed") is True):
+                    self.reservations.leave(waiter)
+                    return
+            if loop.time() >= deadline:
+                raise _reservation_timeout()
+
+    async def _attempt(self, request, path, owner, payload, session_id, waiter, admission_deadline):
         admission = self._admit(payload)
         if admission is None:
-            admission = await self._wait_for_admission(request, payload)
+            admission = await self._wait_for_admission(
+                request, payload, expires=admission_deadline if waiter is not None else None)
         p, d, binding, endpoints, release = admission
-        p_task = d_task = response = None
+        p_task = d_task = response = watch = None
         finished = False
+        retired = False
+        placed = False
+
         async def before_close():
+            nonlocal retired
+            clean = True
+            if watch is not None:
+                watch.cancel()
             if not finished:
                 # Abort wakes D's rendezvous before its HTTP task is joined.
-                await self.abort(binding, endpoints)
-            tasks = tuple(t for t in (p_task, d_task) if t is not None)
+                clean = await self.abort(binding, endpoints)
+            tasks = tuple(t for t in (p_task, d_task, watch) if t is not None)
             if tasks:
                 try:
                     await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True),
                                            self.config.handoff_timeout)
                 except asyncio.TimeoutError:
+                    clean = False
                     logger.warning("PD HTTP task retirement timed out request=%s; native leases stay guarded",
                                    binding.request)
             if retirement.response is None and d_task is not None and d_task.done() and not d_task.cancelled():
                 if d_task.exception() is None:
                     retirement.response = d_task.result()
+            retired = clean
 
         def release_all():
             release()
+            if finished:
+                self.reservations.released()
             record(logger, "http.retire", request=binding.request, finished=finished,
                    status=response.status_code if response is not None else "unknown")
 
@@ -249,13 +375,15 @@ class PDCoordinator:
         async def ready():
             result = await p_task
             if result.status_code != 200:
-                raise RouterError(result.status_code, "upstream_error", result.text, result)
+                raise _upstream_error(result, before_placement=not placed)
             try:
                 valid = result.json() == {"request": binding.request, "status": "ready"}
             except ValueError:
                 valid = False
             if not valid:
                 raise RouterError(503, "pd_protocol_error", "Prefill returned an invalid handoff confirmation")
+            if waiter is not None:
+                self.reservations.leave(waiter)
 
         try:
             def headers(peer):
@@ -268,25 +396,44 @@ class PDCoordinator:
             d_task = asyncio.create_task(send(self.client, self.registry, endpoints[1], path,
                 json=payload, headers=headers(p), timeout=self._timeout(self.config.request_timeout)))
             # JSON headers follow generation; SSE headers only acknowledge setup.
-            header_timeout = (self.config.handoff_timeout if payload.get("stream", False)
-                              else self.config.request_timeout)
-            deadline = asyncio.get_running_loop().time() + header_timeout
-            done, _ = await asyncio.wait((p_task, d_task), return_when=asyncio.FIRST_COMPLETED,
-                                         timeout=header_timeout)
-            if not done:
-                raise RouterError(503, "pd_operation_timeout", "PD response header wait timed out")
-            if p_task in done:
-                await ready()
-            try:
-                response = await asyncio.wait_for(asyncio.shield(d_task),
-                    max(0, deadline - asyncio.get_running_loop().time()))
-            except asyncio.TimeoutError as exc:
-                raise RouterError(503, "pd_operation_timeout", "Decode response header wait timed out") from exc
-            retirement.response = response
+            streaming = payload["stream"]
+            retrying = waiter is not None and waiter.position
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + (self.config.handoff_timeout if streaming else self.config.request_timeout)
+            pending = {p_task, d_task}
+            if retrying and not streaming:
+                watch = asyncio.create_task(self._watch_reservation(endpoints[1], binding, waiter, admission_deadline))
+                pending.add(watch)
+            while response is None:
+                bound_reservation = streaming and retrying and not placed and admission_deadline < deadline
+                expires = admission_deadline if bound_reservation else deadline
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED,
+                                                   timeout=max(0, expires - loop.time()))
+                if not done:
+                    if bound_reservation:
+                        raise _reservation_timeout()
+                    raise RouterError(503, "pd_operation_timeout", "PD response header wait timed out")
+                if d_task in done and not d_task.cancelled() and d_task.exception() is None:
+                    response = retirement.response = d_task.result()
+                    placed = placed or response.status_code == 200
+                if watch in done and watch.exception() is None:
+                    placed = True
+                if p_task in done:
+                    await ready()
+                    placed = True
+                    if watch in pending:
+                        pending.remove(watch)
+                        watch.cancel()
+                if d_task in done and response is None:
+                    d_task.result()  # Preserve the Prefill error when both peers failed.
+                if watch in done and not placed and response is None:
+                    watch.result()
             if response.status_code != 200:
                 await response.aread()
-                raise RouterError(response.status_code, "upstream_error", response.text, response)
-            if not payload.get("stream", False):
+                raise _upstream_error(response, before_placement=not placed)
+            if waiter is not None:
+                self.reservations.leave(waiter)
+            if not streaming:
                 body = await response.aread()
                 await ready()
                 finished = True
@@ -344,6 +491,8 @@ class PDCoordinator:
             retirement.arm(self.config.handoff_timeout)
             return StreamingResponse(stream(), media_type="text/event-stream",
                                      headers=response_headers(response, session_id, decoded=True))
-        except BaseException:
+        except BaseException as exc:
             await retirement.wait()
+            if isinstance(exc, _DecodeAtCapacity) and not retired:
+                raise RouterError(503, "pd_retirement_unconfirmed", "Previous PD attempt could not be retired") from exc
             raise

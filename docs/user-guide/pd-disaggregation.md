@@ -115,6 +115,17 @@ Completion/chat, streaming, tools and optional constraints reuse Serving's ordin
 
 HTTP, control (HTTP port + 10000 by default), and Mooncake's dynamic RPC/RoCE endpoints must be reachable. Optional entry fields are `control_port` and `transfer_hostname` for a distinct data-plane address. Optional fields in the top-level `pd` section are `provider` (currently `mooncake`), `policy` (currently `round_robin`), `capacity` (256 per node), `handoff_timeout` (300 seconds), `request_timeout` (3600 seconds), and `run_id`. Timeouts do not authorize reuse of possibly active memory.
 
+`pd.prefill_waiting_window` defaults to 5, including the queue head. Each request
+admitted ahead of a blocked head reduces its remaining lookahead by one. Set
+the window to 1 to admit new Prefill requests in queue order.
+
+`pd.reservation_retry_position` sets the initial position in the Router's
+Decode reservation wait queue and defaults to 5. Each temporary Decode
+reservation failure moves that request one position closer to the front.
+At position 1 it keeps priority until reservation, cancellation or timeout.
+Set the position to 1 for immediate priority. The queue holds at most
+`pd.capacity` requests and uses one `request_timeout` for admission and retries.
+
 `handoff_timeout` bounds individual control, transfer, and stop-confirmation operations. Waiting for the full Prefill before Decode uses `request_timeout`, so a long, progressing Prefill is not mistaken for a stalled transfer. Non-streaming JSON response headers also wait under `request_timeout`, because they follow generation; streaming setup headers retain `handoff_timeout`. Expiry still follows the normal abort and lease-retirement rules.
 
 An SSE response whose body iterator has not started within `handoff_timeout` is
@@ -142,7 +153,7 @@ The Router always constructs its own PD context.
 
 | Router error code | HTTP status | Meaning |
 | --- | --- | --- |
-| `capacity_exhausted` | 503 | Compatible pairs exist but their per-node request slots are full. The request was not dispatched; `Retry-After` suggests a delay before resubmission. |
+| `capacity_exhausted` | 503 | The Router's node slots or Decode reservation wait queue are full, or the reservation wait expired. `Retry-After` suggests a delay before resubmission. |
 | `no_available_backend` | 503 | No healthy compatible pair; also used for an unseen model while node discovery is incomplete. |
 | `model_not_found` | 404 | Every configured node has supplied a valid descriptor and the model is unknown. |
 | `invalid_request` | 400 | Invalid JSON, object or model field. Model-specific validation stays on the nodes. |
@@ -150,6 +161,7 @@ The Router always constructs its own PD context.
 | `http_pool_exhausted` | 503 | The Router's local HTTP pool could not supply a connection; this does not mark a node unhealthy. |
 | `pd_operation_timeout` | 503 | A PD coordination wait or HTTP operation timed out; the message identifies the wait or HTTP failure. |
 | `pd_protocol_error` | 503 | Invalid handoff confirmation or response protocol. |
+| `pd_retirement_unconfirmed` | 503 | The previous reservation attempt could not be confirmed retired. |
 | `router_closing` | 503 | The Router is shutting down. |
 | `response_retired` | 503 | The unstarted-body guard retired the response before iteration began. After SSE headers this is a stream error. |
 
@@ -159,15 +171,16 @@ existing `error.message` and `error.type` fields and add `error.code` and
 check error events: HTTP 200 and `[DONE]` alone do not prove generation succeeded.
 HTTP disconnects and Router counter release do not prove native transfers stopped.
 
-PD admission does not add a Router waiting queue. Selection follows fixed
-configured P/D-pair positions, skipping unhealthy, draining, incompatible or full
+PD selection follows fixed configured P/D-pair positions, skipping unhealthy, draining, incompatible or full
 nodes. Selection and counter reservation do not yield; P/D POSTs still run
 concurrently. Both modes use the common Registry's per-node outstanding counts,
 with one idempotent release for each admitted request. P capacity returns when its handoff task finishes, independently
 of D headers or output; D capacity returns after response cleanup. The nodes
-retain their own capacity and safe-retirement checks. Only `capacity_exhausted`
-guarantees rejection before either POST; other errors may require cleanup of
-already-started work. The Router never retries or rebinds a started request.
+retain their own capacity and safe-retirement checks. Decode chooses the
+longest legal prefix among groups with both cache pages and a drafter slot.
+On a temporary Decode capacity error before placement, the Router retires the
+attempt and queues the original request. A later attempt gets a fresh binding.
+Confirmed placement keeps the binding for the rest of the request.
 
 `capacity` limits in-flight requests, not model batch size or available HBM.
 Increasing it can increase queueing latency and KV/state pressure; a node can
