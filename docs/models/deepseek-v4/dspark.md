@@ -2,6 +2,10 @@
 
 DSpark serves the converted DeepSeek V4 Flash W8A8 checkpoint with TP4 groups. It supports target-only greedy decoding (`K=0`) and a seven-token speculative chain (`K=7`). The 16-device configuration below uses `--dp 4 --ep 16 --tp 4`; an eight-device configuration uses `--dp 2 --ep 8 --tp 4`. Each configuration needs exactly as many device IDs as its `--ep` value.
 
+See the [validated component versions (JSON)](../../compatibility.json) for
+DSpark on Ascend A2/A3. Entries are listed by verification date, newest first,
+and kept for at most one month.
+
 ## Prepare the Checkpoint
 
 Use the same [checkpoint conversion](mtp.md#checkpoint-conversion) as the eight-device MTP path. Set `--block-size 32` for DSpark. The CLI validates the topology and caps `--max-num-seqs` at 16 times the device count (256 on 16 devices, 128 on eight). `--max-model-len` cannot exceed 1,048,576 or the checkpoint's `max_position_embeddings`. DSpark currently supports greedy sampling only, so use `temperature: 0`.

@@ -1,0 +1,23 @@
+{
+  "retention_months": 1,
+  "entries": [
+    {
+      "verified_on": "2026-11-25",
+      "model": "DeepSeek V4 Flash DSpark",
+      "platform": "Ascend A2/A3",
+      "components": {
+        "pypto_serving": "0764ed75a8e17d791204afaa89fe9b0cd89c0e4b",
+        "pypto_lib": "5d8536a5fe07c6635b71148206eeba297ae5aef5",
+        "pypto": "2e31e0c2a604c3c859c1268a937f97b0ee2d747f",
+        "simpler_runtime": "a5349f42c71666bb8cacfb3759f34eeda1572beb",
+        "pto_isa": "45435c0624c1d0d056bf38aa60d4f56dc0ef3b6b",
+        "ptoas": {
+          "version": "v0.78",
+          "wheel_url": "https://github.com/hw-native-sys/PTOAS/releases/download/v0.78/ptoas-0.78-cp310-cp310-manylinux_2_34_aarch64.whl"
+        },
+        "pytorch": "2.10.0+cpu",
+        "cann": "9.0.0"
+      }
+    }
+  ]
+}
