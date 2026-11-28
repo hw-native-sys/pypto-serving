@@ -247,7 +247,7 @@ class Application:
         self.channel, self.progress = channel, progress
         settings = WorkerSettings(self.boot, endpoint.transfer_hostname or endpoint.host,
                                   config.provider, config.capacity, len(config.prefill) + len(config.decode),
-                                  config.handoff_timeout)
+                                  config.handoff_timeout, role=role)
         tokens = 0 if role == "prefill" else engine_config.runtime_config.num_speculative_tokens
         engine_config = replace(engine_config,
             runtime_config=replace(engine_config.runtime_config, num_speculative_tokens=tokens),

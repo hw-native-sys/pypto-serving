@@ -13,6 +13,11 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from .protocol import CapacityExhausted, receive, send
+from .transfer import TransferError
+
+
+class PeerTransferError(TransferError):
+    """Transfer status reported by the peer, independent of local native access."""
 
 
 class Session:
@@ -37,12 +42,19 @@ class Session:
                 if future is None or future.done():
                     raise ValueError("unexpected control reply")
                 if "error" in reply:
-                    error_type = CapacityExhausted if reply.get("code") == "capacity_exhausted" else RuntimeError
-                    future.set_exception(error_type(reply["error"]))
+                    message = reply["error"]
+                    if reply.get("code") == "capacity_exhausted":
+                        future.set_exception(CapacityExhausted(message))
+                    elif type(reply.get("uncertain")) is bool:
+                        future.set_exception(PeerTransferError(message, uncertain=reply["uncertain"]))
+                    else:
+                        future.set_exception(RuntimeError(message))
                 else:
                     future.set_result(reply["result"])
-        except (Exception, asyncio.CancelledError) as exc:
-            error = exc if isinstance(exc, Exception) else error
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            error = ConnectionError(f"peer control session lost: {exc}")
         finally:
             self.writer.close()
             for future in self.pending.values():
@@ -83,7 +95,10 @@ class Session:
         self.writer.close()
         self.task.cancel()
         await asyncio.gather(self.task, return_exceptions=True)
-        await self.writer.wait_closed()
+        try:
+            await self.writer.wait_closed()
+        except ConnectionError:
+            pass
 
 
 @dataclass

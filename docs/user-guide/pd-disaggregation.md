@@ -12,9 +12,9 @@ Control protocol version 3 separates the common replicated-page data contract fr
 
 Follow the SDK's normal source-build instructions with its matching runtime pin and required PTOAS version. The native Buffer integration requires PTOAS 0.74 with its matching SDK pin. Keep runtime revision checks enabled; a binary copied from another checkout is not a matching source installation.
 
-Model nodes require Linux Python with `os.pidfd_open` and a Mooncake Ascend build that supports `register_memory(address, extent, "npu")`. Startup checks the binding before loading weights. [Mooncake #2191](https://github.com/kvcache-ai/Mooncake/pull/2191)
+Model nodes require Linux Python with `os.pidfd_open`. The Mooncake provider needs an Ascend build that supports `register_memory(address, extent, "npu")`. Startup checks the binding before loading weights. [Mooncake #2191](https://github.com/kvcache-ai/Mooncake/pull/2191)
 
-Each rank has an independent transfer process and ACL context. It imports leased buffers on the same host and registers its own mapped addresses with Mooncake before the first transfer. The compute Worker retains allocation ownership; registration never exposes its process-local pointer to another process. Adding regions after a peer connection is established is not supported. Transfers are device-to-device without Host staging. Deploy on a trusted network: internal control endpoints are not authenticated.
+Each rank has an independent transfer process and ACL context. It imports leased buffers on the same host and registers its own mapped addresses with the selected provider before the first transfer. The compute Worker retains allocation ownership; registration never exposes its process-local pointer to another process. Adding regions after a peer connection is established is not supported. Transfers are device-to-device without Host staging. Deploy on a trusted network: internal control endpoints are not authenticated.
 
 On RoCE hosts, set these variables on both model nodes before starting Serving or loading the SDK.
 
@@ -113,7 +113,61 @@ curl -N http://127.0.0.1:8110/v1/chat/completions \
 
 Completion/chat, streaming, tools and optional constraints reuse Serving's ordinary API. Invalid preparation fails before SSE headers. Later execution failures emit an explicit stream error; clients must inspect events even after HTTP 200.
 
-HTTP, control (HTTP port + 10000 by default), and Mooncake's dynamic RPC/RoCE endpoints must be reachable. Optional entry fields are `control_port` and `transfer_hostname` for a distinct data-plane address. Optional fields in the top-level `pd` section are `provider` (currently `mooncake`), `policy` (currently `round_robin`), `capacity` (256 per node), `handoff_timeout` (300 seconds), `request_timeout` (3600 seconds), and `run_id`. Timeouts do not authorize reuse of possibly active memory.
+HTTP, control (HTTP port + 10000 by default), and the provider's RPC/RoCE endpoints must be reachable. Optional entry fields are `control_port` and `transfer_hostname` for a distinct transfer address. Optional fields in the top-level `pd` section are `provider` (default `mooncake`), `policy` (currently `round_robin`), `capacity` (256 per node), `handoff_timeout` (300 seconds), `request_timeout` (3600 seconds), and `run_id`. Timeouts do not authorize reuse of possibly active memory.
+
+### Experimental HIXL CS provider on A3
+
+Set `pd.provider` to `hixl` with one or more replicas in each role.
+This provider uses PyPTO's
+`alloc_tensor(exportable=True)`, `export_buffer`, and `release_export` APIs.
+Each rank's separate transfer process imports its VMM cache and registers the
+imported address with HIXL. Shutdown unregisters and unmaps the address before
+releasing the compute owner's export. With DDR offload enabled, the DDR copy process
+imports the same cache allocation through a separate lease. The compute worker
+owns the allocation while both consumers use their own mapped addresses.
+Use matching Simpler and CANN 9.1.0 builds. Simpler's
+`examples/workers/l4/pd_rdma_probe/README.md` covers building the standalone
+`pd_rdma_probe` and the `libpd_rdma_bridge.so` bridge used by Serving.
+Set `PYPTO_HIXL_BRIDGE` to the bridge's absolute path and set
+`PYPTO_HIXL_DEVICE_IP` and `PYPTO_HIXL_PHYSICAL_DEVICE` to the local device's
+RoCE IPv4 address and physical ID on each node. Set `PYPTO_HIXL_PORT` on
+Decode. Its `transfer_hostname` (or `host` when omitted) supplies the
+management IPv4 address for HIXL CS. Use the private P/D network for the
+Serving control, HIXL listener, and probe bootstrap ports.
+
+For multiple devices, set `PYPTO_HIXL_DEVICE_ENDPOINTS` on each node to a JSON
+array of `[RoCE IPv4, physical device ID]` pairs in the same rank order as
+`--devices`. This replaces the two single-device endpoint variables. Each
+Decode rank listens on `PYPTO_HIXL_PORT + rank`. Assign disjoint HIXL port
+ranges to Decode replicas on the same host.
+
+The first authorized plan for a Decode rank starts its HIXL listener and
+registers its KV regions. Each configured Prefill may connect to the same
+listener and reuse those registrations. Prefill keeps a separate connection
+for each destination replica and rank, and verifies the remote addresses
+against that replica's Serving registry before writing.
+
+Decode reserves the destination pages per request. The worker uses the ranges
+in the authorized `Plan.copies` for one synchronous batch per source and
+destination rank pair. Decode commits the final chunk after all batches
+succeed and the completion matches that request's authorized plan. Stop
+the Prefill replicas first. Decode releases its registrations after every
+connected Prefill has acknowledged retirement. Keep replica identities stable
+for the duration of a deployment.
+
+The single-card probe uses real device allocations and the Serving plan,
+completion and cache-manager paths with synthetic KV. Run the roles in
+separate terminals. Start Decode first and wait for `DECODE_READY`, then
+start Prefill. Decode waits up to 90 seconds by default for the handoff.
+Each `--port` is used for probe bootstrap. Serving control uses that value
+plus 10000.
+
+```bash
+python examples/pd_rdma_probe.py --role decode --device "$D_DEVICE" \
+  --host "$D_HOST" --port 20882 --peer-host "$P_HOST" --peer-port 20881
+python examples/pd_rdma_probe.py --role prefill --device "$P_DEVICE" \
+  --host "$P_HOST" --port 20881 --peer-host "$D_HOST" --peer-port 20882
+```
 
 `handoff_timeout` bounds individual control, transfer, and stop-confirmation operations. Waiting for the full Prefill before Decode uses `request_timeout`, so a long, progressing Prefill is not mistaken for a stalled transfer. Non-streaming JSON response headers also wait under `request_timeout`, because they follow generation; streaming setup headers retain `handoff_timeout`. Expiry still follows the normal abort and lease-retirement rules.
 
@@ -272,4 +326,4 @@ P also captures the last 128 prompt tokens' target hidden states, without loadin
 
 Terminal output waits for request retirement, including the local state-release acknowledgement, before the Router can admit a replacement. Normal Decode completion reuses Serving's FIFO worker-release ACK without an extra control barrier. Initial-token termination and cancellation without that ACK still explicitly discard reserved state. HTTP cancellation does not cancel the owned retirement task. A confirmed abort for a request that was never admitted consumes no capacity and authorizes no writes.
 
-To shut down normally, stop admitting requests at the Router, let active requests finish, then stop P before D. Confirm sender registrations and pins have retired before freeing receiver memory. Each consumer drains native work, unregisters and disconnects Mooncake, unmaps its VMM imports, and only then releases source export leases. An unconfirmed export, mapping cleanup, or native completion keeps that lease reachable; process/HTTP completion does not release it. Deterministic errors reclaim normally; uncertain native completion gates the affected node and retains its writable suffix/state and bootstrap slot, not healthy shared prefix. Recovery is manual/external: no automatic restart, transfer replay, or backend fallback. Before write authorization, a cached placement without receive-suffix capacity can be released and retried once through normal cold allocation; this is not a transfer retry. Do not equate a closed HTTP connection with stopped DMA.
+To shut down normally, stop admitting requests at the Router, let active requests finish, then stop P before D. Confirm sender registrations and pins have retired before freeing receiver memory. Each consumer drains native work, unregisters and disconnects the transfer provider, unmaps its VMM imports, and only then releases source export leases. An unconfirmed export, mapping cleanup, or native completion keeps that lease reachable; process/HTTP completion does not release it. Deterministic errors reclaim normally; uncertain native completion gates the affected node and retains its writable suffix/state and bootstrap slot, not healthy shared prefix. Recovery is manual/external: no automatic restart, transfer replay, or backend fallback. Before write authorization, a cached placement without receive-suffix capacity can be released and retried once through normal cold allocation; this is not a transfer retry. Do not equate a closed HTTP connection with stopped DMA.
