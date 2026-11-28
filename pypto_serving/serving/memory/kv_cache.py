@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import math
 import struct
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 
 import torch
@@ -874,16 +874,20 @@ class KvCacheManager:
         partition: int | None = None,
         load_tokens: int | None = None,
         allocation_tokens: int | None = None,
+        prefill_target: Callable[[int, int], int] | None = None,
     ) -> tuple[dict[str, list[int]], int, int | None]:
         if not self.enable_prefix_cache or not self._group_pools:
             return {}, 0, None
         if request_id in self._group_request_partitions:
             raise ValueError(f"Request {request_id!r} already owns grouped KV cache blocks")
-        observation = self._dfx_prefix_observation(max_cache_hit_tokens, load_tokens, partition, allocation_tokens)
+        observation = self._dfx_prefix_observation(
+            max_cache_hit_tokens, load_tokens, partition, allocation_tokens, prefill_target=prefill_target,
+        )
         best_blocks, best_hit_tokens, best_partition = self.select_group_prefix_blocks(
             block_hashes, max_cache_hit_tokens=max_cache_hit_tokens,
             shareable_group_names=shareable_group_names, partition=partition,
-            load_tokens=load_tokens, allocation_tokens=allocation_tokens, observation=observation,
+            load_tokens=load_tokens, allocation_tokens=allocation_tokens,
+            prefill_target=prefill_target, observation=observation,
         )
         if observation is not None:
             observation.update(self.dplb_dfx.begin_decision(request_id))
@@ -916,7 +920,7 @@ class KvCacheManager:
 
     def select_group_prefix_blocks(
         self, block_hashes, *, max_cache_hit_tokens, shareable_group_names=None, partition=None,
-        lookup=None, checkpoint_keys=None, load_tokens=None, allocation_tokens=None,
+        lookup=None, checkpoint_keys=None, load_tokens=None, allocation_tokens=None, prefill_target=None,
         restore_bytes=None, page_needs_block=None, observation=None,
     ):
         """Select the longest complete grouped prefix without mutating ownership.
@@ -1081,8 +1085,19 @@ class KvCacheManager:
                 row.update(prefix_hit_tokens=candidate, prefix_status="evaluated")
             if not candidate:
                 continue
-            if allocation_tokens is not None and not self._prefix_fits_allocation(
-                candidate_blocks, candidate, candidate_partition, allocation_tokens, page_needs_block, row,
+            target = allocation_tokens
+            if prefill_target is not None:
+                target = prefill_target(candidate_partition, candidate)
+                if not target:
+                    if row is not None:
+                        row["exclusion_reasons"].append("scheduler_partition_limit")
+                        row["feasible"] = False
+                    continue
+                if row is not None:
+                    row["allocation_tokens"] = target
+            if target is not None and not self._prefix_fits_allocation(
+                candidate_blocks, candidate, candidate_partition, target, page_needs_block, row,
+                prefill=prefill_target is not None,
             ):
                 continue
             missing_bytes = restore_bytes(candidate_blocks) if restore_bytes is not None else 0
@@ -1536,7 +1551,7 @@ class KvCacheManager:
         return self._group_growth_blocks(pool, owned, previous, target)
 
     @staticmethod
-    def _group_growth_blocks(pool, owned, previous, target, *, pinned_prefix=False):
+    def _group_growth_blocks(pool, owned, previous, target, *, is_shared=None):
         if pool.spec.sliding_window is None:
             if target > pool.spec.max_blocks_per_seq:
                 return pool.blocks_per_partition + 1
@@ -1551,21 +1566,26 @@ class KvCacheManager:
             if slot >= len(owned):
                 continue
             block = owned[slot]
-            if block is not None and (pinned_prefix or block.ref_cnt > 1):
+            if block is not None and (block.ref_cnt > 1 if is_shared is None else is_shared(block)):
                 shared_slots.add(slot)
         return missing + len(shared_slots)
 
-    def _prefix_fits_allocation(self, tables, boundary, partition, token_count, page_needs_block, row):
+    @staticmethod
+    def _prefix_page_needs_block(block):
+        return block.ref_cnt == 0
+
+    def _prefix_fits_allocation(self, tables, boundary, partition, token_count, page_needs_block, row, *, prefill):
+        needs_block = page_needs_block if page_needs_block is not None else self._prefix_page_needs_block
         fits = True
         for name, pool in self._group_pools.items():
             owned = tables[name]
             previous = boundary // pool.spec.spec.token_capacity
             target = self._logical_group_blocks(pool, token_count)
-            required = self._group_growth_blocks(pool, owned, previous, target, pinned_prefix=True)
-            if page_needs_block is None:
-                required += sum(block is not None and block.ref_cnt == 0 for block in owned)
-            else:
-                required += sum(page_needs_block(block) for block in owned if block is not None)
+            pinned = not prefill or pool.spec.preserve_prefill_history
+            required = self._group_growth_blocks(
+                pool, owned, previous, target, is_shared=lambda block: pinned or not needs_block(block),
+            )
+            required += sum(needs_block(block) for block in owned if block is not None)
             if row is not None:
                 capacity = row["capacity"][name]
                 capacity.update(required_blocks=required, required_status="evaluated")
@@ -1948,16 +1968,23 @@ class KvCacheManager:
             return "request_count"
         return "short_request_count" if observation["short_sequence"] else "long_logical_load"
 
-    def _dfx_prefix_observation(self, max_cache_hit_tokens, load_tokens, partition, allocation_tokens):
+    def _dfx_prefix_observation(
+        self, max_cache_hit_tokens, load_tokens, partition, allocation_tokens, *, prefill_target=None,
+    ):
         if not self._dfx_active():
             return None
         max_hit_tokens = max(0, int(max_cache_hit_tokens))
+        scope = "prefix_request_limit_only"
+        if prefill_target is not None:
+            scope = "prefill_step"
+        elif allocation_tokens is not None:
+            scope = "prefix_allocation"
         return dict(
             groups=self._dfx_groups(), incoming_logical_tokens=load_tokens or max_hit_tokens,
             prompt_tokens=load_tokens, max_cache_hit_tokens=max_hit_tokens, requested_partition=partition,
             allocation_tokens=allocation_tokens, rotation_start=self._next_group_partition,
             policy=self._dfx_policy(), view="policy_logical",
-            feasibility_scope="prefix_request_limit_only" if allocation_tokens is None else "prefix_allocation",
+            feasibility_scope=scope,
         )
 
     def _dfx_owner(self, request_id: str, action: str, partition: int, **fields) -> None:

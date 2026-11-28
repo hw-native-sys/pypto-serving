@@ -95,7 +95,9 @@ describe existing ownership, explicit partition constraints, scheduler partition
 limits, request-slot limits, KV capacity, and table capacity. PD Prefill uses
 `scheduler_partition_limit` for groups unavailable to the current step.
 `candidates` lists the groups considered for ranking. Prefill prefix lookup uses
-`feasibility_scope=prefix_request_limit_only`. Decode reservation uses
+`feasibility_scope=prefill_step` and checks the allocation for the current chunk
+against each group's KV capacity and scheduling limits. Each schedulable prefix
+candidate reports its own `allocation_tokens` in the group row. Decode reservation uses
 `feasibility_scope=prefix_allocation` and checks how many pages the prefix and
 remaining prompt need before acquiring ownership. `prefix_status` and
 `required_status` explicitly distinguish unexamined values from measured zero.

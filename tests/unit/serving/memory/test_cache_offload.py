@@ -245,7 +245,8 @@ def test_dplb_prefill_prefers_fewer_restore_bytes_for_equal_hits():
     assert len(backend.waiting) == 1
 
 
-def test_decode_uses_feasible_ddr_prefix_when_equal_hbm_hit_cannot_grow():
+@pytest.mark.parametrize('decode', [False, True], ids=['prefill', 'decode'])
+def test_uses_feasible_ddr_prefix_when_equal_hbm_hit_cannot_grow(decode):
     async def run():
         cache, backend = KvCacheManager(enable_dplb=True), Backend()
         cache.init_groups((KVCacheGroupSpec(
@@ -265,11 +266,20 @@ def test_decode_uses_feasible_ddr_prefix_when_equal_hbm_hit_cannot_grow():
         assert [pool.num_free_blocks_in(partition) for partition in (0, 1)] == [0, 3]
         session = attach(tier)
 
-        await asyncio.wait_for(tier.restore('incoming', hashes, 33, maximum=33), timeout=2)
-        reservation = cache.reserve_group_cache('incoming', 'incoming', 34, prompt_token_count=33,
-            prefix_block_hashes=hashes, shareable_group_names=('kv',))
+        if decode:
+            await asyncio.wait_for(tier.restore('incoming', hashes, 33, maximum=33), timeout=2)
+            reservation = cache.reserve_group_cache('incoming', 'incoming', 34, prompt_token_count=33,
+                prefix_block_hashes=hashes, shareable_group_names=('kv',))
+            assert (reservation.partition, reservation.prefix_hit_tokens) == (1, 32)
+        else:
+            scheduler = _prefill_scheduler(cache, replay=0)
+            scheduler.add_request(Request('incoming', list(range(33)), max_new_tokens=1))
+            assert not scheduler.schedule().scheduled_requests
+            assert tier.pending['incoming'].partition == 1
+            await until(lambda: tier.pending['incoming'].remaining == 0)
+            step, = scheduler.schedule().scheduled_requests
+            assert (step.cache_partition, step.num_computed_tokens, step.num_new_tokens) == (1, 32, 1)
 
-        assert (reservation.partition, reservation.prefix_hit_tokens) == (1, 32)
         assert tier.tier.counters['loads'] == 2
         await session.close()
     asyncio.run(run())

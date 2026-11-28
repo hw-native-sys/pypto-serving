@@ -11,6 +11,7 @@
 import pytest
 
 from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
+from pypto_serving.pd.scheduler import PrefillScheduler
 from pypto_serving.serving.memory.kv_cache import KvCacheManager, KVCacheCapacityError
 from pypto_serving.serving.sched.scheduler import Request, Scheduler, SchedulerConfig
 
@@ -156,3 +157,56 @@ def test_decode_reservation_skips_prefix_without_suffix_capacity():
 
     assert (reservation.partition, reservation.prefix_hit_tokens) == (0, 32)
     assert len(reservation.block_ids_by_group["kv"]) == 3
+
+
+@pytest.mark.parametrize("scheduler_type", [Scheduler, PrefillScheduler], ids=["local", "pd"])
+@pytest.mark.parametrize("prompt_length, budget, new_tokens", [(33, 64, 1), (65, 8, 8)])
+def test_prefill_uses_prefix_with_capacity_for_this_step(scheduler_type, prompt_length, budget, new_tokens):
+    manager = KvCacheManager(enable_dplb=True)
+    manager.init_groups((KVCacheGroupSpec(
+        "kv", (0,), KVCacheSpec(16, 16, 1), 8, num_partitions=2, num_blocks=8,
+    ),), max_batch_size=1)
+    tokens = list(range(prompt_length))
+    hashes = manager.compute_group_block_hashes(tokens)
+    for partition, length in enumerate((112, 128)):
+        request = f"seed-{partition}"
+        allocate(manager, request, length, partition)
+        manager.cache_group_blocks(request, hashes, 32, {})
+    assert [manager.group_num_free_blocks("kv", group) for group in (0, 1)] == [1, 0]
+    scheduler = scheduler_type(
+        config=SchedulerConfig(max_num_scheduled_tokens=budget, max_seq_len=128),
+        kv_cache_manager=manager,
+    )
+    scheduler.add_request(Request("incoming", tokens, max_new_tokens=1))
+
+    step, = scheduler.schedule().scheduled_requests
+
+    assert (step.cache_partition, step.num_computed_tokens, step.num_new_tokens) == (0, 32, new_tokens)
+
+
+def test_single_dispatch_prefill_waits_for_temporarily_blocked_prefix():
+    manager = KvCacheManager(enable_dplb=True)
+    manager.init_groups((KVCacheGroupSpec(
+        "kv", (0,), KVCacheSpec(16, 16, 1), 4, num_partitions=2, num_blocks=4,
+    ),), max_batch_size=1)
+    tokens = list(range(33))
+    hashes = manager.compute_group_block_hashes(tokens)
+    for partition in (0, 1):
+        request = f"seed-{partition}"
+        allocate(manager, request, 64, partition)
+        manager.cache_group_blocks(request, hashes, 32, {})
+    scheduler = Scheduler(SchedulerConfig(
+        max_num_scheduled_tokens=1, max_seq_len=64, enable_chunk_prefill=False,
+    ), manager)
+    request = Request("incoming", tokens, max_new_tokens=1)
+    scheduler.add_request(request)
+
+    blocked = scheduler.schedule()
+    assert not blocked.scheduled_requests
+    assert not blocked.rejected_requests
+    assert list(scheduler.waiting) == [request]
+    assert manager.group_request_partition(request.request_id) is None
+
+    manager.release_all_group_requests("seed-0")
+    step, = scheduler.schedule().scheduled_requests
+    assert (step.cache_partition, step.num_computed_tokens, step.num_new_tokens) == (0, 32, 1)

@@ -610,13 +610,25 @@ class Scheduler:
                 remaining_waiting.append(request)
                 continue
 
+            best_prefix_computed = 0
             # Prefix cache lookup
             if self.config.enable_prefix_cache:
                 if self.kv_cache_manager.has_groups:
+                    def prefill_target(partition: int, hit_tokens: int) -> int:
+                        nonlocal best_prefix_computed
+                        computed = self._prefill_prefix_tokens(request, hit_tokens)
+                        best_prefix_computed = max(best_prefix_computed, computed)
+                        if not self._can_admit_waiting_partition(partition):
+                            return 0
+                        num_new = self._limit_scheduled_tokens(
+                            request, token_budget, computed_tokens=computed, partition=partition,
+                        )
+                        return computed + num_new if num_new > 0 else 0
+
                     tiering = self.kv_cache_manager.tiering
                     if tiering is not None and not tiering.prepare(
                         request.request_id, request.group_block_hashes, request.num_prompt_tokens,
-                        maximum=request.group_checkpoint_boundary,
+                        maximum=request.group_checkpoint_boundary, prefill_target=prefill_target,
                     ):
                         remaining_waiting.append(request)
                         continue
@@ -629,6 +641,7 @@ class Scheduler:
                         request.group_block_hashes,
                         max_cache_hit_tokens=request.group_checkpoint_boundary,
                         load_tokens=request.num_prompt_tokens,
+                        prefill_target=prefill_target,
                     )
                     request.group_shared_prefix_boundary = self.kv_cache_manager.group_history_prefix_hit(
                         request.group_block_hashes, request.group_checkpoint_boundary,
@@ -647,11 +660,9 @@ class Scheduler:
                             request.num_computed_tokens,
                         )
                         request.prefix_cache_hit_tokens = request.num_computed_tokens
-                        if self.config.prefix_cache_replay_before_hit:
-                            request.num_computed_tokens = max(
-                                0, request.num_computed_tokens
-                                - self.config.speculative_prefix_cache_replay_tokens,
-                            )
+                        request.num_computed_tokens = self._prefill_prefix_tokens(
+                            request, request.prefix_cache_hit_tokens,
+                        )
                     cached_blocks = []
                 else:
                     cached_blocks = self.kv_cache_manager.get_computed_blocks(
@@ -674,6 +685,11 @@ class Scheduler:
             rejection = self._single_prefill_rejection(request)
             if rejection is not None:
                 self._release_waiting_prefix_blocks(request)
+                if best_prefix_computed and self._single_prefill_rejection(
+                    request, computed_tokens=best_prefix_computed,
+                ) is None:
+                    remaining_waiting.append(request)
+                    continue
                 request.status = RequestStatus.FINISHED_ABORTED
                 self.kv_cache_manager.dfx_terminal(request.request_id, "prefill_rejected")
                 self.requests.pop(request.request_id, None)
@@ -801,11 +817,12 @@ class Scheduler:
             )
         )
 
-    def _single_prefill_rejection(self, request: Request) -> str | None:
+    def _single_prefill_rejection(self, request: Request, *, computed_tokens: int | None = None) -> str | None:
         """Return an admission error when the uncached prompt cannot run in one step."""
         if not self._requires_single_prefill_dispatch():
             return None
-        uncached_tokens = max(1, request.num_prefill_tokens - request.num_computed_tokens)
+        computed = request.num_computed_tokens if computed_tokens is None else computed_tokens
+        uncached_tokens = max(1, request.num_prefill_tokens - computed)
         single_dispatch_limit = self._single_prefill_dispatch_limit()
         if uncached_tokens <= single_dispatch_limit:
             return None
@@ -837,22 +854,36 @@ class Scheduler:
                 return f"replay length {replay_tokens} exceeds the single-dispatch prefill limit {limit}"
         return None
 
+    def _prefill_prefix_tokens(self, request: Request, hit_tokens: int) -> int:
+        if self.config.prefix_cache_replay_before_hit:
+            hit_tokens -= self.config.speculative_prefix_cache_replay_tokens
+        return max(0, min(hit_tokens, request.num_prompt_tokens - 1))
+
+    def _partition_token_budget(self, request: Request, token_budget: int, partition: int | None) -> int:
+        return token_budget
+
     def _limit_scheduled_tokens(
         self,
         request: Request,
         token_budget: int,
+        *,
+        computed_tokens: int | None = None,
+        partition: int | None = None,
     ) -> int:
         """Apply per-request prefill limits and the remaining step budget."""
-        needed = request.num_new_tokens_needed
-        limit = token_budget
-        if request.is_prefill:
+        computed = request.num_computed_tokens if computed_tokens is None else computed_tokens
+        needed = request.num_tokens - computed
+        is_prefill = computed < request.num_prefill_tokens
+        owner = request.cache_partition if partition is None else partition
+        limit = self._partition_token_budget(request, token_budget, owner)
+        if is_prefill:
             chunk_limit = self._prefill_chunk_limit()
             if chunk_limit is not None:
                 limit = min(limit, chunk_limit)
             if self._requires_single_prefill_dispatch() and needed > limit:
                 return 0
-        scheduled = max(0, min(needed, limit, self.config.max_seq_len - request.num_computed_tokens))
-        if request.is_prefill and request.num_computed_tokens + scheduled < request.num_prompt_tokens:
+        scheduled = max(0, min(needed, limit, self.config.max_seq_len - computed))
+        if is_prefill and computed + scheduled < request.num_prompt_tokens:
             # KDA's BF16 recurrence boundaries must stay fixed across dispatches.
             # Leave arbitrary final tails intact; defer unfinished work when the
             # remaining shared budget cannot fit one recurrence block.
