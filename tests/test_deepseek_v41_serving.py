@@ -70,6 +70,8 @@ def test_v41_dp4_http_answer(tmp_path, num_speculative_tokens):
     model_dir = Path(model_path)
     prefill_tokens = int(os.environ.get("PYPTO_DSV41_PREFILL_TOKENS", "1024"))
     assert 128 <= prefill_tokens <= 4096
+    max_batched_tokens = int(os.environ.get("PYPTO_DSV41_MAX_BATCHED_TOKENS", str(prefill_tokens)))
+    assert prefill_tokens <= max_batched_tokens <= 4096
     prompt_tokens = int(os.environ.get("PYPTO_DSV41_PROMPT_TOKENS", str(min(8192, 3 * prefill_tokens))))
     assert prefill_tokens < prompt_tokens <= 8192
     devices = tuple(part.strip() for part in os.environ.get("TASK_DEVICE", "").split(","))
@@ -86,10 +88,20 @@ def test_v41_dp4_http_answer(tmp_path, num_speculative_tokens):
         "--served-model-name", MODEL_NAME, "--backend", "npu", "--platform", "a5",
         "--devices", ",".join(devices), "--tp", "1", "--dp", "4", "--ep", "4",
         "--block-size", "128", "--max-model-len", "8320", "--max-num-seqs", "8",
-        "--max-num-batched-tokens", str(prefill_tokens), "--host", "127.0.0.1", "--port", str(port),
+        "--max-num-batched-tokens", str(max_batched_tokens), "--host", "127.0.0.1", "--port", str(port),
         "--enable-chunked-prefill", "--long-prefill-token-threshold", str(prefill_tokens),
+        "--bounded-decoder-replay",
         "--show-startup-logs",
     ]
+    ring_heap = os.environ.get("PYPTO_DSV41_RING_HEAP")
+    if ring_heap:
+        command.extend(["--ring-heap", ring_heap])
+    ring_dep_pool = os.environ.get("PYPTO_DSV41_RING_DEP_POOL")
+    if ring_dep_pool:
+        command.extend(["--ring-dep-pool", ring_dep_pool])
+    ring_task_window = os.environ.get("PYPTO_DSV41_RING_TASK_WINDOW")
+    if ring_task_window:
+        command.extend(["--ring-task-window", ring_task_window])
     env = os.environ.copy()
     probe_dir = tmp_path / "prefix-probe"
     probe_dir.mkdir()

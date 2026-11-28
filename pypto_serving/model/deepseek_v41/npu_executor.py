@@ -221,7 +221,17 @@ class DeepSeekV41PyptoExecutor(ModelExecutor):
     def max_prefill_batch_size(self) -> int | None:
         if any(runner.runtime.num_speculative_tokens == 5 for runner in self.runners.values()):
             return 1
-        return None
+        return min((runner.runtime.max_batch_size for runner in self.runners.values()), default=None)
+
+    @property
+    def max_prefill_requests_per_partition(self) -> int:
+        return min((runner.runtime.kv_cache_groups[0].max_requests_per_partition
+                    for runner in self.runners.values()), default=1)
+
+    @property
+    def max_prefill_tokens_per_partition(self) -> int | None:
+        hosts = (getattr(runner.resources, "prefill_host", None) for runner in self.runners.values())
+        return min((host.topology.capacity for host in hosts if host is not None), default=None)
 
     def run_decode(self, model, batch):
         return self.runners[model.config.model_id].run_decode(model, batch)

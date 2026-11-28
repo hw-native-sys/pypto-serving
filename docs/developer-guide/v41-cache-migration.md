@@ -111,6 +111,29 @@ The V4.1 CLI enables prefix caching with the 128-token replay policy. Shared
 prefix pages must never be cleared or written by request reset, suffix
 execution, abort, or release.
 
+### Decoder replay configuration
+
+Decoder Prefill bounded replay is controlled by
+`RuntimeConfig.bounded_decoder_replay` (default `True`). The CLI exposes
+`--bounded-decoder-replay` and `--no-bounded-decoder-replay`; the old
+`PYPTO_DSV41_BOUNDED_REPLAY` environment variable is not read.
+
+Each chunk computes only its intersection with the final 128-token Decoder
+replay interval, clipping Decoder SWA reads at the same absolute replay
+origin across chunks. For a 2056-token prompt split at 2048, Decoder work
+is 120 rows followed by 8 rows. Encoder processing and C1A global publication
+still cover every new row. DSpark bootstrap retains target taps in the
+compact Decoder row order, including when a preceding chunk has no Decoder
+rows. Set the runtime field to `False`, or use the negative CLI option, to
+run full Decoder Prefill for numerical comparisons.
+
+For example, enable bounded replay with DSpark K5 using
+`--bounded-decoder-replay --speculative-config '{"method":"dspark","num_speculative_tokens":5}'`.
+
+The V4.1 resident prefill graph is compiled for the per-request chunk limit.
+The scheduler may use a larger `max_num_batched_tokens` budget to co-batch
+multiple chunks without expanding every graph dispatch to that full budget.
+
 ### Publisher audit
 
 Both compressed families pass the same write slots to their KV and index
